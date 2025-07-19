@@ -436,8 +436,18 @@ fn get_indices(
     ))
 }
 
+/// Contains information about a StructField
+/// # Fields:
+/// * `0` - The index of the struct field in its struct
+/// * `1` - A reference to the struct field's name
+/// * `2` - A reference to the struct field
 type FieldInfo<'k> = (usize, &'k String, &'k StructField);
-/// Matches each parquet Field with a a kernel [[FieldInfo]]. If the kernel
+
+/// Constructs an iterator where each parquet Field in `fields` is matched
+/// with a a kernel `FieldInfo` reperesenting a StructField.
+///
+/// This returns an iterator of tuples. Each tuple contains the parquet field's ordinal
+/// and the matching `FieldInfo` if present.
 fn get_field_infos<'k, 'p>(
     requested_schema: &'k StructType,
     fields: &'p Fields,
@@ -880,9 +890,12 @@ mod tests {
         assert_eq!(result.column(2).null_count(), 2);
     }
 
+    /// Generates metadata for a parquet field with id `field_id`.
     fn arrow_fid(field_id: i64) -> HashMap<String, String> {
         HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string())])
     }
+
+    /// Generates metadata for a kernel struct field with column mapping id `field_id`.
     fn kernel_fid(field_id: i64) -> HashMap<String, MetadataValue> {
         HashMap::from([(
             ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),

@@ -571,6 +571,11 @@ pub trait ParquetHandler: AsAny {
     /// the columns requested by physical schema . The ParquetHandler _must_ return exactly the
     /// columns specified in `physical_schema`, and they _must_ be in schema order.
     ///
+    /// If a [`StructField`] in the  physical schema contains a field id, then the id is
+    /// used to resolve the parquet column. The field id, if present, is specified in the
+    /// [`ColumnMetadataKey::ParquetFieldId`] metadata field. If no field id is specified, the
+    /// column is resolved using the name.
+    ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
