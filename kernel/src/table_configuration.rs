@@ -13,7 +13,8 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
-use crate::schema::{InvariantChecker, SchemaRef};
+use crate::scan::data_skipping::stats_schema;
+use crate::schema::{InvariantChecker, Schema, SchemaRef, StructType};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, ReaderFeature, WriterFeature,
@@ -338,6 +339,26 @@ impl TableConfiguration {
                 "Enablement version and timestamp are not present.",
             )),
         }
+    }
+
+    /// Returns the expected schema for parsed table statistics written to checkpoints.
+    ///
+    /// The expected stats schema is controlled by the table properties.
+    /// * `dataSkippingStatsColumns` - used to explicitly specify the columns
+    ///   to be used for data skipping statistics. (takes precedence)
+    /// * `dataSkippingNumIndexedCols` - used to specify the number of columns
+    ///   to be used for data skipping statistics. Defaults to 32.
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn stats_schema(&self) -> Schema {
+        let partition_columns = self.metadata().partition_columns();
+        let physical_file_schema = StructType::new(
+            self.schema()
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name()))
+                .map(|field| field.make_physical()),
+        );
+        stats_schema(&physical_file_schema, &self.table_properties)
     }
 }
 
