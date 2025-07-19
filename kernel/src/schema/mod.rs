@@ -27,11 +27,7 @@ pub type SchemaRef = Arc<StructType>;
 
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
-#[cfg(feature = "internal-api")]
-pub trait ToSchema {
-    fn to_schema() -> StructType;
-}
-#[cfg(not(feature = "internal-api"))]
+#[internal_api]
 pub(crate) trait ToSchema {
     fn to_schema() -> StructType;
 }
