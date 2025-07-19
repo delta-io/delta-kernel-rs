@@ -61,7 +61,7 @@ fn read_files<F, I>(
     files: &[FileMeta],
     schema: SchemaRef,
     predicate: Option<PredicateRef>,
-    mut try_create_from_file: F
+    mut try_create_from_file: F,
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
@@ -88,7 +88,7 @@ where
                 File::open(path)?,
                 schema.clone(),
                 arrow_schema.clone(),
-                predicate.clone()
+                predicate.clone(),
             )
         })
         // Flatten to Iterator<DeltaResult<DeltaResult<ArrowEngineData>>>

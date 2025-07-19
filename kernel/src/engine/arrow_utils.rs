@@ -354,9 +354,6 @@ fn get_indices(
                             if key_val_names.next().is_some() {
                                 return Err(Error::generic("map fields had more than 2 members"));
                             }
-                            // TODO(#1070): Once nested column ids are supproted, we can either pass
-                            // `ColumnMode::Id` if the nested columns are present. Otherwise, pass
-                            // in `ColumnMode::NestedId`.
                             let inner_schema = map_type.as_struct_schema(key_name, val_name);
                             let (parquet_advance, _children) = get_indices(
                                 parquet_index + parquet_offset,

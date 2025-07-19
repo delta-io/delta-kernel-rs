@@ -179,8 +179,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let parquet_metadata = self.write_parquet(path, data).await?;
         parquet_metadata.as_record_batch(&partition_values, data_change)
     }
+}
 
-    fn read_parquet_files_internal(
+impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
+    fn read_parquet_files(
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
@@ -219,17 +221,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             files,
             self.readahead,
         )
-    }
-}
-
-impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
-    fn read_parquet_files(
-        &self,
-        files: &[FileMeta],
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
-        self.read_parquet_files_internal(files, physical_schema, predicate)
     }
 }
 

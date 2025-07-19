@@ -385,7 +385,7 @@ fn read_with_scan_metadata(
             .read_parquet_files(
                 &[meta],
                 scan.physical_schema().clone(),
-                scan.physical_predicate().clone()
+                scan.physical_predicate().clone(),
             )
             .unwrap();
 

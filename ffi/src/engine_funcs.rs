@@ -131,12 +131,7 @@ fn read_parquet_file_impl(
             .map_err(|_| Error::generic_err("unable to convert to FileSize"))?,
     };
     // TODO: Plumb the predicate through the FFI?
-
-    let data = parquet_handler.read_parquet_files(
-        &[delta_fm],
-        physical_schema,
-        None,
-    )?;
+    let data = parquet_handler.read_parquet_files(&[delta_fm], physical_schema, None)?;
     let res = Box::new(FileReadResultIterator {
         data,
         engine: extern_engine,
