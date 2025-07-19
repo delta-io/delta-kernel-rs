@@ -64,6 +64,7 @@ impl TableConfiguration {
     ///     - Column mapping is the only legacy feature present in kernel. No future delta versions
     ///       will introduce new legacy features.
     /// See: <https://github.com/delta-io/delta-kernel-rs/issues/650>
+    #[internal_api]
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
