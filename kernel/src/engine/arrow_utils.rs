@@ -1697,13 +1697,15 @@ mod tests {
     fn no_matches() {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
-                StructField::nullable("s", DataType::STRING),
-                StructField::nullable("i2", DataType::INTEGER),
+                StructField::nullable("s", DataType::STRING).with_metadata(kernel_fid(1)),
+                StructField::nullable("i2", DataType::INTEGER).with_metadata(kernel_fid(2)),
             ])
             .make_physical(mode)
             .into();
-            let nots_field = ArrowField::new("NOTs", ArrowDataType::Utf8, true);
-            let noti2_field = ArrowField::new("NOTi2", ArrowDataType::Int32, true);
+            let nots_field =
+                ArrowField::new("NOTs", ArrowDataType::Utf8, true).with_metadata(arrow_fid(3));
+            let noti2_field =
+                ArrowField::new("NOTi2", ArrowDataType::Int32, true).with_metadata(arrow_fid(4));
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 nots_field.clone(),
                 noti2_field.clone(),
@@ -1711,9 +1713,15 @@ mod tests {
             let (mask_indices, reorder_indices) =
                 get_requested_indices(&requested_schema, &parquet_schema).unwrap();
             let expect_mask: Vec<usize> = vec![];
+            let mut fields = requested_schema.fields();
+            let metadata1 = fields.next().unwrap().metadata_with_string_values();
+            let metadata2 = fields.next().unwrap().metadata_with_string_values();
             let expect_reorder = vec![
-                ReorderIndex::missing(0, nots_field.with_name("s").into()),
-                ReorderIndex::missing(1, noti2_field.with_name("i2").into()),
+                ReorderIndex::missing(0, nots_field.with_name("s").with_metadata(metadata1).into()),
+                ReorderIndex::missing(
+                    1,
+                    noti2_field.with_name("i2").with_metadata(metadata2).into(),
+                ),
             ];
             assert_eq!(mask_indices, expect_mask);
             assert_eq!(reorder_indices, expect_reorder);
@@ -1722,20 +1730,18 @@ mod tests {
 
     #[test]
     fn empty_requested_schema() {
-        column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([]).make_physical(mode).into();
-            let parquet_schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("i", ArrowDataType::Int32, false),
-                ArrowField::new("s", ArrowDataType::Utf8, true),
-                ArrowField::new("i2", ArrowDataType::Int32, true),
-            ]));
-            let (mask_indices, reorder_indices) =
-                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-            let expect_mask: Vec<usize> = vec![];
-            let expect_reorder = vec![];
-            assert_eq!(mask_indices, expect_mask);
-            assert_eq!(reorder_indices, expect_reorder);
-        });
+        let requested_schema = Arc::new(StructType::new([]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new("s", ArrowDataType::Utf8, true),
+            ArrowField::new("i2", ArrowDataType::Int32, true),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask: Vec<usize> = vec![];
+        let expect_reorder = vec![];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
     }
 
     #[test]
