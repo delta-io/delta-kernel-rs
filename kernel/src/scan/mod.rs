@@ -111,6 +111,7 @@ impl ScanBuilder {
         let state_info = get_state_info(
             logical_schema.as_ref(),
             &self.snapshot.metadata().partition_columns,
+            self.snapshot.table_configuration().column_mapping_mode(),
         )?;
 
         let physical_predicate = match self.predicate {
@@ -815,7 +816,11 @@ struct StateInfo {
 }
 
 /// Get the state needed to process a scan, see [`StateInfo`] for details.
-fn get_state_info(logical_schema: &Schema, partition_columns: &[String]) -> DeltaResult<StateInfo> {
+fn get_state_info(
+    logical_schema: &Schema,
+    partition_columns: &[String],
+    column_mapping_mode: ColumnMappingMode,
+) -> DeltaResult<StateInfo> {
     let mut have_partition_cols = false;
     let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
     // Loop over all selected fields and note if they are columns that will be read from the
@@ -834,7 +839,7 @@ fn get_state_info(logical_schema: &Schema, partition_columns: &[String]) -> Delt
             } else {
                 // Add to read schema, store field so we can build a `Column` expression later
                 // if needed (i.e. if we have partition columns)
-                let physical_field = logical_field.make_physical();
+                let physical_field = logical_field.make_physical(column_mapping_mode);
                 debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                 let physical_name = physical_field.name.clone();
                 read_fields.push(physical_field);
