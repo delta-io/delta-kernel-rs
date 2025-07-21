@@ -418,7 +418,8 @@ mod tests {
         add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
         run_with_validate_callback,
     };
-    use crate::scan::{get_state_info, Scan};
+    use crate::scan::{Scan, StateInfo};
+    use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
         engine::sync::SyncEngine,
@@ -503,7 +504,8 @@ mod tests {
             StructField::new("date", DataType::DATE, true),
         ]));
         let partition_cols = ["date".to_string()];
-        let state_info = get_state_info(schema.as_ref(), &partition_cols).unwrap();
+        let state_info =
+            StateInfo::try_new(schema.as_ref(), &partition_cols, ColumnMappingMode::None).unwrap();
         let static_transform = Some(Arc::new(Scan::get_static_transform(&state_info.all_fields)));
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
