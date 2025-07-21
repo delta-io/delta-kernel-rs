@@ -13,6 +13,7 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
+use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
@@ -81,6 +82,8 @@ impl TableConfiguration {
         validate_schema_column_mapping(&schema, column_mapping_mode)?;
 
         validate_timestamp_ntz_feature_support(&schema, &protocol)?;
+
+        validate_variant_type_feature_support(&schema, &protocol)?;
 
         Ok(Self {
             schema,
@@ -627,6 +630,53 @@ mod test {
         assert!(
             result.is_ok(),
             "Should succeed when TIMESTAMP_NTZ is used with required features"
+        );
+    }
+
+    #[test]
+    fn test_variant_validation_integration() {
+        // Schema with VARIANT column
+        let schema_string = r#"{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}"#.to_string();
+        let metadata = Metadata {
+            schema_string,
+            ..Default::default()
+        };
+
+        let protocol_without_variant_features = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
+        )
+        .unwrap();
+
+        let protocol_with_variant_features = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::VariantType]),
+            Some([WriterFeature::VariantType]),
+        )
+        .unwrap();
+
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result: Result<TableConfiguration, Error> = TableConfiguration::try_new(
+            metadata.clone(),
+            protocol_without_variant_features,
+            table_root.clone(),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "Should fail when VARIANT is used without required features"
+        );
+        assert!(result.unwrap_err().to_string().contains("variantType"));
+
+        let result =
+            TableConfiguration::try_new(metadata, protocol_with_variant_features, table_root, 0);
+        assert!(
+            result.is_ok(),
+            "Should succeed when VARIANT is used with required features"
         );
     }
 }

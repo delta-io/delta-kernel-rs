@@ -191,6 +191,15 @@ pub struct EngineSchemaVisitor {
         is_nullable: bool,
         metadata: &CStringMap,
     ),
+
+    /// Visit a `variant` belonging to the list identified by `sibling_list_id`.
+    pub visit_variant: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        name: KernelStringSlice,
+        is_nullable: bool,
+        metadata: &CStringMap,
+    ),
 }
 
 /// Visit the given `schema` using the provided `visitor`. See the documentation of
@@ -306,6 +315,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             DataType::Primitive(PrimitiveType::Decimal(d)) => {
                 call!(visit_decimal, d.precision(), d.scale())
             }
+            &DataType::Variant(_) => call!(visit_variant),
             &DataType::STRING => call!(visit_string),
             &DataType::LONG => call!(visit_long),
             &DataType::INTEGER => call!(visit_integer),
