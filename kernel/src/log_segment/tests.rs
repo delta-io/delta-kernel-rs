@@ -1771,7 +1771,7 @@ fn commits_since() {
     let log_segment = create_segment_for(
         &Vec::from_iter(0..=6),
         &[],
-        Some(3), // No checkpoint
+        Some(3), // Checkpoint @ 3
         None,    // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
@@ -1781,7 +1781,7 @@ fn commits_since() {
     let log_segment = create_segment_for(
         &Vec::from_iter(0..=6),
         &[(0, 2)],
-        Some(3), // Checkpoint
+        Some(3), // Checkpoint @ 3
         None,    // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
@@ -1791,7 +1791,7 @@ fn commits_since() {
     let log_segment = create_segment_for(
         &Vec::from_iter(0..=6),
         &[(3, 4)],
-        Some(2), // Checkpoint
+        Some(2), // Checkpoint @ 2
         None,    // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
@@ -1801,7 +1801,7 @@ fn commits_since() {
     let log_segment = create_segment_for(
         &Vec::from_iter(0..=6),
         &[(1, 2), (3, 4)],
-        None, // Checkpoint
+        None, // No Checkpoint
         None, // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 6);
@@ -1811,7 +1811,7 @@ fn commits_since() {
     let log_segment = create_segment_for(
         &Vec::from_iter(0..=10),
         &[(1, 2), (3, 9), (4, 6)],
-        None, // Checkpoint
+        None, // No Checkpoint
         None, // Version to load
     );
     assert_eq!(log_segment.commits_since_checkpoint(), 10);

@@ -252,11 +252,11 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
     size
 }
 
-async fn write_data(
+async fn write_data_and_check_result_and_stats(
     table_url: Url,
     schema: SchemaRef,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    expected_since_commit: usize,
+    expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let commit_info = new_commit_info()?;
     let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), engine.as_ref(), None)?);
@@ -328,7 +328,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 
     for (table_url, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
         let engine = Arc::new(engine);
-        write_data(table_url.clone(), schema.clone(), engine.clone(), 1).await?;
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -413,8 +414,10 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
 
     for (table_url, engine, _, _) in setup_test_tables(schema.clone(), &[]).await? {
         let engine = Arc::new(engine);
-        write_data(table_url.clone(), schema.clone(), engine.clone(), 1).await?;
-        write_data(table_url.clone(), schema.clone(), engine.clone(), 2).await?;
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 2)
+            .await?;
 
         test_read(
             &ArrowEngineData::new(RecordBatch::try_new(

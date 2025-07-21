@@ -315,8 +315,13 @@ impl WriteContext {
 /// trigger actions like checkpointing or log compaction. This struct holds that information.
 #[derive(Debug)]
 pub struct PostCommitStats {
-    pub commits_since_checkpoint: usize,
-    pub commits_since_log_compaction: usize,
+    /// The number of commits since this table has been checkpointed. Note that commit 0 is
+    /// considered a checkpoint for the purposes of this computation.
+    pub commits_since_checkpoint: u64,
+    /// The number of commits since the log has been compacted on this table. Note that a checkpoint
+    /// is considered a compaction for the purposes of this computation. Thus this is really the
+    /// number of commits since a compaction OR a checkpoint.
+    pub commits_since_log_compaction: u64,
 }
 
 /// Result of committing a transaction.

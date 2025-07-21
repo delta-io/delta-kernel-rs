@@ -472,17 +472,16 @@ impl LogSegment {
     }
 
     /// How many commits since a checkpoint, according to this log segment
-    pub(crate) fn commits_since_checkpoint(&self) -> usize {
+    pub(crate) fn commits_since_checkpoint(&self) -> u64 {
         // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
         // is the correct number of commits since a checkpoint if there are no checkpoints
         let checkpoint_version = self.checkpoint_version.unwrap_or(0);
-        (self.end_version - checkpoint_version)
-            .try_into()
-            .unwrap_or(usize::MAX)
+        debug_assert!(checkpoint_version <= self.end_version);
+        self.end_version - checkpoint_version
     }
 
     /// How many commits since a log-compaction or checkpoint, according to this log segment
-    pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> usize {
+    pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
         // Annoyingly we have to search all the compaction files to determine this, because we only
         // sort by start version, so technically the max end version could be anywhere in the vec.
         // We can return 0 in the case there is no compaction since end_version - 0 is the correct
@@ -501,7 +500,8 @@ impl LogSegment {
         });
         // we want to subtract off the max of the max compaction end or the checkpoint version
         let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
-        (self.end_version - to_sub).try_into().unwrap_or(usize::MAX)
+        debug_assert!(to_sub <= self.end_version);
+        self.end_version - to_sub
     }
 }
 
