@@ -585,11 +585,18 @@ pub trait ParquetHandler: AsAny {
     /// the columns requested by physical schema . The ParquetHandler _must_ return exactly the
     /// columns specified in `physical_schema`, and they _must_ be in schema order.
     ///
+    /// If a [`StructField`] in the  physical schema contains a field id, then the id is
+    /// used to resolve the parquet column. The field id, if present, is specified in the
+    /// [`ColumnMetadataKey::ParquetFieldId`] metadata field. If no field id is specified or if
+    /// there is no matching field id, the column is resolved using the name.
+    ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    ///
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
