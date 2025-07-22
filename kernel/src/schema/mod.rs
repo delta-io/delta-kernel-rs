@@ -17,6 +17,10 @@ use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
+
+#[cfg(feature = "internal-api")]
+pub mod derive_macro_utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
 pub(crate) mod variant_utils;
 
@@ -25,6 +29,7 @@ pub type SchemaRef = Arc<StructType>;
 
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
+#[internal_api]
 pub(crate) trait ToSchema {
     fn to_schema() -> StructType;
 }

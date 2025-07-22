@@ -4,7 +4,8 @@ default:
 # run tests
 test:
     cargo test --features default-engine
-
+    cargo test --doc
+  
 # lint codebase
 lint:
     cargo clippy --tests --features default-engine
