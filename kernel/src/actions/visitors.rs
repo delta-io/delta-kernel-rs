@@ -21,6 +21,38 @@ pub(crate) struct MetadataVisitor {
     pub(crate) metadata: Option<Metadata>,
 }
 
+impl MetadataVisitor {
+    #[internal_api]
+    fn visit_metadata<'a>(
+        row_index: usize,
+        id: String,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<Metadata> {
+        require!(
+            getters.len() == 9,
+            Error::InternalError(format!(
+                "Wrong number of MetadataVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        // get format out of primitives
+        let configuration_map_opt = getters[8].get_opt(row_index, "metaData.configuration")?;
+        Ok(Metadata {
+            id,
+            name: getters[1].get_opt(row_index, "metaData.name")?,
+            description: getters[2].get_opt(row_index, "metaData.description")?,
+            format: Format {
+                provider: getters[3].get(row_index, "metaData.format.provider")?,
+                options: HashMap::new(), // options for format is always empty, so skip getters[4]
+            },
+            schema_string: getters[5].get(row_index, "metaData.schemaString")?,
+            partition_columns: getters[6].get(row_index, "metaData.partitionColumns")?,
+            created_time: getters[7].get_opt(row_index, "metaData.created_time")?,
+            configuration: configuration_map_opt.unwrap_or_else(HashMap::new),
+        })
+    }
+}
+
 impl RowVisitor for MetadataVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
@@ -30,9 +62,10 @@ impl RowVisitor for MetadataVisitor {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            if let Some(metadata) = visit_metadata_at(i, getters)? {
-                self.metadata = Some(metadata);
-                break;
+            // Since id column is required, use it to detect presence of a metadata action
+            if let Some(id) = getters[0].get_opt(i, "metaData.id")? {
+                self.metadata = Some(Self::visit_metadata(i, id, getters)?);
+                break; // A commit has at most one metaData action
             }
         }
         Ok(())
@@ -81,9 +114,10 @@ impl RowVisitor for ProtocolVisitor {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
-            if let Some(protocol) = visit_protocol_at(i, getters)? {
-                self.protocol = Some(protocol);
-                break;
+            // Since minReaderVersion column is required, use it to detect presence of a Protocol action
+            if let Some(mrv) = getters[0].get_opt(i, "protocol.min_reader_version")? {
+                self.protocol = Some(Self::visit_protocol(i, mrv, getters)?);
+                break; // A commit has at most one Protocol action
             }
         }
         Ok(())
