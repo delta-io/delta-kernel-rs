@@ -55,7 +55,8 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+    #[internal_api]
+    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
         Self {
             log_segment,
             table_configuration,

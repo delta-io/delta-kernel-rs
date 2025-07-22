@@ -1744,3 +1744,76 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
         None,
     );
 }
+
+#[test]
+fn commits_since() {
+    // simple
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=4),
+        &[],
+        None, // No checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
+
+    // with compaction, no checkpoint
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=4),
+        &[(0, 2)],
+        None, // No checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+
+    // checkpoint, no compaction
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[],
+        Some(3), // Checkpoint @ 3
+        None,    // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 3);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
+
+    // checkpoint and compaction less than checkpoint
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[(0, 2)],
+        Some(3), // Checkpoint @ 3
+        None,    // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 3);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
+
+    // checkpoint and compaction greater than checkpoint
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[(3, 4)],
+        Some(2), // Checkpoint @ 2
+        None,    // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+
+    // multiple compactions
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[(1, 2), (3, 4)],
+        None, // No Checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 6);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+
+    // multiple compactions, out of order
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=10),
+        &[(1, 2), (3, 9), (4, 6)],
+        None, // No Checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 10);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 1);
+}

@@ -2,6 +2,7 @@ use super::*;
 use crate::expressions::{column_name, column_pred};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use crate::schema::variant_utils::unshredded_variant_schema;
 use crate::Predicate;
 use std::fs::File;
 
@@ -211,6 +212,13 @@ fn test_get_stat_values() {
         None // Timestamp defaults to 96-bit, which doesn't get stats
     );
 
+    // Read a random column as Variant. The actual read does not need to be performed, as stats on
+    // Variant should always return None.
+    assert_eq!(
+        filter.get_min_stat(&column_name!("chrono.date32"), &unshredded_variant_schema()),
+        None
+    );
+
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
         filter.get_min_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
@@ -381,6 +389,13 @@ fn test_get_stat_values() {
     assert_eq!(
         filter.get_max_stat(&column_name!("chrono.timestamp"), &DataType::TIMESTAMP),
         None // Timestamp defaults to 96-bit, which doesn't get stats
+    );
+
+    // Read a random column as Variant. The actual read does not need to be performed, as stats on
+    // Variant should always return None.
+    assert_eq!(
+        filter.get_max_stat(&column_name!("chrono.date32"), &unshredded_variant_schema()),
+        None
     );
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
