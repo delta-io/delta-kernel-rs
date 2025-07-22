@@ -175,14 +175,6 @@ pub enum Error {
     #[error("Invalid log path: {0}")]
     InvalidLogPath(String),
 
-    /// Invalid commit info passed to the transaction
-    #[error("Invalid commit info: {0}")]
-    InvalidCommitInfo(String),
-
-    /// Commit info was not passed to the transaction
-    #[error("Missing commit info")]
-    MissingCommitInfo,
-
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]
     FileAlreadyExists(String),
