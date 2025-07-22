@@ -1182,6 +1182,27 @@ mod tests {
     }
 
     #[test]
+    fn test_unshredded_variant() {
+        let unshredded_variant_type = DataType::unshredded_variant();
+
+        match &unshredded_variant_type {
+            DataType::Variant(struct_type) => {
+                let fields: Vec<_> = struct_type.fields().collect();
+                assert_eq!(fields.len(), 2);
+
+                assert_eq!(fields[0].name, "metadata");
+                assert_eq!(fields[0].data_type, DataType::BINARY);
+                assert!(!fields[0].nullable);
+
+                assert_eq!(fields[1].name, "value");
+                assert_eq!(fields[1].data_type, DataType::BINARY);
+                assert!(!fields[1].nullable);
+            }
+            _ => panic!("Expected DataType::Variant, got {unshredded_variant_type:?}"),
+        }
+    }
+
+    #[test]
     fn test_field_metadata() {
         let data = r#"
         {
