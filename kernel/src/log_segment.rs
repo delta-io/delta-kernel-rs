@@ -2,6 +2,7 @@
 //! files.
 use std::collections::HashMap;
 use std::convert::identity;
+use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
@@ -202,6 +203,61 @@ impl LogSegment {
             None, // TODO: use CRC files for table changes?
         );
         LogSegment::try_new(listed_files, log_root, end_version)
+    }
+
+    #[allow(unused)]
+    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
+    /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
+    /// `limit` specifies the maximum length of the returned log segment. The log segment may be
+    /// shorter than `limit` if there are missing commits.
+    ///
+    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
+    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    pub(crate) fn for_timestamp_conversion(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<NonZero<usize>>,
+    ) -> DeltaResult<Self> {
+        // Compute the version to start listing from.
+        let start_from = limit
+            .map(|limit| match NonZero::<Version>::try_from(limit) {
+                Ok(limit) => Ok(Version::saturating_sub(end_version, limit.get() - 1)),
+                _ => Err(Error::generic(format!(
+                    "Invalid limit {limit} when building log segment in timestamp conversion",
+                ))),
+            })
+            .transpose()?;
+
+        let mut contiguous_commits: Vec<ParsedLogPath> =
+            limit.map_or_else(Vec::new, |limit| Vec::with_capacity(limit.get()));
+
+        for commit_res in list_log_files(storage, &log_root, start_from, Some(end_version))? {
+            let commit = match commit_res {
+                Ok(file) if matches!(file.file_type, LogPathFileType::Commit) => file,
+                Ok(_) | Err(Error::InvalidLogPath(_)) => continue, // Ignore non-commit
+                Err(err) => return Err(err), // Listing errors are propagated to the caller
+            };
+
+            if contiguous_commits
+                .last()
+                .is_some_and(|prev_commit| prev_commit.version + 1 != commit.version)
+            {
+                // We found a gap, so throw away all earlier versions
+                contiguous_commits.clear();
+            }
+
+            contiguous_commits.push(commit);
+        }
+
+        let listed_files = ListedLogFiles {
+            ascending_commit_files: contiguous_commits,
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+        };
+
+        LogSegment::try_new(listed_files, log_root, Some(end_version))
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
