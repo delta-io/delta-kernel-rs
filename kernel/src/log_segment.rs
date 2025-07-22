@@ -22,7 +22,7 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -797,7 +797,7 @@ fn list_log_files_with_checkpoint(
         ));
     };
     if latest_checkpoint.version != checkpoint_metadata.version {
-        warn!(
+        info!(
             "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
             checkpoint_metadata.version,
             latest_checkpoint.version
