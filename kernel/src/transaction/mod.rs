@@ -162,7 +162,21 @@ impl Transaction {
         // step three: commit the actions as a json file in the log
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
-            Ok(()) => Ok(CommitResult::Committed(commit_version)),
+            Ok(()) => Ok(CommitResult::Committed {
+                version: commit_version,
+                post_commit_stats: PostCommitStats {
+                    commits_since_checkpoint: self
+                        .read_snapshot
+                        .log_segment()
+                        .commits_since_checkpoint()
+                        + 1,
+                    commits_since_log_compaction: self
+                        .read_snapshot
+                        .log_segment()
+                        .commits_since_log_compaction_or_checkpoint()
+                        + 1,
+                },
+            }),
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
             Err(e) => Err(e),
         }
@@ -297,16 +311,34 @@ impl WriteContext {
     }
 }
 
-/// Result after committing a transaction. If 'committed', the version is the new version written
-/// to the log. If 'conflict', the transaction is returned so the caller can resolve the conflict
-/// (along with the version which conflicted).
-// TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
-// update the transaction to a new version etc.
+/// Kernel exposes information about the state of the table that engines might want to use to
+/// trigger actions like checkpointing or log compaction. This struct holds that information.
+#[derive(Debug)]
+pub struct PostCommitStats {
+    /// The number of commits since this table has been checkpointed. Note that commit 0 is
+    /// considered a checkpoint for the purposes of this computation.
+    pub commits_since_checkpoint: u64,
+    /// The number of commits since the log has been compacted on this table. Note that a checkpoint
+    /// is considered a compaction for the purposes of this computation. Thus this is really the
+    /// number of commits since a compaction OR a checkpoint.
+    pub commits_since_log_compaction: u64,
+}
+
+/// Result of committing a transaction.
 #[derive(Debug)]
 pub enum CommitResult {
-    /// The transaction was successfully committed at the version.
-    Committed(Version),
-    /// This transaction conflicted with an existing version (at the version given).
+    /// The transaction was successfully committed.
+    Committed {
+        /// the version of the table that was just committed
+        version: Version,
+        /// The [`PostCommitStats`] for this transaction
+        post_commit_stats: PostCommitStats,
+    },
+    /// This transaction conflicted with an existing version (at the version given). The transaction
+    /// is returned so the caller can resolve the conflict (along with the version which
+    /// conflicted).
+    // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
+    // update the transaction to a new version etc.
     Conflict(Transaction, Version),
 }
 

@@ -470,6 +470,39 @@ impl LogSegment {
         // read the same protocol and metadata schema for both commits and checkpoints
         self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone())
     }
+
+    /// How many commits since a checkpoint, according to this log segment
+    pub(crate) fn commits_since_checkpoint(&self) -> u64 {
+        // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
+        // is the correct number of commits since a checkpoint if there are no checkpoints
+        let checkpoint_version = self.checkpoint_version.unwrap_or(0);
+        debug_assert!(checkpoint_version <= self.end_version);
+        self.end_version - checkpoint_version
+    }
+
+    /// How many commits since a log-compaction or checkpoint, according to this log segment
+    pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
+        // Annoyingly we have to search all the compaction files to determine this, because we only
+        // sort by start version, so technically the max end version could be anywhere in the vec.
+        // We can return 0 in the case there is no compaction since end_version - 0 is the correct
+        // number of commits since compaction if there are no compactions
+        let max_compaction_end = self.ascending_compaction_files.iter().fold(0, |cur, f| {
+            if let &ParsedLogPath {
+                file_type: LogPathFileType::CompactedCommit { hi },
+                ..
+            } = f
+            {
+                Version::max(cur, hi)
+            } else {
+                warn!("Found invalid ParsedLogPath in ascending_compaction_files: {f:?}");
+                cur
+            }
+        });
+        // we want to subtract off the max of the max compaction end or the checkpoint version
+        let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
+        debug_assert!(to_sub <= self.end_version);
+        self.end_version - to_sub
+    }
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version`
