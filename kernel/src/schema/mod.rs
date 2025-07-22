@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
-use crate::schema::variant_utils::unshredded_variant_schema;
 use crate::utils::{require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
@@ -633,10 +632,10 @@ where
         str_value == "variant",
         serde::de::Error::custom(format!("Invalid variant: {str_value}"))
     );
-    match unshredded_variant_schema() {
+    match DataType::unshredded_variant() {
         DataType::Variant(st) => Ok(st),
         _ => Err(serde::de::Error::custom(
-            "Issue in unshredded_variant_schema(). Please raise an issue at ".to_string()
+            "Issue in DataType::unshredded_variant(). Please raise an issue at ".to_string()
                 + "delta-io/delta-kernel-rs.",
         )),
     }
@@ -753,12 +752,24 @@ impl DataType {
     pub fn struct_type(fields: impl IntoIterator<Item = StructField>) -> Self {
         StructType::new(fields).into()
     }
+
     pub fn try_struct_type<E>(
         fields: impl IntoIterator<Item = Result<StructField, E>>,
     ) -> Result<Self, E> {
         Ok(StructType::try_new(fields)?.into())
     }
 
+    /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
+    /// binary fields: `metadata` and `value`.
+    pub fn unshredded_variant() -> Self {
+        DataType::variant_type([
+            StructField::not_null("metadata", DataType::BINARY),
+            StructField::not_null("value", DataType::BINARY),
+        ])
+    }
+
+    /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
+    /// should prefer using [`DataType::unshredded_variant`].
     pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> Self {
         DataType::Variant(Box::new(StructType::new(fields)))
     }
@@ -1053,8 +1064,6 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
-    use crate::schema::variant_utils::unshredded_variant_schema;
-
     use super::*;
     use serde_json;
 
@@ -1163,7 +1172,7 @@ mod tests {
         }
         "#;
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert_eq!(field.data_type, unshredded_variant_schema());
+        assert_eq!(field.data_type, DataType::unshredded_variant());
 
         let json_str = serde_json::to_string(&field).unwrap();
         assert_eq!(
