@@ -216,6 +216,7 @@ pub fn engine_store_setup(
 
 // we provide this table creation function since we only do appends to existing tables for now.
 // this will just create an empty table with the given schema. (just protocol + metadata actions)
+#[allow(clippy::too_many_arguments)]
 pub async fn create_table(
     store: Arc<dyn ObjectStore>,
     table_path: Url,
@@ -223,6 +224,8 @@ pub async fn create_table(
     partition_columns: &[&str],
     use_37_protocol: bool,
     enable_timestamp_without_timezone: bool,
+    enable_variant: bool,
+    enable_column_mapping: bool,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
     let schema = serde_json::to_string(&schema)?;
@@ -233,6 +236,18 @@ pub async fn create_table(
         if enable_timestamp_without_timezone {
             reader_features.push("timestampNtz");
             writer_features.push("timestampNtz");
+        }
+        if enable_variant {
+            reader_features.push("variantType");
+            writer_features.push("variantType");
+            // We can add shredding features as well as we are allowed to write unshredded variants
+            // into shredded tables and shredded reads are explicitly blocked in the default
+            // engine's parquet reader.
+            reader_features.push("variantShredding-preview");
+            writer_features.push("variantShredding-preview");
+        }
+        if enable_column_mapping {
+            reader_features.push("columnMapping");
         }
         (reader_features, writer_features)
     };
@@ -263,7 +278,7 @@ pub async fn create_table(
             },
             "schemaString": schema,
             "partitionColumns": partition_columns,
-            "configuration": {},
+            "configuration": {"delta.columnMapping.mode": "name"},
             "createdTime": 1677811175819u64
         }
     });
@@ -307,6 +322,8 @@ pub async fn setup_test_tables(
                 partition_columns,
                 true,
                 false,
+                false,
+                false,
             )
             .await?,
             engine_37,
@@ -319,6 +336,8 @@ pub async fn setup_test_tables(
                 table_location_11,
                 schema,
                 partition_columns,
+                false,
+                false,
                 false,
                 false,
             )
