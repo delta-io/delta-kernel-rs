@@ -2,15 +2,55 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use itertools::Itertools;
 
-use crate::schema::{ArrayType, DataType, PrimitiveType, StructField};
+use crate::schema::derive_macro_utils::ToDataType;
+use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct StructData {
-    fields: Vec<StructField>,
-    values: Vec<Scalar>,
+pub struct DecimalData {
+    bits: i128,
+    ty: DecimalType,
+}
+
+impl DecimalData {
+    pub fn try_new(bits: impl Into<i128>, ty: DecimalType) -> DeltaResult<Self> {
+        let bits = bits.into();
+        require!(
+            ty.precision() >= get_decimal_precision(bits),
+            Error::invalid_decimal(format!(
+                "Decimal value {} exceeds precision {}",
+                bits,
+                ty.precision()
+            ))
+        );
+        Ok(Self { bits, ty })
+    }
+
+    pub fn bits(&self) -> i128 {
+        self.bits
+    }
+
+    pub fn ty(&self) -> &DecimalType {
+        &self.ty
+    }
+
+    pub fn precision(&self) -> u8 {
+        self.ty.precision()
+    }
+
+    pub fn scale(&self) -> u8 {
+        self.ty.scale()
+    }
+}
+
+/// Computes the decimal precision of a 128-bit number. The largest possible magnitude is i128::MIN
+/// = -2**127 with 39 decimal digits.
+fn get_decimal_precision(value: i128) -> u8 {
+    // Not sure why checked_ilog10 returns u32 when log10(2**127) = 38 fits easily in u8??
+    value.unsigned_abs().checked_ilog10().map_or(0, |p| p + 1) as _
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,11 +61,34 @@ pub struct ArrayData {
 }
 
 impl ArrayData {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-    pub fn new(tpe: ArrayType, elements: impl IntoIterator<Item = impl Into<Scalar>>) -> Self {
-        let elements = elements.into_iter().map(Into::into).collect();
-        Self { tpe, elements }
+    pub fn try_new(
+        tpe: ArrayType,
+        elements: impl IntoIterator<Item = impl Into<Scalar>>,
+    ) -> DeltaResult<Self> {
+        let elements = elements
+            .into_iter()
+            .map(|v| {
+                let v = v.into();
+                // disallow nulls if the type is not allowed to contain nulls
+                if !tpe.contains_null() && v.is_null() {
+                    Err(Error::schema(
+                        "Array element cannot be null for non-nullable array",
+                    ))
+                // check element types match
+                } else if *tpe.element_type() != v.data_type() {
+                    Err(Error::Schema(format!(
+                        "Array scalar type mismatch: expected {}, got {}",
+                        tpe.element_type(),
+                        v.data_type()
+                    )))
+                } else {
+                    Ok(v)
+                }
+            })
+            .try_collect()?;
+        Ok(Self { tpe, elements })
     }
+
     pub fn array_type(&self) -> &ArrayType {
         &self.tpe
     }
@@ -36,6 +99,70 @@ impl ArrayData {
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapData {
+    data_type: MapType,
+    pairs: Vec<(Scalar, Scalar)>,
+}
+
+impl MapData {
+    pub fn try_new(
+        data_type: MapType,
+        values: impl IntoIterator<Item = (impl Into<Scalar>, impl Into<Scalar>)>,
+    ) -> DeltaResult<Self> {
+        let key_type = data_type.key_type();
+        let val_type = data_type.value_type();
+        let pairs = values
+            .into_iter()
+            .map(|(key, val)| {
+                let (k, v) = (key.into(), val.into());
+                // check key types match
+                if k.data_type() != *key_type {
+                    Err(Error::Schema(format!(
+                        "Map scalar type mismatch: expected key type {}, got key type {}",
+                        key_type,
+                        k.data_type()
+                    )))
+                // keys can't be null
+                } else if k.is_null() {
+                    Err(Error::schema("Map key cannot be null"))
+                // check val types match
+                } else if v.data_type() != *val_type {
+                    Err(Error::Schema(format!(
+                        "Map scalar type mismatch: expected value type {}, got value type {}",
+                        val_type,
+                        v.data_type()
+                    )))
+                // vals can only be null if value_contains_null is true
+                } else if v.is_null() && !data_type.value_contains_null {
+                    Err(Error::schema(
+                        "Null map value disallowed if map value_contains_null is false",
+                    ))
+                } else {
+                    Ok((k, v))
+                }
+            })
+            .try_collect()?;
+        Ok(Self { data_type, pairs })
+    }
+
+    // TODO: array.elements is deprecated? do we want to expose this? How will FFI get pairs for
+    // visiting?
+    pub fn pairs(&self) -> &[(Scalar, Scalar)] {
+        &self.pairs
+    }
+
+    pub fn map_type(&self) -> &MapType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructData {
+    fields: Vec<StructField>,
+    values: Vec<Scalar>,
 }
 
 impl StructData {
@@ -117,13 +244,15 @@ pub enum Scalar {
     /// Binary data
     Binary(Vec<u8>),
     /// Decimal value with a given precision and scale.
-    Decimal(i128, u8, u8),
+    Decimal(DecimalData),
     /// Null value with a given data type.
     Null(DataType),
     /// Struct value
     Struct(StructData),
     /// Array Value
     Array(ArrayData),
+    /// Map Value
+    Map(MapData),
 }
 
 impl Scalar {
@@ -141,10 +270,11 @@ impl Scalar {
             Self::TimestampNtz(_) => DataType::TIMESTAMP_NTZ,
             Self::Date(_) => DataType::DATE,
             Self::Binary(_) => DataType::BINARY,
-            Self::Decimal(_, precision, scale) => DataType::decimal_unchecked(*precision, *scale),
+            Self::Decimal(d) => DataType::from(*d.ty()),
             Self::Null(data_type) => data_type.clone(),
             Self::Struct(data) => DataType::struct_type(data.fields.clone()),
             Self::Array(data) => data.tpe.clone().into(),
+            Self::Map(data) => data.data_type.clone().into(),
         }
     }
 
@@ -153,50 +283,111 @@ impl Scalar {
         matches!(self, Self::Null(_))
     }
 
-    /// Constructs a Scalar timestamp with no timezone from an `i64` millisecond since unix epoch
-    pub(crate) fn timestamp_ntz_from_millis(millis: i64) -> DeltaResult<Self> {
+    /// Constructs a Decimal value from raw parts
+    pub fn decimal(bits: impl Into<i128>, precision: u8, scale: u8) -> DeltaResult<Self> {
+        let dtype = DecimalType::try_new(precision, scale)?;
+        let dval = DecimalData::try_new(bits, dtype)?;
+        Ok(Self::Decimal(dval))
+    }
+
+    /// Constructs a Scalar timestamp (in UTC) from an `i64` millisecond since unix epoch
+    pub(crate) fn timestamp_from_millis(millis: i64) -> DeltaResult<Self> {
         let Some(timestamp) = DateTime::from_timestamp_millis(millis) else {
             return Err(Error::generic(format!(
                 "Failed to create millisecond timestamp from {millis}"
             )));
         };
-        Ok(Self::TimestampNtz(timestamp.timestamp_micros()))
+        Ok(Self::Timestamp(timestamp.timestamp_micros()))
+    }
+
+    /// Attempts to add two scalars, returning None if they were incompatible.
+    pub fn try_add(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_add(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_add(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_add(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_add(*b)?),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to subtract two scalars, returning None if they were incompatible.
+    pub fn try_sub(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_sub(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_sub(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_sub(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_sub(*b)?),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to multiply two scalars, returning None if they were incompatible.
+    pub fn try_mul(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_mul(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_mul(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_mul(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_mul(*b)?),
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    /// Attempts to divide two scalars, returning None if they were incompatible.
+    pub fn try_div(&self, other: &Scalar) -> Option<Scalar> {
+        use Scalar::*;
+        let result = match (self, other) {
+            (Integer(a), Integer(b)) => Integer(a.checked_div(*b)?),
+            (Long(a), Long(b)) => Long(a.checked_div(*b)?),
+            (Short(a), Short(b)) => Short(a.checked_div(*b)?),
+            (Byte(a), Byte(b)) => Byte(a.checked_div(*b)?),
+            _ => return None,
+        };
+        Some(result)
     }
 }
 
 impl Display for Scalar {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Integer(i) => write!(f, "{}", i),
-            Self::Long(i) => write!(f, "{}", i),
-            Self::Short(i) => write!(f, "{}", i),
-            Self::Byte(i) => write!(f, "{}", i),
-            Self::Float(fl) => write!(f, "{}", fl),
-            Self::Double(fl) => write!(f, "{}", fl),
-            Self::String(s) => write!(f, "'{}'", s),
-            Self::Boolean(b) => write!(f, "{}", b),
-            Self::Timestamp(ts) => write!(f, "{}", ts),
-            Self::TimestampNtz(ts) => write!(f, "{}", ts),
-            Self::Date(d) => write!(f, "{}", d),
-            Self::Binary(b) => write!(f, "{:?}", b),
-            Self::Decimal(value, _, scale) => match scale.cmp(&0) {
+            Self::Integer(i) => write!(f, "{i}"),
+            Self::Long(i) => write!(f, "{i}"),
+            Self::Short(i) => write!(f, "{i}"),
+            Self::Byte(i) => write!(f, "{i}"),
+            Self::Float(fl) => write!(f, "{fl}"),
+            Self::Double(fl) => write!(f, "{fl}"),
+            Self::String(s) => write!(f, "'{s}'"),
+            Self::Boolean(b) => write!(f, "{b}"),
+            Self::Timestamp(ts) => write!(f, "{ts}"),
+            Self::TimestampNtz(ts) => write!(f, "{ts}"),
+            Self::Date(d) => write!(f, "{d}"),
+            Self::Binary(b) => write!(f, "{b:?}"),
+            Self::Decimal(d) => match d.scale().cmp(&0) {
                 Ordering::Equal => {
-                    write!(f, "{}", value)
+                    write!(f, "{}", d.bits())
                 }
                 Ordering::Greater => {
-                    let scalar_multiple = 10_i128.pow(*scale as u32);
+                    let scale = d.scale();
+                    let scalar_multiple = 10_i128.pow(scale as u32);
+                    let value = d.bits();
                     write!(f, "{}", value / scalar_multiple)?;
                     write!(f, ".")?;
                     write!(
                         f,
                         "{:0>scale$}",
                         value % scalar_multiple,
-                        scale = *scale as usize
+                        scale = scale as usize
                     )
                 }
                 Ordering::Less => {
-                    write!(f, "{}", value)?;
-                    for _ in 0..*scale {
+                    write!(f, "{}", d.bits())?;
+                    for _ in 0..d.scale() {
                         write!(f, "0")?;
                     }
                     Ok(())
@@ -220,6 +411,15 @@ impl Display for Scalar {
                     delim = ", ";
                 }
                 write!(f, ")")
+            }
+            Self::Map(data) => {
+                write!(f, "{{")?;
+                let mut delim = "";
+                for (key, val) in &data.pairs {
+                    write!(f, "{delim}{key}: {val}")?;
+                    delim = ", ";
+                }
+                write!(f, "}}")
             }
         }
     }
@@ -261,13 +461,14 @@ impl PartialOrd for Scalar {
             (Date(_), _) => None,
             (Binary(a), Binary(b)) => a.partial_cmp(b),
             (Binary(_), _) => None,
-            (Decimal(v1, p1, s1), Decimal(v2, p2, s2)) => (s1.eq(s2) && p1.eq(p2))
-                .then(|| v1.partial_cmp(v2))
+            (Decimal(d1), Decimal(d2)) => (d1.ty() == d2.ty())
+                .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
-            (Decimal(_, _, _), _) => None,
+            (Decimal(_), _) => None,
             (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
+            (Map(_), _) => None,  // TODO: Support Map?
         }
     }
 }
@@ -314,6 +515,12 @@ impl From<bool> for Scalar {
     }
 }
 
+impl From<DecimalData> for Scalar {
+    fn from(d: DecimalData) -> Self {
+        Self::Decimal(d)
+    }
+}
+
 impl From<&str> for Scalar {
     fn from(s: &str) -> Self {
         Self::String(s.into())
@@ -338,27 +545,19 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+// NOTE: We "cheat" and use the macro support trait `ToDataType`
+impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
+    fn from(t: Option<T>) -> Self {
+        match t {
+            Some(t) => t.into(),
+            None => Self::Null(T::to_data_type()),
+        }
+    }
+}
+
 // TODO: add more From impls
 
 impl PrimitiveType {
-    /// Check if the given precision and scale are valid for a decimal type.
-    pub fn check_decimal(precision: u8, scale: u8) -> DeltaResult<()> {
-        require!(
-            0 < precision && precision <= 38,
-            Error::invalid_decimal(format!(
-                "precision must in range 1..38 inclusive, found: {}.",
-                precision
-            ))
-        );
-        require!(
-            scale <= precision,
-            Error::invalid_decimal(format!(
-                "scale must be in range 0..precision inclusive, found: {scale}."
-            ))
-        );
-        Ok(())
-    }
-
     fn data_type(&self) -> DataType {
         DataType::Primitive(self.clone())
     }
@@ -374,7 +573,7 @@ impl PrimitiveType {
             String => Ok(Scalar::String(raw.to_string())),
             Binary => Ok(Scalar::Binary(raw.to_string().into_bytes())),
             Byte => self.parse_str_as_scalar(raw, Scalar::Byte),
-            Decimal(precision, scale) => self.parse_decimal(raw, *precision, *scale),
+            Decimal(dtype) => Self::parse_decimal(raw, *dtype),
             Short => self.parse_str_as_scalar(raw, Scalar::Short),
             Integer => self.parse_str_as_scalar(raw, Scalar::Integer),
             Long => self.parse_str_as_scalar(raw, Scalar::Long),
@@ -447,7 +646,7 @@ impl PrimitiveType {
         }
     }
 
-    fn parse_decimal(&self, raw: &str, precision: u8, expected_scale: u8) -> Result<Scalar, Error> {
+    fn parse_decimal(raw: &str, dtype: DecimalType) -> Result<Scalar, Error> {
         let (base, exp): (&str, i128) = match raw.find(['e', 'E']) {
             None => (raw, 0), // no 'e' or 'E', so there's no exponent
             Some(pos) => {
@@ -456,7 +655,8 @@ impl PrimitiveType {
                 (base, exp[1..].parse()?)
             }
         };
-        require!(!base.is_empty(), self.parse_error(raw));
+        let parse_error = || PrimitiveType::from(dtype).parse_error(raw);
+        require!(!base.is_empty(), parse_error());
 
         // now split on any '.' and parse
         let (int_part, frac_part, frac_digits) = match base.find('.') {
@@ -477,15 +677,13 @@ impl PrimitiveType {
         // we can assume this won't underflow since `frac_digits` is at minimum 0, and exp is at
         // most i128::MAX, and 0-i128::MAX doesn't underflow
         let scale = frac_digits - exp;
-        let scale: u8 = scale.try_into().map_err(|_| self.parse_error(raw))?;
-        require!(scale == expected_scale, self.parse_error(raw));
-        Self::check_decimal(precision, scale)?;
-
+        let scale: u8 = scale.try_into().map_err(|_| parse_error())?;
+        require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
             None => int_part.parse()?,
-            Some(frac_part) => format!("{}{}", int_part, frac_part).parse()?,
+            Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
         };
-        Ok(Scalar::Decimal(int, precision, scale))
+        Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
     }
 }
 
@@ -493,20 +691,27 @@ impl PrimitiveType {
 mod tests {
     use std::f32::consts::PI;
 
-    use crate::expressions::{column_expr, BinaryOperator};
-    use crate::Expression;
+    use crate::expressions::{column_expr, BinaryPredicateOp};
+    use crate::{Expression as Expr, Predicate as Pred};
 
     use super::*;
 
     #[test]
+    fn test_bad_decimal() {
+        let dtype = DecimalType::try_new(3, 0).unwrap();
+        DecimalData::try_new(123456789, dtype).expect_err("should have failed");
+        PrimitiveType::parse_decimal("0.12345", dtype).expect_err("should have failed");
+        PrimitiveType::parse_decimal("12345", dtype).expect_err("should have failed");
+    }
+    #[test]
     fn test_decimal_display() {
-        let s = Scalar::Decimal(123456789, 9, 2);
+        let s = Scalar::decimal(123456789, 9, 2).unwrap();
         assert_eq!(s.to_string(), "1234567.89");
 
-        let s = Scalar::Decimal(123456789, 9, 0);
+        let s = Scalar::decimal(123456789, 9, 0).unwrap();
         assert_eq!(s.to_string(), "123456789");
 
-        let s = Scalar::Decimal(123456789, 9, 9);
+        let s = Scalar::decimal(123456789, 9, 9).unwrap();
         assert_eq!(s.to_string(), "0.123456789");
     }
 
@@ -516,12 +721,12 @@ mod tests {
         expect_prec: u8,
         expect_scale: u8,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let s = PrimitiveType::Decimal(expect_prec, expect_scale);
+        let s = PrimitiveType::decimal(expect_prec, expect_scale)?;
         match s.parse_scalar(raw)? {
-            Scalar::Decimal(int, prec, scale) => {
-                assert_eq!(int, expect_int);
-                assert_eq!(prec, expect_prec);
-                assert_eq!(scale, expect_scale);
+            Scalar::Decimal(val) => {
+                assert_eq!(val.bits(), expect_int);
+                assert_eq!(val.precision(), expect_prec);
+                assert_eq!(val.scale(), expect_scale);
             }
             _ => panic!("Didn't parse as decimal"),
         };
@@ -529,7 +734,71 @@ mod tests {
     }
 
     #[test]
+    fn test_decimal_precision() {
+        // Test around 0, 1, 2, and 4 digit boundaries
+        assert_eq!(get_decimal_precision(0), 0);
+        assert_eq!(get_decimal_precision(1), 1);
+        assert_eq!(get_decimal_precision(9), 1);
+        assert_eq!(get_decimal_precision(10), 2);
+        assert_eq!(get_decimal_precision(99), 2);
+        assert_eq!(get_decimal_precision(100), 3);
+        assert_eq!(get_decimal_precision(999), 3);
+        assert_eq!(get_decimal_precision(1000), 4);
+        assert_eq!(get_decimal_precision(9999), 4);
+        assert_eq!(get_decimal_precision(10000), 5);
+
+        // Test around the 8 digit boundary
+        assert_eq!(get_decimal_precision(999_9999), 7);
+        assert_eq!(get_decimal_precision(1000_0000), 8);
+        assert_eq!(get_decimal_precision(9999_9999), 8);
+        assert_eq!(get_decimal_precision(1_0000_0000), 9);
+
+        // Test around the 16 digit boundary
+        assert_eq!(get_decimal_precision(999_9999_9999_9999), 15);
+        assert_eq!(get_decimal_precision(1000_0000_0000_0000), 16);
+        assert_eq!(get_decimal_precision(9999_9999_9999_9999), 16);
+        assert_eq!(get_decimal_precision(1_0000_0000_0000_0000), 17);
+
+        // Test around the 32 digit boundary
+        assert_eq!(
+            get_decimal_precision(999_9999_9999_9999_9999_9999_9999_9999),
+            31
+        );
+        assert_eq!(
+            get_decimal_precision(1000_0000_0000_0000_0000_0000_0000_0000),
+            32
+        );
+        assert_eq!(
+            get_decimal_precision(9999_9999_9999_9999_9999_9999_9999_9999),
+            32
+        );
+        assert_eq!(
+            get_decimal_precision(1_0000_0000_0000_0000_0000_0000_0000_0000),
+            33
+        );
+
+        // Test around the 38 digit boundary
+        assert_eq!(
+            get_decimal_precision(9_9999_9999_9999_9999_9999_9999_9999_9999_9999),
+            37
+        );
+        assert_eq!(
+            get_decimal_precision(10_0000_0000_0000_0000_0000_0000_0000_0000_0000),
+            38
+        );
+        assert_eq!(
+            get_decimal_precision(99_9999_9999_9999_9999_9999_9999_9999_9999_9999),
+            38
+        );
+        assert_eq!(
+            get_decimal_precision(100_0000_0000_0000_0000_0000_0000_0000_0000_0000),
+            39
+        );
+    }
+
+    #[test]
     fn test_parse_decimal() -> Result<(), Box<dyn std::error::Error>> {
+        assert_decimal("0.999", 999, 3, 3)?;
         assert_decimal("0", 0, 1, 0)?;
         assert_decimal("0.00", 0, 3, 2)?;
         assert_decimal("123", 123, 3, 0)?;
@@ -546,25 +815,26 @@ mod tests {
     }
 
     fn expect_fail_parse(raw: &str, prec: u8, scale: u8) {
-        let s = PrimitiveType::Decimal(prec, scale);
+        let s = PrimitiveType::decimal(prec, scale).unwrap();
         let res = s.parse_scalar(raw);
         assert!(res.is_err(), "Fail on {raw}");
     }
 
     #[test]
     fn test_parse_decimal_expect_fail() {
-        expect_fail_parse("iowjef", 0, 0);
-        expect_fail_parse("123Ef", 0, 0);
-        expect_fail_parse("1d2E3", 0, 0);
-        expect_fail_parse("a", 0, 0);
+        expect_fail_parse("1.000", 3, 3);
+        expect_fail_parse("iowjef", 1, 0);
+        expect_fail_parse("123Ef", 1, 0);
+        expect_fail_parse("1d2E3", 1, 0);
+        expect_fail_parse("a", 1, 0);
         expect_fail_parse("2.a", 1, 1);
-        expect_fail_parse("E45", 0, 0);
-        expect_fail_parse("1.2.3", 0, 0);
-        expect_fail_parse("1.2E1.3", 0, 0);
+        expect_fail_parse("E45", 1, 0);
+        expect_fail_parse("1.2.3", 1, 0);
+        expect_fail_parse("1.2E1.3", 1, 0);
         expect_fail_parse("123.45", 5, 1);
         expect_fail_parse(".45", 5, 1);
-        expect_fail_parse("+", 0, 0);
-        expect_fail_parse("-", 0, 0);
+        expect_fail_parse("+", 1, 0);
+        expect_fail_parse("-", 1, 0);
         expect_fail_parse("0.-0", 2, 1);
         expect_fail_parse("--1.0", 1, 1);
         expect_fail_parse("+-1.0", 1, 1);
@@ -572,9 +842,9 @@ mod tests {
         expect_fail_parse("++1.0", 1, 1);
         expect_fail_parse("1.0E1+", 1, 1);
         // overflow i8 for `scale`
-        expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 0, 0);
+        expect_fail_parse("0.999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999", 1, 0);
         // scale will be too small to fit in i8
-        expect_fail_parse("0.E170141183460469231731687303715884105727", 0, 0);
+        expect_fail_parse("0.E170141183460469231731687303715884105727", 1, 0);
     }
 
     #[test]
@@ -586,14 +856,65 @@ mod tests {
         });
 
         let column = column_expr!("item");
-        let array_op = Expression::binary(BinaryOperator::In, 10, array.clone());
-        let array_not_op = Expression::binary(BinaryOperator::NotIn, 10, array);
-        let column_op = Expression::binary(BinaryOperator::In, PI, column.clone());
-        let column_not_op = Expression::binary(BinaryOperator::NotIn, "Cool", column);
-        assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
-        assert_eq!(&format!("{}", array_not_op), "10 NOT IN (1, 2, 3)");
-        assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
-        assert_eq!(&format!("{}", column_not_op), "'Cool' NOT IN Column(item)");
+        let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
+        let array_not_op = Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal(10),
+            array,
+        ));
+        let column_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(PI), column.clone());
+        let column_not_op = Pred::not(Pred::binary(
+            BinaryPredicateOp::In,
+            Expr::literal("Cool"),
+            column,
+        ));
+        assert_eq!(&format!("{array_op}"), "10 IN (1, 2, 3)");
+        assert_eq!(&format!("{array_not_op}"), "NOT(10 IN (1, 2, 3))");
+        assert_eq!(&format!("{column_op}"), "3.1415927 IN Column(item)");
+        assert_eq!(&format!("{column_not_op}"), "NOT('Cool' IN Column(item))");
+    }
+
+    #[test]
+    fn test_invalid_array() {
+        assert!(ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, false),
+            [Scalar::Integer(1), Scalar::String("s".to_string())],
+        )
+        .is_err());
+
+        assert!(
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_invalid_map() {
+        // incorrect schema
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::INTEGER, false),
+            [(Scalar::Integer(1), Scalar::String("s".to_string())),],
+        )
+        .is_err());
+
+        // key must be non-null
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            [(
+                Scalar::Null(DataType::STRING),  // key
+                Scalar::String("s".to_string())  // val
+            ),],
+        )
+        .is_err());
+
+        // val must be non-null if we have value_contains_null = false
+        assert!(MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            [(
+                Scalar::String("s".to_string()), // key
+                Scalar::Null(DataType::STRING)   // val
+            ),],
+        )
+        .is_err());
     }
 
     #[test]

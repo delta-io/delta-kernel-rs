@@ -1,58 +1,58 @@
-//! A simple, single threaded, [`Engine`] that can only read from the local filesystem
+//! A simple, single threaded, test-only [`Engine`] that can only read from the local filesystem
 
-use super::arrow_expression::ArrowExpressionHandler;
+use super::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{
-    DeltaResult, Engine, Error, ExpressionHandler, ExpressionRef, FileDataReadResultIterator,
-    FileMeta, FileSystemClient, JsonHandler, ParquetHandler, SchemaRef,
+    DeltaResult, Engine, Error, EvaluationHandler, FileDataReadResultIterator, FileMeta,
+    JsonHandler, ParquetHandler, PredicateRef, SchemaRef, StorageHandler,
 };
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use itertools::Itertools;
 use std::fs::File;
 use std::sync::Arc;
 use tracing::debug;
 
-mod fs_client;
 pub(crate) mod json;
 mod parquet;
+mod storage;
 
-/// This is a simple implementation of [`Engine`]. It only supports reading data from the local
-/// filesystem, and internally represents data using `Arrow`.
-pub struct SyncEngine {
-    fs_client: Arc<fs_client::SyncFilesystemClient>,
+/// This is a simple (test-only) implementation of [`Engine`]. It only supports reading data from
+/// the local filesystem, and internally represents data using `Arrow`.
+pub(crate) struct SyncEngine {
+    storage_handler: Arc<storage::SyncStorageHandler>,
     json_handler: Arc<json::SyncJsonHandler>,
     parquet_handler: Arc<parquet::SyncParquetHandler>,
-    expression_handler: Arc<ArrowExpressionHandler>,
+    evaluation_handler: Arc<ArrowEvaluationHandler>,
 }
 
 impl SyncEngine {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         SyncEngine {
-            fs_client: Arc::new(fs_client::SyncFilesystemClient {}),
+            storage_handler: Arc::new(storage::SyncStorageHandler {}),
             json_handler: Arc::new(json::SyncJsonHandler {}),
             parquet_handler: Arc::new(parquet::SyncParquetHandler {}),
-            expression_handler: Arc::new(ArrowExpressionHandler {}),
+            evaluation_handler: Arc::new(ArrowEvaluationHandler {}),
         }
     }
 }
 
 impl Engine for SyncEngine {
-    fn get_expression_handler(&self) -> Arc<dyn ExpressionHandler> {
-        self.expression_handler.clone()
+    fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+        self.evaluation_handler.clone()
     }
 
-    fn get_file_system_client(&self) -> Arc<dyn FileSystemClient> {
-        self.fs_client.clone()
+    fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+        self.storage_handler.clone()
     }
 
     /// Get the connector provided [`ParquetHandler`].
-    fn get_parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+    fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet_handler.clone()
     }
 
-    fn get_json_handler(&self) -> Arc<dyn JsonHandler> {
+    fn json_handler(&self) -> Arc<dyn JsonHandler> {
         self.json_handler.clone()
     }
 }
@@ -60,12 +60,12 @@ impl Engine for SyncEngine {
 fn read_files<F, I>(
     files: &[FileMeta],
     schema: SchemaRef,
-    predicate: Option<ExpressionRef>,
+    predicate: Option<PredicateRef>,
     mut try_create_from_file: F,
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<ExpressionRef>) -> DeltaResult<I>
+    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>) -> DeltaResult<I>
         + Send
         + 'static,
 {
@@ -73,7 +73,7 @@ where
     if files.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
-    let arrow_schema = Arc::new(ArrowSchema::try_from(&*schema)?);
+    let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let files = files.to_vec();
     let result = files
         .into_iter()

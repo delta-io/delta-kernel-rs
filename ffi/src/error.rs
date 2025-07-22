@@ -4,22 +4,23 @@ use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
 #[repr(C)]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+    #[cfg(feature = "default-engine-base")]
     ArrowError,
     EngineDataTypeError,
     ExtractError,
     GenericError,
     IOErrorError,
-    #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+    #[cfg(feature = "default-engine-base")]
     ParquetError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ObjectStoreError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ObjectStorePathError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ReqwestError,
     FileNotFoundError,
     MissingColumnError,
@@ -53,26 +54,29 @@ pub enum KernelError {
     ChangeDataFeedIncompatibleSchema,
     InvalidCheckpoint,
     LiteralExpressionTransformError,
+    CheckpointWriteError,
+    SchemaError,
 }
 
 impl From<Error> for KernelError {
     fn from(e: Error) -> Self {
         match e {
             // NOTE: By definition, no kernel Error maps to FFIError
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+            #[cfg(feature = "default-engine-base")]
             Error::Arrow(_) => KernelError::ArrowError,
+            Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
             Error::Extract(..) => KernelError::ExtractError,
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
-            #[cfg(any(feature = "default-engine", feature = "sync-engine"))]
+            #[cfg(feature = "default-engine-base")]
             Error::Parquet(_) => KernelError::ParquetError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::Reqwest(_) => KernelError::ReqwestError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
@@ -114,6 +118,8 @@ impl From<Error> for KernelError {
             Error::LiteralExpressionTransformError(_) => {
                 KernelError::LiteralExpressionTransformError
             }
+            Error::Schema(_) => KernelError::SchemaError,
+            _ => KernelError::UnknownError,
         }
     }
 }
@@ -178,7 +184,9 @@ impl AllocateError for AllocateErrorFn {
     }
 }
 
-impl AllocateError for &dyn ExternEngine {
+// We do this instead of `impl AllocateError for &dyn ExternEngine` since we can then directly use
+// this trait on type T instead of having to cast it to a trait object first.
+impl<T: ExternEngine + ?Sized> AllocateError for &T {
     /// # Safety
     ///
     /// In addition to the usual requirements, the engine handle must be valid.
@@ -206,7 +214,7 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
                 ExternResult::Err(err)
             }

@@ -1,86 +1,113 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
-use std::any::type_name;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::schemas::GetStructField;
-use crate::schema::{SchemaRef, StructType};
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
-    ReaderFeatures, WriterFeatures, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
+    ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
-use delta_kernel_derive::Schema;
+use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 pub mod deletion_vector;
 pub mod set_transaction;
 
-pub(crate) mod schemas;
-#[cfg(feature = "developer-visibility")]
+pub(crate) mod crc;
+pub(crate) mod domain_metadata;
+
+// see comment in ../lib.rs for the path module for why we include this way
+#[cfg(feature = "internal-api")]
 pub mod visitors;
-#[cfg(not(feature = "developer-visibility"))]
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod visitors;
 
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const ADD_NAME: &str = "add";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const REMOVE_NAME: &str = "remove";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const METADATA_NAME: &str = "metaData";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const PROTOCOL_NAME: &str = "protocol";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const SET_TRANSACTION_NAME: &str = "txn";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const COMMIT_INFO_NAME: &str = "commitInfo";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const CDC_NAME: &str = "cdc";
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) const SIDECAR_NAME: &str = "sidecar";
+#[internal_api]
+pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
+#[internal_api]
+pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| StructType::new([Option::<Add>::get_struct_field(ADD_NAME)]).into());
+pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
+
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        ADD_NAME,
+        Add::to_schema(),
+    )]))
+});
 
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([
-        Option::<Add>::get_struct_field(ADD_NAME),
-        Option::<Remove>::get_struct_field(REMOVE_NAME),
-        Option::<Metadata>::get_struct_field(METADATA_NAME),
-        Option::<Protocol>::get_struct_field(PROTOCOL_NAME),
-        Option::<SetTransaction>::get_struct_field(SET_TRANSACTION_NAME),
-        Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME),
-        Option::<Cdc>::get_struct_field(CDC_NAME),
-        Option::<Sidecar>::get_struct_field(SIDECAR_NAME),
-        // We don't support the following actions yet
-        //Option::<DomainMetadata>::get_struct_field(DOMAIN_METADATA_NAME),
-    ])
-    .into()
+    Arc::new(StructType::new([
+        StructField::nullable(ADD_NAME, Add::to_schema()),
+        StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+        StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+        StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+        StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
+        StructField::nullable(CDC_NAME, Cdc::to_schema()),
+        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
+        StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+    ]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([Option::<CommitInfo>::get_struct_field(COMMIT_INFO_NAME)]).into()
+    Arc::new(StructType::new([StructField::nullable(
+        COMMIT_INFO_NAME,
+        CommitInfo::to_schema(),
+    )]))
 });
 
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-fn get_log_schema() -> &'static SchemaRef {
+static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        SET_TRANSACTION_NAME,
+        SetTransaction::to_schema(),
+    )]))
+});
+
+static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        DOMAIN_METADATA_NAME,
+        DomainMetadata::to_schema(),
+    )]))
+});
+
+#[internal_api]
+pub(crate) fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
 }
 
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(not(feature = "developer-visibility"), visibility::make(pub(crate)))]
-fn get_log_add_schema() -> &'static SchemaRef {
+#[internal_api]
+pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
     &LOG_ADD_SCHEMA
 }
 
@@ -88,9 +115,21 @@ pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
     &LOG_COMMIT_INFO_SCHEMA
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
+pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
+    &LOG_TXN_SCHEMA
+}
+
+pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
+    &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[internal_api]
 pub(crate) struct Format {
     /// Name of the encoding for files in this table
     pub(crate) provider: String,
@@ -107,9 +146,13 @@ impl Default for Format {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(test, derive(Serialize), serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
+#[cfg_attr(
+    any(test, feature = "internal-api"),
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
+#[internal_api]
 pub(crate) struct Metadata {
     /// Unique identifier for this table
     pub(crate) id: String,
@@ -130,23 +173,49 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
+    // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn created_time(&self) -> Option<i64> {
+        self.created_time
+    }
+
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
         Ok(visitor.metadata)
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn configuration(&self) -> &HashMap<String, String> {
         &self.configuration
     }
 
+    #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
 
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
         &self.partition_columns
@@ -155,14 +224,15 @@ impl Metadata {
     /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.
     /// Note that parsing is infallible -- any items that fail to parse are simply propagated
     /// through to the `TableProperties.unknown_properties` field.
+    #[internal_api]
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Schema, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
 // try_new function.
 pub(crate) struct Protocol {
@@ -175,11 +245,26 @@ pub(crate) struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) reader_features: Option<Vec<String>>,
+    reader_features: Option<Vec<ReaderFeature>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) writer_features: Option<Vec<String>>,
+    writer_features: Option<Vec<WriterFeature>>,
+}
+
+fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
+where
+    T: FromStr,
+    T::Err: Debug,
+{
+    features
+        .map(|fs| {
+            fs.into_iter()
+                .map(|f| T::from_str(&f.to_string()))
+                .collect()
+        })
+        .transpose()
+        .expect("Parsing FromStr should never fail with strum 'default'")
 }
 
 impl Protocol {
@@ -188,8 +273,8 @@ impl Protocol {
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,
-        reader_features: Option<impl IntoIterator<Item = impl Into<String>>>,
-        writer_features: Option<impl IntoIterator<Item = impl Into<String>>>,
+        reader_features: Option<impl IntoIterator<Item = impl ToString>>,
+        writer_features: Option<impl IntoIterator<Item = impl ToString>>,
     ) -> DeltaResult<Self> {
         if min_reader_version == 3 {
             require!(
@@ -207,8 +292,10 @@ impl Protocol {
                 )
             );
         }
-        let reader_features = reader_features.map(|f| f.into_iter().map(Into::into).collect());
-        let writer_features = writer_features.map(|f| f.into_iter().map(Into::into).collect());
+
+        let reader_features = parse_features(reader_features);
+        let writer_features = parse_features(writer_features);
+
         Ok(Protocol {
             min_reader_version,
             min_writer_version,
@@ -226,37 +313,39 @@ impl Protocol {
     }
 
     /// This protocol's minimum reader version
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn min_reader_version(&self) -> i32 {
         self.min_reader_version
     }
 
     /// This protocol's minimum writer version
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn min_writer_version(&self) -> i32 {
         self.min_writer_version
     }
 
     /// Get the reader features for the protocol
-    pub(crate) fn reader_features(&self) -> Option<&[String]> {
+    #[internal_api]
+    pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
-    pub(crate) fn writer_features(&self) -> Option<&[String]> {
+    #[internal_api]
+    pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
-    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeatures) -> bool {
+    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
         self.reader_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// True if this protocol has the requested writer feature
-    pub(crate) fn has_writer_feature(&self, feature: &WriterFeatures) -> bool {
+    pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
         self.writer_features()
-            .is_some_and(|features| features.iter().any(|f| f == feature.as_ref()))
+            .is_some_and(|features| features.contains(feature))
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -318,46 +407,45 @@ impl Protocol {
     }
 }
 
-// given unparsed `table_features`, parse and check if they are subset of `supported_features`
+// given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
-    table_features: &[String],
-    supported_features: &HashSet<T>,
+    table_features: &[T],
+    supported_features: &[T],
 ) -> DeltaResult<()>
 where
+    T: Display + FromStr + Hash + Eq,
     <T as FromStr>::Err: Display,
-    T: Debug + FromStr + Hash + Eq,
 {
-    let error = |unsupported, unsupported_or_unknown| {
-        let supported = supported_features.iter().collect::<Vec<_>>();
-        let features_type = type_name::<T>()
-            .rsplit("::")
-            .next()
-            .unwrap_or("table features");
-        Error::Unsupported(format!(
-            "{} {} {:?}. Supported {} are {:?}",
-            unsupported_or_unknown, features_type, unsupported, features_type, supported
-        ))
-    };
-    let parsed_features: HashSet<T> = table_features
+    // first check if all features are supported, else we proceed to craft an error message
+    if table_features
         .iter()
-        .map(|s| T::from_str(s).map_err(|_| error(vec![s.to_string()], "Unknown")))
-        .collect::<Result<_, Error>>()?;
+        .all(|feature| supported_features.contains(feature))
+    {
+        return Ok(());
+    }
 
-    // check that parsed features are a subset of supported features
-    parsed_features
-        .is_subset(supported_features)
-        .then_some(())
-        .ok_or_else(|| {
-            let unsupported = parsed_features
-                .difference(supported_features)
-                .map(|f| format!("{:?}", f))
-                .collect::<Vec<_>>();
-            error(unsupported, "Unsupported")
-        })
+    // we get the type name (ReaderFeature/WriterFeature) for better error messages
+    let features_type = std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or("table feature");
+
+    // NB: we didn't do this above to avoid allocation in the common case
+    let mut unsupported = table_features
+        .iter()
+        .filter(|feature| !supported_features.contains(*feature));
+
+    Err(Error::Unsupported(format!(
+        "Unknown {}s: \"{}\". Supported {}s: \"{}\"",
+        features_type,
+        unsupported.join("\", \""),
+        features_type,
+        supported_features.iter().join("\", \""),
+    )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
     /// The time this logical file was created, as milliseconds since the epoch.
@@ -384,9 +472,9 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_commit_info: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
@@ -397,9 +485,12 @@ pub(crate) struct Add {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
-    /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
-    #[drop_null_container_values]
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     pub(crate) partition_values: HashMap<String, String>,
 
     /// The size of this data file in bytes
@@ -442,15 +533,15 @@ pub(crate) struct Add {
 }
 
 impl Add {
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Remove {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -499,8 +590,8 @@ pub(crate) struct Remove {
     pub(crate) default_row_commit_version: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct Cdc {
     /// A relative path to a change data file from the root of the table or an absolute path to a
@@ -512,9 +603,12 @@ pub(crate) struct Cdc {
 
     /// A map from partition column to value for this logical file. This map can contain null in the
     /// values meaning a partition is null. We drop those values from this map, due to the
-    /// `drop_null_container_values` annotation. This means an engine can assume that if a partition
-    /// is found in [`Metadata`] `partition_columns`, but not in this map, its value is null.
-    #[drop_null_container_values]
+    /// `allow_null_container_values` annotation allowing them and because [`materialize`] drops
+    /// null values. This means an engine can assume that if a partition is found in
+    /// [`Metadata::partition_columns`] but not in this map, its value is null.
+    ///
+    /// [`materialize`]: crate::engine_data::EngineMap::materialize
+    #[allow_null_container_values]
     pub partition_values: HashMap<String, String>,
 
     /// The size of this cdc file in bytes
@@ -531,8 +625,8 @@ pub(crate) struct Cdc {
     pub tags: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Schema)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[internal_api]
 pub(crate) struct SetTransaction {
     /// A unique identifier for the application performing the transaction.
     pub(crate) app_id: String,
@@ -544,12 +638,22 @@ pub(crate) struct SetTransaction {
     pub(crate) last_updated: Option<i64>,
 }
 
+impl SetTransaction {
+    pub(crate) fn new(app_id: String, version: i64, last_updated: Option<i64>) -> Self {
+        Self {
+            app_id,
+            version,
+            last_updated,
+        }
+    }
+}
+
 /// The sidecar action references a sidecar file which provides some of the checkpoint's
 /// file actions. This action is only allowed in checkpoints following the V2 spec.
 ///
 /// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#sidecar-file-information
-#[derive(Schema, Debug, PartialEq)]
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+#[derive(ToSchema, Debug, PartialEq)]
+#[internal_api]
 pub(crate) struct Sidecar {
     /// A path to a sidecar file that can be either:
     /// - A relative path (just the file name) within the `_delta_log/_sidecars` directory.
@@ -586,6 +690,48 @@ impl Sidecar {
                 ))
             })?,
         })
+    }
+}
+
+/// The CheckpointMetadata action describes details about a checkpoint following the V2 specification.
+///
+/// [More info]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#checkpoint-metadata
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+pub(crate) struct CheckpointMetadata {
+    /// The version of the V2 spec checkpoint.
+    ///
+    /// Currently using `i64` for compatibility with other actions' representations.
+    /// Future work will address converting numeric fields to unsigned types (e.g., `u64`) where
+    /// semantically appropriate (e.g., for version, size, timestamps, etc.).
+    /// See issue #786 for tracking progress.
+    pub(crate) version: i64,
+
+    /// Map containing any additional metadata about the V2 spec checkpoint.
+    pub(crate) tags: Option<HashMap<String, String>>,
+}
+
+/// The [DomainMetadata] action contains a configuration (string) for a named metadata domain. Two
+/// overlapping transactions conflict if they both contain a domain metadata action for the same
+/// metadata domain.
+///
+/// Note that the `delta.*` domain is reserved for internal use.
+///
+/// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+pub(crate) struct DomainMetadata {
+    domain: String,
+    configuration: String,
+    removed: bool,
+}
+
+impl DomainMetadata {
+    // returns true if the domain metadata is an system-controlled domain (all domains that start
+    // with "delta.")
+    #[allow(unused)]
+    fn is_internal(&self) -> bool {
+        self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
     }
 }
 
@@ -750,6 +896,21 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&[CHECKPOINT_METADATA_NAME])
+            .expect("Couldn't get checkpointMetadata field");
+        let expected = Arc::new(StructType::new([StructField::nullable(
+            "checkpointMetadata",
+            StructType::new([
+                StructField::not_null("version", DataType::LONG),
+                tags_field(),
+            ]),
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
     fn test_transaction_schema() {
         let schema = get_log_schema()
             .project(&["txn"])
@@ -787,6 +948,22 @@ mod tests {
                     "engineCommitInfo",
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
+            ]),
+        )]));
+        assert_eq!(schema, expected);
+    }
+
+    #[test]
+    fn test_domain_metadata_schema() {
+        let schema = get_log_schema()
+            .project(&[DOMAIN_METADATA_NAME])
+            .expect("Couldn't get domainMetadata field");
+        let expected = Arc::new(StructType::new([StructField::nullable(
+            "domainMetadata",
+            StructType::new([
+                StructField::not_null("domain", DataType::STRING),
+                StructField::not_null("configuration", DataType::STRING),
+                StructField::not_null("removed", DataType::BOOLEAN),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -838,8 +1015,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -847,8 +1024,8 @@ mod tests {
         let protocol = Protocol::try_new(
             4,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_err());
@@ -868,7 +1045,7 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
             Some(&empty_features),
         )
         .unwrap();
@@ -878,7 +1055,7 @@ mod tests {
             3,
             7,
             Some(&empty_features),
-            Some([WriterFeatures::V2Checkpoint]),
+            Some([WriterFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -886,8 +1063,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::V2Checkpoint]),
-            Some([WriterFeatures::V2Checkpoint]),
+            Some([ReaderFeature::V2Checkpoint]),
+            Some([WriterFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -916,9 +1093,9 @@ mod tests {
             7,
             Some::<Vec<String>>(vec![]),
             Some(vec![
-                WriterFeatures::AppendOnly,
-                WriterFeatures::DeletionVectors,
-                WriterFeatures::Invariants,
+                WriterFeature::AppendOnly,
+                WriterFeature::DeletionVectors,
+                WriterFeature::Invariants,
             ]),
         )
         .unwrap();
@@ -927,8 +1104,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::RowTracking]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::RowTracking]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_err());
@@ -936,26 +1113,109 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features = [
-            ReaderFeatures::ColumnMapping,
-            ReaderFeatures::DeletionVectors,
-        ]
-        .into_iter()
-        .collect();
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string()];
+        let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors];
+        let table_features = vec![ReaderFeature::ColumnMapping];
         ensure_supported_features(&table_features, &supported_features).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeatures::ColumnMapping.to_string(), "idk".to_string()];
+        let table_features = vec![ReaderFeature::ColumnMapping, ReaderFeature::unknown("idk")];
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [ColumnMapping, DeletionVectors]"
+                "Unknown ReaderFeatures: \"idk\". Supported ReaderFeatures: \"columnMapping\", \"deletionVectors\""
             => {},
-            Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures [\"idk\"]. Supported ReaderFeatures are [DeletionVectors, ColumnMapping]"
-            => {},
-            _ => panic!("Expected unsupported error"),
+            _ => panic!("Expected unsupported error, got: {error}"),
         }
+    }
+
+    #[test]
+    fn test_parse_table_feature_never_fails() {
+        // parse a non-str
+        let features = Some([5]);
+        let expected = Some(vec![ReaderFeature::unknown("5")]);
+        assert_eq!(parse_features::<ReaderFeature>(features), expected);
+
+        // weird strs
+        let features = Some(["", "absurD_)(+13%^⚙️"]);
+        let expected = Some(vec![
+            ReaderFeature::unknown(""),
+            ReaderFeature::unknown("absurD_)(+13%^⚙️"),
+        ]);
+        assert_eq!(parse_features::<ReaderFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_into_engine_data() {
+        use crate::arrow::array::{Int64Array, StringArray};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use crate::arrow::record_batch::RecordBatch;
+
+        use crate::engine::arrow_data::ArrowEngineData;
+        use crate::engine::arrow_expression::ArrowEvaluationHandler;
+        use crate::IntoEngineData;
+        use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
+
+        // duplicated
+        struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+        impl ExprEngine {
+            fn new() -> Self {
+                ExprEngine(Arc::new(ArrowEvaluationHandler))
+            }
+        }
+
+        impl Engine for ExprEngine {
+            fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+                self.0.clone()
+            }
+
+            fn json_handler(&self) -> Arc<dyn JsonHandler> {
+                unimplemented!()
+            }
+
+            fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+                unimplemented!()
+            }
+
+            fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+                unimplemented!()
+            }
+        }
+
+        let engine = ExprEngine::new();
+
+        let set_transaction = SetTransaction {
+            app_id: "app_id".to_string(),
+            version: 0,
+            last_updated: None,
+        };
+
+        let engine_data =
+            set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
+
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("appId", ArrowDataType::Utf8, false),
+            Field::new("version", ArrowDataType::Int64, false),
+            Field::new("lastUpdated", ArrowDataType::Int64, true),
+        ]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["app_id"])),
+                Arc::new(Int64Array::from(vec![0_i64])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
     }
 }

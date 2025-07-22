@@ -1,19 +1,18 @@
 use super::table_changes_action_iter;
-use super::TableChangesScanData;
+use super::TableChangesScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
-use crate::expressions::Scalar;
-use crate::expressions::{column_expr, BinaryOperator};
+use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
-use crate::table_features::ReaderFeatures;
+use crate::table_features::ReaderFeature;
 use crate::utils::test_utils::{Action, LocalMockTable};
-use crate::Expression;
+use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
 
 use itertools::Itertools;
@@ -37,7 +36,7 @@ fn get_segment(
     let table_root = url::Url::from_directory_path(path).unwrap();
     let log_root = table_root.join("_delta_log/")?;
     let log_segment = LogSegment::for_table_changes(
-        engine.get_file_system_client().as_ref(),
+        engine.storage_handler().as_ref(),
         log_root,
         start_version,
         end_version,
@@ -45,8 +44,8 @@ fn get_segment(
     Ok(log_segment.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanData>>) -> Vec<bool> {
-    iter.map_ok(|scan_data| scan_data.selection_vector.into_iter())
+fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>) -> Vec<bool> {
+    iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
         .flatten_ok()
         .try_collect()
         .unwrap()
@@ -75,8 +74,8 @@ async fn metadata_protocol() {
                 Protocol::try_new(
                     3,
                     7,
-                    Some([ReaderFeatures::DeletionVectors]),
-                    Some([ReaderFeatures::ColumnMapping]),
+                    Some([ReaderFeature::DeletionVectors]),
+                    Some([ReaderFeature::ColumnMapping]),
                 )
                 .unwrap(),
             ),
@@ -129,10 +128,7 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([
-                    ReaderFeatures::DeletionVectors,
-                    ReaderFeatures::ColumnMapping,
-                ]),
+                Some([ReaderFeature::DeletionVectors, ReaderFeature::ColumnMapping]),
                 Some([""; 0]),
             )
             .unwrap(),
@@ -297,10 +293,10 @@ async fn add_remove() {
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, HashMap::new().into());
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -347,10 +343,10 @@ async fn filter_data_change() {
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, HashMap::new().into());
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -393,10 +389,10 @@ async fn cdc_selection() {
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, HashMap::new().into());
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -459,10 +455,10 @@ async fn dv() {
     .into();
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            assert_eq!(scan_data.remove_dvs, expected_remove_dvs);
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            assert_eq!(scan_metadata.remove_dvs, expected_remove_dvs);
+            scan_metadata.selection_vector
         })
         .collect_vec();
 
@@ -520,15 +516,15 @@ async fn data_skipping_filter() {
         .await;
 
     // Look for actions with id > 4
-    let predicate = Expression::binary(
-        BinaryOperator::GreaterThan,
+    let predicate = Predicate::binary(
+        BinaryPredicateOp::GreaterThan,
         column_expr!("id"),
         Scalar::from(4),
     );
     let logical_schema = get_schema();
     let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
         Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
-        other => panic!("Unexpected result: {:?}", other),
+        other => panic!("Unexpected result: {other:?}"),
     };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
@@ -536,9 +532,9 @@ async fn data_skipping_filter() {
 
     let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
         .unwrap()
-        .flat_map(|scan_data| {
-            let scan_data = scan_data.unwrap();
-            scan_data.selection_vector
+        .flat_map(|scan_metadata| {
+            let scan_metadata = scan_metadata.unwrap();
+            scan_metadata.selection_vector
         })
         .collect_vec();
 

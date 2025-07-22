@@ -85,7 +85,7 @@ pub type TracingEventFn = extern "C" fn(event: Event);
 /// Returns `true` if the callback was setup successfully, false on failure (i.e. if called a second
 /// time)
 ///
-/// [`event`] based tracing gives an engine maximal flexibility in formatting event log
+/// Event-based tracing gives an engine maximal flexibility in formatting event log
 /// lines. Kernel can also format events for the engine. If this is desired call
 /// [`enable_log_line_tracing`] instead of this method.
 ///
@@ -230,7 +230,7 @@ struct MessageFieldVisitor {
 impl Visit for MessageFieldVisitor {
     fn record_debug(&mut self, field: &TracingField, value: &dyn fmt::Debug) {
         if field.name() == "message" {
-            self.message = Some(format!("{:?}", value));
+            self.message = Some(format!("{value:?}"));
         }
     }
 
@@ -327,7 +327,7 @@ impl io::Write for BufferedMessageWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.current_buffer
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Could not lock buffer"))?
+            .map_err(|_| io::Error::other("Could not lock buffer"))?
             .extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -577,7 +577,7 @@ mod tests {
 
         // file path will use \ on windows
         use std::path::MAIN_SEPARATOR;
-        let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
+        let expected_file = format!("ffi{MAIN_SEPARATOR}src{MAIN_SEPARATOR}ffi_tracing.rs");
 
         let ok = event.level == Level::INFO
             && target == "delta_kernel_ffi::ffi_tracing::tests"

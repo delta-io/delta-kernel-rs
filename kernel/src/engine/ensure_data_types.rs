@@ -8,6 +8,7 @@ use std::{
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
+use super::arrow_conversion::TryIntoArrow as _;
 use crate::{
     engine::arrow_utils::make_arrow_error,
     schema::{DataType, MetadataValue, StructField},
@@ -62,7 +63,10 @@ impl EnsureDataTypes {
     ) -> DeltaResult<DataTypeCompat> {
         match (kernel_type, arrow_type) {
             (DataType::Primitive(_), _) if arrow_type.is_primitive() => {
-                check_cast_compat(kernel_type.try_into()?, arrow_type)
+                check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
+            }
+            (&DataType::Variant(_), _) => {
+                check_cast_compat(kernel_type.try_into_arrow()?, arrow_type)
             }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
@@ -120,15 +124,13 @@ impl EnsureDataTypes {
                         .take(5)
                         .join(", ");
                     make_arrow_error(format!(
-                        "Missing Struct fields {} (Up to five missing fields shown)",
-                        missing_field_names
+                        "Missing Struct fields {missing_field_names} (Up to five missing fields shown)"
                     ))
                 });
                 Ok(DataTypeCompat::Nested)
             }
             _ => Err(make_arrow_error(format!(
-                "Incorrect datatype. Expected {}, got {}",
-                kernel_type, arrow_type
+                "Incorrect datatype. Expected {kernel_type}, got {arrow_type}"
             ))),
         }
     }
@@ -143,8 +145,7 @@ impl EnsureDataTypes {
             && kernel_field_is_nullable != arrow_field_is_nullable
         {
             Err(Error::Generic(format!(
-                "{desc} has nullablily {} in kernel and {} in arrow",
-                kernel_field_is_nullable, arrow_field_is_nullable,
+                "{desc} has nullablily {kernel_field_is_nullable} in kernel and {arrow_field_is_nullable} in arrow",
             )))
         } else {
             Ok(())
@@ -199,8 +200,7 @@ fn check_cast_compat(
         }
         (Date32, Timestamp(_, None)) => Ok(DataTypeCompat::NeedsCast(target_type)),
         _ => Err(make_arrow_error(format!(
-            "Incorrect datatype. Expected {}, got {}",
-            target_type, source_type
+            "Incorrect datatype. Expected {target_type}, got {source_type}"
         ))),
     }
 }
@@ -258,10 +258,12 @@ fn metadata_eq(
 mod tests {
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
-    use crate::{
-        engine::ensure_data_types::ensure_data_types,
-        schema::{ArrayType, DataType, MapType, StructField},
-    };
+    use crate::engine::arrow_conversion::TryFromKernel as _;
+    use crate::engine::arrow_data::unshredded_variant_arrow_type;
+    use crate::schema::variant_utils::unshredded_variant_schema;
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
+
+    use super::*;
 
     #[test]
     fn accepts_safe_decimal_casts() {
@@ -318,6 +320,29 @@ mod tests {
         assert!(!can_upcast_to_decimal(&Int32, 10u8, 1i8));
         assert!(!can_upcast_to_decimal(&Int64, 19u8, 0i8));
         assert!(!can_upcast_to_decimal(&Int64, 20u8, 1i8));
+    }
+
+    #[test]
+    fn ensure_variants() {
+        fn incorrect_variant_arrow_type() -> ArrowDataType {
+            let metadata_field = ArrowField::new("field_1", ArrowDataType::Binary, true);
+            let value_field = ArrowField::new("field_2", ArrowDataType::Binary, true);
+            let fields = vec![metadata_field, value_field];
+            ArrowDataType::Struct(fields.into())
+        }
+
+        assert!(ensure_data_types(
+            &unshredded_variant_schema(),
+            &unshredded_variant_arrow_type(),
+            true
+        )
+        .is_ok());
+        assert!(ensure_data_types(
+            &unshredded_variant_schema(),
+            &incorrect_variant_arrow_type(),
+            true
+        )
+        .is_err());
     }
 
     #[test]
@@ -421,7 +446,7 @@ mod tests {
                 true,
             ),
         )]);
-        let arrow_struct: ArrowDataType = (&schema).try_into().unwrap();
+        let arrow_struct = ArrowDataType::try_from_kernel(&schema).unwrap();
         assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
 
         let kernel_simple = DataType::struct_type([

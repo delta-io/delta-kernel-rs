@@ -1,37 +1,36 @@
-//! Provides engine implementation that implement the required traits. These engines can optionally
-//! be built into the kernel by setting the `default-engine` or `sync-engine` feature flags. See the
-//! related modules for more information.
+//! Provides engine implementation that implement the required traits. The engine can optionally
+//! be built into the kernel by setting the `default-engine` feature flag. See the related module
+//! for more information.
 
 #[cfg(feature = "arrow-conversion")]
-pub(crate) mod arrow_conversion;
+pub mod arrow_conversion;
 
-#[cfg(all(
-    feature = "arrow-expression",
-    any(feature = "default-engine-base", feature = "sync-engine")
-))]
+#[cfg(all(feature = "arrow-expression", feature = "default-engine-base"))]
 pub mod arrow_expression;
 #[cfg(feature = "arrow-expression")]
 pub(crate) mod arrow_utils;
+#[cfg(feature = "internal-api")]
+pub use self::arrow_utils::{parse_json, to_json_bytes};
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
 
-#[cfg(feature = "sync-engine")]
-pub mod sync;
+#[cfg(test)]
+pub(crate) mod sync;
 
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub mod arrow_data;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub(crate) mod arrow_get_data;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub(crate) mod ensure_data_types;
-#[cfg(any(feature = "default-engine-base", feature = "sync-engine"))]
+#[cfg(feature = "default-engine-base")]
 pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 mod tests {
+    use crate::object_store::path::Path;
     use itertools::Itertools;
-    use object_store::path::Path;
     use std::sync::Arc;
     use url::Url;
 
@@ -47,7 +46,7 @@ mod tests {
         base_url: &Url,
         engine_data: impl Fn() -> Box<dyn EngineData>,
     ) {
-        let json = engine.get_json_handler();
+        let json = engine.json_handler();
         let get_data = || Box::new(std::iter::once(Ok(engine_data())));
 
         let expected_names: Vec<Path> = (1..4)
@@ -61,11 +60,11 @@ mod tests {
         let path = base_url.join("other").unwrap();
         json.write_json_file(&path, get_data(), false).unwrap();
 
-        let fs = engine.get_file_system_client();
+        let storage = engine.storage_handler();
 
         // list files after an offset
         let test_url = base_url.join(expected_names[0].as_ref()).unwrap();
-        let files: Vec<_> = fs.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
         assert_eq!(files.len(), expected_names.len() - 1);
         for (file, expected) in files.iter().zip(expected_names.iter().skip(1)) {
             assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
@@ -74,12 +73,12 @@ mod tests {
         let test_url = base_url
             .join(delta_path_for_version(0, "json").as_ref())
             .unwrap();
-        let files: Vec<_> = fs.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
         assert_eq!(files.len(), expected_names.len());
 
         // list files inside a directory / key prefix
         let test_url = base_url.join("_delta_log/").unwrap();
-        let files: Vec<_> = fs.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
         assert_eq!(files.len(), expected_names.len());
         for (file, expected) in files.iter().zip(expected_names.iter()) {
             assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());

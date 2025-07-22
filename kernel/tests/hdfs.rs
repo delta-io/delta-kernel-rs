@@ -4,16 +4,12 @@
 // tools available and on your path. Any Java version between 8 and 17 should work.
 //
 // Run these integration tests with:
-//   cargo test --features integration-test,cloud --test hdfs
-#![cfg(all(
-    feature = "integration-test",
-    feature = "cloud",
-    not(target_os = "windows")
-))]
+//   cargo test --features integration-test --test hdfs
+#![cfg(all(feature = "integration-test", not(target_os = "windows")))]
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::Table;
+use delta_kernel::Snapshot;
 use hdfs_native::{Client, WriteOptions};
 use hdfs_native_object_store::minidfs::MiniDfs;
 use std::collections::HashSet;
@@ -77,8 +73,7 @@ async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(TokioBackgroundExecutor::new()),
     )?;
 
-    let table = Table::new(url);
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = Snapshot::try_new(url, &engine, None)?;
     assert_eq!(snapshot.version(), 1);
 
     Ok(())

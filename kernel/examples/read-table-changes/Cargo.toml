@@ -4,16 +4,17 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# for cargo-release
 [package.metadata.release]
 release = false
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
-  "cloud",
   "arrow",
   "default-engine",
+  "internal-api",
 ] }
-env_logger = "0.11.3"
 url = "2"
-itertools = "0.13"
+itertools = "0.14"

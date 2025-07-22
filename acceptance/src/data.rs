@@ -6,13 +6,14 @@ use delta_kernel::arrow::compute::{
 };
 use delta_kernel::arrow::datatypes::{DataType, Schema};
 
+use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error, Table};
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error};
 use futures::{stream::TryStreamExt, StreamExt};
 use itertools::Itertools;
-use object_store::{local::LocalFileSystem, ObjectStore};
 
 use crate::{TestCaseInfo, TestResult};
 
@@ -25,7 +26,7 @@ pub async fn read_golden(path: &Path, _version: Option<&str>) -> DeltaResult<Rec
     for meta in files.into_iter() {
         if let Some(ext) = meta.location.extension() {
             if ext == "parquet" {
-                let reader = ParquetObjectReader::new(store.clone(), meta);
+                let reader = ParquetObjectReader::new(store.clone(), meta.location);
                 let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
                 if schema.is_none() {
                     schema = Some(builder.schema().clone());
@@ -109,10 +110,12 @@ fn assert_columns_match(actual: &[Arc<dyn Array>], expected: &[Arc<dyn Array>]) 
     }
 }
 
-pub async fn assert_scan_data(engine: Arc<dyn Engine>, test_case: &TestCaseInfo) -> TestResult<()> {
+pub async fn assert_scan_metadata(
+    engine: Arc<dyn Engine>,
+    test_case: &TestCaseInfo,
+) -> TestResult<()> {
     let table_root = test_case.table_root()?;
-    let table = Table::new(table_root);
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(table_root, engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan

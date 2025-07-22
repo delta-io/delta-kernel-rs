@@ -1,22 +1,22 @@
+use common::LocationArgs;
 use delta_kernel::actions::visitors::{
-    AddVisitor, CdcVisitor, MetadataVisitor, ProtocolVisitor, RemoveVisitor, SetTransactionVisitor,
+    visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
+    SetTransactionVisitor,
 };
 use delta_kernel::actions::{
     get_log_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME,
 };
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, ExpressionRef, Table};
+use delta_kernel::{DeltaResult, Error, ExpressionRef, Snapshot};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 use clap::{Parser, Subcommand};
 
@@ -24,12 +24,11 @@ use clap::{Parser, Subcommand};
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Path to the table to inspect
-    #[arg(short, long)]
-    path: String,
-
     #[command(subcommand)]
     command: Commands,
+
+    #[command(flatten)]
+    location_args: LocationArgs,
 }
 
 #[derive(Subcommand)]
@@ -41,7 +40,7 @@ enum Commands {
     /// Show the table's schema
     Schema,
     /// Show the meta-data that would be used to scan the table
-    ScanData,
+    ScanMetadata,
     /// Show each action from the log-segments
     Actions {
         /// Show the log in reverse order (default is log replay order -- newest first)
@@ -125,18 +124,13 @@ impl RowVisitor for LogVisitor {
                 let remove =
                     RemoveVisitor::visit_remove(i, path, &getters[remove_start..remove_end])?;
                 Action::Remove(remove)
-            } else if let Some(id) = getters[metadata_start].get_opt(i, "metadata.id")? {
-                let metadata =
-                    MetadataVisitor::visit_metadata(i, id, &getters[metadata_start..metadata_end])?;
-                Action::Metadata(metadata)
-            } else if let Some(min_reader_version) =
-                getters[protocol_start].get_opt(i, "protocol.min_reader_version")?
+            } else if let Some(metadata) =
+                visit_metadata_at(i, &getters[metadata_start..metadata_end])?
             {
-                let protocol = ProtocolVisitor::visit_protocol(
-                    i,
-                    min_reader_version,
-                    &getters[protocol_start..protocol_end],
-                )?;
+                Action::Metadata(metadata)
+            } else if let Some(protocol) =
+                visit_protocol_at(i, &getters[protocol_start..protocol_end])?
+            {
                 Action::Protocol(protocol)
             } else if let Some(app_id) = getters[txn_start].get_opt(i, "txn.appId")? {
                 let txn =
@@ -186,16 +180,9 @@ fn print_scan_file(
 fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
-    // build a table and get the latest snapshot from it
-    let table = Table::try_from_uri(&cli.path)?;
-
-    let engine = DefaultEngine::try_new(
-        table.location(),
-        HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
-
-    let snapshot = table.snapshot(&engine, None)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
+    let engine = common::get_engine(&url, &cli.location_args)?;
+    let snapshot = Snapshot::try_new(url, &engine, None)?;
 
     match cli.command {
         Commands::TableVersion => {
@@ -207,18 +194,12 @@ fn try_main() -> DeltaResult<()> {
         Commands::Schema => {
             println!("{:#?}", snapshot.schema());
         }
-        Commands::ScanData => {
+        Commands::ScanMetadata => {
             let scan = ScanBuilder::new(snapshot).build()?;
-            let scan_data = scan.scan_data(&engine)?;
-            for res in scan_data {
-                let (data, vector, transforms) = res?;
-                delta_kernel::scan::state::visit_scan_files(
-                    data.as_ref(),
-                    &vector,
-                    &transforms,
-                    (),
-                    print_scan_file,
-                )?;
+            let scan_metadata_iter = scan.scan_metadata(&engine)?;
+            for res in scan_metadata_iter {
+                let scan_metadata = res?;
+                scan_metadata.visit_scan_files((), print_scan_file)?;
             }
         }
         Commands::Actions { oldest_first } => {
@@ -232,7 +213,7 @@ fn try_main() -> DeltaResult<()> {
 
             let mut visitor = LogVisitor::new();
             for action in actions {
-                visitor.visit_rows_of(action?.0.as_ref())?;
+                visitor.visit_rows_of(action?.actions())?;
             }
 
             if oldest_first {
@@ -240,12 +221,12 @@ fn try_main() -> DeltaResult<()> {
             }
             for (action, row) in visitor.actions.iter() {
                 match action {
-                    Action::Metadata(md) => println!("\nAction {row}:\n{:#?}", md),
-                    Action::Protocol(p) => println!("\nAction {row}:\n{:#?}", p),
-                    Action::Remove(r) => println!("\nAction {row}:\n{:#?}", r),
-                    Action::Add(a) => println!("\nAction {row}:\n{:#?}", a),
-                    Action::SetTransaction(t) => println!("\nAction {row}:\n{:#?}", t),
-                    Action::Cdc(c) => println!("\nAction {row}:\n{:#?}", c),
+                    Action::Metadata(md) => println!("\nAction {row}:\n{md:#?}"),
+                    Action::Protocol(p) => println!("\nAction {row}:\n{p:#?}"),
+                    Action::Remove(r) => println!("\nAction {row}:\n{r:#?}"),
+                    Action::Add(a) => println!("\nAction {row}:\n{a:#?}"),
+                    Action::SetTransaction(t) => println!("\nAction {row}:\n{t:#?}"),
+                    Action::Cdc(c) => println!("\nAction {row}:\n{c:#?}"),
                 }
             }
         }

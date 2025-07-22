@@ -13,9 +13,8 @@ typedef struct PartitionList
 // "context" argument, and then pass it back when calling a callback.
 struct EngineContext
 {
-  SharedGlobalScanState* global_state;
   SharedSchema* logical_schema;
-  SharedSchema* read_schema;
+  SharedSchema* physical_schema;
   char* table_root;
   SharedExternEngine* engine;
   PartitionList* partition_cols;

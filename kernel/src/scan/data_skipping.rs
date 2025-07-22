@@ -8,14 +8,16 @@ use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
-    column_expr, joined_column_expr, BinaryOperator, ColumnName, Expression as Expr, ExpressionRef,
-    Scalar, VariadicOperator,
+    column_expr, joined_column_expr, BinaryPredicateOp, ColumnName, Expression as Expr,
+    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
 };
-use crate::predicates::{
-    DataSkippingPredicateEvaluator, PredicateEvaluator, PredicateEvaluatorDefaults,
+use crate::kernel_predicates::{
+    DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
 use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
-use crate::{Engine, EngineData, ExpressionEvaluator, JsonHandler, RowVisitor as _};
+use crate::{
+    Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
+};
 
 #[cfg(test)]
 mod tests;
@@ -31,27 +33,27 @@ mod tests;
 ///
 /// Unary `IsNull` checks if the null counts indicate that the column could contain a null.
 ///
-/// The variadic operations are rewritten as follows:
+/// The junction operations are rewritten as follows:
 /// - `AND` is rewritten as a conjunction of the rewritten operands where we just skip operands that
-///         are not eligible for data skipping.
+///   are not eligible for data skipping.
 /// - `OR` is rewritten only if all operands are eligible for data skipping. Otherwise, the whole OR
-///        expression is dropped.
+///   predicate is dropped.
 #[cfg(test)]
-fn as_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval(expr)
+pub(crate) fn as_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+    DataSkippingPredicateCreator.eval(pred)
 }
 
-/// Like `as_data_skipping_predicate`, but invokes [`PredicateEvaluator::eval_sql_where`] instead
-/// of [`PredicateEvaluator::eval_expr`].
-fn as_sql_data_skipping_predicate(expr: &Expr) -> Option<Expr> {
-    DataSkippingPredicateCreator.eval_sql_where(expr)
+/// Like `as_data_skipping_predicate`, but invokes [`KernelPredicateEvaluator::eval_sql_where`]
+/// instead of [`KernelPredicateEvaluator::eval`].
+fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
+    DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
-    skipping_evaluator: Arc<dyn ExpressionEvaluator>,
-    filter_evaluator: Arc<dyn ExpressionEvaluator>,
+    skipping_evaluator: Arc<dyn PredicateEvaluator>,
+    filter_evaluator: Arc<dyn PredicateEvaluator>,
     json_handler: Arc<dyn JsonHandler>,
 }
 
@@ -63,14 +65,11 @@ impl DataSkippingFilter {
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
         engine: &dyn Engine,
-        physical_predicate: Option<(ExpressionRef, SchemaRef)>,
+        physical_predicate: Option<(PredicateRef, SchemaRef)>,
     ) -> Option<Self> {
-        static PREDICATE_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            DataType::struct_type([StructField::nullable("predicate", DataType::BOOLEAN)])
-        });
         static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
-        static FILTER_EXPR: LazyLock<Expr> =
-            LazyLock::new(|| column_expr!("predicate").distinct(false));
+        static FILTER_PRED: LazyLock<Pred> =
+            LazyLock::new(|| column_expr!("output").distinct(Expr::literal(false)));
 
         let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -133,31 +132,28 @@ impl DataSkippingFilter {
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
         //    the predicate is true/null and false (= skip) when the predicate is false.
-        let select_stats_evaluator = engine.get_expression_handler().get_evaluator(
+        let select_stats_evaluator = engine.evaluation_handler().new_expression_evaluator(
             // safety: kernel is very broken if we don't have the schema for Add actions
             get_log_add_schema().clone(),
             STATS_EXPR.clone(),
             DataType::STRING,
         );
 
-        let skipping_evaluator = engine.get_expression_handler().get_evaluator(
+        let skipping_evaluator = engine.evaluation_handler().new_predicate_evaluator(
             stats_schema.clone(),
-            Expr::struct_from([as_sql_data_skipping_predicate(&predicate)?]),
-            PREDICATE_SCHEMA.clone(),
+            as_sql_data_skipping_predicate(&predicate)?,
         );
 
-        let filter_evaluator = engine.get_expression_handler().get_evaluator(
-            stats_schema.clone(),
-            FILTER_EXPR.clone(),
-            DataType::BOOLEAN,
-        );
+        let filter_evaluator = engine
+            .evaluation_handler()
+            .new_predicate_evaluator(stats_schema.clone(), FILTER_PRED.clone());
 
         Some(Self {
             stats_schema,
             select_stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
-            json_handler: engine.get_json_handler(),
+            json_handler: engine.json_handler(),
         })
     }
 
@@ -197,9 +193,8 @@ impl DataSkippingFilter {
 struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
-    type Output = Expr;
-    type TypedStat = Expr;
-    type IntStat = Expr;
+    type Output = Pred;
+    type ColumnStat = Expr;
 
     /// Retrieves the minimum value of a column, if it exists and has the requested type.
     fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
@@ -207,8 +202,13 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     }
 
     /// Retrieves the maximum value of a column, if it exists and has the requested type.
-    fn get_max_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
-        Some(joined_column_expr!("maxValues", col))
+    // TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since
+    // they are truncated to milliseconds in add.stats.
+    fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
+        match data_type {
+            &DataType::TIMESTAMP | &DataType::TIMESTAMP_NTZ => None,
+            _ => Some(joined_column_expr!("maxValues", col)),
+        }
     }
 
     /// Retrieves the null count of a column, if it exists.
@@ -227,51 +227,62 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         col: Expr,
         val: &Scalar,
         inverted: bool,
-    ) -> Option<Expr> {
-        let op = match (ord, inverted) {
-            (Ordering::Less, false) => BinaryOperator::LessThan,
-            (Ordering::Less, true) => BinaryOperator::GreaterThanOrEqual,
-            (Ordering::Equal, false) => BinaryOperator::Equal,
-            (Ordering::Equal, true) => BinaryOperator::NotEqual,
-            (Ordering::Greater, false) => BinaryOperator::GreaterThan,
-            (Ordering::Greater, true) => BinaryOperator::LessThanOrEqual,
+    ) -> Option<Pred> {
+        let pred_fn = match (ord, inverted) {
+            (Ordering::Less, false) => Pred::lt,
+            (Ordering::Less, true) => Pred::ge,
+            (Ordering::Equal, false) => Pred::eq,
+            (Ordering::Equal, true) => Pred::ne,
+            (Ordering::Greater, false) => Pred::gt,
+            (Ordering::Greater, true) => Pred::le,
         };
-        Some(Expr::binary(op, col, val.clone()))
+        Some(pred_fn(col, val.clone()))
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted).map(Expr::literal)
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted).map(Pred::literal)
     }
 
-    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_scalar(val, inverted).map(Expr::literal)
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted).map(Pred::literal)
     }
 
-    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Expr> {
+    // NOTE: This is nearly identical to the impl for ParquetStatsProvider in
+    // parquet_stats_skipping.rs, except it uses `Expression` and `Predicate` instead of `Scalar`.
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<Pred> {
         let safe_to_skip = match inverted {
             true => self.get_rowcount_stat()?, // all-null
             false => Expr::literal(0i64),      // no-null
         };
-        Some(Expr::ne(self.get_nullcount_stat(col)?, safe_to_skip))
+        Some(Pred::ne(self.get_nullcount_stat(col)?, safe_to_skip))
     }
 
-    fn eval_binary_scalars(
+    fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
-    ) -> Option<Expr> {
-        PredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
-            .map(Expr::literal)
+    ) -> Option<Pred> {
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
+            .map(Pred::literal)
     }
 
-    fn finish_eval_variadic(
+    fn eval_pred_opaque(
         &self,
-        mut op: VariadicOperator,
-        exprs: impl IntoIterator<Item = Option<Expr>>,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
         inverted: bool,
-    ) -> Option<Expr> {
+    ) -> Option<Pred> {
+        op.as_data_skipping_predicate(self, exprs, inverted)
+    }
+
+    fn finish_eval_pred_junction(
+        &self,
+        mut op: JunctionPredicateOp,
+        preds: &mut dyn Iterator<Item = Option<Pred>>,
+        inverted: bool,
+    ) -> Option<Pred> {
         if inverted {
             op = op.invert();
         }
@@ -282,16 +293,15 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         // where FALSE would otherwise be expected. So, we filter out all nulls except the first,
         // observing that one NULL is enough to produce the correct behavior during predicate eval.
         let mut keep_null = true;
-        let exprs: Vec<_> = exprs
-            .into_iter()
-            .flat_map(|e| match e {
-                Some(expr) => Some(expr),
+        let preds: Vec<_> = preds
+            .flat_map(|p| match p {
+                Some(pred) => Some(pred),
                 None => keep_null.then(|| {
                     keep_null = false;
-                    Expr::null_literal(DataType::BOOLEAN)
+                    Pred::null_literal()
                 }),
             })
             .collect();
-        Some(Expr::variadic(op, exprs))
+        Some(Pred::junction(op, preds))
     }
 }

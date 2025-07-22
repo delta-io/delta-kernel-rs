@@ -1,11 +1,32 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
+use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType};
 use crate::{AsAny, DeltaResult, Error};
 
 use tracing::debug;
 
 use std::collections::HashMap;
+
+/// Engine data paired with a selection vector indicating which rows are logically selected.
+///
+/// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
+/// while `false` means the row is logically deleted and should be ignored.
+///
+/// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
+pub struct FilteredEngineData {
+    // The underlying engine data
+    pub data: Box<dyn EngineData>,
+    // The selection vector where `true` marks rows to include in results
+    pub selection_vector: Vec<bool>,
+}
+
+impl HasSelectionVector for FilteredEngineData {
+    /// Returns true if any row in the selection vector is marked as selected
+    fn has_selected_rows(&self) -> bool {
+        self.selection_vector.contains(&true)
+    }
+}
 
 /// a trait that an engine exposes to give access to a list
 pub trait EngineList {
@@ -50,7 +71,11 @@ impl<'a> ListItem<'a> {
 pub trait EngineMap {
     /// Get the item with the specified key from the map at `row_index` in the raw data, and return it as an `Option<&'a str>`
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str>;
-    /// Materialize the entire map at `row_index` in the raw data into a `HashMap`
+    /// Materialize the entire map at `row_index` in the raw data into a `HashMap`. Note that in
+    /// conjunction with the `allow_null_container_values` attribute, `materialize` _drops_ any
+    /// (key, value) pairs where the underlying value was `null`. If preserving `null` values is
+    /// important, use the `allow_null_container_values` attribute, and manually materialize the map
+    /// using [`Self::get`].
     fn materialize(&self, row_index: usize) -> HashMap<String, String>;
 }
 

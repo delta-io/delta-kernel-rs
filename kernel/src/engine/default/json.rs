@@ -5,25 +5,25 @@ use std::ops::Range;
 use std::sync::{mpsc, Arc};
 use std::task::Poll;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
+use crate::object_store::path::Path;
+use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
-use object_store::path::Path;
-use object_store::{DynObjectStore, GetResultPayload};
 use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
+use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, ExpressionRef, FileDataReadResultIterator, FileMeta,
-    JsonHandler,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
 const DEFAULT_BUFFER_SIZE: usize = 1000;
@@ -96,13 +96,13 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<ExpressionRef>,
+        _predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         if files.is_empty() {
             return Ok(Box::new(std::iter::empty()));
         }
 
-        let schema: ArrowSchemaRef = Arc::new(physical_schema.as_ref().try_into()?);
+        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
 
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
@@ -137,19 +137,20 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         path: &Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
-        _overwrite: bool,
+        overwrite: bool,
     ) -> DeltaResult<()> {
         let buffer = to_json_bytes(data)?;
-        // Put if absent
+        let put_mode = if overwrite {
+            PutMode::Overwrite
+        } else {
+            PutMode::Create
+        };
+
         let store = self.store.clone(); // cheap Arc
         let path = Path::from_url_path(path.path())?;
         let path_str = path.to_string();
         self.task_executor
-            .block_on(async move {
-                store
-                    .put_opts(&path, buffer.into(), object_store::PutMode::Create.into())
-                    .await
-            })
+            .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
             .map_err(|e| match e {
                 object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
                 e => e.into(),
@@ -257,14 +258,17 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
+    use crate::object_store::local::LocalFileSystem;
+    use crate::object_store::memory::InMemory;
+    use crate::object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    };
+    use crate::schema::{DataType as DeltaDataType, Schema, StructField};
+    use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
-    };
+    use serde_json::json;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -306,7 +310,7 @@ mod tests {
             let mut seen = HashSet::new();
             for key in ordered_keys.iter() {
                 if !seen.insert(key) {
-                    panic!("Duplicate key in OrderedGetStore: {}", key);
+                    panic!("Duplicate key in OrderedGetStore: {key}");
                 }
             }
 
@@ -351,7 +355,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            opts: PutMultipartOpts,
+            opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -422,11 +426,11 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
+        async fn get_range(&self, location: &Path, range: Range<u64>) -> Result<Bytes> {
             self.inner.get_range(location, range).await
         }
 
-        async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
         }
 
@@ -438,7 +442,7 @@ mod tests {
             self.inner.delete(location).await
         }
 
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
 
@@ -446,7 +450,7 @@ mod tests {
             &self,
             prefix: Option<&Path>,
             offset: &Path,
-        ) -> BoxStream<'_, Result<ObjectMeta>> {
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list_with_offset(prefix, offset)
         }
 
@@ -469,14 +473,6 @@ mod tests {
         async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
             self.inner.rename_if_not_exists(from, to).await
         }
-    }
-
-    fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
-        let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
-            .expect("Can't convert to record batch");
-        Box::new(ArrowEngineData::new(batch))
     }
 
     #[test]
@@ -533,17 +529,19 @@ mod tests {
         ))
         .unwrap();
         let url = Url::from_file_path(path).unwrap();
-        let location = Path::from(url.path());
+        let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
+        let meta_size = meta.size;
+        #[cfg(not(feature = "arrow-55"))]
+        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
+            size: meta_size,
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let physical_schema = Arc::new(ArrowSchema::try_from(get_log_schema().as_ref()).unwrap());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_log_schema().clone(), None)
             .unwrap()
@@ -557,7 +555,7 @@ mod tests {
         // limit batch size
         let handler = handler.with_batch_size(2);
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, Arc::new(physical_schema.try_into().unwrap()), None)
+            .read_json_files(files, get_log_schema().clone(), None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -573,7 +571,7 @@ mod tests {
         // note we don't want to go over 1000 since we only buffer 1000 requests at a time
         let num_paths = 1000;
         let ordered_paths: Vec<Path> = (0..num_paths)
-            .map(|i| Path::from(format!("/test/path{}", i)))
+            .map(|i| Path::from(format!("/test/path{i}")))
             .collect();
         let jumbled_paths: Vec<_> = ordered_paths[100..400]
             .iter()
@@ -585,7 +583,7 @@ mod tests {
         let memory_store = InMemory::new();
         for (i, path) in ordered_paths.iter().enumerate() {
             memory_store
-                .put(path, Bytes::from(format!("content_{}", i)).into())
+                .put(path, Bytes::from(format!("content_{i}")).into())
                 .await
                 .unwrap();
         }
@@ -634,7 +632,7 @@ mod tests {
         // 2. we then set up an ObjectStore to resolves those paths in a jumbled order
         // 3. then call read_json_files and check that the results are in order
         let ordered_paths: Vec<Path> = (0..1000)
-            .map(|i| Path::from(format!("test/path{}", i)))
+            .map(|i| Path::from(format!("test/path{i}")))
             .collect();
 
         let test_list: &[(usize, Vec<Path>)] = &[
@@ -682,13 +680,16 @@ mod tests {
                 .map(|path| {
                     let store = store.clone();
                     async move {
-                        let url = Url::parse(&format!("memory:/{}", path)).unwrap();
+                        let url = Url::parse(&format!("memory:/{path}")).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
+                        let meta_size = meta.size;
+                        #[cfg(not(feature = "arrow-55"))]
+                        let meta_size = meta_size.try_into().unwrap();
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta.size,
+                            size: meta_size,
                         }
                     }
                 })
@@ -705,12 +706,10 @@ mod tests {
                 )),
             );
             let handler = handler.with_buffer_size(*buffer_size);
-            let schema = Arc::new(ArrowSchema::new(vec![Arc::new(Field::new(
+            let physical_schema = Arc::new(Schema::new(vec![StructField::nullable(
                 "val",
-                DataType::Int32,
-                true,
-            ))]));
-            let physical_schema = Arc::new(schema.try_into().unwrap());
+                DeltaDataType::INTEGER,
+            )]));
             let data: Vec<RecordBatch> = handler
                 .read_json_files(&files, physical_schema, None)
                 .unwrap()
@@ -728,5 +727,84 @@ mod tests {
                 .collect();
             assert_eq!(all_values, (0..1000).collect_vec());
         }
+    }
+
+    // Helper function to create test data
+    fn create_test_data(values: Vec<&str>) -> DeltaResult<Box<dyn EngineData>> {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "dog",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(values))])?;
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    // Helper function to read JSON file asynchronously
+    async fn read_json_file(
+        store: &Arc<InMemory>,
+        path: &Path,
+    ) -> DeltaResult<Vec<serde_json::Value>> {
+        let content = store.get(path).await?;
+        let file_bytes = content.bytes().await?;
+        let file_string =
+            String::from_utf8(file_bytes.to_vec()).map_err(|e| object_store::Error::Generic {
+                store: "memory",
+                source: Box::new(e),
+            })?;
+        let json: Vec<_> = serde_json::Deserializer::from_str(&file_string)
+            .into_iter::<serde_json::Value>()
+            .flatten()
+            .collect();
+        Ok(json)
+    }
+
+    #[tokio::test]
+    async fn test_write_json_file_without_overwrite() -> DeltaResult<()> {
+        do_test_write_json_file(false).await
+    }
+
+    #[tokio::test]
+    async fn test_write_json_file_overwrite() -> DeltaResult<()> {
+        do_test_write_json_file(true).await
+    }
+
+    async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = DefaultJsonHandler::new(store.clone(), executor);
+        let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
+        let object_path = Path::from("/test/data/00000000000000000001.json");
+
+        // First write with no existing file
+        let data = create_test_data(vec!["remi", "wilson"])?;
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+
+        // Verify the first write is successful
+        assert!(result.is_ok());
+        let json = read_json_file(&store, &object_path).await?;
+        assert_eq!(json, vec![json!({"dog": "remi"}), json!({"dog": "wilson"})]);
+
+        // Second write with existing file
+        let data = create_test_data(vec!["seb", "tia"])?;
+        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+
+        if overwrite {
+            // Verify the second write is successful
+            assert!(result.is_ok());
+            let json = read_json_file(&store, &object_path).await?;
+            assert_eq!(json, vec![json!({"dog": "seb"}), json!({"dog": "tia"})]);
+        } else {
+            // Verify the second write fails with FileAlreadyExists error
+            match result {
+                Err(Error::FileAlreadyExists(err_path)) => {
+                    assert_eq!(err_path, object_path.to_string());
+                }
+                _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
+            }
+        }
+
+        Ok(())
     }
 }

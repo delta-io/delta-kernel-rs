@@ -2,14 +2,29 @@
 
 use std::sync::Arc;
 
-use delta_kernel::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+};
+
+use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
+use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::memory::InMemory;
+use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
-use delta_kernel::EngineData;
+use delta_kernel::scan::Scan;
+use delta_kernel::schema::SchemaRef;
+use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::TaskExecutor;
+use delta_kernel::engine::default::DefaultEngine;
 use itertools::Itertools;
-use object_store::{path::Path, ObjectStore};
+use serde_json::{json, to_vec};
+use url::Url;
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
 pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
@@ -81,6 +96,18 @@ impl IntoArray for Vec<i32> {
     }
 }
 
+impl IntoArray for Vec<i64> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(Int64Array::from(self))
+    }
+}
+
+impl IntoArray for Vec<bool> {
+    fn into_array(self) -> ArrayRef {
+        Arc::new(BooleanArray::from(self))
+    }
+}
+
 impl IntoArray for Vec<&'static str> {
     fn into_array(self) -> ArrayRef {
         Arc::new(StringArray::from(self))
@@ -112,6 +139,12 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+/// get an ObjectStore path for a compressed log file, based on the start/end versions
+pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suffix: &str) -> Path {
+    let path = format!("_delta_log/{start_version:020}.{end_version:020}.compacted.{suffix}");
+    Path::from(path.as_str())
+}
+
 /// put a commit file into the specified object store.
 pub async fn add_commit(
     store: &dyn ObjectStore,
@@ -131,12 +164,235 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// We implement abs_diff here so we don't have to bump our msrv.
-/// TODO: Remove and use std version when msrv >= 1.81.0
-pub fn abs_diff(self_dur: std::time::Duration, other: std::time::Duration) -> std::time::Duration {
-    if let Some(res) = self_dur.checked_sub(other) {
-        res
-    } else {
-        other.checked_sub(self_dur).unwrap()
+/// Simple extension trait with helpful methods (just constuctor for now) for creating/using
+/// DefaultEngine in our tests.
+///
+/// Note: we implment this extension trait here so that we can import this trait (from test-utils
+/// crate) and get to use all these test-only helper methods from places where we don't have access
+pub trait DefaultEngineExtension {
+    type Executor: TaskExecutor;
+
+    fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
+}
+
+impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
+    type Executor = TokioBackgroundExecutor;
+
+    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
+        let object_store = Arc::new(LocalFileSystem::new());
+        Arc::new(DefaultEngine::new(
+            object_store,
+            TokioBackgroundExecutor::new().into(),
+        ))
     }
+}
+
+// setup default engine with in-memory (=true) or local fs (=false) object store.
+pub fn engine_store_setup(
+    table_name: &str,
+    in_memory: bool,
+) -> (
+    Arc<dyn ObjectStore>,
+    DefaultEngine<TokioBackgroundExecutor>,
+    Url,
+) {
+    let (storage, base_path, base_url): (Arc<dyn ObjectStore>, &str, &str) = if in_memory {
+        (Arc::new(InMemory::new()), "/", "memory:///")
+    } else {
+        (
+            Arc::new(LocalFileSystem::new()),
+            "./kernel_write_tests/",
+            "file://",
+        )
+    };
+
+    let table_root_path = Path::from(format!("{base_path}{table_name}"));
+    let url = Url::parse(&format!("{base_url}{table_root_path}/")).unwrap();
+    let executor = Arc::new(TokioBackgroundExecutor::new());
+    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
+
+    (storage, engine, url)
+}
+
+// we provide this table creation function since we only do appends to existing tables for now.
+// this will just create an empty table with the given schema. (just protocol + metadata actions)
+#[allow(clippy::too_many_arguments)]
+pub async fn create_table(
+    store: Arc<dyn ObjectStore>,
+    table_path: Url,
+    schema: SchemaRef,
+    partition_columns: &[&str],
+    use_37_protocol: bool,
+    enable_timestamp_without_timezone: bool,
+    enable_variant: bool,
+    enable_column_mapping: bool,
+) -> Result<Url, Box<dyn std::error::Error>> {
+    let table_id = "test_id";
+    let schema = serde_json::to_string(&schema)?;
+
+    let (reader_features, writer_features) = {
+        let mut reader_features = vec![];
+        let mut writer_features = vec![];
+        if enable_timestamp_without_timezone {
+            reader_features.push("timestampNtz");
+            writer_features.push("timestampNtz");
+        }
+        if enable_variant {
+            reader_features.push("variantType");
+            writer_features.push("variantType");
+            // We can add shredding features as well as we are allowed to write unshredded variants
+            // into shredded tables and shredded reads are explicitly blocked in the default
+            // engine's parquet reader.
+            reader_features.push("variantShredding-preview");
+            writer_features.push("variantShredding-preview");
+        }
+        if enable_column_mapping {
+            reader_features.push("columnMapping");
+        }
+        (reader_features, writer_features)
+    };
+
+    let protocol = if use_37_protocol {
+        json!({
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": reader_features,
+                "writerFeatures": writer_features,
+            }
+        })
+    } else {
+        json!({
+            "protocol": {
+                "minReaderVersion": 1,
+                "minWriterVersion": 1,
+            }
+        })
+    };
+    let metadata = json!({
+        "metaData": {
+            "id": table_id,
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": schema,
+            "partitionColumns": partition_columns,
+            "configuration": {"delta.columnMapping.mode": "name"},
+            "createdTime": 1677811175819u64
+        }
+    });
+
+    let data = [
+        to_vec(&protocol).unwrap(),
+        b"\n".to_vec(),
+        to_vec(&metadata).unwrap(),
+    ]
+    .concat();
+
+    // put 0.json with protocol + metadata
+    let path = table_path.join("_delta_log/00000000000000000000.json")?;
+    store
+        .put(&Path::from_url_path(path.path())?, data.into())
+        .await?;
+    Ok(table_path)
+}
+
+/// Creates two empty test tables, one with 3/7 protocol and one with 1/1 protocol
+pub async fn setup_test_tables(
+    schema: SchemaRef,
+    partition_columns: &[&str],
+) -> Result<
+    Vec<(
+        Url,
+        DefaultEngine<TokioBackgroundExecutor>,
+        Arc<dyn ObjectStore>,
+        &'static str,
+    )>,
+    Box<dyn std::error::Error>,
+> {
+    let (store_37, engine_37, table_location_37) = engine_store_setup("test_table_37", true);
+    let (store_11, engine_11, table_location_11) = engine_store_setup("test_table_11", true);
+    Ok(vec![
+        (
+            create_table(
+                store_37.clone(),
+                table_location_37,
+                schema.clone(),
+                partition_columns,
+                true,
+                false,
+                false,
+                false,
+            )
+            .await?,
+            engine_37,
+            store_37,
+            "test_table_37",
+        ),
+        (
+            create_table(
+                store_11.clone(),
+                table_location_11,
+                schema,
+                partition_columns,
+                false,
+                false,
+                false,
+                false,
+            )
+            .await?,
+            engine_11,
+            store_11,
+            "test_table_11",
+        ),
+    ])
+}
+
+pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
+    Ok(data
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+        .into())
+}
+
+// TODO (zach): this is listed as unused for acceptance crate
+pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
+    let scan_results = scan.execute(engine)?;
+    scan_results
+        .map(|scan_result| -> DeltaResult<_> {
+            let scan_result = scan_result?;
+            let mask = scan_result.full_mask();
+            let data = scan_result.raw_data?;
+            let record_batch = to_arrow(data)?;
+            if let Some(mask) = mask {
+                Ok(filter_record_batch(&record_batch, &mask.into())?)
+            } else {
+                Ok(record_batch)
+            }
+        })
+        .try_collect()
+}
+
+// TODO (zach): this is listed as unused for acceptance crate
+pub fn test_read(
+    expected: &ArrowEngineData,
+    url: &Url,
+    engine: Arc<dyn Engine>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = Snapshot::try_new(url.clone(), engine.as_ref(), None)?;
+    let scan = snapshot.into_scan_builder().build()?;
+    let batches = read_scan(&scan, engine)?;
+    let formatted = pretty_format_batches(&batches).unwrap().to_string();
+
+    let expected = pretty_format_batches(&[expected.record_batch().clone()])
+        .unwrap()
+        .to_string();
+
+    println!("actual:\n{formatted}");
+    println!("expected:\n{expected}");
+    assert_eq!(formatted, expected);
+
+    Ok(())
 }

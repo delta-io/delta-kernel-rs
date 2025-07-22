@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::mem;
+use std::ops::Deref as _;
 
 use tracing::debug;
 
@@ -76,35 +77,48 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
     }
 }
 
+// All leaf types (primitive, array, map) share the same "shape" of transformation logic
+macro_rules! transform_leaf {
+    ($self:ident, $type_variant:path, $type:ident) => {{
+        // first always check error to terminate early if possible
+        $self.error.as_ref().ok()?;
+
+        let Some(scalar) = $self.scalars.next() else {
+            $self.set_error(Error::InsufficientScalars);
+            return None;
+        };
+
+        // NOTE: Grab a reference here so code below can leverage the blanket impl<T> Deref for &T
+        let $type_variant(ref scalar_type) = scalar.data_type() else {
+            $self.set_error(Error::Schema(format!(
+                "Mismatched scalar type while creating Expression: expected {}({:?}), got {:?}",
+                stringify!($type_variant),
+                $type,
+                scalar.data_type()
+            )));
+            return None;
+        };
+
+        // NOTE: &T and &Box<T> both deref to &T
+        if scalar_type.deref() != $type {
+            $self.set_error(Error::Schema(format!(
+                "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
+                $type, scalar_type
+            )));
+            return None;
+        }
+
+        $self.stack.push(Expression::Literal(scalar.clone()));
+        None
+    }};
+}
+
 impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressionTransform<'a, T> {
     fn transform_primitive(
         &mut self,
         prim_type: &'a PrimitiveType,
     ) -> Option<Cow<'a, PrimitiveType>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-
-        let Some(scalar) = self.scalars.next() else {
-            self.set_error(Error::InsufficientScalars);
-            return None;
-        };
-
-        let DataType::Primitive(scalar_type) = scalar.data_type() else {
-            self.set_error(Error::Schema(
-                "Non-primitive scalar type {datatype} provided".to_string(),
-            ));
-            return None;
-        };
-        if scalar_type != *prim_type {
-            self.set_error(Error::Schema(format!(
-                "Mismatched scalar type while creating Expression: expected {}, got {}",
-                prim_type, scalar_type
-            )));
-            return None;
-        }
-
-        self.stack.push(Expression::Literal(scalar.clone()));
-        None
+        transform_leaf!(self, DataType::Primitive, prim_type)
     }
 
     fn transform_struct(&mut self, struct_type: &'a StructType) -> Option<Cow<'a, StructType>> {
@@ -160,22 +174,14 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         Some(Cow::Borrowed(field))
     }
 
-    // arrays unsupported for now
-    fn transform_array(&mut self, _array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        self.error.as_ref().ok()?;
-        self.set_error(Error::Unsupported(
-            "ArrayType not yet supported in literal expression transform".to_string(),
-        ));
-        None
+    // arrays treated as leaves
+    fn transform_array(&mut self, array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        transform_leaf!(self, DataType::Array, array_type)
     }
 
-    // maps unsupported for now
-    fn transform_map(&mut self, _map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
-        self.error.as_ref().ok()?;
-        self.set_error(Error::Unsupported(
-            "MapType not yet supported in literal expression transform".to_string(),
-        ));
-        None
+    // maps treated as leaves
+    fn transform_map(&mut self, map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
+        transform_leaf!(self, DataType::Map, map_type)
     }
 }
 
@@ -185,17 +191,20 @@ mod tests {
 
     use std::sync::Arc;
 
+    use crate::expressions::{ArrayData, MapData};
     use crate::schema::SchemaRef;
     use crate::schema::StructType;
     use crate::DataType as DeltaDataTypes;
 
     use paste::paste;
 
+    use Expression as Expr;
+
     // helper to take values/schema to pass to `create_one` and assert the result = expected
     fn assert_single_row_transform(
         values: &[Scalar],
         schema: SchemaRef,
-        expected: Result<Expression, ()>,
+        expected: Result<Expr, ()>,
     ) {
         let mut schema_transform = LiteralExpressionTransform::new(values);
         let datatype = schema.into();
@@ -221,15 +230,14 @@ mod tests {
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected = Expression::null_literal(schema.clone().into());
+        let expected = Expr::null_literal(schema.clone().into());
         assert_single_row_transform(values, schema, Ok(expected));
 
         let schema = Arc::new(StructType::new([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
-        let expected =
-            Expression::struct_from(vec![Expression::null_literal(DeltaDataTypes::INTEGER)]);
+        let expected = Expr::struct_from(vec![Expr::null_literal(DeltaDataTypes::INTEGER)]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
 
@@ -283,9 +291,30 @@ mod tests {
                 ]),
             ),
         ]));
-        let expected = Expression::struct_from(vec![
-            Expression::struct_from(vec![Expression::literal(1), Expression::literal(2)]),
-            Expression::struct_from(vec![Expression::literal(3), Expression::literal(4)]),
+        let expected = Expr::struct_from(vec![
+            Expr::struct_from(vec![Expr::literal(1), Expr::literal(2)]),
+            Expr::struct_from(vec![Expr::literal(3), Expr::literal(4)]),
+        ]);
+        assert_single_row_transform(values, schema, Ok(expected));
+    }
+
+    #[test]
+    fn test_map_and_array() {
+        let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::STRING, false);
+        let map_data = MapData::try_new(map_type.clone(), vec![("k1", "v1")]).unwrap();
+        let array_type = ArrayType::new(DeltaDataTypes::INTEGER, false);
+        let array_data = ArrayData::try_new(array_type.clone(), vec![1, 2]).unwrap();
+        let values: &[Scalar] = &[
+            Scalar::Map(map_data.clone()),
+            Scalar::Array(array_data.clone()),
+        ];
+        let schema = Arc::new(StructType::new([
+            StructField::nullable("map", DeltaDataTypes::Map(Box::new(map_type))),
+            StructField::nullable("array", DeltaDataTypes::Array(Box::new(array_type))),
+        ]));
+        let expected = Expr::struct_from(vec![
+            Expr::literal(Scalar::Map(map_data)),
+            Expr::literal(Scalar::Array(array_data)),
         ]);
         assert_single_row_transform(values, schema, Ok(expected));
     }
@@ -327,16 +356,16 @@ mod tests {
 
         let expected_result = match expected {
             Expected::Noop => {
-                let nested_struct = Expression::struct_from(vec![
-                    Expression::literal(values[0].clone()),
-                    Expression::literal(values[1].clone()),
+                let nested_struct = Expr::struct_from(vec![
+                    Expr::literal(values[0].clone()),
+                    Expr::literal(values[1].clone()),
                 ]);
-                Ok(Expression::struct_from([nested_struct]))
+                Ok(Expr::struct_from([nested_struct]))
             }
-            Expected::Null => Ok(Expression::null_literal(schema.clone().into())),
+            Expected::Null => Ok(Expr::null_literal(schema.clone().into())),
             Expected::NullStruct => {
-                let nested_null = Expression::null_literal(field_x.data_type().clone());
-                Ok(Expression::struct_from([nested_null]))
+                let nested_null = Expr::null_literal(field_x.data_type().clone());
+                Ok(Expr::struct_from([nested_null]))
             }
             Expected::Error => Err(()),
         };

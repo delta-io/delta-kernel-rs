@@ -6,7 +6,7 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use super::log_replay::TableChangesScanData;
+use super::log_replay::TableChangesScanMetadata;
 use crate::actions::visitors::visit_deletion_vector_at;
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_expr, Expression};
@@ -47,17 +47,17 @@ pub(crate) struct CdfScanFile {
 
 pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile);
 
-/// Transforms an iterator of [`TableChangesScanData`] into an iterator of
+/// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
 /// [`CdfScanFile`] by visiting the engine data.
-pub(crate) fn scan_data_to_scan_file(
-    scan_data: impl Iterator<Item = DeltaResult<TableChangesScanData>>,
+pub(crate) fn scan_metadata_to_scan_file(
+    scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
 ) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
-    scan_data
-        .map(|scan_data| -> DeltaResult<_> {
-            let scan_data = scan_data?;
+    scan_metadata
+        .map(|scan_metadata| -> DeltaResult<_> {
+            let scan_metadata = scan_metadata?;
             let callback: CdfScanCallback<Vec<CdfScanFile>> =
                 |context, scan_file| context.push(scan_file);
-            Ok(visit_cdf_scan_files(&scan_data, vec![], callback)?.into_iter())
+            Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_iter())
         }) // Iterator-Result-Iterator
         .flatten_ok() // Iterator-Result
 }
@@ -78,7 +78,7 @@ pub(crate) fn scan_data_to_scan_file(
 /// ## Example
 /// ```ignore
 /// let mut context = [my context];
-/// for res in scan_data { // scan data table_changes_scan.scan_data()
+/// for res in scan_metadata { // scan metadata table_changes_scan.scan_metadata()
 ///     let (data, vector, remove_dv) = res?;
 ///     context = delta_kernel::table_changes::scan_file::visit_cdf_scan_files(
 ///        data.as_ref(),
@@ -89,18 +89,18 @@ pub(crate) fn scan_data_to_scan_file(
 /// }
 /// ```
 pub(crate) fn visit_cdf_scan_files<T>(
-    scan_data: &TableChangesScanData,
+    scan_metadata: &TableChangesScanMetadata,
     context: T,
     callback: CdfScanCallback<T>,
 ) -> DeltaResult<T> {
     let mut visitor = CdfScanFileVisitor {
         callback,
         context,
-        selection_vector: &scan_data.selection_vector,
-        remove_dvs: scan_data.remove_dvs.as_ref(),
+        selection_vector: &scan_metadata.selection_vector,
+        remove_dvs: scan_metadata.remove_dvs.as_ref(),
     };
 
-    visitor.visit_rows_of(scan_data.scan_data.as_ref())?;
+    visitor.visit_rows_of(scan_metadata.scan_metadata.as_ref())?;
     Ok(visitor.context)
 }
 
@@ -172,7 +172,7 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
     }
 }
 
-/// Get the schema that scan rows (from [`TableChanges::scan_data`]) will be returned with.
+/// Get the schema that scan rows (from [`TableChanges::scan_metadata`]) will be returned with.
 pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
     static CDF_SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
         let deletion_vector = StructType::new([
@@ -213,7 +213,7 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
 }
 
 /// Expression to convert an action with `log_schema` into one with
-/// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanData`].
+/// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanMetadata`].
 pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64) -> Expression {
     Expression::struct_from([
         Expression::struct_from([
@@ -230,8 +230,8 @@ pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64)
             column_expr!("cdc.path"),
             Expression::struct_from([column_expr!("cdc.partitionValues")]),
         ]),
-        commit_timestamp.into(),
-        commit_number.into(),
+        Expression::literal(commit_timestamp),
+        Expression::literal(commit_number),
     ])
 }
 
@@ -242,7 +242,7 @@ mod tests {
 
     use itertools::Itertools;
 
-    use super::{scan_data_to_scan_file, CdfScanFile, CdfScanFileType};
+    use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};
     use crate::actions::deletion_vector::DeletionVectorDescriptor;
     use crate::actions::{Add, Cdc, Remove};
     use crate::engine::sync::SyncEngine;
@@ -251,7 +251,7 @@ mod tests {
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::log_replay::table_changes_action_iter;
     use crate::utils::test_utils::{Action, LocalMockTable};
-    use crate::Engine;
+    use crate::Engine as _;
 
     #[tokio::test]
     async fn test_scan_file_visiting() {
@@ -326,25 +326,23 @@ mod tests {
 
         let table_root = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let log_root = table_root.join("_delta_log/").unwrap();
-        let log_segment = LogSegment::for_table_changes(
-            engine.get_file_system_client().as_ref(),
-            log_root,
-            0,
-            None,
-        )
-        .unwrap();
+        let log_segment =
+            LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
+                .unwrap();
         let table_schema = StructType::new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
-        let scan_data = table_changes_action_iter(
+        let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
             log_segment.ascending_commit_files.clone(),
             table_schema.into(),
             None,
         )
         .unwrap();
-        let scan_files: Vec<_> = scan_data_to_scan_file(scan_data).try_collect().unwrap();
+        let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
+            .try_collect()
+            .unwrap();
 
         // Generate the expected [`CdfScanFile`]
         let timestamps = log_segment

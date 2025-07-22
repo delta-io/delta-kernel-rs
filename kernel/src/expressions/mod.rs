@@ -1,25 +1,59 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 
 use itertools::Itertools;
 
 pub use self::column_names::{
-    column_expr, column_name, joined_column_expr, joined_column_name, ColumnName,
+    column_expr, column_name, column_pred, joined_column_expr, joined_column_name, ColumnName,
 };
-pub use self::scalars::{ArrayData, Scalar, StructData};
-use crate::DataType;
+pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+use self::transforms::{ExpressionTransform as _, GetColumnReferences};
+use crate::kernel_predicates::{
+    DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+    IndirectDataSkippingPredicateEvaluator,
+};
+use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
-mod scalars;
-
 pub(crate) mod literal_expression_transform;
+mod scalars;
+pub mod transforms;
 
+pub type ExpressionRef = std::sync::Arc<Expression>;
+pub type PredicateRef = std::sync::Arc<Predicate>;
+
+////////////////////////////////////////////////////////////////////////
+// Operators
+////////////////////////////////////////////////////////////////////////
+
+/// A unary predicate operator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UnaryPredicateOp {
+    /// Unary Is Null
+    IsNull,
+}
+
+/// A binary predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// A binary operator.
-pub enum BinaryOperator {
+pub enum BinaryPredicateOp {
+    /// Comparison Less Than
+    LessThan,
+    /// Comparison Greater Than
+    GreaterThan,
+    /// Comparison Equal
+    Equal,
+    /// Distinct
+    Distinct,
+    /// IN
+    In,
+}
+
+/// A binary expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinaryExpressionOp {
     /// Arithmetic Plus
     Plus,
     /// Arithmetic Minus
@@ -28,142 +62,183 @@ pub enum BinaryOperator {
     Multiply,
     /// Arithmetic Divide
     Divide,
-    /// Comparison Less Than
-    LessThan,
-    /// Comparison Less Than Or Equal
-    LessThanOrEqual,
-    /// Comparison Greater Than
-    GreaterThan,
-    /// Comparison Greater Than Or Equal
-    GreaterThanOrEqual,
-    /// Comparison Equal
-    Equal,
-    /// Comparison Not Equal
-    NotEqual,
-    /// Distinct
-    Distinct,
-    /// IN
-    In,
-    /// NOT IN
-    NotIn,
 }
 
-impl BinaryOperator {
-    /// True if this is a comparison for which NULL input always produces NULL output
-    pub(crate) fn is_null_intolerant_comparison(&self) -> bool {
-        use BinaryOperator::*;
-        match self {
-            Plus | Minus | Multiply | Divide => false, // not a comparison
-            LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual => true,
-            Equal | NotEqual => true,
-            Distinct | In | NotIn => false, // tolerates NULL input
-        }
-    }
-
-    /// Returns `<op2>` (if any) such that `B <op2> A` is equivalent to `A <op> B`.
-    pub(crate) fn commute(&self) -> Option<BinaryOperator> {
-        use BinaryOperator::*;
-        match self {
-            GreaterThan => Some(LessThan),
-            GreaterThanOrEqual => Some(LessThanOrEqual),
-            LessThan => Some(GreaterThan),
-            LessThanOrEqual => Some(GreaterThanOrEqual),
-            Equal | NotEqual | Distinct | Plus | Multiply => Some(*self),
-            In | NotIn | Minus | Divide => None, // not commutative
-        }
-    }
-}
-
+/// A junction (AND/OR) predicate operator.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum VariadicOperator {
+pub enum JunctionPredicateOp {
+    /// Conjunction
     And,
+    /// Disjunction
     Or,
 }
 
-impl VariadicOperator {
-    pub(crate) fn invert(&self) -> VariadicOperator {
-        use VariadicOperator::*;
-        match self {
-            And => Or,
-            Or => And,
-        }
-    }
+/// A kernel-supplied scalar expression evaluator which in particular can convert column references
+/// (i.e. [`Expression::Column`]) to [`Scalar`] values. [`OpaqueExpressionOp::eval_expr_scalar`] and
+/// [`OpaquePredicateOp::eval_pred_scalar`] rely on this evaluator.
+///
+/// If the evaluator produces `None`, it means kernel was unable to evaluate
+/// the input expression. Otherwise, `Some(Scalar)` is the result of that evaluation (possibly
+/// `Scalar::Null` if the output was NULL).
+pub type ScalarExpressionEvaluator<'a> = dyn Fn(&Expression) -> Option<Scalar> + 'a;
+
+/// An opaque expression operation (ie defined and implemented by the engine).
+pub trait OpaqueExpressionOp: DynPartialEq + std::fmt::Debug {
+    /// Succinctly identifies this op
+    fn name(&self) -> &str;
+
+    /// Attempts scalar evaluation of this opaque expression, e.g. for partition pruning.
+    ///
+    /// Implementations can evaluate the child expressions however they see fit, possibly by
+    /// calling back to the provided [`ScalarExpressionEvaluator`],
+    ///
+    /// An output of `Err` indicates that this operation does not support scalar evaluation, or was
+    /// invoked incorrectly (e.g. with the wrong number and/or types of arguments, None input,
+    /// etc); the operation is disqualified from participating in partition pruning.
+    ///
+    /// `Ok(Scalar::Null)` means the operation actually produced a legitimately NULL result.
+    fn eval_expr_scalar(
+        &self,
+        eval_expr: &ScalarExpressionEvaluator<'_>,
+        exprs: &[Expression],
+    ) -> DeltaResult<Scalar>;
 }
 
-impl Display for BinaryOperator {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Plus => write!(f, "+"),
-            Self::Minus => write!(f, "-"),
-            Self::Multiply => write!(f, "*"),
-            Self::Divide => write!(f, "/"),
-            Self::LessThan => write!(f, "<"),
-            Self::LessThanOrEqual => write!(f, "<="),
-            Self::GreaterThan => write!(f, ">"),
-            Self::GreaterThanOrEqual => write!(f, ">="),
-            Self::Equal => write!(f, "="),
-            Self::NotEqual => write!(f, "!="),
-            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
-            // so ideally this would not be used as we use Display for rendering expressions
-            // in our code we take care of this, but theirs might not ...
-            Self::Distinct => write!(f, "DISTINCT"),
-            Self::In => write!(f, "IN"),
-            Self::NotIn => write!(f, "NOT IN"),
-        }
-    }
+/// An opaque predicate operation (ie defined and implemented by the engine).
+pub trait OpaquePredicateOp: DynPartialEq + std::fmt::Debug {
+    /// Succinctly identifies this op
+    fn name(&self) -> &str;
+
+    /// Attempts scalar evaluation of this (possibly inverted) opaque predicate on behalf of a
+    /// [`DirectPredicateEvaluator`], e.g. for partition pruning or to evaluate an opaque data
+    /// skipping predicate produced previously by an [`IndirectDataSkippingPredicateEvaluator`].
+    ///
+    /// Implementations can evaluate the child expressions however they see fit, possibly by calling
+    /// back to the provided [`ScalarExpressionEvaluator`] and/or [`DirectPredicateEvaluator`].
+    ///
+    /// An output of `Err` indicates that this operation does not support scalar evaluation, or was
+    /// invoked incorrectly (e.g. wrong number and/or types of arguments, None input, etc); the
+    /// operation is disqualified from participating in partition pruning and/or data skipping.
+    ///
+    /// `Ok(None)` means the operation actually produced a legitimately NULL output.
+    fn eval_pred_scalar(
+        &self,
+        eval_expr: &ScalarExpressionEvaluator<'_>,
+        eval_pred: &DirectPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
+    ) -> DeltaResult<Option<bool>>;
+
+    /// Evaluates this (possibly inverted) opaque predicate for data skipping on behalf of a
+    /// [`DirectDataSkippingPredicateEvaluator`], e.g. for parquet row group skipping.
+    ///
+    /// Implementations can evaluate the child expressions however they see fit, possibly by
+    /// calling back to the provided [`DirectDataSkippingPredicateEvaluator`].
+    ///
+    /// An output of `None` indicates that this operation does not support evaluation as a data
+    /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
+    /// None input, etc.); the operation is disqualified from participating in row group skipping.
+    fn eval_as_data_skipping_predicate(
+        &self,
+        evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
+    ) -> Option<bool>;
+
+    /// Converts this (possibly inverted) opaque predicate to a data skipping predicate on behalf of
+    /// an [`IndirectDataSkippingPredicateEvaluator`], e.g. for stats-based file pruning.
+    ///
+    /// Implementations can transform the predicate and its child expressions however they see fit,
+    /// possibly by calling back to the owning [`IndirectDataSkippingPredicateEvaluator`].
+    ///
+    /// An output of `None` indicates that this operation does not support conversion to a data
+    /// skipping predicate, or was invoked incorrectly (e.g. wrong number and/or types of arguments,
+    /// None input, etc.); the operation is disqualified from participating in file pruning.
+    //
+    // NOTE: It would be nicer if this method could accept an `Arc<Self>`, in case the data skipping
+    // predicate rewrite can reuse the same operation. But sadly, that would not be dyn-compatible.
+    fn as_data_skipping_predicate(
+        &self,
+        evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+        exprs: &[Expression],
+        inverted: bool,
+    ) -> Option<Predicate>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// A unary operator.
-pub enum UnaryOperator {
-    /// Unary Not
-    Not,
-    /// Unary Is Null
-    IsNull,
-}
+/// A shared reference to an [`OpaqueExpressionOp`] instance.
+pub type OpaqueExpressionOpRef = Arc<dyn OpaqueExpressionOp>;
 
-pub type ExpressionRef = std::sync::Arc<Expression>;
+/// A shared reference to an [`OpaquePredicateOp`] instance.
+pub type OpaquePredicateOpRef = Arc<dyn OpaquePredicateOp>;
+
+////////////////////////////////////////////////////////////////////////
+// Expressions and predicates
+////////////////////////////////////////////////////////////////////////
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct UnaryExpression {
+pub struct UnaryPredicate {
     /// The operator.
-    pub op: UnaryOperator,
-    /// The expression.
+    pub op: UnaryPredicateOp,
+    /// The input expression.
     pub expr: Box<Expression>,
 }
-impl UnaryExpression {
-    fn new(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        let expr = Box::new(expr.into());
-        Self { op, expr }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BinaryExpression {
+pub struct BinaryPredicate {
     /// The operator.
-    pub op: BinaryOperator,
+    pub op: BinaryPredicateOp,
     /// The left-hand side of the operation.
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
     pub right: Box<Expression>,
 }
-impl BinaryExpression {
-    fn new(op: BinaryOperator, left: impl Into<Expression>, right: impl Into<Expression>) -> Self {
-        let left = Box::new(left.into());
-        let right = Box::new(right.into());
-        Self { op, left, right }
-    }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryExpression {
+    /// The operator.
+    pub op: BinaryExpressionOp,
+    /// The left-hand side of the operation.
+    pub left: Box<Expression>,
+    /// The right-hand side of the operation.
+    pub right: Box<Expression>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct VariadicExpression {
+pub struct JunctionPredicate {
     /// The operator.
-    pub op: VariadicOperator,
-    /// The expressions.
+    pub op: JunctionPredicateOp,
+    /// The input predicates.
+    pub preds: Vec<Predicate>,
+}
+
+// NOTE: We have to use `Arc<dyn OpaquePredicateOp>` instead of `Box<dyn OpaquePredicateOp>` because
+// we cannot require `OpaquePredicateOp: Clone` (not a dyn-compatible trait). Instead, we must rely
+// on cheap `Arc` clone, which does not duplicate the inner object.
+#[derive(Clone, Debug)]
+pub struct OpaquePredicate {
+    pub op: OpaquePredicateOpRef,
     pub exprs: Vec<Expression>,
 }
-impl VariadicExpression {
-    fn new(op: VariadicOperator, exprs: Vec<Expression>) -> Self {
+
+impl OpaquePredicate {
+    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+        let exprs = exprs.into_iter().collect();
+        Self { op, exprs }
+    }
+}
+
+// NOTE: We have to use `Arc<dyn OpaqueExpressionOp>` instead of `Box<dyn OpaqueExpressionOp>`
+// because we cannot require `OpaqueExpressionOp: Clone` (not a dyn-compatible trait). Instead, we
+// must rely on cheap `Arc` clone, which does not duplicate the inner object.
+#[derive(Clone, Debug)]
+pub struct OpaqueExpression {
+    pub op: OpaqueExpressionOpRef,
+    pub exprs: Vec<Expression>,
+}
+
+impl OpaqueExpression {
+    fn new(op: OpaqueExpressionOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+        let exprs = exprs.into_iter().collect();
         Self { op, exprs }
     }
 }
@@ -179,73 +254,130 @@ pub enum Expression {
     Literal(Scalar),
     /// A column reference by name.
     Column(ColumnName),
+    /// A predicate treated as a boolean expression
+    Predicate(Box<Predicate>),
     /// A struct computed from a Vec of expressions
     Struct(Vec<Expression>),
-    /// A unary operation.
-    Unary(UnaryExpression),
-    /// A binary operation.
+    /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
-    /// A variadic operation.
-    Variadic(VariadicExpression),
-    // TODO: support more expressions, such as IS IN, LIKE, etc.
+    /// An expression that the engine defines and implements. Kernel interacts with the expression
+    /// only through methods provided by the [`OpaqueExpressionOp`] trait.
+    Opaque(OpaqueExpression),
+    /// An unknown expression (i.e. one that neither kernel nor engine attempts to evaluate). For
+    /// data skipping purposes, kernel treats unknown expressions as if they were literal NULL
+    /// values (which may disable skipping if it "poisons" the predicate), but engines MUST NOT
+    /// attempt to interpret them as NULL when evaluating query filters because it could produce
+    /// incorrect results. For example, converting `WHERE <fancy-udf-invocation> IS NULL` to `WHERE
+    /// <unknown> IS NULL` to `WHERE NULL IS NULL` is equivalent to `WHERE TRUE` and would include
+    /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
+    /// for expressions kernel doesn't understand but which engine can still evaluate.
+    Unknown(String),
 }
 
-impl<T: Into<Scalar>> From<T> for Expression {
-    fn from(value: T) -> Self {
-        Self::literal(value)
-    }
+/// A SQL predicate.
+///
+/// These predicates do not track or validate data types, other than the type
+/// of literals. It is up to the predicate evaluator to validate the
+/// predicate against a schema and add appropriate casts as required.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Predicate {
+    /// A boolean-valued expression, useful for e.g. `AND(<boolean_col1>, <boolean_col2>)`.
+    BooleanExpression(Expression),
+    /// Boolean inversion (true <-> false)
+    ///
+    /// NOTE: NOT is not a normal unary predicate, because it requires a predicate as input (not an
+    /// expression), and is never directly evaluated. Instead, observing that all predicates are
+    /// invertible, NOT is always pushed down into its child predicate, inverting it. For example,
+    /// `NOT (a < b)` pushes down and inverts `<` to `>=`, producing `a >= b`.
+    Not(Box<Predicate>),
+    /// A unary operation.
+    Unary(UnaryPredicate),
+    /// A binary operation.
+    Binary(BinaryPredicate),
+    /// A junction operation (AND/OR).
+    Junction(JunctionPredicate),
+    /// A predicate that the engine defines and implements. Kernel interacts with the predicate
+    /// only through methods provided by the [`OpaquePredicateOp`] trait.
+    Opaque(OpaquePredicate),
+    /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
+    /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
+    /// (which may disable skipping if it "poisons" the predicate), but engines MUST NOT attempt to
+    /// interpret them as NULL when evaluating query filters because it could produce incorrect
+    /// results. For example, converting `WHERE <fancy-udf-invocation>` to `WHERE NULL` is
+    /// equivalent to `WHERE FALSE` and would filter out all rows -- almost certainly NOT what the
+    /// query author intended. Use `Predicate::Opaque` for predicates kernel doesn't understand
+    /// but which engine can still evaluate.
+    Unknown(String),
 }
 
-impl From<ColumnName> for Expression {
-    fn from(value: ColumnName) -> Self {
-        Self::Column(value)
-    }
-}
+////////////////////////////////////////////////////////////////////////
+// Struct/Enum impls
+////////////////////////////////////////////////////////////////////////
 
-impl Display for Expression {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl BinaryPredicateOp {
+    /// True if this is a comparison for which NULL input always produces NULL output
+    pub(crate) fn is_null_intolerant(&self) -> bool {
+        use BinaryPredicateOp::*;
         match self {
-            Self::Literal(l) => write!(f, "{l}"),
-            Self::Column(name) => write!(f, "Column({name})"),
-            Self::Struct(exprs) => write!(
-                f,
-                "Struct({})",
-                &exprs.iter().map(|e| format!("{e}")).join(", ")
-            ),
-            Self::Binary(BinaryExpression {
-                op: BinaryOperator::Distinct,
-                left,
-                right,
-            }) => write!(f, "DISTINCT({left}, {right})"),
-            Self::Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
-            Self::Unary(UnaryExpression { op, expr }) => match op {
-                UnaryOperator::Not => write!(f, "NOT {expr}"),
-                UnaryOperator::IsNull => write!(f, "{expr} IS NULL"),
-            },
-            Self::Variadic(VariadicExpression { op, exprs }) => {
-                let exprs = &exprs.iter().map(|e| format!("{e}")).join(", ");
-                let op = match op {
-                    VariadicOperator::And => "AND",
-                    VariadicOperator::Or => "OR",
-                };
-                write!(f, "{op}({exprs})")
-            }
+            LessThan | GreaterThan | Equal => true,
+            Distinct | In => false, // tolerates NULL input
         }
+    }
+}
+
+impl JunctionPredicateOp {
+    pub(crate) fn invert(&self) -> JunctionPredicateOp {
+        use JunctionPredicateOp::*;
+        match self {
+            And => Or,
+            Or => And,
+        }
+    }
+}
+
+impl UnaryPredicate {
+    fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self { op, expr }
+    }
+}
+
+impl BinaryExpression {
+    fn new(
+        op: BinaryExpressionOp,
+        left: impl Into<Expression>,
+        right: impl Into<Expression>,
+    ) -> Self {
+        let left = Box::new(left.into());
+        let right = Box::new(right.into());
+        Self { op, left, right }
+    }
+}
+
+impl BinaryPredicate {
+    fn new(
+        op: BinaryPredicateOp,
+        left: impl Into<Expression>,
+        right: impl Into<Expression>,
+    ) -> Self {
+        let left = Box::new(left.into());
+        let right = Box::new(right.into());
+        Self { op, left, right }
+    }
+}
+
+impl JunctionPredicate {
+    fn new(op: JunctionPredicateOp, preds: Vec<Predicate>) -> Self {
+        Self { op, preds }
     }
 }
 
 impl Expression {
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
-        let mut set = HashSet::new();
-
-        for expr in self.walk() {
-            if let Self::Column(name) = expr {
-                set.insert(name);
-            }
-        }
-
-        set
+        let mut references = GetColumnReferences::default();
+        let _ = references.transform_expr(self);
+        references.into_inner()
     }
 
     /// Create a new column name expression from input satisfying `FromIterator for ColumnName`.
@@ -261,8 +393,17 @@ impl Expression {
         Self::Literal(value.into())
     }
 
+    /// Creates a NULL literal expression
     pub const fn null_literal(data_type: DataType) -> Self {
         Self::Literal(Scalar::Null(data_type))
+    }
+
+    /// Wraps a predicate as a boolean-valued expression
+    pub fn from_pred(value: Predicate) -> Self {
+        match value {
+            Predicate::BooleanExpression(expr) => expr,
+            _ => Self::Predicate(Box::new(value)),
+        }
     }
 
     /// Create a new struct expression
@@ -270,17 +411,54 @@ impl Expression {
         Self::Struct(exprs.into_iter().collect())
     }
 
-    /// Creates a new unary expression OP expr
-    pub fn unary(op: UnaryOperator, expr: impl Into<Expression>) -> Self {
-        Self::Unary(UnaryExpression {
-            op,
-            expr: Box::new(expr.into()),
-        })
+    /// Create a new predicate `self IS NULL`
+    pub fn is_null(self) -> Predicate {
+        Predicate::is_null(self)
+    }
+
+    /// Create a new predicate `self IS NOT NULL`
+    pub fn is_not_null(self) -> Predicate {
+        Predicate::is_not_null(self)
+    }
+
+    /// Create a new predicate `self == other`
+    pub fn eq(self, other: impl Into<Self>) -> Predicate {
+        Predicate::eq(self, other)
+    }
+
+    /// Create a new predicate `self != other`
+    pub fn ne(self, other: impl Into<Self>) -> Predicate {
+        Predicate::ne(self, other)
+    }
+
+    /// Create a new predicate `self <= other`
+    pub fn le(self, other: impl Into<Self>) -> Predicate {
+        Predicate::le(self, other)
+    }
+
+    /// Create a new predicate `self < other`
+    pub fn lt(self, other: impl Into<Self>) -> Predicate {
+        Predicate::lt(self, other)
+    }
+
+    /// Create a new predicate `self >= other`
+    pub fn ge(self, other: impl Into<Self>) -> Predicate {
+        Predicate::ge(self, other)
+    }
+
+    /// Create a new predicate `self > other`
+    pub fn gt(self, other: impl Into<Self>) -> Predicate {
+        Predicate::gt(self, other)
+    }
+
+    /// Create a new predicate `DISTINCT(self, other)`
+    pub fn distinct(self, other: impl Into<Self>) -> Predicate {
+        Predicate::distinct(self, other)
     }
 
     /// Creates a new binary expression lhs OP rhs
     pub fn binary(
-        op: BinaryOperator,
+        op: BinaryExpressionOp,
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
@@ -291,286 +469,277 @@ impl Expression {
         })
     }
 
-    /// Creates a new variadic expression OP(exprs...)
-    pub fn variadic(op: VariadicOperator, exprs: impl IntoIterator<Item = Self>) -> Self {
-        let exprs = exprs.into_iter().collect::<Vec<_>>();
-        Self::Variadic(VariadicExpression { op, exprs })
+    /// Creates a new opaque expression
+    pub fn opaque(
+        op: impl OpaqueExpressionOp,
+        exprs: impl IntoIterator<Item = Expression>,
+    ) -> Self {
+        Self::Opaque(OpaqueExpression::new(Arc::new(op), exprs))
     }
 
-    /// Creates a new expression AND(exprs...)
-    pub fn and_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::variadic(VariadicOperator::And, exprs)
-    }
-
-    /// Creates a new expression OR(exprs...)
-    pub fn or_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::variadic(VariadicOperator::Or, exprs)
-    }
-
-    /// Create a new expression `self IS NULL`
-    pub fn is_null(self) -> Self {
-        Self::unary(UnaryOperator::IsNull, self)
-    }
-
-    /// Create a new expression `self IS NOT NULL`
-    pub fn is_not_null(self) -> Self {
-        !Self::is_null(self)
-    }
-
-    /// Create a new expression `self == other`
-    pub fn eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::Equal, self, other)
-    }
-
-    /// Create a new expression `self != other`
-    pub fn ne(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::NotEqual, self, other)
-    }
-
-    /// Create a new expression `self <= other`
-    pub fn le(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self < other`
-    pub fn lt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThan, self, other)
-    }
-
-    /// Create a new expression `self >= other`
-    pub fn ge(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self > other`
-    pub fn gt(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThan, self, other)
-    }
-
-    /// Create a new expression `self >= other`
-    pub fn gt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::GreaterThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self <= other`
-    pub fn lt_eq(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::LessThanOrEqual, self, other)
-    }
-
-    /// Create a new expression `self AND other`
-    pub fn and(self, other: impl Into<Self>) -> Self {
-        Self::and_from([self, other.into()])
-    }
-
-    /// Create a new expression `self OR other`
-    pub fn or(self, other: impl Into<Self>) -> Self {
-        Self::or_from([self, other.into()])
-    }
-
-    /// Create a new expression `DISTINCT(self, other)`
-    pub fn distinct(self, other: impl Into<Self>) -> Self {
-        Self::binary(BinaryOperator::Distinct, self, other)
-    }
-
-    fn walk(&self) -> impl Iterator<Item = &Self> + '_ {
-        use Expression::*;
-        let mut stack = vec![self];
-        std::iter::from_fn(move || {
-            let expr = stack.pop()?;
-            match expr {
-                Literal(_) => {}
-                Column { .. } => {}
-                Struct(exprs) => stack.extend(exprs),
-                Unary(UnaryExpression { expr, .. }) => stack.push(expr),
-                Binary(BinaryExpression { left, right, .. }) => {
-                    stack.push(left);
-                    stack.push(right);
-                }
-                Variadic(VariadicExpression { exprs, .. }) => stack.extend(exprs),
-            }
-            Some(expr)
-        })
+    /// Creates a new unknown expression
+    pub fn unknown(name: impl Into<String>) -> Self {
+        Self::Unknown(name.into())
     }
 }
 
-/// Generic framework for recursive bottom-up expression transforms. Transformations return
-/// `Option<Cow>` with the following semantics:
-///
-/// * `Some(Cow::Owned)` -- The input was transformed and the parent should be updated with it.
-/// * `Some(Cow::Borrowed)` -- The input was not transformed.
-/// * `None` -- The input was filtered out and the parent should be updated to not reference it.
-///
-/// The transform can start from the generic [`Self::transform`], or directly from a specific
-/// expression variant (e.g. [`Self::transform_binary`] to start with [`BinaryExpression`]).
-///
-/// The provided `transform_xxx` methods all default to no-op (returning their input as
-/// `Some(Cow::Borrowed)`), and implementations should selectively override specific `transform_xxx`
-/// methods as needed for the task at hand.
-///
-/// The provided `recurse_into_xxx` methods encapsulate the boilerplate work of recursing into the
-/// children of each expression variant. Implementations can call these as needed but will generally
-/// not need to override them.
-pub trait ExpressionTransform<'a> {
-    /// Called for each literal encountered during the expression traversal.
-    fn transform_literal(&mut self, value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
-        Some(Cow::Borrowed(value))
+impl Predicate {
+    /// Returns a set of columns referenced by this predicate.
+    pub fn references(&self) -> HashSet<&ColumnName> {
+        let mut references = GetColumnReferences::default();
+        let _ = references.transform_pred(self);
+        references.into_inner()
     }
 
-    /// Called for each column reference encountered during the expression traversal.
-    fn transform_column(&mut self, name: &'a ColumnName) -> Option<Cow<'a, ColumnName>> {
-        Some(Cow::Borrowed(name))
+    /// Creates a new boolean column reference. See also [`Expression::column`].
+    pub fn column<A>(field_names: impl IntoIterator<Item = A>) -> Predicate
+    where
+        ColumnName: FromIterator<A>,
+    {
+        Self::from_expr(ColumnName::new(field_names))
     }
 
-    /// Called for the expression list of each [`Expression::Struct`] encountered during the
-    /// traversal. Implementations can call [`Self::recurse_into_struct`] if they wish to
-    /// recursively transform child expressions.
-    fn transform_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
-        self.recurse_into_struct(fields)
+    /// Create a new literal boolean value
+    pub const fn literal(value: bool) -> Self {
+        Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
     }
 
-    /// Called for each [`UnaryExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_unary`] if they wish to recursively transform the child.
-    fn transform_unary(&mut self, expr: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
-        self.recurse_into_unary(expr)
+    /// Creates a NULL literal boolean value
+    pub const fn null_literal() -> Self {
+        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
     }
 
-    /// Called for each [`BinaryExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_binary`] if they wish to recursively transform the children.
-    fn transform_binary(
-        &mut self,
-        expr: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
-        self.recurse_into_binary(expr)
-    }
-
-    /// Called for each [`VariadicExpression`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_variadic`] if they wish to recursively transform the children.
-    fn transform_variadic(
-        &mut self,
-        expr: &'a VariadicExpression,
-    ) -> Option<Cow<'a, VariadicExpression>> {
-        self.recurse_into_variadic(expr)
-    }
-
-    /// General entry point for transforming an expression. This method will dispatch to the
-    /// specific transform for each expression variant. Also invoked internally in order to recurse
-    /// on the child(ren) of non-leaf variants.
-    fn transform(&mut self, expr: &'a Expression) -> Option<Cow<'a, Expression>> {
-        use Cow::*;
-        let expr = match expr {
-            Expression::Literal(s) => match self.transform_literal(s)? {
-                Owned(s) => Owned(Expression::Literal(s)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Column(c) => match self.transform_column(c)? {
-                Owned(c) => Owned(Expression::Column(c)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Struct(s) => match self.transform_struct(s)? {
-                Owned(s) => Owned(Expression::Struct(s)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Unary(u) => match self.transform_unary(u)? {
-                Owned(u) => Owned(Expression::Unary(u)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Binary(b) => match self.transform_binary(b)? {
-                Owned(b) => Owned(Expression::Binary(b)),
-                Borrowed(_) => Borrowed(expr),
-            },
-            Expression::Variadic(v) => match self.transform_variadic(v)? {
-                Owned(v) => Owned(Expression::Variadic(v)),
-                Borrowed(_) => Borrowed(expr),
-            },
-        };
-        Some(expr)
-    }
-
-    /// Recursively transforms a struct's child expressions. Returns `None` if all children were
-    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
-        let mut num_borrowed = 0;
-        let new_fields: Vec<_> = fields
-            .iter()
-            .filter_map(|f| self.transform(f))
-            .inspect(|f| {
-                if matches!(f, Cow::Borrowed(_)) {
-                    num_borrowed += 1;
-                }
-            })
-            .collect();
-
-        if new_fields.is_empty() {
-            None // all fields filtered out
-        } else if num_borrowed < fields.len() {
-            // At least one field was changed or filtered out, so make a new field list
-            let fields = new_fields.into_iter().map(|f| f.into_owned()).collect();
-            Some(Cow::Owned(fields))
-        } else {
-            Some(Cow::Borrowed(fields))
+    /// Converts a boolean-valued expression into a predicate
+    pub fn from_expr(expr: impl Into<Expression>) -> Self {
+        match expr.into() {
+            Expression::Predicate(p) => *p,
+            expr => Predicate::BooleanExpression(expr),
         }
     }
 
-    /// Recursively transforms a unary expression's child. Returns `None` if the child was removed,
-    /// `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_unary(&mut self, u: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
-        use Cow::*;
-        let u = match self.transform(&u.expr)? {
-            Owned(expr) => Owned(UnaryExpression::new(u.op, expr)),
-            Borrowed(_) => Borrowed(u),
-        };
-        Some(u)
+    /// Logical NOT (boolean inversion)
+    pub fn not(pred: impl Into<Self>) -> Self {
+        Self::Not(Box::new(pred.into()))
     }
 
-    /// Recursively transforms a binary expression's children. Returns `None` if at least one child
-    /// was removed, `Some(Cow::Owned)` if at least one child changed, and `Some(Cow::Borrowed)`
-    /// otherwise.
-    fn recurse_into_binary(
-        &mut self,
-        b: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
-        use Cow::*;
-        let left = self.transform(&b.left)?;
-        let right = self.transform(&b.right)?;
-        let b = match (&left, &right) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(b),
-            _ => Owned(BinaryExpression::new(
-                b.op,
-                left.into_owned(),
-                right.into_owned(),
-            )),
-        };
-        Some(b)
+    /// Create a new predicate `self IS NULL`
+    pub fn is_null(expr: impl Into<Expression>) -> Predicate {
+        Self::unary(UnaryPredicateOp::IsNull, expr)
     }
 
-    /// Recursively transforms a variadic expression's children. Returns `None` if all children were
-    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_variadic(
-        &mut self,
-        v: &'a VariadicExpression,
-    ) -> Option<Cow<'a, VariadicExpression>> {
-        use Cow::*;
-        let v = match self.recurse_into_struct(&v.exprs)? {
-            Owned(exprs) => Owned(VariadicExpression::new(v.op, exprs)),
-            Borrowed(_) => Borrowed(v),
-        };
-        Some(v)
+    /// Create a new predicate `self IS NOT NULL`
+    pub fn is_not_null(expr: impl Into<Expression>) -> Predicate {
+        Self::not(Self::is_null(expr))
+    }
+
+    /// Create a new predicate `self == other`
+    pub fn eq(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::Equal, a, b)
+    }
+
+    /// Create a new predicate `self != other`
+    pub fn ne(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::not(Self::binary(BinaryPredicateOp::Equal, a, b))
+    }
+
+    /// Create a new predicate `self <= other`
+    pub fn le(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::not(Self::binary(BinaryPredicateOp::GreaterThan, a, b))
+    }
+
+    /// Create a new predicate `self < other`
+    pub fn lt(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::LessThan, a, b)
+    }
+
+    /// Create a new predicate `self >= other`
+    pub fn ge(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::not(Self::binary(BinaryPredicateOp::LessThan, a, b))
+    }
+
+    /// Create a new predicate `self > other`
+    pub fn gt(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::GreaterThan, a, b)
+    }
+
+    /// Create a new predicate `DISTINCT(self, other)`
+    pub fn distinct(a: impl Into<Expression>, b: impl Into<Expression>) -> Self {
+        Self::binary(BinaryPredicateOp::Distinct, a, b)
+    }
+
+    /// Create a new predicate `self AND other`
+    pub fn and(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::and_from([a.into(), b.into()])
+    }
+
+    /// Create a new predicate `self OR other`
+    pub fn or(a: impl Into<Self>, b: impl Into<Self>) -> Self {
+        Self::or_from([a.into(), b.into()])
+    }
+
+    /// Creates a new predicate AND(preds...)
+    pub fn and_from(preds: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionPredicateOp::And, preds)
+    }
+
+    /// Creates a new predicate OR(preds...)
+    pub fn or_from(preds: impl IntoIterator<Item = Self>) -> Self {
+        Self::junction(JunctionPredicateOp::Or, preds)
+    }
+
+    /// Creates a new unary predicate OP expr
+    pub fn unary(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self::Unary(UnaryPredicate { op, expr })
+    }
+
+    /// Creates a new binary predicate lhs OP rhs
+    pub fn binary(
+        op: BinaryPredicateOp,
+        lhs: impl Into<Expression>,
+        rhs: impl Into<Expression>,
+    ) -> Self {
+        Self::Binary(BinaryPredicate {
+            op,
+            left: Box::new(lhs.into()),
+            right: Box::new(rhs.into()),
+        })
+    }
+
+    /// Creates a new junction predicate OP(preds...)
+    pub fn junction(op: JunctionPredicateOp, preds: impl IntoIterator<Item = Self>) -> Self {
+        let preds = preds.into_iter().collect();
+        Self::Junction(JunctionPredicate { op, preds })
+    }
+
+    /// Creates a new opaque predicate
+    pub fn opaque(op: impl OpaquePredicateOp, exprs: impl IntoIterator<Item = Expression>) -> Self {
+        Self::Opaque(OpaquePredicate::new(Arc::new(op), exprs))
+    }
+
+    /// Creates a new unknown predicate
+    pub fn unknown(name: impl Into<String>) -> Self {
+        Self::Unknown(name.into())
     }
 }
 
-impl std::ops::Not for Expression {
-    type Output = Self;
+////////////////////////////////////////////////////////////////////////
+// Trait impls
+////////////////////////////////////////////////////////////////////////
 
-    fn not(self) -> Self {
-        Self::unary(UnaryOperator::Not, self)
+impl PartialEq for OpaquePredicate {
+    fn eq(&self, other: &Self) -> bool {
+        self.op.dyn_eq(other.op.any_ref()) && self.exprs == other.exprs
+    }
+}
+
+impl PartialEq for OpaqueExpression {
+    fn eq(&self, other: &Self) -> bool {
+        self.op.dyn_eq(other.op.any_ref()) && self.exprs == other.exprs
+    }
+}
+
+impl Display for BinaryExpressionOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryExpressionOp::*;
+        match self {
+            Plus => write!(f, "+"),
+            Minus => write!(f, "-"),
+            Multiply => write!(f, "*"),
+            Divide => write!(f, "/"),
+        }
+    }
+}
+
+impl Display for BinaryPredicateOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use BinaryPredicateOp::*;
+        match self {
+            LessThan => write!(f, "<"),
+            GreaterThan => write!(f, ">"),
+            Equal => write!(f, "="),
+            // TODO(roeap): AFAIK DISTINCT does not have a commonly used operator symbol
+            // so ideally this would not be used as we use Display for rendering expressions
+            // in our code we take care of this, but theirs might not ...
+            Distinct => write!(f, "DISTINCT"),
+            In => write!(f, "IN"),
+        }
+    }
+}
+
+// Helper for displaying the children of variadic expressions and predicates
+fn format_child_list<T: Display>(children: &[T]) -> String {
+    children.iter().map(|c| format!("{c}")).join(", ")
+}
+
+impl Display for Expression {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Expression::*;
+        match self {
+            Literal(l) => write!(f, "{l}"),
+            Column(name) => write!(f, "Column({name})"),
+            Predicate(p) => write!(f, "{p}"),
+            Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
+            Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Opaque(OpaqueExpression { op, exprs }) => {
+                write!(f, "{op:?}({})", format_child_list(exprs))
+            }
+            Unknown(name) => write!(f, "<unknown: {name}>"),
+        }
+    }
+}
+
+impl Display for Predicate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use Predicate::*;
+        match self {
+            BooleanExpression(expr) => write!(f, "{expr}"),
+            Not(pred) => write!(f, "NOT({pred})"),
+            Binary(BinaryPredicate {
+                op: BinaryPredicateOp::Distinct,
+                left,
+                right,
+            }) => write!(f, "DISTINCT({left}, {right})"),
+            Binary(BinaryPredicate { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Unary(UnaryPredicate { op, expr }) => match op {
+                UnaryPredicateOp::IsNull => write!(f, "{expr} IS NULL"),
+            },
+            Junction(JunctionPredicate { op, preds }) => {
+                let op = match op {
+                    JunctionPredicateOp::And => "AND",
+                    JunctionPredicateOp::Or => "OR",
+                };
+                write!(f, "{op}({})", format_child_list(preds))
+            }
+            Opaque(OpaquePredicate { op, exprs }) => {
+                write!(f, "{op:?}({})", format_child_list(exprs))
+            }
+            Unknown(name) => write!(f, "<unknown: {name}>"),
+        }
+    }
+}
+
+impl From<Scalar> for Expression {
+    fn from(value: Scalar) -> Self {
+        Self::literal(value)
+    }
+}
+
+impl From<ColumnName> for Expression {
+    fn from(value: ColumnName) -> Self {
+        Self::Column(value)
+    }
+}
+
+impl From<Predicate> for Expression {
+    fn from(value: Predicate) -> Self {
+        Self::from_pred(value)
+    }
+}
+
+impl From<ColumnName> for Predicate {
+    fn from(value: ColumnName) -> Self {
+        Self::from_expr(value)
     }
 }
 
@@ -578,7 +747,7 @@ impl<R: Into<Expression>> std::ops::Add<R> for Expression {
     type Output = Self;
 
     fn add(self, rhs: R) -> Self::Output {
-        Self::binary(BinaryOperator::Plus, self, rhs)
+        Self::binary(BinaryExpressionOp::Plus, self, rhs)
     }
 }
 
@@ -586,7 +755,7 @@ impl<R: Into<Expression>> std::ops::Sub<R> for Expression {
     type Output = Self;
 
     fn sub(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Minus, self, rhs)
+        Self::binary(BinaryExpressionOp::Minus, self, rhs)
     }
 }
 
@@ -594,7 +763,7 @@ impl<R: Into<Expression>> std::ops::Mul<R> for Expression {
     type Output = Self;
 
     fn mul(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Multiply, self, rhs)
+        Self::binary(BinaryExpressionOp::Multiply, self, rhs)
     }
 }
 
@@ -602,210 +771,74 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
     type Output = Self;
 
     fn div(self, rhs: R) -> Self {
-        Self::binary(BinaryOperator::Divide, self, rhs)
-    }
-}
-
-/// An expression "transform" that doesn't actually change the expression at all. Instead, it
-/// measures the maximum depth of a expression, with a depth limit to prevent stack overflow. Useful
-/// for verifying that a expression has reasonable depth before attempting to work with it.
-pub struct ExpressionDepthChecker {
-    depth_limit: usize,
-    max_depth_seen: usize,
-    current_depth: usize,
-    call_count: usize,
-}
-impl ExpressionDepthChecker {
-    /// Depth-checks the given expression against a given depth limit. The return value is the
-    /// largest depth seen, which is capped at one more than the depth limit (indicating the
-    /// recursion was terminated).
-    pub fn check(expr: &Expression, depth_limit: usize) -> usize {
-        Self::check_with_call_count(expr, depth_limit).0
-    }
-
-    // Exposed for testing
-    fn check_with_call_count(expr: &Expression, depth_limit: usize) -> (usize, usize) {
-        let mut checker = Self {
-            depth_limit,
-            max_depth_seen: 0,
-            current_depth: 0,
-            call_count: 0,
-        };
-        checker.transform(expr);
-        (checker.max_depth_seen, checker.call_count)
-    }
-
-    // Triggers the requested recursion only doing so would not exceed the depth limit.
-    fn depth_limited<'a, T: Clone + std::fmt::Debug>(
-        &mut self,
-        recurse: impl FnOnce(&mut Self, &'a T) -> Option<Cow<'a, T>>,
-        arg: &'a T,
-    ) -> Option<Cow<'a, T>> {
-        self.call_count += 1;
-        if self.max_depth_seen < self.current_depth {
-            self.max_depth_seen = self.current_depth;
-            if self.depth_limit < self.current_depth {
-                tracing::warn!(
-                    "Max expression depth {} exceeded by {arg:?}",
-                    self.depth_limit
-                );
-            }
-        }
-        if self.max_depth_seen <= self.depth_limit {
-            self.current_depth += 1;
-            let _ = recurse(self, arg);
-            self.current_depth -= 1;
-        }
-        None
-    }
-}
-impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
-    fn transform_struct(
-        &mut self,
-        fields: &'a Vec<Expression>,
-    ) -> Option<Cow<'a, Vec<Expression>>> {
-        self.depth_limited(Self::recurse_into_struct, fields)
-    }
-
-    fn transform_unary(&mut self, expr: &'a UnaryExpression) -> Option<Cow<'a, UnaryExpression>> {
-        self.depth_limited(Self::recurse_into_unary, expr)
-    }
-
-    fn transform_binary(
-        &mut self,
-        expr: &'a BinaryExpression,
-    ) -> Option<Cow<'a, BinaryExpression>> {
-        self.depth_limited(Self::recurse_into_binary, expr)
-    }
-
-    fn transform_variadic(
-        &mut self,
-        expr: &'a VariadicExpression,
-    ) -> Option<Cow<'a, VariadicExpression>> {
-        self.depth_limited(Self::recurse_into_variadic, expr)
+        Self::binary(BinaryExpressionOp::Divide, self, rhs)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{column_expr, Expression as Expr, ExpressionDepthChecker};
-    use std::ops::Not;
+    use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
 
     #[test]
     fn test_expression_format() {
-        let col_ref = column_expr!("x");
         let cases = [
-            (col_ref.clone(), "Column(x)"),
-            (col_ref.clone().eq(2), "Column(x) = 2"),
-            ((col_ref.clone() - 4).lt(10), "Column(x) - 4 < 10"),
-            ((col_ref.clone() + 4) / 10 * 42, "Column(x) + 4 / 10 * 42"),
+            (column_expr!("x"), "Column(x)"),
             (
-                col_ref.clone().gt_eq(2).and(col_ref.clone().lt_eq(10)),
-                "AND(Column(x) >= 2, Column(x) <= 10)",
+                (column_expr!("x") + Expr::literal(4)) / Expr::literal(10) * Expr::literal(42),
+                "Column(x) + 4 / 10 * 42",
             ),
             (
-                Expr::and_from([
-                    col_ref.clone().gt_eq(2),
-                    col_ref.clone().lt_eq(10),
-                    col_ref.clone().lt_eq(100),
-                ]),
-                "AND(Column(x) >= 2, Column(x) <= 10, Column(x) <= 100)",
+                Expr::struct_from([column_expr!("x"), Expr::literal(2), Expr::literal(10)]),
+                "Struct(Column(x), 2, 10)",
             ),
-            (
-                col_ref.clone().gt(2).or(col_ref.clone().lt(10)),
-                "OR(Column(x) > 2, Column(x) < 10)",
-            ),
-            (col_ref.eq("foo"), "Column(x) = 'foo'"),
         ];
 
         for (expr, expected) in cases {
-            let result = format!("{}", expr);
+            let result = format!("{expr}");
             assert_eq!(result, expected);
         }
     }
 
     #[test]
-    fn test_depth_checker() {
-        let expr = Expr::and_from([
-            Expr::struct_from([
-                Expr::and_from([
-                    Expr::lt(Expr::literal(10), column_expr!("x")),
-                    Expr::or_from([Expr::literal(true), column_expr!("b")]),
-                ]),
-                Expr::literal(true),
-                Expr::not(Expr::literal(true)),
-            ]),
-            Expr::and_from([
-                Expr::not(column_expr!("b")),
-                Expr::gt(Expr::literal(10), column_expr!("x")),
-                Expr::or_from([
-                    Expr::and_from([Expr::not(Expr::literal(true)), Expr::literal(10)]),
-                    Expr::literal(10),
-                ]),
-                Expr::literal(true),
-            ]),
-            Expr::ne(
-                Expr::literal(true),
-                Expr::and_from([Expr::literal(true), column_expr!("b")]),
+    fn test_predicate_format() {
+        let cases = [
+            (column_pred!("x"), "Column(x)"),
+            (column_expr!("x").eq(Expr::literal(2)), "Column(x) = 2"),
+            (
+                (column_expr!("x") - Expr::literal(4)).lt(Expr::literal(10)),
+                "Column(x) - 4 < 10",
             ),
-        ]);
+            (
+                Pred::and(
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                ),
+                "AND(NOT(Column(x) < 2), NOT(Column(x) > 10))",
+            ),
+            (
+                Pred::and_from([
+                    column_expr!("x").ge(Expr::literal(2)),
+                    column_expr!("x").le(Expr::literal(10)),
+                    column_expr!("x").le(Expr::literal(100)),
+                ]),
+                "AND(NOT(Column(x) < 2), NOT(Column(x) > 10), NOT(Column(x) > 100))",
+            ),
+            (
+                Pred::or(
+                    column_expr!("x").gt(Expr::literal(2)),
+                    column_expr!("x").lt(Expr::literal(10)),
+                ),
+                "OR(Column(x) > 2, Column(x) < 10)",
+            ),
+            (
+                column_expr!("x").eq(Expr::literal("foo")),
+                "Column(x) = 'foo'",
+            ),
+        ];
 
-        // Similar to ExpressionDepthChecker::check, but also returns call count
-        let check_with_call_count =
-            |depth_limit| ExpressionDepthChecker::check_with_call_count(&expr, depth_limit);
-
-        // NOTE: The checker ignores leaf nodes!
-
-        // AND
-        //  * STRUCT
-        //    * AND     >LIMIT<
-        //    * NOT
-        //  * AND
-        //  * NE
-        assert_eq!(check_with_call_count(1), (2, 6));
-
-        // AND
-        //  * STRUCT
-        //    * AND
-        //      * LT     >LIMIT<
-        //      * OR
-        //    * NOT
-        //  * AND
-        //  * NE
-        assert_eq!(check_with_call_count(2), (3, 8));
-
-        // AND
-        //  * STRUCT
-        //    * AND
-        //      * LT
-        //      * OR
-        //    * NOT
-        //  * AND
-        //    * NOT
-        //    * GT
-        //    * OR
-        //      * AND
-        //        * NOT     >LIMIT<
-        //  * NE
-        assert_eq!(check_with_call_count(3), (4, 13));
-
-        // Depth limit not hit (full traversal required)
-
-        // AND
-        //  * STRUCT
-        //    * AND
-        //      * LT
-        //      * OR
-        //    * NOT
-        //  * AND
-        //    * NOT
-        //    * GT
-        //    * OR
-        //      * AND
-        //        * NOT
-        //  * NE
-        //    * AND
-        assert_eq!(check_with_call_count(4), (4, 14));
-        assert_eq!(check_with_call_count(5), (4, 14));
+        for (pred, expected) in cases {
+            let result = format!("{pred}");
+            assert_eq!(result, expected);
+        }
     }
 }

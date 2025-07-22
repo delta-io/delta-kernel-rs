@@ -1,7 +1,10 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
-use crate::expressions::{BinaryOperator, ColumnName, Scalar, VariadicOperator};
-use crate::predicates::{DataSkippingPredicateEvaluator, PredicateEvaluatorDefaults};
+use crate::expressions::{
+    BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+};
+use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
+
 use std::cmp::Ordering;
 
 #[cfg(test)]
@@ -27,12 +30,10 @@ pub(crate) trait ParquetStatsProvider {
     fn get_parquet_rowcount_stat(&self) -> i64;
 }
 
-/// Blanket implementation that converts a [`ParquetStatsProvider`] into a
-/// [`DataSkippingPredicateEvaluator`].
+// Blanket implementation for all types that impl ParquetStatsProvider.
 impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
     type Output = bool;
-    type TypedStat = Scalar;
-    type IntStat = i64;
+    type ColumnStat = Scalar;
 
     fn get_min_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Scalar> {
         self.get_parquet_min_stat(col, data_type)
@@ -42,12 +43,12 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         self.get_parquet_max_stat(col, data_type)
     }
 
-    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<i64> {
-        self.get_parquet_nullcount_stat(col)
+    fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Scalar> {
+        self.get_parquet_nullcount_stat(col).map(Scalar::from)
     }
 
-    fn get_rowcount_stat(&self) -> Option<i64> {
-        Some(self.get_parquet_rowcount_stat())
+    fn get_rowcount_stat(&self) -> Option<Scalar> {
+        Some(Scalar::from(self.get_parquet_rowcount_stat()))
     }
 
     fn eval_partial_cmp(
@@ -57,41 +58,52 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
         val: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        PredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
+        KernelPredicateEvaluatorDefaults::partial_cmp_scalars(ord, &col, val, inverted)
     }
 
-    fn eval_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        PredicateEvaluatorDefaults::eval_scalar_is_null(val, inverted)
+    fn eval_pred_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar(val, inverted)
     }
 
-    fn eval_scalar(&self, val: &Scalar, inverted: bool) -> Option<bool> {
-        PredicateEvaluatorDefaults::eval_scalar(val, inverted)
+    fn eval_pred_scalar_is_null(&self, val: &Scalar, inverted: bool) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::eval_pred_scalar_is_null(val, inverted)
     }
 
-    fn eval_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
+    // NOTE: This is nearly identical to the impl for DataSkippingPredicateEvaluator in
+    // data_skipping.rs, except it uses `Scalar` instead of `Expression` and `Predicate`.
+    fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
         let safe_to_skip = match inverted {
             true => self.get_rowcount_stat()?, // all-null
-            false => 0i64,                     // no-null
+            false => Scalar::from(0i64),       // no-null
         };
         Some(self.get_nullcount_stat(col)? != safe_to_skip)
     }
 
-    fn eval_binary_scalars(
+    fn eval_pred_binary_scalars(
         &self,
-        op: BinaryOperator,
+        op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        PredicateEvaluatorDefaults::eval_binary_scalars(op, left, right, inverted)
+        KernelPredicateEvaluatorDefaults::eval_pred_binary_scalars(op, left, right, inverted)
     }
 
-    fn finish_eval_variadic(
+    fn eval_pred_opaque(
         &self,
-        op: VariadicOperator,
-        exprs: impl IntoIterator<Item = Option<bool>>,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expression],
         inverted: bool,
     ) -> Option<bool> {
-        PredicateEvaluatorDefaults::finish_eval_variadic(op, exprs, inverted)
+        op.eval_as_data_skipping_predicate(self, exprs, inverted)
+    }
+
+    fn finish_eval_pred_junction(
+        &self,
+        op: JunctionPredicateOp,
+        preds: &mut dyn Iterator<Item = Option<bool>>,
+        inverted: bool,
+    ) -> Option<bool> {
+        KernelPredicateEvaluatorDefaults::finish_eval_pred_junction(op, preds, inverted)
     }
 }

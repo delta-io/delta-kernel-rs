@@ -2,4 +2,4 @@ error[E0451]: field `ptr` of struct `Handle` is private
   --> tests/invalid-handle-code/private-constructor.rs:10:41
    |
 10 |     let _: Handle<SharedFoo> = Handle { ptr: std::ptr::NonNull::dangling() };
-   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private field
+   |                                         ^^^ private field

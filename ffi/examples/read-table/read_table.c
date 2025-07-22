@@ -61,8 +61,9 @@ void scan_row_callback(
   } else {
     print_diag(" [no stats])\n");
   }
+  KernelStringSlice table_root_slice = { context->table_root, strlen(context->table_root) };
   ExternResultKernelBoolSlice selection_vector_res =
-    selection_vector_from_dv(dv_info, context->engine, context->global_state);
+    selection_vector_from_dv(dv_info, context->engine, table_root_slice);
   if (selection_vector_res.tag != OkKernelBoolSlice) {
     printf("Could not get selection vector from kernel\n");
     exit(-1);
@@ -83,22 +84,28 @@ void scan_row_callback(
   context->partition_values = NULL;
 }
 
-// For each chunk of scan data (which may contain multiple files to scan), kernel will call this
-// function (named do_visit_scan_data to avoid conflict with visit_scan_data exported by kernel)
-void do_visit_scan_data(
-  void* engine_context,
-  ExclusiveEngineData* engine_data,
-  KernelBoolSlice selection_vec,
-  const CTransforms* transforms)
-{
+// For each chunk of scan metadata (which may contain multiple files to scan), kernel will call this
+// function (named do_visit_scan_metadata to avoid conflict with visit_scan_metadata exported by
+// kernel)
+void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_metadata) {
   print_diag("\nScan iterator found some data to read\n  Of this data, here is "
              "a selection vector\n");
-  print_selection_vector("    ", &selection_vec);
+  struct EngineContext* context = engine_context;
+
+  ExternResultKernelBoolSlice selection_vector_res =
+    selection_vector_from_scan_metadata(scan_metadata, context->engine);
+  if (selection_vector_res.tag != OkKernelBoolSlice) {
+    printf("Could not get selection vector from kernel\n");
+    exit(-1);
+  }
+  KernelBoolSlice selection_vector = selection_vector_res.ok;
+  print_selection_vector("    ", &selection_vector);
+
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
-  visit_scan_data(engine_data, selection_vec, transforms, engine_context, scan_row_callback);
-  free_bool_slice(selection_vec);
-  free_engine_data(engine_data);
+  visit_scan_metadata(scan_metadata, engine_context, scan_row_callback);
+  free_bool_slice(selection_vector);
+  free_scan_metadata(scan_metadata);
 }
 
 // Called for each element of the partition StringSliceIterator. We just turn the slice into a
@@ -275,13 +282,15 @@ int main(int argc, char* argv[])
   }
 
   SharedScan* scan = scan_res.ok;
-  SharedGlobalScanState* global_state = get_global_scan_state(scan);
-  SharedSchema* logical_schema = get_global_logical_schema(global_state);
-  SharedSchema* read_schema = get_global_read_schema(global_state);
+
+  char* scan_table_path = scan_table_root(scan, allocate_string);
+  print_diag("Scan table root: %s\n", scan_table_path);
+
+  SharedSchema* logical_schema = scan_logical_schema(scan);
+  SharedSchema* physical_schema = scan_physical_schema(scan);
   struct EngineContext context = {
-    global_state,
     logical_schema,
-    read_schema,
+    physical_schema,
     table_root,
     engine,
     partition_cols,
@@ -291,26 +300,28 @@ int main(int argc, char* argv[])
 #endif
   };
 
-  ExternResultHandleSharedScanDataIterator data_iter_res = kernel_scan_data_init(engine, scan);
-  if (data_iter_res.tag != OkHandleSharedScanDataIterator) {
-    print_error("Failed to construct scan data iterator.", (Error*)data_iter_res.err);
+  ExternResultHandleSharedScanMetadataIterator data_iter_res =
+    scan_metadata_iter_init(engine, scan);
+  if (data_iter_res.tag != OkHandleSharedScanMetadataIterator) {
+    print_error("Failed to construct scan metadata iterator.", (Error*)data_iter_res.err);
     free_error((Error*)data_iter_res.err);
     return -1;
   }
 
-  SharedScanDataIterator* data_iter = data_iter_res.ok;
+  SharedScanMetadataIterator* data_iter = data_iter_res.ok;
 
-  print_diag("\nIterating scan data\n");
+  print_diag("\nIterating scan metadata\n");
 
   // iterate scan files
   for (;;) {
-    ExternResultbool ok_res = kernel_scan_data_next(data_iter, &context, do_visit_scan_data);
+    ExternResultbool ok_res =
+      scan_metadata_next(data_iter, &context, do_visit_scan_metadata);
     if (ok_res.tag != Okbool) {
-      print_error("Failed to iterate scan data.", (Error*)ok_res.err);
+      print_error("Failed to iterate scan metadata.", (Error*)ok_res.err);
       free_error((Error*)ok_res.err);
       return -1;
     } else if (!ok_res.ok) {
-      print_diag("Scan data iterator done\n");
+      print_diag("Scan metadata iterator done\n");
       break;
     }
   }
@@ -323,14 +334,14 @@ int main(int argc, char* argv[])
   context.arrow_context = NULL;
 #endif
 
-  free_kernel_scan_data(data_iter);
+  free_scan_metadata_iter(data_iter);
   free_scan(scan);
   free_schema(logical_schema);
-  free_schema(read_schema);
-  free_global_scan_state(global_state);
+  free_schema(physical_schema);
   free_snapshot(snapshot);
   free_engine(engine);
   free(context.table_root);
+  free(scan_table_path);
   free_partition_list(context.partition_cols);
 
   return 0;

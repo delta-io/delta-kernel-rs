@@ -1,15 +1,13 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
-use crate::expressions::{
-    BinaryExpression, ColumnName, Expression, Scalar, UnaryExpression, VariadicExpression,
-};
+use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
+use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
 use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::file::statistics::Statistics;
 use crate::parquet::schema::types::ColumnDescPtr;
-use crate::predicates::parquet_stats_skipping::ParquetStatsProvider;
-use crate::schema::{DataType, PrimitiveType};
+use crate::schema::{DataType, DecimalType, PrimitiveType};
 use chrono::{DateTime, Days};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::debug;
 
 #[cfg(test)]
@@ -19,10 +17,10 @@ mod tests;
 pub(crate) trait ParquetRowGroupSkipping {
     /// Instructs the parquet reader to perform row group skipping, eliminating any row group whose
     /// stats prove that none of the group's rows can satisfy the given `predicate`.
-    fn with_row_group_filter(self, predicate: &Expression) -> Self;
+    fn with_row_group_filter(self, predicate: &Predicate) -> Self;
 }
 impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
-    fn with_row_group_filter(self, predicate: &Expression) -> Self {
+    fn with_row_group_filter(self, predicate: &Predicate) -> Self {
         let indices = self
             .metadata()
             .row_groups()
@@ -48,7 +46,7 @@ struct RowGroupFilter<'a> {
 
 impl<'a> RowGroupFilter<'a> {
     /// Creates a new row group filter for the given row group and predicate.
-    fn new(row_group: &'a RowGroupMetaData, predicate: &Expression) -> Self {
+    fn new(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> Self {
         Self {
             row_group,
             field_indices: compute_field_indices(row_group.schema_descr().columns(), predicate),
@@ -56,8 +54,8 @@ impl<'a> RowGroupFilter<'a> {
     }
 
     /// Applies a filtering predicate to a row group. Return value false means to skip it.
-    fn apply(row_group: &'a RowGroupMetaData, predicate: &Expression) -> bool {
-        use crate::predicates::PredicateEvaluator as _;
+    fn apply(row_group: &'a RowGroupMetaData, predicate: &Predicate) -> bool {
+        use crate::kernel_predicates::KernelPredicateEvaluator as _;
         RowGroupFilter::new(row_group, predicate).eval_sql_where(predicate) != Some(false)
     }
 
@@ -68,18 +66,15 @@ impl<'a> RowGroupFilter<'a> {
             .map(|&i| self.row_group.column(i).statistics())
     }
 
-    fn decimal_from_bytes(bytes: Option<&[u8]>, precision: u8, scale: u8) -> Option<Scalar> {
+    fn decimal_from_bytes(bytes: Option<&[u8]>, dtype: DecimalType) -> Option<Scalar> {
         // WARNING: The bytes are stored in big-endian order; reverse and then 0-pad to 16 bytes.
         let bytes = bytes.filter(|b| b.len() <= 16)?;
         let mut bytes = Vec::from(bytes);
         bytes.reverse();
         bytes.resize(16, 0u8);
         let bytes: [u8; 16] = bytes.try_into().ok()?;
-        Some(Scalar::Decimal(
-            i128::from_le_bytes(bytes),
-            precision,
-            scale,
-        ))
+        let value = DecimalData::try_new(i128::from_le_bytes(bytes), dtype).ok()?;
+        Some(value.into())
     }
 
     fn timestamp_from_date(days: Option<&i32>) -> Option<Scalar> {
@@ -128,10 +123,14 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.min_opt()?),
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.min_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-            (Decimal(p, s), Statistics::Int32(i)) => Scalar::Decimal(*i.min_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::Int64(i)) => Scalar::Decimal(*i.min_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::FixedLenByteArray(b)) => {
-                Self::decimal_from_bytes(b.min_bytes_opt(), *p, *s)?
+            (Decimal(d), Statistics::Int32(i)) => {
+                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::Int64(i)) => {
+                DecimalData::try_new(*i.min_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::FixedLenByteArray(b)) => {
+                Self::decimal_from_bytes(b.min_bytes_opt(), *d)?
             }
             (Decimal(..), _) => return None,
         };
@@ -170,10 +169,14 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
             (TimestampNtz, Statistics::Int64(s)) => Scalar::TimestampNtz(*s.max_opt()?),
             (TimestampNtz, Statistics::Int32(s)) => Self::timestamp_from_date(s.max_opt())?,
             (TimestampNtz, _) => return None, // TODO: Int96 timestamps
-            (Decimal(p, s), Statistics::Int32(i)) => Scalar::Decimal(*i.max_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::Int64(i)) => Scalar::Decimal(*i.max_opt()? as i128, *p, *s),
-            (Decimal(p, s), Statistics::FixedLenByteArray(b)) => {
-                Self::decimal_from_bytes(b.max_bytes_opt(), *p, *s)?
+            (Decimal(d), Statistics::Int32(i)) => {
+                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::Int64(i)) => {
+                DecimalData::try_new(*i.max_opt()?, *d).ok()?.into()
+            }
+            (Decimal(d), Statistics::FixedLenByteArray(b)) => {
+                Self::decimal_from_bytes(b.max_bytes_opt(), *d)?
             }
             (Decimal(..), _) => return None,
         };
@@ -218,42 +221,26 @@ impl ParquetStatsProvider for RowGroupFilter<'_> {
     }
 }
 
-/// Given a filter expression of interest and a set of parquet column descriptors, build a column ->
-/// index mapping for columns the expression references. This ensures O(1) lookup times, for an
-/// overall O(n) cost to evaluate an expression tree with n nodes.
+/// Given a predicate of interest and a set of parquet column descriptors, build a column ->
+/// index mapping for columns the predicate references. This ensures O(1) lookup times, for an
+/// overall O(n) cost to evaluate a predicate tree with n nodes.
 pub(crate) fn compute_field_indices(
     fields: &[ColumnDescPtr],
-    expression: &Expression,
+    predicate: &Predicate,
 ) -> HashMap<ColumnName, usize> {
-    fn do_recurse(expression: &Expression, cols: &mut HashSet<ColumnName>) {
-        use Expression::*;
-        let mut recurse = |expr| do_recurse(expr, cols); // simplifies the call sites below
-        match expression {
-            Literal(_) => {}
-            Column(name) => cols.extend([name.clone()]), // returns `()`, unlike `insert`
-            Struct(fields) => fields.iter().for_each(recurse),
-            Unary(UnaryExpression { expr, .. }) => recurse(expr),
-            Binary(BinaryExpression { left, right, .. }) => {
-                [left, right].iter().for_each(|e| recurse(e))
-            }
-            Variadic(VariadicExpression { exprs, .. }) => exprs.iter().for_each(recurse),
-        }
-    }
-
     // Build up a set of requested column paths, then take each found path as the corresponding map
     // key (avoids unnecessary cloning).
     //
     // NOTE: If a requested column was not available, it is silently ignored. These missing columns
     // are implied all-null, so we will infer their min/max stats as NULL and nullcount == rowcount.
-    let mut requested_columns = HashSet::new();
-    do_recurse(expression, &mut requested_columns);
+    let mut requested_columns = predicate.references();
     fields
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
             requested_columns
                 .take(f.path().parts())
-                .map(|path| (path, i))
+                .map(|path| (path.clone(), i))
         })
         .collect()
 }

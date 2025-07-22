@@ -8,19 +8,20 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
+use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, ColumnMappingMode, ReaderFeatures,
-    WriterFeatures,
+    column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
+    ColumnMappingMode, ReaderFeature, WriterFeature,
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
+use delta_kernel_derive::internal_api;
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
@@ -32,8 +33,8 @@ use crate::{DeltaResult, Error, Version};
 /// to validate that Metadata and Protocol are correctly formatted and mutually compatible. If
 /// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
 /// table is supported.
-#[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
-#[derive(Debug)]
+#[internal_api]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
     metadata: Metadata,
     protocol: Protocol,
@@ -64,6 +65,7 @@ impl TableConfiguration {
     ///     - Column mapping is the only legacy feature present in kernel. No future delta versions
     ///       will introduce new legacy features.
     /// See: <https://github.com/delta-io/delta-kernel-rs/issues/650>
+    #[internal_api]
     pub(crate) fn try_new(
         metadata: Metadata,
         protocol: Protocol,
@@ -78,6 +80,11 @@ impl TableConfiguration {
 
         // validate column mapping mode -- all schema fields should be correctly (un)annotated
         validate_schema_column_mapping(&schema, column_mapping_mode)?;
+
+        validate_timestamp_ntz_feature_support(&schema, &protocol)?;
+
+        validate_variant_type_feature_support(&schema, &protocol)?;
+
         Ok(Self {
             schema,
             metadata,
@@ -89,51 +96,76 @@ impl TableConfiguration {
         })
     }
 
+    pub(crate) fn try_new_from(
+        table_configuration: &Self,
+        new_metadata: Option<Metadata>,
+        new_protocol: Option<Protocol>,
+        new_version: Version,
+    ) -> DeltaResult<Self> {
+        // simplest case: no new P/M, just return the existing table configuration with new version
+        if new_metadata.is_none() && new_protocol.is_none() {
+            return Ok(Self {
+                version: new_version,
+                ..table_configuration.clone()
+            });
+        }
+
+        // note that while we could pick apart the protocol/metadata updates and validate them
+        // individually, instead we just re-parse so that we can recycle the try_new validation
+        // (instead of duplicating it here).
+        Self::try_new(
+            new_metadata.unwrap_or_else(|| table_configuration.metadata.clone()),
+            new_protocol.unwrap_or_else(|| table_configuration.protocol.clone()),
+            table_configuration.table_root.clone(),
+            new_version,
+        )
+    }
+
     /// The [`Metadata`] for this table at this version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
     /// The [`Protocol`] of this table at this version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn protocol(&self) -> &Protocol {
         &self.protocol
     }
 
     /// The logical schema ([`SchemaRef`]) of this table at this version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
     /// The [`TableProperties`] of this table at this version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn table_properties(&self) -> &TableProperties {
         &self.table_properties
     }
 
     /// The [`ColumnMappingMode`] for this table at this version.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.column_mapping_mode
     }
 
     /// The [`Url`] of the table this [`TableConfiguration`] belongs to
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn table_root(&self) -> &Url {
         &self.table_root
     }
 
     /// The [`Version`] which this [`TableConfiguration`] belongs to.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn version(&self) -> Version {
         self.version
     }
 
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         self.protocol.ensure_write_supported()?;
 
@@ -154,10 +186,10 @@ impl TableConfiguration {
     /// See the documentation of [`TableChanges`] for more details.
     ///
     /// [`TableChanges`]: crate::table_changes::TableChanges
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<HashSet<ReaderFeatures>> =
-            LazyLock::new(|| HashSet::from([ReaderFeatures::DeletionVectors]));
+        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
+            LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {
@@ -184,16 +216,16 @@ impl TableConfiguration {
     /// both the protocol's readerFeatures and writerFeatures.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         let read_supported = self
             .protocol()
-            .has_reader_feature(&ReaderFeatures::DeletionVectors)
+            .has_reader_feature(&ReaderFeature::DeletionVectors)
             && self.protocol.min_reader_version() == 3;
         let write_supported = self
             .protocol()
-            .has_writer_feature(&WriterFeatures::DeletionVectors)
+            .has_writer_feature(&WriterFeature::DeletionVectors)
             && self.protocol.min_writer_version() == 7;
         read_supported && write_supported
     }
@@ -203,7 +235,7 @@ impl TableConfiguration {
     /// table property is set to `true`.
     ///
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[cfg_attr(feature = "developer-visibility", visibility::make(pub))]
+    #[internal_api]
     #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
         self.is_deletion_vector_supported()
@@ -215,12 +247,12 @@ impl TableConfiguration {
 
     /// Returns `true` if the table supports the appendOnly table feature. To support this feature:
     /// - The table must have a writer version between 2 and 7 (inclusive)
-    /// - If the table is on writer version 7, it must have the [`WriterFeatures::AppendOnly`]
+    /// - If the table is on writer version 7, it must have the [`WriterFeature::AppendOnly`]
     ///   writer feature.
     pub(crate) fn is_append_only_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::AppendOnly) => true,
+            7 if protocol.has_writer_feature(&WriterFeature::AppendOnly) => true,
             version => (2..=6).contains(&version),
         }
     }
@@ -234,8 +266,80 @@ impl TableConfiguration {
     pub(crate) fn is_invariants_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeatures::Invariants) => true,
+            7 if protocol.has_writer_feature(&WriterFeature::Invariants) => true,
             version => (2..=6).contains(&version),
+        }
+    }
+
+    /// Returns `true` if V2 checkpoint is supported on this table. To support V2 checkpoint,
+    /// a table must support reader version 3, writer version 7, and the v2Checkpoint feature in
+    /// both the protocol's readerFeatures and writerFeatures.
+    ///
+    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-checkpoint-table-feature>
+    pub(crate) fn is_v2_checkpoint_write_supported(&self) -> bool {
+        let read_supported = self
+            .protocol()
+            .has_reader_feature(&ReaderFeature::V2Checkpoint);
+        let write_supported = self
+            .protocol()
+            .has_writer_feature(&WriterFeature::V2Checkpoint);
+        read_supported && write_supported
+    }
+
+    /// Returns `true` if the table supports writing in-commit timestamps.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7
+    /// - Have the [`WriterFeature::InCommitTimestamp`] writer feature.
+    #[allow(unused)]
+    pub(crate) fn is_in_commit_timestamps_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::InCommitTimestamp)
+    }
+
+    /// Returns `true` if in-commit timestamps is supported and it is enabled. In-commit timestamps
+    /// is enabled when the `delta.enableInCommitTimestamps` configuration is set to `true`.
+    #[allow(unused)]
+    pub(crate) fn is_in_commit_timestamps_enabled(&self) -> bool {
+        self.is_in_commit_timestamps_supported()
+            && self
+                .table_properties()
+                .enable_in_commit_timestamps
+                .unwrap_or(false)
+    }
+
+    /// If in-commit timestamps is enabled, returns a tuple of the in-commit timestamp enablement
+    /// version and timestamp.
+    ///
+    /// If in-commit timestamps is not supported, or not enabled, this returns `None`.
+    /// If in-commit timestams is enabled, but the enablement version or timestamp is not present,
+    /// this returns an error.
+    #[allow(unused)]
+    pub(crate) fn in_commit_timestamp_enablement(&self) -> DeltaResult<Option<(Version, i64)>> {
+        if !self.is_in_commit_timestamps_enabled() {
+            return Ok(None);
+        }
+        let enablement_version = self
+            .table_properties()
+            .in_commit_timestamp_enablement_version;
+        let enablement_timestamp = self
+            .table_properties()
+            .in_commit_timestamp_enablement_timestamp;
+
+        let ict_error = |err: &str| {
+            Error::generic(format!(
+                "In-commit timestamp enabled, but missing Enablement version or timestamp. {err}"
+            ))
+        };
+        match (enablement_version, enablement_timestamp) {
+            (Some(version), Some(timestamp)) => Ok(Some((version, timestamp))),
+            (Some(_), None) => Err(ict_error("Enablement timestamp is not present")),
+            (None, Some(_)) => Err(ict_error("Enablement version is not present")),
+            (None, None) => Err(ict_error(
+                "Enablement version and timestamp are not present.",
+            )),
         }
     }
 }
@@ -247,7 +351,9 @@ mod test {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
-    use crate::table_features::{ReaderFeatures, WriterFeatures};
+    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_properties::TableProperties;
+    use crate::Error;
 
     use super::TableConfiguration;
 
@@ -264,8 +370,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -290,14 +396,83 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::DeletionVectors]),
-            Some([WriterFeatures::DeletionVectors]),
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_deletion_vector_supported());
         assert!(table_config.is_deletion_vector_enabled());
+    }
+    #[test]
+    fn ict_supported_and_enabled() {
+        let metadata = Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            configuration: HashMap::from_iter([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            ),
+                ("delta.inCommitTimestampEnablementVersion".to_string(), "5".to_string()),
+                ("delta.inCommitTimestampEnablementTimestamp".to_string(), "100".to_string())]),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(table_config.is_in_commit_timestamps_enabled());
+        let enablement = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(enablement, Some((5, 100)))
+    }
+    #[test]
+    fn ict_supported_and_enabled_without_enablement_info() {
+        let metadata = Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            configuration: HashMap::from_iter([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(matches!(
+                table_config.in_commit_timestamp_enablement(),
+                Err(Error::Generic(msg)) if msg.contains("Enablement version and timestamp are not present.")));
+    }
+    #[test]
+    fn ict_supported_and_not_enabled() {
+        let metadata = Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(!table_config.is_in_commit_timestamps_enabled());
     }
     #[test]
     fn fails_on_unsupported_feature() {
@@ -323,13 +498,185 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeatures::TimestampWithoutTimezone]),
-            Some([WriterFeatures::TimestampWithoutTimezone]),
+            Some([ReaderFeature::TimestampWithoutTimezone]),
+            Some([WriterFeature::TimestampWithoutTimezone]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(!table_config.is_deletion_vector_supported());
         assert!(!table_config.is_deletion_vector_enabled());
+    }
+
+    #[test]
+    fn test_try_new_from() {
+        let schema_string =r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string();
+        let metadata = Metadata {
+            configuration: HashMap::from_iter([(
+                "delta.enableChangeDataFeed".to_string(),
+                "true".to_string(),
+            )]),
+            schema_string: schema_string.clone(),
+            ..Default::default()
+        };
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+
+        let new_metadata = Metadata {
+            configuration: HashMap::from_iter([
+                (
+                    "delta.enableChangeDataFeed".to_string(),
+                    "false".to_string(),
+                ),
+                (
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+            schema_string,
+            ..Default::default()
+        };
+        let new_protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors, ReaderFeature::V2Checkpoint]),
+            Some([
+                WriterFeature::DeletionVectors,
+                WriterFeature::V2Checkpoint,
+                WriterFeature::AppendOnly,
+            ]),
+        )
+        .unwrap();
+        let new_version = 1;
+        let new_table_config = TableConfiguration::try_new_from(
+            &table_config,
+            Some(new_metadata.clone()),
+            Some(new_protocol.clone()),
+            new_version,
+        )
+        .unwrap();
+
+        assert_eq!(new_table_config.version(), new_version);
+        assert_eq!(new_table_config.metadata(), &new_metadata);
+        assert_eq!(new_table_config.protocol(), &new_protocol);
+        assert_eq!(new_table_config.schema(), table_config.schema());
+        assert_eq!(
+            new_table_config.table_properties(),
+            &TableProperties {
+                enable_change_data_feed: Some(false),
+                enable_deletion_vectors: Some(true),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            new_table_config.column_mapping_mode(),
+            table_config.column_mapping_mode()
+        );
+        assert_eq!(new_table_config.table_root(), table_config.table_root());
+    }
+
+    #[test]
+    fn test_timestamp_ntz_validation_integration() {
+        // Schema with TIMESTAMP_NTZ column
+        let schema_string = r#"{"type":"struct","fields":[{"name":"ts","type":"timestamp_ntz","nullable":true,"metadata":{}}]}"#.to_string();
+        let metadata = Metadata {
+            schema_string,
+            ..Default::default()
+        };
+
+        let protocol_without_timestamp_ntz_features = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
+        )
+        .unwrap();
+
+        let protocol_with_timestamp_ntz_features = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::TimestampWithoutTimezone]),
+            Some([WriterFeature::TimestampWithoutTimezone]),
+        )
+        .unwrap();
+
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result = TableConfiguration::try_new(
+            metadata.clone(),
+            protocol_without_timestamp_ntz_features,
+            table_root.clone(),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "Should fail when TIMESTAMP_NTZ is used without required features"
+        );
+        assert!(result.unwrap_err().to_string().contains("timestampNtz"));
+
+        let result = TableConfiguration::try_new(
+            metadata,
+            protocol_with_timestamp_ntz_features,
+            table_root,
+            0,
+        );
+        assert!(
+            result.is_ok(),
+            "Should succeed when TIMESTAMP_NTZ is used with required features"
+        );
+    }
+
+    #[test]
+    fn test_variant_validation_integration() {
+        // Schema with VARIANT column
+        let schema_string = r#"{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}"#.to_string();
+        let metadata = Metadata {
+            schema_string,
+            ..Default::default()
+        };
+
+        let protocol_without_variant_features = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some::<Vec<String>>(vec![]),
+        )
+        .unwrap();
+
+        let protocol_with_variant_features = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::VariantType]),
+            Some([WriterFeature::VariantType]),
+        )
+        .unwrap();
+
+        let table_root = Url::try_from("file:///").unwrap();
+
+        let result: Result<TableConfiguration, Error> = TableConfiguration::try_new(
+            metadata.clone(),
+            protocol_without_variant_features,
+            table_root.clone(),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "Should fail when VARIANT is used without required features"
+        );
+        assert!(result.unwrap_err().to_string().contains("variantType"));
+
+        let result =
+            TableConfiguration::try_new(metadata, protocol_with_variant_features, table_root, 0);
+        assert!(
+            result.is_ok(),
+            "Should succeed when VARIANT is used with required features"
+        );
     }
 }
