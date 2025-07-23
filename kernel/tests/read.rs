@@ -1341,3 +1341,12 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }
+
+#[test]
+fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = include!("data/unshredded-variant.expected.in");
+    let test_name = "unshredded-variant";
+    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}
