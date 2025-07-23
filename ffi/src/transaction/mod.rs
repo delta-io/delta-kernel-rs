@@ -3,8 +3,8 @@ mod write_context;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::unwrap_and_parse_path_as_url;
 use crate::KernelStringSlice;
+use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
 use delta_kernel::transaction::{CommitResult, Transaction};
@@ -60,13 +60,14 @@ pub unsafe extern "C" fn free_transaction(txn: Handle<ExclusiveTransaction>) {
 ///
 /// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION and commit info
 #[no_mangle]
-pub unsafe extern "C" fn with_commit_info(
+pub unsafe extern "C" fn with_engine_info(
     txn: Handle<ExclusiveTransaction>,
-    commit_info: Handle<ExclusiveEngineData>,
+    engine_info: KernelStringSlice,
 ) -> Handle<ExclusiveTransaction> {
     let txn = unsafe { txn.into_inner() };
-    let commit_info = unsafe { commit_info.into_inner() };
-    Box::new(txn.with_commit_info(commit_info)).into()
+    let info_string: DeltaResult<&str> =
+        unsafe { TryFromStringSlice::try_from_slice(&engine_info) };
+    Box::new(txn.with_engine_info(info_string.unwrap())).into()
 }
 
 /// Add file metadata to the transaction for files that have been written. The metadata contains
@@ -105,7 +106,10 @@ pub unsafe extern "C" fn commit(
     // TODO: for now this removes the enum, which prevents doing any conflict resolution. We should fix
     //       this by making the commit function return the enum somehow.
     match txn.commit(engine.as_ref()) {
-        Ok(CommitResult::Committed(v)) => Ok(v),
+        Ok(CommitResult::Committed {
+            version: v,
+            post_commit_stats: _,
+        }) => Ok(v),
         Ok(CommitResult::Conflict(_, v)) => Err(delta_kernel::Error::Generic(format!(
             "commit conflict at version {v}"
         ))),
@@ -147,7 +151,7 @@ mod tests {
         json_string: &str,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
         let cursor = std::io::Cursor::new(json_string.as_bytes());
-        let mut reader = arrow_json::reader::ReaderBuilder::new(schema.into())
+        let mut reader = delta_kernel::arrow::json::reader::ReaderBuilder::new(schema.into())
             .build(cursor)
             .unwrap();
         let batch = reader.next().unwrap().unwrap();
@@ -160,33 +164,6 @@ mod tests {
             array: out_array,
             schema: out_schema,
         })
-    }
-
-    fn new_commit_info() -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        // create commit info of the form {engineCommitInfo: Map { "engineInfo": "default engine" } }
-        let schema = ArrowSchema::new(vec![Field::new(
-            "engineCommitInfo",
-            ArrowDataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    ArrowDataType::Struct(
-                        vec![
-                            Field::new("key", ArrowDataType::Utf8, false),
-                            Field::new("value", ArrowDataType::Utf8, true),
-                        ]
-                        .into(),
-                    ),
-                    false,
-                )),
-                false,
-            ),
-            false,
-        )]);
-
-        create_arrow_ffi_from_json(
-            schema,
-            r#"{"engineCommitInfo":{"engineInfo" :"default engine"}}"#,
-        )
     }
 
     fn create_file_metadata(
@@ -250,20 +227,6 @@ mod tests {
         create_file_metadata(file_path, res.num_rows)
     }
 
-    unsafe fn add_commit_info_to_transaction(
-        txn: Handle<ExclusiveTransaction>,
-        engine: &Handle<SharedExternEngine>,
-        commit_info: ArrowFFIData,
-    ) -> Handle<ExclusiveTransaction> {
-        // Construct the commit info by going through the ffi format
-        let commit_info_engine_data = ok_or_panic(get_engine_data(
-            commit_info.array,
-            &commit_info.schema,
-            engine.shallow_copy(),
-        ));
-        with_commit_info(txn, commit_info_engine_data)
-    }
-
     #[tokio::test]
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(StructType::new(vec![
@@ -295,11 +258,12 @@ mod tests {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
 
-            // Add some empty commit info
-            let txn_with_commit_info =
-                unsafe { add_commit_info_to_transaction(txn, &engine, new_commit_info()?) };
+            // Add engine info
+            let engine_info = "default_engine";
+            let engine_info_kernel_string = kernel_string_slice!(engine_info);
+            let txn_with_engine_info = unsafe { with_engine_info(txn, engine_info_kernel_string) };
 
-            let write_context = unsafe { get_write_context(txn_with_commit_info.shallow_copy()) };
+            let write_context = unsafe { get_write_context(txn_with_engine_info.shallow_copy()) };
 
             // TODO: write separate test for properly testing the write schema
             let write_schema = unsafe { get_write_schema(write_context.shallow_copy()) };
@@ -336,9 +300,9 @@ mod tests {
                 get_engine_data(file_info.array, &file_info.schema, engine.shallow_copy())
             });
 
-            unsafe { add_files(txn_with_commit_info.shallow_copy(), file_info_engine_data) };
+            unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
 
-            ok_or_panic(unsafe { commit(txn_with_commit_info, engine.shallow_copy()) });
+            ok_or_panic(unsafe { commit(txn_with_engine_info, engine.shallow_copy()) });
 
             // Confirm that the data matches what we appended
             let test_batch = ArrowEngineData::from(batch);

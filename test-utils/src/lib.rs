@@ -203,8 +203,7 @@ pub fn engine_store_setup(
         ),
         Some(dir) => (
             Arc::new(LocalFileSystem::new()),
-            Url::parse(format!("{dir}kernel_write_tests/{table_name}/").as_str())
-                .expect("valid url"),
+            Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
     let executor = Arc::new(TokioBackgroundExecutor::new());
@@ -291,6 +290,7 @@ pub async fn create_table(
 
     // put 0.json with protocol + metadata
     let path = table_path.join("_delta_log/00000000000000000000.json")?;
+
     store
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
