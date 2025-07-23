@@ -122,9 +122,9 @@ projects.
 
 There are a few key concepts that will help in understanding kernel:
 
-1. The `Engine` trait encapsulates all the functionality and engine or connector needs to provide to
+1. The `Engine` trait encapsulates all the functionality an engine or connector needs to provide to
    the Delta Kernel in order to read/write the Delta table.
-2. The `DefaultEngine` is our default implementation of the the above trait. It lives in
+2. The `DefaultEngine` is our default implementation of the above trait. It lives in
    `engine/default`, and provides a reference implementation for all `Engine`
    functionality. `DefaultEngine` uses [arrow](https://docs.rs/arrow/latest/arrow/) as its in-memory
    data format.
@@ -153,7 +153,7 @@ Some design principles which should be considered:
 - If using `emacs`, both [eglot](https://github.com/joaotavora/eglot) and
   [lsp-mode](https://github.com/emacs-lsp/lsp-mode) provide excellent integration with
   `rust-analyzer`. [rustic](https://github.com/brotzeit/rustic) is a nice mode as well.
-- When also developing in vscode its sometimes convenient to configure rust-analyzer in
+- When also developing in VS Code it's sometimes convenient to configure rust-analyzer in
   `.vscode/settings.json`.
 
 ```json
