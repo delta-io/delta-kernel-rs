@@ -5,8 +5,11 @@ use std::collections::{HashMap, HashSet};
 
 use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
 
+use delta_kernel_derive::internal_api;
+
 /// Converts a type to a [`DataType`]. Implemented for the primitive types and automatically derived
 /// for all types that implement [`ToSchema`].
+#[internal_api]
 pub(crate) trait ToDataType {
     fn to_data_type() -> DataType;
 }
@@ -66,6 +69,7 @@ impl<K: ToDataType, V: ToDataType> ToDataType for HashMap<K, V> {
 /// The [`delta_kernel_derive::ToSchema`] macro uses this to convert a struct field's name + type
 /// into a `StructField` definition. A blanket impl for `Option<T: ToDataType>` supports nullable
 /// struct fields, which otherwise default to non-nullable.
+#[internal_api]
 pub(crate) trait GetStructField {
     fn get_struct_field(name: impl Into<String>) -> StructField;
 }
@@ -101,6 +105,7 @@ impl<K: ToDataType, V: ToDataType> ToNullableContainerType for HashMap<K, V> {
 // The [`delta_kernel_derive::ToSchema`] macro uses this to convert a struct field's name + type
 // into a `StructField` definition for a container with nullable values, when the struct field was
 // annotated with the `allow_null_container_values` attribute.
+#[internal_api]
 pub(crate) trait GetNullableContainerStructField {
     fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField;
 }
