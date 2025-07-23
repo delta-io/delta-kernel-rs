@@ -67,6 +67,8 @@
 /// cannot invoke the macro because `delta_kernel` is an unknown crate identifier (you have to use
 /// `crate` instead). We could make the macro use `crate::schema::DataType` instead, but then the
 /// macro is useless outside the `delta_kernel` crate.
+// TODO: when running `cargo package -p delta_kernel` this gives 'unused' warning - #1095
+#[allow(unused_extern_crates)]
 extern crate self as delta_kernel;
 
 use std::any::Any;
