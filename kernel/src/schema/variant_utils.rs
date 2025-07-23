@@ -1,20 +1,11 @@
 //! Utility functions for the variant type and variant-related table features.
 
 use crate::actions::Protocol;
-use crate::schema::{DataType, Schema, SchemaTransform, StructField};
+use crate::schema::{DataType, Schema, SchemaTransform};
 use crate::table_features::{ReaderFeature, WriterFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use std::borrow::Cow;
-
-// TODO (@zachschuermann): Replace this with the public unshredded_variant_schema public API so it
-// is easy for engines to directly use.
-pub(crate) fn unshredded_variant_schema() -> DataType {
-    DataType::variant_type([
-        StructField::not_null("metadata", DataType::BINARY),
-        StructField::not_null("value", DataType::BINARY),
-    ])
-}
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
 #[derive(Debug, Default)]
@@ -60,7 +51,7 @@ mod tests {
     #[test]
     fn test_is_unshredded_variant() {
         fn is_unshredded_variant(s: &DataType) -> bool {
-            s == &unshredded_variant_schema()
+            s == &DataType::unshredded_variant()
         }
         assert!(!is_unshredded_variant(&DataType::variant_type([
             StructField::not_null("metadata", DataType::BINARY),
@@ -84,7 +75,7 @@ mod tests {
         ];
         let schema_with_variant = StructType::new([
             StructField::new("id", DataType::INTEGER, false),
-            StructField::new("v", unshredded_variant_schema(), true),
+            StructField::new("v", DataType::unshredded_variant(), true),
         ]);
 
         let schema_without_variant = StructType::new([
@@ -99,7 +90,7 @@ mod tests {
                 "nested",
                 DataType::Struct(Box::new(StructType::new([StructField::new(
                     "inner_v",
-                    unshredded_variant_schema(),
+                    DataType::unshredded_variant(),
                     true,
                 )]))),
                 true,

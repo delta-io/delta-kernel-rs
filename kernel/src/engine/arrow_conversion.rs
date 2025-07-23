@@ -7,7 +7,6 @@ use crate::arrow::datatypes::{
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::schema::variant_utils::unshredded_variant_schema;
 use itertools::Itertools;
 
 use crate::error::Error;
@@ -163,7 +162,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                 false,
             )),
             DataType::Variant(s) => {
-                if *t == unshredded_variant_schema() {
+                if *t == DataType::unshredded_variant() {
                     Ok(ArrowDataType::Struct(
                         s.fields()
                             .map(TryIntoArrow::try_into_arrow)
@@ -325,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_variant_shredded_type_fail() -> DeltaResult<()> {
-        let unshredded_variant = unshredded_variant_schema();
+        let unshredded_variant = DataType::unshredded_variant();
         let unshredded_variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant)?;
         assert!(unshredded_variant_arrow == unshredded_variant_arrow_type());
         let shredded_variant = DataType::variant_type([

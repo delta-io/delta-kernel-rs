@@ -771,14 +771,6 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// TODO (@zachschuermann): Replace this with the public unshredded_variant_schema public API.
-fn unshredded_variant_schema() -> DataType {
-    DataType::variant_type([
-        StructField::not_null("metadata", DataType::BINARY),
-        StructField::not_null("value", DataType::BINARY),
-    ])
-}
-
 #[tokio::test]
 async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -798,7 +790,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a table with VARIANT column
     let table_schema = Arc::new(StructType::new(vec![
-        StructField::nullable("v", unshredded_variant_schema())
+        StructField::nullable("v", DataType::unshredded_variant())
             .with_metadata([("delta.columnMapping.physicalName", "col1")])
             .add_metadata([("delta.columnMapping.id", 1)]),
         StructField::nullable("i", DataType::INTEGER)
@@ -819,7 +811,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     ]));
 
     let write_schema = Arc::new(StructType::new(vec![
-        StructField::nullable("col1", unshredded_variant_schema()),
+        StructField::nullable("col1", DataType::unshredded_variant()),
         StructField::nullable("col2", DataType::INTEGER),
         StructField::nullable(
             "col3",
@@ -878,7 +870,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let value_nested_v_array = Arc::new(BinaryArray::from(value_nested_v)) as ArrayRef;
     let metadata_nested_v_array = Arc::new(BinaryArray::from(metadata_nested_v)) as ArrayRef;
 
-    let variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant_schema()).unwrap();
+    let variant_arrow = ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap();
     let variant_arrow_flipped = variant_arrow_type_flipped();
 
     let i_values = vec![31, 32, 33];
@@ -971,13 +963,13 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // The scanned data will match the logical schema, not the physical one
     let expected_schema = Arc::new(StructType::new(vec![
-        StructField::nullable("v", unshredded_variant_schema()),
+        StructField::nullable("v", DataType::unshredded_variant()),
         StructField::nullable("i", DataType::INTEGER),
         StructField::nullable(
             "nested",
             StructType::new(vec![StructField::nullable(
                 "nested_v",
-                unshredded_variant_schema(),
+                DataType::unshredded_variant(),
             )]),
         ),
     ]));
@@ -989,7 +981,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         Some(null_bitmap),
     )?);
     let variant_arrow_type: ArrowDataType =
-        ArrowDataType::try_from_kernel(&unshredded_variant_schema()).unwrap();
+        ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap();
     let expected_data = RecordBatch::try_new(
         Arc::new(expected_schema.as_ref().try_into_arrow()?),
         vec![
@@ -1020,7 +1012,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let _ = tracing_subscriber::fmt::try_init();
     let table_schema = Arc::new(StructType::new(vec![StructField::nullable(
         "v",
-        unshredded_variant_schema(),
+        DataType::unshredded_variant(),
     )]));
 
     // The table will be attempted to be written in this form but be read into

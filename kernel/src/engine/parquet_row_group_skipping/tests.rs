@@ -2,7 +2,6 @@ use super::*;
 use crate::expressions::{column_name, column_pred};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
-use crate::schema::variant_utils::unshredded_variant_schema;
 use crate::Predicate;
 use std::fs::File;
 
@@ -215,7 +214,10 @@ fn test_get_stat_values() {
     // Read a random column as Variant. The actual read does not need to be performed, as stats on
     // Variant should always return None.
     assert_eq!(
-        filter.get_min_stat(&column_name!("chrono.date32"), &unshredded_variant_schema()),
+        filter.get_min_stat(
+            &column_name!("chrono.date32"),
+            &DataType::unshredded_variant()
+        ),
         None
     );
 
@@ -394,7 +396,10 @@ fn test_get_stat_values() {
     // Read a random column as Variant. The actual read does not need to be performed, as stats on
     // Variant should always return None.
     assert_eq!(
-        filter.get_max_stat(&column_name!("chrono.date32"), &unshredded_variant_schema()),
+        filter.get_max_stat(
+            &column_name!("chrono.date32"),
+            &DataType::unshredded_variant()
+        ),
         None
     );
 
