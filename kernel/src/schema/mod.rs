@@ -745,15 +745,6 @@ impl DataType {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
     }
 
-    /// Create a decimal type without checking the precision and scale.
-    ///
-    /// # Safety
-    /// This function assumes that the caller has already checked the precision and scale
-    /// and that they are valid. Will panic if they are not.
-    pub unsafe fn decimal_unchecked(precision: u8, scale: u8) -> Self {
-        Self::decimal(precision, scale).unwrap()
-    }
-
     /// Create a new struct type with the given fields.
     pub fn struct_type(fields: impl IntoIterator<Item = StructField>) -> Self {
         StructType::new(fields).into()
