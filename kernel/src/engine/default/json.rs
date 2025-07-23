@@ -260,9 +260,13 @@ mod tests {
     };
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
+    #[cfg(feature = "arrow-55")]
+    use crate::object_store::PutMultipartOptions;
+    #[cfg(not(feature = "arrow-55"))]
+    use crate::object_store::PutMultipartOpts;
     use crate::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
+        PutPayload, PutResult, Result,
     };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
@@ -355,7 +359,8 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            opts: PutMultipartOptions,
+            #[cfg(not(feature = "arrow-55"))] opts: PutMultipartOpts,
+            #[cfg(feature = "arrow-55")] opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
