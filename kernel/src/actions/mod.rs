@@ -8,13 +8,17 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::expressions::{MapData, Scalar};
+use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use crate::{
+    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
+    IntoEngineData, RowVisitor as _,
+};
 
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -22,6 +26,9 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+
+const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
 pub mod set_transaction;
@@ -467,9 +474,59 @@ pub(crate) struct CommitInfo {
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
     pub(crate) kernel_version: Option<String>,
-    /// A place for the engine to store additional metadata associated with this commit encoded as
-    /// a map of strings.
-    pub(crate) engine_commit_info: Option<HashMap<String, String>>,
+    /// A place for the engine to store additional metadata associated with this commit
+    pub(crate) engine_info: Option<String>,
+}
+
+impl CommitInfo {
+    pub(crate) fn new(
+        timestamp: i64,
+        operation: Option<String>,
+        engine_info: Option<String>,
+    ) -> Self {
+        Self {
+            timestamp: Some(timestamp),
+            in_commit_timestamp: None,
+            operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
+            operation_parameters: None,
+            kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            engine_info,
+        }
+    }
+}
+
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
+impl IntoEngineData for CommitInfo {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let timestamp = Scalar::from(self.timestamp);
+        let in_commit_timestamp = Scalar::from(self.in_commit_timestamp);
+        let operation = Scalar::from(self.operation);
+
+        let operation_parameters = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.operation_parameters.unwrap_or_default(),
+        )
+        .map(Scalar::Map)?;
+
+        let kernel_version = Scalar::from(self.kernel_version);
+        let engine_info = Scalar::from(self.engine_info);
+
+        let values = [
+            timestamp,
+            in_commit_timestamp,
+            operation,
+            operation_parameters,
+            kernel_version,
+            engine_info,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -737,10 +794,43 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::{
+        arrow::array::{Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder},
+        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
+        arrow::record_batch::RecordBatch,
+        engine::arrow_data::ArrowEngineData,
+        engine::arrow_expression::ArrowEvaluationHandler,
+        schema::{ArrayType, DataType, MapType, StructField},
+        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    };
+
+    // duplicated
+    struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+    impl ExprEngine {
+        fn new() -> Self {
+            ExprEngine(Arc::new(ArrowEvaluationHandler))
+        }
+    }
+
+    impl Engine for ExprEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.0.clone()
+        }
+
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            unimplemented!()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            unimplemented!()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn test_metadata_schema() {
@@ -944,10 +1034,7 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
-                StructField::nullable(
-                    "engineCommitInfo",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                ),
+                StructField::nullable("engineInfo", DataType::STRING),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1146,42 +1233,6 @@ mod tests {
 
     #[test]
     fn test_into_engine_data() {
-        use crate::arrow::array::{Int64Array, StringArray};
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use crate::arrow::record_batch::RecordBatch;
-
-        use crate::engine::arrow_data::ArrowEngineData;
-        use crate::engine::arrow_expression::ArrowEvaluationHandler;
-        use crate::IntoEngineData;
-        use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-
-        // duplicated
-        struct ExprEngine(Arc<dyn EvaluationHandler>);
-
-        impl ExprEngine {
-            fn new() -> Self {
-                ExprEngine(Arc::new(ArrowEvaluationHandler))
-            }
-        }
-
-        impl Engine for ExprEngine {
-            fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-                self.0.clone()
-            }
-
-            fn json_handler(&self) -> Arc<dyn JsonHandler> {
-                unimplemented!()
-            }
-
-            fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-                unimplemented!()
-            }
-
-            fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-                unimplemented!()
-            }
-        }
-
         let engine = ExprEngine::new();
 
         let set_transaction = SetTransaction {
@@ -1212,6 +1263,50 @@ mod tests {
                 Arc::new(StringArray::from(vec!["app_id"])),
                 Arc::new(Int64Array::from(vec![0_i64])),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_commit_info_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let commit_info = CommitInfo::new(0, None, None);
+
+        let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
+
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let mut map_builder = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        )
+        .with_values_field(Field::new("value".to_string(), ArrowDataType::Utf8, false));
+        map_builder.append(true).unwrap();
+        let operation_parameters = Arc::new(map_builder.finish());
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(0)])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
+                operation_parameters,
+                Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(StringArray::from(vec![None::<String>])),
             ],
         )
         .unwrap();
