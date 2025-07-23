@@ -1,8 +1,6 @@
 //! This module implements the API for writing single-file checkpoints.
 //!
-//! The entry-points for this API are:
-//! 1. [`Snapshot::checkpoint`]
-//! 2. [`Table::checkpoint`]
+//! The entry point for this API is [`Snapshot::checkpoint`].
 //!
 //! ## Checkpoint Types and Selection Logic
 //! This API supports two checkpoint types, selected based on table features:
@@ -24,7 +22,7 @@
 //!
 //! The following steps outline the process of creating a checkpoint:
 //!
-//! 1. Create a [`CheckpointWriter`] using [`Snapshot::checkpoint`] or [`Table::checkpoint`]
+//! 1. Create a [`CheckpointWriter`] using [`Snapshot::checkpoint`]
 //! 2. Get the checkpoint path from [`CheckpointWriter::checkpoint_path`]
 //! 2. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
 //! 3. Write the data to the path in object storage (engine-specific)
@@ -36,11 +34,10 @@
 //! # use delta_kernel::checkpoint::CheckpointDataIterator;
 //! # use delta_kernel::checkpoint::CheckpointWriter;
 //! # use delta_kernel::Engine;
-//! # use delta_kernel::table::Table;
+//! # use delta_kernel::Snapshot;
 //! # use delta_kernel::DeltaResult;
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
-//! # use delta_kernel::snapshot::Snapshot;
 //! # use url::Url;
 //! fn write_checkpoint_file(path: Url, data: &CheckpointDataIterator) -> DeltaResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
@@ -48,12 +45,11 @@
 //!
 //! let engine: &dyn Engine = todo!(); /* create engine instance */
 //!
-//! // Create a table instance for the table you want to checkpoint
-//! let table = Table::try_from_uri("./tests/data/app-txn-no-checkpoint")?;
+//! // Create a snapshot for the table at the version you want to checkpoint (None = latest)
+//! let snapshot = Arc::new(Snapshot::try_from_uri("./tests/data/app-txn-no-checkpoint", engine, None)?);
 //!
-//! // Create a checkpoint writer from a version of the table (e.g., version 1)
-//! // Alternatively, if you have a snapshot, you can use `Snapshot::checkpoint()`
-//! let mut writer = table.checkpoint(engine, Some(1))?;
+//! // Create a checkpoint writer from the snapshot
+//! let mut writer = snapshot.checkpoint()?;
 //!
 //! // Get the checkpoint path and data
 //! let checkpoint_path = writer.checkpoint_path()?;
@@ -82,7 +78,6 @@
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 //! [`LastCheckpointHint`]: crate::snapshot::LastCheckpointHint
-//! [`Table::checkpoint`]: crate::table::Table::checkpoint
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
@@ -462,12 +457,14 @@ fn deleted_file_retention_timestamp_with_time(
 /// A new [`EngineData`] batch with the `_last_checkpoint` fields:
 /// - `version` (i64, required): Table version number
 /// - `size` (i64, required): Total actions count
-/// - `parts` (i64, optional): Always 1 for single-file checkpoints
+/// - `parts` (i64, optional): Always None for single-file checkpoints
 /// - `sizeInBytes` (i64, optional): Size of checkpoint file in bytes
 /// - `numOfAddFiles` (i64, optional): Number of Add actions
 ///
-/// TODO(#838) Add `checksum` field to `_last_checkpoint` file
-/// TODO(#839) Add `checkpoint_schema` field to `_last_checkpoint` file
+/// TODO(#838): Add `checksum` field to `_last_checkpoint` file
+/// TODO(#839): Add `checkpoint_schema` field to `_last_checkpoint` file
+/// TODO(#1054): Add `tags` field to `_last_checkpoint` file
+/// TODO(#1052): Add `v2Checkpoint` field to `_last_checkpoint` file
 pub(crate) fn create_last_checkpoint_data(
     engine: &dyn Engine,
     version: i64,
@@ -480,7 +477,7 @@ pub(crate) fn create_last_checkpoint_data(
         &[
             version.into(),
             actions_counter.into(),
-            1i64.into(), // parts = 1 since we only support single-part checkpoint here
+            None::<i64>.into(), // parts = None since we only support single-part checkpoints
             size_in_bytes.into(),
             add_actions_counter.into(),
         ],

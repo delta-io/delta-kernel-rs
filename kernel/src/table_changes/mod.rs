@@ -6,14 +6,13 @@
 //! # use test_utils::DefaultEngineExtension;
 //! # use delta_kernel::engine::default::DefaultEngine;
 //! # use delta_kernel::expressions::{column_expr, Scalar};
-//! # use delta_kernel::{Predicate, Table, Error, Engine};
+//! # use delta_kernel::{Predicate, Snapshot, Error, Engine};
+//! # use delta_kernel::table_changes::TableChanges;
 //! # let path = "./tests/data/table-with-cdf";
 //! # let engine = DefaultEngine::new_local();
-//! // Construct a table from a path
-//! let table = Table::try_from_uri(path)?;
-//!
+//! let url = delta_kernel::try_parse_uri(path)?;
 //! // Get the table changes (change data feed) between version 0 and 1
-//! let table_changes = table.table_changes(engine.as_ref(), 0, 1)?;
+//! let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
 //!
 //! // Optionally specify a schema and predicate to apply to the table changes scan
 //! let schema = table_changes
@@ -98,11 +97,12 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  ```rust
 ///  # use delta_kernel::engine::default::DefaultEngine;
 ///  # use test_utils::DefaultEngineExtension;
-///  # use delta_kernel::{Table, Error};
+///  # use delta_kernel::{Snapshot, Error};
+///  # use delta_kernel::table_changes::TableChanges;
 ///  # let engine = DefaultEngine::new_local();
 ///  # let path = "./tests/data/table-with-cdf";
-///  let table = Table::try_from_uri(path).unwrap();
-///  let table_changes = table.table_changes(engine.as_ref(), 0, 1)?;
+///  let url = delta_kernel::try_parse_uri(path).unwrap();
+///  let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
 ///  # Ok::<(), Error>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
@@ -274,10 +274,12 @@ fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;
-    use crate::{Error, Table};
+    use crate::Error;
     use itertools::assert_equal;
 
     #[test]
@@ -285,20 +287,29 @@ mod tests {
         // Table with CDF enabled, then disabled at version 2 and enabled at version 3
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
-        let table = Table::try_from_uri(path).unwrap();
+        let url = delta_kernel::try_parse_uri(path).unwrap();
 
         let valid_ranges = [(0, 1), (0, 0), (1, 1)];
         for (start_version, end_version) in valid_ranges {
-            let table_changes = table
-                .table_changes(engine.as_ref(), start_version, end_version)
-                .unwrap();
+            let table_changes = TableChanges::try_new(
+                url.clone(),
+                engine.as_ref(),
+                start_version,
+                end_version.into(),
+            )
+            .unwrap();
             assert_eq!(table_changes.start_version, start_version);
             assert_eq!(table_changes.end_version(), end_version);
         }
 
         let invalid_ranges = [(0, 2), (1, 2), (2, 2), (2, 3)];
         for (start_version, end_version) in invalid_ranges {
-            let res = table.table_changes(engine.as_ref(), start_version, end_version);
+            let res = TableChanges::try_new(
+                url.clone(),
+                engine.as_ref(),
+                start_version,
+                end_version.into(),
+            );
             assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))))
         }
     }
@@ -306,11 +317,11 @@ mod tests {
     fn schema_evolution_fails() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
-        let table = Table::try_from_uri(path).unwrap();
+        let url = delta_kernel::try_parse_uri(path).unwrap();
         let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }} }";
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes_res = table.table_changes(engine.as_ref(), 3, 4);
+        let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
         assert!(matches!(table_changes_res, Err(Error::Generic(msg)) if msg == expected_msg));
     }
 
@@ -318,7 +329,7 @@ mod tests {
     fn table_changes_has_cdf_schema() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
-        let table = Table::try_from_uri(path).unwrap();
+        let url = delta_kernel::try_parse_uri(path).unwrap();
         let expected_schema = [
             StructField::nullable("part", DataType::INTEGER),
             StructField::nullable("id", DataType::INTEGER),
@@ -326,7 +337,8 @@ mod tests {
         .into_iter()
         .chain(CDF_FIELDS.clone());
 
-        let table_changes = table.table_changes(engine.as_ref(), 0, 0).unwrap();
+        let table_changes =
+            TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).unwrap();
         assert_equal(expected_schema, table_changes.schema().fields().cloned());
     }
 }

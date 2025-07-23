@@ -27,8 +27,8 @@ use crate::scan::test_utils::{
 use crate::snapshot::LastCheckpointHint;
 use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor,
-    StorageHandler, Table, Version,
+    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
+    StorageHandler,
 };
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
@@ -50,8 +50,7 @@ fn test_replay_for_metadata() {
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
     let engine = SyncEngine::new();
 
-    let table = Table::new(url);
-    let snapshot = table.snapshot(&engine, None).unwrap();
+    let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
     let data: Vec<_> = snapshot
         .log_segment()
         .replay_for_metadata(&engine)
@@ -1744,4 +1743,249 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
         ],
         None,
     );
+}
+
+#[test]
+fn commits_since() {
+    // simple
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=4),
+        &[],
+        None, // No checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
+
+    // with compaction, no checkpoint
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=4),
+        &[(0, 2)],
+        None, // No checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+
+    // checkpoint, no compaction
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[],
+        Some(3), // Checkpoint @ 3
+        None,    // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 3);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
+
+    // checkpoint and compaction less than checkpoint
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[(0, 2)],
+        Some(3), // Checkpoint @ 3
+        None,    // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 3);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
+
+    // checkpoint and compaction greater than checkpoint
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[(3, 4)],
+        Some(2), // Checkpoint @ 2
+        None,    // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 4);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+
+    // multiple compactions
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=6),
+        &[(1, 2), (3, 4)],
+        None, // No Checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 6);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
+
+    // multiple compactions, out of order
+    let log_segment = create_segment_for(
+        &Vec::from_iter(0..=10),
+        &[(1, 2), (3, 9), (4, 6)],
+        None, // No Checkpoint
+        None, // Version to load
+    );
+    assert_eq!(log_segment.commits_since_checkpoint(), 10);
+    assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 1);
+}
+
+#[test]
+fn for_timestamp_conversion_gets_commit_range() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_with_old_end_version() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 5, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![0, 1, 2, 3, 4, 5], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_only_contiguous_ranges() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            // version 4 is missing
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment =
+        LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 7, None).unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![5, 6, 7], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_with_limit() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment = LogSegment::for_timestamp_conversion(
+        storage.as_ref(),
+        log_root.clone(),
+        7,
+        Some(NonZero::new(3).unwrap()),
+    )
+    .unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![5, 6, 7], versions);
+}
+#[test]
+fn for_timestamp_conversion_with_large_limit() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(1, "json"),
+            delta_path_for_version(1, "checkpoint.parquet"),
+            delta_path_for_version(2, "json"),
+            delta_path_for_version(3, "json"),
+            delta_path_for_version(3, "checkpoint.parquet"),
+            delta_path_for_version(4, "json"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(6, "json"),
+            delta_path_for_version(7, "json"),
+        ],
+        None,
+    );
+
+    let log_segment = LogSegment::for_timestamp_conversion(
+        storage.as_ref(),
+        log_root.clone(),
+        7,
+        Some(NonZero::new(20).unwrap()),
+    )
+    .unwrap();
+    let commit_files = log_segment.ascending_commit_files;
+    let checkpoint_parts = log_segment.checkpoint_parts;
+
+    assert!(checkpoint_parts.is_empty());
+
+    let versions = commit_files.iter().map(|x| x.version).collect_vec();
+    assert_eq!(vec![0, 1, 2, 3, 4, 5, 6, 7], versions);
+}
+
+#[test]
+fn for_timestamp_conversion_no_commit_files() {
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[delta_path_for_version(5, "checkpoint.parquet")],
+        None,
+    );
+
+    let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None);
+    assert!(res.is_err());
+    let msg = res.err().unwrap().to_string();
+    assert!(msg.contains("No files in log segment"))
 }

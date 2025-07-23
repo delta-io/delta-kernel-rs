@@ -62,6 +62,13 @@
     rust_2021_compatibility
 )]
 
+/// This `extern crate` declaration allows the macro to reliably refer to
+/// `delta_kernel::schema::DataType` no matter which crate invokes it. Without that, `delta_kernel`
+/// cannot invoke the macro because `delta_kernel` is an unknown crate identifier (you have to use
+/// `crate` instead). We could make the macro use `crate::schema::DataType` instead, but then the
+/// macro is useless outside the `delta_kernel` crate.
+extern crate self as delta_kernel;
+
 use std::any::Any;
 use std::fs::DirEntry;
 use std::sync::Arc;
@@ -81,7 +88,6 @@ pub mod expressions;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
-pub mod table;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
@@ -94,6 +100,9 @@ pub use arrow_compat::*;
 
 pub mod kernel_predicates;
 pub(crate) mod utils;
+
+#[cfg(feature = "internal-api")]
+pub use utils::try_parse_uri;
 
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
@@ -123,7 +132,7 @@ pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use table::Table;
+pub use snapshot::Snapshot;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
@@ -326,6 +335,18 @@ impl<T: Any + Send + Sync> AsAny for T {
     }
     fn type_name(&self) -> &'static str {
         std::any::type_name::<Self>()
+    }
+}
+
+/// Extension trait that facilitates object-safe implementations of `PartialEq`.
+pub trait DynPartialEq: AsAny {
+    fn dyn_eq(&self, other: &dyn Any) -> bool;
+}
+
+// Blanket implementation for all eligible types
+impl<T: PartialEq + AsAny> DynPartialEq for T {
+    fn dyn_eq(&self, other: &dyn Any) -> bool {
+        other.downcast_ref::<T>().is_some_and(|other| self == other)
     }
 }
 
@@ -614,3 +635,75 @@ compile_error!(
     "The default-engine-base feature flag is not meant to be used directly. \
     Please use either default-engine or default-engine-rustls."
 );
+
+// Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
+// using doctests to test macros. Specifically, we are testing for failed macro invocations due
+// to invalid input, not the macro output when the macro invocation is successful (which can/should be
+// done in unit tests). This module is not exclusively for macro tests only so other doctests can also be added.
+// https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
+#[cfg(doctest)]
+mod doc_tests {
+
+    /// ```
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
+    /// pub struct WithFields {
+    ///     some_name: String,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithField;
+
+    /// ```compile_fail
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
+    /// pub struct NoFields;
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithoutField;
+
+    /// ```
+    /// # use delta_kernel_derive::ToSchema;
+    /// # use std::collections::HashMap;
+    /// #[derive(ToSchema)]
+    /// pub struct WithAngleBracketPath {
+    ///     map_field: HashMap<String, String>,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithAngleBracketedPathField;
+
+    /// ```
+    /// # use delta_kernel_derive::ToSchema;
+    /// # use std::collections::HashMap;
+    /// #[derive(ToSchema)]
+    /// pub struct WithAttributedField {
+    ///     #[allow_null_container_values]
+    ///     map_field: HashMap<String, String>,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithAttributedField;
+
+    /// ```compile_fail
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
+    /// pub struct WithInvalidAttributeTarget {
+    ///     #[allow_null_container_values]
+    ///     some_name: String,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithInvalidAttributeTarget;
+
+    /// ```compile_fail
+    /// # use delta_kernel_derive::ToSchema;
+    /// # use syn::Token;
+    /// #[derive(ToSchema)]
+    /// pub struct WithInvalidFieldType {
+    ///     token: Token![struct],
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithInvalidFieldType;
+}

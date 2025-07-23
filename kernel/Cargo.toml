@@ -15,6 +15,7 @@ rust-version.workspace = true
 [package.metadata.docs.rs]
 all-features = true
 
+# for cargo-release
 [package.metadata.release]
 pre-release-replacements = [
   { file = "../README.md", search = "delta_kernel = \"[a-z0-9\\.-]+\"", replace = "delta_kernel = \"{{version}}\"" },
@@ -37,7 +38,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.12.1" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.13.0" }
 bytes = "1.10"
 chrono = "0.4.40"
 indexmap = "2.9.0"
@@ -132,7 +133,7 @@ default-engine-rustls = [
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "default-engine"] }
+delta_kernel = { path = ".", features = ["arrow", "default-engine", "internal-api"] }
 test_utils = { path = "../test-utils" }
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.14.0" }

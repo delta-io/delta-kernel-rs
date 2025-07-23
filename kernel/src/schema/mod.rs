@@ -11,18 +11,24 @@ use serde::{Deserialize, Serialize};
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
-use crate::utils::require;
+use crate::utils::{require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
+
+#[cfg(feature = "internal-api")]
+pub mod derive_macro_utils;
+#[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod variant_utils;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
 
 /// Converts a type to a [`Schema`] that represents that type. Derivable for struct types using the
 /// [`delta_kernel_derive::ToSchema`] derive macro.
+#[internal_api]
 pub(crate) trait ToSchema {
     fn to_schema() -> StructType;
 }
@@ -142,6 +148,7 @@ impl StructField {
         Self::new(name, data_type, false)
     }
 
+    /// Replaces `self.metadata` with the list of <key, value> pairs in `metadata`.
     pub fn with_metadata(
         mut self,
         metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
@@ -150,6 +157,16 @@ impl StructField {
             .into_iter()
             .map(|(k, v)| (k.into(), v.into()))
             .collect();
+        self
+    }
+
+    /// Extends `self.metadata` to include the <key, value> pairs in `metadata`.
+    pub fn add_metadata(
+        mut self,
+        metadata: impl IntoIterator<Item = (impl Into<String>, impl Into<MetadataValue>)>,
+    ) -> Self {
+        self.metadata
+            .extend(metadata.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
     }
 
@@ -604,6 +621,31 @@ where
     DecimalType::try_new(precision, scale).map_err(serde::de::Error::custom)
 }
 
+fn serialize_variant<S: serde::Serializer>(
+    _: &StructType,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str("variant")
+}
+
+fn deserialize_variant<'de, D>(deserializer: D) -> Result<Box<StructType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let str_value = String::deserialize(deserializer)?;
+    require!(
+        str_value == "variant",
+        serde::de::Error::custom(format!("Invalid variant: {str_value}"))
+    );
+    match DataType::unshredded_variant() {
+        DataType::Variant(st) => Ok(st),
+        _ => Err(serde::de::Error::custom(
+            "Issue in DataType::unshredded_variant(). Please raise an issue at ".to_string()
+                + "delta-io/delta-kernel-rs.",
+        )),
+    }
+}
+
 impl Display for PrimitiveType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -639,6 +681,13 @@ pub enum DataType {
     /// A map stores an arbitrary length collection of key-value pairs
     /// with a single keyType and a single valueType
     Map(Box<MapType>),
+    /// The Variant data type. The physical representation can be flexible to support shredded
+    /// reads. The unshredded schema is `Variant(StructType<metadata: BINARY, value: BINARY>)`.
+    #[serde(
+        serialize_with = "serialize_variant",
+        deserialize_with = "deserialize_variant"
+    )]
+    Variant(Box<StructType>),
 }
 
 impl From<DecimalType> for PrimitiveType {
@@ -708,10 +757,26 @@ impl DataType {
     pub fn struct_type(fields: impl IntoIterator<Item = StructField>) -> Self {
         StructType::new(fields).into()
     }
+
     pub fn try_struct_type<E>(
         fields: impl IntoIterator<Item = Result<StructField, E>>,
     ) -> Result<Self, E> {
         Ok(StructType::try_new(fields)?.into())
+    }
+
+    /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
+    /// binary fields: `metadata` and `value`.
+    pub fn unshredded_variant() -> Self {
+        DataType::variant_type([
+            StructField::not_null("metadata", DataType::BINARY),
+            StructField::not_null("value", DataType::BINARY),
+        ])
+    }
+
+    /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
+    /// should prefer using [`DataType::unshredded_variant`].
+    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> Self {
+        DataType::Variant(Box::new(StructType::new(fields)))
     }
 
     pub fn as_primitive_opt(&self) -> Option<&PrimitiveType> {
@@ -738,6 +803,7 @@ impl Display for DataType {
                 write!(f, ">")
             }
             DataType::Map(m) => write!(f, "map<{}, {}>", m.key_type, m.value_type),
+            DataType::Variant(_) => write!(f, "variant"),
         }
     }
 }
@@ -808,28 +874,33 @@ pub trait SchemaTransform<'a> {
         self.transform(etype)
     }
 
+    /// Called for each variant values encountered. By default does nothing
+    fn transform_variant(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
+        Some(Cow::Borrowed(etype))
+    }
+
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
     /// dispatch on nested data types encountered during the traversal.
     fn transform(&mut self, data_type: &'a DataType) -> Option<Cow<'a, DataType>> {
-        use Cow::*;
         use DataType::*;
-
-        // quick boilerplate helper
-        macro_rules! apply_transform {
-            ( $transform_fn:ident, $arg:ident ) => {
-                match self.$transform_fn($arg) {
-                    Some(Borrowed(_)) => Some(Borrowed(data_type)),
-                    Some(Owned(inner)) => Some(Owned(inner.into())),
-                    None => None,
-                }
-            };
-        }
-        match data_type {
-            Primitive(ptype) => apply_transform!(transform_primitive, ptype),
-            Array(atype) => apply_transform!(transform_array, atype),
-            Struct(stype) => apply_transform!(transform_struct, stype),
-            Map(mtype) => apply_transform!(transform_map, mtype),
-        }
+        let result = match data_type {
+            Primitive(ptype) => self
+                .transform_primitive(ptype)?
+                .map_owned_or_else(data_type, DataType::from),
+            Array(atype) => self
+                .transform_array(atype)?
+                .map_owned_or_else(data_type, DataType::from),
+            Struct(stype) => self
+                .transform_struct(stype)?
+                .map_owned_or_else(data_type, DataType::from),
+            Map(mtype) => self
+                .transform_map(mtype)?
+                .map_owned_or_else(data_type, DataType::from),
+            Variant(_) => self
+                .transform_variant(data_type)?
+                .map_owned_or_else(data_type, DataType::from),
+        };
+        Some(result)
     }
 
     /// Recursively transforms a struct field's data type. If the data type changes, update the
@@ -838,17 +909,14 @@ pub trait SchemaTransform<'a> {
         &mut self,
         field: &'a StructField,
     ) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-        let field = match self.transform(&field.data_type)? {
-            Borrowed(_) => Borrowed(field),
-            Owned(new_data_type) => Owned(StructField {
-                name: field.name.clone(),
-                data_type: new_data_type,
-                nullable: field.nullable,
-                metadata: field.metadata.clone(),
-            }),
+        let result = self.transform(&field.data_type)?;
+        let f = |new_data_type| StructField {
+            name: field.name.clone(),
+            data_type: new_data_type,
+            nullable: field.nullable,
+            metadata: field.metadata.clone(),
         };
-        Some(field)
+        Some(result.map_owned_or_else(field, f))
     }
 
     /// Recursively transforms a struct's fields. If one or more fields were changed or removed,
@@ -881,34 +949,27 @@ pub trait SchemaTransform<'a> {
     /// Recursively transforms an array's element type. If the element type changes, update the
     /// array to reference it. Otherwise, no-op.
     fn recurse_into_array(&mut self, atype: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        use Cow::*;
-        let atype = match self.transform_array_element(&atype.element_type)? {
-            Borrowed(_) => Borrowed(atype),
-            Owned(element_type) => Owned(ArrayType {
-                type_name: atype.type_name.clone(),
-                element_type,
-                contains_null: atype.contains_null,
-            }),
+        let result = self.transform_array_element(&atype.element_type)?;
+        let f = |element_type| ArrayType {
+            type_name: atype.type_name.clone(),
+            element_type,
+            contains_null: atype.contains_null,
         };
-        Some(atype)
+        Some(result.map_owned_or_else(atype, f))
     }
 
     /// Recursively transforms a map's key and value types. If either one changes, update the map to
     /// reference them. If either one is removed, remove the map as well. Otherwise, no-op.
     fn recurse_into_map(&mut self, mtype: &'a MapType) -> Option<Cow<'a, MapType>> {
-        use Cow::*;
         let key_type = self.transform_map_key(&mtype.key_type)?;
         let value_type = self.transform_map_value(&mtype.value_type)?;
-        let mtype = match (&key_type, &value_type) {
-            (Borrowed(_), Borrowed(_)) => Borrowed(mtype),
-            _ => Owned(MapType {
-                type_name: mtype.type_name.clone(),
-                key_type: key_type.into_owned(),
-                value_type: value_type.into_owned(),
-                value_contains_null: mtype.value_contains_null,
-            }),
+        let f = |(key_type, value_type)| MapType {
+            type_name: mtype.type_name.clone(),
+            key_type,
+            value_type,
+            value_contains_null: mtype.value_contains_null,
         };
-        Some(mtype)
+        Some((key_type, value_type).map_owned_or_else(mtype, f))
     }
 }
 
@@ -1103,6 +1164,47 @@ mod tests {
             json_str,
             r#"{"name":"a","type":"decimal(10,2)","nullable":false,"metadata":{}}"#
         );
+    }
+
+    #[test]
+    fn test_roundtrip_variant() {
+        let data = r#"
+        {
+            "name": "v",
+            "type": "variant",
+            "nullable": false,
+            "metadata": {}
+        }
+        "#;
+        let field: StructField = serde_json::from_str(data).unwrap();
+        assert_eq!(field.data_type, DataType::unshredded_variant());
+
+        let json_str = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            json_str,
+            r#"{"name":"v","type":"variant","nullable":false,"metadata":{}}"#
+        );
+    }
+
+    #[test]
+    fn test_unshredded_variant() {
+        let unshredded_variant_type = DataType::unshredded_variant();
+
+        match &unshredded_variant_type {
+            DataType::Variant(struct_type) => {
+                let fields: Vec<_> = struct_type.fields().collect();
+                assert_eq!(fields.len(), 2);
+
+                assert_eq!(fields[0].name, "metadata");
+                assert_eq!(fields[0].data_type, DataType::BINARY);
+                assert!(!fields[0].nullable);
+
+                assert_eq!(fields[1].name, "value");
+                assert_eq!(fields[1].data_type, DataType::BINARY);
+                assert!(!fields[1].nullable);
+            }
+            _ => panic!("Expected DataType::Variant, got {unshredded_variant_type:?}"),
+        }
     }
 
     #[test]

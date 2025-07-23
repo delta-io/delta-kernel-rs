@@ -22,6 +22,7 @@ use evaluate_expression::{evaluate_expression, evaluate_predicate};
 
 mod apply_schema;
 pub mod evaluate_expression;
+pub mod opaque;
 
 #[cfg(test)]
 mod tests;
@@ -259,6 +260,11 @@ impl Scalar {
                 for _ in 0..num_rows {
                     builder.append(false)?;
                 }
+            }
+            DataType::Variant(_) => {
+                return Err(Error::unsupported(
+                    "Variant is not supported as scalar yet.",
+                ));
             }
         }
         Ok(())
