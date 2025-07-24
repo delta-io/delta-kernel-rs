@@ -34,8 +34,11 @@ jobs:
         id: check
         continue-on-error: true
         shell: bash
+        # only check semver on released crates (delta_kernel and delta_kernel_ffi).
+        # note that this won't run on proc macro/derive crates, so don't need to include
+        # delta_kernel_derive etc.
         run: |
-          cargo semver-checks --all-features --baseline-rev ${{ github.event.pull_request.base.sha }}
+          cargo semver-checks -p delta_kernel -p delta_kernel_ffi --all-features --baseline-rev ${{ github.event.pull_request.base.sha }}
       - name: On Failure
         id: set_failure
         if: ${{ steps.check.outcome == 'failure' }}
