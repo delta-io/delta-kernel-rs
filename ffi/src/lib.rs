@@ -32,6 +32,8 @@ use handle::Handle;
 // relies on `crate::`
 extern crate self as delta_kernel_ffi;
 
+mod domain_metadata;
+pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
@@ -41,6 +43,9 @@ pub mod expressions;
 pub mod ffi_tracing;
 pub mod scan;
 pub mod schema;
+
+#[cfg(test)]
+mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
 pub mod test_ffi;
 
@@ -513,6 +518,9 @@ fn get_default_default_engine_impl(
     get_default_engine_impl(url?, Default::default(), allocate_error)
 }
 
+/// Safety
+///
+/// Caller must free this handle to prevent memory leaks
 #[cfg(feature = "default-engine-base")]
 fn engine_to_handle(
     engine: Arc<dyn Engine>,
@@ -772,46 +780,15 @@ impl<T> Default for ReferenceSet<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::error::KernelError;
+    use crate::ffi_test_utils::{
+        allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
+        recover_string,
+    };
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
     use delta_kernel::object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
-
-    use super::*;
-    use crate::error::{EngineError, KernelError};
-
-    #[no_mangle]
-    extern "C" fn allocate_err(etype: KernelError, _: KernelStringSlice) -> *mut EngineError {
-        let boxed = Box::new(EngineError { etype });
-        Box::leak(boxed)
-    }
-
-    #[no_mangle]
-    extern "C" fn allocate_str(kernel_str: KernelStringSlice) -> NullableCvoid {
-        let s = unsafe { String::try_from_slice(&kernel_str) };
-        let ptr = Box::into_raw(Box::new(s.unwrap())).cast(); // never null
-        let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        Some(ptr)
-    }
-
-    // helper to recover an error from the above
-    unsafe fn recover_error(ptr: *mut EngineError) -> EngineError {
-        *Box::from_raw(ptr)
-    }
-
-    // helper to recover a string from the above
-    fn recover_string(ptr: NonNull<c_void>) -> String {
-        let ptr = ptr.as_ptr().cast();
-        *unsafe { Box::from_raw(ptr) }
-    }
-
-    fn ok_or_panic<T>(result: ExternResult<T>) -> T {
-        match result {
-            ExternResult::Ok(t) => t,
-            ExternResult::Err(e) => unsafe {
-                panic!("Got engine error with type {:?}", (*e).etype);
-            },
-        }
-    }
 
     #[test]
     fn string_slice() {
@@ -876,13 +853,7 @@ mod tests {
         // Test getting non-existent snapshot
         let snapshot_at_non_existent_version =
             unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
-        assert!(snapshot_at_non_existent_version.is_err());
-
-        // Avoid leaking the error by recovering it
-        let ExternResult::Err(e) = snapshot_at_non_existent_version else {
-            panic!("Expected error but operation succeeded");
-        };
-        unsafe { recover_error(e) };
+        assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, "Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1");
 
         let table_root = unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
         assert!(table_root.is_some());
