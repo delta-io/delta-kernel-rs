@@ -347,13 +347,13 @@ mod tests {
     #[test]
     fn ensure_decimals() {
         assert!(ensure_data_types(
-            &DataType::decimal_unchecked(5, 2),
+            &DataType::decimal(5, 2).unwrap(),
             &ArrowDataType::Decimal128(5, 2),
             false
         )
         .is_ok());
         assert!(ensure_data_types(
-            &DataType::decimal_unchecked(5, 2),
+            &DataType::decimal(5, 2).unwrap(),
             &ArrowDataType::Decimal128(5, 3),
             false
         )

@@ -744,20 +744,17 @@ impl DataType {
     pub const TIMESTAMP: Self = DataType::Primitive(PrimitiveType::Timestamp);
     pub const TIMESTAMP_NTZ: Self = DataType::Primitive(PrimitiveType::TimestampNtz);
 
+    /// Create a new decimal type with the given precision and scale.
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(PrimitiveType::decimal(precision, scale)?.into())
     }
 
-    // This function assumes that the caller has already checked the precision and scale
-    // and that they are valid. Will panic if they are not.
-    pub fn decimal_unchecked(precision: u8, scale: u8) -> Self {
-        Self::decimal(precision, scale).unwrap()
-    }
-
+    /// Create a new struct type with the given fields.
     pub fn struct_type(fields: impl IntoIterator<Item = StructField>) -> Self {
         StructType::new(fields).into()
     }
 
+    /// Create a new struct type from a fallible iterator of fields.
     pub fn try_struct_type<E>(
         fields: impl IntoIterator<Item = Result<StructField, E>>,
     ) -> Result<Self, E> {
@@ -779,6 +776,8 @@ impl DataType {
         DataType::Variant(Box::new(StructType::new(fields)))
     }
 
+    /// Attempt to convert this data type to a [`PrimitiveType`]. Returns `None` if this is a
+    /// non-primitive type.
     pub fn as_primitive_opt(&self) -> Option<&PrimitiveType> {
         match self {
             DataType::Primitive(ptype) => Some(ptype),
