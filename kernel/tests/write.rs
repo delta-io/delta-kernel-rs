@@ -1,74 +1,37 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::Error as KernelError;
+use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
+
 use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
-use delta_kernel::arrow::array::{
-    Int32Array, MapBuilder, MapFieldNames, StringArray, StringBuilder, TimestampMicrosecondArray,
-};
+use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
-use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
 
+use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
+use delta_kernel::engine::default::DefaultEngine;
+
 use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
+use delta_kernel::transaction::CommitResult;
+
 use itertools::Itertools;
 use serde_json::json;
 use serde_json::Deserializer;
 
-use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::schema::{DataType, StructField, StructType};
-use delta_kernel::Error as KernelError;
-use delta_kernel::Snapshot;
-use delta_kernel::{DeltaResult, Engine};
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
 use test_utils::{create_table, engine_store_setup, setup_test_tables};
 
 mod common;
 use test_utils::test_read;
-
-// create commit info in arrow of the form {engineInfo: "default engine"}
-fn new_commit_info() -> DeltaResult<Box<ArrowEngineData>> {
-    // create commit info of the form {engineCommitInfo: Map { "engineInfo": "default engine" } }
-    let commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-        "engineCommitInfo",
-        ArrowDataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                ArrowDataType::Struct(
-                    vec![
-                        Field::new("key", ArrowDataType::Utf8, false),
-                        Field::new("value", ArrowDataType::Utf8, true),
-                    ]
-                    .into(),
-                ),
-                false,
-            )),
-            false,
-        ),
-        false,
-    )]));
-
-    let key_builder = StringBuilder::new();
-    let val_builder = StringBuilder::new();
-    let names = MapFieldNames {
-        entry: "entries".to_string(),
-        key: "key".to_string(),
-        value: "value".to_string(),
-    };
-    let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
-    builder.keys().append_value("engineInfo");
-    builder.values().append_value("default engine");
-    builder.append(true).unwrap();
-    let array = builder.finish();
-
-    let commit_info_batch =
-        RecordBatch::try_new(commit_info_schema.clone(), vec![Arc::new(array)])?;
-    Ok(Box::new(ArrowEngineData::new(commit_info_batch)))
-}
+use url::Url;
 
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,11 +45,9 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
-        let commit_info = new_commit_info()?;
-
         // create a transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let txn = snapshot.transaction()?.with_commit_info(commit_info);
+        let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // commit!
         txn.commit(&engine)?;
@@ -110,87 +71,11 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
                 "operation": "UNKNOWN",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
-                "engineCommitInfo": {
-                    "engineInfo": "default engine"
-                }
+                "engineInfo": "default engine",
             }
         });
 
         assert_eq!(parsed_commit, expected_commit);
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_empty_commit() -> Result<(), Box<dyn std::error::Error>> {
-    // setup tracing
-    let _ = tracing_subscriber::fmt::try_init();
-    // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )]));
-
-    for (table_url, engine, _store, _table_name) in setup_test_tables(schema, &[]).await? {
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        assert!(matches!(
-            snapshot.transaction()?.commit(&engine).unwrap_err(),
-            KernelError::MissingCommitInfo
-        ));
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_invalid_commit_info() -> Result<(), Box<dyn std::error::Error>> {
-    // setup tracing
-    let _ = tracing_subscriber::fmt::try_init();
-
-    // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )]));
-    for (table_url, engine, _store, _table_name) in setup_test_tables(schema, &[]).await? {
-        // empty commit info test
-        let commit_info_schema = Arc::new(ArrowSchema::empty());
-        let commit_info_batch = RecordBatch::new_empty(commit_info_schema.clone());
-        assert!(commit_info_batch.num_rows() == 0);
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let txn = snapshot
-            .transaction()?
-            .with_commit_info(Box::new(ArrowEngineData::new(commit_info_batch)));
-
-        // commit!
-        assert!(matches!(
-            txn.commit(&engine),
-            Err(KernelError::InvalidCommitInfo(_))
-        ));
-
-        // two-row commit info test
-        let commit_info_schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "engineInfo",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let commit_info_batch = RecordBatch::try_new(
-            commit_info_schema.clone(),
-            vec![Arc::new(StringArray::from(vec![
-                "row1: default engine",
-                "row2: default engine",
-            ]))],
-        )?;
-
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let txn = snapshot
-            .transaction()?
-            .with_commit_info(Box::new(ArrowEngineData::new(commit_info_batch)));
-
-        // commit!
-        assert!(matches!(
-            txn.commit(&engine),
-            Err(KernelError::InvalidCommitInfo(_))
-        ));
     }
     Ok(())
 }
@@ -252,6 +137,114 @@ async fn get_and_check_all_parquet_sizes(store: Arc<dyn ObjectStore>, path: &str
     size
 }
 
+async fn write_data_and_check_result_and_stats(
+    table_url: Url,
+    schema: SchemaRef,
+    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    expected_since_commit: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), engine.as_ref(), None)?);
+    let mut txn = snapshot.transaction()?;
+
+    // create two new arrow record batches to append
+    let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(data.to_vec()))],
+        )?;
+        Ok(Box::new(ArrowEngineData::new(data)))
+    });
+
+    // write data out by spawning async tasks to simulate executors
+    let write_context = Arc::new(txn.get_write_context());
+    let tasks = append_data.into_iter().map(|data| {
+        // arc clones
+        let engine = engine.clone();
+        let write_context = write_context.clone();
+        tokio::task::spawn(async move {
+            engine
+                .write_parquet(
+                    data.as_ref().unwrap(),
+                    write_context.as_ref(),
+                    HashMap::new(),
+                    true,
+                )
+                .await
+        })
+    });
+
+    let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+    for meta in add_files_metadata {
+        txn.add_files(meta?);
+    }
+
+    // commit!
+    match txn.commit(engine.as_ref())? {
+        CommitResult::Committed {
+            version,
+            post_commit_stats,
+        } => {
+            assert_eq!(version, expected_since_commit as Version);
+            assert_eq!(
+                post_commit_stats.commits_since_checkpoint,
+                expected_since_commit
+            );
+            assert_eq!(
+                post_commit_stats.commits_since_log_compaction,
+                expected_since_commit
+            );
+        }
+        _ => panic!("Commit should have succeeded"),
+    };
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table_url, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
+        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+        let txn = snapshot.transaction()?.with_engine_info("default engine");
+
+        txn.commit(&engine)?;
+
+        let commit = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let mut parsed_commits: Vec<_> = Deserializer::from_slice(&commit.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        // set timestamps to 0 and paths to known string values for comparison
+        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+
+        let expected_commit = vec![json!({
+            "commitInfo": {
+                "timestamp": 0,
+                "operation": "UNKNOWN",
+                "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "operationParameters": {},
+                "engineInfo": "default engine",
+            }
+        })];
+
+        assert_eq!(parsed_commits, expected_commit);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -263,46 +256,10 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table_url, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
-        let commit_info = new_commit_info()?;
-
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let mut txn = snapshot.transaction()?.with_commit_info(commit_info);
-
-        // create two new arrow record batches to append
-        let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
-            let data = RecordBatch::try_new(
-                Arc::new(schema.as_ref().try_into_arrow()?),
-                vec![Arc::new(Int32Array::from(data.to_vec()))],
-            )?;
-            Ok(Box::new(ArrowEngineData::new(data)))
-        });
-
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
-        let tasks = append_data.into_iter().map(|data| {
-            // arc clones
-            let engine = engine.clone();
-            let write_context = write_context.clone();
-            tokio::task::spawn(async move {
-                engine
-                    .write_parquet(
-                        data.as_ref().unwrap(),
-                        write_context.as_ref(),
-                        HashMap::new(),
-                        true,
-                    )
-                    .await
-            })
-        });
-
-        let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
-        for meta in add_files_metadata {
-            txn.add_files(meta?);
-        }
-
-        // commit!
-        txn.commit(engine.as_ref())?;
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -336,9 +293,6 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
-                    "engineCommitInfo": {
-                        "engineInfo": "default engine"
-                    }
                 }
             }),
             json!({
@@ -376,6 +330,37 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table_url, engine, _, _) in setup_test_tables(schema.clone(), &[]).await? {
+        let engine = Arc::new(engine);
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 2)
+            .await?;
+
+        test_read(
+            &ArrowEngineData::new(RecordBatch::try_new(
+                Arc::new(schema.as_ref().try_into_arrow()?),
+                vec![Arc::new(Int32Array::from(vec![
+                    1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6,
+                ]))],
+            )?),
+            &table_url,
+            engine,
+        )?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
@@ -396,10 +381,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col]).await?
     {
-        let commit_info = new_commit_info()?;
-
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let mut txn = snapshot.transaction()?.with_commit_info(commit_info);
+        let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -473,9 +456,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
-                    "engineCommitInfo": {
-                        "engineInfo": "default engine"
-                    }
+                    "engineInfo": "default engine",
                 }
             }),
             json!({
@@ -535,10 +516,8 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     )]));
 
     for (table_url, engine, _store, _table_name) in setup_test_tables(table_schema, &[]).await? {
-        let commit_info = new_commit_info()?;
-
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-        let txn = snapshot.transaction()?.with_commit_info(commit_info);
+        let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> DeltaResult<_> {
@@ -592,8 +571,6 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
-        let commit_info = new_commit_info()?;
-
         // can't have duplicate app_id in same transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         assert!(matches!(
@@ -608,7 +585,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let txn = snapshot
             .transaction()?
-            .with_commit_info(commit_info)
+            .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2);
 
@@ -686,9 +663,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
-                    "engineCommitInfo": {
-                        "engineInfo": "default engine"
-                    }
+                    "engineInfo": "default engine",
                 }
             }),
             json!({
@@ -736,10 +711,8 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let commit_info = new_commit_info()?;
-
     let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-    let mut txn = snapshot.transaction()?.with_commit_info(commit_info);
+    let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -798,14 +771,6 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// TODO (@zachschuermann): Replace this with the public unshredded_variant_schema public API.
-fn unshredded_variant_schema() -> DataType {
-    DataType::variant_type([
-        StructField::not_null("metadata", DataType::BINARY),
-        StructField::not_null("value", DataType::BINARY),
-    ])
-}
-
 #[tokio::test]
 async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -825,7 +790,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a table with VARIANT column
     let table_schema = Arc::new(StructType::new(vec![
-        StructField::nullable("v", unshredded_variant_schema())
+        StructField::nullable("v", DataType::unshredded_variant())
             .with_metadata([("delta.columnMapping.physicalName", "col1")])
             .add_metadata([("delta.columnMapping.id", 1)]),
         StructField::nullable("i", DataType::INTEGER)
@@ -846,7 +811,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     ]));
 
     let write_schema = Arc::new(StructType::new(vec![
-        StructField::nullable("col1", unshredded_variant_schema()),
+        StructField::nullable("col1", DataType::unshredded_variant()),
         StructField::nullable("col2", DataType::INTEGER),
         StructField::nullable(
             "col3",
@@ -870,10 +835,8 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let commit_info = new_commit_info()?;
-
     let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-    let mut txn = snapshot.transaction()?.with_commit_info(commit_info);
+    let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -907,7 +870,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let value_nested_v_array = Arc::new(BinaryArray::from(value_nested_v)) as ArrayRef;
     let metadata_nested_v_array = Arc::new(BinaryArray::from(metadata_nested_v)) as ArrayRef;
 
-    let variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant_schema()).unwrap();
+    let variant_arrow = ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap();
     let variant_arrow_flipped = variant_arrow_type_flipped();
 
     let i_values = vec![31, 32, 33];
@@ -1000,13 +963,13 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // The scanned data will match the logical schema, not the physical one
     let expected_schema = Arc::new(StructType::new(vec![
-        StructField::nullable("v", unshredded_variant_schema()),
+        StructField::nullable("v", DataType::unshredded_variant()),
         StructField::nullable("i", DataType::INTEGER),
         StructField::nullable(
             "nested",
             StructType::new(vec![StructField::nullable(
                 "nested_v",
-                unshredded_variant_schema(),
+                DataType::unshredded_variant(),
             )]),
         ),
     ]));
@@ -1018,7 +981,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         Some(null_bitmap),
     )?);
     let variant_arrow_type: ArrowDataType =
-        ArrowDataType::try_from_kernel(&unshredded_variant_schema()).unwrap();
+        ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap();
     let expected_data = RecordBatch::try_new(
         Arc::new(expected_schema.as_ref().try_into_arrow()?),
         vec![
@@ -1049,7 +1012,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let _ = tracing_subscriber::fmt::try_init();
     let table_schema = Arc::new(StructType::new(vec![StructField::nullable(
         "v",
-        unshredded_variant_schema(),
+        DataType::unshredded_variant(),
     )]));
 
     // The table will be attempted to be written in this form but be read into
@@ -1077,10 +1040,8 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let commit_info = new_commit_info()?;
-
     let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
-    let mut txn = snapshot.transaction()?.with_commit_info(commit_info);
+    let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
