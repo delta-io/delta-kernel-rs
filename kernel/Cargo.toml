@@ -121,9 +121,9 @@ default-engine-base = [
   "need-arrow",
   "tokio",
 ]
-# the default-engine use the reqwest crate with default features which uses native-tls. if you want
+# the default-engine-native-tls use the reqwest crate with default features which uses native-tls. if you want
 # to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency
-default-engine = ["default-engine-base", "reqwest/default"]
+default-engine-native-tls = ["default-engine-base", "reqwest/default"]
 default-engine-rustls = [
   "default-engine-base",
   "reqwest/rustls-tls-native-roots",
@@ -134,7 +134,7 @@ default-engine-rustls = [
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "default-engine", "internal-api"] }
+delta_kernel = { path = ".", features = ["arrow", "default-engine-rustls", "internal-api"] }
 test_utils = { path = "../test-utils" }
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.14.0" }

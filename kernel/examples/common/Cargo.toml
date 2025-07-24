@@ -14,7 +14,7 @@ release = false
 clap = { version = "4.5", features = ["derive"] }
 delta_kernel = { path = "../../../kernel", features = [
   "arrow-55",
-  "default-engine",
+  "default-engine-rustls",
   "internal-api",
 ] }
 url = "2"
