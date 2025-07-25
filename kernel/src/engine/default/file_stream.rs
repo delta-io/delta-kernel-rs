@@ -10,6 +10,7 @@ use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
+use tracing::error;
 
 use super::executor::TaskExecutor;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -118,9 +119,9 @@ impl FileStream {
         let executor_for_block = task_executor.clone();
         task_executor.spawn(async move {
             while let Some(res) = stream.next().await {
-                let sender = sender.clone();
+                let sender_clone = sender.clone();
                 let join_res = executor_for_block
-                    .spawn_blocking(move || sender.send(res))
+                    .spawn_blocking(move || sender_clone.send(res))
                     .await;
                 match join_res {
                     Ok(send_res) => match send_res {
@@ -128,7 +129,12 @@ impl FileStream {
                         Err(_) => break,
                     },
                     Err(je) => {
-                        panic!("Couldn't join spawned task, runtime is likely in bad state: {je}")
+                        error!("Couldn't join spawned task, runtime is likely in bad state: {je}");
+                        // Send an error through the channel to be handled by the receiver
+                        let _ = sender.send(Err(crate::Error::JoinFailure(format!(
+                            "Failed to join spawned task: {je}",
+                        ))));
+                        break;
                     }
                 }
             }

@@ -78,7 +78,7 @@ impl DataFileMetadata {
             builder.keys().append_value(k);
             builder.values().append_value(v);
         }
-        builder.append(true).unwrap();
+        builder.append(true)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
         let size: i64 = (*size)

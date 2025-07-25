@@ -271,6 +271,8 @@ pub fn split_vector(
         Some(vector) if split_index < vector.len() => Some(vector.split_off(split_index)),
         Some(vector) if extend.is_some() => {
             vector.extend(std::iter::repeat_n(
+                // safety: we just checked `is_some` above
+                #[allow(clippy::unwrap_used)]
                 extend.unwrap(),
                 split_index - vector.len(),
             ));

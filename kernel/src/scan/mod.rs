@@ -36,8 +36,12 @@ pub(crate) mod data_skipping;
 pub mod log_replay;
 pub mod state;
 
+// safety: we define get_log_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
+#[allow(clippy::unwrap_used)]
 static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap());
+// safety: we define get_log_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
+#[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_log_schema().project(&[ADD_NAME, SIDECAR_NAME]).unwrap());
 

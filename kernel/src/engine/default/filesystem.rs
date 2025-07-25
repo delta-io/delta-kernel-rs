@@ -140,18 +140,22 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         self.task_executor.spawn(
             futures::stream::iter(files)
                 .map(move |(url, range)| {
-                    // Wasn't checking the scheme before calling to_file_path causing the url path to
-                    // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
-                    // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
-                    // details about why this check is necessary
-                    let path = if url.scheme() == "file" {
-                        let file_path = url.to_file_path().expect("Not a valid file path");
-                        Path::from_absolute_path(file_path).expect("Not able to be made into Path")
-                    } else {
-                        Path::from(url.path())
-                    };
                     let store = store.clone();
                     async move {
+                        // Wasn't checking the scheme before calling to_file_path causing the url path to
+                        // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
+                        // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
+                        // details about why this check is necessary
+                        let path = if url.scheme() == "file" {
+                            let file_path = url.to_file_path().map_err(|_| {
+                                Error::InvalidTableLocation(format!("Invalid file URL: {url}"))
+                            })?;
+                            Path::from_absolute_path(file_path).map_err(|e| {
+                                Error::InvalidTableLocation(format!("Invalid file path: {e}"))
+                            })?
+                        } else {
+                            Path::from(url.path())
+                        };
                         if url.is_presigned() {
                             // have to annotate type here or rustc can't figure it out
                             Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
