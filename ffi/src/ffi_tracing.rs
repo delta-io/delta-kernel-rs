@@ -1,5 +1,6 @@
 //! FFI functions to allow engines to receive log and tracing events from kernel
 
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
@@ -8,6 +9,8 @@ use tracing::{
     field::{Field as TracingField, Visit},
     Event as TracingEvent, Subscriber,
 };
+
+use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
 
@@ -272,20 +275,53 @@ where
     }
 }
 
-fn get_event_dispatcher(callback: TracingEventFn, max_level: Level) -> tracing_core::Dispatch {
+static DISPATCH: LazyLock<Mutex<Option<tracing_core::Dispatch>>> =
+    LazyLock::new(|| Mutex::new(None));
+static RELOAD_HANDLE: LazyLock<
+    Mutex<Option<tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>>>,
+> = LazyLock::new(|| Mutex::new(None));
+
+fn get_event_dispatcher(
+    callback: TracingEventFn,
+    max_level: Level,
+) -> (
+    tracing_core::Dispatch,
+    tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
+) {
     use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
-    let filter: LevelFilter = max_level.into();
-    let event_layer = EventLayer { callback }.with_filter(filter);
+    let (filter_layer, reload_handle) =
+        tracing_subscriber::reload::Layer::new(LevelFilter::from(max_level));
+    let event_layer = EventLayer { callback }.with_filter(filter_layer);
     let subscriber = Registry::default().with(event_layer);
-    tracing_core::Dispatch::new(subscriber)
+    (tracing_core::Dispatch::new(subscriber), reload_handle)
 }
 
 fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
     if !max_level.is_valid() {
         return Err(Error::generic("max_level out of range"));
     }
-    let dispatch = get_event_dispatcher(callback, max_level);
-    set_global_default(dispatch)
+    let (dispatch, reload_handle) = get_event_dispatcher(callback, max_level);
+    let result = set_global_default(dispatch.clone());
+    // set_global_default can be called successfully only once
+    if result.is_ok() {
+        *DISPATCH.lock().unwrap() = Some(dispatch);
+        *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
+    } else {
+        if let Err(_e) = &result {
+            if let Some(filter_handle) = &*RELOAD_HANDLE.lock().unwrap() {
+                if let Err(e) = filter_handle.reload(LevelFilter::from(max_level)) {
+                    warn!("Failed to reload tracing level: {}", e);
+                    return Err(Error::generic(format!(
+                        "Unable to reload subscriber: {}",
+                        e
+                    )));
+                } else {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    result
 }
 
 // utility code below for setting up the tracing subscriber for log lines
@@ -424,7 +460,9 @@ fn setup_log_line_subscriber(
 mod tests {
     use std::sync::LazyLock;
 
+    use tracing::debug;
     use tracing::info;
+    use tracing::trace;
     use tracing_subscriber::fmt::time::FormatTime;
 
     use crate::TryFromStringSlice;
@@ -565,9 +603,19 @@ mod tests {
         })
     }
 
-    static EVENTS_OK: Mutex<Option<Vec<bool>>> = Mutex::new(None);
+    static EVENTS_OK: Mutex<Option<Vec<tracing::Level>>> = Mutex::new(None);
     fn setup_events() {
         *EVENTS_OK.lock().unwrap() = Some(vec![]);
+    }
+
+    fn convert_level(level: Level) -> tracing::Level {
+        match level {
+            Level::ERROR => tracing::Level::ERROR,
+            Level::WARN => tracing::Level::WARN,
+            Level::INFO => tracing::Level::INFO,
+            Level::DEBUG => tracing::Level::DEBUG,
+            Level::TRACE => tracing::Level::TRACE,
+        }
     }
 
     extern "C" fn event_callback(event: Event) {
@@ -579,13 +627,14 @@ mod tests {
         use std::path::MAIN_SEPARATOR;
         let expected_file = format!("ffi{}src{}ffi_tracing.rs", MAIN_SEPARATOR, MAIN_SEPARATOR);
 
-        let ok = event.level == Level::INFO
-            && target == "delta_kernel_ffi::ffi_tracing::tests"
+        let ok = target == "delta_kernel_ffi::ffi_tracing::tests"
             && file == expected_file
             && (msg == "Testing 1" || msg == "Another line");
-        let mut lock = EVENTS_OK.lock().unwrap();
-        if let Some(ref mut events) = *lock {
-            events.push(ok);
+        if ok {
+            let mut lock = EVENTS_OK.lock().unwrap();
+            if let Some(ref mut events) = *lock {
+                events.push(convert_level(event.level));
+            }
         }
     }
 
@@ -593,7 +642,7 @@ mod tests {
     fn trace_event_tracking() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
-        let dispatch = get_event_dispatcher(event_callback, Level::TRACE);
+        let (dispatch, _filter) = get_event_dispatcher(event_callback, Level::TRACE);
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1", "Another line"];
             for line in lines {
@@ -602,9 +651,84 @@ mod tests {
         });
         let lock = EVENTS_OK.lock().unwrap();
         if let Some(ref results) = *lock {
-            assert!(results.iter().all(|x| *x));
+            assert!(!results.is_empty(), "No events were captured");
+            assert!(
+                results.iter().all(|lvl| *lvl == tracing::Level::INFO),
+                "Not all events were INFO"
+            );
         } else {
             panic!("Events wasn't Some");
+        }
+    }
+
+    #[test]
+    fn change_event_tracking_level() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        setup_events();
+        let lines = ["Testing 1", "Another line"];
+        let result = setup_event_subscriber(event_callback, Level::DEBUG);
+        assert!(result.is_ok());
+        for line in lines {
+            warn!("{line}");
+            info!("{line}");
+            debug!("{line}");
+            trace!("{line}");
+        }
+        {
+            let lock = EVENTS_OK.lock().unwrap();
+            if let Some(ref results) = *lock {
+                assert!(!results.is_empty(), "No events were captured");
+                assert!(
+                    results.iter().all(|lvl| *lvl == tracing::Level::INFO
+                        || *lvl == tracing::Level::WARN
+                        || *lvl == tracing::Level::DEBUG),
+                    "Not all events were INFO or WARN or DEBUG"
+                );
+                assert!(
+                    results.iter().any(|lvl| *lvl == tracing::Level::INFO),
+                    "No INFO events found"
+                );
+                assert!(
+                    results.iter().any(|lvl| *lvl == tracing::Level::WARN),
+                    "No WARN events found"
+                );
+                assert!(
+                    results.iter().any(|lvl| *lvl == tracing::Level::DEBUG),
+                    "No DEBUG events found"
+                );
+            } else {
+                panic!("Events wasn't Some");
+            }
+        }
+        setup_events();
+        let result = setup_event_subscriber(event_callback, Level::INFO);
+        assert!(result.is_ok());
+        for line in lines {
+            warn!("{line}");
+            info!("{line}");
+            debug!("{line}");
+            trace!("{line}");
+        }
+        {
+            let lock = EVENTS_OK.lock().unwrap();
+            if let Some(ref results) = *lock {
+                assert!(
+                    results
+                        .iter()
+                        .all(|lvl| *lvl == tracing::Level::INFO || *lvl == tracing::Level::WARN),
+                    "Not all events were INFO or WARN"
+                );
+                assert!(
+                    results.iter().any(|lvl| *lvl == tracing::Level::INFO),
+                    "No INFO events found"
+                );
+                assert!(
+                    results.iter().any(|lvl| *lvl == tracing::Level::WARN),
+                    "No WARN events found"
+                );
+            } else {
+                panic!("Events wasn't Some");
+            }
         }
     }
 
