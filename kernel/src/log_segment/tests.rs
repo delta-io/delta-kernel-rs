@@ -1989,3 +1989,30 @@ fn for_timestamp_conversion_no_commit_files() {
     let msg = res.err().unwrap().to_string();
     assert!(msg.contains("No files in log segment"))
 }
+
+#[test]
+fn test_listed_log_files_contiguous_commit_files() {
+    let res = ListedLogFiles::try_new(
+        vec![
+            create_log_path("file:///00000000000000000001.json"),
+            create_log_path("file:///00000000000000000002.json"),
+            create_log_path("file:///00000000000000000003.json"),
+        ],
+        vec![],
+        vec![],
+        None,
+    );
+    assert!(res.is_ok());
+
+    let res = ListedLogFiles::try_new(
+        vec![
+            create_log_path("file:///00000000000000000001.json"),
+            create_log_path("file:///00000000000000000003.json"),
+        ],
+        vec![],
+        vec![],
+        None,
+    );
+
+    assert!(res.is_err());
+}

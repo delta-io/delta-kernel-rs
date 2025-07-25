@@ -239,12 +239,7 @@ impl LogSegment {
             contiguous_commits.push(commit);
         }
 
-        let listed_files = ListedLogFiles::try_new (
-            contiguous_commits,
-            vec![],
-            vec![],
-            None,
-        )?;
+        let listed_files = ListedLogFiles::try_new(contiguous_commits, vec![], vec![], None)?;
 
         LogSegment::try_new(listed_files, log_root, Some(end_version))
     }
