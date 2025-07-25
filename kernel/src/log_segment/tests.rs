@@ -964,14 +964,14 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
 
     // Create the stream over checkpoint batches.
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(
                 "file:///00000000000000000001.checkpoint.parquet",
             )],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -995,14 +995,14 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
 
     // Create the stream over checkpoint batches.
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(
                 "file:///00000000000000000001.checkpoint.parquet",
             )],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1033,12 +1033,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_one_file)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1092,7 +1092,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![
@@ -1100,7 +1100,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
                 create_log_path(&checkpoint_two_file),
             ],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1146,12 +1146,12 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_one_file)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1192,12 +1192,12 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_one_file)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1259,12 +1259,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
     let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             vec![],
             vec![],
             vec![create_log_path(&checkpoint_file_path)],
             None,
-        ),
+        )?,
         log_root,
         None,
     )?;
@@ -1689,7 +1689,7 @@ fn test_commit_cover_minimal_overlap() {
 #[test]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_in_order_compaction_files() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![
             create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
@@ -1704,7 +1704,7 @@ fn test_debug_assert_listed_log_file_in_order_compaction_files() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![
             create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
@@ -1719,7 +1719,7 @@ fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![],
         vec![
@@ -1734,7 +1734,7 @@ fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
-    let _ = ListedLogFiles::new(
+    let _ = ListedLogFiles::try_new(
         vec![],
         vec![],
         vec![
