@@ -246,6 +246,7 @@ impl StructField {
             }
         }
         // NOTE: unwrap is safe because the transformer is incapable of returning None
+        #[allow(clippy::unwrap_used)]
         MakePhysical
             .transform_struct_field(self)
             .unwrap()

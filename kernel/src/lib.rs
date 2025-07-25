@@ -59,8 +59,13 @@
     trivial_numeric_casts,
     unused_extern_crates,
     rust_2018_idioms,
-    rust_2021_compatibility
+    rust_2021_compatibility,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
 )]
+// we re-allow panics in tests
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 /// This `extern crate` declaration allows the macro to reliably refer to
 /// `delta_kernel::schema::DataType` no matter which crate invokes it. Without that, `delta_kernel`
