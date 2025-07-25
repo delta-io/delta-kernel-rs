@@ -1,4 +1,4 @@
-// TODO: (make issue) remove panics in this file
+// TODO: (#1112) remove panics in this file
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 #![allow(clippy::panic)]
