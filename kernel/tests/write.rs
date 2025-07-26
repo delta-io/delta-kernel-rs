@@ -934,6 +934,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .write_parquet_file(
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
+            write_context.add_files_schema().clone(),
             HashMap::new(),
             true,
         )
@@ -1101,6 +1102,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         .write_parquet_file(
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
+            write_context.add_files_schema().clone(),
             HashMap::new(),
             true,
         )
