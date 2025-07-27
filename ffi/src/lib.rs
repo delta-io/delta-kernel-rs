@@ -781,7 +781,7 @@ impl<T> Default for ReferenceSet<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::KernelError;
+    use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
@@ -789,6 +789,11 @@ mod tests {
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
     use delta_kernel::object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
+
+    #[no_mangle]
+    extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {
+        std::ptr::null_mut()
+    }
 
     #[test]
     fn string_slice() {
@@ -898,6 +903,28 @@ mod tests {
 
         unsafe { free_string_slice_data(partition_iter) }
         unsafe { free_snapshot(snapshot) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allocate_null_err_okay() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
+        let path = "memory:///";
+
+        // Get a non-existent snapshot, this will call allocate_null_err
+        let snapshot_at_non_existent_version =
+            unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
+        assert!(snapshot_at_non_existent_version.is_err());
+
         unsafe { free_engine(engine) }
         Ok(())
     }
