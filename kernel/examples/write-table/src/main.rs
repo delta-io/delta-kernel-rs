@@ -67,14 +67,14 @@ async fn try_main() -> DeltaResult<()> {
 
     let path = &cli.location_args.path;
     // TODO: Check if path is a directory and if not, create it
-    let url = delta_kernel::try_parse_uri(&path)?;
+    let url = delta_kernel::try_parse_uri(path)?;
     println!("Using Delta table at: {url}");
 
     // Get the engine
     let engine = common::get_engine(&url, &cli.location_args)?;
     let store = engine
         .get_object_store_for_url(&url)
-        .expect(&format!("Failed to get object store for URL: {url}"));
+        .unwrap_or_else(|| panic!("Failed to get object store for URL: {url}"));
 
     // Create or get the table
     let (table_url, schema) =
@@ -101,7 +101,7 @@ async fn try_main() -> DeltaResult<()> {
 async fn create_or_get_table(
     url: &Url,
     engine: &dyn Engine,
-    schema_str: &String,
+    schema_str: &str,
     store: &Arc<dyn ObjectStore>,
 ) -> DeltaResult<(Url, SchemaRef)> {
     // Check if table already exists
@@ -121,7 +121,7 @@ async fn create_or_get_table(
 }
 
 /// Parse a schema string into a SchemaRef
-fn parse_schema(schema_str: &String) -> DeltaResult<SchemaRef> {
+fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
     let fields = schema_str
         .split(',')
         .map(|field| {
@@ -208,7 +208,7 @@ async fn create_table(
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
 
-    println!("✓ Created Delta table with schema: {:#?}", schema);
+    println!("✓ Created Delta table with schema: {schema:#?}");
     Ok(())
 }
 
@@ -218,28 +218,28 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
     let mut columns = Vec::new();
 
     for field in fields {
-        let column: Arc<dyn arrow::array::Array> = match field.data_type() {
-            &DataType::STRING => {
-                let data: Vec<String> = (0..num_rows).map(|i| format!("item_{}", i)).collect();
+        let column: Arc<dyn arrow::array::Array> = match *field.data_type() {
+            DataType::STRING => {
+                let data: Vec<String> = (0..num_rows).map(|i| format!("item_{i}")).collect();
                 Arc::new(StringArray::from(data))
             }
-            &DataType::INTEGER => {
+            DataType::INTEGER => {
                 let data: Vec<i32> = (0..num_rows).map(|i| i as i32).collect();
                 Arc::new(Int32Array::from(data))
             }
-            &DataType::LONG => {
+            DataType::LONG => {
                 let data: Vec<i64> = (0..num_rows).map(|i| i as i64).collect();
                 Arc::new(arrow::array::Int64Array::from(data))
             }
-            &DataType::DOUBLE => {
+            DataType::DOUBLE => {
                 let data: Vec<f64> = (0..num_rows).map(|i| i as f64 * 1.5).collect();
                 Arc::new(Float64Array::from(data))
             }
-            &DataType::BOOLEAN => {
+            DataType::BOOLEAN => {
                 let data: Vec<bool> = (0..num_rows).map(|i| i % 2 == 0).collect();
                 Arc::new(BooleanArray::from(data))
             }
-            &DataType::TIMESTAMP => {
+            DataType::TIMESTAMP => {
                 let now = chrono::Utc::now();
                 let data: Vec<i64> = (0..num_rows)
                     .map(|i| (now + chrono::Duration::seconds(i as i64)).timestamp_micros())
@@ -277,7 +277,7 @@ async fn write_data(
     // Write the data using the engine
     let write_context = Arc::new(txn.get_write_context());
     let file_metadata = engine
-        .write_parquet(&data, write_context.as_ref(), HashMap::new(), true)
+        .write_parquet(data, write_context.as_ref(), HashMap::new(), true)
         .await?;
 
     // Add the file metadata to the transaction
@@ -286,12 +286,11 @@ async fn write_data(
     // Commit the transaction
     match txn.commit(engine)? {
         delta_kernel::transaction::CommitResult::Committed { version, .. } => {
-            println!("✓ Committed transaction at version {}", version);
+            println!("✓ Committed transaction at version {version}");
         }
         delta_kernel::transaction::CommitResult::Conflict(_, conflicting_version) => {
             println!(
-                "✗ Transaction conflicted with version: {}",
-                conflicting_version
+                "✗ Transaction conflicted with version: {conflicting_version}"
             );
             return Err(delta_kernel::Error::generic("Commit failed"));
         }
