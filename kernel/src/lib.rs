@@ -26,10 +26,10 @@
 //!
 //! [`write.rs`]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/tests/write.rs
 //!
-//! # Engine traits
+//! # Engine trait
 //!
-//! The [`Engine`] trait allow connectors to bring their own implementation of functionality such
-//! as reading parquet files, listing files in a file system, parsing a JSON string etc.  This
+//! The [`Engine`] trait allows connectors to bring their own implementation of functionality such
+//! as reading parquet files, listing files in a file system, parsing a JSON string etc. This
 //! trait exposes methods to get sub-engines which expose the core functionalities customizable by
 //! connectors.
 //!
@@ -37,20 +37,20 @@
 //!
 //! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
 //! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
-//! and allow evaluation of that predicate for a specific batches of data.
+//! and allow evaluation of that predicate for a specific batch of data.
 //!
 //! ## File system interactions
 //!
 //! Delta Kernel needs to perform some basic operations against file systems like listing and
 //! reading files. These interactions are encapsulated in the [`StorageHandler`] trait.
-//! Implementers must take care that all assumptions on the behavior if the functions - like sorted
+//! Implementers must take care that all assumptions on the behavior of the functions - like sorted
 //! results - are respected.
 //!
 //! ## Reading log and data files
 //!
 //! Delta Kernel requires the capability to read and write json files and read parquet files, which
 //! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
-//! connectors are asked to provide the context information it requires to execute the actual
+//! connectors are asked to provide the context information they require to execute the actual
 //! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
@@ -230,7 +230,9 @@ impl FileMeta {
 /// Extension trait that makes it easier to work with traits objects that implement [`Any`],
 /// implemented automatically for any type that satisfies `Any`, `Send`, and `Sync`. In particular,
 /// given some `trait T: Any + Send + Sync`, it allows upcasting `T` to `dyn Any + Send + Sync`,
-/// which in turn allows downcasting the result to a concrete type. For example:
+/// which in turn allows downcasting the result to a concrete type.
+///
+/// For example, the following code will compile:
 ///
 /// ```
 /// # use delta_kernel::AsAny;
@@ -384,8 +386,8 @@ pub trait PredicateEvaluator: AsAny {
 
 /// Provides expression evaluation capability to Delta Kernel.
 ///
-/// Delta Kernel can use this handler to evaluate predicate on partition filters,
-/// fill up partition column values and any computation on data using Expressions.
+/// Delta Kernel can use this handler to evaluate a predicate on partition filters,
+/// fill up partition column values, and any computation on data using Expressions.
 pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].

@@ -1,4 +1,4 @@
-//! Provides engine implementation that implement the required traits. The engine can optionally
+//! Provides an engine implementation that implements the required traits. The engine can optionally
 //! be built into the kernel by setting the `default-engine` feature flag. See the related module
 //! for more information.
 
