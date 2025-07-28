@@ -3,7 +3,7 @@ use delta_kernel::{DeltaResult, Error};
 use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types

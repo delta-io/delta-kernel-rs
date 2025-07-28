@@ -271,7 +271,7 @@ where
                 .collect()
         })
         .transpose()
-        .expect("Parsing FromStr should never fail with strum 'default'")
+        .ok()?
 }
 
 impl Protocol {
