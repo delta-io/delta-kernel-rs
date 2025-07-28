@@ -1,3 +1,8 @@
+// TODO: (#1112) remove panics in this file
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
+#![allow(clippy::panic)]
+
 //! The default engine uses Async IO to read files, but the kernel APIs are all
 //! synchronous. Therefore, we need an executor to run the async IO on in the
 //! background.
