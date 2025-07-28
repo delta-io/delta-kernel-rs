@@ -50,8 +50,8 @@ impl TableConfiguration {
     /// This validates that the [`Metadata`] and [`Protocol`] are compatible with one another
     /// and that the kernel supports reading from this table.
     ///
-    /// Note: This only returns successfully kernel supports reading the table. It's important
-    /// to do this validation is done in `try_new` because all table accesses must first construct
+    /// Note: This only returns successfully if kernel supports reading the table. It's important
+    /// to do this validation in `try_new` because all table accesses must first construct
     /// the [`TableConfiguration`]. This ensures that developers never forget to check that kernel
     /// supports reading the table, and that all table accesses are legal.
     ///
