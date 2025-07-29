@@ -8,8 +8,10 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{MapData, Scalar};
-use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::expressions::{ArrayData, MapData, Scalar, StructData};
+use crate::schema::{
+    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
@@ -153,6 +155,23 @@ impl Default for Format {
     }
 }
 
+impl TryFrom<Format> for Scalar {
+    type Error = Error;
+
+    fn try_from(format: Format) -> DeltaResult<Self> {
+        let provider = Scalar::from(format.provider);
+        let options = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            format.options,
+        )
+        .map(Scalar::Map)?;
+        Ok(Scalar::Struct(StructData::try_new(
+            Format::to_schema().fields().cloned().collect(),
+            vec![provider, options],
+        )?))
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     any(test, feature = "internal-api"),
@@ -180,6 +199,28 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
+    // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
+    #[allow(dead_code)]
+    pub(crate) fn try_new(
+        name: Option<String>,
+        description: Option<String>,
+        schema_string: StructType,
+        partition_columns: Vec<String>,
+        created_time: i64,
+        configuration: HashMap<String, String>,
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            description,
+            format: Format::default(),
+            schema_string: serde_json::to_string(&schema_string)?,
+            partition_columns,
+            created_time: Some(created_time),
+            configuration,
+        })
+    }
+
     // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
     #[internal_api]
     #[allow(dead_code)]
@@ -234,6 +275,45 @@ impl Metadata {
     #[internal_api]
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
+    }
+}
+
+// TODO: derive IntoEngineData instead
+impl IntoEngineData for Metadata {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let id = Scalar::from(self.id);
+        let name = Scalar::from(self.name);
+        let description = Scalar::from(self.description);
+        let format = Scalar::try_from(self.format)?;
+        let schema_string = Scalar::from(self.schema_string);
+        let partition_columns = Scalar::Array(ArrayData::try_new(
+            ArrayType::new(DataType::STRING, false),
+            self.partition_columns,
+        )?);
+        let created_time = Scalar::from(self.created_time);
+        let configuration = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.configuration,
+        )
+        .map(Scalar::Map)?;
+
+        let values = [
+            id,
+            name,
+            description,
+            format,
+            schema_string,
+            partition_columns,
+            created_time,
+            configuration,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
     }
 }
 
@@ -1312,5 +1392,126 @@ mod tests {
         .unwrap();
 
         assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_metadata_try_new() {
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
+
+        let metadata = Metadata::try_new(
+            Some("test_table".to_string()),
+            Some("description".to_string()),
+            schema.clone(),
+            vec!["year".to_string()],
+            1234567890,
+            config.clone(),
+        )
+        .unwrap();
+
+        assert!(!metadata.id.is_empty());
+        assert_eq!(metadata.name, Some("test_table".to_string()));
+        assert_eq!(
+            metadata.schema_string,
+            serde_json::to_string(&schema).unwrap()
+        );
+        assert_eq!(metadata.created_time, Some(1234567890));
+        assert_eq!(metadata.configuration, config);
+    }
+
+    #[test]
+    fn test_metadata_try_new_default() {
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+
+        assert!(!metadata.id.is_empty());
+        assert_eq!(metadata.name, None);
+        assert_eq!(metadata.description, None);
+    }
+
+    #[test]
+    fn test_metadata_unique_ids() {
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
+        let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        assert_ne!(m1.id, m2.id);
+    }
+
+    #[test]
+    fn test_format_try_from_scalar() {
+        let options = HashMap::from([
+            ("path".to_string(), "/delta/table".to_string()),
+            ("compressionType".to_string(), "snappy".to_string()),
+        ]);
+        let format = Format {
+            provider: "parquet".to_string(),
+            options,
+        };
+        let scalar = Scalar::try_from(format).unwrap();
+
+        let Scalar::Struct(struct_data) = scalar else {
+            panic!("Expected struct scalar");
+        };
+        assert_eq!(struct_data.fields()[0].name(), "provider");
+        assert_eq!(struct_data.fields()[1].name(), "options");
+
+        let Scalar::String(provider) = &struct_data.values()[0] else {
+            panic!("Expected string provider");
+        };
+        assert_eq!(provider, "parquet");
+
+        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+            panic!("Expected map options");
+        };
+        assert_eq!(map_data.pairs().len(), 2);
+    }
+
+    #[test]
+    fn test_format_default() {
+        let format = Format::default();
+        let expected = Format {
+            provider: "parquet".to_string(),
+            options: HashMap::new(),
+        };
+        assert_eq!(format, expected);
+    }
+
+    #[test]
+    fn test_format_empty_options() {
+        let format = Format {
+            provider: "parquet".to_string(),
+            options: HashMap::new(),
+        };
+        let scalar = Scalar::try_from(format).unwrap();
+
+        let Scalar::Struct(struct_data) = scalar else {
+            panic!("Expected struct");
+        };
+        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+            panic!("Expected map");
+        };
+        assert!(map_data.pairs().is_empty());
+    }
+
+    #[test]
+    fn test_format_special_characters() {
+        let options = HashMap::from([
+            ("path".to_string(), "/path/with spaces".to_string()),
+            ("unicode".to_string(), "测试🎉".to_string()),
+            ("empty".to_string(), "".to_string()),
+        ]);
+        let format = Format {
+            provider: "custom".to_string(),
+            options,
+        };
+        let scalar = Scalar::try_from(format).unwrap();
+
+        let Scalar::Struct(struct_data) = scalar else {
+            panic!("Expected struct");
+        };
+        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+            panic!("Expected map");
+        };
+        assert_eq!(map_data.pairs().len(), 3);
     }
 }
