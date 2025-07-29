@@ -62,6 +62,7 @@ async fn main() -> ExitCode {
     }
 }
 
+// TODO: Update the example once official write APIs are introduced (issue#1123)
 async fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
@@ -77,21 +78,20 @@ async fn try_main() -> DeltaResult<()> {
         .unwrap_or_else(|| panic!("Failed to get object store for URL: {url}"));
 
     // Create or get the table
-    let (table_url, schema) =
-        create_or_get_table(&url, &engine, &cli.write_args.schema, &store).await?;
+    let schema = create_or_get_table(&url, &engine, &cli.write_args.schema, &store).await?;
 
     // Create sample data based on the schema
     let sample_data = create_sample_data(&schema, cli.write_args.num_rows)?;
 
     // Write sample data to the table
-    write_data(&table_url, &engine, &sample_data).await?;
+    write_data(&url, &engine, &sample_data).await?;
     println!(
         "✓ Successfully wrote {} rows to the table",
         cli.write_args.num_rows
     );
 
     // Read and display the data
-    read_and_display_data(&table_url, engine).await?;
+    read_and_display_data(&url, engine).await?;
     println!("✓ Successfully read data from the table");
 
     Ok(())
@@ -103,19 +103,19 @@ async fn create_or_get_table(
     engine: &dyn Engine,
     schema_str: &str,
     store: &Arc<dyn ObjectStore>,
-) -> DeltaResult<(Url, SchemaRef)> {
+) -> DeltaResult<SchemaRef> {
     // Check if table already exists
     match Snapshot::try_new(url.clone(), engine, None) {
         Ok(snapshot) => {
             println!("✓ Found existing table at version {}", snapshot.version());
-            Ok((url.clone(), snapshot.schema()))
+            Ok(snapshot.schema())
         }
         Err(_) => {
             // Create new table
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(store, url, &schema).await?;
-            Ok((url.clone(), schema))
+            Ok(schema)
         }
     }
 }
@@ -289,9 +289,7 @@ async fn write_data(
             println!("✓ Committed transaction at version {version}");
         }
         delta_kernel::transaction::CommitResult::Conflict(_, conflicting_version) => {
-            println!(
-                "✗ Transaction conflicted with version: {conflicting_version}"
-            );
+            println!("✗ Transaction conflicted with version: {conflicting_version}");
             return Err(delta_kernel::Error::generic("Commit failed"));
         }
     }
