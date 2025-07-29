@@ -272,11 +272,12 @@ impl StructField {
                 let name = match self.column_mapping_mode {
                     ColumnMappingMode::None => field.name().to_owned(),
                     ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                        // Assert that the physical name is present
-                        debug_assert!(field
-                            .metadata
-                            .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-                            .is_some_and(|x| matches!(x, MetadataValue::String(_))));
+                        // TODO(#1128): uncomment this once unshredded variant supports column maping metadata
+                        // // Assert that the physical name is present
+                        // debug_assert!(field
+                        //     .metadata
+                        //     .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                        //     .is_some_and(|x| matches!(x, MetadataValue::String(_))));
                         field.physical_name().to_owned()
                     }
                 };
@@ -331,9 +332,11 @@ impl StructField {
                 debug_assert!(base_metadata.contains_key(physical_name_key));
             }
             ColumnMappingMode::Name => {
-                // Logical metadata should have the column mapping metadata keys
-                debug_assert!(base_metadata.contains_key(physical_name_key));
-                debug_assert!(base_metadata.contains_key(field_id_key));
+                // TODO(#1128): Uncomment the debug assertions once unshredded variant can be constructed
+                // with column mapping metadata.
+                // // Logical metadata should have the column mapping metadata keys
+                // debug_assert!(base_metadata.contains_key(physical_name_key));
+                // debug_assert!(base_metadata.contains_key(field_id_key));
 
                 // Remove all id mode related metadata keys
                 base_metadata.remove(field_id_key);
