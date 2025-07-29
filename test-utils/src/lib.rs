@@ -248,6 +248,10 @@ pub async fn create_table(
         }
         if enable_column_mapping {
             reader_features.push("columnMapping");
+            // TODO: (#1124) we don't actually support column mapping writes yet, but have some
+            // tests that do column mapping on writes. for now omit the writer feature to let tests
+            // run, but after actual support this should be enabled.
+            // writer_features.push("columnMapping");
         }
         (reader_features, writer_features)
     };
@@ -357,7 +361,6 @@ pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
         .into())
 }
 
-// TODO (zach): this is listed as unused for acceptance crate
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
@@ -375,7 +378,6 @@ pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<Record
         .try_collect()
 }
 
-// TODO (zach): this is listed as unused for acceptance crate
 pub fn test_read(
     expected: &ArrowEngineData,
     url: &Url,
