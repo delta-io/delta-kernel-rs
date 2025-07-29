@@ -1,7 +1,7 @@
 //! Utility functions for the variant type and variant-related table features.
 
 use crate::actions::Protocol;
-use crate::schema::{DataType, Schema, SchemaTransform};
+use crate::schema::{Schema, SchemaTransform, StructType};
 use crate::table_features::{ReaderFeature, WriterFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
@@ -12,7 +12,7 @@ use std::borrow::Cow;
 pub(crate) struct UsesVariant(pub(crate) bool);
 
 impl<'a> SchemaTransform<'a> for UsesVariant {
-    fn transform_variant(&mut self, _: &'a DataType) -> Option<Cow<'a, DataType>> {
+    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
         self.0 = true;
         None
     }
