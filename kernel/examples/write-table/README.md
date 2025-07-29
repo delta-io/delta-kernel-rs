@@ -3,21 +3,16 @@ Write Table
 
 ## About
 
-This example shows a simple program that writes to a Delta table. 
+This example shows how to write a Delta table using the default engine by:
+- Creating a schema defined by the command line arguments
+- Generating random Apache Arrow data for the table
+- Committing the transaction
 
-It demonstrates how to:
+Note: As of July 2025, the Rust kernel does not officially expose APIs for creating tables. This example uses unofficial, internal APIs to create the table.
 
-0. (Optional) Create a new Delta table with a specified schema<sup>*</sup>
-1. Write data to the table using a transaction
-2. Commit changes to the table
-3. Read back the table's contents to verify the write operation
-
-<sup>*</sup>Creating tables is not officially supported by `kernel-rs` yet, so this example uses an unofficial API to create an empty table if there is no existing table at the specified path.
-
-The example uses the default engine and demonstrates basic write operations including:
-- Writing Arrow RecordBatches to Parquet files
-- Transaction management and commits
-- Basic error handling
+Additional details about the example:
+- default schema (`id:integer,name:string,score:double`) will be used in the case that the schema is not specified in the command like arguments
+- table contents will be printed in the command line after successfully creating tables
 
 You can run this example from the same directory as this `README.md` by running `cargo run -- [args]`.
 
