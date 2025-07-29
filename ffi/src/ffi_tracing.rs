@@ -306,18 +306,15 @@ fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaRe
     if result.is_ok() {
         *DISPATCH.lock().unwrap() = Some(dispatch);
         *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
-    } else {
-        if let Err(_e) = &result {
-            if let Some(filter_handle) = &*RELOAD_HANDLE.lock().unwrap() {
-                if let Err(e) = filter_handle.reload(LevelFilter::from(max_level)) {
-                    warn!("Failed to reload tracing level: {}", e);
-                    return Err(Error::generic(format!(
-                        "Unable to reload subscriber: {}",
-                        e
-                    )));
-                } else {
-                    return Ok(());
-                }
+    } else if let Err(_e) = &result {
+        if let Some(filter_handle) = &*RELOAD_HANDLE.lock().unwrap() {
+            if let Err(e) = filter_handle.reload(LevelFilter::from(max_level)) {
+                warn!("Failed to reload tracing level: {e}");
+                return Err(Error::generic(format!(
+                    "Unable to reload subscriber: {e}"
+                )));
+            } else {
+                return Ok(());
             }
         }
     }
@@ -685,15 +682,15 @@ mod tests {
                     "Not all events were INFO or WARN or DEBUG"
                 );
                 assert!(
-                    results.iter().any(|lvl| *lvl == tracing::Level::INFO),
+                    results.contains(&tracing::Level::INFO),
                     "No INFO events found"
                 );
                 assert!(
-                    results.iter().any(|lvl| *lvl == tracing::Level::WARN),
+                    results.contains(&tracing::Level::WARN),
                     "No WARN events found"
                 );
                 assert!(
-                    results.iter().any(|lvl| *lvl == tracing::Level::DEBUG),
+                    results.contains(&tracing::Level::DEBUG),
                     "No DEBUG events found"
                 );
             } else {
@@ -719,11 +716,11 @@ mod tests {
                     "Not all events were INFO or WARN"
                 );
                 assert!(
-                    results.iter().any(|lvl| *lvl == tracing::Level::INFO),
+                    results.contains(&tracing::Level::INFO),
                     "No INFO events found"
                 );
                 assert!(
-                    results.iter().any(|lvl| *lvl == tracing::Level::WARN),
+                    results.contains(&tracing::Level::WARN),
                     "No WARN events found"
                 );
             } else {
