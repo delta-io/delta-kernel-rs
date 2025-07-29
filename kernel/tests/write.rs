@@ -21,16 +21,18 @@ use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::ObjectStore;
 use delta_kernel::transaction::CommitResult;
 
+use test_utils::set_json_value;
+
 use itertools::Itertools;
 use serde_json::json;
 use serde_json::Deserializer;
+use tempfile::tempdir;
 
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
-use test_utils::{create_table, engine_store_setup, setup_test_tables};
+use test_utils::{create_table, engine_store_setup, setup_test_tables, test_read};
 
 mod common;
-use test_utils::test_read;
 use url::Url;
 
 #[tokio::test]
@@ -44,7 +46,9 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema, &[], None, "test_table").await?
+    {
         // create a transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
@@ -99,21 +103,6 @@ fn check_action_timestamps<'a>(
         }
     });
 
-    Ok(())
-}
-
-// update `value` at (.-separated) `path` to `new_value`
-fn set_value(
-    value: &mut serde_json::Value,
-    path: &str,
-    new_value: serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut path_string = path.replace(".", "/");
-    path_string.insert(0, '/');
-    let v = value
-        .pointer_mut(&path_string)
-        .ok_or_else(|| format!("key '{path}' not found"))?;
-    *v = new_value;
     Ok(())
 }
 
@@ -210,7 +199,9 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table_url, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
@@ -228,7 +219,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
 
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
-        set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
 
         let expected_commit = vec![json!({
             "commitInfo": {
@@ -255,7 +246,9 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table_url, engine, store, table_name) in setup_test_tables(schema.clone(), &[]).await? {
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
         write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
@@ -280,11 +273,11 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
-        set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
-        set_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
-        set_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
-        set_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
-        set_value(&mut parsed_commits[2], "add.path", json!("second.parquet"))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
+        set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
+        set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
+        set_json_value(&mut parsed_commits[2], "add.path", json!("second.parquet"))?;
 
         let expected_commit = vec![
             json!({
@@ -339,7 +332,9 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table_url, engine, _, _) in setup_test_tables(schema.clone(), &[]).await? {
+    for (table_url, engine, _, _) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
         let engine = Arc::new(engine);
         write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
             .await?;
@@ -379,7 +374,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     )]));
 
     for (table_url, engine, store, table_name) in
-        setup_test_tables(table_schema.clone(), &[partition_col]).await?
+        setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let mut txn = snapshot.transaction()?.with_engine_info("default engine");
@@ -443,11 +438,11 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         // set timestamps to 0 and paths to known string values for comparison
         // (otherwise timestamps are non-deterministic and paths are random UUIDs)
-        set_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
-        set_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
-        set_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
-        set_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
-        set_value(&mut parsed_commits[2], "add.path", json!("second.parquet"))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
+        set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
+        set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
+        set_json_value(&mut parsed_commits[2], "add.path", json!("second.parquet"))?;
 
         let expected_commit = vec![
             json!({
@@ -515,7 +510,9 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         DataType::STRING,
     )]));
 
-    for (table_url, engine, _store, _table_name) in setup_test_tables(table_schema, &[]).await? {
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(table_schema, &[], None, "test_table").await?
+    {
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
@@ -570,7 +567,9 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         DataType::INTEGER,
     )]));
 
-    for (table_url, engine, store, table_name) in setup_test_tables(schema, &[]).await? {
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema, &[], None, "test_table").await?
+    {
         // can't have duplicate app_id in same transaction
         let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
         assert!(matches!(
@@ -698,7 +697,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         DataType::TIMESTAMP_NTZ,
     )]));
 
-    let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", true);
+    let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", None);
     let table_url = create_table(
         store.clone(),
         table_location,
@@ -822,7 +821,12 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         ),
     ]));
 
-    let (store, engine, table_location) = engine_store_setup("test_table_variant", true);
+    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+    let (store, engine, table_location) =
+        engine_store_setup("test_table_variant", Some(&tmp_test_dir_url));
+
     let table_url = create_table(
         store.clone(),
         table_location,
@@ -945,10 +949,11 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     txn.commit(engine.as_ref())?;
 
     // Verify the commit was written correctly
+    let commit1_url = tmp_test_dir_url
+        .join("test_table_variant/_delta_log/00000000000000000001.json")
+        .unwrap();
     let commit1 = store
-        .get(&Path::from(
-            "/test_table_variant/_delta_log/00000000000000000001.json",
-        ))
+        .get(&Path::from_url_path(commit1_url.path()).unwrap())
         .await?;
 
     let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
@@ -1027,7 +1032,11 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         ]),
     )]));
 
-    let (store, engine, table_location) = engine_store_setup("test_table_variant_2", true);
+    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+    let (store, engine, table_location) =
+        engine_store_setup("test_table_variant_2", Some(&tmp_test_dir_url));
     let table_url = create_table(
         store.clone(),
         table_location,
@@ -1112,10 +1121,11 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     txn.commit(engine.as_ref())?;
 
     // Verify the commit was written correctly
+    let commit1_url = tmp_test_dir_url
+        .join("test_table_variant_2/_delta_log/00000000000000000001.json")
+        .unwrap();
     let commit1 = store
-        .get(&Path::from(
-            "/test_table_variant_2/_delta_log/00000000000000000001.json",
-        ))
+        .get(&Path::from_url_path(commit1_url.path()).unwrap())
         .await?;
 
     let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)

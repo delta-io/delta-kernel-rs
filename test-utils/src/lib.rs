@@ -187,27 +187,25 @@ impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
     }
 }
 
-// setup default engine with in-memory (=true) or local fs (=false) object store.
+// setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
 pub fn engine_store_setup(
     table_name: &str,
-    in_memory: bool,
+    local_directory: Option<&Url>,
 ) -> (
     Arc<dyn ObjectStore>,
     DefaultEngine<TokioBackgroundExecutor>,
     Url,
 ) {
-    let (storage, base_path, base_url): (Arc<dyn ObjectStore>, &str, &str) = if in_memory {
-        (Arc::new(InMemory::new()), "/", "memory:///")
-    } else {
-        (
+    let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
+        None => (
+            Arc::new(InMemory::new()),
+            Url::parse(format!("memory:///{table_name}/").as_str()).expect("valid url"),
+        ),
+        Some(dir) => (
             Arc::new(LocalFileSystem::new()),
-            "./kernel_write_tests/",
-            "file://",
-        )
+            Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
+        ),
     };
-
-    let table_root_path = Path::from(format!("{base_path}{table_name}"));
-    let url = Url::parse(&format!("{base_url}{table_root_path}/")).unwrap();
     let executor = Arc::new(TokioBackgroundExecutor::new());
     let engine = DefaultEngine::new(Arc::clone(&storage), executor);
 
@@ -296,16 +294,21 @@ pub async fn create_table(
 
     // put 0.json with protocol + metadata
     let path = table_path.join("_delta_log/00000000000000000000.json")?;
+
     store
         .put(&Path::from_url_path(path.path())?, data.into())
         .await?;
     Ok(table_path)
 }
 
-/// Creates two empty test tables, one with 3/7 protocol and one with 1/1 protocol
+/// Creates two empty test tables, one with 37 protocol and one with 11 protocol.
+/// the tables will be named {table_base_name}_11 and table_base_name}_37. The local_directory param
+/// can be set to write out the tables to the local filesystem, passing in None will create in-memory tables
 pub async fn setup_test_tables(
     schema: SchemaRef,
     partition_columns: &[&str],
+    local_directory: Option<&Url>,
+    table_base_name: &str,
 ) -> Result<
     Vec<(
         Url,
@@ -315,8 +318,12 @@ pub async fn setup_test_tables(
     )>,
     Box<dyn std::error::Error>,
 > {
-    let (store_37, engine_37, table_location_37) = engine_store_setup("test_table_37", true);
-    let (store_11, engine_11, table_location_11) = engine_store_setup("test_table_11", true);
+    let table_name_11 = format!("{table_base_name}_11");
+    let table_name_37 = format!("{table_base_name}_37");
+    let (store_11, engine_11, table_location_11) =
+        engine_store_setup(table_name_11.as_str(), local_directory);
+    let (store_37, engine_37, table_location_37) =
+        engine_store_setup(table_name_37.as_str(), local_directory);
     Ok(vec![
         (
             create_table(
@@ -396,5 +403,20 @@ pub fn test_read(
     println!("expected:\n{expected}");
     assert_eq!(formatted, expected);
 
+    Ok(())
+}
+
+// Helper function to set json values in a serde_json Values
+pub fn set_json_value(
+    value: &mut serde_json::Value,
+    path: &str,
+    new_value: serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut path_string = path.replace(".", "/");
+    path_string.insert(0, '/');
+    let v = value
+        .pointer_mut(&path_string)
+        .ok_or_else(|| format!("key '{path}' not found"))?;
+    *v = new_value;
     Ok(())
 }
