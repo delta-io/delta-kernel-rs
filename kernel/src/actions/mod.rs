@@ -288,7 +288,13 @@ impl IntoEngineData for Metadata {
         let id = Scalar::from(self.id);
         let name = Scalar::from(self.name);
         let description = Scalar::from(self.description);
-        let format = Scalar::try_from(self.format)?;
+        // For format, we need to provide individual scalars for provider and options
+        let format_provider = Scalar::from(self.format.provider);
+        let format_options = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.format.options,
+        )
+        .map(Scalar::Map)?;
         let schema_string = Scalar::from(self.schema_string);
         let partition_columns = Scalar::Array(ArrayData::try_new(
             ArrayType::new(DataType::STRING, false),
@@ -305,7 +311,8 @@ impl IntoEngineData for Metadata {
             id,
             name,
             description,
-            format,
+            format_provider,
+            format_options,
             schema_string,
             partition_columns,
             created_time,
@@ -875,6 +882,7 @@ impl DomainMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::json::ReaderBuilder;
     use crate::{
         arrow::array::{Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder},
         arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
@@ -884,6 +892,7 @@ mod tests {
         schema::{ArrayType, DataType, MapType, StructField},
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
+    use serde_json::json;
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);
@@ -1513,5 +1522,107 @@ mod tests {
             panic!("Expected map");
         };
         assert_eq!(map_data.pairs().len(), 3);
+    }
+
+    #[test]
+    fn test_metadata_into_engine_data() {
+        let engine = ExprEngine::new();
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+
+        let test_metadata = Metadata::try_new(
+            Some("test".to_string()),
+            Some("my table".to_string()),
+            schema.clone(),
+            vec!["part".to_string()],
+            123,
+            HashMap::from([("k".to_string(), "v".to_string())]),
+        )
+        .unwrap();
+
+        // have to get the id since it's random
+        let test_id = test_metadata.id.clone();
+
+        let actual: RecordBatch = test_metadata
+            .into_engine_data(Metadata::to_schema().into(), &engine)
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let expected_json = json!({
+            "id": test_id,
+            "name": "test",
+            "description": "my table",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+            "partitionColumns": ["part"],
+            "createdTime": 123,
+            "configuration": {
+                "k": "v"
+            }
+        }).to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_metadata_with_log_schema() {
+        let engine = ExprEngine::new();
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+
+        let metadata = Metadata::try_new(
+            Some("table".to_string()),
+            None, // test that omitting description will omit entire field
+            schema,
+            vec![],
+            456,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let metadata_id = metadata.id.clone();
+
+        // test with the full log schema that wraps metadata in a "metaData" field
+        let log_schema = get_log_schema().project(&[METADATA_NAME]).unwrap();
+        let actual: RecordBatch = metadata
+            .into_engine_data(log_schema, &engine)
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let expected_json = json!({
+            "metaData": {
+                "id": metadata_id,
+                "name": "table",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "createdTime": 456,
+                "configuration": {}
+            }
+        }).to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
     }
 }
