@@ -300,25 +300,42 @@ fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaRe
     if !max_level.is_valid() {
         return Err(Error::generic("max_level out of range"));
     }
-    let (dispatch, reload_handle) = get_event_dispatcher(callback, max_level);
-    let result = set_global_default(dispatch.clone());
-    // set_global_default can be called successfully only once
-    if result.is_ok() {
-        *DISPATCH.lock().unwrap() = Some(dispatch);
-        *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
-    } else if let Err(_e) = &result {
-        if let Some(filter_handle) = &*RELOAD_HANDLE.lock().unwrap() {
-            if let Err(e) = filter_handle.reload(LevelFilter::from(max_level)) {
+
+    // Try reloading if already initialized
+    if let Some(reload_handle) = &*RELOAD_HANDLE.lock().unwrap() {
+        match reload_handle.reload(LevelFilter::from(max_level)) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
                 warn!("Failed to reload tracing level: {e}");
-                return Err(Error::generic(format!(
-                    "Unable to reload subscriber: {e}"
-                )));
-            } else {
-                return Ok(());
+                return Err(Error::generic(format!("Unable to reload subscriber: {e}")));
             }
         }
     }
-    result
+
+    // Otherwise, try to install a new global subscriber
+    let (dispatch, reload_handle) = get_event_dispatcher(callback, max_level);
+    match set_global_default(dispatch.clone()) {
+        Ok(()) => {
+            *DISPATCH.lock().unwrap() = Some(dispatch);
+            *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to set global default: {e}");
+            // Fallback: try to reload with the new handle instead
+            match reload_handle.reload(LevelFilter::from(max_level)) {
+                Ok(_) => {
+                    *DISPATCH.lock().unwrap() = Some(dispatch);
+                    *RELOAD_HANDLE.lock().unwrap() = Some(reload_handle);
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("Failed to reload fallback tracing level: {e}");
+                    Err(Error::generic(format!("Unable to reload subscriber: {e}")))
+                }
+            }
+        }
+    }
 }
 
 // utility code below for setting up the tracing subscriber for log lines
@@ -659,12 +676,14 @@ mod tests {
     }
 
     #[test]
-    fn change_event_tracking_level() {
+    fn trace_event_tracking_level() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
         let lines = ["Testing 1", "Another line"];
         let result = setup_event_subscriber(event_callback, Level::DEBUG);
-        assert!(result.is_ok());
+        if let Err(e) = &result {
+            assert!(result.is_ok(), "{e}");
+        }
         for line in lines {
             warn!("{line}");
             info!("{line}");
