@@ -505,6 +505,55 @@ impl Protocol {
     }
 }
 
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
+impl IntoEngineData for Protocol {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let min_reader_version = Scalar::from(self.min_reader_version);
+        let min_writer_version = Scalar::from(self.min_writer_version);
+
+        let reader_features = match self.reader_features {
+            Some(features) => {
+                let features: Vec<Scalar> = features.into_iter().map(Scalar::from).collect();
+                Scalar::Array(ArrayData::try_new(
+                    ArrayType::new(DataType::STRING, false),
+                    features,
+                )?)
+            }
+            None => Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+                DataType::STRING,
+                false,
+            )))),
+        };
+        let writer_features = match self.writer_features {
+            Some(features) => {
+                let features: Vec<Scalar> = features.into_iter().map(Scalar::from).collect();
+                Scalar::Array(ArrayData::try_new(
+                    ArrayType::new(DataType::STRING, false),
+                    features,
+                )?)
+            }
+            None => Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+                DataType::STRING,
+                false,
+            )))),
+        };
+
+        let values = [
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
+}
+
 // given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
     table_features: &[T],
