@@ -3,6 +3,8 @@ use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use delta_kernel_derive::internal_api;
+
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
 use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
@@ -83,6 +85,8 @@ impl Transaction {
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
     /// a snapshot.
+    /// Use this API only if you need to create a transaction from a specific snapshot.
+    #[internal_api]
     pub(crate) fn try_new(snapshot: impl Into<Arc<Snapshot>>) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
