@@ -204,7 +204,7 @@ impl Metadata {
     pub(crate) fn try_new(
         name: Option<String>,
         description: Option<String>,
-        schema_string: StructType,
+        schema: StructType,
         partition_columns: Vec<String>,
         created_time: i64,
         configuration: HashMap<String, String>,
@@ -213,8 +213,12 @@ impl Metadata {
             id: uuid::Uuid::new_v4().to_string(),
             name,
             description,
+            // As of Delta Lake 0.3.0, user-facing APIs only allow the creation of tables where
+            // format = 'parquet' and options = {}. Support for reading other formats is present
+            // both for legacy reasons and to enable possible support for other formats in the
+            // future (See delta-io/delta#87).
             format: Format::default(),
-            schema_string: serde_json::to_string(&schema_string)?,
+            schema_string: serde_json::to_string(&schema)?,
             partition_columns,
             created_time: Some(created_time),
             configuration,
@@ -278,7 +282,7 @@ impl Metadata {
     }
 }
 
-// TODO: derive IntoEngineData instead
+// TODO: derive IntoEngineData instead (see issue #1083)
 impl IntoEngineData for Metadata {
     fn into_engine_data(
         self,
