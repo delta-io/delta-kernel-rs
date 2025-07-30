@@ -874,9 +874,10 @@ pub trait SchemaTransform<'a> {
         self.transform(etype)
     }
 
-    /// Called for each variant values encountered. By default does nothing
-    fn transform_variant(&mut self, etype: &'a DataType) -> Option<Cow<'a, DataType>> {
-        Some(Cow::Borrowed(etype))
+    /// Called for each variant value encountered. By default, recurses into the fields of the
+    /// variant struct type.
+    fn transform_variant(&mut self, stype: &'a StructType) -> Option<Cow<'a, StructType>> {
+        self.recurse_into_struct(stype)
     }
 
     /// General entry point for a recursive traversal over any data type. Also invoked internally to
@@ -896,9 +897,9 @@ pub trait SchemaTransform<'a> {
             Map(mtype) => self
                 .transform_map(mtype)?
                 .map_owned_or_else(data_type, DataType::from),
-            Variant(_) => self
-                .transform_variant(data_type)?
-                .map_owned_or_else(data_type, DataType::from),
+            Variant(stype) => self
+                .transform_variant(stype)?
+                .map_owned_or_else(data_type, |s| DataType::Variant(Box::new(s))),
         };
         Some(result)
     }

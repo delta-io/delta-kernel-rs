@@ -464,7 +464,7 @@ impl Scan {
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
     ///   index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
-    ///   is `true` at index `i` the row *should* be processed. If the selector vector is *shorter*
+    ///   is `true` at index `i` the row *should* be processed. If the selection vector is *shorter*
     ///   than the number of rows returned, missing elements are considered `true`, i.e. included in
     ///   the query. NB: If you are using the default engine and plan to call arrow's
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
@@ -485,12 +485,12 @@ impl Scan {
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
     ///
-    /// The existing iterator is assumed contain data from a previous call to  `scan_metadata`,
+    /// The existing iterator is assumed to contain data from a previous call to `scan_metadata`.
     /// Engines may decide to cache the results of `scan_metadata` to avoid additional IO operations
     /// required to replay the log.
     ///
     /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the new
-    /// scan's predicate MUST skip all files the previous scan's predicate skipped, The new scan's
+    /// scan's predicate MUST skip all files the previous scan's predicate skipped. The new scan's
     /// predicate is also allowed to skip files the previous predicate kept. For example, if the previous
     /// scan predicate was
     /// ```sql
