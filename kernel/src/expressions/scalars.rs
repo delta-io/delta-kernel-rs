@@ -692,6 +692,7 @@ mod tests {
     use std::f32::consts::PI;
 
     use crate::expressions::{column_expr, BinaryPredicateOp};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
 
     use super::*;
@@ -876,45 +877,51 @@ mod tests {
 
     #[test]
     fn test_invalid_array() {
-        assert!(ArrayData::try_new(
-            ArrayType::new(DataType::INTEGER, false),
-            [Scalar::Integer(1), Scalar::String("s".to_string())],
-        )
-        .is_err());
+        assert_result_error_with_message(
+            ArrayData::try_new(
+                ArrayType::new(DataType::INTEGER, false),
+                [Scalar::Integer(1), Scalar::String("s".to_string())],
+            ),
+            "Schema error: Array scalar type mismatch: expected integer, got string",
+        );
 
-        assert!(
-            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]).is_err()
+        assert_result_error_with_message(
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]),
+            "Schema error: Array element cannot be null for non-nullable array",
         );
     }
 
     #[test]
     fn test_invalid_map() {
         // incorrect schema
-        assert!(MapData::try_new(
+        assert_result_error_with_message(MapData::try_new(
             MapType::new(DataType::STRING, DataType::INTEGER, false),
             [(Scalar::Integer(1), Scalar::String("s".to_string())),],
-        )
-        .is_err());
+        ), "Schema error: Map scalar type mismatch: expected key type string, got key type integer");
 
         // key must be non-null
-        assert!(MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, true),
-            [(
-                Scalar::Null(DataType::STRING),  // key
-                Scalar::String("s".to_string())  // val
-            ),],
-        )
-        .is_err());
+        assert_result_error_with_message(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::STRING, true),
+                [(
+                    Scalar::Null(DataType::STRING),  // key
+                    Scalar::String("s".to_string()), // val
+                )],
+            ),
+            "Schema error: Map key cannot be null",
+        );
 
         // val must be non-null if we have value_contains_null = false
-        assert!(MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            [(
-                Scalar::String("s".to_string()), // key
-                Scalar::Null(DataType::STRING)   // val
-            ),],
-        )
-        .is_err());
+        assert_result_error_with_message(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::STRING, false),
+                [(
+                    Scalar::String("s".to_string()), // key
+                    Scalar::Null(DataType::STRING),  // val
+                )],
+            ),
+            "Schema error: Null map value disallowed if map value_contains_null is false",
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ mod tests {
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {
@@ -101,11 +102,7 @@ mod tests {
             &schema_with_timestamp_ntz,
             &protocol_without_features,
         );
-        assert!(
-            result.is_err(),
-            "Should fail when TIMESTAMP_NTZ columns are present but features are missing"
-        );
-        assert!(result.unwrap_err().to_string().contains("timestampNtz"));
+        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
 
         // Nested schema with TIMESTAMP_NTZ
         let nested_schema_with_timestamp_ntz = StructType::new([
@@ -125,9 +122,6 @@ mod tests {
             &nested_schema_with_timestamp_ntz,
             &protocol_without_features,
         );
-        assert!(
-            result.is_err(),
-            "Should fail for nested TIMESTAMP_NTZ columns when features are missing"
-        );
+        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
     }
 }
