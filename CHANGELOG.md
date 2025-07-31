@@ -4,34 +4,41 @@
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.13.0...v0.14.0)
 
+### 🏗️ Breaking changes
+1. Removed Table APIs: instead use `Snapshot` and `Transaction` directly. ([#976])
+2. Add support for Variant type and the variantType table feature (new `DataType::Variant` enum
+   variant and new `variantType-preivew` and `variantShredding` Reader/Writer features) ([#1015])
+3. Expose post commit stats. Now, in `Transaction::commit` the `Committed` variant of the enum
+   includes a `post_commit_stats` field with info about the commits since checkpoint and log
+   compaction. ([#1079])
+4. Replace `Transaction::with_commit_info()` API with `with_engine_info()` API ([#997])
+5. Removed `DataType::decimal_unchecked` API ([#1087])
+6. `make_physical` takes column mapping and sets parquet field ids. breaking: (1)
+    `StructField::make_physical` is now an internal_api instead of a public function. Its signature
+    has also changed. And (2) If `ColumnMappingMode` is `None`, then the physical schema's name is
+    the logical name. Previously, kernel would unconditionally use the column mapping physical name,
+    even if column mapping mode is none. ([#1082])
 
 ### 🚀 Features / new APIs
 
 1. *(ffi)* Added default-engine-rustls feature and extern "C" for .h file ([#1023])
-2. Add support for Variant type and the variantType table feature ([#1015])
-3. Expose post commit stats ([#1079])
-4. Add log segment constructor for timestamp to version conversion ([#895])
-5. Replace `with_commit_info()` API with `with_engine_info()` API ([#997])
-6. Expose unshredded variant type as `DataType::unshredded_variant()` ([#1086])
-7. New ffi API for `get_domain_metadata()` ([#1041])
-8. Add append functions to ffi ([#962])
-9. Add try_new and `IntoEngineData` for Metadata action ([#1122])
-10. `make_physical` takes column mapping and sets parquet field ids ([#1082])
+2. Add log segment constructor for timestamp to version conversion ([#895])
+3. Expose unshredded variant type as `DataType::unshredded_variant()` ([#1086])
+4. New ffi API for `get_domain_metadata()` ([#1041])
+5. Add append functions to ffi ([#962])
+6. Add try_new and `IntoEngineData` for Metadata action ([#1122])
 
 ### 🐛 Bug Fixes
 
-1. Rename object_store PutMultipartOpts ([#1071])
-2. Object_store PutMultiPartOpts fix redo ([#1090])
-3. Remove `DataType::decimal_unchecked` ([#1087])
-4. Use object_store >= 0.12.3 for arrow 55 feature ([#1117])
-5. VARIANT follow-ups for SchemaTransform etc ([#1106])
+1. Rename object_store PutMultipartOpts ([#1071], [#1090])
+2. Use object_store >= 0.12.3 for arrow 55 feature ([#1117])
+3. VARIANT follow-ups for SchemaTransform etc ([#1106])
 
 ### 🚜 Refactor
 
-1. Remove Table APIs ([#976])
-2. Downgrade stale `_last_checkpoint` log from `warn!` to `info!` ([#777])
-3. Exclude `tests/data` from release ([#1092])
-4. Deny panics in prod code ([#1113])
+1. Downgrade stale `_last_checkpoint` log from `warn!` to `info!` ([#777])
+2. Exclude `tests/data` from release ([#1092])
+3. Deny panics in prod code ([#1113])
 
 ### 🧪 Testing
 
