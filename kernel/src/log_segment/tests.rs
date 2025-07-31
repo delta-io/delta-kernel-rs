@@ -25,7 +25,7 @@ use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
 use crate::snapshot::LastCheckpointHint;
-use crate::utils::test_utils::{assert_batch_matches, Action};
+use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
@@ -457,7 +457,10 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
 
     let log_segment =
         LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None);
-    assert!(log_segment.is_err())
+    assert_result_error_with_message(
+        log_segment,
+        "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
+    )
 }
 #[test]
 fn build_snapshot_with_bad_checkpoint_hint_fails() {
@@ -491,7 +494,11 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
 
     let log_segment =
         LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None);
-    assert!(log_segment.is_err())
+    assert_result_error_with_message(
+        log_segment,
+        "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
+        it has 2",
+    )
 }
 
 #[test]
@@ -769,14 +776,26 @@ fn test_non_contiguous_log() {
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 0, None);
-    assert!(log_segment_res.is_err());
+    // check the error message up to the timestamp
+    let expected_error_pattern = "Generic delta kernel error: Expected ordered contiguous \
+        commit files [ParsedLogPath { location: FileMeta { location: Url { scheme: \"memory\", \
+        cannot_be_a_base: false, username: \"\", password: None, host: None, port: None, path: \
+        \"/_delta_log/00000000000000000000.json\", query: None, fragment: None }, last_modified:";
+    assert_result_error_with_message(log_segment_res, expected_error_pattern);
 
     let log_segment_res =
         LogSegment::for_table_changes(storage.as_ref(), log_root.clone(), 1, None);
-    assert!(log_segment_res.is_err());
+    assert_result_error_with_message(
+        log_segment_res,
+        "Generic delta kernel error: Expected the first commit to have version 1",
+    );
 
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 0, Some(1));
-    assert!(log_segment_res.is_err());
+    assert_result_error_with_message(
+        log_segment_res,
+        "Generic delta kernel error: LogSegment end version 0 not the same as the specified end \
+        version 1",
+    );
 }
 
 #[test]
@@ -790,7 +809,7 @@ fn table_changes_fails_with_larger_start_version_than_end() {
         None,
     );
     let log_segment_res = LogSegment::for_table_changes(storage.as_ref(), log_root, 1, Some(0));
-    assert!(log_segment_res.is_err());
+    assert_result_error_with_message(log_segment_res, "Generic delta kernel error: Failed to build LogSegment: start_version cannot be greater than end_version");
 }
 #[test]
 fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
@@ -912,7 +931,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 
     // Assert that an error is returned when trying to read sidecar files that do not exist
     let err = iter.next().unwrap();
-    assert!(err.is_err());
+    assert_result_error_with_message(err, "Arrow error: External: Object at location _delta_log/_sidecars/sidecarfile1.parquet not found: No data in memory found. Location: _delta_log/_sidecars/sidecarfile1.parquet");
 
     Ok(())
 }
@@ -982,7 +1001,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
     );
 
     // Errors because the schema has an REMOVE action but no SIDECAR action.
-    assert!(result.is_err());
+    assert_result_error_with_message(result, "Invalid Checkpoint: If the checkpoint read schema contains file actions, it must contain the sidecar column");
 
     Ok(())
 }
@@ -1009,7 +1028,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
     let result = log_segment.create_checkpoint_stream(&engine, get_log_add_schema().clone(), None);
 
     // Errors because the schema has an ADD action but no SIDECAR action.
-    assert!(result.is_err());
+    assert_result_error_with_message(result, "Invalid Checkpoint: If the checkpoint read schema contains file actions, it must contain the sidecar column");
 
     Ok(())
 }
@@ -1985,7 +2004,5 @@ fn for_timestamp_conversion_no_commit_files() {
     );
 
     let res = LogSegment::for_timestamp_conversion(storage.as_ref(), log_root.clone(), 0, None);
-    assert!(res.is_err());
-    let msg = res.err().unwrap().to_string();
-    assert!(msg.contains("No files in log segment"))
+    assert_result_error_with_message(res, "Generic delta kernel error: No files in log segment");
 }

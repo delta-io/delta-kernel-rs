@@ -261,6 +261,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
 
@@ -336,12 +337,14 @@ mod tests {
             true
         )
         .is_ok());
-        assert!(ensure_data_types(
-            &DataType::unshredded_variant(),
-            &incorrect_variant_arrow_type(),
-            true
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::unshredded_variant(),
+                &incorrect_variant_arrow_type(),
+                true,
+            ),
+            "Invalid argument error: Incorrect datatype. Expected Struct(metadata Binary, value Binary), got Struct(field_1 Binary, field_2 Binary)",
         )
-        .is_err());
     }
 
     #[test]
@@ -352,12 +355,14 @@ mod tests {
             false
         )
         .is_ok());
-        assert!(ensure_data_types(
-            &DataType::decimal(5, 2).unwrap(),
-            &ArrowDataType::Decimal128(5, 3),
-            false
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::decimal(5, 2).unwrap(),
+                &ArrowDataType::Decimal128(5, 3),
+                false,
+            ),
+            "Invalid argument error: Incorrect datatype. Expected Decimal128(5, 2), got Decimal128(5, 3)",
         )
-        .is_err());
     }
 
     #[test]
@@ -381,23 +386,26 @@ mod tests {
         )
         .is_ok());
 
-        assert!(ensure_data_types(
-            &DataType::Map(Box::new(MapType::new(
-                DataType::LONG,
-                DataType::STRING,
-                false
-            ))),
-            arrow_field.data_type(),
-            true
-        )
-        .is_err());
-
-        assert!(ensure_data_types(
-            &DataType::Map(Box::new(MapType::new(DataType::LONG, DataType::LONG, true))),
-            arrow_field.data_type(),
-            false
-        )
-        .is_err());
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Map(Box::new(MapType::new(
+                    DataType::LONG,
+                    DataType::STRING,
+                    false,
+                ))),
+                arrow_field.data_type(),
+                true,
+            ),
+            "Generic delta kernel error: Map has nullablily false in kernel and true in arrow",
+        );
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Map(Box::new(MapType::new(DataType::LONG, DataType::LONG, true))),
+                arrow_field.data_type(),
+                false,
+            ),
+            "Invalid argument error: Incorrect datatype. Expected long, got Utf8",
+        );
     }
 
     #[test]
@@ -408,18 +416,22 @@ mod tests {
             false
         )
         .is_ok());
-        assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-            &ArrowDataType::new_list(ArrowDataType::Int64, true),
-            false
-        )
-        .is_err());
-        assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
-            &ArrowDataType::new_list(ArrowDataType::Int64, false),
-            true
-        )
-        .is_err());
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                false,
+            ),
+            "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
+        );
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &ArrowDataType::new_list(ArrowDataType::Int64, false),
+                true,
+            ),
+            "Generic delta kernel error: List has nullablily true in kernel and false in arrow",
+        );
     }
 
     #[test]
@@ -468,7 +480,10 @@ mod tests {
             Fields::from(vec![ArrowField::new("w", ArrowDataType::Int64, true)]),
             true,
         );
-        assert!(ensure_data_types(&kernel_simple, arrow_missing_simple.data_type(), true).is_err());
+        assert_result_error_with_message(
+            ensure_data_types(&kernel_simple, arrow_missing_simple.data_type(), true),
+            "Invalid argument error: Missing Struct fields x (Up to five missing fields shown)",
+        );
 
         let arrow_nullable_mismatch_simple = ArrowField::new_struct(
             "arrow_struct",
@@ -478,11 +493,13 @@ mod tests {
             ]),
             true,
         );
-        assert!(ensure_data_types(
-            &kernel_simple,
-            arrow_nullable_mismatch_simple.data_type(),
-            true
-        )
-        .is_err());
+        assert_result_error_with_message(
+            ensure_data_types(
+                &kernel_simple,
+                arrow_nullable_mismatch_simple.data_type(),
+                true,
+            ),
+            "Generic delta kernel error: w has nullablily true in kernel and false in arrow",
+        );
     }
 }
