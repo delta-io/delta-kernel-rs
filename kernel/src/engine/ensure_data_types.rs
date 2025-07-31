@@ -343,7 +343,8 @@ mod tests {
                 &incorrect_variant_arrow_type(),
                 true,
             ),
-            r#"Invalid argument error: Incorrect datatype. Expected Struct([Field { name: "metadata", data_type: Binary, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "value", data_type: Binary, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }]), got Struct([Field { name: "field_1", data_type: Binary, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, Field { name: "field_2", data_type: Binary, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }])"#,
+            // Arrow has different printing for different versions. We use the common prefix
+            "Invalid argument error: Incorrect datatype. Expected Struct",
         )
     }
 
