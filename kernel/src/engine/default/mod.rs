@@ -102,7 +102,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
-        let output_schema = write_context.schema();
+        let output_schema = write_context.snapshot_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
@@ -113,6 +113,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             .write_parquet_file(
                 write_context.target_dir(),
                 physical_data,
+                write_context.add_files_schema().clone(),
                 partition_values,
                 data_change,
             )

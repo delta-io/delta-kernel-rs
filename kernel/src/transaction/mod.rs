@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::iter;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
@@ -12,29 +12,6 @@ use crate::snapshot::Snapshot;
 use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, Version};
 
 use url::Url;
-
-pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new(vec![
-        StructField::not_null("path", DataType::STRING),
-        StructField::not_null(
-            "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::not_null("size", DataType::LONG),
-        StructField::not_null("modificationTime", DataType::LONG),
-        StructField::not_null("dataChange", DataType::BOOLEAN),
-    ]))
-});
-
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
-/// Concretely, it is the expected schema for engine data passed to [`add_files`].
-///
-/// Each row represents metadata about a file to be added to the table.
-///
-/// [`add_files`]: crate::transaction::Transaction::add_files
-pub fn add_files_schema() -> &'static SchemaRef {
-    &ADD_FILES_SCHEMA
-}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -54,6 +31,7 @@ pub struct Transaction {
     read_snapshot: Arc<Snapshot>,
     operation: Option<String>,
     engine_info: Option<String>,
+    add_files_schema: SchemaRef,
     add_files_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
@@ -69,9 +47,14 @@ pub struct Transaction {
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
-            "Transaction {{ read_snapshot version: {}, engine_info: {} }}",
+            "Transaction {{ read_snapshot version: {}, operation: {:?}, engine_info: {:?}, add_files_schema: {:?}, add_files_metadata len: {}, set_transactions len: {}, commit_timestamp: {} }}",
             self.read_snapshot.version(),
-            self.engine_info.is_some()
+            self.operation,
+            self.engine_info,
+            self.add_files_schema,
+            self.add_files_metadata.len(),
+            self.set_transactions.len(),
+            self.commit_timestamp
         ))
     }
 }
@@ -91,6 +74,17 @@ impl Transaction {
             .table_configuration()
             .ensure_write_supported()?;
 
+        let add_files_schema = Arc::new(StructType::new(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::not_null("size", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
+        ]));
+
         // TODO: unify all these into a (safer) `fn current_time_ms()`
         let commit_timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -102,6 +96,7 @@ impl Transaction {
             read_snapshot,
             operation: None,
             engine_info: None,
+            add_files_schema,
             add_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
@@ -142,7 +137,8 @@ impl Transaction {
         let commit_info_schema = get_log_commit_info_schema().clone();
 
         let commit_info_action = commit_info.into_engine_data(commit_info_schema, engine);
-        let add_actions = generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
+        let add_actions =
+            self.generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
 
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
@@ -222,43 +218,51 @@ impl Transaction {
     pub fn get_write_context(&self) -> WriteContext {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
+        let add_files_schema = self.add_files_schema.clone();
         let logical_to_physical = self.generate_logical_to_physical();
-        WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
+        WriteContext::new(
+            target_dir.clone(),
+            snapshot_schema,
+            add_files_schema,
+            logical_to_physical,
+        )
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
     ///
-    /// The expected schema for `add_metadata` is given by [`add_files_schema`].
-    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
-        self.add_files_metadata.push(add_metadata);
+    /// The expected schema for `add_files` is given by [`add_files_schema`].
+    ///
+    /// [`add_files_schema`]: WriteContext::add_files_schema
+    pub fn add_files(&mut self, add_files: Box<dyn EngineData>) {
+        self.add_files_metadata.push(add_files);
     }
-}
 
-// convert add_files_metadata into add actions using an expression to transform the data in a single
-// pass
-fn generate_adds<'a>(
-    engine: &dyn Engine,
-    add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
-) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
-    let evaluation_handler = engine.evaluation_handler();
-    let add_files_schema = add_files_schema();
-    let log_schema = get_log_add_schema();
+    // convert add_files_metadata into add actions using an expression to transform the data in a single
+    // pass
+    fn generate_adds<'a>(
+        &'a self,
+        engine: &dyn Engine,
+        add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
+    ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
+        let evaluation_handler = engine.evaluation_handler();
+        let log_schema = get_log_add_schema();
 
-    add_files_metadata.map(move |add_files_batch| {
-        let adds_expr = Expression::struct_from([Expression::struct_from(
-            add_files_schema
-                .fields()
-                .map(|f| Expression::column([f.name()])),
-        )]);
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            add_files_schema.clone(),
-            adds_expr,
-            log_schema.clone().into(),
-        );
-        adds_evaluator.evaluate(add_files_batch)
-    })
+        add_files_metadata.map(move |add_files_batch| {
+            let adds_expr = Expression::struct_from([Expression::struct_from(
+                self.add_files_schema
+                    .fields()
+                    .map(|f| Expression::column([f.name()])),
+            )]);
+            let adds_evaluator = evaluation_handler.new_expression_evaluator(
+                self.add_files_schema.clone(),
+                adds_expr,
+                log_schema.clone().into(),
+            );
+            adds_evaluator.evaluate(add_files_batch)
+        })
+    }
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -267,25 +271,41 @@ fn generate_adds<'a>(
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    schema: SchemaRef,
+    snapshot_schema: SchemaRef,
+    add_files_schema: SchemaRef,
     logical_to_physical: Expression,
 }
 
 impl WriteContext {
-    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: Expression) -> Self {
+    fn new(
+        target_dir: Url,
+        snapshot_schema: SchemaRef,
+        add_files_schema: SchemaRef,
+        logical_to_physical: Expression,
+    ) -> Self {
         WriteContext {
             target_dir,
-            schema,
+            snapshot_schema,
+            add_files_schema,
             logical_to_physical,
         }
     }
 
+    /// The target directory for writing data.
     pub fn target_dir(&self) -> &Url {
         &self.target_dir
     }
 
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
+    /// Get the schema of the snapshot that this transaction is based on.
+    pub fn snapshot_schema(&self) -> &SchemaRef {
+        &self.snapshot_schema
+    }
+
+    /// Get the expected schema for engine data passed to [`add_files`].
+    ///
+    /// [`add_files`]: crate::transaction::Transaction::add_files
+    pub fn add_files_schema(&self) -> &SchemaRef {
+        &self.add_files_schema
     }
 
     pub fn logical_to_physical(&self) -> &Expression {
@@ -327,13 +347,21 @@ pub enum CommitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
+    use std::path::PathBuf;
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
-    fn test_add_files_schema() {
-        let schema = add_files_schema();
+    fn test_add_files_schema() -> DeltaResult<()> {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/"))?;
+        let url = Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::try_new(url, &engine, None)?;
+        let txn = Transaction::try_new(snapshot)?;
+        let ctx = txn.get_write_context();
+        let schema = ctx.add_files_schema();
         let expected = StructType::new(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
@@ -345,5 +373,6 @@ mod tests {
             StructField::not_null("dataChange", DataType::BOOLEAN),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
     }
 }
