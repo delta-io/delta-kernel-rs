@@ -101,6 +101,10 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
+mod create_table;
+#[cfg(feature = "internal-api")]
+pub use create_table::CreateTableBuilder;
+
 mod arrow_compat;
 #[cfg(any(feature = "arrow-54", feature = "arrow-55"))]
 pub use arrow_compat::*;
