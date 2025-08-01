@@ -7,7 +7,7 @@
 ### 🏗️ Breaking changes
 1. Removed Table APIs: instead use `Snapshot` and `Transaction` directly. ([#976])
 2. Add support for Variant type and the variantType table feature (new `DataType::Variant` enum
-   variant and new `variantType-preivew` and `variantShredding` Reader/Writer features) ([#1015])
+   variant and new `variantType-preview` and `variantShredding` Reader/Writer features) ([#1015])
 3. Expose post commit stats. Now, in `Transaction::commit` the `Committed` variant of the enum
    includes a `post_commit_stats` field with info about the commits since checkpoint and log
    compaction. ([#1079])
