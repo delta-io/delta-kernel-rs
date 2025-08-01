@@ -409,6 +409,8 @@ mod tests {
 
     use itertools::Itertools;
 
+    use crate::utils::test_utils::assert_result_error_with_message;
+
     use super::*;
 
     fn into_record_batch(
@@ -599,9 +601,11 @@ mod tests {
             .unwrap(),
         ));
 
-        assert!(parquet_handler
-            .write_parquet(&Url::parse("memory:///data").unwrap(), data)
-            .await
-            .is_err());
+        assert_result_error_with_message(
+            parquet_handler
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data)
+                .await,
+            "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
+        );
     }
 }
