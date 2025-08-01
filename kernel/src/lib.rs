@@ -145,7 +145,11 @@ use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::{SchemaTransform, StructField, StructType};
 
-#[cfg(any(feature = "default-engine", feature = "arrow-conversion"))]
+#[cfg(any(
+    feature = "default-engine-native-tls",
+    feature = "default-engine-rustls",
+    feature = "arrow-conversion"
+))]
 pub mod engine;
 
 /// Delta table version is 8 byte unsigned int
@@ -634,15 +638,18 @@ pub trait Engine: AsAny {
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared
-// pieces of default-engine and default-engine-rustls. the crate can't compile with _only_
+// pieces of default-engine-native-tls and default-engine-rustls. the crate can't compile with _only_
 // default-engine-base, so we give a friendly error here.
 #[cfg(all(
     feature = "default-engine-base",
-    not(any(feature = "default-engine", feature = "default-engine-rustls",))
+    not(any(
+        feature = "default-engine-native-tls",
+        feature = "default-engine-rustls",
+    ))
 ))]
 compile_error!(
     "The default-engine-base feature flag is not meant to be used directly. \
-    Please use either default-engine or default-engine-rustls."
+    Please use either default-engine-native-tls or default-engine-rustls."
 );
 
 // Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are

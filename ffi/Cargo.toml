@@ -42,13 +42,13 @@ tempfile = "3.20.0"
 itertools = "0.14.0"
 
 [features]
-default = ["default-engine"]
-default-engine = ["delta_kernel/default-engine", "default-engine-base"]
+default = ["default-engine-rustls"]
+default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
 
-# This is an 'internal' feature flag which has all the shared bits from default-engine and
+# This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
-# default-engine or default-engine-rustls, so default-engine-base will not work by itself
+# default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
 default-engine-base = ["delta_kernel/default-engine-base", "delta_kernel/arrow"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]

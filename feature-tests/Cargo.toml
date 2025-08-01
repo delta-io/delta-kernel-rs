@@ -16,5 +16,5 @@ release = false
 delta_kernel = { path = "../kernel", features = ["arrow"] }
 
 [features]
-default-engine = [ "delta_kernel/default-engine" ]
+default-engine-native-tls= [ "delta_kernel/default-engine-native-tls" ]
 default-engine-rustls = [ "delta_kernel/default-engine-rustls" ]

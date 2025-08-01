@@ -111,8 +111,8 @@ jobs:
         run: cargo clippy --workspace --no-default-features --exclude delta_kernel --exclude delta_kernel_ffi --exclude delta_kernel_derive --exclude delta_kernel_ffi_macros -- -D warnings
       - name: lint without default features - packages which don't depend on kernel with features enabled
         run: cargo clippy --no-default-features --package delta_kernel --package delta_kernel_ffi --package delta_kernel_derive --package delta_kernel_ffi_macros -- -D warnings
-      - name: check kernel builds with default-engine
-        run: cargo build -p feature_tests --features default-engine
+      - name: check kernel builds with default-engine-native-tls
+        run: cargo build -p feature_tests --features default-engine-native-tls
       - name: check kernel builds with default-engine-rustls
         run: cargo build -p feature_tests --features default-engine-rustls
   test:
@@ -178,7 +178,7 @@ jobs:
           cargo build
           popd
           pushd ffi
-          cargo b --features default-engine,test-ffi,tracing
+          cargo b --features default-engine-rustls,test-ffi,tracing
           popd
       - name: build and run read-table test
         run: |
@@ -210,7 +210,7 @@ jobs:
       - name: Test with Miri
         run: |
           pushd ffi
-          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine
+          MIRIFLAGS=-Zmiri-disable-isolation cargo miri test --features default-engine-rustls
 
   coverage:
     runs-on: ubuntu-latest
