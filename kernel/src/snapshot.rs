@@ -13,7 +13,7 @@ use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
-use crate::transaction::Transaction;
+use crate::transaction::{self, Transaction};
 use crate::utils::{calculate_transaction_expiration_timestamp, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
@@ -352,7 +352,7 @@ impl Snapshot {
     }
 
     /// Create a [`Transaction`] for this `Arc<Snapshot>`.
-    pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
+    pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction<transaction::Metadata>> {
         Transaction::try_new(self)
     }
 
