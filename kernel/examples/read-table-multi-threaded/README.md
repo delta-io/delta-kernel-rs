@@ -1,7 +1,7 @@
 Read Table Multi-Threaded
 =========================
 
-# About
+## About
 This example shows a program that reads a table using multiple threads. This shows the use of the
 `scan_metadata`, `global_scan_state`, and `visit_scan_files` methods, that can be used to partition work
 to either multiple threads, or workers (in the case of a distributed engine).
@@ -23,7 +23,7 @@ by closing the copy that the main thread has once all the threads have been crea
 we can simply loop over our `RecordBatch` receiver, because it will return results until the last
 thread has exited (which closes that last sender).
 
-# Examples
+## Examples
 
 Assuming you're running in the directory this README is in:
 
@@ -35,15 +35,11 @@ Assuming you're running in the directory this README is in:
 
 `cargo run -- --help`
 
-- Use the sync engine to read `kernel/tests/data/basic_partitioned/`
-
-`cargo run -- -e sync ../../../kernel/tests/data/basic_partitioned/`
-
 - Read some giant table using 100 threads:
 
 `cargo run -- -t 100 /path/to/my/giant/table`
 
-## selecting specific columns
+### Selecting specific columns
 
 To select specific columns you need a `--` after the column list specification.
 
