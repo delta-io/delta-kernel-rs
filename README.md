@@ -1,11 +1,11 @@
-# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.82+]][rustc]
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.84+]][rustc]
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
 [latest-version]: https://img.shields.io/crates/v/delta_kernel.svg
 [crates.io]: https://crates.io/crates/delta\_kernel
-[rustc-version-1.82+]: https://img.shields.io/badge/rustc-1.82+-lightgray.svg
-[rustc]: https://blog.rust-lang.org/2024/10/17/Rust-1.82.0/
+[rustc-version-1.84+]: https://img.shields.io/badge/rustc-1.84+-lightgray.svg
+[rustc]: https://blog.rust-lang.org/2025/01/09/Rust-1.84.0/
 [docs]: https://img.shields.io/docsrs/delta_kernel
 [docs.rs]: https://docs.rs/delta_kernel/latest/delta_kernel/
 
