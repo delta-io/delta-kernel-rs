@@ -1,7 +1,7 @@
 Write Table
 ===========
 
-## About
+# About
 
 This example shows how to write a Delta table using the default engine by:
 - Creating a schema defined by the command line arguments
@@ -11,14 +11,14 @@ This example shows how to write a Delta table using the default engine by:
 Note: As of July 2025, the Rust kernel does not officially expose APIs for creating tables. This example uses unofficial, internal APIs to create the table.
 
 Additional details about the example:
-- default schema (`id:integer,name:string,score:double`) will be used in the case that the schema is not specified in the command like arguments
-- table contents will be printed in the command line after successfully creating tables
+- A default schema (`id:integer,name:string,score:double`) will be used in the case that the schema is not specified in the command like arguments
+- Table contents will be printed in the command line after successfully creating tables
 
-You can run this example from the same directory as this `README.md` by running `cargo run -- [args]`.
+You can run this example from anywhere in this repository by running `cargo run -p write-table -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
-## Examples
+# Examples
 
-Assuming you're running in the directory this README is in:
+Assuming you're running in the directory of this example:
 
 - Create and write to a new table in the current directory:
 
@@ -40,7 +40,7 @@ cargo run -- ./custom_table --schema "id:integer,name:string,score:double"
 cargo run -- --help
 ```
 
-### Schema Specification
+## Schema Specification
 
 The `--schema` argument accepts a comma-separated list of field definitions in the format:
 `field_name:data_type`

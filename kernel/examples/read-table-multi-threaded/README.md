@@ -1,12 +1,12 @@
 Read Table Multi-Threaded
 =========================
 
-## About
+# About
 This example shows a program that reads a table using multiple threads. This shows the use of the
 `scan_metadata`, `global_scan_state`, and `visit_scan_files` methods, that can be used to partition work
 to either multiple threads, or workers (in the case of a distributed engine).
 
-You can run this from the same directory as this `README.md` by running `cargo run -- [args]`.
+You can run this example from anywhere in this repository by running `cargo run -p read-table-multi-threaded -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
 We use a single-producer-multi-consumer channel to send each file and its metadata that needs to be
 read out to a pool of threads. The data is sent as a [`ScanFile`], a struct we define that holds all
@@ -23,9 +23,9 @@ by closing the copy that the main thread has once all the threads have been crea
 we can simply loop over our `RecordBatch` receiver, because it will return results until the last
 thread has exited (which closes that last sender).
 
-## Examples
+# Examples
 
-Assuming you're running in the directory this README is in:
+Assuming you're running in the directory of this example:
 
 - Read and print the table in `kernel/tests/data/table-with-dv-small/`:
 
@@ -39,7 +39,7 @@ Assuming you're running in the directory this README is in:
 
 `cargo run -- -t 100 /path/to/my/giant/table`
 
-### Selecting specific columns
+## selecting specific columns
 
 To select specific columns you need a `--` after the column list specification.
 

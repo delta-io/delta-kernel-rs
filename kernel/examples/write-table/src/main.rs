@@ -78,44 +78,68 @@ async fn try_main() -> DeltaResult<()> {
         .unwrap_or_else(|| panic!("Failed to get object store for URL: {url}"));
 
     // Create or get the table
-    let schema = create_or_get_table(&url, &engine, &cli.write_args.schema, &store).await?;
+    let snapshot =
+        Arc::new(create_or_get_base_snapshot(&url, &engine, &cli.write_args.schema, &store).await?);
 
     // Create sample data based on the schema
-    let sample_data = create_sample_data(&schema, cli.write_args.num_rows)?;
+    let sample_data = create_sample_data(&snapshot.schema(), cli.write_args.num_rows)?;
 
     // Write sample data to the table
-    write_data(&url, &engine, &sample_data).await?;
-    println!(
-        "✓ Successfully wrote {} rows to the table",
-        cli.write_args.num_rows
-    );
+    let mut txn = snapshot
+        .transaction()?
+        .with_operation("INSERT".to_string())
+        .with_engine_info("delta-kernel-rs example");
 
-    // Read and display the data
-    read_and_display_data(&url, engine).await?;
-    println!("✓ Successfully read data from the table");
+    // Write the data using the engine
+    let write_context = Arc::new(txn.get_write_context());
+    let file_metadata = engine
+        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new(), true)
+        .await?;
 
-    Ok(())
+    // Add the file metadata to the transaction
+    txn.add_files(file_metadata);
+
+    // Commit the transaction
+    match txn.commit(&engine)? {
+        delta_kernel::transaction::CommitResult::Committed { version, .. } => {
+            println!("✓ Committed transaction at version {version}");
+            println!(
+                "✓ Successfully wrote {} rows to the table",
+                cli.write_args.num_rows
+            );
+
+            // Read and display the data
+            read_and_display_data(&url, engine).await?;
+            println!("✓ Successfully read data from the table");
+
+            Ok(())
+        }
+        delta_kernel::transaction::CommitResult::Conflict(_, conflicting_version) => {
+            println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
+            Err(delta_kernel::Error::generic("Commit failed"))
+        }
+    }
 }
 
 /// Creates a new Delta table or gets an existing one
-async fn create_or_get_table(
+async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
     store: &Arc<dyn ObjectStore>,
-) -> DeltaResult<SchemaRef> {
+) -> DeltaResult<Snapshot> {
     // Check if table already exists
     match Snapshot::try_new(url.clone(), engine, None) {
         Ok(snapshot) => {
             println!("✓ Found existing table at version {}", snapshot.version());
-            Ok(snapshot.schema())
+            Ok(snapshot)
         }
         Err(_) => {
             // Create new table
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(store, url, &schema).await?;
-            Ok(schema)
+            Snapshot::try_new(url.clone(), engine, None)
         }
     }
 }
@@ -260,41 +284,6 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
     let record_batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
 
     Ok(ArrowEngineData::new(record_batch))
-}
-
-/// Write data to the Delta table
-async fn write_data(
-    table_url: &Url,
-    engine: &DefaultEngine<TokioBackgroundExecutor>,
-    data: &ArrowEngineData,
-) -> DeltaResult<()> {
-    let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), engine, None)?);
-    let mut txn = snapshot
-        .transaction()?
-        .with_operation("INSERT".to_string())
-        .with_engine_info("delta-kernel-rs example");
-
-    // Write the data using the engine
-    let write_context = Arc::new(txn.get_write_context());
-    let file_metadata = engine
-        .write_parquet(data, write_context.as_ref(), HashMap::new(), true)
-        .await?;
-
-    // Add the file metadata to the transaction
-    txn.add_files(file_metadata);
-
-    // Commit the transaction
-    match txn.commit(engine)? {
-        delta_kernel::transaction::CommitResult::Committed { version, .. } => {
-            println!("✓ Committed transaction at version {version}");
-        }
-        delta_kernel::transaction::CommitResult::Conflict(_, conflicting_version) => {
-            println!("✗ Transaction conflicted with version: {conflicting_version}");
-            return Err(delta_kernel::Error::generic("Commit failed"));
-        }
-    }
-
-    Ok(())
 }
 
 /// Read and display data from the table

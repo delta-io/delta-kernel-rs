@@ -1,7 +1,7 @@
 Read Table Single-Threaded
 =========================
 
-## About
+# About
 This example shows a program that reads a table using a single thread. It uses the "all-in-one"
 `Scan::execute` method, which simplifies reading, but does not allow for distributing the work of
 reading the table.
@@ -11,11 +11,11 @@ format, since we're using the default client, which uses arrow. We therefore
 downcast into arrow, and use the arrow functions to filter out deleted rows, and then to print the
 final data.
 
-You can run this from the same directory as this `README.md` by running `cargo run -- [args]`.
+You can run this example from anywhere in this repository by running `cargo run -p read-table-single-threaded -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
-## Examples
+# Examples
 
-Assuming you're running in the directory this README is in:
+Assuming you're running in the directory of this example:
 
 - Read and print the table in `kernel/tests/data/table-with-dv-small/`:
 
@@ -25,7 +25,7 @@ Assuming you're running in the directory this README is in:
 
 `cargo run -- --help`
 
-### Selecting specific columns
+## selecting specific columns
 
 To select specific columns you need a `--` after the column list specification.
 
