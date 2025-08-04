@@ -343,7 +343,9 @@ mod tests {
                 &incorrect_variant_arrow_type(),
                 true,
             ),
-            // Arrow has different printing for different versions. We use the common prefix
+            // TODO(#1140): Arrow has different printing for different versions. We use the
+            // common prefix to check the error. Once the minimum version of arrow is greater
+            // than 55.1, assert the full message
             "Invalid argument error: Incorrect datatype. Expected Struct",
         )
     }
