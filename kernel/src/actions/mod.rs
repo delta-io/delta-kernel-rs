@@ -512,35 +512,32 @@ impl IntoEngineData for Protocol {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        fn features_to_scalar<T>(
+            features: Option<impl IntoIterator<Item = T>>,
+        ) -> DeltaResult<Scalar>
+        where
+            T: Into<Scalar>,
+        {
+            match features {
+                Some(features) => {
+                    let features: Vec<Scalar> = features.into_iter().map(Into::into).collect();
+                    Ok(Scalar::Array(ArrayData::try_new(
+                        ArrayType::new(DataType::STRING, false),
+                        features,
+                    )?))
+                }
+                None => Ok(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+                    DataType::STRING,
+                    false,
+                ))))),
+            }
+        }
+
         let min_reader_version = Scalar::from(self.min_reader_version);
         let min_writer_version = Scalar::from(self.min_writer_version);
 
-        let reader_features = match self.reader_features {
-            Some(features) => {
-                let features: Vec<Scalar> = features.into_iter().map(Scalar::from).collect();
-                Scalar::Array(ArrayData::try_new(
-                    ArrayType::new(DataType::STRING, false),
-                    features,
-                )?)
-            }
-            None => Scalar::Null(DataType::Array(Box::new(ArrayType::new(
-                DataType::STRING,
-                false,
-            )))),
-        };
-        let writer_features = match self.writer_features {
-            Some(features) => {
-                let features: Vec<Scalar> = features.into_iter().map(Scalar::from).collect();
-                Scalar::Array(ArrayData::try_new(
-                    ArrayType::new(DataType::STRING, false),
-                    features,
-                )?)
-            }
-            None => Scalar::Null(DataType::Array(Box::new(ArrayType::new(
-                DataType::STRING,
-                false,
-            )))),
-        };
+        let reader_features = features_to_scalar(self.reader_features)?;
+        let writer_features = features_to_scalar(self.writer_features)?;
 
         let values = [
             min_reader_version,
