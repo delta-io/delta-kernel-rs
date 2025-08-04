@@ -283,7 +283,7 @@ pub(crate) mod test_utils {
                 let error_str = error.to_string();
                 assert!(
                     error_str.contains(message),
-                    "Error message does not contain the expected message.\nExpected message: {message}\nActual message: {error_str}"
+                    "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
                 );
             }
         }
