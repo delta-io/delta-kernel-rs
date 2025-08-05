@@ -505,6 +505,52 @@ impl Protocol {
     }
 }
 
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
+impl IntoEngineData for Protocol {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        fn features_to_scalar<T>(
+            features: Option<impl IntoIterator<Item = T>>,
+        ) -> DeltaResult<Scalar>
+        where
+            T: Into<Scalar>,
+        {
+            match features {
+                Some(features) => {
+                    let features: Vec<Scalar> = features.into_iter().map(Into::into).collect();
+                    Ok(Scalar::Array(ArrayData::try_new(
+                        ArrayType::new(DataType::STRING, false),
+                        features,
+                    )?))
+                }
+                None => Ok(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+                    DataType::STRING,
+                    false,
+                ))))),
+            }
+        }
+
+        let min_reader_version = Scalar::from(self.min_reader_version);
+        let min_writer_version = Scalar::from(self.min_writer_version);
+
+        let reader_features = features_to_scalar(self.reader_features)?;
+        let writer_features = features_to_scalar(self.writer_features)?;
+
+        let values = [
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
+}
+
 // given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
     table_features: &[T],
@@ -886,9 +932,13 @@ impl DomainMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::array::ListBuilder;
     use crate::arrow::json::ReaderBuilder;
     use crate::{
-        arrow::array::{Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder},
+        arrow::array::{
+            Array, Int32Array, Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+            StructArray,
+        },
         arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
         arrow::record_batch::RecordBatch,
         engine::arrow_data::ArrowEngineData,
@@ -1623,5 +1673,177 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data() {
+        let engine = ExprEngine::new();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::ColumnMapping]),
+            Some([WriterFeature::DeletionVectors]),
+        )
+        .unwrap();
+
+        let engine_data = protocol
+            .clone()
+            .into_engine_data(Protocol::to_schema().into(), &engine);
+        let record_batch: RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
+        let protocol_fields = vec![
+            Field::new("minReaderVersion", ArrowDataType::Int32, false),
+            Field::new("minWriterVersion", ArrowDataType::Int32, false),
+            Field::new(
+                "readerFeatures",
+                ArrowDataType::List(list_field.clone()),
+                true, // nullable
+            ),
+            Field::new(
+                "writerFeatures",
+                ArrowDataType::List(list_field.clone()),
+                true, // nullable
+            ),
+        ];
+        let schema = Arc::new(Schema::new(protocol_fields.clone()));
+
+        let string_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
+        list_builder.values().append_value("columnMapping");
+        list_builder.append(true);
+        let reader_features_array = list_builder.finish();
+
+        let string_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
+        list_builder.values().append_value("deletionVectors");
+        list_builder.append(true);
+        let writer_features_array = list_builder.finish();
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(reader_features_array.clone()),
+                Arc::new(writer_features_array.clone()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+
+        // test with the full log schema that wraps protocol in a "protocol" field
+        let log_schema = get_log_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let engine_data = protocol.into_engine_data(log_schema, &engine);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "protocol",
+            ArrowDataType::Struct(protocol_fields.into()),
+            true,
+        )]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("minReaderVersion", ArrowDataType::Int32, false)),
+                    Arc::new(Int32Array::from(vec![3])) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new("minWriterVersion", ArrowDataType::Int32, false)),
+                    Arc::new(Int32Array::from(vec![7])) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "readerFeatures",
+                        ArrowDataType::List(list_field.clone()),
+                        true,
+                    )),
+                    Arc::new(reader_features_array) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "writerFeatures",
+                        ArrowDataType::List(list_field),
+                        true,
+                    )),
+                    Arc::new(writer_features_array) as Arc<dyn Array>,
+                ),
+            ]))],
+        )
+        .unwrap();
+
+        let record_batch: RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data_empty_features() {
+        let engine = ExprEngine::new();
+        let empty_features: Vec<String> = vec![];
+        let protocol =
+            Protocol::try_new(3, 7, Some(empty_features.clone()), Some(empty_features)).unwrap();
+
+        let engine_data = protocol
+            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .unwrap();
+        let record_batch: RecordBatch = engine_data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 4);
+
+        // reader/writer features are Some([]) lists
+        let reader_features_col = record_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<crate::arrow::array::ListArray>()
+            .unwrap();
+        assert_eq!(reader_features_col.len(), 1);
+        assert_eq!(reader_features_col.value(0).len(), 0); // empty list
+        let writer_features_col = record_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<crate::arrow::array::ListArray>()
+            .unwrap();
+        assert_eq!(writer_features_col.len(), 1);
+        assert_eq!(writer_features_col.value(0).len(), 0); // empty list
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data_no_features() {
+        let engine = ExprEngine::new();
+        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+
+        let engine_data = protocol
+            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .unwrap();
+        let record_batch: RecordBatch = engine_data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 4);
+
+        // reader/writer features are null
+        assert!(record_batch.column(2).is_null(0));
+        assert!(record_batch.column(3).is_null(0));
     }
 }
