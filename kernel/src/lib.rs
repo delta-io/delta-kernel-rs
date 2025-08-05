@@ -204,7 +204,11 @@ impl TryFrom<DirEntry> for FileMeta {
             ))
         })?;
         let metadata_len = metadata.len();
-        #[cfg(all(feature = "arrow-54", not(feature = "arrow-55"), not(feature = "arrow-56")))]
+        #[cfg(all(
+            feature = "arrow-54",
+            not(feature = "arrow-55"),
+            not(feature = "arrow-56")
+        ))]
         let metadata_len = metadata_len
             .try_into()
             .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?;

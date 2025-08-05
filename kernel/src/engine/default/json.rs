@@ -359,7 +359,8 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))] opts: PutMultipartOpts,
+            #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
+            opts: PutMultipartOpts,
             #[cfg(any(feature = "arrow-55", feature = "arrow-56"))] opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await

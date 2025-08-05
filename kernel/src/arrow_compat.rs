@@ -14,7 +14,11 @@ mod arrow_compat_shims {
     pub use parquet_55 as parquet;
 }
 
-#[cfg(all(feature = "arrow-54", not(feature = "arrow-55"), not(feature = "arrow-56")))]
+#[cfg(all(
+    feature = "arrow-54",
+    not(feature = "arrow-55"),
+    not(feature = "arrow-56")
+))]
 mod arrow_compat_shims {
     pub use arrow_54 as arrow;
     pub use object_store_54 as object_store;

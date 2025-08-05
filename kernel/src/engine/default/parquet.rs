@@ -286,7 +286,11 @@ impl FileOpener for ParquetOpener {
                     ParquetObjectReader::new(store, path)
                 }
             };
-            #[cfg(all(feature = "arrow-54", not(feature = "arrow-55"), not(feature = "arrow-56")))]
+            #[cfg(all(
+                feature = "arrow-54",
+                not(feature = "arrow-55"),
+                not(feature = "arrow-56")
+            ))]
             let mut reader = {
                 // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
                 // in arrow 55)
