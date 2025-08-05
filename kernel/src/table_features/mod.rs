@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
+use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use delta_kernel_derive::internal_api;
@@ -156,6 +157,18 @@ impl ToDataType for ReaderFeature {
 impl ToDataType for WriterFeature {
     fn to_data_type() -> DataType {
         DataType::STRING
+    }
+}
+
+impl From<ReaderFeature> for Scalar {
+    fn from(feature: ReaderFeature) -> Self {
+        Scalar::String(feature.to_string())
+    }
+}
+
+impl From<WriterFeature> for Scalar {
+    fn from(feature: WriterFeature) -> Self {
+        Scalar::String(feature.to_string())
     }
 }
 
