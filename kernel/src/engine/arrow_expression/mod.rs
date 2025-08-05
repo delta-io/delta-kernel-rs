@@ -50,13 +50,13 @@ impl ArrayBuilderAs for Box<dyn ArrayBuilder> {
     }
 }
 
-#[cfg(not(feature = "arrow-55"))]
+#[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
 struct StructFieldBuilder<'a> {
     builder: &'a mut array::StructBuilder,
     field_index: usize,
 }
 
-#[cfg(not(feature = "arrow-55"))]
+#[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
 impl ArrayBuilderAs for StructFieldBuilder<'_> {
     fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T> {
         self.builder.field_builder::<T>(self.field_index)
@@ -138,7 +138,7 @@ impl Scalar {
                 );
                 for _ in 0..num_rows {
                     // TODO: Get rid of this alternate code path when we drop arrow-54 support.
-                    #[cfg(not(feature = "arrow-55"))]
+                    #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
                     for (field_index, value) in data.values().iter().enumerate() {
                         let builder = &mut StructFieldBuilder {
                             builder,
@@ -147,9 +147,9 @@ impl Scalar {
                         value.append_to(builder, 1)?;
                     }
 
-                    #[cfg(feature = "arrow-55")]
+                    #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
                     let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(feature = "arrow-55")]
+                    #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
                     for (builder, value) in field_builders.zip(data.values()) {
                         value.append_to(builder, 1)?;
                     }
@@ -233,7 +233,7 @@ impl Scalar {
                 );
                 for _ in 0..num_rows {
                     // TODO: Get rid of this alternate code path when we drop arrow-54 support.
-                    #[cfg(not(feature = "arrow-55"))]
+                    #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
                     for (field_index, field) in stype.fields().enumerate() {
                         let builder = &mut StructFieldBuilder {
                             builder,
@@ -242,9 +242,9 @@ impl Scalar {
                         Self::append_null(builder, &field.data_type, 1)?;
                     }
 
-                    #[cfg(feature = "arrow-55")]
+                    #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
                     let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(feature = "arrow-55")]
+                    #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
                     for (builder, field) in field_builders.zip(stype.fields()) {
                         Self::append_null(builder, &field.data_type, 1)?;
                     }

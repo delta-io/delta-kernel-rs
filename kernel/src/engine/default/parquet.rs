@@ -149,7 +149,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         let metadata_size = metadata.size;
-        #[cfg(not(feature = "arrow-55"))]
+        #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
         let metadata_size: u64 = metadata_size
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
@@ -263,7 +263,7 @@ impl FileOpener for ParquetOpener {
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            #[cfg(feature = "arrow-55")]
+            #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
             let mut reader = {
                 use crate::object_store::ObjectStoreScheme;
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
@@ -286,7 +286,7 @@ impl FileOpener for ParquetOpener {
                     ParquetObjectReader::new(store, path)
                 }
             };
-            #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
+            #[cfg(all(feature = "arrow-54", not(feature = "arrow-55"), not(feature = "arrow-56")))]
             let mut reader = {
                 // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
                 // in arrow 55)
@@ -440,7 +440,7 @@ mod tests {
             .clone();
 
         let meta_size = meta.size;
-        #[cfg(not(feature = "arrow-55"))]
+        #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
         let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
