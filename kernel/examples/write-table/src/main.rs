@@ -14,9 +14,11 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::object_store::{path::Path, ObjectStore};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::{DeltaResult, Engine, Snapshot};
+use delta_kernel::transaction::CommitResult;
+use delta_kernel::{DeltaResult, Engine, Error, Snapshot};
 use serde_json::{json, to_vec};
 use url::Url;
+use uuid::Uuid;
 
 use clap::Parser;
 use itertools::Itertools;
@@ -75,7 +77,9 @@ async fn try_main() -> DeltaResult<()> {
     let engine = common::get_engine(&url, &cli.location_args)?;
     let store = engine
         .get_object_store_for_url(&url)
-        .unwrap_or_else(|| panic!("Failed to get object store for URL: {url}"));
+        .ok_or(Error::generic(format!(
+            "Failed to get object store for URL: {url}"
+        )))?;
 
     // Create or get the table
     let snapshot =
@@ -88,7 +92,7 @@ async fn try_main() -> DeltaResult<()> {
     let mut txn = snapshot
         .transaction()?
         .with_operation("INSERT".to_string())
-        .with_engine_info("delta-kernel-rs example");
+        .with_engine_info(format!("default_engine/write-table-example"));
 
     // Write the data using the engine
     let write_context = Arc::new(txn.get_write_context());
@@ -101,7 +105,7 @@ async fn try_main() -> DeltaResult<()> {
 
     // Commit the transaction
     match txn.commit(&engine)? {
-        delta_kernel::transaction::CommitResult::Committed { version, .. } => {
+        CommitResult::Committed { version, .. } => {
             println!("✓ Committed transaction at version {version}");
             println!(
                 "✓ Successfully wrote {} rows to the table",
@@ -114,9 +118,9 @@ async fn try_main() -> DeltaResult<()> {
 
             Ok(())
         }
-        delta_kernel::transaction::CommitResult::Conflict(_, conflicting_version) => {
+        CommitResult::Conflict(_, conflicting_version) => {
             println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-            Err(delta_kernel::Error::generic("Commit failed"))
+            Err(Error::generic("Commit failed"))
         }
     }
 }
@@ -151,7 +155,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
         .map(|field| {
             let parts: Vec<&str> = field.split(':').collect();
             if parts.len() != 2 {
-                return Err(delta_kernel::Error::generic(format!(
+                return Err(Error::generic(format!(
                     "Invalid field specification: {field}. Expected format: field_name:data_type"
                 )));
             }
@@ -165,7 +169,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
                 "boolean" => DataType::BOOLEAN,
                 "timestamp" => DataType::TIMESTAMP,
                 _ => {
-                    return Err(delta_kernel::Error::generic(format!(
+                    return Err(Error::generic(format!(
                         "Unsupported data type: {data_type}"
                     )));
                 }
@@ -185,7 +189,7 @@ async fn create_table(
     table_url: &Url,
     schema: &SchemaRef,
 ) -> DeltaResult<()> {
-    let table_id = "dummy_table";
+    let table_id = Uuid::new_v4().to_string();
     let schema_str = serde_json::to_string(&schema)?;
 
     let (reader_features, writer_features) = {
@@ -271,7 +275,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
                 Arc::new(TimestampMicrosecondArray::from(data))
             }
             _ => {
-                return Err(delta_kernel::Error::generic(format!(
+                return Err(Error::generic(format!(
                     "Unsupported data type for sample data: {:?}",
                     field.data_type()
                 )));
@@ -303,7 +307,7 @@ async fn read_and_display_data(
             let record_batch: RecordBatch = data
                 .into_any()
                 .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+                .map_err(|_| Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
 
             if let Some(mask) = mask {
