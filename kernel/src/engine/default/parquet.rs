@@ -286,17 +286,7 @@ impl FileOpener for ParquetOpener {
                     ParquetObjectReader::new(store, path)
                 }
             };
-            #[cfg(all(
-                feature = "arrow-54",
-                not(feature = "arrow-55"),
-                not(feature = "arrow-56")
-            ))]
-            let mut reader = {
-                // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
-                // in arrow 55)
-                let meta = store.head(&path).await?;
-                ParquetObjectReader::new(store, meta)
-            };
+
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =

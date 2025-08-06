@@ -55,7 +55,7 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 delta_kernel = "0.14.0"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.14.0", features = ["default-engine", "arrow-55"] }
+delta_kernel = { version = "0.14.0", features = ["default-engine", "arrow-56"] }
 ```
 
 ### Feature flags
@@ -85,12 +85,12 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-54`: Use arrow version 54
 - `arrow-55`: Use arrow version 55
+- `arrow-56`: Use arrow version 56
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
-  specify it directly with `arrow-N`, e.g. `arrow-55`.
+  specify it directly with `arrow-N`, e.g. `arrow-56`.
 
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of
