@@ -262,8 +262,6 @@ mod tests {
     use crate::object_store::memory::InMemory;
     #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
     use crate::object_store::PutMultipartOptions;
-    #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
-    use crate::object_store::PutMultipartOpts;
     use crate::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
         PutPayload, PutResult, Result,
@@ -359,9 +357,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
-            opts: PutMultipartOpts,
-            #[cfg(any(feature = "arrow-55", feature = "arrow-56"))] opts: PutMultipartOptions,
+            opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -539,8 +535,6 @@ mod tests {
         let meta = store.head(&location).await.unwrap();
 
         let meta_size = meta.size;
-        #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
-        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
@@ -690,8 +684,6 @@ mod tests {
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
                         let meta_size = meta.size;
-                        #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
-                        let meta_size = meta_size.try_into().unwrap();
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),

@@ -149,10 +149,6 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
         let metadata_size = metadata.size;
-        #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
-        let metadata_size: u64 = metadata_size
-            .try_into()
-            .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
         if size != metadata_size {
             return Err(Error::generic(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
@@ -434,8 +430,6 @@ mod tests {
             .clone();
 
         let meta_size = meta.size;
-        #[cfg(all(not(feature = "arrow-55"), not(feature = "arrow-56")))]
-        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
