@@ -147,11 +147,18 @@ impl LogSegment {
         let time_travel_version = time_travel_version.into();
 
         let listed_files = match (checkpoint_hint.into(), time_travel_version) {
-            (Some(cp), None) => list_log_files_with_checkpoint(&cp, storage, &log_root, None)?,
-            (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                list_log_files_with_checkpoint(&cp, storage, &log_root, Some(end_version))?
+            (Some(cp), None) => {
+                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None)?
             }
-            _ => list_log_files_with_version(storage, &log_root, None, time_travel_version)?,
+            (Some(cp), Some(end_version)) if cp.version <= end_version => {
+                ListedLogFiles::list_with_checkpoint_hint(
+                    &cp,
+                    storage,
+                    &log_root,
+                    Some(end_version),
+                )?
+            }
+            _ => ListedLogFiles::list(storage, &log_root, None, time_travel_version)?,
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version)

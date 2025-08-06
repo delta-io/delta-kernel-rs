@@ -165,117 +165,117 @@ impl ListedLogFiles {
             .try_collect()?;
         ListedLogFiles::try_new(commits, vec![], vec![], None)
     }
-}
 
-/// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
-/// If successful, this returns a `ListedLogFiles`.
-// TODO: encode some of these guarantees in the output types. e.g. we could have:
-// - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
-// - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same version)
-pub(crate) fn list_log_files_with_version(
-    storage: &dyn StorageHandler,
-    log_root: &Url,
-    start_version: Option<Version>,
-    end_version: Option<Version>,
-) -> DeltaResult<ListedLogFiles> {
-    // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
-    // on config at some point
+    /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
+    /// If successful, this returns a `ListedLogFiles`.
+    // TODO: encode some of these guarantees in the output types. e.g. we could have:
+    // - SortedCommitFiles: Vec<ParsedLogPath>, is_ascending: bool, end_version: Version
+    // - CheckpointParts: Vec<ParsedLogPath>, checkpoint_version: Version (guarantee all same version)
+    pub(crate) fn list(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
+        // on config at some point
 
-    let log_files = list_log_files(storage, log_root, start_version, end_version)?;
+        let log_files = list_log_files(storage, log_root, start_version, end_version)?;
 
-    log_files.process_results(|iter| {
-        let mut ascending_commit_files = Vec::with_capacity(10);
-        let mut ascending_compaction_files = Vec::with_capacity(2);
-        let mut checkpoint_parts = vec![];
-        let mut latest_crc_file: Option<ParsedLogPath> = None;
+        log_files.process_results(|iter| {
+            let mut ascending_commit_files = Vec::with_capacity(10);
+            let mut ascending_compaction_files = Vec::with_capacity(2);
+            let mut checkpoint_parts = vec![];
+            let mut latest_crc_file: Option<ParsedLogPath> = None;
 
-        // Group log files by version
-        let log_files_per_version = iter.chunk_by(|x| x.version);
+            // Group log files by version
+            let log_files_per_version = iter.chunk_by(|x| x.version);
 
-        for (version, files) in &log_files_per_version {
-            let mut new_checkpoint_parts = vec![];
-            for file in files {
-                use LogPathFileType::*;
-                match file.file_type {
-                    Commit => ascending_commit_files.push(file),
-                    CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
-                        ascending_compaction_files.push(file);
-                    }
-                    CompactedCommit { .. } => (), // Failed the bounds check above
-                    SinglePartCheckpoint | UuidCheckpoint(_) | MultiPartCheckpoint { .. } => {
-                        new_checkpoint_parts.push(file)
-                    }
-                    Crc => {
-                        let latest_crc_ref = latest_crc_file.as_ref();
-                        if latest_crc_ref.is_none_or(|latest| latest.version < file.version) {
-                            latest_crc_file = Some(file);
+            for (version, files) in &log_files_per_version {
+                let mut new_checkpoint_parts = vec![];
+                for file in files {
+                    use LogPathFileType::*;
+                    match file.file_type {
+                        Commit => ascending_commit_files.push(file),
+                        CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
+                            ascending_compaction_files.push(file);
+                        }
+                        CompactedCommit { .. } => (), // Failed the bounds check above
+                        SinglePartCheckpoint | UuidCheckpoint(_) | MultiPartCheckpoint { .. } => {
+                            new_checkpoint_parts.push(file)
+                        }
+                        Crc => {
+                            let latest_crc_ref = latest_crc_file.as_ref();
+                            if latest_crc_ref.is_none_or(|latest| latest.version < file.version) {
+                                latest_crc_file = Some(file);
+                            }
+                        }
+                        Unknown => {
+                            warn!(
+                                "Found file {} with unknown file type {:?} at version {}",
+                                file.filename, file.file_type, version
+                            );
                         }
                     }
-                    Unknown => {
-                        warn!(
-                            "Found file {} with unknown file type {:?} at version {}",
-                            file.filename, file.file_type, version
-                        );
-                    }
+                }
+                // Group and find the first complete checkpoint for this version.
+                // All checkpoints for the same version are equivalent, so we only take one.
+                if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
+                    .into_iter()
+                    // `num_parts` is guaranteed to be non-negative and within `usize` range
+                    .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
+                {
+                    checkpoint_parts = complete_checkpoint;
+                    // Log replay only uses commits/compactions after a complete checkpoint
+                    ascending_commit_files.clear();
+                    ascending_compaction_files.clear();
                 }
             }
-            // Group and find the first complete checkpoint for this version.
-            // All checkpoints for the same version are equivalent, so we only take one.
-            if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
-                .into_iter()
-                // `num_parts` is guaranteed to be non-negative and within `usize` range
-                .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
-            {
-                checkpoint_parts = complete_checkpoint;
-                // Log replay only uses commits/compactions after a complete checkpoint
-                ascending_commit_files.clear();
-                ascending_compaction_files.clear();
-            }
-        }
 
-        ListedLogFiles::try_new(
-            ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-        )
-    })?
-}
+            ListedLogFiles::try_new(
+                ascending_commit_files,
+                ascending_compaction_files,
+                checkpoint_parts,
+                latest_crc_file,
+            )
+        })?
+    }
 
-/// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
-/// the returned [`ParsedLogPath`]s will have a version less than or equal to the `end_version`.
-/// See [`list_log_files_with_version`] for details on the return type.
-pub(crate) fn list_log_files_with_checkpoint(
-    checkpoint_metadata: &LastCheckpointHint,
-    storage: &dyn StorageHandler,
-    log_root: &Url,
-    end_version: Option<Version>,
-) -> DeltaResult<ListedLogFiles> {
-    let listed_files = list_log_files_with_version(
-        storage,
-        log_root,
-        Some(checkpoint_metadata.version),
-        end_version,
-    )?;
+    /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
+    /// the returned [`ParsedLogPath`]s will have a version less than or equal to the `end_version`.
+    /// See [`list_log_files_with_version`] for details on the return type.
+    pub(crate) fn list_with_checkpoint_hint(
+        checkpoint_metadata: &LastCheckpointHint,
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        let listed_files = Self::list(
+            storage,
+            log_root,
+            Some(checkpoint_metadata.version),
+            end_version,
+        )?;
 
-    let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
-        // TODO: We could potentially recover here
-        return Err(Error::invalid_checkpoint(
-            "Had a _last_checkpoint hint but didn't find any checkpoints",
-        ));
-    };
-    if latest_checkpoint.version != checkpoint_metadata.version {
-        info!(
+        let Some(latest_checkpoint) = listed_files.checkpoint_parts.last() else {
+            // TODO: We could potentially recover here
+            return Err(Error::invalid_checkpoint(
+                "Had a _last_checkpoint hint but didn't find any checkpoints",
+            ));
+        };
+        if latest_checkpoint.version != checkpoint_metadata.version {
+            info!(
             "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
             checkpoint_metadata.version,
             latest_checkpoint.version
         );
-    } else if listed_files.checkpoint_parts.len() != checkpoint_metadata.parts.unwrap_or(1) {
-        return Err(Error::InvalidCheckpoint(format!(
-            "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
-            checkpoint_metadata.parts.unwrap_or(1),
-            listed_files.checkpoint_parts.len()
-        )));
+        } else if listed_files.checkpoint_parts.len() != checkpoint_metadata.parts.unwrap_or(1) {
+            return Err(Error::InvalidCheckpoint(format!(
+                "_last_checkpoint indicated that checkpoint should have {} parts, but it has {}",
+                checkpoint_metadata.parts.unwrap_or(1),
+                listed_files.checkpoint_parts.len()
+            )));
+        }
+        Ok(listed_files)
     }
-    Ok(listed_files)
 }
