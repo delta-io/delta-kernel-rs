@@ -261,6 +261,11 @@ impl Scalar {
                     builder.append(false)?;
                 }
             }
+            DataType::Variant(_) => {
+                return Err(Error::unsupported(
+                    "Variant is not supported as scalar yet.",
+                ));
+            }
         }
         Ok(())
     }

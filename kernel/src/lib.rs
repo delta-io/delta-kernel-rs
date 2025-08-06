@@ -26,10 +26,10 @@
 //!
 //! [`write.rs`]: https://github.com/delta-io/delta-kernel-rs/tree/main/kernel/tests/write.rs
 //!
-//! # Engine traits
+//! # Engine trait
 //!
-//! The [`Engine`] trait allow connectors to bring their own implementation of functionality such
-//! as reading parquet files, listing files in a file system, parsing a JSON string etc.  This
+//! The [`Engine`] trait allows connectors to bring their own implementation of functionality such
+//! as reading parquet files, listing files in a file system, parsing a JSON string etc. This
 //! trait exposes methods to get sub-engines which expose the core functionalities customizable by
 //! connectors.
 //!
@@ -37,20 +37,20 @@
 //!
 //! Expression handling is done via the [`EvaluationHandler`], which in turn allows the creation of
 //! [`ExpressionEvaluator`]s. These evaluators are created for a specific predicate [`Expression`]
-//! and allow evaluation of that predicate for a specific batches of data.
+//! and allow evaluation of that predicate for a specific batch of data.
 //!
 //! ## File system interactions
 //!
 //! Delta Kernel needs to perform some basic operations against file systems like listing and
 //! reading files. These interactions are encapsulated in the [`StorageHandler`] trait.
-//! Implementers must take care that all assumptions on the behavior if the functions - like sorted
+//! Implementers must take care that all assumptions on the behavior of the functions - like sorted
 //! results - are respected.
 //!
 //! ## Reading log and data files
 //!
 //! Delta Kernel requires the capability to read and write json files and read parquet files, which
 //! is exposed via the [`JsonHandler`] and [`ParquetHandler`] respectively. When reading files,
-//! connectors are asked to provide the context information it requires to execute the actual
+//! connectors are asked to provide the context information they require to execute the actual
 //! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
 #![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
@@ -59,8 +59,22 @@
     trivial_numeric_casts,
     unused_extern_crates,
     rust_2018_idioms,
-    rust_2021_compatibility
+    rust_2021_compatibility,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
 )]
+// we re-allow panics in tests
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+/// This `extern crate` declaration allows the macro to reliably refer to
+/// `delta_kernel::schema::DataType` no matter which crate invokes it. Without that, `delta_kernel`
+/// cannot invoke the macro because `delta_kernel` is an unknown crate identifier (you have to use
+/// `crate` instead). We could make the macro use `crate::schema::DataType` instead, but then the
+/// macro is useless outside the `delta_kernel` crate.
+// TODO: when running `cargo package -p delta_kernel` this gives 'unused' warning - #1095
+#[allow(unused_extern_crates)]
+extern crate self as delta_kernel;
 
 use std::any::Any;
 use std::fs::DirEntry;
@@ -216,7 +230,9 @@ impl FileMeta {
 /// Extension trait that makes it easier to work with traits objects that implement [`Any`],
 /// implemented automatically for any type that satisfies `Any`, `Send`, and `Sync`. In particular,
 /// given some `trait T: Any + Send + Sync`, it allows upcasting `T` to `dyn Any + Send + Sync`,
-/// which in turn allows downcasting the result to a concrete type. For example:
+/// which in turn allows downcasting the result to a concrete type.
+///
+/// For example, the following code will compile:
 ///
 /// ```
 /// # use delta_kernel::AsAny;
@@ -370,8 +386,8 @@ pub trait PredicateEvaluator: AsAny {
 
 /// Provides expression evaluation capability to Delta Kernel.
 ///
-/// Delta Kernel can use this handler to evaluate predicate on partition filters,
-/// fill up partition column values and any computation on data using Expressions.
+/// Delta Kernel can use this handler to evaluate a predicate on partition filters,
+/// fill up partition column values, and any computation on data using Expressions.
 pub trait EvaluationHandler: AsAny {
     /// Create an [`ExpressionEvaluator`] that can evaluate the given [`Expression`]
     /// on columnar batches with the given [`Schema`] to produce data of [`DataType`].
@@ -628,3 +644,75 @@ compile_error!(
     "The default-engine-base feature flag is not meant to be used directly. \
     Please use either default-engine or default-engine-rustls."
 );
+
+// Rustdoc's documentation tests can do some things that regular unit tests can't. Here we are
+// using doctests to test macros. Specifically, we are testing for failed macro invocations due
+// to invalid input, not the macro output when the macro invocation is successful (which can/should be
+// done in unit tests). This module is not exclusively for macro tests only so other doctests can also be added.
+// https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
+#[cfg(doctest)]
+mod doc_tests {
+
+    /// ```
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
+    /// pub struct WithFields {
+    ///     some_name: String,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithField;
+
+    /// ```compile_fail
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
+    /// pub struct NoFields;
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithoutField;
+
+    /// ```
+    /// # use delta_kernel_derive::ToSchema;
+    /// # use std::collections::HashMap;
+    /// #[derive(ToSchema)]
+    /// pub struct WithAngleBracketPath {
+    ///     map_field: HashMap<String, String>,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithAngleBracketedPathField;
+
+    /// ```
+    /// # use delta_kernel_derive::ToSchema;
+    /// # use std::collections::HashMap;
+    /// #[derive(ToSchema)]
+    /// pub struct WithAttributedField {
+    ///     #[allow_null_container_values]
+    ///     map_field: HashMap<String, String>,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithAttributedField;
+
+    /// ```compile_fail
+    /// # use delta_kernel_derive::ToSchema;
+    /// #[derive(ToSchema)]
+    /// pub struct WithInvalidAttributeTarget {
+    ///     #[allow_null_container_values]
+    ///     some_name: String,
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithInvalidAttributeTarget;
+
+    /// ```compile_fail
+    /// # use delta_kernel_derive::ToSchema;
+    /// # use syn::Token;
+    /// #[derive(ToSchema)]
+    /// pub struct WithInvalidFieldType {
+    ///     token: Token![struct],
+    /// }
+    /// ```
+    #[cfg(doctest)]
+    pub struct MacroTestStructWithInvalidFieldType;
+}

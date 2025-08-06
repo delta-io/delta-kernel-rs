@@ -161,6 +161,20 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                 Arc::new(m.as_ref().try_into_arrow()?),
                 false,
             )),
+            DataType::Variant(s) => {
+                if *t == DataType::unshredded_variant() {
+                    Ok(ArrowDataType::Struct(
+                        s.fields()
+                            .map(TryIntoArrow::try_into_arrow)
+                            .collect::<Result<Vec<ArrowField>, ArrowError>>()?
+                            .into(),
+                    ))
+                } else {
+                    Err(ArrowError::SchemaError(format!(
+                        "Incorrect Variant Schema: {t}. Only the unshredded variant schema is supported right now."
+                    )))
+                }
+            }
         }
     }
 }
@@ -266,7 +280,7 @@ impl TryFromArrow<&ArrowDataType> for DataType {
                     let value_type_nullable = struct_fields[1].is_nullable();
                     Ok(MapType::new(key_type, value_type, value_type_nullable).into())
                 } else {
-                    panic!("DataType::Map should contain a struct field child");
+                    unreachable!("DataType::Map should contain a struct field child");
                 }
             }
             // Dictionary types are just an optimized in-memory representation of an array.
@@ -285,6 +299,7 @@ impl TryFromArrow<&ArrowDataType> for DataType {
 mod tests {
     use super::*;
     use crate::engine::arrow_conversion::ArrowField;
+    use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::{
         schema::{DataType, StructField},
         DeltaResult,
@@ -304,6 +319,24 @@ mod tests {
             new_metadata.get("description").unwrap(),
             &"hello world".to_owned()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_variant_shredded_type_fail() -> DeltaResult<()> {
+        let unshredded_variant = DataType::unshredded_variant();
+        let unshredded_variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant)?;
+        assert!(unshredded_variant_arrow == unshredded_variant_arrow_type());
+        let shredded_variant = DataType::variant_type([
+            StructField::nullable("metadata", DataType::BINARY),
+            StructField::nullable("value", DataType::BINARY),
+            StructField::nullable("typed_value", DataType::INTEGER),
+        ]);
+        let shredded_variant_arrow = ArrowDataType::try_from_kernel(&shredded_variant);
+        assert!(shredded_variant_arrow
+            .unwrap_err()
+            .to_string()
+            .contains("Incorrect Variant Schema"));
         Ok(())
     }
 }

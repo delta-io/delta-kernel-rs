@@ -2,6 +2,7 @@
 //! files.
 use std::collections::HashMap;
 use std::convert::identity;
+use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
@@ -21,7 +22,7 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 #[cfg(test)]
@@ -75,17 +76,6 @@ impl LogSegment {
             ascending_commit_files.retain(|log_path| checkpoint_file.version < log_path.version);
             checkpoint_file.version
         });
-
-        // TODO: consider unifying this with debug_asserts in the ListedLogFiles::new(); issue#995
-        // We require that commits that are contiguous. In other words, there must be no gap between commit versions.
-        require!(
-            ascending_commit_files
-                .windows(2)
-                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
-            Error::generic(format!(
-                "Expected ordered contiguous commit files {ascending_commit_files:?}"
-            ))
-        );
 
         // There must be no gap between a checkpoint and the first commit version. Note that
         // that all checkpoint parts share the same version.
@@ -185,7 +175,7 @@ impl LogSegment {
 
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
-        // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
+        // - [`ListedLogFiles::try_new`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
             ascending_commit_files
@@ -195,13 +185,63 @@ impl LogSegment {
                 "Expected the first commit to have version {start_version}"
             ))
         );
-        let listed_files = ListedLogFiles::new(
+        let listed_files = ListedLogFiles::try_new(
             ascending_commit_files,
             vec![],
             vec![],
             None, // TODO: use CRC files for table changes?
-        );
+        )?;
         LogSegment::try_new(listed_files, log_root, end_version)
+    }
+
+    #[allow(unused)]
+    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
+    /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
+    /// `limit` specifies the maximum length of the returned log segment. The log segment may be
+    /// shorter than `limit` if there are missing commits.
+    ///
+    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
+    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    pub(crate) fn for_timestamp_conversion(
+        storage: &dyn StorageHandler,
+        log_root: Url,
+        end_version: Version,
+        limit: Option<NonZero<usize>>,
+    ) -> DeltaResult<Self> {
+        // Compute the version to start listing from.
+        let start_from = limit
+            .map(|limit| match NonZero::<Version>::try_from(limit) {
+                Ok(limit) => Ok(Version::saturating_sub(end_version, limit.get() - 1)),
+                _ => Err(Error::generic(format!(
+                    "Invalid limit {limit} when building log segment in timestamp conversion",
+                ))),
+            })
+            .transpose()?;
+
+        let mut contiguous_commits: Vec<ParsedLogPath> =
+            limit.map_or_else(Vec::new, |limit| Vec::with_capacity(limit.get()));
+
+        for commit_res in list_log_files(storage, &log_root, start_from, Some(end_version))? {
+            let commit = match commit_res {
+                Ok(file) if matches!(file.file_type, LogPathFileType::Commit) => file,
+                Ok(_) | Err(Error::InvalidLogPath(_)) => continue, // Ignore non-commit
+                Err(err) => return Err(err), // Listing errors are propagated to the caller
+            };
+
+            if contiguous_commits
+                .last()
+                .is_some_and(|prev_commit| prev_commit.version + 1 != commit.version)
+            {
+                // We found a gap, so throw away all earlier versions
+                contiguous_commits.clear();
+            }
+
+            contiguous_commits.push(commit);
+        }
+
+        let listed_files = ListedLogFiles::try_new(contiguous_commits, vec![], vec![], None)?;
+
+        LogSegment::try_new(listed_files, log_root, Some(end_version))
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
@@ -470,6 +510,39 @@ impl LogSegment {
         // read the same protocol and metadata schema for both commits and checkpoints
         self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone())
     }
+
+    /// How many commits since a checkpoint, according to this log segment
+    pub(crate) fn commits_since_checkpoint(&self) -> u64 {
+        // we can use 0 as the checkpoint version if there is no checkpoint since `end_version - 0`
+        // is the correct number of commits since a checkpoint if there are no checkpoints
+        let checkpoint_version = self.checkpoint_version.unwrap_or(0);
+        debug_assert!(checkpoint_version <= self.end_version);
+        self.end_version - checkpoint_version
+    }
+
+    /// How many commits since a log-compaction or checkpoint, according to this log segment
+    pub(crate) fn commits_since_log_compaction_or_checkpoint(&self) -> u64 {
+        // Annoyingly we have to search all the compaction files to determine this, because we only
+        // sort by start version, so technically the max end version could be anywhere in the vec.
+        // We can return 0 in the case there is no compaction since end_version - 0 is the correct
+        // number of commits since compaction if there are no compactions
+        let max_compaction_end = self.ascending_compaction_files.iter().fold(0, |cur, f| {
+            if let &ParsedLogPath {
+                file_type: LogPathFileType::CompactedCommit { hi },
+                ..
+            } = f
+            {
+                Version::max(cur, hi)
+            } else {
+                warn!("Found invalid ParsedLogPath in ascending_compaction_files: {f:?}");
+                cur
+            }
+        });
+        // we want to subtract off the max of the max compaction end or the checkpoint version
+        let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
+        debug_assert!(to_sub <= self.end_version);
+        self.end_version - to_sub
+    }
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version`
@@ -514,13 +587,24 @@ pub(crate) struct ListedLogFiles {
 }
 
 impl ListedLogFiles {
+    // TODO: enforce the usage of this construct to enforce the assertion (issue#1143)
     #[internal_api]
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         ascending_commit_files: Vec<ParsedLogPath>,
         ascending_compaction_files: Vec<ParsedLogPath>,
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
-    ) -> Self {
+    ) -> DeltaResult<Self> {
+        // Ensure commit file versions are contiguous
+        require!(
+            ascending_commit_files
+                .windows(2)
+                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
+            Error::generic(format!(
+                "Expected ordered contiguous commit files {ascending_commit_files:?}"
+            ))
+        );
+
         // We are adding debug_assertions here since we want to validate invariants that are (relatively) expensive to compute
         #[cfg(debug_assertions)]
         {
@@ -555,12 +639,12 @@ impl ListedLogFiles {
             }
         }
 
-        ListedLogFiles {
+        Ok(ListedLogFiles {
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
-        }
+        })
     }
 }
 
@@ -630,13 +714,13 @@ pub(crate) fn list_log_files_with_version(
             }
         }
 
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
         )
-    })
+    })?
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -708,7 +792,7 @@ fn list_log_files_with_checkpoint(
         ));
     };
     if latest_checkpoint.version != checkpoint_metadata.version {
-        warn!(
+        info!(
             "_last_checkpoint hint is out of date. _last_checkpoint version: {}. Using actual most recent: {}",
             checkpoint_metadata.version,
             latest_checkpoint.version

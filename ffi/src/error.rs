@@ -3,7 +3,7 @@ use delta_kernel::{DeltaResult, Error};
 use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
@@ -45,9 +45,7 @@ pub enum KernelError {
     InternalError,
     InvalidExpression,
     InvalidLogPath,
-    InvalidCommitInfo,
     FileAlreadyExists,
-    MissingCommitInfo,
     UnsupportedError,
     ParseIntervalError,
     ChangeDataFeedUnsupported,
@@ -105,9 +103,7 @@ impl From<Error> for KernelError {
             } => Self::from(*source),
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
             Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
-            Error::InvalidCommitInfo(_) => KernelError::InvalidCommitInfo,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
-            Error::MissingCommitInfo => KernelError::MissingCommitInfo,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
             Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,

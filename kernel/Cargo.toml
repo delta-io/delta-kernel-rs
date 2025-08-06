@@ -9,7 +9,8 @@ repository.workspace = true
 readme.workspace = true
 version.workspace = true
 # exclude golden tests + golden test data since they push us over 10MB crate size limit
-exclude = ["tests/golden_tables.rs", "tests/golden_data/"]
+# also exlude tests/data since similarly this has large test tables we don't need to ship
+exclude = ["tests/golden_tables.rs", "tests/golden_data/", "tests/data/"]
 rust-version.workspace = true
 
 [package.metadata.docs.rs]
@@ -38,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.13.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.14.0" }
 bytes = "1.10"
 chrono = "0.4.40"
 indexmap = "2.9.0"
@@ -91,7 +92,7 @@ features = ["async", "object_store"]
 optional = true
 [dependencies.object_store_55]
 package = "object_store"
-version = "0.12"
+version = "0.12.3"
 features = ["aws", "azure", "gcp", "http"]
 optional = true
 

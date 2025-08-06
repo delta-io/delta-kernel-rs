@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
+use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use delta_kernel_derive::internal_api;
@@ -56,6 +57,12 @@ pub(crate) enum ReaderFeature {
     VacuumProtocolCheck,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
+    #[strum(serialize = "variantType-preview")]
+    #[serde(rename = "variantType-preview")]
+    VariantTypePreview,
+    #[strum(serialize = "variantShredding-preview")]
+    #[serde(rename = "variantShredding-preview")]
+    VariantShreddingPreview,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -130,6 +137,12 @@ pub(crate) enum WriterFeature {
     ClusteredTable,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
+    #[strum(serialize = "variantType-preview")]
+    #[serde(rename = "variantType-preview")]
+    VariantTypePreview,
+    #[strum(serialize = "variantShredding-preview")]
+    #[serde(rename = "variantShredding-preview")]
+    VariantShreddingPreview,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -144,6 +157,18 @@ impl ToDataType for ReaderFeature {
 impl ToDataType for WriterFeature {
     fn to_data_type() -> DataType {
         DataType::STRING
+    }
+}
+
+impl From<ReaderFeature> for Scalar {
+    fn from(feature: ReaderFeature) -> Self {
+        Scalar::String(feature.to_string())
+    }
+}
+
+impl From<WriterFeature> for Scalar {
+    fn from(feature: WriterFeature) -> Self {
+        Scalar::String(feature.to_string())
     }
 }
 
@@ -170,6 +195,14 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
         ReaderFeature::TypeWideningPreview,
         ReaderFeature::VacuumProtocolCheck,
         ReaderFeature::V2Checkpoint,
+        ReaderFeature::VariantType,
+        ReaderFeature::VariantTypePreview,
+        // The default engine currently DOES NOT support shredded Variant reads and the parquet
+        // reader will reject the read if it sees a shredded schema in the parquet file. That being
+        // said, kernel does permit reconstructing shredded variants into the
+        // `STRUCT<metadata: BINARY, value: BINARY>` representation if parquet readers of
+        // third-party engines support it.
+        ReaderFeature::VariantShreddingPreview,
     ]
 });
 
@@ -182,6 +215,9 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::DeletionVectors,
         WriterFeature::Invariants,
         WriterFeature::TimestampWithoutTimezone,
+        WriterFeature::VariantType,
+        WriterFeature::VariantTypePreview,
+        WriterFeature::VariantShreddingPreview,
     ]
 });
 
@@ -234,6 +270,11 @@ mod tests {
             (ReaderFeature::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (ReaderFeature::VariantType, "variantType"),
+            (ReaderFeature::VariantTypePreview, "variantType-preview"),
+            (
+                ReaderFeature::VariantShreddingPreview,
+                "variantShredding-preview",
+            ),
             (ReaderFeature::unknown("something"), "something"),
         ];
 
@@ -275,6 +316,11 @@ mod tests {
             (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (WriterFeature::ClusteredTable, "clustering"),
             (WriterFeature::VariantType, "variantType"),
+            (WriterFeature::VariantTypePreview, "variantType-preview"),
+            (
+                WriterFeature::VariantShreddingPreview,
+                "variantShredding-preview",
+            ),
             (WriterFeature::unknown("something"), "something"),
         ];
 

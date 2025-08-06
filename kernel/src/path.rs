@@ -85,6 +85,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
+        #[allow(clippy::unwrap_used)]
         let filename = url
             .path_segments()
             .ok_or_else(|| Error::invalid_log_path(url))?
@@ -98,6 +99,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         let mut split = filename.split('.');
 
         // NOTE: str::split always returns at least one item, even for the empty string.
+        #[allow(clippy::unwrap_used)]
         let version = split.next().unwrap();
 
         // Every valid log path starts with a numeric version part. If version parsing fails, it
