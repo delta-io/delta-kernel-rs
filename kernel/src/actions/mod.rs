@@ -613,6 +613,9 @@ pub(crate) struct CommitInfo {
     pub(crate) kernel_version: Option<String>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
+    /// A unique transaction identified for this commit. When the `catalogManaged` table feature is
+    /// enabled (not yet implemented), this field will be required. Otherwise, it is optional.
+    pub(crate) txn_id: Option<String>,
 }
 
 impl CommitInfo {
@@ -628,6 +631,7 @@ impl CommitInfo {
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
+            txn_id: None,
         }
     }
 }
@@ -651,6 +655,7 @@ impl IntoEngineData for CommitInfo {
 
         let kernel_version = Scalar::from(self.kernel_version);
         let engine_info = Scalar::from(self.engine_info);
+        let txn_id = Scalar::from(self.txn_id);
 
         let values = [
             timestamp,
@@ -659,6 +664,7 @@ impl IntoEngineData for CommitInfo {
             operation_parameters,
             kernel_version,
             engine_info,
+            txn_id,
         ];
 
         let evaluator = engine.evaluation_handler();
@@ -1179,6 +1185,7 @@ mod tests {
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::nullable("engineInfo", DataType::STRING),
+                StructField::nullable("txnId", DataType::STRING),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1444,6 +1451,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
             ],
         )
