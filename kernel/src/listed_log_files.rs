@@ -3,7 +3,6 @@ use std::convert::identity;
 
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::snapshot::LastCheckpointHint;
-use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler, Version};
 
 use delta_kernel_derive::internal_api;
@@ -16,6 +15,8 @@ use url::Url;
 /// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
 /// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
 /// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
+///
+/// NOTE: the `ascending_commit_files` _may_ contain gaps.
 #[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
@@ -31,7 +32,7 @@ pub(crate) struct ListedLogFiles {
 /// `end_version` is not specified, files up to the most recent version will be included.
 ///
 /// Note: this calls [`StorageHandler::list_from`] to get the list of log files.
-pub(crate) fn list_log_files(
+fn list_log_files(
     storage: &dyn StorageHandler,
     log_root: &Url,
     start_version: impl Into<Option<Version>>,
@@ -108,17 +109,8 @@ impl ListedLogFiles {
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
     ) -> DeltaResult<Self> {
-        // Ensure commit file versions are contiguous
-        require!(
-            ascending_commit_files
-                .windows(2)
-                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
-            Error::generic(format!(
-                "Expected ordered contiguous commit files {ascending_commit_files:?}"
-            ))
-        );
-
-        // We are adding debug_assertions here since we want to validate invariants that are (relatively) expensive to compute
+        // We are adding debug_assertions here since we want to validate invariants that are
+        // (relatively) expensive to compute
         #[cfg(debug_assertions)]
         {
             assert!(ascending_compaction_files
@@ -158,6 +150,20 @@ impl ListedLogFiles {
             checkpoint_parts,
             latest_crc_file,
         })
+    }
+
+    /// List all commits between the provided `start_version` (inclusive) and `end_version`
+    /// (inclusive). All other types are ignored.
+    pub(crate) fn list_commits(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+        start_version: Option<Version>,
+        end_version: Option<Version>,
+    ) -> DeltaResult<Self> {
+        let commits: Vec<_> = list_log_files(storage, log_root, start_version, end_version)?
+            .filter_ok(|log_file| matches!(log_file.file_type, LogPathFileType::Commit))
+            .try_collect()?;
+        ListedLogFiles::try_new(commits, vec![], vec![], None)
     }
 }
 

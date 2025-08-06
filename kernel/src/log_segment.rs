@@ -71,6 +71,16 @@ impl LogSegment {
             latest_crc_file,
         } = listed_files;
 
+        // Ensure commit file versions are contiguous
+        require!(
+            ascending_commit_files
+                .windows(2)
+                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
+            Error::generic(format!(
+                "Expected ordered contiguous commit files {ascending_commit_files:?}"
+            ))
+        );
+
         // Commit file versions must be greater than the most recent checkpoint version if it exists
         let checkpoint_version = checkpoint_parts.first().map(|checkpoint_file| {
             ascending_commit_files.retain(|log_path| checkpoint_file.version < log_path.version);
@@ -167,30 +177,22 @@ impl LogSegment {
             }
         }
 
-        // todo: compactions?
-        let ascending_commit_files: Vec<_> =
-            list_log_files(storage, &log_root, start_version, end_version)?
-                .filter_ok(|x| x.is_commit())
-                .try_collect()?;
-
+        // TODO: compactions?
+        let listed_files =
+            ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`ListedLogFiles::try_new`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
-            ascending_commit_files
+            listed_files
+                .ascending_commit_files
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
             Error::generic(format!(
                 "Expected the first commit to have version {start_version}"
             ))
         );
-        let listed_files = ListedLogFiles::try_new(
-            ascending_commit_files,
-            vec![],
-            vec![],
-            None, // TODO: use CRC files for table changes?
-        )?;
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
@@ -218,30 +220,23 @@ impl LogSegment {
             })
             .transpose()?;
 
-        let mut contiguous_commits: Vec<ParsedLogPath> =
-            limit.map_or_else(Vec::new, |limit| Vec::with_capacity(limit.get()));
+        // this is a list of commits with possible gaps, we want to take the latest contiguous
+        // chunk of commits
+        let mut listed_commits =
+            ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
 
-        for commit_res in list_log_files(storage, &log_root, start_from, Some(end_version))? {
-            let commit = match commit_res {
-                Ok(file) if matches!(file.file_type, LogPathFileType::Commit) => file,
-                Ok(_) | Err(Error::InvalidLogPath(_)) => continue, // Ignore non-commit
-                Err(err) => return Err(err), // Listing errors are propagated to the caller
-            };
-
-            if contiguous_commits
-                .last()
-                .is_some_and(|prev_commit| prev_commit.version + 1 != commit.version)
+        // remove gaps - return latest contiguous chunk of commits
+        let commits = &mut listed_commits.ascending_commit_files;
+        if !commits.is_empty() {
+            let mut start_idx = commits.len() - 1;
+            while start_idx > 0 && commits[start_idx].version - commits[start_idx - 1].version == 1
             {
-                // We found a gap, so throw away all earlier versions
-                contiguous_commits.clear();
+                start_idx -= 1;
             }
-
-            contiguous_commits.push(commit);
+            commits.drain(..start_idx);
         }
 
-        let listed_files = ListedLogFiles::try_new(contiguous_commits, vec![], vec![], None)?;
-
-        LogSegment::try_new(listed_files, log_root, Some(end_version))
+        LogSegment::try_new(listed_commits, log_root, Some(end_version))
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
