@@ -614,7 +614,7 @@ pub(crate) struct CommitInfo {
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identified for this commit. When the `catalogManaged` table feature is
-    /// enabled (not yet implemented), this field will be required.
+    /// enabled (not yet implemented), this field will be required. Otherwise, it is optional.
     pub(crate) txn_id: Option<String>,
 }
 
