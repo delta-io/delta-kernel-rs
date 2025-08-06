@@ -189,7 +189,7 @@ impl LogSegment {
             ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
-        // - [`ListedLogFiles::try_new`] also checks that there are no gaps between commits.
+        // - [`ListedLogFiles::list_commits`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
             listed_files

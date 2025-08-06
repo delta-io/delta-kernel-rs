@@ -1,3 +1,17 @@
+//! [`ListedLogFiles`] is a struct holding the result of listing the delta log. Currently, it
+//! exposes three APIs for listing:
+//! 1. [`list_commits`]: Lists all commit files between the provided start and end versions.
+//! 2. [`list`]: Lists all commit and checkpoint files between the provided start and end versions.
+//! 3. [`list_with_checkpoint_hint`]: Lists all commit and checkpoint files after the provided
+//!    checkpoint hint.
+//!
+//! After listing, one can leverage the [`ListedLogFiles`] to construct a [`LogSegment`].
+//!
+//! [`list_commits`]: Self::list_commits
+//! [`list`]: Self::list
+//! [`list_with_checkpoint_hint`]: Self::list_with_checkpoint_hint
+//! [`LogSegment`]: crate::log_segment::LogSegment
+
 use std::collections::HashMap;
 use std::convert::identity;
 
@@ -101,8 +115,9 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 }
 
 impl ListedLogFiles {
-    // TODO: enforce the usage of this construct to enforce the assertion (issue#1143)
-    #[internal_api]
+    // Note: for now we expose the constructor as pub(crate) to allow for use in testing. Ideally,
+    // we should explore entirely encapsulating ListedLogFiles within LogSegment - currently
+    // LogSegment constructor requires a ListedLogFiles.
     pub(crate) fn try_new(
         ascending_commit_files: Vec<ParsedLogPath>,
         ascending_compaction_files: Vec<ParsedLogPath>,
