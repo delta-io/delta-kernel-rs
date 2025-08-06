@@ -2,11 +2,13 @@ use std::borrow::Cow;
 
 use crate::{
     schema::{
-        ColumnName, DataType, PrimitiveType, Schema, SchemaTransform, StructField, StructType,
+        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaTransform,
+        StructField, StructType,
     },
     table_properties::{DataSkippingNumIndexedCols, TableProperties},
 };
 
+/// Generates the expected schema for file statistics.
 pub(crate) fn stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
@@ -14,20 +16,30 @@ pub(crate) fn stats_schema(
     let mut fields = Vec::with_capacity(4);
     fields.push(StructField::nullable("numRecords", DataType::LONG));
 
-    let mut min_max_transform = MinMaxStatsTransform::new(table_properties);
-    if let Some(min_max_schema) = min_max_transform.transform_struct(physical_file_schema) {
-        let min_max_schema = min_max_schema.into_owned();
+    // generate the base stats schema:
+    // - omit map, array, and variant fields
+    // - make all fields nullable
+    // - include fields according to table properties (num_indexed_cols, stats_coliumns, ...)
+    let mut base_transform = BaseStatsTransform::new(table_properties);
+    if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
+        let base_schema = base_schema.into_owned();
 
+        // convert all leaf fields to data type LONG for null count
         let mut null_count_transform = NullCountStatsTransform;
-        if let Some(null_count_schema) = null_count_transform.transform_struct(&min_max_schema) {
+        if let Some(null_count_schema) = null_count_transform.transform_struct(&base_schema) {
             fields.push(StructField::nullable(
                 "nullCount",
                 null_count_schema.into_owned(),
             ));
         };
 
-        fields.push(StructField::nullable("minValues", min_max_schema.clone()));
-        fields.push(StructField::nullable("maxValues", min_max_schema));
+        // include only min/max skipping eligible fields (data types)
+        let mut min_max_transform = MinMaxStatsTransform;
+        if let Some(min_max_schema) = min_max_transform.transform_struct(&base_schema) {
+            let min_max_schema = min_max_schema.into_owned();
+            fields.push(StructField::nullable("minValues", min_max_schema.clone()));
+            fields.push(StructField::nullable("maxValues", min_max_schema));
+        }
     }
 
     StructType::new(fields)
@@ -58,15 +70,28 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     }
 }
 
-pub(crate) struct MinMaxStatsTransform {
+/// Transforms a table schema into a base stats schema.
+///
+/// Base stats schema in this case refers the subsets of fields in the table schema
+/// that may be considered for stats collection. Depending on the type of stats - min/max/nullcount/... -
+/// additional transformations may be applied.
+///
+/// The concrete shape of the schema depends on the table configuration.
+/// * `dataSkippingStatsColumns` - used to explicitly specify the columns
+///   to be used for data skipping statistics. (takes precedence)
+/// * `dataSkippingNumIndexedCols` - used to specify the number of columns
+///   to be used for data skipping statistics. Defaults to 32.
+///
+/// All fields are nullable.
+struct BaseStatsTransform {
     n_columns: Option<DataSkippingNumIndexedCols>,
     added_columns: u64,
     column_names: Option<Vec<ColumnName>>,
     path: Vec<String>,
 }
 
-impl MinMaxStatsTransform {
-    pub(crate) fn new(props: &TableProperties) -> Self {
+impl BaseStatsTransform {
+    fn new(props: &TableProperties) -> Self {
         // if data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified
         if let Some(columns_names) = &props.data_skipping_stats_columns {
@@ -91,7 +116,18 @@ impl MinMaxStatsTransform {
     }
 }
 
-impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
+impl<'a> SchemaTransform<'a> for BaseStatsTransform {
+    // array and map fields are not eligible for data skipping, so filter them out.
+    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        None
+    }
+    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
+        None
+    }
+    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+        None
+    }
+
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         use Cow::*;
 
@@ -106,21 +142,29 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
         self.path.push(field.name.clone());
         let data_type = field.data_type();
 
-        // we assert in the constructor, that `n_columns` and `column_names` are mutually exclusive.
-        //
+        // keep the field if it:
+        // - is a struct field and we need to traverse its children
+        // - OR it is referenced by the column names
+        // - OR it is a primitive type / leaf field
         let should_include = matches!(data_type, DataType::Struct(_))
             || self
                 .column_names
                 .as_ref()
                 .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
-                .unwrap_or_else(|| is_skipping_eligeble_datatype(data_type));
+                .unwrap_or_else(|| {
+                    !matches!(
+                        data_type,
+                        DataType::Map(_) | DataType::Array(_) | DataType::Variant(_)
+                    )
+                });
 
         if !should_include {
             self.path.pop();
             return None;
         }
 
-        if is_skipping_eligeble_datatype(data_type) {
+        // increment count only for leaf columns.
+        if matches!(data_type, DataType::Primitive(_)) {
             self.added_columns += 1;
         }
 
@@ -139,11 +183,25 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 
         self.path.pop();
 
-        // exclude struct fields with no eligible children
+        // exclude struct fields with no children
         if matches!(field.data_type(), DataType::Struct(dt) if dt.fields.is_empty()) {
             None
         } else {
             Some(field)
+        }
+    }
+}
+
+// removes all fields with non eligible data types
+//
+// should only be applied to schema oricessed via `BaseStatsTransform`.
+struct MinMaxStatsTransform;
+impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
+    fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        if is_skipping_eligeble_datatype(ptype) {
+            Some(Cow::Borrowed(ptype))
+        } else {
+            None
         }
     }
 }
@@ -160,21 +218,21 @@ fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) 
 
 /// Checks if a data type is eligible for min/max file skipping.
 /// https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61
-fn is_skipping_eligeble_datatype(data_type: &DataType) -> bool {
+fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
         data_type,
-        &DataType::BYTE
-            | &DataType::SHORT
-            | &DataType::INTEGER
-            | &DataType::LONG
-            | &DataType::FLOAT
-            | &DataType::DOUBLE
-            | &DataType::DATE
-            | &DataType::TIMESTAMP
-            | &DataType::TIMESTAMP_NTZ
-            | &DataType::STRING
-            // | &DataType::BOOLEAN
-            | DataType::Primitive(PrimitiveType::Decimal(_))
+        &PrimitiveType::Byte
+            | &PrimitiveType::Short
+            | &PrimitiveType::Integer
+            | &PrimitiveType::Long
+            | &PrimitiveType::Float
+            | &PrimitiveType::Double
+            | &PrimitiveType::Date
+            | &PrimitiveType::Timestamp
+            | &PrimitiveType::TimestampNtz
+            | &PrimitiveType::String
+            // | &PrimitiveType::Boolean
+            | PrimitiveType::Decimal(_)
     )
 }
 
@@ -339,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_schema_old_n_cols() {
+    fn test_stats_schema_n_cols() {
         let properties: TableProperties = [(
             "delta.dataSkippingNumIndexedCols".to_string(),
             "1".to_string(),
@@ -364,6 +422,129 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+        ]);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_different_fields_in_null_vs_minmax() {
+        let properties: TableProperties = [("key", "value")].into();
+
+        // Create a schema with fields that have different eligibility for min/max vs null count
+        // - "id" (LONG) - eligible for both null count and min/max
+        // - "is_active" (BOOLEAN) - eligible for null count but NOT for min/max
+        // - "metadata" (BINARY) - eligible for null count but NOT for min/max
+        let file_schema = StructType::new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("is_active", DataType::BOOLEAN),
+            StructField::nullable("metadata", DataType::BINARY),
+        ]);
+
+        let stats_schema = stats_schema(&file_schema, &properties);
+
+        // Expected nullCount schema: all fields converted to LONG
+        let expected_null_count = StructType::new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("is_active", DataType::LONG),
+            StructField::nullable("metadata", DataType::LONG),
+        ]);
+
+        // Expected minValues/maxValues schema: only eligible fields (no boolean, no binary)
+        let expected_min_max = StructType::new([StructField::nullable("id", DataType::LONG)]);
+
+        let expected = StructType::new([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("minValues", expected_min_max.clone()),
+            StructField::nullable("maxValues", expected_min_max),
+        ]);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_nested_different_fields_in_null_vs_minmax() {
+        let properties: TableProperties = [("key", "value")].into();
+
+        // Create a nested schema where some nested fields are eligible for min/max and others aren't
+        let user_struct = StructType::new([
+            StructField::nullable("name", DataType::STRING), // eligible for min/max
+            StructField::nullable("is_admin", DataType::BOOLEAN), // NOT eligible for min/max
+            StructField::nullable("age", DataType::INTEGER), // eligible for min/max
+            StructField::nullable("profile_pic", DataType::BINARY), // NOT eligible for min/max
+        ]);
+
+        let file_schema = StructType::new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(user_struct.clone()))),
+            StructField::nullable("is_deleted", DataType::BOOLEAN), // NOT eligible for min/max
+        ]);
+
+        let stats_schema = stats_schema(&file_schema, &properties);
+
+        // Expected nullCount schema: all fields converted to LONG, maintaining structure
+        let expected_null_user = StructType::new([
+            StructField::nullable("name", DataType::LONG),
+            StructField::nullable("is_admin", DataType::LONG),
+            StructField::nullable("age", DataType::LONG),
+            StructField::nullable("profile_pic", DataType::LONG),
+        ]);
+        let expected_null_count = StructType::new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(expected_null_user))),
+            StructField::nullable("is_deleted", DataType::LONG),
+        ]);
+
+        // Expected minValues/maxValues schema: only eligible fields
+        let expected_minmax_user = StructType::new([
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("age", DataType::INTEGER),
+        ]);
+        let expected_min_max = StructType::new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("user", DataType::Struct(Box::new(expected_minmax_user))),
+        ]);
+
+        let expected = StructType::new([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            StructField::nullable("minValues", expected_min_max.clone()),
+            StructField::nullable("maxValues", expected_min_max),
+        ]);
+
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_only_non_eligible_fields() {
+        let properties: TableProperties = [("key", "value")].into();
+
+        // Create a schema with only fields that are NOT eligible for min/max skipping
+        let file_schema = StructType::new([
+            StructField::nullable("is_active", DataType::BOOLEAN),
+            StructField::nullable("metadata", DataType::BINARY),
+            StructField::nullable(
+                "tags",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            ),
+        ]);
+
+        let stats_schema = stats_schema(&file_schema, &properties);
+
+        // Expected nullCount schema: all fields converted to LONG
+        let expected_null_count = StructType::new([
+            StructField::nullable("is_active", DataType::LONG),
+            StructField::nullable("metadata", DataType::LONG),
+            // Note: array fields are filtered out by BaseStatsTransform, so "tags" won't appear
+        ]);
+
+        // Expected minValues/maxValues schema: empty since no fields are eligible
+        // Since there are no eligible fields, minValues and maxValues should not be present
+        let expected = StructType::new([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", expected_null_count),
+            // No minValues or maxValues fields since no primitive fields are eligible
         ]);
 
         assert_eq!(&expected, &stats_schema);

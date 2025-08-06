@@ -355,11 +355,12 @@ impl TableConfiguration {
     #[allow(unused)]
     pub(crate) fn stats_schema(&self) -> Schema {
         let partition_columns = self.metadata().partition_columns();
+        let column_mapping_mode = self.column_mapping_mode();
         let physical_file_schema = StructType::new(
             self.schema()
                 .fields()
                 .filter(|field| !partition_columns.contains(field.name()))
-                .map(|field| field.make_physical()),
+                .map(|field| field.make_physical(column_mapping_mode)),
         );
         stats_schema(&physical_file_schema, &self.table_properties)
     }
