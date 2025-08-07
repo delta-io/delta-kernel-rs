@@ -396,6 +396,7 @@ impl FileOpener for PresignedUrlOpener {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::slice;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::arrow::array::{Array, RecordBatch};
@@ -574,7 +575,7 @@ mod tests {
 
         let data: Vec<RecordBatch> = parquet_handler
             .read_parquet_files(
-                &[parquet_file.clone()],
+                slice::from_ref(parquet_file),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
             )
