@@ -9,6 +9,29 @@ use crate::{
 };
 
 /// Generates the expected schema for file statistics.
+///
+/// The base stats schema is dependent on the current table configuration and derived via:
+/// - only fields present in data files are included (use physical names, no partition columns)
+/// - if `dataSkippingStatsColumns` is set, include only those columns.
+///   Column names may refer to struct fields in which case all child fields are included.
+/// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included.
+/// - all fields are made nullable.
+///
+/// For the `nullCount` schema, we consider the whole base schema and convert all leaf fields
+/// to data type LONG. Maps, arrays, and variant are considered leaf fields in this case.
+///
+/// For the min / max schemas, we non-eligible leaf fields from the base schema.
+/// Field eligibility is determined by the fields data type via [`is_skipping_eligeble_datatype`].
+///
+/// The overall schema is then:
+/// ```ignored
+/// {
+///    numRecords: long,
+///    nullCount: <derived null count schema>,
+///    minValues: <derived min/max schema>,
+///    maxValues: <derived min/max schema>,
+/// }
+/// ```
 pub(crate) fn stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
@@ -17,7 +40,6 @@ pub(crate) fn stats_schema(
     fields.push(StructField::nullable("numRecords", DataType::LONG));
 
     // generate the base stats schema:
-    // - omit map, array, and variant fields
     // - make all fields nullable
     // - include fields according to table properties (num_indexed_cols, stats_coliumns, ...)
     let mut base_transform = BaseStatsTransform::new(table_properties);
@@ -68,6 +90,31 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     fn transform_primitive(&mut self, _ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         Some(Cow::Owned(PrimitiveType::Long))
     }
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+
+        if matches!(
+            &field.data_type,
+            DataType::Array(_) | DataType::Map(_) | DataType::Variant(_)
+        ) {
+            return Some(Cow::Owned(StructField {
+                name: field.name.clone(),
+                data_type: DataType::LONG,
+                nullable: true,
+                metadata: Default::default(),
+            }));
+        }
+
+        match self.transform(&field.data_type)? {
+            Borrowed(_) => Some(Borrowed(field)),
+            dt => Some(Owned(StructField {
+                name: field.name.clone(),
+                data_type: dt.into_owned(),
+                nullable: true,
+                metadata: Default::default(),
+            })),
+        }
+    }
 }
 
 /// Transforms a table schema into a base stats schema.
@@ -117,17 +164,6 @@ impl BaseStatsTransform {
 }
 
 impl<'a> SchemaTransform<'a> for BaseStatsTransform {
-    // array and map fields are not eligible for data skipping, so filter them out.
-    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        None
-    }
-    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
-        None
-    }
-    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
-        None
-    }
-
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         use Cow::*;
 
@@ -151,12 +187,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
                 .column_names
                 .as_ref()
                 .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
-                .unwrap_or_else(|| {
-                    !matches!(
-                        data_type,
-                        DataType::Map(_) | DataType::Array(_) | DataType::Variant(_)
-                    )
-                });
+                .unwrap_or(true);
 
         if !should_include {
             self.path.pop();
@@ -164,7 +195,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
         }
 
         // increment count only for leaf columns.
-        if matches!(data_type, DataType::Primitive(_)) {
+        if !matches!(data_type, DataType::Struct(_)) {
             self.added_columns += 1;
         }
 
@@ -174,10 +205,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
                 name: field.name.clone(),
                 data_type: data_type.into_owned(),
                 nullable: true,
-                // TODO: should we consider the metadata here?
-                // Things like column ids would surely not make sense as this is a different field
-                // in a different file
-                metadata: field.metadata.clone(),
+                metadata: Default::default(),
             }),
         };
 
@@ -196,7 +224,19 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 //
 // should only be applied to schema oricessed via `BaseStatsTransform`.
 struct MinMaxStatsTransform;
+
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
+    // array and map fields are not eligible for data skipping, so filter them out.
+    fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
+        None
+    }
+    fn transform_map(&mut self, _: &'a MapType) -> Option<Cow<'a, MapType>> {
+        None
+    }
+    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+        None
+    }
+
     fn transform_primitive(&mut self, ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
         if is_skipping_eligeble_datatype(ptype) {
             Some(Cow::Borrowed(ptype))
@@ -209,11 +249,12 @@ impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
 // Checks if a column should be included or traversed into.
 //
 // Returns true if the column name is included in the list of column names
-// or if the column name is a prefix of any column name in the list.
+// or if the column name is a prefix of any column name in the list
+// or if the column name is a child of any column name in the list
 fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) -> bool {
-    column_names
-        .iter()
-        .any(|name| name.as_ref().starts_with(column_name))
+    column_names.iter().any(|name| {
+        name.as_ref().starts_with(column_name) || column_name.as_ref().starts_with(name)
+    })
 }
 
 /// Checks if a data type is eligible for min/max file skipping.
@@ -248,9 +289,15 @@ mod tests {
         let parent = ColumnName::new(["lvl1", "lvl2", "lvl3"]);
         assert!(should_include_column(&parent, &full_name));
         assert!(should_include_column(&full_name[0], &full_name));
+        // child fields should also be included
+        assert!(should_include_column(&full_name[0], &[parent]));
+
         let not_parent = ColumnName::new(["lvl1", "lvl2", "lvl3", "lvl5"]);
         assert!(!should_include_column(&not_parent, &full_name));
         let not_parent = ColumnName::new(["lvl1", "lvl3", "lvl4"]);
+        assert!(!should_include_column(&not_parent, &full_name));
+
+        let not_parent = ColumnName::new(["lvl1", "lvl2", "lvl4"]);
         assert!(!should_include_column(&not_parent, &full_name));
     }
 
@@ -333,6 +380,16 @@ mod tests {
 
         let stats_schema = stats_schema(&file_schema, &properties);
 
+        let expected_null_nested = StructType::new([
+            StructField::nullable("name", DataType::LONG),
+            StructField::nullable("tags", DataType::LONG),
+            StructField::nullable("score", DataType::LONG),
+        ]);
+        let expected_null = StructType::new([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("metadata", DataType::Struct(Box::new(expected_null_nested))),
+        ]);
+
         let expected_nested = StructType::new([
             StructField::nullable("name", DataType::STRING),
             StructField::nullable("score", DataType::DOUBLE),
@@ -342,14 +399,9 @@ mod tests {
             StructField::nullable("metadata", DataType::Struct(Box::new(expected_nested))),
         ]);
 
-        let null_count = NullCountStatsTransform
-            .transform_struct(&expected_fields)
-            .unwrap()
-            .into_owned();
-
         let expected = StructType::new([
             StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", null_count),
+            StructField::nullable("nullCount", expected_null),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
         ]);
@@ -536,7 +588,7 @@ mod tests {
         let expected_null_count = StructType::new([
             StructField::nullable("is_active", DataType::LONG),
             StructField::nullable("metadata", DataType::LONG),
-            // Note: array fields are filtered out by BaseStatsTransform, so "tags" won't appear
+            StructField::nullable("tags", DataType::LONG),
         ]);
 
         // Expected minValues/maxValues schema: empty since no fields are eligible
