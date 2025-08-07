@@ -90,10 +90,11 @@ use crate::actions::{
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
+use crate::last_checkpoint_hint::LAST_CHECKPOINT_FILE_NAME;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::snapshot::{Snapshot, LAST_CHECKPOINT_FILE_NAME};
+use crate::snapshot::Snapshot;
 use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};

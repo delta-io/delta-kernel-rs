@@ -3,7 +3,7 @@
 /// Since each new `.rs` file in this directory results in increased build and link time, it is
 /// important to only add new files if absolutely necessary for code readability or test
 /// performance.
-use delta_kernel::snapshot::LastCheckpointHint;
+use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
 
 #[test]
 fn test_checkpoint_serde() {

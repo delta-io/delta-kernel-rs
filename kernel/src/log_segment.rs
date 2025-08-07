@@ -8,10 +8,10 @@ use crate::actions::{
     get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
-use crate::snapshot::LastCheckpointHint;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
