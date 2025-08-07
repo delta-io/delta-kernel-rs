@@ -2,6 +2,7 @@
 //! the metadata needed to generate the Change Data Feed.
 
 use std::collections::{HashMap, HashSet};
+use std::slice;
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
@@ -158,7 +159,7 @@ impl LogReplayScanner {
         // all of the rows will be filtered by the predicate. Instead, we wait until deletion
         // vectors are resolved so that we can skip both actions in the pair.
         let action_iter = engine.json_handler().read_json_files(
-            &[commit_file.location.clone()],
+            slice::from_ref(&commit_file.location),
             visitor_schema,
             None, // not safe to apply data skipping yet
         )?;
@@ -229,10 +230,11 @@ impl LogReplayScanner {
         let remove_dvs = Arc::new(remove_dvs);
 
         let schema = FileActionSelectionVisitor::schema();
-        let action_iter =
-            engine
-                .json_handler()
-                .read_json_files(&[commit_file.location.clone()], schema, None)?;
+        let action_iter = engine.json_handler().read_json_files(
+            slice::from_ref(&commit_file.location),
+            schema,
+            None,
+        )?;
         let commit_version = commit_file
             .version
             .try_into()
