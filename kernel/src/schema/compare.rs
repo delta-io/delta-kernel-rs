@@ -33,6 +33,7 @@ use super::{DataType, StructField, StructType};
 pub(crate) struct Nullable(bool);
 
 /// Represents the ways a schema comparison can fail.
+#[allow(unused)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error("The nullability was tightened for a field")]
