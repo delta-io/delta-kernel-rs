@@ -92,7 +92,7 @@ async fn try_main() -> DeltaResult<()> {
     let mut txn = snapshot
         .transaction()?
         .with_operation("INSERT".to_string())
-        .with_engine_info(format!("default_engine/write-table-example"));
+        .with_engine_info("default_engine/write-table-example");
 
     // Write the data using the engine
     let write_context = Arc::new(txn.get_write_context());
