@@ -260,7 +260,6 @@ mod tests {
     };
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
-    #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
     use crate::object_store::PutMultipartOptions;
     use crate::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
@@ -534,11 +533,10 @@ mod tests {
         let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
-        let meta_size = meta.size;
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta_size,
+            size: meta.size,
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -683,11 +681,10 @@ mod tests {
                         let url = Url::parse(&format!("memory:/{path}")).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
-                        let meta_size = meta.size;
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta_size,
+                            size: meta.size,
                         }
                     }
                 })

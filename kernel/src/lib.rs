@@ -203,11 +203,10 @@ impl TryFrom<DirEntry> for FileMeta {
                 last_modified.as_millis()
             ))
         })?;
-        let metadata_len = metadata.len();
         Ok(FileMeta {
             location,
             last_modified,
-            size: metadata_len,
+            size: metadata.len(),
         })
     }
 }

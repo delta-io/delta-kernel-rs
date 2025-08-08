@@ -148,8 +148,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
-        let metadata_size = metadata.size;
-        if size != metadata_size {
+        if size != metadata.size {
             return Err(Error::generic(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
                 size, metadata.size

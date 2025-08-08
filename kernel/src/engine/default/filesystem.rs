@@ -92,12 +92,11 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     Ok(meta) => {
                         let mut location = url.clone();
                         location.set_path(&format!("/{}", meta.location.as_ref()));
-                        let meta_size = meta.size;
                         sender
                             .send(Ok(FileMeta {
                                 location,
                                 last_modified: meta.last_modified.timestamp_millis(),
-                                size: meta_size,
+                                size: meta.size,
                             }))
                             .ok();
                     }
