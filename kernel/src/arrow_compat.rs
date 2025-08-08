@@ -23,5 +23,4 @@ mod arrow_compat_shims {
 ))]
 compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow-55` or `arrow-56` feature");
 
-#[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
 pub use arrow_compat_shims::*;

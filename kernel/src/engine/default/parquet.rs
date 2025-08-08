@@ -258,7 +258,6 @@ impl FileOpener for ParquetOpener {
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
             let mut reader = {
                 use crate::object_store::ObjectStoreScheme;
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
