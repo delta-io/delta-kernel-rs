@@ -62,22 +62,7 @@ reqwest = { version = "0.12.15", default-features = false, optional = true }
 # optionally used with default engine (though not required)
 tokio = { version = "1.44", optional = true, features = ["rt-multi-thread"] }
 
-# arrow 54
-[dependencies.arrow_54]
-package = "arrow"
-version = "54.3"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
-optional = true
-[dependencies.parquet_54]
-package = "parquet"
-version = "54.3"
-features = ["async", "object_store"]
-optional = true
-[dependencies.object_store_54]
-package = "object_store"
-version = "0.11"
-features = ["aws", "azure", "gcp", "http"]
-optional = true
+
 
 # arrow 55
 [dependencies.arrow_55]
@@ -96,6 +81,18 @@ version = "0.12.3"
 features = ["aws", "azure", "gcp", "http"]
 optional = true
 
+# arrow 56
+[dependencies.arrow_56]
+package = "arrow"
+version = "56"
+features = ["chrono-tz", "ffi", "json", "prettyprint"]
+optional = true
+[dependencies.parquet_56]
+package = "parquet"
+version = "56"
+features = ["async", "object_store"]
+optional = true
+
 [features]
 # no default features
 default = []
@@ -105,10 +102,11 @@ internal-api = []
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-55"] # latest arrow version
+arrow = ["arrow-56"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
-arrow-54 = ["dep:arrow_54", "dep:parquet_54", "dep:object_store_54"]
+
 arrow-55 = ["dep:arrow_55", "dep:parquet_55", "dep:object_store_55"]
+arrow-56 = ["dep:arrow_56", "dep:parquet_56", "dep:object_store_55"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 

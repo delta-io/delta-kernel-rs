@@ -260,10 +260,7 @@ mod tests {
     };
     use crate::object_store::local::LocalFileSystem;
     use crate::object_store::memory::InMemory;
-    #[cfg(feature = "arrow-55")]
     use crate::object_store::PutMultipartOptions;
-    #[cfg(not(feature = "arrow-55"))]
-    use crate::object_store::PutMultipartOpts;
     use crate::object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
         PutPayload, PutResult, Result,
@@ -359,8 +356,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            #[cfg(not(feature = "arrow-55"))] opts: PutMultipartOpts,
-            #[cfg(feature = "arrow-55")] opts: PutMultipartOptions,
+            opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -537,13 +533,10 @@ mod tests {
         let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
-        let meta_size = meta.size;
-        #[cfg(not(feature = "arrow-55"))]
-        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta_size,
+            size: meta.size,
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -688,13 +681,10 @@ mod tests {
                         let url = Url::parse(&format!("memory:/{path}")).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
-                        let meta_size = meta.size;
-                        #[cfg(not(feature = "arrow-55"))]
-                        let meta_size = meta_size.try_into().unwrap();
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta_size,
+                            size: meta.size,
                         }
                     }
                 })
