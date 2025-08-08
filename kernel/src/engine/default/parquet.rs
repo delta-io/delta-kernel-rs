@@ -429,11 +429,10 @@ mod tests {
             .schema()
             .clone();
 
-        let meta_size = meta.size;
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
-            size: meta_size,
+            size: meta.size,
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
