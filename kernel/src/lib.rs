@@ -92,6 +92,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod history_manager;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -129,11 +130,6 @@ pub(crate) mod log_replay;
 pub mod log_segment;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment;
-
-#[cfg(feature = "internal-api")]
-pub mod history_manager;
-#[cfg(not(feature = "internal-api"))]
-pub(crate) mod history_manager;
 
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
