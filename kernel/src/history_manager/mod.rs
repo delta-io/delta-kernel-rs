@@ -56,7 +56,7 @@ type Timestamp = i64;
 fn get_log_segment_for_timestamp_conversion(
     engine: &dyn Engine,
     snapshot: &Snapshot,
-    limit: Option<NonZero<usize>>
+    limit: Option<NonZero<usize>>,
 ) -> Result<LogSegment, LogHistoryError> {
     let log_segment = LogSegment::for_timestamp_conversion(
         engine.storage_handler().as_ref(),
@@ -70,7 +70,6 @@ fn get_log_segment_for_timestamp_conversion(
     })?;
     Ok(log_segment)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -168,7 +167,8 @@ mod tests {
         let engine = SyncEngine::new();
         let path = Url::from_directory_path(mock_table.table_root()).unwrap();
         let snapshot = Snapshot::try_new(path, &engine, None).unwrap();
-        let log_segment = get_log_segment_for_timestamp_conversion(&engine, &snapshot, None).unwrap();
+        let log_segment =
+            get_log_segment_for_timestamp_conversion(&engine, &snapshot, None).unwrap();
         let commits = log_segment.ascending_commit_files;
 
         // File that has no In-commit timestamps
@@ -216,7 +216,8 @@ mod tests {
         let engine = SyncEngine::new();
         let path = Url::from_directory_path(mock_table.table_root()).unwrap();
         let snapshot = Snapshot::try_new(path, &engine, None).unwrap();
-        let log_segment = get_log_segment_for_timestamp_conversion(&engine, &snapshot, None).unwrap();
+        let log_segment =
+            get_log_segment_for_timestamp_conversion(&engine, &snapshot, None).unwrap();
         let commits = log_segment.ascending_commit_files;
 
         // Read the file modification timestamps
