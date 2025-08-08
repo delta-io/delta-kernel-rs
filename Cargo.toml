@@ -22,5 +22,5 @@ keywords = ["deltalake", "delta", "datalake"]
 license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
-rust-version = "1.82"
+rust-version = "1.84"
 version = "0.14.0"
