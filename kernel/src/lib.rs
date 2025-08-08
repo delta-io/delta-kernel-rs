@@ -102,6 +102,7 @@ pub mod table_properties;
 pub mod transaction;
 
 mod arrow_compat;
+#[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
 pub use arrow_compat::*;
 
 pub mod kernel_predicates;

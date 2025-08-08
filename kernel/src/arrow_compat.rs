@@ -1,6 +1,6 @@
 //! This module re-exports the different versions of arrow, parquet, and object_store we support.
 
-#![cfg(feature = "arrow-56")]
+#[cfg(feature = "arrow-56")]
 mod arrow_compat_shims {
     pub use arrow_56 as arrow;
     pub use object_store_55 as object_store;
@@ -23,4 +23,5 @@ mod arrow_compat_shims {
 ))]
 compile_error!("Requested a feature that needs arrow without enabling arrow. Please enable the `arrow-55` or `arrow-56` feature");
 
+#[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
 pub use arrow_compat_shims::*;
