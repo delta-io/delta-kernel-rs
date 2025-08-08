@@ -1,5 +1,6 @@
 //! Utilities to make working with directory and file paths easier
 
+use std::slice;
 use std::str::FromStr;
 
 use crate::{
@@ -276,7 +277,7 @@ impl ParsedLogPath<FileMeta> {
         let mut action_iter = engine
             .json_handler()
             .read_json_files(
-                &[self.location.clone()],
+                slice::from_ref(&self.location),
                 InCommitTimestampVisitor::schema(),
                 None,
             )
