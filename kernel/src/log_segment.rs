@@ -77,17 +77,6 @@ impl LogSegment {
             checkpoint_file.version
         });
 
-        // TODO: consider unifying this with debug_asserts in the ListedLogFiles::new(); issue#995
-        // We require that commits that are contiguous. In other words, there must be no gap between commit versions.
-        require!(
-            ascending_commit_files
-                .windows(2)
-                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
-            Error::generic(format!(
-                "Expected ordered contiguous commit files {ascending_commit_files:?}"
-            ))
-        );
-
         // There must be no gap between a checkpoint and the first commit version. Note that
         // that all checkpoint parts share the same version.
         if let (Some(checkpoint_version), Some(commit_file)) =
@@ -186,7 +175,7 @@ impl LogSegment {
 
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
-        // - [`LogSegment::try_new`] also checks that there are no gaps between commits.
+        // - [`ListedLogFiles::try_new`] also checks that there are no gaps between commits.
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
             ascending_commit_files
@@ -196,12 +185,12 @@ impl LogSegment {
                 "Expected the first commit to have version {start_version}"
             ))
         );
-        let listed_files = ListedLogFiles::new(
+        let listed_files = ListedLogFiles::try_new(
             ascending_commit_files,
             vec![],
             vec![],
             None, // TODO: use CRC files for table changes?
-        );
+        )?;
         LogSegment::try_new(listed_files, log_root, end_version)
     }
 
@@ -250,12 +239,7 @@ impl LogSegment {
             contiguous_commits.push(commit);
         }
 
-        let listed_files = ListedLogFiles {
-            ascending_commit_files: contiguous_commits,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None,
-        };
+        let listed_files = ListedLogFiles::try_new(contiguous_commits, vec![], vec![], None)?;
 
         LogSegment::try_new(listed_files, log_root, Some(end_version))
     }
@@ -603,13 +587,24 @@ pub(crate) struct ListedLogFiles {
 }
 
 impl ListedLogFiles {
+    // TODO: enforce the usage of this construct to enforce the assertion (issue#1143)
     #[internal_api]
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         ascending_commit_files: Vec<ParsedLogPath>,
         ascending_compaction_files: Vec<ParsedLogPath>,
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
-    ) -> Self {
+    ) -> DeltaResult<Self> {
+        // Ensure commit file versions are contiguous
+        require!(
+            ascending_commit_files
+                .windows(2)
+                .all(|cfs| cfs[0].version + 1 == cfs[1].version),
+            Error::generic(format!(
+                "Expected ordered contiguous commit files {ascending_commit_files:?}"
+            ))
+        );
+
         // We are adding debug_assertions here since we want to validate invariants that are (relatively) expensive to compute
         #[cfg(debug_assertions)]
         {
@@ -644,12 +639,12 @@ impl ListedLogFiles {
             }
         }
 
-        ListedLogFiles {
+        Ok(ListedLogFiles {
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
-        }
+        })
     }
 }
 
@@ -719,13 +714,13 @@ pub(crate) fn list_log_files_with_version(
             }
         }
 
-        ListedLogFiles::new(
+        ListedLogFiles::try_new(
             ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
         )
-    })
+    })?
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
