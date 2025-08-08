@@ -27,7 +27,7 @@ async fn test_read_last_checkpoint() {
     let store = Arc::new(LocalFileSystem::new());
     let prefix = Path::from_url_path(url.path()).unwrap();
     let storage = ObjectStoreStorageHandler::new(store, prefix);
-    let cp = read_last_checkpoint(&storage, &url).await.unwrap().unwrap();
+    let cp = LastCheckpointHint::read(&storage, &url).await.unwrap().unwrap();
     assert_eq!(cp.version, 2);
 }
 

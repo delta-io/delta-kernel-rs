@@ -36,28 +36,30 @@ pub(crate) struct LastCheckpointHint {
     pub(crate) checksum: Option<String>,
 }
 
-/// Try reading the `_last_checkpoint` file.
-///
-/// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without failing
-/// the read. Thus, the semantics of this function are to return `None` if the file is not found or
-/// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
-/// cause failure.
-// TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-level
-// result coming from storage.read_files
-pub(crate) fn read_last_checkpoint(
-    storage: &dyn StorageHandler,
-    log_root: &Url,
-) -> DeltaResult<Option<LastCheckpointHint>> {
-    let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
-    match storage.read_files(vec![(file_path, None)])?.next() {
-        Some(Ok(data)) => Ok(serde_json::from_slice(&data)
-            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-            .ok()),
-        Some(Err(Error::FileNotFound(_))) => Ok(None),
-        Some(Err(err)) => Err(err),
-        None => {
-            warn!("empty _last_checkpoint file");
-            Ok(None)
+impl LastCheckpointHint {
+    /// Try reading the `_last_checkpoint` file.
+    ///
+    /// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without
+    /// failing the read. Thus, the semantics of this function are to return `None` if the file is
+    /// not found or is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and
+    /// are assumed to cause failure.
+    // TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-
+    // level result coming from storage.read_files
+    pub(crate) fn read(
+        storage: &dyn StorageHandler,
+        log_root: &Url,
+    ) -> DeltaResult<Option<LastCheckpointHint>> {
+        let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
+        match storage.read_files(vec![(file_path, None)])?.next() {
+            Some(Ok(data)) => Ok(serde_json::from_slice(&data)
+                .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
+                .ok()),
+            Some(Err(Error::FileNotFound(_))) => Ok(None),
+            Some(Err(err)) => Err(err),
+            None => {
+                warn!("empty _last_checkpoint file");
+                Ok(None)
+            }
         }
     }
 }

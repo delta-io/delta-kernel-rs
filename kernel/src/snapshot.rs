@@ -7,7 +7,7 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
-use crate::last_checkpoint_hint::read_last_checkpoint;
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
@@ -93,7 +93,7 @@ impl Snapshot {
         let storage = engine.storage_handler();
         let log_root = table_root.join("_delta_log/")?;
 
-        let checkpoint_hint = read_last_checkpoint(storage.as_ref(), &log_root)?;
+        let checkpoint_hint = LastCheckpointHint::read(storage.as_ref(), &log_root)?;
 
         let log_segment =
             LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_hint, version)?;
@@ -786,7 +786,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
-        let cp = read_last_checkpoint(&storage, &url).unwrap();
+        let cp = LastCheckpointHint::read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -815,7 +815,7 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -846,9 +846,9 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let valid = LastCheckpointHint::read(&storage, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::read(&storage, &url).expect("read last checkpoint");
         let expected = LastCheckpointHint {
             version: 1,
             size: 8,
