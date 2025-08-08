@@ -92,6 +92,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+pub mod row_tracking;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;

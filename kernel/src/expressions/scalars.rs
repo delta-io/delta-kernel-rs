@@ -497,6 +497,12 @@ impl From<i64> for Scalar {
     }
 }
 
+impl From<u64> for Scalar {
+    fn from(i: u64) -> Self {
+        Self::Long(i as i64)
+    }
+}
+
 impl From<f32> for Scalar {
     fn from(i: f32) -> Self {
         Self::Float(i)

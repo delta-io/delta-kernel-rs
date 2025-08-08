@@ -256,7 +256,7 @@ pub trait RowVisitor {
 /// }
 ///
 /// impl EngineData for MyDataType {
-///   fn visit_rows(&self, leaf_columns: &[ColumnName], visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+///   fn visit_rows(&self, column_names: &[ColumnName], visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
 ///     let getters = self.do_extraction(); // do the extraction
 ///     visitor.visit(self.len(), &getters); // call the visitor back with the getters
 ///     Ok(())

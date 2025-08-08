@@ -342,6 +342,40 @@ impl TableConfiguration {
             )),
         }
     }
+
+    /// Returns `true` if the table supports writing domain metadata.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7.
+    /// - Have the [`WriterFeature::DomainMetadata`] writer feature.
+    #[allow(unused)]
+    pub(crate) fn is_domain_metadata_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::DomainMetadata)
+    }
+
+    /// Returns `true` if the table supports writing row tracking metadata.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7.
+    /// - Have the [`WriterFeature::RowTracking`] writer feature.
+    #[allow(unused)]
+    pub(crate) fn is_row_tracking_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::RowTracking)
+    }
+
+    /// Returns `true` if row tracking is enabled for this table. Row tracking is enabled
+    /// when the `delta.enableRowTracking` table property is set to `true`.
+    #[allow(unused)]
+    pub(crate) fn is_row_tracking_enabled(&self) -> bool {
+        self.is_row_tracking_supported()
+            && self.table_properties().enable_row_tracking.unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
