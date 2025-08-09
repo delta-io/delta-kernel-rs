@@ -3,17 +3,30 @@ use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
-use crate::actions::{CommitInfo, SetTransaction};
+use crate::actions::{
+    get_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
+    get_log_txn_schema,
+};
+use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::error::Error;
 use crate::path::ParsedLogPath;
-use crate::schema::{MapType, SchemaRef, StructField, StructType};
+use crate::row_tracking::{
+    RowTrackingDomainConfiguration, RowTrackingVisitor, ROW_TRACKING_DOMAIN,
+};
+use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, Version};
+use crate::{DeltaResult, Engine, EngineData, Expression, IntoEngineData, RowVisitor, Version};
 
 use url::Url;
 
-pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+/// This function specifies the schema for the add_files metadata (and soon remove_files metadata)
+/// **as they are provided by the Parquet handler**. Concretely, it is the expected schema for engine data passed to [`add_files`].
+/// Each row represents metadata about a file to be added to the table.
+/// Kernel-rs takes this information and extends it to the full add_file metadata schema, adding
+/// additional fields (e.g., baseRowID) as necessary.
+///
+/// [`add_files`]: crate::transaction::Transaction::add_files
+pub(crate) static PARQUET_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null(
@@ -23,17 +36,12 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::not_null("size", DataType::LONG),
         StructField::not_null("modificationTime", DataType::LONG),
         StructField::not_null("dataChange", DataType::BOOLEAN),
+        StructField::nullable("stats", DataType::STRING),
     ]))
 });
 
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
-/// Concretely, it is the expected schema for engine data passed to [`add_files`].
-///
-/// Each row represents metadata about a file to be added to the table.
-///
-/// [`add_files`]: crate::transaction::Transaction::add_files
-pub fn add_files_schema() -> &'static SchemaRef {
-    &ADD_FILES_SCHEMA
+pub(crate) fn parquet_add_file_schema() -> &'static SchemaRef {
+    &PARQUET_ADD_FILE_SCHEMA
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -111,7 +119,7 @@ impl Transaction {
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
     /// will include the failed transaction in case of a conflict so the user can retry.
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
-        // step 0: if there are txn(app_id, version) actions being committed, ensure that every
+        // Step 0: if there are txn(app_id, version) actions being committed, ensure that every
         // `app_id` is unique and create a row of `EngineData` for it.
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
         // in the HashSet?
@@ -132,28 +140,86 @@ impl Transaction {
             .into_iter()
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
-        // step one: construct the iterator of commit info + file actions we want to commit
+        // Step 1: construct commit info and initialize the action iterator
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
         );
+        let commit_info_action =
+            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        let commit_info_schema = get_log_commit_info_schema().clone();
+        let actions = iter::once(commit_info_action).chain(set_transaction_actions);
 
-        let commit_info_action = commit_info.into_engine_data(commit_info_schema, engine);
-        let add_actions = generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
-
-        let actions = iter::once(commit_info_action)
-            .chain(add_actions)
-            .chain(set_transaction_actions);
-
-        // step two: set new commit version (current_version + 1) and path to write
+        // Step 2: set new commit version (current_version + 1) and path to write
         let commit_version = self.read_snapshot.version() + 1;
         let commit_path =
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
 
-        // step three: commit the actions as a json file in the log
+        // Step 3: add row tracking metadata if row tracking is supported
+        // Step 4: construct the file actions we want to commit
+        let actions = if self
+            .read_snapshot
+            .table_configuration()
+            .is_row_tracking_supported()
+        {
+            // Read the current rowIdHighWaterMark from the snapshot
+            // Note that there might be no row tracking domain metadata in the snapshot if the table hasn't been written to before
+            let row_tracking_domain: RowTrackingDomainConfiguration = match self
+                .read_snapshot
+                .get_domain_metadata(ROW_TRACKING_DOMAIN, engine)?
+            {
+                Some(domain_metadata) => serde_json::from_str(&domain_metadata)?,
+                None => RowTrackingDomainConfiguration {
+                    row_id_high_water_mark: None,
+                },
+            };
+
+            let mut row_tracking_visitor = RowTrackingVisitor::new(
+                row_tracking_domain.row_id_high_water_mark,
+                commit_version as i64,
+            );
+
+            self.add_files_metadata
+                .iter()
+                .try_for_each(|add_files_batch| {
+                    row_tracking_visitor.visit_rows_of(add_files_batch.as_ref())
+                })?;
+
+            let add_actions: Vec<_> = row_tracking_visitor
+                .adds
+                .iter()
+                .map(|add| {
+                    add.clone()
+                        // NOTE: This creates single-row EngineData - can we make this more efficient?
+                        .into_engine_data(get_log_add_schema().clone(), engine)
+                })
+                .collect();
+
+            // Generate a domain metadata action based on the new rowIdHighWaterMark and append it to the actions
+            let domain_metadata = DomainMetadata::new(
+                ROW_TRACKING_DOMAIN.to_string(),
+                serde_json::to_string(&RowTrackingDomainConfiguration {
+                    row_id_high_water_mark: row_tracking_visitor.row_id_high_water_mark,
+                })?,
+                false,
+            );
+            let domain_metadata_action =
+                domain_metadata.into_engine_data(get_log_domain_metadata_schema().clone(), engine);
+
+            Box::new(
+                actions
+                    .chain(add_actions)
+                    .chain(iter::once(domain_metadata_action)),
+            ) as Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>
+        } else {
+            let add_actions =
+                self.generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
+
+            Box::new(actions.chain(add_actions))
+                as Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>
+        };
+        // Step 5: commit the actions as a json file in the log
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
             Ok(()) => Ok(CommitResult::Committed {
@@ -230,35 +296,35 @@ impl Transaction {
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
     ///
-    /// The expected schema for `add_metadata` is given by [`add_files_schema`].
-    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
-        self.add_files_metadata.push(add_metadata);
+    /// The expected schema for `add_files` is given by [`parquet_add_file_schema`].
+    pub fn add_files(&mut self, add_files: Box<dyn EngineData>) {
+        self.add_files_metadata.push(add_files);
     }
-}
 
-// convert add_files_metadata into add actions using an expression to transform the data in a single
-// pass
-fn generate_adds<'a>(
-    engine: &dyn Engine,
-    add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
-) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
-    let evaluation_handler = engine.evaluation_handler();
-    let add_files_schema = add_files_schema();
-    let log_schema = get_log_add_schema();
+    // convert add_files_metadata into add actions using an expression to transform the data in a single
+    // pass
+    fn generate_adds<'a>(
+        &'a self,
+        engine: &dyn Engine,
+        add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
+    ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
+        let evaluation_handler = engine.evaluation_handler();
+        let log_schema = get_log_add_schema();
 
-    add_files_metadata.map(move |add_files_batch| {
-        let adds_expr = Expression::struct_from([Expression::struct_from(
-            add_files_schema
-                .fields()
-                .map(|f| Expression::column([f.name()])),
-        )]);
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            add_files_schema.clone(),
-            adds_expr,
-            log_schema.clone().into(),
-        );
-        adds_evaluator.evaluate(add_files_batch)
-    })
+        add_files_metadata.map(move |add_files_batch| {
+            let adds_expr = Expression::struct_from([Expression::struct_from(
+                parquet_add_file_schema()
+                    .fields()
+                    .map(|f| Expression::column([f.name()])),
+            )]);
+            let adds_evaluator = evaluation_handler.new_expression_evaluator(
+                parquet_add_file_schema().clone(),
+                adds_expr,
+                log_schema.clone().into(),
+            );
+            adds_evaluator.evaluate(add_files_batch)
+        })
+    }
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -267,15 +333,17 @@ fn generate_adds<'a>(
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    schema: SchemaRef,
+    snapshot_schema: SchemaRef,
+    parquet_add_file_schema: SchemaRef,
     logical_to_physical: Expression,
 }
 
 impl WriteContext {
-    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: Expression) -> Self {
+    fn new(target_dir: Url, snapshot_schema: SchemaRef, logical_to_physical: Expression) -> Self {
         WriteContext {
             target_dir,
-            schema,
+            snapshot_schema,
+            parquet_add_file_schema: PARQUET_ADD_FILE_SCHEMA.clone(),
             logical_to_physical,
         }
     }
@@ -284,8 +352,16 @@ impl WriteContext {
         &self.target_dir
     }
 
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
+    /// Get the logical schema of the read snapshot that this transaction is based on.
+    pub fn snapshot_schema(&self) -> &SchemaRef {
+        &self.snapshot_schema
+    }
+
+    /// Get the expected schema for engine data passed to [`add_files`].
+    ///
+    /// [`add_files`]: crate::transaction::Transaction::add_files
+    pub fn parquet_add_file_schema(&self) -> &SchemaRef {
+        &self.parquet_add_file_schema
     }
 
     pub fn logical_to_physical(&self) -> &Expression {
@@ -327,13 +403,22 @@ pub enum CommitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
+    use std::path::PathBuf;
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
-    fn test_add_files_schema() {
-        let schema = add_files_schema();
+    fn test_parquet_add_file_schema() -> DeltaResult<()> {
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/"))?;
+        let url = Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::try_new(url, &engine, None)?;
+        let txn = Transaction::try_new(snapshot)?;
+        let ctx = txn.get_write_context();
+        let schema = ctx.parquet_add_file_schema();
+
         let expected = StructType::new(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
@@ -343,7 +428,29 @@ mod tests {
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
             StructField::not_null("dataChange", DataType::BOOLEAN),
+            StructField::nullable("stats", DataType::STRING),
+            // StructField::nullable(
+            //     "tags",
+            //     MapType::new(DataType::STRING, DataType::STRING, false),
+            // ),
+            // StructField::nullable(
+            //     "deletionVector",
+            //     StructType::new(vec![
+            //         StructField::not_null("storageType", DataType::STRING),
+            //         StructField::not_null("pathOrInlineDv", DataType::STRING),
+            //         StructField::nullable("offset", DataType::INTEGER),
+            //         StructField::not_null("sizeInBytes", DataType::INTEGER),
+            //         StructField::not_null("cardinality", DataType::LONG),
+            //         // TODO: Should derived fields be present here?
+            //         // StructField::not_null("uniqueID", DataType::STRING),
+            //         // StructField::not_null("abslutePath", DataType::STRING),
+            //     ]),
+            // ),
+            // StructField::nullable("baseRowId", DataType::LONG),
+            // StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+            // StructField::nullable("clusteringProvider", DataType::STRING),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
     }
 }

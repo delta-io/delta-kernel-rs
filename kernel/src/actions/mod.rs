@@ -34,6 +34,7 @@ const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
 pub mod set_transaction;
+pub mod stats;
 
 pub(crate) mod crc;
 pub(crate) mod domain_metadata;
@@ -740,6 +741,60 @@ impl Add {
     }
 }
 
+impl IntoEngineData for Add {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let partition_values = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.partition_values,
+        )
+        .map(Scalar::Map)?;
+
+        let tags = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.tags.unwrap_or_default(),
+        )
+        .map(Scalar::Map)?;
+
+        let (storage_type, path_or_inline_dv, offset, size_in_bytes, cardinality) =
+            if let Some(dv) = self.deletion_vector {
+                (
+                    Some(dv.storage_type),
+                    Some(dv.path_or_inline_dv),
+                    dv.offset,
+                    Some(dv.size_in_bytes),
+                    Some(dv.cardinality),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
+        let values = [
+            Scalar::from(self.path),
+            partition_values,
+            Scalar::from(self.size),
+            Scalar::from(self.modification_time),
+            Scalar::from(self.data_change),
+            Scalar::from(self.stats),
+            tags,
+            Scalar::from(storage_type),
+            Scalar::from(path_or_inline_dv),
+            Scalar::from(offset),
+            Scalar::from(size_in_bytes),
+            Scalar::from(cardinality),
+            Scalar::from(self.base_row_id),
+            Scalar::from(self.default_row_commit_version),
+            Scalar::from(self.clustering_provider),
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
@@ -927,11 +982,36 @@ pub(crate) struct DomainMetadata {
 }
 
 impl DomainMetadata {
+    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
+        Self {
+            domain,
+            configuration,
+            removed,
+        }
+    }
+
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
     fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
+}
+
+impl IntoEngineData for DomainMetadata {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let domain = Scalar::from(self.domain);
+        let configuration = Scalar::from(self.configuration);
+        let removed = Scalar::from(self.removed);
+
+        let values = [domain, configuration, removed];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
     }
 }
 
@@ -950,7 +1030,6 @@ mod tests {
         engine::arrow_data::ArrowEngineData,
         engine::arrow_expression::ArrowEvaluationHandler,
         schema::{ArrayType, DataType, MapType, StructField},
-        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
@@ -1325,22 +1404,11 @@ mod tests {
                 WriterFeature::AppendOnly,
                 WriterFeature::DeletionVectors,
                 WriterFeature::Invariants,
+                WriterFeature::RowTracking,
             ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([ReaderFeature::DeletionVectors]),
-            Some([WriterFeature::RowTracking]),
-        )
-        .unwrap();
-        assert_result_error_with_message(
-            protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "rowTracking". Supported WriterFeatures: "appendOnly", "deletionVectors", "invariants", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
-        );
     }
 
     #[test]
