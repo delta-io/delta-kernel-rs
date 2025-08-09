@@ -812,4 +812,59 @@ mod tests {
 
         Ok(())
     }
+
+    use crate::engine::default::DefaultEngine;
+    use crate::schema::StructType;
+    use crate::Engine;
+    use std::io::Write;
+    use std::time::Duration;
+    use tempfile::NamedTempFile;
+    use tokio::runtime::Builder;
+
+    #[test]
+    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
+        let path = temp_file.path();
+        let file_url = Url::from_file_path(path).expect("Failed to create file URL");
+
+        println!("Created temporary malformed file at: {file_url}");
+
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(runtime.handle().clone()));
+        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()), executor);
+
+        let file_vec = vec![FileMeta::new(file_url, 1, 1)];
+
+        let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
+        let struct_type = StructType::new(vec![field]);
+        let physical_schema = Arc::new(struct_type);
+
+        println!("\nAttempting to read malformed JSON file...");
+        let mut iter =
+            default_engine
+                .json_handler()
+                .read_json_files(&file_vec, physical_schema, None)?;
+
+        let read_result = iter.next().unwrap();
+
+        if read_result.is_ok() {
+            panic!("Read succeeded unexpectedly. The JSON should have been invalid.");
+        }
+
+        // The Tokio runtime will use the entire duration to
+        // shutdown!
+        //
+        // note that a non-existent file does not cause any hanging
+        // here, which is interesting
+        println!("\nAttempting to shut down runtime...");
+        runtime.shutdown_timeout(Duration::from_secs(10));
+        println!("Runtime shutdown complete.");
+
+        Ok(())
+    }
 }
