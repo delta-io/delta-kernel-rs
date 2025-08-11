@@ -11,10 +11,10 @@ use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
 use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
+use object_store::{local::LocalFileSystem, ObjectStore};
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;

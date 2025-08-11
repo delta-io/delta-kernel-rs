@@ -139,10 +139,10 @@ mod tests {
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::ObjectStore;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;

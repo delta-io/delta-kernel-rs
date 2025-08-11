@@ -161,9 +161,9 @@ pub(crate) mod test_utils {
     use crate::Engine;
     use crate::EngineData;
 
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::ObjectStore;
     use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
+    use object_store::ObjectStore;
     use serde::Serialize;
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;

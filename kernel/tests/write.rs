@@ -17,9 +17,9 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore;
 use delta_kernel::transaction::CommitResult;
+use object_store::path::Path;
+use object_store::ObjectStore;
 
 use test_utils::set_json_value;
 
