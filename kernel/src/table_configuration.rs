@@ -50,8 +50,8 @@ impl TableConfiguration {
     /// This validates that the [`Metadata`] and [`Protocol`] are compatible with one another
     /// and that the kernel supports reading from this table.
     ///
-    /// Note: This only returns successfully kernel supports reading the table. It's important
-    /// to do this validation is done in `try_new` because all table accesses must first construct
+    /// Note: This only returns successfully if kernel supports reading the table. It's important
+    /// to do this validation in `try_new` because all table accesses must first construct
     /// the [`TableConfiguration`]. This ensures that developers never forget to check that kernel
     /// supports reading the table, and that all table accesses are legal.
     ///
@@ -353,6 +353,7 @@ mod test {
     use crate::actions::{Metadata, Protocol};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::table_properties::TableProperties;
+    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
 
     use super::TableConfiguration;
@@ -615,11 +616,7 @@ mod test {
             table_root.clone(),
             0,
         );
-        assert!(
-            result.is_err(),
-            "Should fail when TIMESTAMP_NTZ is used without required features"
-        );
-        assert!(result.unwrap_err().to_string().contains("timestampNtz"));
+        assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
 
         let result = TableConfiguration::try_new(
             metadata,
@@ -666,11 +663,7 @@ mod test {
             table_root.clone(),
             0,
         );
-        assert!(
-            result.is_err(),
-            "Should fail when VARIANT is used without required features"
-        );
-        assert!(result.unwrap_err().to_string().contains("variantType"));
+        assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
 
         let result =
             TableConfiguration::try_new(metadata, protocol_with_variant_features, table_root, 0);

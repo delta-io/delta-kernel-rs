@@ -396,6 +396,7 @@ impl FileOpener for PresignedUrlOpener {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::slice;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::arrow::array::{Array, RecordBatch};
@@ -408,6 +409,8 @@ mod tests {
     use crate::EngineData;
 
     use itertools::Itertools;
+
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
 
@@ -572,7 +575,7 @@ mod tests {
 
         let data: Vec<RecordBatch> = parquet_handler
             .read_parquet_files(
-                &[parquet_file.clone()],
+                slice::from_ref(parquet_file),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
             )
@@ -599,9 +602,11 @@ mod tests {
             .unwrap(),
         ));
 
-        assert!(parquet_handler
-            .write_parquet(&Url::parse("memory:///data").unwrap(), data)
-            .await
-            .is_err());
+        assert_result_error_with_message(
+            parquet_handler
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data)
+                .await,
+            "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
+        );
     }
 }
