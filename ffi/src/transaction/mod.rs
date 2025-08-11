@@ -210,6 +210,7 @@ mod tests {
             Field::new("size", ArrowDataType::Int64, false),
             Field::new("modificationTime", ArrowDataType::Int64, false),
             Field::new("dataChange", ArrowDataType::Boolean, false),
+            Field::new("stats", ArrowDataType::Utf8, true),
         ]);
 
         let current_time: i64 = std::time::SystemTime::now()
@@ -218,7 +219,7 @@ mod tests {
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": "{{\"numRecords\":{num_rows}}}"}}"#,
         );
 
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
@@ -366,7 +367,8 @@ mod tests {
                         "partitionValues": {},
                         "size": 0,
                         "modificationTime": 0,
-                        "dataChange": true
+                        "dataChange": true,
+                        "stats": "{\"numRecords\":5}"
                     }
                 }),
             ];

@@ -305,7 +305,8 @@ impl Snapshot {
         self.table_configuration().version()
     }
 
-    /// Table [`type@Schema`] at this `Snapshot`s version.
+    /// Table [`type@Schema`] at this `Snapshot`s version. Note that this is the _logical_ schema
+    /// which may differ from the physical schema of the data files in storage.
     pub fn schema(&self) -> SchemaRef {
         self.table_configuration.schema()
     }

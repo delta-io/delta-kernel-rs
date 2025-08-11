@@ -94,7 +94,7 @@ fn sort_record_batch(batch: RecordBatch) -> DeltaResult<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-// Ensure that two sets of  fields have the same names, and dict_is_ordered
+// Ensure that two sets of fields have the same names, and dict_is_ordered
 // We ignore:
 //  - data type: This is checked already in `assert_columns_match`
 //  - nullability: parquet marks many things as nullable that we don't in our schema
