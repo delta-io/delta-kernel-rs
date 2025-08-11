@@ -301,7 +301,9 @@ impl Snapshot {
         self.table_configuration().version()
     }
 
-    /// Table [`type@Schema`] at this `Snapshot`s version.
+    /// Table [`Schema`] at this `Snapshot`s version.
+    ///
+    /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {
         self.table_configuration.schema()
     }

@@ -77,7 +77,7 @@
 //! in the future, we can revisit this decision.
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
-//! [`LastCheckpointHint`]: crate::snapshot::LastCheckpointHint
+//! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
