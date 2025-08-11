@@ -236,7 +236,7 @@ impl LogSegment {
         let commits = &mut listed_commits.ascending_commit_files;
         if !commits.is_empty() {
             let mut start_idx = commits.len() - 1;
-            while start_idx > 0 && commits[start_idx].version - commits[start_idx - 1].version == 1
+            while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
             {
                 start_idx -= 1;
             }
