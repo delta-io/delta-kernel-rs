@@ -7,26 +7,21 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
-use crate::schema::{Schema, SchemaRef};
+use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::{calculate_transaction_expiration_timestamp, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
+use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
 
-use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 use url::Url;
-
-/// Name of the _last_checkpoint file that provides metadata about the last checkpoint
-/// created for the table. This file is used as a hint for the engine to quickly locate
-/// the latest checkpoint without a full directory listing.
-pub(crate) const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
@@ -98,7 +93,7 @@ impl Snapshot {
         let storage = engine.storage_handler();
         let log_root = table_root.join("_delta_log/")?;
 
-        let checkpoint_hint = read_last_checkpoint(storage.as_ref(), &log_root)?;
+        let checkpoint_hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root)?;
 
         let log_segment =
             LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_hint, version)?;
@@ -306,7 +301,9 @@ impl Snapshot {
         self.table_configuration().version()
     }
 
-    /// Table [`type@Schema`] at this `Snapshot`s version.
+    /// Table [`Schema`] at this `Snapshot`s version.
+    ///
+    /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {
         self.table_configuration.schema()
     }
@@ -396,54 +393,6 @@ impl Snapshot {
     }
 }
 
-// Note: Schema can not be derived because the checkpoint schema is only known at runtime.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[internal_api]
-pub(crate) struct LastCheckpointHint {
-    /// The version of the table when the last checkpoint was made.
-    #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)
-    pub version: Version,
-    /// The number of actions that are stored in the checkpoint.
-    pub(crate) size: i64,
-    /// The number of fragments if the last checkpoint was written in multiple parts.
-    pub(crate) parts: Option<usize>,
-    /// The number of bytes of the checkpoint.
-    pub(crate) size_in_bytes: Option<i64>,
-    /// The number of AddFile actions in the checkpoint.
-    pub(crate) num_of_add_files: Option<i64>,
-    /// The schema of the checkpoint file.
-    pub(crate) checkpoint_schema: Option<Schema>,
-    /// The checksum of the last checkpoint JSON.
-    pub(crate) checksum: Option<String>,
-}
-
-/// Try reading the `_last_checkpoint` file.
-///
-/// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without failing
-/// the read. Thus, the semantics of this function are to return `None` if the file is not found or
-/// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
-/// cause failure.
-// TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-level
-// result coming from storage.read_files
-fn read_last_checkpoint(
-    storage: &dyn StorageHandler,
-    log_root: &Url,
-) -> DeltaResult<Option<LastCheckpointHint>> {
-    let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
-    match storage.read_files(vec![(file_path, None)])?.next() {
-        Some(Ok(data)) => Ok(serde_json::from_slice(&data)
-            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-            .ok()),
-        Some(Err(Error::FileNotFound(_))) => Ok(None),
-        Some(Err(err)) => Err(err),
-        None => {
-            warn!("empty _last_checkpoint file");
-            Ok(None)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +415,7 @@ mod tests {
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
+    use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::path::ParsedLogPath;
     use crate::utils::test_utils::string_array_to_engine_data;
     use test_utils::{add_commit, delta_path_for_version};
@@ -838,7 +788,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
-        let cp = read_last_checkpoint(&storage, &url).unwrap();
+        let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -867,7 +817,7 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -898,9 +848,9 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let valid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         let expected = LastCheckpointHint {
             version: 1,
             size: 8,

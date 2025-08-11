@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 use std::convert::identity;
 
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::snapshot::LastCheckpointHint;
 use crate::{DeltaResult, Error, StorageHandler, Version};
 
 use delta_kernel_derive::internal_api;
