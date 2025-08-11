@@ -14,7 +14,6 @@ use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatc
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
-use object_store::{local::LocalFileSystem, ObjectStore};
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -23,6 +22,7 @@ use delta_kernel::{DeltaResult, Snapshot};
 
 use futures::{stream::TryStreamExt, StreamExt};
 use itertools::Itertools;
+use object_store::{local::LocalFileSystem, ObjectStore};
 use paste::paste;
 use url::Url;
 

@@ -9,13 +9,13 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, Snapshot};
-use object_store::{memory::InMemory, path::Path, ObjectStore};
 
 use arrow_56::{
     array::{create_array, RecordBatch},
     datatypes::Field,
 };
 
+use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;

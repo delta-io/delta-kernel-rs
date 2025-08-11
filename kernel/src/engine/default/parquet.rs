@@ -388,8 +388,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::arrow::array::{Array, RecordBatch};
-    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
-    use url::Url;
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -397,6 +395,8 @@ mod tests {
     use crate::EngineData;
 
     use itertools::Itertools;
+    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use url::Url;
 
     use crate::utils::test_utils::assert_result_error_with_message;
 
