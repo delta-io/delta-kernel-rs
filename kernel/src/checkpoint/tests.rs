@@ -11,7 +11,7 @@ use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, Snapshot};
 
-use arrow_55::{
+use arrow_56::{
     array::{create_array, RecordBatch},
     datatypes::Field,
 };
