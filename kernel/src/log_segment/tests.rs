@@ -1367,7 +1367,7 @@ fn test_list_log_files_with_version() -> DeltaResult<()> {
         ],
         None,
     );
-    let result = list_log_files_with_version(storage.as_ref(), &log_root, Some(0), None)?;
+    let result = ListedLogFiles::list(storage.as_ref(), &log_root, Some(0), None)?;
     let latest_crc = result.latest_crc_file.unwrap();
     assert_eq!(
         latest_crc.location.location.path(),
@@ -2008,7 +2008,7 @@ fn for_timestamp_conversion_no_commit_files() {
 }
 
 #[test]
-fn test_listed_log_files_contiguous_commit_files() {
+fn test_log_segment_contiguous_commit_files() {
     let res = ListedLogFiles::try_new(
         vec![
             create_log_path("file:///00000000000000000001.json"),
@@ -2021,7 +2021,8 @@ fn test_listed_log_files_contiguous_commit_files() {
     );
     assert!(res.is_ok());
 
-    let res = ListedLogFiles::try_new(
+    // allow gaps in ListedLogFiles
+    let listed = ListedLogFiles::try_new(
         vec![
             create_log_path("file:///00000000000000000001.json"),
             create_log_path("file:///00000000000000000003.json"),
@@ -2031,8 +2032,10 @@ fn test_listed_log_files_contiguous_commit_files() {
         None,
     );
 
+    // disallow gaps in LogSegment
+    let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
     assert_result_error_with_message(
-        res,
+        log_segment,
         "Generic delta kernel error: Expected ordered \
         contiguous commit files [ParsedLogPath { location: FileMeta { location: Url { scheme: \
         \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \

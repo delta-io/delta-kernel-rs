@@ -7,7 +7,8 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
-use crate::log_segment::{self, ListedLogFiles, LogSegment};
+use crate::listed_log_files::ListedLogFiles;
+use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::{Schema, SchemaRef};
 use crate::table_configuration::TableConfiguration;
@@ -154,7 +155,7 @@ impl Snapshot {
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
-        let new_listed_files = log_segment::list_log_files_with_version(
+        let new_listed_files = ListedLogFiles::list(
             storage.as_ref(),
             &log_root,
             Some(listing_start),
