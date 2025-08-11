@@ -91,6 +91,7 @@ use crate::actions::{
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
 use crate::log_replay::LogReplayProcessor;
+use crate::log_segment::{Phase1LogReplay};
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::{Snapshot, LAST_CHECKPOINT_FILE_NAME};
@@ -239,6 +240,27 @@ impl CheckpointWriter {
         )
         .map(|parsed| parsed.location)
     }
+
+    /// Returns checkpoint data for phase 1 replay. This includes log files and the content of a
+    /// single-part checkpoint (V1 or V2). Multi-part checkpoints and any v2 checkpoint sidecars
+    /// will be processed in phase 2.
+    #[cfg(test)]
+    pub(crate) fn phase1_checkpoint_data(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Phase1LogReplay<CheckpointLogReplayProcessor>> {
+        self.snapshot.log_segment().start_phase1_replay(
+            engine,
+            CheckpointLogReplayProcessor::new(
+                self.deleted_file_retention_timestamp()?,
+                self.get_transaction_expiration_timestamp()?,
+            ),
+            CHECKPOINT_ACTIONS_SCHEMA.clone(),
+            CHECKPOINT_ACTIONS_SCHEMA.clone(),
+            None,
+        )
+    }
+
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
     /// This method reads the actions from the log segment and processes them

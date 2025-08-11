@@ -705,6 +705,7 @@ pub(crate) struct Add {
 
     /// Map containing metadata about this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    #[allow_null_container_values]
     pub tags: Option<HashMap<String, String>>,
 
     /// Information about deletion vector (DV) associated with this add action

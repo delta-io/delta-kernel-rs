@@ -10,7 +10,7 @@ use crate::actions::{
     get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
-use crate::log_replay::ActionsBatch;
+use crate::log_replay::{ActionsBatch, LogReplayProcessor};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
 use crate::snapshot::LastCheckpointHint;
@@ -264,21 +264,68 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
-        let commits_and_compactions = self.find_commit_cover();
-        let commit_stream = engine
-            .json_handler()
-            .read_json_files(
-                &commits_and_compactions,
+        let commit_actions =
+            self.read_commit_actions(engine, commit_read_schema, meta_predicate.clone())?;
+        let checkpoint_actions =
+            self.read_checkpoint_actions(engine, checkpoint_read_schema, meta_predicate)?;
+
+        Ok(commit_actions.chain(checkpoint_actions))
+    }
+
+    /// Returns an iterator over the top-level (phase 1) actions. This includes all actions from
+    /// commit .json files (in reverse chronological order) as well as all actions from the
+    /// checkpoint manifest. Multi-part checkpoints and v2 checkpoint sidecars are processed
+    /// separately, during phase 2.
+    #[internal_api]
+    pub(crate) fn read_phase1_actions(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let commit_actions =
+            self.read_commit_actions(engine, commit_read_schema, meta_predicate.clone())?;
+        let (checkpoint_actions, _) =
+            self.read_phase1_checkpoint_actions(engine, checkpoint_read_schema, meta_predicate)?;
+
+        Ok(commit_actions.chain(checkpoint_actions))
+    }
+
+    #[internal_api]
+    pub(crate) fn start_phase1_replay<P: LogReplayProcessor>(
+        &self,
+        engine: &dyn Engine,
+        processor: P,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Phase1LogReplay<P>> {
+        let sidecars = if self.checkpoint_parts.len() > 1 {
+            self.checkpoint_parts
+                .iter()
+                .map(|f| f.location.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (checkpoint_actions, need_file_actions) = self.read_phase1_checkpoint_actions(
+            engine,
+            checkpoint_read_schema,
+            meta_predicate.clone(),
+        )?;
+        Ok(Phase1LogReplay {
+            processor,
+            commit_actions: Box::new(self.read_commit_actions(
+                engine,
                 commit_read_schema,
-                meta_predicate.clone(),
-            )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
-
-        let checkpoint_stream =
-            self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
-
-        Ok(commit_stream.chain(checkpoint_stream))
+                meta_predicate,
+            )?),
+            checkpoint_actions: Box::new(checkpoint_actions),
+            sidecars,
+            log_root: self.log_root.clone(),
+            need_file_actions,
+        })
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -324,6 +371,88 @@ impl LogSegment {
         selected_files
     }
 
+    /// Returns an iterator over commit log files.
+    pub(crate) fn read_commit_actions(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        // `replay` expects commit files to be sorted in descending order, so the return value here is correct
+        let commits_and_compactions = self.find_commit_cover();
+        let commit_stream = engine
+            .json_handler()
+            .read_json_files(
+                &commits_and_compactions,
+                commit_read_schema,
+                meta_predicate.clone(),
+            )?
+            .map_ok(|batch| ActionsBatch::new(batch, true));
+        Ok(commit_stream)
+    }
+
+    /// Returns an iterator over "phase 1" checkpoint data.
+    ///
+    /// If the log segment has no checkpoint, or has a multi-part checkpoints, the result is an
+    /// empty iterator. A single-file (classic or v2) checkpoint is read in its entirety, and any
+    /// sidecar actions are included in the result. The caller is responsible to collect the sidecar
+    /// file names and process them in phase 2.
+    pub(crate) fn read_phase1_checkpoint_actions(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<(impl Iterator<Item = DeltaResult<ActionsBatch>> + Send, bool)> {
+        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
+            || checkpoint_read_schema.contains(REMOVE_NAME);
+        require!(
+            !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
+            Error::invalid_checkpoint(
+                "If the checkpoint read schema contains file actions, it must contain the sidecar column"
+            )
+        );
+
+        let checkpoint_file_meta: Vec<_> = self
+            .checkpoint_parts
+            .iter()
+            .map(|f| f.location.clone())
+            .collect();
+
+        let parquet_handler = engine.parquet_handler();
+
+        // Historically, we had a shared file reader trait for JSON and Parquet handlers,
+        // but it was removed to avoid unnecessary coupling. This is a concrete case
+        // where it *could* have been useful, but for now, we're keeping them separate.
+        // If similar patterns start appearing elsewhere, we should reconsider that decision.
+        let actions = match self.checkpoint_parts.first() {
+            Some(parsed_log_path) if parsed_log_path.extension == "json" => {
+                engine.json_handler().read_json_files(
+                    &checkpoint_file_meta,
+                    checkpoint_read_schema.clone(),
+                    meta_predicate.clone(),
+                )?
+            }
+            Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
+                .read_parquet_files(
+                    &checkpoint_file_meta,
+                    checkpoint_read_schema.clone(),
+                    meta_predicate.clone(),
+                )?,
+            Some(parsed_log_path) => {
+                return Err(Error::generic(format!(
+                    "Unsupported checkpoint file type: {}",
+                    parsed_log_path.extension,
+                )));
+            }
+            // This is the case when there are no checkpoints in the log segment
+            // so we return an empty iterator
+            None => Box::new(std::iter::empty()),
+        };
+
+        let actions = actions.map_ok(|batch| ActionsBatch::new(batch, false));
+        Ok((actions, need_file_actions))
+    }
+
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
     /// By default, `create_checkpoint_stream` checks for the presence of sidecar files, and
@@ -335,7 +464,7 @@ impl LogSegment {
     /// sidecar files contain the actual file actions that would otherwise be
     /// stored directly in the checkpoint. The sidecar file batches are chained to the
     /// checkpoint batch in the top level iterator to be returned.
-    fn create_checkpoint_stream(
+    pub(crate) fn read_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         checkpoint_read_schema: SchemaRef,
@@ -402,7 +531,7 @@ impl LogSegment {
                 //    returned as-is.
                 let sidecar_content = if need_file_actions && checkpoint_file_meta.len() == 1 {
                     Self::process_sidecars(
-                        parquet_handler.clone(), // cheap Arc clone
+                        parquet_handler.as_ref(), // cheap Arc clone
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
                         checkpoint_read_schema.clone(),
@@ -426,35 +555,37 @@ impl LogSegment {
         Ok(actions_iter)
     }
 
+    pub(crate) fn visit_sidecars(
+        batch: &dyn EngineData,
+        log_root: Url,
+    ) -> DeltaResult<Vec<FileMeta>> {
+        // Visit the rows of the checkpoint batch to extract sidecar file references
+        let mut visitor = SidecarVisitor::default();
+        visitor.visit_rows_of(batch)?;
+
+        visitor
+            .sidecars
+            .iter()
+            .map(|sidecar| sidecar.to_filemeta(&log_root))
+            .try_collect()
+    }
+
     /// Processes sidecar files for the given checkpoint batch.
     ///
     /// This function extracts any sidecar file references from the provided batch.
     /// Each sidecar file is read and an iterator of file action batches is returned
     fn process_sidecars(
-        parquet_handler: Arc<dyn ParquetHandler>,
+        parquet_handler: &dyn ParquetHandler,
         log_root: Url,
         batch: &dyn EngineData,
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
-        // Visit the rows of the checkpoint batch to extract sidecar file references
-        let mut visitor = SidecarVisitor::default();
-        visitor.visit_rows_of(batch)?;
-
-        // If there are no sidecar files, return early
-        if visitor.sidecars.is_empty() {
-            return Ok(None);
-        }
-
-        let sidecar_files: Vec<_> = visitor
-            .sidecars
-            .iter()
-            .map(|sidecar| sidecar.to_filemeta(&log_root))
-            .try_collect()?;
+        let sidecar_files = Self::visit_sidecars(batch, log_root)?;
 
         // Read the sidecar files and return an iterator of sidecar file batches
         Ok(Some(parquet_handler.read_parquet_files(
-            &sidecar_files,
+            &sidecar_files.to_vec(),
             checkpoint_read_schema,
             meta_predicate,
         )?))
@@ -542,6 +673,101 @@ impl LogSegment {
         let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
         debug_assert!(to_sub <= self.end_version);
         self.end_version - to_sub
+    }
+}
+
+pub(crate) struct Phase2LogReplay<P: LogReplayProcessor> {
+    processor: P,
+    checkpoint_actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+}
+
+impl<P: LogReplayProcessor> Phase2LogReplay<P> {
+    pub(crate) fn try_new(
+        engine: &dyn Engine,
+        processor: P,
+        sidecars: Vec<FileMeta>,
+        checkpoint_read_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Self> {
+        let checkpoint_actions = engine.parquet_handler().read_parquet_files(
+            &sidecars,
+            checkpoint_read_schema,
+            meta_predicate,
+        )?;
+        let checkpoint_actions = checkpoint_actions.map_ok(|batch| ActionsBatch::new(batch, false));
+        Ok(Self::new(processor, checkpoint_actions))
+    }
+
+    pub(crate) fn new(
+        processor: P,
+        checkpoint_actions: impl Iterator<Item = DeltaResult<ActionsBatch>> + Send + 'static,
+    ) -> Self {
+        Self {
+            processor,
+            checkpoint_actions: Box::new(checkpoint_actions),
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> DeltaResult<P> {
+        if self.next().is_some() {
+            return Err(Error::generic(
+                "Must process all actions before finishing Phase2LogReplay",
+            ));
+        }
+        Ok(self.processor)
+    }
+}
+
+impl<P: LogReplayProcessor> Iterator for Phase2LogReplay<P> {
+    type Item = DeltaResult<P::Output>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = self.checkpoint_actions.next()?;
+        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
+    }
+}
+
+pub(crate) struct Phase1LogReplay<P: LogReplayProcessor> {
+    processor: P,
+    commit_actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    checkpoint_actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    sidecars: Vec<FileMeta>,
+    log_root: Url,
+    need_file_actions: bool,
+}
+
+impl<P: LogReplayProcessor> Phase1LogReplay<P> {
+    // Returns the processor and any sidecars that were collected
+    pub(crate) fn finish(mut self) -> DeltaResult<(P, Vec<FileMeta>)> {
+        if self.next().is_some() {
+            return Err(Error::generic(
+                "Must process all actions before finishing Phase1LogReplay",
+            ));
+        }
+        Ok((self.processor, self.sidecars))
+    }
+
+    fn extract_sidecars(&mut self, batch: DeltaResult<ActionsBatch>) -> DeltaResult<ActionsBatch> {
+        if self.need_file_actions {
+            if let Ok(ActionsBatch { ref actions, .. }) = batch {
+                let sidecars = LogSegment::visit_sidecars(actions.as_ref(), self.log_root.clone())?;
+                self.sidecars.extend(sidecars);
+            }
+        }
+        batch
+    }
+}
+
+impl<P: LogReplayProcessor> Iterator for Phase1LogReplay<P> {
+    type Item = DeltaResult<P::Output>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = self.commit_actions.next().or_else(|| {
+            self.checkpoint_actions
+                .next()
+                .map(|batch| self.extract_sidecars(batch))
+        })?;
+        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
     }
 }
 

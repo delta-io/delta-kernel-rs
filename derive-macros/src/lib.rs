@@ -119,14 +119,6 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                     }
                 });
                 if have_schema_null {
-                    if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
-                        if last_ident != "HashMap" {
-                           return Error::new(
-                                last_ident.span(),
-                                format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
-                            ).to_compile_error()
-                        }
-                    }
                     quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name))}
                 } else {
                     quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name))}

@@ -46,6 +46,7 @@ use std::sync::LazyLock;
 /// trait that filters log segment actions for inclusion in a V1 spec checkpoint file. This
 /// processor is leveraged when creating a single-file V2 checkpoint as the V2 spec schema is
 /// a superset of the V1 spec schema, with the addition of a [`CheckpointMetadata`] action.
+#[derive(Debug)]
 pub(crate) struct CheckpointLogReplayProcessor {
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.

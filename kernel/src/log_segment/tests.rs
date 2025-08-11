@@ -854,7 +854,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let checkpoint_batch = add_batch_simple(get_log_schema().clone());
 
     let mut iter = LogSegment::process_sidecars(
-        engine.parquet_handler(),
+        engine.parquet_handler().as_ref(),
         log_root,
         checkpoint_batch.as_ref(),
         get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
@@ -892,7 +892,7 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
     );
 
     let mut iter = LogSegment::process_sidecars(
-        engine.parquet_handler(),
+        engine.parquet_handler().as_ref(),
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),
@@ -920,7 +920,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
     );
 
     let mut iter = LogSegment::process_sidecars(
-        engine.parquet_handler(),
+        engine.parquet_handler().as_ref(),
         log_root,
         checkpoint_batch.as_ref(),
         get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
@@ -960,7 +960,7 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     });
 
     let mut iter = LogSegment::process_sidecars(
-        engine.parquet_handler(),
+        engine.parquet_handler().as_ref(),
         log_root,
         checkpoint_batch.as_ref(),
         read_schema.clone(),
@@ -994,7 +994,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_ac
         log_root,
         None,
     )?;
-    let result = log_segment.create_checkpoint_stream(
+    let result = log_segment.read_checkpoint_actions(
         &engine,
         get_log_schema().project(&[REMOVE_NAME])?,
         None,
@@ -1025,7 +1025,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
         log_root,
         None,
     )?;
-    let result = log_segment.create_checkpoint_stream(&engine, get_log_add_schema().clone(), None);
+    let result = log_segment.read_checkpoint_actions(&engine, get_log_add_schema().clone(), None);
 
     // Errors because the schema has an ADD action but no SIDECAR action.
     assert_result_error_with_message(result, "Invalid Checkpoint: If the checkpoint read schema contains file actions, it must contain the sidecar column");
@@ -1062,7 +1062,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         None,
     )?;
     let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+        log_segment.read_checkpoint_actions(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1124,7 +1124,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
         None,
     )?;
     let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+        log_segment.read_checkpoint_actions(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert the correctness of batches returned
     for expected_sidecar in ["sidecar1.parquet", "sidecar2.parquet"].iter() {
@@ -1175,7 +1175,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         None,
     )?;
     let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+        log_segment.read_checkpoint_actions(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1220,8 +1220,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
         log_root,
         None,
     )?;
-    let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
+    let mut iter = log_segment.read_checkpoint_actions(&engine, v2_checkpoint_read_schema, None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {
@@ -1288,7 +1287,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         None,
     )?;
     let mut iter =
-        log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
+        log_segment.read_checkpoint_actions(&engine, v2_checkpoint_read_schema.clone(), None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
     let ActionsBatch {

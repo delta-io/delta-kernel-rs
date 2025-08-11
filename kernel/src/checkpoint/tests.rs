@@ -16,6 +16,7 @@ use arrow_55::{
     datatypes::Field,
 };
 
+use itertools::Itertools as _;
 use serde_json::{from_slice, json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;
@@ -71,7 +72,7 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::try_new(table_root, &engine, None)?;
-    let writer = Arc::new(snapshot).checkpoint()?;
+    let writer = Arc::new(snapshot).checkpoint_writer()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
 
@@ -294,7 +295,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, None)?);
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.checkpoint_writer()?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -362,7 +363,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     // Specify version 0 for checkpoint
     let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, Some(0))?);
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.checkpoint_writer()?;
 
     // Verify the checkpoint file path is the specified version.
     assert_eq!(
@@ -410,7 +411,7 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, Some(0))?);
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.checkpoint_writer()?;
     let data_iter = writer.checkpoint_data(&engine)?;
 
     /* The returned data iterator has batches that we do not consume */
@@ -464,7 +465,7 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     let snapshot = Arc::new(Snapshot::try_new(table_root, &engine, None)?);
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.checkpoint_writer()?;
 
     // Verify the checkpoint file path is the latest version by default.
     assert_eq!(
@@ -504,4 +505,82 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes)?;
 
     Ok(())
+}
+
+/// unpack the test data tarball from `path` into a temp dir, and return the dir it was
+/// unpacked into
+#[allow(unused)]
+pub(crate) fn load_test_data(
+    test_parent_dir: &str,
+    test_name: &str,
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let path = format!("{test_parent_dir}/{test_name}.tar.zst");
+    let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
+    let mut archive = tar::Archive::new(tar);
+    let temp_dir = tempfile::tempdir()?;
+    archive.unpack(temp_dir.path())?;
+    Ok(temp_dir)
+}
+
+/// Tests the `checkpoint()` API with:
+/// - A table that does supports v2Checkpoint
+/// - No version specified (latest version is used)
+#[test]
+fn two_phase_checkpoint_replay() {
+    let test_name = "v2-checkpoints-parquet-with-sidecars";
+    let tmp_path = load_test_data("tests/data", test_name).unwrap();
+    let table_path = tmp_path.path().join(test_name);
+    let log_path = table_path.join("_delta_log");
+
+    // The table has a checkpoint for every commit (v6 is latest), which makes it hard to fully test
+    // two-phase log replay. Manually delete checkpoints 5 and 6, so we replay deltas for v6 and v5
+    // on top of the checkpoint for v4. Also delete the (too new) _last_checkpoint file.
+    std::fs::remove_file(
+        log_path
+            .join("00000000000000000005.checkpoint.cda8d476-9f57-4c68-866b-0bcdd4bfe71b.parquet"),
+    )
+    .unwrap();
+    std::fs::remove_file(
+        log_path
+            .join("00000000000000000006.checkpoint.f15b9025-707a-4c73-aac0-31dfcbd29aa6.parquet"),
+    )
+    .unwrap();
+    std::fs::remove_file(log_path.join("_last_checkpoint")).unwrap();
+    let engine = crate::engine::sync::SyncEngine::new();
+    let snapshot = Snapshot::try_from_uri(
+        table_path.to_str().expect("table path to string"),
+        &engine,
+        None,
+    )
+    .unwrap();
+
+    // Traditional log replay
+    let checkpoint_writer = Arc::new(snapshot).checkpoint_writer().unwrap();
+    let mut checkpoint_data = checkpoint_writer.checkpoint_data(&engine).unwrap();
+    let mut expected_batches = (&mut checkpoint_data).map(Result::unwrap).collect_vec();
+
+    // Ignore the v2 checkpointMetadata batch, because it's not actually part of replay
+    assert_eq!(expected_batches.pop().unwrap().data.len(), 1);
+
+    // Two-phase log replay
+    let mut phase1 = checkpoint_writer.phase1_checkpoint_data(&engine).unwrap();
+    let mut two_phase_batches = (&mut phase1).map(Result::unwrap).collect_vec();
+    let (processor, sidecars) = phase1.finish().unwrap();
+
+    // TODO: Share read-only processor among multiple phase2?
+    let mut phase2 = crate::log_segment::Phase2LogReplay::try_new(
+        &engine,
+        processor,
+        sidecars,
+        super::CHECKPOINT_ACTIONS_SCHEMA.clone(), // todo: remove `sidecar` field?
+        None,
+    )
+    .unwrap();
+    two_phase_batches.extend((&mut phase2).map(Result::unwrap));
+    let processor = phase2.finish().unwrap();
+
+    assert_eq!(expected_batches.len(), two_phase_batches.len());
+    for (expected, two_phase) in expected_batches.into_iter().zip(two_phase_batches) {
+        assert_eq!(expected.selection_vector, two_phase.filtered_data.selection_vector);
+    }
 }

@@ -436,10 +436,9 @@ impl Scan {
 
     /// Get the predicate [`Expression`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
-        if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
-            Some(predicate.clone())
-        } else {
-            None
+        match self.physical_predicate {
+            PhysicalPredicate::Some(ref predicate, _) => Some(predicate.clone()),
+            _ => None,
         }
     }
 
