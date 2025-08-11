@@ -3,11 +3,11 @@ use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::{
     get_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_txn_schema,
+    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
-use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::error::Error;
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{
@@ -20,13 +20,13 @@ use crate::{DeltaResult, Engine, EngineData, Expression, IntoEngineData, RowVisi
 use url::Url;
 
 /// This function specifies the schema for the add_files metadata (and soon remove_files metadata)
-/// **as they are provided by the Parquet handler**. Concretely, it is the expected schema for engine data passed to [`add_files`].
-/// Each row represents metadata about a file to be added to the table.
+/// **as they are provided by the Parquet handler**. Concretely, it is the expected schema for
+/// engine data passed to [`add_files`]. Each row represents metadata about a file to be added to the table.
 /// Kernel-rs takes this information and extends it to the full add_file metadata schema, adding
 /// additional fields (e.g., baseRowID) as necessary.
 ///
 /// [`add_files`]: crate::transaction::Transaction::add_files
-pub(crate) static PARQUET_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static WRITE_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null(
@@ -40,8 +40,8 @@ pub(crate) static PARQUET_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|
     ]))
 });
 
-pub(crate) fn parquet_add_file_schema() -> &'static SchemaRef {
-    &PARQUET_ADD_FILE_SCHEMA
+pub(crate) fn write_result_schema() -> &'static SchemaRef {
+    &WRITE_RESULT_SCHEMA
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -165,15 +165,17 @@ impl Transaction {
         {
             // Read the current rowIdHighWaterMark from the snapshot
             // Note that there might be no row tracking domain metadata in the snapshot if the table hasn't been written to before
-            let row_tracking_domain: RowTrackingDomainConfiguration = match self
-                .read_snapshot
-                .get_domain_metadata(ROW_TRACKING_DOMAIN, engine)?
-            {
-                Some(domain_metadata) => serde_json::from_str(&domain_metadata)?,
-                None => RowTrackingDomainConfiguration {
-                    row_id_high_water_mark: None,
-                },
-            };
+            let row_tracking_domain: RowTrackingDomainConfiguration =
+                match domain_metadata_configuration(
+                    self.read_snapshot.log_segment(),
+                    ROW_TRACKING_DOMAIN,
+                    engine,
+                )? {
+                    Some(domain_metadata) => serde_json::from_str(&domain_metadata)?,
+                    None => RowTrackingDomainConfiguration {
+                        row_id_high_water_mark: None,
+                    },
+                };
 
             let mut row_tracking_visitor = RowTrackingVisitor::new(
                 row_tracking_domain.row_id_high_water_mark,
@@ -313,12 +315,12 @@ impl Transaction {
 
         add_files_metadata.map(move |add_files_batch| {
             let adds_expr = Expression::struct_from([Expression::struct_from(
-                parquet_add_file_schema()
+                write_result_schema()
                     .fields()
                     .map(|f| Expression::column([f.name()])),
             )]);
             let adds_evaluator = evaluation_handler.new_expression_evaluator(
-                parquet_add_file_schema().clone(),
+                write_result_schema().clone(),
                 adds_expr,
                 log_schema.clone().into(),
             );
@@ -343,7 +345,7 @@ impl WriteContext {
         WriteContext {
             target_dir,
             snapshot_schema,
-            parquet_add_file_schema: PARQUET_ADD_FILE_SCHEMA.clone(),
+            parquet_add_file_schema: WRITE_RESULT_SCHEMA.clone(),
             logical_to_physical,
         }
     }

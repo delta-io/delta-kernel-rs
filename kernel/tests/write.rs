@@ -711,6 +711,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         true, // enable "timestamp without timezone" feature
         false,
         false,
+        false, // row tracking
     )
     .await?;
 
@@ -838,8 +839,9 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         &[],
         true,
         false,
-        true, // enable "variantType" feature
-        true, // enable "columnMapping" feature
+        true,  // enable "variantType" feature
+        true,  // enable "columnMapping" feature
+        false, // row tracking
     )
     .await?;
 
@@ -1050,6 +1052,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         false,
         true,  // enable "variantType" feature
         false, // enable "columnMapping" feature
+        false, // row tracking
     )
     .await?;
 
@@ -1145,6 +1148,160 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
     assert!(matches!(res,
         Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_append_row_tracking() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Create a simple schema: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    let tmp_test_dir = tempdir()?;
+    let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
+
+    let (store, engine, table_location) =
+        engine_store_setup("test_table_row_tracking", Some(&tmp_test_dir_url));
+
+    // Create table with row tracking feature enabled
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],   // no partition columns
+        true,  // use 37 protocol
+        false, // timestamp without timezone
+        false, // variant type
+        false, // column mapping
+        true,  // row tracking
+    )
+    .await?;
+
+    let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+    let mut txn = snapshot
+        .transaction()?
+        .with_engine_info("row tracking test");
+
+    // Create two new arrow record batches to append
+    let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
+        let data = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(data.to_vec()))],
+        )?;
+        Ok(Box::new(ArrowEngineData::new(data)))
+    });
+
+    // Write data out by spawning async tasks to simulate executors
+    let engine = Arc::new(engine);
+    let write_context = Arc::new(txn.get_write_context());
+    let tasks = append_data.into_iter().map(|data| {
+        let engine = engine.clone();
+        let write_context = write_context.clone();
+        tokio::task::spawn(async move {
+            engine
+                .write_parquet(
+                    data.as_ref().unwrap(),
+                    write_context.as_ref(),
+                    HashMap::new(),
+                    true,
+                )
+                .await
+        })
+    });
+    let add_files_metadata = futures::future::join_all(tasks).await.into_iter().flatten();
+
+    for meta in add_files_metadata {
+        txn.add_files(meta?);
+    }
+
+    match txn.commit(engine.as_ref())? {
+        CommitResult::Committed { version, .. } => {
+            assert_eq!(version, 1);
+        }
+        _ => panic!("Commit should have succeeded"),
+    };
+
+    let commit1 = store
+        .get(&Path::from(
+            "/test_table_row_tracking/_delta_log/00000000000000000001.json",
+        ))
+        .await?;
+
+    let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+        .into_iter::<serde_json::Value>()
+        .try_collect()?;
+
+    // Check that we have the expected structure: commitInfo + 2 add actions + domainMetadata
+    assert_eq!(parsed_commits.len(), 4);
+
+    // Check commitInfo
+    assert!(parsed_commits[0].get("commitInfo").is_some());
+
+    // Check that both add actions have row tracking fields
+    for i in 1..3 {
+        let add_action = parsed_commits[i]
+            .get("add")
+            .expect("Should have add action");
+
+        // Check that baseRowId exists and is a number
+        let base_row_id = add_action
+            .get("baseRowId")
+            .expect("Add action should have baseRowId field");
+        assert!(base_row_id.is_number(), "baseRowId should be a number");
+
+        // Check that defaultRowCommitVersion exists and equals 1 (the commit version)
+        let default_row_commit_version = add_action
+            .get("defaultRowCommitVersion")
+            .expect("Add action should have defaultRowCommitVersion field");
+        assert_eq!(
+            default_row_commit_version.as_i64().unwrap(),
+            1,
+            "defaultRowCommitVersion should be 1"
+        );
+
+        // Verify baseRowId is different for each file (should be incremental)
+        let expected_base_row_id = if i == 1 { 0 } else { 3 }; // First file starts at 0, second at 3
+        assert_eq!(
+            base_row_id.as_i64().unwrap(),
+            expected_base_row_id,
+            "baseRowId should be incremental based on file order and size"
+        );
+    }
+
+    // Check that domain metadata action exists for row tracking
+    let domain_metadata = parsed_commits[3]
+        .get("domainMetadata")
+        .expect("Should have domainMetadata action");
+
+    assert_eq!(
+        domain_metadata.get("domain").unwrap().as_str().unwrap(),
+        "delta.rowTracking"
+    );
+
+    // Check that the configuration contains rowIdHighWaterMark
+    let configuration = domain_metadata
+        .get("configuration")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    let config_json: serde_json::Value = serde_json::from_str(configuration)?;
+    assert!(config_json.get("rowIdHighWaterMark").is_some());
+
+    // Verify the data can still be read correctly
+    test_read(
+        &ArrowEngineData::new(RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow()?),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6]))],
+        )?),
+        &table_url,
+        engine,
+    )?;
 
     Ok(())
 }

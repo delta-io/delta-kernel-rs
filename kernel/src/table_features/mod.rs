@@ -209,6 +209,8 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
 // note: we 'support' Invariants, but only insofar as we check that they are not present.
 // we support writing to tables that have Invariants enabled but not used. similarly, we only
 // support DeletionVectors in that we never write them (no DML).
+// note: we support writing to existing tables with row tracking, but we don't support creating
+// tables with row tracking yet.
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = LazyLock::new(|| {
     vec![
         WriterFeature::AppendOnly,

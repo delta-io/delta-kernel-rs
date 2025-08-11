@@ -25,7 +25,7 @@ use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requeste
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
-use crate::transaction::parquet_add_file_schema;
+use crate::transaction::write_result_schema;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -52,7 +52,7 @@ impl DataFileMetadata {
         Self {
             file_meta,
             num_records,
-            schema: parquet_add_file_schema().clone(),
+            schema: write_result_schema().clone(),
         }
     }
 
@@ -505,7 +505,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let parquet_add_file_schema =
-            Arc::new(parquet_add_file_schema().as_ref().try_into_arrow().unwrap());
+            Arc::new(write_result_schema().as_ref().try_into_arrow().unwrap());
 
         let field_names = MapFieldNames {
             entry: "key_value".to_string(),

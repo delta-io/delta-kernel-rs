@@ -224,7 +224,11 @@ pub async fn create_table(
     enable_timestamp_without_timezone: bool,
     enable_variant: bool,
     enable_column_mapping: bool,
+    enable_row_tracking: bool,
 ) -> Result<Url, Box<dyn std::error::Error>> {
+    // TODO: Refactor this function to directly accept reader and writer feature vectors so that we
+    // don't have to change its signature for each new feature test
+
     let table_id = "test_id";
     let schema = serde_json::to_string(&schema)?;
 
@@ -250,6 +254,9 @@ pub async fn create_table(
             // tests that do column mapping on writes. for now omit the writer feature to let tests
             // run, but after actual support this should be enabled.
             // writer_features.push("columnMapping");
+        }
+        if enable_row_tracking {
+            writer_features.push("rowTracking");
         }
         (reader_features, writer_features)
     };
@@ -280,6 +287,7 @@ pub async fn create_table(
             },
             "schemaString": schema,
             "partitionColumns": partition_columns,
+            // TODO: Isn't this an issue if enable_column_mapping is false?
             "configuration": {"delta.columnMapping.mode": "name"},
             "createdTime": 1677811175819u64
         }
@@ -335,6 +343,7 @@ pub async fn setup_test_tables(
                 false,
                 false,
                 false,
+                false,
             )
             .await?,
             engine_37,
@@ -347,6 +356,7 @@ pub async fn setup_test_tables(
                 table_location_11,
                 schema,
                 partition_columns,
+                false,
                 false,
                 false,
                 false,
