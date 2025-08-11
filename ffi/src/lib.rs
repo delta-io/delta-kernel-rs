@@ -788,7 +788,7 @@ mod tests {
         recover_string,
     };
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-    use delta_kernel::object_store::memory::InMemory;
+    use object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
     #[no_mangle]

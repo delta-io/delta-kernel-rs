@@ -61,8 +61,8 @@ futures = { version = "0.3", optional = true }
 reqwest = { version = "0.12.15", default-features = false, optional = true }
 # optionally used with default engine (though not required)
 tokio = { version = "1.44", optional = true, features = ["rt-multi-thread"] }
-
-
+# both arrow versions below are optional and require object_store
+object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
 
 # arrow 55
 [dependencies.arrow_55]
@@ -74,11 +74,6 @@ optional = true
 package = "parquet"
 version = "55"
 features = ["async", "object_store"]
-optional = true
-[dependencies.object_store_55]
-package = "object_store"
-version = "0.12.3"
-features = ["aws", "azure", "gcp", "http"]
 optional = true
 
 # arrow 56
@@ -105,8 +100,8 @@ integration-test = ["hdfs-native-object-store/integration-test"]
 arrow = ["arrow-56"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-55 = ["dep:arrow_55", "dep:parquet_55", "dep:object_store_55"]
-arrow-56 = ["dep:arrow_56", "dep:parquet_56", "dep:object_store_55"]
+arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store"]
+arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 

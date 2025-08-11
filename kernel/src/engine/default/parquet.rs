@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
-use crate::object_store::path::Path;
-use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
+use object_store::path::Path;
+use object_store::DynObjectStore;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -259,7 +259,7 @@ impl FileOpener for ParquetOpener {
 
         Ok(Box::pin(async move {
             let mut reader = {
-                use crate::object_store::ObjectStoreScheme;
+                use object_store::ObjectStoreScheme;
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
                 // request which isn't supported by Azure. For now we just detect if the URL is
                 // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -388,8 +388,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::arrow::array::{Array, RecordBatch};
-    use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
-    use url::Url;
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -397,6 +395,8 @@ mod tests {
     use crate::EngineData;
 
     use itertools::Itertools;
+    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use url::Url;
 
     use crate::utils::test_utils::assert_result_error_with_message;
 
