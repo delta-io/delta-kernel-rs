@@ -13,6 +13,7 @@ members = [
 # - read-table-changes
 # - read-table-multi-threaded
 # - read-table-single-threaded
+# - write-table
 resolver = "2"
 
 [workspace.package]
