@@ -87,8 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create client
     let client = UCClient::builder(&cli.workspace_url, &cli.token)
-        .timeout(Duration::from_secs(60))
-        .max_retries(3)
+        .with_timeout(Duration::from_secs(60))
+        .with_max_retries(3)
         .build()?;
 
     // Execute command

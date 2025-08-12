@@ -28,6 +28,9 @@ pub enum Error {
 
     #[error("Operation not supported: {0}")]
     UnsupportedOperation(String),
+
+    #[error("Max retries exceeded")]
+    MaxRetriesExceeded,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

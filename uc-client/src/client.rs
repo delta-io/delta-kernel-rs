@@ -99,38 +99,39 @@ impl UCClient {
         F: Fn() -> Fut,
         Fut: Future<Output = std::result::Result<Response, reqwest::Error>>,
     {
-        let mut retries = 0;
-        let max_retries = self.config.max_retries;
-
-        loop {
+        for retry in 0..=self.config.max_retries {
             match f().await {
-                Ok(response) => {
-                    if response.status().is_server_error() && retries < max_retries {
-                        retries += 1;
-                        warn!(
-                            "Server error {}, retrying (attempt {}/{})",
-                            response.status(),
-                            retries,
-                            max_retries
-                        );
-                        tokio::time::sleep(self.config.retry_base_delay * retries).await;
-                        continue;
-                    }
-                    return Ok(response);
+                Ok(response) if !response.status().is_server_error() => return Ok(response),
+                Ok(response) if retry < self.config.max_retries => {
+                    warn!(
+                        "Server error {}, retrying (attempt {}/{})",
+                        response.status(),
+                        retry + 1,
+                        self.config.max_retries
+                    );
                 }
-                Err(e) => {
-                    if retries >= max_retries {
-                        return Err(Error::from(e));
-                    }
-                    retries += 1;
+                Ok(response) => {
+                    return Err(Error::ApiError {
+                        status: response.status().as_u16(),
+                        message: "Server error".to_string(),
+                    })
+                }
+                Err(e) if retry < self.config.max_retries => {
                     warn!(
                         "Request failed, retrying (attempt {}/{}): {}",
-                        retries, max_retries, e
+                        retry + 1,
+                        self.config.max_retries,
+                        e
                     );
-                    tokio::time::sleep(self.config.retry_base_delay * retries).await;
                 }
+                Err(e) => return Err(Error::from(e)),
             }
+
+            tokio::time::sleep(self.config.retry_base_delay * (retry + 1)).await;
         }
+
+        // this is actually unreachable since we return in the loop for Ok/Err after all retries
+        Err(Error::MaxRetriesExceeded)
     }
 
     async fn handle_response<T>(&self, response: Response) -> Result<T>
@@ -169,27 +170,27 @@ pub struct UCClientBuilder {
 impl UCClientBuilder {
     pub fn new(workspace: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            config_builder: ClientConfig::builder(workspace, token),
+            config_builder: ClientConfig::build(workspace, token),
         }
     }
 
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.config_builder = self.config_builder.timeout(timeout);
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.config_builder = self.config_builder.with_timeout(timeout);
         self
     }
 
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.config_builder = self.config_builder.connect_timeout(timeout);
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config_builder = self.config_builder.with_connect_timeout(timeout);
         self
     }
 
-    pub fn max_retries(mut self, retries: u32) -> Self {
-        self.config_builder = self.config_builder.max_retries(retries);
+    pub fn with_max_retries(mut self, retries: u32) -> Self {
+        self.config_builder = self.config_builder.with_max_retries(retries);
         self
     }
 
-    pub fn retry_delays(mut self, base: Duration, max: Duration) -> Self {
-        self.config_builder = self.config_builder.retry_delays(base, max);
+    pub fn with_retry_delays(mut self, base: Duration, max: Duration) -> Self {
+        self.config_builder = self.config_builder.with_retry_delays(base, max);
         self
     }
 

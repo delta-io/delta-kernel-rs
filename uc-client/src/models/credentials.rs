@@ -14,9 +14,9 @@ impl TemporaryTableCredentials {
     }
 
     pub fn is_expired(&self) -> bool {
+        // If we can't parse the timestamp, consider it expired for safety
         self.expiration_as_datetime()
-            .map(|exp| exp < chrono::Utc::now())
-            .unwrap_or(true) // If we can't parse the timestamp, consider it expired for safety
+            .is_none_or(|exp| exp < chrono::Utc::now())
     }
 
     pub fn time_until_expiry(&self) -> Option<chrono::Duration> {

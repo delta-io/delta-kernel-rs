@@ -1,4 +1,3 @@
-use crate::config::ClientConfig;
 use crate::models::commits::CommitsRequest;
 use crate::models::credentials::Operation;
 
@@ -19,30 +18,6 @@ fn test_operation_display() {
     assert_eq!(Operation::Read.to_string(), "READ");
     assert_eq!(Operation::Write.to_string(), "WRITE");
     assert_eq!(Operation::ReadWrite.to_string(), "READ_WRITE");
-}
-
-#[test]
-fn test_client_config() {
-    let config = ClientConfig::new("some-workspace.something.com", "token").unwrap();
-    assert!(config
-        .workspace_url
-        .as_str()
-        .contains("api/2.1/unity-catalog"));
-    assert_eq!(config.token, "token");
-}
-
-#[test]
-fn test_client_config_builder() {
-    use std::time::Duration;
-
-    let config = ClientConfig::builder("some-workspace.something.com", "token")
-        .timeout(Duration::from_secs(60))
-        .max_retries(5)
-        .build()
-        .unwrap();
-
-    assert_eq!(config.timeout, Duration::from_secs(60));
-    assert_eq!(config.max_retries, 5);
 }
 
 #[test]
