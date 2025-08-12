@@ -35,12 +35,10 @@ fn get_segment(
 ) -> DeltaResult<Vec<ParsedLogPath>> {
     let table_root = url::Url::from_directory_path(path).unwrap();
     let log_root = table_root.join("_delta_log/")?;
-    let log_segment = LogSegment::for_table_changes(
-        engine.storage_handler().as_ref(),
-        log_root,
-        start_version,
-        end_version,
-    )?;
+    let log_segment = LogSegment::build(log_root)
+        .with_start_version(start_version)
+        .with_end_version_opt(end_version.into())
+        .build_incremental(engine.storage_handler().as_ref())?;
     Ok(log_segment.ascending_commit_files)
 }
 
