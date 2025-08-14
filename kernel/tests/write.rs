@@ -1220,17 +1220,15 @@ async fn test_append_row_tracking() -> Result<(), Box<dyn std::error::Error>> {
         txn.add_files(meta?);
     }
 
-    match txn.commit(engine.as_ref())? {
-        CommitResult::Committed { version, .. } => {
-            assert_eq!(version, 1);
-        }
-        _ => panic!("Commit should have succeeded"),
-    };
+    // Commit the transaction
+    txn.commit(engine.as_ref())?;
 
+    // Verify the commit was written correctly
+    let commit1_url = tmp_test_dir_url
+        .join("test_table_row_tracking/_delta_log/00000000000000000001.json")
+        .unwrap();
     let commit1 = store
-        .get(&Path::from(
-            "/test_table_row_tracking/_delta_log/00000000000000000001.json",
-        ))
+        .get(&Path::from_url_path(commit1_url.path()).unwrap())
         .await?;
 
     let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
@@ -1240,7 +1238,7 @@ async fn test_append_row_tracking() -> Result<(), Box<dyn std::error::Error>> {
     // Check that we have the expected structure: commitInfo + 2 add actions + domainMetadata
     assert_eq!(parsed_commits.len(), 4);
 
-    // Check commitInfo
+    // Check that the commitInfo exists
     assert!(parsed_commits[0].get("commitInfo").is_some());
 
     // Check that both add actions have row tracking fields
@@ -1290,8 +1288,15 @@ async fn test_append_row_tracking() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .as_str()
         .unwrap();
+    println!("{}", configuration);
     let config_json: serde_json::Value = serde_json::from_str(configuration)?;
     assert!(config_json.get("rowIdHighWaterMark").is_some());
+    let row_id_high_water_mark = config_json
+        .get("rowIdHighWaterMark")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_eq!(row_id_high_water_mark, 5);
 
     // Verify the data can still be read correctly
     test_read(

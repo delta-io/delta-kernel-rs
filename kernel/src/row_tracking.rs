@@ -1,8 +1,8 @@
 use crate::actions::stats::Statistics;
-use crate::actions::visitors::visit_deletion_vector_at;
-use crate::actions::{Add, ADD_NAME};
+use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::transaction::write_result_schema;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::{internal_api, ToSchema};
@@ -41,31 +41,18 @@ impl RowTrackingVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
         require!(
-            getters.len() == 15, // TODO: Replace this magic number
+            getters.len() == 6, // TODO: Replace this magic number
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
             ))
         );
 
-        let partition_values: HashMap<_, _> = getters[1].get(row_index, "add.partitionValues")?;
-        let size: i64 = getters[2].get(row_index, "add.size")?;
-        let modification_time: i64 = getters[3].get(row_index, "add.modificationTime")?;
-        let data_change: bool = getters[4].get(row_index, "add.dataChange")?;
-        let stats: Option<String> = getters[5].get_opt(row_index, "add.stats")?;
-        let tags: Option<HashMap<String, String>> = getters[6].get_opt(row_index, "add.tags")?;
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
-        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
-        let default_row_commit_version: Option<i64> =
-            getters[13].get_opt(row_index, "add.default_row_commit")?;
-        let clustering_provider: Option<String> =
-            getters[14].get_opt(row_index, "add.clustering_provider")?;
-
-        if base_row_id.is_some() || default_row_commit_version.is_some() {
-            return Err(Error::InternalError(
-                "Base row id and default row commit version should not be present in Add action before the row tracking visitor.".to_string(),
-            ));
-        }
+        let partition_values: HashMap<_, _> = getters[1].get(row_index, "partitionValues")?;
+        let size: i64 = getters[2].get(row_index, "size")?;
+        let modification_time: i64 = getters[3].get(row_index, "modificationTime")?;
+        let data_change: bool = getters[4].get(row_index, "dataChange")?;
+        let stats: Option<String> = getters[5].get_opt(row_index, "stats")?;
 
         let statistics: Statistics = match &stats {
             Some(stats) => match serde_json::from_str(stats) {
@@ -100,30 +87,26 @@ impl RowTrackingVisitor {
             modification_time,
             data_change,
             stats,
-            tags,
-            deletion_vector,
+            tags: None,
+            deletion_vector: None,
             base_row_id: Some(base_row_id),
             default_row_commit_version: Some(self.default_row_commit_version),
-            clustering_provider,
+            clustering_provider: None,
         })
-    }
-
-    pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| Add::to_schema().leaves(ADD_NAME));
-        NAMES_AND_TYPES.as_ref()
     }
 }
 
 impl RowVisitor for RowTrackingVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        Self::names_and_types()
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| write_result_schema().leaves(None));
+        NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Add action
-            if let Some(path) = getters[0].get_opt(i, "add.path")? {
+            if let Some(path) = getters[0].get_opt(i, "path")? {
                 let add = self.visit_add(i, path, getters)?;
                 self.adds.push(add);
             }
@@ -135,7 +118,8 @@ impl RowVisitor for RowTrackingVisitor {
 pub(crate) const ROW_TRACKING_DOMAIN: &str = "delta.rowTracking";
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize, Serialize)]
-#[cfg_attr(test, serde(rename_all = "camelCase"))]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct RowTrackingDomainConfiguration {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) row_id_high_water_mark: Option<i64>,
 }
