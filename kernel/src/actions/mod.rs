@@ -67,13 +67,6 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
-        ADD_NAME,
-        Add::to_schema(),
-    )]))
-});
-
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new([
         StructField::nullable(ADD_NAME, Add::to_schema()),
@@ -87,6 +80,13 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
     ]))
+});
+
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        ADD_NAME,
+        Add::to_schema(),
+    )]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -740,6 +740,60 @@ impl Add {
     }
 }
 
+impl IntoEngineData for Add {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let partition_values = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, true),
+            self.partition_values,
+        )
+        .map(Scalar::Map)?;
+
+        let tags = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.tags.unwrap_or_default(),
+        )
+        .map(Scalar::Map)?;
+
+        let (storage_type, path_or_inline_dv, offset, size_in_bytes, cardinality) =
+            if let Some(dv) = self.deletion_vector {
+                (
+                    Some(dv.storage_type),
+                    Some(dv.path_or_inline_dv),
+                    dv.offset,
+                    Some(dv.size_in_bytes),
+                    Some(dv.cardinality),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
+        let values = [
+            Scalar::from(self.path),
+            partition_values,
+            Scalar::from(self.size),
+            Scalar::from(self.modification_time),
+            Scalar::from(self.data_change),
+            Scalar::from(self.stats),
+            tags,
+            Scalar::from(storage_type),
+            Scalar::from(path_or_inline_dv),
+            Scalar::from(offset),
+            Scalar::from(size_in_bytes),
+            Scalar::from(cardinality),
+            Scalar::from(self.base_row_id),
+            Scalar::from(self.default_row_commit_version),
+            Scalar::from(self.clustering_provider),
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
@@ -935,6 +989,23 @@ impl DomainMetadata {
     }
 }
 
+impl IntoEngineData for DomainMetadata {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let domain = Scalar::from(self.domain);
+        let configuration = Scalar::from(self.configuration);
+        let removed = Scalar::from(self.removed);
+
+        let values = [domain, configuration, removed];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,10 +1013,10 @@ mod tests {
     use crate::arrow::json::ReaderBuilder;
     use crate::{
         arrow::array::{
-            Array, Int32Array, Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-            StructArray,
+            Array, BooleanArray, Int32Array, Int64Array, MapBuilder, MapFieldNames, StringArray,
+            StringBuilder, StructArray,
         },
-        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
+        arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema},
         arrow::record_batch::RecordBatch,
         engine::arrow_data::ArrowEngineData,
         engine::arrow_expression::ArrowEvaluationHandler,
@@ -980,6 +1051,25 @@ mod tests {
         fn storage_handler(&self) -> Arc<dyn StorageHandler> {
             unimplemented!()
         }
+    }
+
+    fn create_string_map_builder(
+        nullable_values: bool,
+    ) -> MapBuilder<StringBuilder, StringBuilder> {
+        MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        )
+        .with_values_field(Field::new(
+            "value".to_string(),
+            ArrowDataType::Utf8,
+            nullable_values,
+        ))
     }
 
     #[test]
@@ -1430,16 +1520,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let mut map_builder = MapBuilder::new(
-            Some(MapFieldNames {
-                entry: "key_value".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            }),
-            StringBuilder::new(),
-            StringBuilder::new(),
-        )
-        .with_values_field(Field::new("value".to_string(), ArrowDataType::Utf8, false));
+        let mut map_builder = create_string_map_builder(false);
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
 
@@ -1453,6 +1534,199 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_add_into_engine_data_empty_dv() {
+        let engine = ExprEngine::new();
+
+        let add = Add {
+            path: "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet".to_string(),
+            partition_values: HashMap::from([("year".to_string(), "2021".to_string())]),
+            size: 12345,
+            modification_time: 1234567890,
+            data_change: true,
+            stats: Some("{\"numRecords\":10}".to_string()),
+            tags: Some(HashMap::from([("tag1".to_string(), "value1".to_string())])),
+            deletion_vector: None,
+            base_row_id: Some(100),
+            default_row_commit_version: Some(1),
+            clustering_provider: Some("hilbert".to_string()),
+        };
+
+        let engine_data = add.into_engine_data(Add::to_schema().into(), &engine);
+
+        let record_batch: RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let mut partition_values_builder = create_string_map_builder(true);
+        partition_values_builder.keys().append_value("year");
+        partition_values_builder.values().append_value("2021");
+        partition_values_builder.append(true).unwrap();
+        let partition_values = Arc::new(partition_values_builder.finish());
+
+        let mut tags_builder = create_string_map_builder(false);
+        tags_builder.keys().append_value("tag1");
+        tags_builder.values().append_value("value1");
+        tags_builder.append(true).unwrap();
+        let tags = Arc::new(tags_builder.finish());
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet",
+                ])),
+                partition_values,
+                Arc::new(Int64Array::from(vec![12345])),
+                Arc::new(Int64Array::from(vec![1234567890])),
+                Arc::new(BooleanArray::from(vec![true])),
+                Arc::new(StringArray::from(vec![Some("{\"numRecords\":10}")])),
+                tags,
+                Arc::new(StructArray::new_null(
+                    Fields::from(vec![
+                        Field::new("storageType", ArrowDataType::Utf8, false),
+                        Field::new("pathOrInlineDv", ArrowDataType::Utf8, false),
+                        Field::new("offset", ArrowDataType::Int32, true),
+                        Field::new("sizeInBytes", ArrowDataType::Int32, false),
+                        Field::new("cardinality", ArrowDataType::Int64, false),
+                    ]),
+                    1,
+                )),
+                Arc::new(Int64Array::from(vec![Some(100)])),
+                Arc::new(Int64Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("hilbert")])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_add_into_engine_data_with_dv() {
+        let engine = ExprEngine::new();
+
+        let add = Add {
+            path: "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet".to_string(),
+            partition_values: HashMap::from([("year".to_string(), "SHOULD_BE_NONE".to_string())]), // TODO: test with None values
+            size: 12345,
+            modification_time: 1234567890,
+            data_change: false,
+            stats: None,
+            tags: None,
+            deletion_vector: Some(DeletionVectorDescriptor {
+                storage_type: "inline".to_string(),
+                path_or_inline_dv: "inline_dv_data".to_string(),
+                offset: None,
+                size_in_bytes: 100,
+                cardinality: 10,
+            }),
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+        };
+
+        let engine_data = add.into_engine_data(Add::to_schema().into(), &engine);
+
+        let record_batch: RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let mut partition_values_builder = create_string_map_builder(true);
+        partition_values_builder.keys().append_value("year");
+        partition_values_builder
+            .values()
+            .append_value("SHOULD_BE_NONE");
+        partition_values_builder.append(true).unwrap();
+        let partition_values = Arc::new(partition_values_builder.finish());
+
+        let mut tags_builder = create_string_map_builder(false);
+        tags_builder.append(true).unwrap();
+        let tags = Arc::new(tags_builder.finish());
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet",
+                ])),
+                partition_values,
+                Arc::new(Int64Array::from(vec![12345])),
+                Arc::new(Int64Array::from(vec![1234567890])),
+                Arc::new(BooleanArray::from(vec![false])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+                tags,
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(Field::new("storageType", ArrowDataType::Utf8, false)),
+                        Arc::new(StringArray::from(vec!["inline"])) as Arc<dyn Array>,
+                    ),
+                    (
+                        Arc::new(Field::new("pathOrInlineDv", ArrowDataType::Utf8, false)),
+                        Arc::new(StringArray::from(vec!["inline_dv_data"])) as Arc<dyn Array>,
+                    ),
+                    (
+                        Arc::new(Field::new("offset", ArrowDataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![None::<i32>])) as Arc<dyn Array>,
+                    ),
+                    (
+                        Arc::new(Field::new("sizeInBytes", ArrowDataType::Int32, false)),
+                        Arc::new(Int32Array::from(vec![100])) as Arc<dyn Array>,
+                    ),
+                    (
+                        Arc::new(Field::new("cardinality", ArrowDataType::Int64, false)),
+                        Arc::new(Int64Array::from(vec![10])) as Arc<dyn Array>,
+                    ),
+                ])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_domain_metadata_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let domain_metadata = DomainMetadata {
+            domain: "my.domain".to_string(),
+            configuration: "config_value".to_string(),
+            removed: false,
+        };
+
+        let engine_data =
+            domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
+
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["my.domain"])),
+                Arc::new(StringArray::from(vec!["config_value"])),
+                Arc::new(BooleanArray::from(vec![false])),
             ],
         )
         .unwrap();
