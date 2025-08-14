@@ -331,7 +331,7 @@ fn get_add_transform_expr() -> Expression {
         column_expr_ref!("add.modificationTime"),
         column_expr_ref!("add.stats"),
         column_expr_ref!("add.deletionVector"),
-        std::sync::Arc::new(Expression::Struct(vec![column_expr_ref!(
+        Arc::new(Expression::Struct(vec![column_expr_ref!(
             "add.partitionValues"
         )])),
     ])
@@ -341,7 +341,7 @@ fn get_add_transform_expr() -> Expression {
 #[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
     use crate::expressions::column_expr_ref;
-    Expression::Struct(vec![std::sync::Arc::new(Expression::Struct(vec![
+    Expression::Struct(vec![Arc::new(Expression::Struct(vec![
         column_expr_ref!("path"),
         column_expr_ref!("fileConstantValues.partitionValues"),
         column_expr_ref!("size"),

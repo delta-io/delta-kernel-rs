@@ -327,7 +327,7 @@ fn visit_expression_struct(
     sibling_list_id: usize,
 ) {
     let child_list_id = call!(visitor, make_field_list, exprs.len());
-    for expr in exprs.iter() {
+    for expr in exprs {
         visit_expression_impl(visitor, expr, child_list_id);
     }
     call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
