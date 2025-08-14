@@ -334,7 +334,7 @@ pub fn get_transform_for_row(
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// `Transform`.
 pub(crate) enum TransformExpr {
-    Static(Expression),
+    Static(ExpressionRef),
     Partition(usize),
 }
 
@@ -452,7 +452,7 @@ impl Scan {
             .iter()
             .map(|field| match field {
                 ColumnType::Selected(col_name) => {
-                    TransformExpr::Static(ColumnName::new([col_name]).into())
+                    TransformExpr::Static(Arc::new(ColumnName::new([col_name]).into()))
                 }
                 ColumnType::Partition(idx) => TransformExpr::Partition(*idx),
             })

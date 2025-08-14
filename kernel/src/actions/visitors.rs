@@ -1085,7 +1085,10 @@ mod tests {
                 get_log_schema().clone(),
                 Expression::Struct(vec![Expression::Struct(vec![column_expr!(
                     "commitInfo.inCommitTimestamp"
-                )])]),
+                )
+                .into()])
+                .into()])
+                .into(),
                 InCommitTimestampVisitor::schema().into(),
             )
             .evaluate(batch.as_ref())

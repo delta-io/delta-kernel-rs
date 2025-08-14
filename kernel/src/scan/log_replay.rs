@@ -9,9 +9,7 @@ use super::{ScanMetadata, Transform};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{
-    column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
-};
+use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
@@ -172,7 +170,7 @@ impl AddRemoveDedupVisitor<'_> {
                             "missing partition value for field index {field_idx}"
                         )));
                     };
-                    Ok(partition_value.into())
+                    Ok(Arc::new(partition_value.into()))
                 }
                 TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
             })
@@ -333,7 +331,9 @@ fn get_add_transform_expr() -> Expression {
         column_expr_ref!("add.modificationTime"),
         column_expr_ref!("add.stats"),
         column_expr_ref!("add.deletionVector"),
-        std::sync::Arc::new(Expression::Struct(vec![column_expr_ref!("add.partitionValues")])),
+        std::sync::Arc::new(Expression::Struct(vec![column_expr_ref!(
+            "add.partitionValues"
+        )])),
     ])
 }
 
@@ -527,12 +527,12 @@ mod tests {
             };
             assert_eq!(inner.len(), 2, "expected two items in transform struct");
 
-            let Expr::Column(ref name) = inner[0] else {
+            let Expr::Column(ref name) = inner[0].as_ref() else {
                 panic!("Expected first expression to be a column");
             };
             assert_eq!(name, &column_name!("value"), "First col should be 'value'");
 
-            let Expr::Literal(ref scalar) = inner[1] else {
+            let Expr::Literal(ref scalar) = inner[1].as_ref() else {
                 panic!("Expected second expression to be a literal");
             };
             assert_eq!(
