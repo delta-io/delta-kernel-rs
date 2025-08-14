@@ -4,7 +4,7 @@ use std::ffi::c_void;
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    Expression, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression,
+    Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression,
     OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate, Scalar, StructData,
     UnaryPredicate, UnaryPredicateOp,
 };
@@ -323,11 +323,11 @@ fn visit_expression_struct_literal(
 
 fn visit_expression_struct(
     visitor: &mut EngineExpressionVisitor,
-    exprs: &[Expression],
+    exprs: &[ExpressionRef],
     sibling_list_id: usize,
 ) {
     let child_list_id = call!(visitor, make_field_list, exprs.len());
-    for expr in exprs {
+    for expr in exprs.iter() {
         visit_expression_impl(visitor, expr, child_list_id);
     }
     call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
