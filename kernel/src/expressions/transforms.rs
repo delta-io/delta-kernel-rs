@@ -191,11 +191,8 @@ pub trait ExpressionTransform<'a> {
         fields: &'a [ExpressionRef],
     ) -> Option<Cow<'a, [ExpressionRef]>> {
         recurse_into_children(fields, |f| {
-            // Transform the Arc<Expression> by dereferencing it first
-            self.transform_expr(f).map(|cow| match cow {
-                Cow::Borrowed(_) => Cow::Borrowed(f),
-                Cow::Owned(expr) => Cow::Owned(Arc::new(expr)),
-            })
+            self.transform_expr(f)
+                .map(|cow| cow.map_owned_or_else(f, Arc::new))
         })
     }
 

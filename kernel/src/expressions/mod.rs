@@ -408,8 +408,8 @@ impl Expression {
     }
 
     /// Create a new struct expression
-    pub fn struct_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::Struct(exprs.into_iter().map(Arc::new).collect())
+    pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
+        Self::Struct(exprs.into_iter().map(Into::into).collect())
     }
 
     /// Create a new predicate `self IS NULL`
