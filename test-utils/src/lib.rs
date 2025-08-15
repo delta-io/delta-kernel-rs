@@ -278,6 +278,24 @@ pub async fn create_table(
             }
         })
     };
+    // TODO: Compose the configuration of individual components instead of static if/else blocks
+    // once this becomes more complex
+    let configuration = if enable_column_mapping && enable_row_tracking {
+        json!({
+            "delta.columnMapping.mode": "name",
+            "delta.materializedRowIdColumnName": "some_dummy_column_name",
+            "delta.materializedRowCommitVersionColumnName": "another_dummy_column_name",
+        })
+    } else if enable_column_mapping {
+        json!({"delta.columnMapping.mode": "name"})
+    } else if enable_row_tracking {
+        json!({
+            "delta.materializedRowIdColumnName": "some_dummy_column_name",
+            "delta.materializedRowCommitVersionColumnName": "another_dummy_column_name",
+        })
+    } else {
+        json!({})
+    };
     let metadata = json!({
         "metaData": {
             "id": table_id,
@@ -287,9 +305,8 @@ pub async fn create_table(
             },
             "schemaString": schema,
             "partitionColumns": partition_columns,
-            // TODO: Isn't this an issue if enable_column_mapping is false?
-            "configuration": {"delta.columnMapping.mode": "name"},
-            "createdTime": 1677811175819u64
+            "configuration": configuration,
+            "createdTime": 1677811175819u64,
         }
     });
 
