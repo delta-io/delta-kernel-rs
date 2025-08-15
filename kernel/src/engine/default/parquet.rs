@@ -24,8 +24,8 @@ use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::parquet_write_response_schema;
 use crate::schema::SchemaRef;
-use crate::transaction::write_result_schema;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -38,22 +38,16 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     readahead: usize,
 }
 
-/// Metadata of a data file (typically a parquet file), currently just includes the file metadata
-/// but will expand to include file statistics and other metadata in the future.
+/// Metadata of a data file (typically a parquet file).
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
-    num_records: u64,
-    schema: SchemaRef,
+    stats: String,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta, num_records: u64) -> Self {
-        Self {
-            file_meta,
-            num_records,
-            schema: write_result_schema().clone(),
-        }
+    pub fn new(file_meta: FileMeta, stats: String) -> Self {
+        Self { file_meta, stats }
     }
 
     // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
@@ -69,28 +63,25 @@ impl DataFileMetadata {
                     last_modified,
                     size,
                 },
-            num_records,
-            schema,
+            stats,
         } = self;
 
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
+        let key_builder = StringBuilder::new();
+        let val_builder = StringBuilder::new();
         let names = MapFieldNames {
             entry: "key_value".to_string(),
             key: "key".to_string(),
             value: "value".to_string(),
         };
-        let mut partition_builder = MapBuilder::new(
-            Some(names.clone()),
-            StringBuilder::new(),
-            StringBuilder::new(),
-        );
+        let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
         for (k, v) in partition_values {
-            partition_builder.keys().append_value(k);
-            partition_builder.values().append_value(v);
+            builder.keys().append_value(k);
+            builder.values().append_value(v);
         }
-        partition_builder.append(true)?;
-        let partitions = Arc::new(partition_builder.finish());
+        builder.append(true)?;
+        let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
         let size: i64 = (*size)
             .try_into()
@@ -98,21 +89,17 @@ impl DataFileMetadata {
         let size = Arc::new(Int64Array::from(vec![size]));
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-
-        let stats = Statistics::new(*num_records);
-        let stats_str = serde_json::to_string(&stats)
-            .map_err(|e| Error::generic(format!("Failed to serialize stats: {e}")))?;
-        let stats_array = Arc::new(StringArray::from(vec![stats_str]));
+        let stats = Arc::new(StringArray::from(vec![stats.as_ref()]));
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow()?),
+            Arc::new(parquet_write_response_schema().as_ref().try_into_arrow()?),
             vec![
                 path,
                 partitions,
                 size,
                 modification_time,
                 data_change,
-                stats_array,
+                stats,
             ],
         )?)))
     }
@@ -185,8 +172,12 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             )));
         }
 
+        let stats = Statistics::new(num_records as u64);
+        let stats_str = serde_json::to_string(&stats)
+            .map_err(|e| Error::generic(format!("Failed to serialize stats: {e}")))?;
+
         let file_meta = FileMeta::new(path, modification_time, size);
-        Ok(DataFileMetadata::new(file_meta, num_records as u64))
+        Ok(DataFileMetadata::new(file_meta, stats_str))
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
@@ -495,17 +486,16 @@ mod tests {
         let size = 1_000_000;
         let last_modified = 10000000000;
         let num_records = 10;
+        let stats = Statistics::new(num_records);
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
-        let data_file_metadata = DataFileMetadata::new(file_metadata, num_records);
+        let data_file_metadata =
+            DataFileMetadata::new(file_metadata, serde_json::to_string(&stats).unwrap());
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let data_change = true;
         let actual = data_file_metadata
             .as_record_batch(&partition_values, data_change)
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
-
-        let parquet_add_file_schema =
-            Arc::new(write_result_schema().as_ref().try_into_arrow().unwrap());
 
         let field_names = MapFieldNames {
             entry: "key_value".to_string(),
@@ -522,11 +512,15 @@ mod tests {
         partition_builder.append(true).unwrap();
         let partition_values = partition_builder.finish();
 
-        let stats = Statistics::new(num_records);
-        let stats_str = serde_json::to_string(&stats).expect("Failed to serialize stats to JSON");
+        let stats_str = r#"{"numRecords":10}"#;
 
         let expected = RecordBatch::try_new(
-            parquet_add_file_schema,
+            Arc::new(
+                parquet_write_response_schema()
+                    .as_ref()
+                    .try_into_arrow()
+                    .unwrap(),
+            ),
             vec![
                 Arc::new(StringArray::from(vec![location.to_string()])),
                 Arc::new(partition_values),
@@ -567,7 +561,7 @@ mod tests {
                     last_modified,
                     size,
                 },
-            ..
+            stats,
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 
@@ -590,6 +584,10 @@ mod tests {
         assert_eq!(&expected_location.join(filename).unwrap(), location);
         assert_eq!(expected_size, size);
         assert!(now - last_modified < 10_000);
+
+        // check that statistics are correctly written
+        let expected_stats = Statistics::new(3);
+        assert_eq!(stats, serde_json::to_string(&expected_stats).unwrap());
 
         // check we can read back
         let path = Path::from_url_path(location.path()).unwrap();

@@ -33,7 +33,7 @@ pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteCon
     write_context.drop_handle();
 }
 
-/// Get the snapshot logical schema from WriteContext handle. The schema must be freed when no
+/// Get the logical snapshot schema from WriteContext handle. The schema must be freed when no
 /// longer needed via [`free_schema`].
 ///
 /// # Safety
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn get_write_schema(
     write_context: Handle<SharedWriteContext>,
 ) -> Handle<SharedSchema> {
     let write_context = unsafe { write_context.as_ref() };
-    write_context.snapshot_schema().clone().into()
+    write_context.schema().clone().into()
 }
 
 /// Get write path from WriteContext handle.

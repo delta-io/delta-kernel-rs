@@ -1,8 +1,8 @@
 use crate::actions::stats::Statistics;
 use crate::actions::Add;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::parquet_write_response_schema;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
-use crate::transaction::write_result_schema;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::{internal_api, ToSchema};
@@ -99,7 +99,7 @@ impl RowTrackingVisitor {
 impl RowVisitor for RowTrackingVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| write_result_schema().leaves(None));
+            LazyLock::new(|| parquet_write_response_schema().leaves(None));
         NAMES_AND_TYPES.as_ref()
     }
 

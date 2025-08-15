@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::iter;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::domain_metadata::domain_metadata_configuration;
@@ -9,40 +9,16 @@ use crate::actions::{
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
 use crate::error::Error;
+use crate::parquet_write_response_schema;
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{
     RowTrackingDomainConfiguration, RowTrackingVisitor, ROW_TRACKING_DOMAIN,
 };
-use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
 use crate::{DeltaResult, Engine, EngineData, Expression, IntoEngineData, RowVisitor, Version};
 
 use url::Url;
-
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata)
-/// **as they are provided by the Parquet handler**. Concretely, it is the expected schema for
-/// engine data passed to [`add_files`]. Each row represents metadata about a file to be added to the table.
-/// Kernel-rs takes this information and extends it to the full add_file metadata schema, adding
-/// additional fields (e.g., baseRowID) as necessary.
-///
-/// [`add_files`]: crate::transaction::Transaction::add_files
-pub(crate) static WRITE_RESULT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new(vec![
-        StructField::not_null("path", DataType::STRING),
-        StructField::not_null(
-            "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::not_null("size", DataType::LONG),
-        StructField::not_null("modificationTime", DataType::LONG),
-        StructField::not_null("dataChange", DataType::BOOLEAN),
-        StructField::nullable("stats", DataType::STRING),
-    ]))
-});
-
-pub(crate) fn write_result_schema() -> &'static SchemaRef {
-    &WRITE_RESULT_SCHEMA
-}
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -298,7 +274,7 @@ impl Transaction {
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
     ///
-    /// The expected schema for `add_files` is given by [`parquet_add_file_schema`].
+    /// The expected schema for `add_files` is given by [`parquet_write_response_schema`].
     pub fn add_files(&mut self, add_files: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_files);
     }
@@ -315,12 +291,12 @@ impl Transaction {
 
         add_files_metadata.map(move |add_files_batch| {
             let adds_expr = Expression::struct_from([Expression::struct_from(
-                write_result_schema()
+                parquet_write_response_schema()
                     .fields()
                     .map(|f| Expression::column([f.name()])),
             )]);
             let adds_evaluator = evaluation_handler.new_expression_evaluator(
-                write_result_schema().clone(),
+                parquet_write_response_schema().clone(),
                 adds_expr,
                 log_schema.clone().into(),
             );
@@ -335,17 +311,15 @@ impl Transaction {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    snapshot_schema: SchemaRef,
-    parquet_add_file_schema: SchemaRef,
+    schema: SchemaRef,
     logical_to_physical: Expression,
 }
 
 impl WriteContext {
-    fn new(target_dir: Url, snapshot_schema: SchemaRef, logical_to_physical: Expression) -> Self {
+    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: Expression) -> Self {
         WriteContext {
             target_dir,
-            snapshot_schema,
-            parquet_add_file_schema: WRITE_RESULT_SCHEMA.clone(),
+            schema,
             logical_to_physical,
         }
     }
@@ -355,15 +329,8 @@ impl WriteContext {
     }
 
     /// Get the logical schema of the read snapshot that this transaction is based on.
-    pub fn snapshot_schema(&self) -> &SchemaRef {
-        &self.snapshot_schema
-    }
-
-    /// Get the expected schema for engine data passed to [`add_files`].
-    ///
-    /// [`add_files`]: crate::transaction::Transaction::add_files
-    pub fn parquet_add_file_schema(&self) -> &SchemaRef {
-        &self.parquet_add_file_schema
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     pub fn logical_to_physical(&self) -> &Expression {
@@ -405,21 +372,13 @@ pub enum CommitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::sync::SyncEngine;
-    use crate::schema::MapType;
-    use std::path::PathBuf;
+    use crate::schema::{DataType, MapType, StructField, StructType};
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
     fn test_parquet_add_file_schema() -> DeltaResult<()> {
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/"))?;
-        let url = Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
-        let snapshot = Snapshot::try_new(url, &engine, None)?;
-        let txn = Transaction::try_new(snapshot)?;
-        let ctx = txn.get_write_context();
-        let schema = ctx.parquet_add_file_schema();
+        let schema = parquet_write_response_schema();
 
         let expected = StructType::new(vec![
             StructField::not_null("path", DataType::STRING),
@@ -431,26 +390,6 @@ mod tests {
             StructField::not_null("modificationTime", DataType::LONG),
             StructField::not_null("dataChange", DataType::BOOLEAN),
             StructField::nullable("stats", DataType::STRING),
-            // StructField::nullable(
-            //     "tags",
-            //     MapType::new(DataType::STRING, DataType::STRING, false),
-            // ),
-            // StructField::nullable(
-            //     "deletionVector",
-            //     StructType::new(vec![
-            //         StructField::not_null("storageType", DataType::STRING),
-            //         StructField::not_null("pathOrInlineDv", DataType::STRING),
-            //         StructField::nullable("offset", DataType::INTEGER),
-            //         StructField::not_null("sizeInBytes", DataType::INTEGER),
-            //         StructField::not_null("cardinality", DataType::LONG),
-            //         // TODO: Should derived fields be present here?
-            //         // StructField::not_null("uniqueID", DataType::STRING),
-            //         // StructField::not_null("abslutePath", DataType::STRING),
-            //     ]),
-            // ),
-            // StructField::nullable("baseRowId", DataType::LONG),
-            // StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-            // StructField::nullable("clusteringProvider", DataType::STRING),
         ]);
         assert_eq!(*schema, expected.into());
         Ok(())
