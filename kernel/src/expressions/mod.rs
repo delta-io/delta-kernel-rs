@@ -7,7 +7,8 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 pub use self::column_names::{
-    column_expr, column_name, column_pred, joined_column_expr, joined_column_name, ColumnName,
+    column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
+    ColumnName,
 };
 pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
 use self::transforms::{ExpressionTransform as _, GetColumnReferences};
@@ -255,9 +256,9 @@ pub enum Expression {
     /// A column reference by name.
     Column(ColumnName),
     /// A predicate treated as a boolean expression
-    Predicate(Box<Predicate>),
+    Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions
-    Struct(Vec<Expression>),
+    Struct(Vec<ExpressionRef>),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
@@ -407,8 +408,8 @@ impl Expression {
     }
 
     /// Create a new struct expression
-    pub fn struct_from(exprs: impl IntoIterator<Item = Self>) -> Self {
-        Self::Struct(exprs.into_iter().collect())
+    pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
+        Self::Struct(exprs.into_iter().map(Into::into).collect())
     }
 
     /// Create a new predicate `self IS NULL`

@@ -1,9 +1,10 @@
 use std::borrow::{Cow, ToOwned};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, JunctionPredicate, OpaqueExpression,
-    OpaquePredicate, Predicate, Scalar, UnaryPredicate,
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryPredicate,
 };
 use crate::utils::CowExt as _;
 
@@ -39,7 +40,10 @@ pub trait ExpressionTransform<'a> {
     /// Called for the expression list of each [`Expression::Struct`] encountered during the
     /// traversal. Implementations can call [`Self::recurse_into_expr_struct`] if they wish to
     /// recursively transform the child expressions.
-    fn transform_expr_struct(&mut self, fields: &'a [Expression]) -> Option<Cow<'a, [Expression]>> {
+    fn transform_expr_struct(
+        &mut self,
+        fields: &'a [ExpressionRef],
+    ) -> Option<Cow<'a, [ExpressionRef]>> {
         self.recurse_into_expr_struct(fields)
     }
 
@@ -184,9 +188,12 @@ pub trait ExpressionTransform<'a> {
     /// `Some(Cow::Borrowed)` otherwise.
     fn recurse_into_expr_struct(
         &mut self,
-        fields: &'a [Expression],
-    ) -> Option<Cow<'a, [Expression]>> {
-        recurse_into_children(fields, |f| self.transform_expr(f))
+        fields: &'a [ExpressionRef],
+    ) -> Option<Cow<'a, [ExpressionRef]>> {
+        recurse_into_children(fields, |f| {
+            self.transform_expr(f)
+                .map(|cow| cow.map_owned_or_else(f, Arc::new))
+        })
     }
 
     /// Recursively transforms the children of an [`OpaqueExpression`]. Returns `None` if all
@@ -393,7 +400,10 @@ impl ExpressionDepthChecker {
 }
 
 impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
-    fn transform_expr_struct(&mut self, fields: &'a [Expression]) -> Option<Cow<'a, [Expression]>> {
+    fn transform_expr_struct(
+        &mut self,
+        fields: &'a [ExpressionRef],
+    ) -> Option<Cow<'a, [ExpressionRef]>> {
         self.depth_limited(Self::recurse_into_expr_struct, fields)
     }
 
