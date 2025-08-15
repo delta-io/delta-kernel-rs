@@ -265,7 +265,8 @@ impl Snapshot {
         self.table_configuration().version()
     }
 
-    /// Table [`Schema`] at this `Snapshot`s version.
+    /// Table [`Schema`] at this `Snapshot`s version. Note that this is the _logical_ schema
+    /// which may differ from the physical schema of the data files in storage.
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {

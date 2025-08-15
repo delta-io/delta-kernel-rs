@@ -1,5 +1,9 @@
 //! This module holds functionality for managing transactions.
-mod write_context;
+
+use std::sync::Arc;
+
+use delta_kernel::transaction::{CommitResult, Transaction};
+use delta_kernel_ffi_macros::handle_descriptor;
 
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
@@ -7,9 +11,8 @@ use crate::KernelStringSlice;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
-use delta_kernel::transaction::{CommitResult, Transaction};
-use delta_kernel_ffi_macros::handle_descriptor;
-use std::sync::Arc;
+
+mod write_context;
 
 /// A handle representing an exclusive transaction on a Delta table. (Similar to a Box<_>)
 ///
@@ -127,39 +130,38 @@ pub unsafe extern "C" fn commit(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::schema::{DataType, StructField, StructType};
-
-    use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
-    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use delta_kernel::arrow::ffi::to_ffi;
-    use delta_kernel::arrow::json::reader::ReaderBuilder;
-    use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
-    use delta_kernel::parquet::file::properties::WriterProperties;
-
-    use delta_kernel_ffi::engine_data::get_engine_data;
-    use delta_kernel_ffi::engine_data::ArrowFFIData;
-
-    use delta_kernel_ffi::ffi_test_utils::{allocate_str, ok_or_panic, recover_string};
-    use delta_kernel_ffi::tests::get_default_engine;
-
-    use crate::{free_engine, free_schema, kernel_string_slice};
-    use write_context::{free_write_context, get_write_context, get_write_path, get_write_schema};
-
-    use test_utils::{set_json_value, setup_test_tables, test_read};
+    use std::sync::Arc;
 
     use itertools::Itertools;
     use object_store::path::Path;
     use object_store::ObjectStore;
     use serde_json::json;
     use serde_json::Deserializer;
-
-    use std::sync::Arc;
-
-    use super::*;
-
     use tempfile::tempdir;
+
+    use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
+    use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+    use delta_kernel::arrow::ffi::to_ffi;
+    use delta_kernel::arrow::json::reader::ReaderBuilder;
+    use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
+    use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
+    use delta_kernel::parquet::file::properties::WriterProperties;
+    use delta_kernel::parquet_write_response_schema;
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use test_utils::{set_json_value, setup_test_tables, test_read};
+
+    use crate::engine_data::get_engine_data;
+    use crate::engine_data::ArrowFFIData;
+    use crate::ffi_test_utils::{allocate_str, ok_or_panic, recover_string};
+    use crate::tests::get_default_engine;
+    use crate::{free_engine, free_schema, kernel_string_slice};
+
+    use self::write_context::{
+        free_write_context, get_write_context, get_write_path, get_write_schema,
+    };
+    use super::*;
 
     fn create_arrow_ffi_from_json(
         schema: ArrowSchema,
@@ -183,38 +185,13 @@ mod tests {
         path: &str,
         num_rows: i64,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        let schema = ArrowSchema::new(vec![
-            Field::new("path", ArrowDataType::Utf8, false),
-            Field::new(
-                "partitionValues",
-                ArrowDataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        ArrowDataType::Struct(
-                            vec![
-                                Field::new("key", ArrowDataType::Utf8, false),
-                                Field::new("value", ArrowDataType::Utf8, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                false,
-            ),
-            Field::new("size", ArrowDataType::Int64, false),
-            Field::new("modificationTime", ArrowDataType::Int64, false),
-            Field::new("dataChange", ArrowDataType::Boolean, false),
-        ]);
-
+        let schema: ArrowSchema = parquet_write_response_schema().as_ref().try_into_arrow()?;
         let current_time: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": {{"numRecords":{num_rows}}}}}"#,
         );
 
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
@@ -362,7 +339,8 @@ mod tests {
                         "partitionValues": {},
                         "size": 0,
                         "modificationTime": 0,
-                        "dataChange": true
+                        "dataChange": true,
+                        "stats": "{\"numRecords\":5}"
                     }
                 }),
             ];

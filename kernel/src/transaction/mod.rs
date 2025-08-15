@@ -1,42 +1,19 @@
 use std::collections::HashSet;
 use std::iter;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use url::Url;
 
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
 use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
+use crate::expressions::UnaryExpressionOp;
+use crate::parquet_write_response_schema;
 use crate::path::ParsedLogPath;
-use crate::schema::{MapType, SchemaRef, StructField, StructType};
+use crate::schema::SchemaRef;
 use crate::snapshot::Snapshot;
-use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version,
-};
-
-use url::Url;
-
-pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new(vec![
-        StructField::not_null("path", DataType::STRING),
-        StructField::not_null(
-            "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, true),
-        ),
-        StructField::not_null("size", DataType::LONG),
-        StructField::not_null("modificationTime", DataType::LONG),
-        StructField::not_null("dataChange", DataType::BOOLEAN),
-    ]))
-});
-
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
-/// Concretely, it is the expected schema for engine data passed to [`add_files`].
-///
-/// Each row represents metadata about a file to be added to the table.
-///
-/// [`add_files`]: crate::transaction::Transaction::add_files
-pub fn add_files_schema() -> &'static SchemaRef {
-    &ADD_FILES_SCHEMA
-}
+use crate::{DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version};
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
@@ -236,34 +213,45 @@ impl Transaction {
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
     ///
-    /// The expected schema for `add_metadata` is given by [`add_files_schema`].
+    /// The expected schema for `add_metadata` is given by [`parquet_write_response_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
 }
 
-// convert add_files_metadata into add actions using an expression to transform the data in a single
-// pass
+/// Convert file metadata provided by the engine into protocol-compliant add actions.
+///
+/// Uses an expression to transform the data in a single pass.
 fn generate_adds<'a>(
     engine: &dyn Engine,
     add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
     let evaluation_handler = engine.evaluation_handler();
-    let add_files_schema = add_files_schema();
+    let write_response_schema = parquet_write_response_schema();
     let log_schema = get_log_add_schema();
 
     add_files_metadata.map(move |add_files_batch| {
-        let adds_expr = Expression::struct_from([Expression::struct_from(
-            add_files_schema
-                .fields()
-                .map(|f| Expression::column([f.name()])),
-        )]);
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            add_files_schema.clone(),
-            Arc::new(adds_expr),
+        // Create a struct expression that transforms all fields, converting the stats struct to JSON
+        let field_expressions: Vec<Expression> = write_response_schema
+            .fields()
+            .map(|f| {
+                let field_name = f.name();
+                if field_name == "stats" {
+                    Expression::unary(UnaryExpressionOp::ToJson, Expression::column([field_name]))
+                } else {
+                    Expression::column([field_name])
+                }
+            })
+            .collect();
+
+        let add_evaluator = evaluation_handler.new_expression_evaluator(
+            write_response_schema.clone(),
+            Arc::new(Expression::struct_from([Expression::struct_from(
+                field_expressions,
+            )])),
             log_schema.clone().into(),
         );
-        adds_evaluator.evaluate(add_files_batch)
+        add_evaluator.evaluate(add_files_batch)
     })
 }
 
@@ -333,13 +321,13 @@ pub enum CommitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::MapType;
+    use crate::schema::{DataType, MapType, StructField, StructType};
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
-    fn test_add_files_schema() {
-        let schema = add_files_schema();
+    fn test_parquet_write_response_schema() {
+        let schema = parquet_write_response_schema();
         let expected = StructType::new(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
@@ -349,6 +337,16 @@ mod tests {
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
             StructField::not_null("dataChange", DataType::BOOLEAN),
+            StructField::nullable(
+                "stats",
+                DataType::struct_type(vec![
+                    StructField::nullable("numRecords", DataType::LONG),
+                    StructField::nullable("tightBounds", DataType::BOOLEAN),
+                    StructField::nullable("minValues", DataType::STRING),
+                    StructField::nullable("maxValues", DataType::STRING),
+                    StructField::nullable("nullCount", DataType::STRING),
+                ]),
+            ),
         ]);
         assert_eq!(*schema, expected.into());
     }
