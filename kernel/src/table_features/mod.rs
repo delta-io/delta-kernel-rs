@@ -37,7 +37,8 @@ mod timestamp_ntz;
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum ReaderFeature {
-    /// CatalogManaged tables: https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md
+    /// CatalogManaged tables:
+    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
     CatalogManaged,
     #[strum(serialize = "catalogOwned-preview")]
     #[serde(rename = "catalogOwned-preview")]
@@ -95,7 +96,8 @@ pub(crate) enum ReaderFeature {
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum WriterFeature {
-    /// CatalogManaged tables: https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md
+    /// CatalogManaged tables:
+    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
     CatalogManaged,
     #[strum(serialize = "catalogOwned-preview")]
     #[serde(rename = "catalogOwned-preview")]
