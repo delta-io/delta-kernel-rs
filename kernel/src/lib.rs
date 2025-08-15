@@ -611,8 +611,8 @@ pub trait ParquetHandler: AsAny {
     /// Parquet columns are matched to `physical_schema` [`StructField`]s using the following rules:
     /// 1. **Field ID**: If a [`StructField`] in `physical_schema` contains a field ID
     ///    (specified in [`ColumnMetadataKey::ParquetFieldId`] metadata), use the ID to
-    ///    match the Parquet column
-    /// 2. **Field Name**: If no field ID is present or no matching field ID is found,
+    ///    match the Parquet column's field id
+    /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or no matching parquet field ID is found,
     ///    fall back to matching by column name
     ///
     ///  If no matching Parquet column is found, `NULL` values are returned
@@ -646,7 +646,7 @@ pub trait ParquetHandler: AsAny {
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
     ///
     /// # Returns
-    /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`]. This is an boxed Iterator.
+    /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
     /// Each element of the iterator is a [`DeltaResult`] of [`EngineData`]. The [`EngineData`]
     /// has the contents of `files` and must match the provided `physical_schema`.
     ///

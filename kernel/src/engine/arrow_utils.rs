@@ -308,7 +308,6 @@ fn get_indices(
     // for each field, get its position in the parquet (via enumerate), a reference to the arrow
     // field, and info about where it appears in the requested_schema, or None if the field is not
     // requested
-
     let all_field_info = get_field_infos(requested_schema, fields);
     for MatchedParquetField {
         parquet_index,
@@ -532,7 +531,7 @@ struct MatchedParquetField<'p, 'k> {
 }
 
 /// Constructs an iterator where each parquet Field in `fields` is matched
-/// with a a kernel `KernelFieldInfo` reperesenting a StructField.
+/// with a a kernel `KernelFieldInfo` representing a StructField.
 ///
 /// The iterator returned has a [`MatchedParquetField`] for each element in `parquet_fields`.
 fn get_field_infos<'k, 'p>(
