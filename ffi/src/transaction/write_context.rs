@@ -33,8 +33,8 @@ pub unsafe extern "C" fn free_write_context(write_context: Handle<SharedWriteCon
     write_context.drop_handle();
 }
 
-/// Get schema from WriteContext handle. The schema must be freed when no longer needed via
-/// [`free_schema`].
+/// Get the logical snapshot schema from WriteContext handle. The schema must be freed when no
+/// longer needed via [`free_schema`].
 ///
 /// # Safety
 /// Engine is responsible for providing a valid WriteContext pointer
