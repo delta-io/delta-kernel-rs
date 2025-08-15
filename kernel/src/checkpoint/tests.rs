@@ -7,7 +7,6 @@ use crate::arrow::datatypes::{DataType, Schema};
 use crate::checkpoint::{create_last_checkpoint_data, deleted_file_retention_timestamp_with_time};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, Snapshot};
 
@@ -16,6 +15,7 @@ use arrow_56::{
     datatypes::Field,
 };
 
+use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;

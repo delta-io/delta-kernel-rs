@@ -4,10 +4,9 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
 use itertools::Itertools;
+use object_store::path::Path;
+use object_store::{DynObjectStore, ObjectStore};
 use url::Url;
-
-use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStore};
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
@@ -183,16 +182,15 @@ mod tests {
     use std::ops::Range;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::{local::LocalFileSystem, ObjectStore};
+    use itertools::Itertools;
+    use object_store::memory::InMemory;
+    use object_store::{local::LocalFileSystem, ObjectStore};
 
     use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::Engine as _;
-
-    use itertools::Itertools;
 
     use super::*;
 
