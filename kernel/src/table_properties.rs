@@ -288,8 +288,14 @@ mod tests {
             ("delta.tuneFileSizesForRewrites", "true"),
             ("delta.checkpointPolicy", "v2"),
             ("delta.enableRowTracking", "true"),
-            ("delta.rowTracking.materializedRowIdColumnName", "_row-id-col-some_uuid"),
-            ("delta.rowTracking.materializedRowCommitVersionColumnName", "_row-commit-version-col-some_uuid"),
+            (
+                "delta.rowTracking.materializedRowIdColumnName",
+                "_row-id-col-some_uuid",
+            ),
+            (
+                "delta.rowTracking.materializedRowCommitVersionColumnName",
+                "_row-commit-version-col-some_uuid",
+            ),
             ("delta.enableInCommitTimestamps", "true"),
             ("delta.inCommitTimestampEnablementVersion", "15"),
             ("delta.inCommitTimestampEnablementTimestamp", "1612345678"),
@@ -319,7 +325,9 @@ mod tests {
             checkpoint_policy: Some(CheckpointPolicy::V2),
             enable_row_tracking: Some(true),
             materialized_row_id_column_name: Some("_row-id-col-some_uuid".to_string()),
-            materialized_row_commit_version_column_name: Some("_row-commit-version-col-some_uuid".to_string()),
+            materialized_row_commit_version_column_name: Some(
+                "_row-commit-version-col-some_uuid".to_string(),
+            ),
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),
