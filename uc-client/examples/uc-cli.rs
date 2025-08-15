@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use uc_client::{
-    models::{credentials::Operation, CommitsRequest},
+    models::{commits::Commit, credentials::Operation, CommitsRequest},
     UCClient,
 };
 
@@ -99,24 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match client.get_table(&name).await {
                 Ok(table) => {
                     println!("\n✓ Table metadata retrieved successfully\n");
-                    println!("Full Name:        {}", table.full_name());
-                    println!("Catalog:          {}", table.catalog_name);
-                    println!("Schema:           {}", table.schema_name);
-                    println!("Table Name:       {}", table.name);
-                    println!("Type:             {}", table.table_type);
-                    println!("Format:           {}", table.data_source_format);
-                    println!("Storage Location: {}", table.storage_location);
-                    println!("Owner:            {}", table.owner);
-                    println!("Table ID:         {}", table.table_id);
-                    println!("Is Delta Table:   {}", table.is_delta_table());
-                    println!("Is Managed:       {}", table.is_managed_table());
-
-                    if !table.properties.is_empty() {
-                        println!("\nProperties:");
-                        for (key, value) in &table.properties {
-                            println!("  {}: {}", key, value);
-                        }
-                    }
+                    println!("{}", table);
                 }
                 Err(e) => {
                     eprintln!("✗ Failed to get table: {}", e);
@@ -167,33 +150,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Latest Version:  {}", response.latest_table_version);
 
                     if let Some(commits) = response.commits {
-                        println!("\nCommits ({} total):", commits.len());
-                        println!(
-                            "{:<8} {:<20} {:<40} {:<15}",
-                            "Version", "Timestamp", "File Name", "Size"
-                        );
-                        println!("{}", "-".repeat(85));
-
-                        for commit in commits {
-                            let timestamp_str = commit
-                                .timestamp_as_datetime()
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                                .unwrap_or_else(|| {
-                                    format!("Invalid timestamp: {}", commit.timestamp)
-                                });
-
-                            println!(
-                                "{:<8} {:<20} {:<40} {:<15}",
-                                commit.version,
-                                timestamp_str,
-                                if commit.file_name.len() > 40 {
-                                    format!("{}...", &commit.file_name[..37])
-                                } else {
-                                    commit.file_name.clone()
-                                },
-                                format_bytes(commit.file_size)
-                            );
-                        }
+                        println!();
+                        print_commits(&commits);
                     } else {
                         println!("No commits found in the specified range");
                     }
@@ -258,6 +216,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_commits(commits: &[Commit]) {
+    println!("Commits ({} total):", commits.len());
+    println!(
+        "{:<8} {:<20} {:<40} {:<15}",
+        "Version", "Timestamp", "File Name", "Size"
+    );
+    println!("{}", "-".repeat(85));
+
+    for commit in commits {
+        let timestamp_str = commit
+            .timestamp_as_datetime()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| format!("Invalid timestamp: {}", commit.timestamp));
+
+        println!(
+            "{:<8} {:<20} {:<40} {:<15}",
+            commit.version,
+            timestamp_str,
+            if commit.file_name.len() > 40 {
+                format!("{}...", &commit.file_name[..37])
+            } else {
+                commit.file_name.clone()
+            },
+            format_bytes(commit.file_size)
+        );
+    }
 }
 
 fn format_bytes(bytes: i64) -> String {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::{self, Display};
 
 // note this is a subset of actual get tables response
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,5 +36,31 @@ impl TablesResponse {
 
     pub fn is_external_table(&self) -> bool {
         self.table_type.eq_ignore_ascii_case("external")
+    }
+}
+
+impl Display for TablesResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Full Name:        {}", self.full_name())?;
+        writeln!(f, "Catalog:          {}", self.catalog_name)?;
+        writeln!(f, "Schema:           {}", self.schema_name)?;
+        writeln!(f, "Table Name:       {}", self.name)?;
+        writeln!(f, "Type:             {}", self.table_type)?;
+        writeln!(f, "Format:           {}", self.data_source_format)?;
+        writeln!(f, "Storage Location: {}", self.storage_location)?;
+        writeln!(f, "Owner:            {}", self.owner)?;
+        writeln!(f, "Table ID:         {}", self.table_id)?;
+        writeln!(f, "Is Delta Table:   {}", self.is_delta_table())?;
+        writeln!(f, "Is Managed:       {}", self.is_managed_table())?;
+
+        if !self.properties.is_empty() {
+            writeln!(f)?;
+            writeln!(f, "Properties:")?;
+            for (key, value) in &self.properties {
+                writeln!(f, "  {}: {}", key, value)?;
+            }
+        }
+
+        Ok(())
     }
 }
