@@ -16,7 +16,7 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
@@ -320,58 +320,111 @@ pub enum ColumnType {
 /// A transform is ultimately a `Struct` expr. This holds the set of expressions that make that struct expr up
 type Transform = Vec<TransformExpr>;
 
+/// A cache for deduplicating transform expressions to save memory
+#[derive(Debug, Clone)]
+pub struct TransformCache {
+    /// Vector of unique transform expressions for indexed access
+    transforms_vec: Vec<ExpressionRef>,
+}
+
+impl TransformCache {
+    /// Create a new empty transform cache
+    pub fn new() -> Self {
+        Self {
+            transforms_vec: Vec::new(),
+        }
+    }
+
+    /// Get or insert a transform expression, returning its index
+    ///
+    /// This does a linear search to find existing transforms. While not optimal
+    /// for very large numbers of unique transforms, in practice the number of
+    /// unique transforms is typically small (e.g., one per partition value).
+    pub fn get_or_insert(&mut self, transform: ExpressionRef) -> usize {
+        // Check if we already have this transform
+        for (idx, existing) in self.transforms_vec.iter().enumerate() {
+            if Arc::ptr_eq(existing, &transform) {
+                return idx;
+            }
+        }
+        // Not found, add it
+        let idx = self.transforms_vec.len();
+        self.transforms_vec.push(transform);
+        idx
+    }
+
+    /// Get a transform by its index
+    pub fn get(&self, idx: usize) -> Option<&ExpressionRef> {
+        self.transforms_vec.get(idx)
+    }
+}
+
+impl Default for TransformCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row
 pub fn get_transform_for_row(
     row: usize,
-    transforms: &[Option<ExpressionRef>],
+    transform_indices: &[Option<usize>],
+    transform_cache: &TransformCache,
 ) -> Option<ExpressionRef> {
-    transforms.get(row).cloned().flatten()
+    transform_indices
+        .get(row)
+        .and_then(|opt_idx| opt_idx.as_ref())
+        .and_then(|idx| transform_cache.get(*idx))
+        .cloned()
 }
 
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// `Transform`.
 pub(crate) enum TransformExpr {
-    Static(Expression),
+    Static(ExpressionRef),
     Partition(usize),
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
-/// and (2) a vector of transforms (one transform per scan file) that must be applied to the data read
-/// from those files.
+/// and (2) a cache of transforms with indices indicating which transform to apply to each file.
 pub struct ScanMetadata {
     /// Filtered engine data with one row per file to scan (and only selected rows should be scanned)
     pub scan_files: FilteredEngineData,
 
-    /// Row-level transformations to apply to data read from files.
+    /// Cache containing all unique transform expressions
+    pub transform_cache: Arc<TransformCache>,
+
+    /// Indices into the transform cache for each scan file.
     ///
     /// Each entry in this vector corresponds to a row in the `scan_files` data. The entry is an
-    /// optional expression that must be applied to convert the file's data into the logical schema
-    /// expected by the scan:
+    /// optional index into the `transform_cache` that specifies which transform to apply:
     ///
-    /// - `Some(expr)`: Apply this expression to transform the data to match
+    /// - `Some(idx)`: Apply the transform at index `idx` in the cache to match
     ///   [`Scan::logical_schema()`].
     /// - `None`: No transformation is needed; the data is already in the correct logical form.
     ///
     /// Note: This vector can be indexed by row number, as rows masked by the selection vector will
     /// have corresponding entries that will be `None`.
-    pub scan_file_transforms: Vec<Option<ExpressionRef>>,
+    pub scan_file_transform_indices: Vec<Option<usize>>,
 }
 
 impl ScanMetadata {
     fn new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
-        scan_file_transforms: Vec<Option<ExpressionRef>>,
+        transform_cache: Arc<TransformCache>,
+        scan_file_transform_indices: Vec<Option<usize>>,
     ) -> Self {
         Self {
             scan_files: FilteredEngineData {
                 data,
                 selection_vector,
             },
-            scan_file_transforms,
+            transform_cache,
+            scan_file_transform_indices,
         }
     }
 }
@@ -435,7 +488,7 @@ impl Scan {
         &self.physical_schema
     }
 
-    /// Get the predicate [`Expression`] of the scan.
+    /// Get the predicate [`PredicateRef`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
         if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
             Some(predicate.clone())
@@ -452,7 +505,7 @@ impl Scan {
             .iter()
             .map(|field| match field {
                 ColumnType::Selected(col_name) => {
-                    TransformExpr::Static(ColumnName::new([col_name]).into())
+                    TransformExpr::Static(Arc::new(ColumnName::new([col_name]).into()))
                 }
                 ColumnType::Partition(idx) => TransformExpr::Partition(*idx),
             })

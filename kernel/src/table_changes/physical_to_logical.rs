@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use itertools::Itertools;
 
@@ -59,6 +60,7 @@ pub(crate) fn physical_to_logical_expr(
                 Ok(generated_column.unwrap_or_else(|| ColumnName::new([field_name]).into()))
             }
         })
+        .map(|expr| expr.map(Arc::new))
         .try_collect()?;
     Ok(Expression::Struct(all_fields))
 }

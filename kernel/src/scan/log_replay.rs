@@ -1,17 +1,17 @@
 use std::clone::Clone;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock};
 
 use itertools::Itertools;
 
 use super::data_skipping::DataSkippingFilter;
-use super::{ScanMetadata, Transform};
+use super::{ScanMetadata, Transform, TransformCache};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
-use crate::expressions::{
-    column_expr, column_name, ColumnName, Expression, ExpressionRef, PredicateRef,
-};
+use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
@@ -87,7 +87,10 @@ struct AddRemoveDedupVisitor<'seen> {
     logical_schema: SchemaRef,
     transform: Option<Arc<Transform>>,
     partition_filter: Option<PredicateRef>,
-    row_transform_exprs: Vec<Option<ExpressionRef>>,
+    transform_cache: TransformCache,
+    transform_indices: Vec<Option<usize>>,
+    // cache partition value combinations to transform indices
+    partition_cache: HashMap<u64, usize>,
 }
 
 impl AddRemoveDedupVisitor<'_> {
@@ -120,7 +123,9 @@ impl AddRemoveDedupVisitor<'_> {
             logical_schema,
             transform,
             partition_filter,
-            row_transform_exprs: Vec::new(),
+            transform_cache: TransformCache::new(),
+            transform_indices: Vec::new(),
+            partition_cache: HashMap::new(),
         }
     }
 
@@ -172,12 +177,28 @@ impl AddRemoveDedupVisitor<'_> {
                             "missing partition value for field index {field_idx}"
                         )));
                     };
-                    Ok(partition_value.into())
+                    Ok(Arc::new(partition_value.into()))
                 }
                 TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
             })
             .try_collect()?;
         Ok(Arc::new(Expression::Struct(transforms)))
+    }
+
+    /// Create a hash-based cache key from partition values
+    fn partition_values_to_cache_key(&self, partition_values: &HashMap<String, String>) -> u64 {
+        let mut hasher = DefaultHasher::new();
+
+        // Sort keys to ensure deterministic hashing
+        let mut keys: Vec<_> = partition_values.keys().collect();
+        keys.sort();
+
+        for key in keys {
+            key.hash(&mut hasher);
+            partition_values[key].hash(&mut hasher);
+        }
+
+        hasher.finish()
     }
 
     fn is_file_partition_pruned(
@@ -222,32 +243,45 @@ impl AddRemoveDedupVisitor<'_> {
         // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
         // removes), because they are needed to suppress earlier incompatible adds we might
         // encounter if the table's schema was replaced after the most recent checkpoint.
-        let partition_values = match &self.transform {
+        let (raw_partition_values, parsed_partition_values) = match &self.transform {
             Some(transform) if is_add => {
-                let partition_values =
+                let raw_partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values = self.parse_partition_values(transform, &partition_values)?;
-                if self.is_file_partition_pruned(&partition_values) {
+                let parsed_partition_values =
+                    self.parse_partition_values(transform, &raw_partition_values)?;
+                if self.is_file_partition_pruned(&parsed_partition_values) {
                     return Ok(false);
                 }
-                partition_values
+                (Some(raw_partition_values), parsed_partition_values)
             }
-            _ => Default::default(),
+            _ => (None, Default::default()),
         };
 
         // Check both adds and removes (skipping already-seen), but only transform and return adds
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
-        let transform = self
-            .transform
-            .as_ref()
-            .map(|transform| self.get_transform_expr(transform, partition_values))
-            .transpose()?;
-        if transform.is_some() {
-            // fill in any needed `None`s for previous rows
-            self.row_transform_exprs.resize_with(i, Default::default);
-            self.row_transform_exprs.push(transform);
+        if let Some(transform) = self.transform.as_ref() {
+            if let Some(raw_partition_values) = raw_partition_values {
+                // Convert to sorted Vec for cache key
+                let cache_key = self.partition_values_to_cache_key(&raw_partition_values);
+
+                let idx = if let Some(&cached_idx) = self.partition_cache.get(&cache_key) {
+                    // Cache hit - reuse existing transform
+                    cached_idx
+                } else {
+                    // Cache miss - build new transform
+                    let transform_expr =
+                        self.get_transform_expr(transform, parsed_partition_values)?;
+                    let idx = self.transform_cache.get_or_insert(transform_expr);
+                    self.partition_cache.insert(cache_key, idx);
+                    idx
+                };
+
+                // fill in any needed `None`s for previous rows
+                self.transform_indices.resize_with(i, Default::default);
+                self.transform_indices.push(Some(idx));
+            }
         }
         Ok(true)
     }
@@ -326,27 +360,31 @@ pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
     LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
 fn get_add_transform_expr() -> Expression {
+    use crate::expressions::column_expr_ref;
     Expression::Struct(vec![
-        column_expr!("add.path"),
-        column_expr!("add.size"),
-        column_expr!("add.modificationTime"),
-        column_expr!("add.stats"),
-        column_expr!("add.deletionVector"),
-        Expression::Struct(vec![column_expr!("add.partitionValues")]),
+        column_expr_ref!("add.path"),
+        column_expr_ref!("add.size"),
+        column_expr_ref!("add.modificationTime"),
+        column_expr_ref!("add.stats"),
+        column_expr_ref!("add.deletionVector"),
+        Arc::new(Expression::Struct(vec![column_expr_ref!(
+            "add.partitionValues"
+        )])),
     ])
 }
 
 // TODO: remove once `scan_metadata_from` is pub.
 #[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
-    Expression::Struct(vec![Expression::Struct(vec![
-        column_expr!("path"),
-        column_expr!("fileConstantValues.partitionValues"),
-        column_expr!("size"),
-        column_expr!("modificationTime"),
-        column_expr!("stats"),
-        column_expr!("deletionVector"),
-    ])])
+    use crate::expressions::column_expr_ref;
+    Expression::Struct(vec![Arc::new(Expression::Struct(vec![
+        column_expr_ref!("path"),
+        column_expr_ref!("fileConstantValues.partitionValues"),
+        column_expr_ref!("size"),
+        column_expr_ref!("modificationTime"),
+        column_expr_ref!("stats"),
+        column_expr_ref!("deletionVector"),
+    ]))])
 }
 
 impl LogReplayProcessor for ScanLogReplayProcessor {
@@ -375,10 +413,12 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let result = self.add_transform.evaluate(actions.as_ref())?;
+
         Ok(ScanMetadata::new(
             result,
             visitor.selection_vector,
-            visitor.row_transform_exprs,
+            Arc::new(visitor.transform_cache),
+            visitor.transform_indices,
         ))
     }
 
@@ -491,7 +531,7 @@ mod tests {
         for res in iter {
             let scan_metadata = res.unwrap();
             assert!(
-                scan_metadata.scan_file_transforms.is_empty(),
+                scan_metadata.scan_file_transform_indices.is_empty(),
                 "Should have no transforms"
             );
         }
@@ -525,12 +565,12 @@ mod tests {
             };
             assert_eq!(inner.len(), 2, "expected two items in transform struct");
 
-            let Expr::Column(ref name) = inner[0] else {
+            let Expr::Column(ref name) = inner[0].as_ref() else {
                 panic!("Expected first expression to be a column");
             };
             assert_eq!(name, &column_name!("value"), "First col should be 'value'");
 
-            let Expr::Literal(ref scalar) = inner[1] else {
+            let Expr::Literal(ref scalar) = inner[1].as_ref() else {
                 panic!("Expected second expression to be a literal");
             };
             assert_eq!(
@@ -542,7 +582,12 @@ mod tests {
 
         for res in iter {
             let scan_metadata = res.unwrap();
-            let transforms = scan_metadata.scan_file_transforms;
+            // Extract transforms from the cache
+            let transforms: Vec<_> = scan_metadata
+                .scan_file_transform_indices
+                .iter()
+                .map(|idx| idx.and_then(|i| scan_metadata.transform_cache.get(i).cloned()))
+                .collect();
             // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
             // the first and 3rd being a `None`
             assert_eq!(transforms.len(), 4, "Should have 4 transforms");

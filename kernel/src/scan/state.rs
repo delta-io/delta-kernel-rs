@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::actions::deletion_vector::deletion_treemap_to_bools;
-use crate::scan::get_transform_for_row;
+use crate::scan::{get_transform_for_row, TransformCache};
 use crate::schema::Schema;
 use crate::utils::require;
 use crate::ExpressionRef;
@@ -157,7 +157,8 @@ impl ScanMetadata {
         let mut visitor = ScanFileVisitor {
             callback,
             selection_vector: &self.scan_files.selection_vector,
-            transforms: &self.scan_file_transforms,
+            transform_indices: &self.scan_file_transform_indices,
+            transform_cache: &self.transform_cache,
             context,
         };
         visitor.visit_rows_of(self.scan_files.data.as_ref())?;
@@ -168,7 +169,8 @@ impl ScanMetadata {
 struct ScanFileVisitor<'a, T> {
     callback: ScanCallback<T>,
     selection_vector: &'a [bool],
-    transforms: &'a [Option<ExpressionRef>],
+    transform_indices: &'a [Option<usize>],
+    transform_cache: &'a TransformCache,
     context: T,
 }
 impl<T> RowVisitor for ScanFileVisitor<'_, T> {
@@ -216,7 +218,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     size,
                     stats,
                     dv_info,
-                    get_transform_for_row(row_index, self.transforms),
+                    get_transform_for_row(row_index, self.transform_indices, self.transform_cache),
                     partition_values,
                 )
             }
