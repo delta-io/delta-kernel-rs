@@ -34,6 +34,7 @@ const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
 pub mod set_transaction;
+pub mod statistics;
 
 pub(crate) mod crc;
 pub(crate) mod domain_metadata;
