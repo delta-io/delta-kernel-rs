@@ -237,9 +237,9 @@ impl FileMeta {
 /// a Parquet write operation back to Kernel.
 ///
 /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
-/// for constructing the full add_file (and soon remove_file) metadata schema. Each row represents
-/// metadata about a file to be added to the table. Kernel takes this information and extends it to the
-/// full add_file metadata schema, adding additional fields (e.g., baseRowID) as necessary.
+/// for constructing an add_file (and soon remove_file) action. Each row represents metadata about a
+/// file to be added to the table. Kernel takes this information and extends it to the full add_file
+/// action schema, adding additional fields (e.g., baseRowID) as necessary.
 ///
 /// [`add_files`]: crate::transaction::Transaction::add_files
 pub static PARQUET_WRITE_RESPONSE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {

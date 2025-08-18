@@ -42,15 +42,17 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
-    stats: String,
+    stats: Statistics,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta, stats: String) -> Self {
+    pub fn new(file_meta: FileMeta, stats: Statistics) -> Self {
         Self { file_meta, stats }
     }
 
-    // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
+    /// Convert DataFileMetadata into a record batch which matches the [`PARQUET_WRITE_RESPONSE_SCHEMA`] schema.
+    ///
+    /// [`PARQUET_WRITE_RESPONSE_SCHEMA`]: crate::PARQUET_WRITE_RESPONSE_SCHEMA
     fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
@@ -89,7 +91,10 @@ impl DataFileMetadata {
         let size = Arc::new(Int64Array::from(vec![size]));
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let stats = Arc::new(StringArray::from(vec![stats.as_ref()]));
+        let stats_str = serde_json::to_string(&stats)
+            .map_err(|e| Error::generic(format!("Failed to serialize stats: {e}")))
+            .map(|s| Arc::new(StringArray::from(vec![s])))?;
+
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(parquet_write_response_schema().as_ref().try_into_arrow()?),
             vec![
@@ -98,7 +103,7 @@ impl DataFileMetadata {
                 size,
                 modification_time,
                 data_change,
-                stats,
+                stats_str,
             ],
         )?)))
     }
@@ -167,11 +172,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
 
         let stats = Statistics::new(num_records as u64);
-        let stats_str = serde_json::to_string(&stats)
-            .map_err(|e| Error::generic(format!("Failed to serialize stats: {e}")))?;
-
         let file_meta = FileMeta::new(path, modification_time, size);
-        Ok(DataFileMetadata::new(file_meta, stats_str))
+        Ok(DataFileMetadata::new(file_meta, stats))
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
@@ -473,8 +475,7 @@ mod tests {
         let num_records = 10;
         let stats = Statistics::new(num_records);
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
-        let data_file_metadata =
-            DataFileMetadata::new(file_metadata, serde_json::to_string(&stats).unwrap());
+        let data_file_metadata = DataFileMetadata::new(file_metadata, stats);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let data_change = true;
         let actual = data_file_metadata
@@ -571,7 +572,7 @@ mod tests {
 
         // check that statistics are correctly written
         let expected_stats = Statistics::new(3);
-        assert_eq!(stats, serde_json::to_string(&expected_stats).unwrap());
+        assert_eq!(stats, expected_stats);
 
         // check we can read back
         let path = Path::from_url_path(location.path()).unwrap();

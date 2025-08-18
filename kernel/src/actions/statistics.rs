@@ -1,16 +1,15 @@
 //! This module defines the `Statistics` struct used in Add and Remove actions.
 
-use delta_kernel_derive::ToSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Statistics {
+pub struct Statistics {
     /// The number of records in this data file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_records: Option<u64>,
 
-    /// Whether per-column statistics are currently tight or wide.
+    /// Whether per-column statistics are currently tight, i.e. the min/maxValue actually exists in the file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tight_bounds: Option<bool>,
 
@@ -43,9 +42,9 @@ impl Statistics {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PerColumnStatistics {
+pub struct PerColumnStatistics {
     // TODO: Implement per-column statistics
     // See (https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics)
 }
