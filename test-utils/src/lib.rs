@@ -221,45 +221,11 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
-    enable_timestamp_without_timezone: bool,
-    enable_variant: bool,
-    enable_column_mapping: bool,
-    enable_row_tracking: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
 ) -> Result<Url, Box<dyn std::error::Error>> {
-    // TODO: Refactor this function to directly accept reader and writer feature vectors so that we
-    // don't have to change its signature for each new feature test
-
     let table_id = "test_id";
     let schema = serde_json::to_string(&schema)?;
-
-    let (reader_features, writer_features) = {
-        let mut reader_features = vec![];
-        let mut writer_features = vec![];
-        if enable_timestamp_without_timezone {
-            reader_features.push("timestampNtz");
-            writer_features.push("timestampNtz");
-        }
-        if enable_variant {
-            reader_features.push("variantType");
-            writer_features.push("variantType");
-            // We can add shredding features as well as we are allowed to write unshredded variants
-            // into shredded tables and shredded reads are explicitly blocked in the default
-            // engine's parquet reader.
-            reader_features.push("variantShredding-preview");
-            writer_features.push("variantShredding-preview");
-        }
-        if enable_column_mapping {
-            reader_features.push("columnMapping");
-            // TODO: (#1124) we don't actually support column mapping writes yet, but have some
-            // tests that do column mapping on writes. for now omit the writer feature to let tests
-            // run, but after actual support this should be enabled.
-            // writer_features.push("columnMapping");
-        }
-        if enable_row_tracking {
-            writer_features.push("rowTracking");
-        }
-        (reader_features, writer_features)
-    };
 
     let protocol = if use_37_protocol {
         json!({
@@ -278,23 +244,26 @@ pub async fn create_table(
             }
         })
     };
-    // TODO: Compose the configuration of individual components instead of static if/else blocks
-    // once this becomes more complex
-    let configuration = if enable_column_mapping && enable_row_tracking {
-        json!({
-            "delta.columnMapping.mode": "name",
-            "delta.materializedRowIdColumnName": "some_dummy_column_name",
-            "delta.materializedRowCommitVersionColumnName": "another_dummy_column_name",
-        })
-    } else if enable_column_mapping {
-        json!({"delta.columnMapping.mode": "name"})
-    } else if enable_row_tracking {
-        json!({
-            "delta.materializedRowIdColumnName": "some_dummy_column_name",
-            "delta.materializedRowCommitVersionColumnName": "another_dummy_column_name",
-        })
-    } else {
-        json!({})
+
+    let configuration = {
+        let mut config = serde_json::Map::new();
+
+        if reader_features.contains(&"columnMapping") {
+            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+        }
+
+        if writer_features.contains(&"rowTracking") {
+            config.insert(
+                "delta.materializedRowIdColumnName".to_string(),
+                json!("some_dummy_column_name"),
+            );
+            config.insert(
+                "delta.materializedRowCommitVersionColumnName".to_string(),
+                json!("another_dummy_column_name"),
+            );
+        }
+
+        config
     };
     let metadata = json!({
         "metaData": {
@@ -357,10 +326,8 @@ pub async fn setup_test_tables(
                 schema.clone(),
                 partition_columns,
                 true,
-                false,
-                false,
-                false,
-                false,
+                vec![],
+                vec![],
             )
             .await?,
             engine_37,
@@ -374,10 +341,8 @@ pub async fn setup_test_tables(
                 schema,
                 partition_columns,
                 false,
-                false,
-                false,
-                false,
-                false,
+                vec![],
+                vec![],
             )
             .await?,
             engine_11,

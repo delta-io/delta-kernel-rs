@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// A row visitor that iterates over add actions and assigns a base row id and default commit version to each add action.
+/// A row visitor that iterates over preliminary [`Add`] actions as returned by the engine and
+/// assigns a base row ID and default commit version to each [`Add`] action.
+/// It expects to visit engine data conforming to the [`PARQUET_WRITE_RESPONSE_SCHEMA`].
+///
+/// [`PARQUET_WRITE_RESPONSE_SCHEMA`]: crate::PARQUET_WRITE_RESPONSE_SCHEMA
 #[internal_api]
 pub(crate) struct RowTrackingVisitor {
     pub(crate) adds: Vec<Add>,
@@ -41,7 +45,7 @@ impl RowTrackingVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
         require!(
-            getters.len() == 6, // TODO: Replace this magic number
+            getters.len() == parquet_write_response_schema().fields_len(),
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()

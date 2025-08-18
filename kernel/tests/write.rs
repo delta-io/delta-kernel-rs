@@ -708,10 +708,8 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         schema.clone(),
         &[],
         true,
-        true, // enable "timestamp without timezone" feature
-        false,
-        false,
-        false, // row tracking
+        vec!["timestampNtz"],
+        vec!["timestampNtz"],
     )
     .await?;
 
@@ -832,16 +830,20 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_location) =
         engine_store_setup("test_table_variant", Some(&tmp_test_dir_url));
 
+    // We can add shredding features as well as we are allowed to write unshredded variants
+    // into shredded tables and shredded reads are explicitly blocked in the default
+    // engine's parquet reader.
+    // TODO: (#1124) we don't actually support column mapping writes yet, but have some
+    // tests that do column mapping on writes. For now omit the writer feature to let tests
+    // run, but after actual support this should be enabled.
     let table_url = create_table(
         store.clone(),
         table_location,
         table_schema.clone(),
         &[],
         true,
-        false,
-        true,  // enable "variantType" feature
-        true,  // enable "columnMapping" feature
-        false, // row tracking
+        vec!["variantType", "variantShredding-preview", "columnMapping"],
+        vec!["variantType", "variantShredding-preview"],
     )
     .await?;
 
@@ -1049,10 +1051,8 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         table_schema.clone(),
         &[],
         true,
-        false,
-        true,  // enable "variantType" feature
-        false, // enable "columnMapping" feature
-        false, // row tracking
+        vec!["variantType", "variantShredding-preview"],
+        vec!["variantType", "variantShredding-preview"],
     )
     .await?;
 
@@ -1174,12 +1174,10 @@ async fn test_append_row_tracking() -> Result<(), Box<dyn std::error::Error>> {
         store.clone(),
         table_location,
         schema.clone(),
-        &[],   // no partition columns
-        true,  // use 37 protocol
-        false, // timestamp without timezone
-        false, // variant type
-        false, // column mapping
-        true,  // row tracking
+        &[],  // no partition columns
+        true, // use 37 protocol
+        vec![],
+        vec!["rowTracking"],
     )
     .await?;
 
