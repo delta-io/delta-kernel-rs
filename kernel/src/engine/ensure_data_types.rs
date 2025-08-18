@@ -44,6 +44,7 @@ struct EnsureDataTypes {
 }
 
 /// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum DataTypeCompat {
     /// The two types are the same
     Identical,
@@ -71,8 +72,13 @@ impl EnsureDataTypes {
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
             | (&DataType::STRING, ArrowDataType::Utf8)
+            | (&DataType::STRING, ArrowDataType::Utf8View)
+            | (&DataType::BINARY, ArrowDataType::BinaryView)
             | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
-            (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field)) => {
+            (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
+            | (DataType::Array(inner_type), ArrowDataType::LargeList(arrow_list_field))
+            | (DataType::Array(inner_type), ArrowDataType::ListView(arrow_list_field))
+            | (DataType::Array(inner_type), ArrowDataType::LargeListView(arrow_list_field)) => {
                 self.ensure_nullability(
                     "List",
                     inner_type.contains_null,
@@ -256,6 +262,8 @@ fn metadata_eq(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
     use crate::engine::arrow_conversion::TryFromKernel as _;
@@ -419,6 +427,12 @@ mod tests {
             false
         )
         .is_ok());
+        assert!(ensure_data_types(
+            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+            &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
+            false
+        )
+        .is_ok());
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
@@ -503,6 +517,42 @@ mod tests {
                 true,
             ),
             "Generic delta kernel error: w has nullablily true in kernel and false in arrow",
+        );
+    }
+
+    #[test]
+    fn ensure_views() {
+        assert_eq!(
+            ensure_data_types(&DataType::STRING, &ArrowDataType::Utf8View, true).unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(&DataType::BINARY, &ArrowDataType::BinaryView, true).unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(
+                    ArrowDataType::Int64,
+                    true
+                ))),
+                true
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(
+                    ArrowDataType::Int64,
+                    true
+                ))),
+                true
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
         );
     }
 }
