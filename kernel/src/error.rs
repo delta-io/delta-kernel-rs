@@ -13,7 +13,7 @@ use crate::Version;
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
 #[cfg(feature = "default-engine-base")]
-use crate::object_store;
+use object_store;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;
@@ -84,7 +84,7 @@ pub enum Error {
     #[error("Object store path error: {0}")]
     ObjectStorePath(#[from] object_store::path::Error),
 
-    #[cfg(any(feature = "default-engine", feature = "default-engine-rustls"))]
+    #[cfg(feature = "default-engine-base")]
     #[error("Reqwest Error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
@@ -174,14 +174,6 @@ pub enum Error {
     /// Unable to parse the name of a log path
     #[error("Invalid log path: {0}")]
     InvalidLogPath(String),
-
-    /// Invalid commit info passed to the transaction
-    #[error("Invalid commit info: {0}")]
-    InvalidCommitInfo(String),
-
-    /// Commit info was not passed to the transaction
-    #[error("Missing commit info")]
-    MissingCommitInfo,
 
     /// The file already exists at the path, prohibiting a non-overwrite write
     #[error("File already exists: {0}")]

@@ -3,24 +3,24 @@ use delta_kernel::{DeltaResult, Error};
 use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub enum KernelError {
     UnknownError, // catch-all for unrecognized kernel Error types
     FFIError,     // errors encountered in the code layer that supports FFI
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ArrowError,
     EngineDataTypeError,
     ExtractError,
     GenericError,
     IOErrorError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ParquetError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ObjectStoreError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ObjectStorePathError,
-    #[cfg(feature = "default-engine")]
+    #[cfg(feature = "default-engine-base")]
     ReqwestError,
     FileNotFoundError,
     MissingColumnError,
@@ -45,9 +45,7 @@ pub enum KernelError {
     InternalError,
     InvalidExpression,
     InvalidLogPath,
-    InvalidCommitInfo,
     FileAlreadyExists,
-    MissingCommitInfo,
     UnsupportedError,
     ParseIntervalError,
     ChangeDataFeedUnsupported,
@@ -62,7 +60,7 @@ impl From<Error> for KernelError {
     fn from(e: Error) -> Self {
         match e {
             // NOTE: By definition, no kernel Error maps to FFIError
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::Arrow(_) => KernelError::ArrowError,
             Error::CheckpointWrite(_) => KernelError::CheckpointWriteError,
             Error::EngineDataType(_) => KernelError::EngineDataTypeError,
@@ -70,13 +68,13 @@ impl From<Error> for KernelError {
             Error::Generic(_) => KernelError::GenericError,
             Error::GenericError { .. } => KernelError::GenericError,
             Error::IOError(_) => KernelError::IOErrorError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::Parquet(_) => KernelError::ParquetError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::ObjectStore(_) => KernelError::ObjectStoreError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::ObjectStorePath(_) => KernelError::ObjectStorePathError,
-            #[cfg(feature = "default-engine")]
+            #[cfg(feature = "default-engine-base")]
             Error::Reqwest(_) => KernelError::ReqwestError,
             Error::FileNotFound(_) => KernelError::FileNotFoundError,
             Error::MissingColumn(_) => KernelError::MissingColumnError,
@@ -105,9 +103,7 @@ impl From<Error> for KernelError {
             } => Self::from(*source),
             Error::InvalidExpressionEvaluation(_) => KernelError::InvalidExpression,
             Error::InvalidLogPath(_) => KernelError::InvalidLogPath,
-            Error::InvalidCommitInfo(_) => KernelError::InvalidCommitInfo,
             Error::FileAlreadyExists(_) => KernelError::FileAlreadyExists,
-            Error::MissingCommitInfo => KernelError::MissingCommitInfo,
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
             Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
@@ -214,7 +210,7 @@ impl<T> IntoExternResult<T> for DeltaResult<T> {
         match self {
             Ok(ok) => ExternResult::Ok(ok),
             Err(err) => {
-                let msg = format!("{}", err);
+                let msg = format!("{err}");
                 let err = unsafe { alloc.allocate_error(err.into(), kernel_string_slice!(msg)) };
                 ExternResult::Err(err)
             }

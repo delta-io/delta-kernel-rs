@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
+use crate::expressions::Scalar;
 use crate::schema::derive_macro_utils::ToDataType;
 use crate::schema::DataType;
 use delta_kernel_derive::internal_api;
@@ -36,6 +37,12 @@ mod timestamp_ntz;
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum ReaderFeature {
+    /// CatalogManaged tables:
+    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
+    CatalogManaged,
+    #[strum(serialize = "catalogOwned-preview")]
+    #[serde(rename = "catalogOwned-preview")]
+    CatalogOwnedPreview,
     /// Mapping of one column to another
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
@@ -56,6 +63,12 @@ pub(crate) enum ReaderFeature {
     VacuumProtocolCheck,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
+    #[strum(serialize = "variantType-preview")]
+    #[serde(rename = "variantType-preview")]
+    VariantTypePreview,
+    #[strum(serialize = "variantShredding-preview")]
+    #[serde(rename = "variantShredding-preview")]
+    VariantShreddingPreview,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -83,6 +96,12 @@ pub(crate) enum ReaderFeature {
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum WriterFeature {
+    /// CatalogManaged tables:
+    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
+    CatalogManaged,
+    #[strum(serialize = "catalogOwned-preview")]
+    #[serde(rename = "catalogOwned-preview")]
+    CatalogOwnedPreview,
     /// Append Only Tables
     AppendOnly,
     /// Table invariants
@@ -130,6 +149,12 @@ pub(crate) enum WriterFeature {
     ClusteredTable,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
+    #[strum(serialize = "variantType-preview")]
+    #[serde(rename = "variantType-preview")]
+    VariantTypePreview,
+    #[strum(serialize = "variantShredding-preview")]
+    #[serde(rename = "variantShredding-preview")]
+    VariantShreddingPreview,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -144,6 +169,18 @@ impl ToDataType for ReaderFeature {
 impl ToDataType for WriterFeature {
     fn to_data_type() -> DataType {
         DataType::STRING
+    }
+}
+
+impl From<ReaderFeature> for Scalar {
+    fn from(feature: ReaderFeature) -> Self {
+        Scalar::String(feature.to_string())
+    }
+}
+
+impl From<WriterFeature> for Scalar {
+    fn from(feature: WriterFeature) -> Self {
+        Scalar::String(feature.to_string())
     }
 }
 
@@ -163,6 +200,10 @@ impl WriterFeature {
 
 pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = LazyLock::new(|| {
     vec![
+        #[cfg(feature = "catalog-managed")]
+        ReaderFeature::CatalogManaged,
+        #[cfg(feature = "catalog-managed")]
+        ReaderFeature::CatalogOwnedPreview,
         ReaderFeature::ColumnMapping,
         ReaderFeature::DeletionVectors,
         ReaderFeature::TimestampWithoutTimezone,
@@ -170,6 +211,14 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
         ReaderFeature::TypeWideningPreview,
         ReaderFeature::VacuumProtocolCheck,
         ReaderFeature::V2Checkpoint,
+        ReaderFeature::VariantType,
+        ReaderFeature::VariantTypePreview,
+        // The default engine currently DOES NOT support shredded Variant reads and the parquet
+        // reader will reject the read if it sees a shredded schema in the parquet file. That being
+        // said, kernel does permit reconstructing shredded variants into the
+        // `STRUCT<metadata: BINARY, value: BINARY>` representation if parquet readers of
+        // third-party engines support it.
+        ReaderFeature::VariantShreddingPreview,
     ]
 });
 
@@ -182,6 +231,9 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::DeletionVectors,
         WriterFeature::Invariants,
         WriterFeature::TimestampWithoutTimezone,
+        WriterFeature::VariantType,
+        WriterFeature::VariantTypePreview,
+        WriterFeature::VariantShreddingPreview,
     ]
 });
 
@@ -226,6 +278,8 @@ mod tests {
     #[test]
     fn test_roundtrip_reader_features() {
         let cases = [
+            (ReaderFeature::CatalogManaged, "catalogManaged"),
+            (ReaderFeature::CatalogOwnedPreview, "catalogOwned-preview"),
             (ReaderFeature::ColumnMapping, "columnMapping"),
             (ReaderFeature::DeletionVectors, "deletionVectors"),
             (ReaderFeature::TimestampWithoutTimezone, "timestampNtz"),
@@ -234,6 +288,11 @@ mod tests {
             (ReaderFeature::V2Checkpoint, "v2Checkpoint"),
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (ReaderFeature::VariantType, "variantType"),
+            (ReaderFeature::VariantTypePreview, "variantType-preview"),
+            (
+                ReaderFeature::VariantShreddingPreview,
+                "variantShredding-preview",
+            ),
             (ReaderFeature::unknown("something"), "something"),
         ];
 
@@ -242,7 +301,7 @@ mod tests {
         for (feature, expected) in cases {
             assert_eq!(feature.to_string(), expected);
             let serialized = serde_json::to_string(&feature).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", expected));
+            assert_eq!(serialized, format!("\"{expected}\""));
 
             let deserialized: ReaderFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);
@@ -256,6 +315,8 @@ mod tests {
     fn test_roundtrip_writer_features() {
         let cases = [
             (WriterFeature::AppendOnly, "appendOnly"),
+            (WriterFeature::CatalogManaged, "catalogManaged"),
+            (WriterFeature::CatalogOwnedPreview, "catalogOwned-preview"),
             (WriterFeature::Invariants, "invariants"),
             (WriterFeature::CheckConstraints, "checkConstraints"),
             (WriterFeature::ChangeDataFeed, "changeDataFeed"),
@@ -275,6 +336,11 @@ mod tests {
             (WriterFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (WriterFeature::ClusteredTable, "clustering"),
             (WriterFeature::VariantType, "variantType"),
+            (WriterFeature::VariantTypePreview, "variantType-preview"),
+            (
+                WriterFeature::VariantShreddingPreview,
+                "variantShredding-preview",
+            ),
             (WriterFeature::unknown("something"), "something"),
         ];
 
@@ -283,7 +349,7 @@ mod tests {
         for (feature, expected) in cases {
             assert_eq!(feature.to_string(), expected);
             let serialized = serde_json::to_string(&feature).unwrap();
-            assert_eq!(serialized, format!("\"{}\"", expected));
+            assert_eq!(serialized, format!("\"{expected}\""));
 
             let deserialized: WriterFeature = serde_json::from_str(&serialized).unwrap();
             assert_eq!(deserialized, feature);

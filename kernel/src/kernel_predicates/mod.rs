@@ -5,26 +5,32 @@
 //! references with stats column references, which log replay will instruct the engine to evaluate.
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
-    Expression as Expr, JunctionPredicate, JunctionPredicateOp, Predicate as Pred, Scalar,
+    Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
+    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate as Pred, Scalar,
     UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
 use std::cmp::Ordering;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub(crate) mod parquet_stats_skipping;
 
 #[cfg(test)]
 mod tests;
 
+// NOTE: When creating `&dyn Foo` for some `impl<'a> Bar<'a>`, the compiler infers `&'r dyn Foo +
+// 'a` (and then elides the lifetimes because `'a: 'r`). Creating a type alias for `dyn Foo` causes
+// the compiler to infer `dyn Foo + 'static` (the lifetime of the alias). Which in turn requires
+// `impl Bar<'static>`, which is almost always an impossible constraint. Defining the type aliases
+// below with generic lifetimes allows `&'r DynFoo<'a>` (again with `'a: 'r`). Unfortunately,
+// generic lifetimes cannot be hidden, so we end up with `&DynFoo<'_>` at every use site.
+
+/// A predicate evaluator that directly evaluates predicates, resolving column references to scalar values.
+pub type DirectPredicateEvaluator<'a> = dyn KernelPredicateEvaluator<Output = bool> + 'a;
+
 /// A data skipping predicate evaluator that directly applies data skipping, resolving column
 /// references to scalar stats values such as those provided by parquet footer stats.
-//
-// NOTE: We need a generic lifetime here to inform the compiler that this typedef only needs to live
-// as long as whatever is using it. Otherwise the compiler infers the static lifetime, which is too
-// long for any concrete implementation that has a lifetime parameter of its own (such as the
-// `RowGroupFilter` used by parquet data skipping). Downside is a `<'_>` at every use site.
 pub type DirectDataSkippingPredicateEvaluator<'a> =
     dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar> + 'a;
 
@@ -118,6 +124,22 @@ pub trait KernelPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output>;
 
+    /// Dispatches an opaque predicate.
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// Dispatches an opaque expression used as a predicate
+    fn eval_pred_expr_opaque(
+        &self,
+        op: &OpaqueExpressionOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
     /// Completes evaluation of a (possibly inverted) junction predicate.
     ///
     /// AND and OR are implemented by first evaluating its (possibly inverted) inputs. This part is
@@ -152,7 +174,10 @@ pub trait KernelPredicateEvaluator {
             Expr::Literal(val) => self.eval_pred_scalar(val, inverted),
             Expr::Column(col) => self.eval_pred_column(col, inverted),
             Expr::Predicate(pred) => self.eval_pred(pred, inverted),
-            Expr::Struct(_) | Expr::Binary(_) => None,
+            Expr::Opaque(OpaqueExpression { op, exprs }) => {
+                self.eval_pred_expr_opaque(op, exprs, inverted)
+            }
+            Expr::Struct(_) | Expr::Binary(_) | Expr::Unknown(_) => None,
         }
     }
 
@@ -172,7 +197,11 @@ pub trait KernelPredicateEvaluator {
                 // partition pruning encounters a non-partition column.
                 Expr::Literal(val) => self.eval_pred_scalar_is_null(val, inverted),
                 Expr::Column(col) => self.eval_pred_is_null(col, inverted),
-                Expr::Predicate(_) | Expr::Struct(_) | Expr::Binary(_) => {
+                Expr::Predicate(_)
+                | Expr::Struct(_)
+                | Expr::Binary(_)
+                | Expr::Opaque(_)
+                | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
                 }
@@ -278,6 +307,8 @@ pub trait KernelPredicateEvaluator {
             Junction(JunctionPredicate { op, preds }) => {
                 self.eval_pred_junction(*op, preds, inverted)
             }
+            Opaque(OpaquePredicate { op, exprs }) => self.eval_pred_opaque(op, exprs, inverted),
+            Unknown(_) => None, // not supported by definition
         }
     }
 
@@ -572,7 +603,6 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
         self.resolver.resolve_column(col)
     }
 
-    #[allow(unused)] // TODO: remove this annotation once opaque predicates start using it
     pub(crate) fn eval_expr(&self, expr: &Expr) -> Option<Scalar> {
         match expr {
             Expr::Literal(value) => Some(value.clone()),
@@ -588,6 +618,13 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 };
                 op_fn(&self.eval_expr(left)?, &self.eval_expr(right)?)
             }
+            Expr::Opaque(OpaqueExpression { op, exprs }) => op
+                .eval_expr_scalar(&|expr| self.eval_expr(expr), exprs)
+                .inspect_err(|err| {
+                    warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
+                })
+                .ok(),
+            Expr::Unknown(_) => None,
         }
     }
 }
@@ -654,6 +691,43 @@ impl<R: ResolveColumnAsScalar> KernelPredicateEvaluator for DefaultKernelPredica
         self.eval_pred_binary_scalars(op, &left, &right, inverted)
     }
 
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<bool> {
+        op.eval_pred_scalar(&|expr| self.eval_expr(expr), self, exprs, inverted)
+            .unwrap_or_else(|err| {
+                warn!("Unable to evaluate {:?}: {err:?}", op.as_ref());
+                None
+            })
+    }
+
+    fn eval_pred_expr_opaque(
+        &self,
+        op: &OpaqueExpressionOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<bool> {
+        match op.eval_expr_scalar(&|expr| self.eval_expr(expr), exprs) {
+            Ok(Scalar::Boolean(val)) => Some(val != inverted),
+            Ok(Scalar::Null(DataType::BOOLEAN)) => None,
+            Ok(other) => {
+                warn!(
+                    "Expected {:?} to produce a boolean value, but got {:?}",
+                    op.as_ref(),
+                    other.data_type()
+                );
+                None
+            }
+            Err(err) => {
+                warn!("Unable to evaluate {:?}: {err:?}", op.as_ref());
+                None
+            }
+        }
+    }
+
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
@@ -707,6 +781,14 @@ pub trait DataSkippingPredicateEvaluator {
         op: BinaryPredicateOp,
         left: &Scalar,
         right: &Scalar,
+        inverted: bool,
+    ) -> Option<Self::Output>;
+
+    /// See [`KernelPredicateEvaluator::eval_pred_opaque`].
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
         inverted: bool,
     ) -> Option<Self::Output>;
 
@@ -868,6 +950,24 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         None
     }
 
+    fn eval_pred_opaque(
+        &self,
+        op: &OpaquePredicateOpRef,
+        exprs: &[Expr],
+        inverted: bool,
+    ) -> Option<Self::Output> {
+        self.eval_pred_opaque(op, exprs, inverted)
+    }
+
+    fn eval_pred_expr_opaque(
+        &self,
+        _op: &OpaqueExpressionOpRef,
+        _exprs: &[Expr],
+        _inverted: bool,
+    ) -> Option<Self::Output> {
+        None // Unsupported
+    }
+
     fn finish_eval_pred_junction(
         &self,
         op: JunctionPredicateOp,
@@ -877,15 +977,3 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         self.finish_eval_pred_junction(op, preds, inverted)
     }
 }
-
-// Statically verify that both forms of the trait are dyn compatible
-#[cfg(test)]
-const _: Option<&dyn KernelPredicateEvaluator<Output = Pred>> = None;
-#[cfg(test)]
-const _: Option<&dyn KernelPredicateEvaluator<Output = bool>> = None;
-
-// Statically verify that both forms of the trait are dyn compatible
-#[cfg(test)]
-const _: Option<&dyn DataSkippingPredicateEvaluator<Output = Pred, ColumnStat = Expr>> = None;
-#[cfg(test)]
-const _: Option<&dyn DataSkippingPredicateEvaluator<Output = bool, ColumnStat = Scalar>> = None;

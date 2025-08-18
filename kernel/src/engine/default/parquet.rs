@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
-use crate::object_store::path::Path;
-use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
+use object_store::path::Path;
+use object_store::DynObjectStore;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -48,7 +48,7 @@ impl DataFileMetadata {
         Self { file_meta }
     }
 
-    // convert DataFileMetadata into a record batch which matches the 'write_metadata' schema
+    // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
     fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
@@ -62,7 +62,7 @@ impl DataFileMetadata {
                     size,
                 },
         } = self;
-        let write_metadata_schema = crate::transaction::get_write_metadata_schema();
+        let add_files_schema = crate::transaction::add_files_schema();
 
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
@@ -78,7 +78,7 @@ impl DataFileMetadata {
             builder.keys().append_value(k);
             builder.values().append_value(v);
         }
-        builder.append(true).unwrap();
+        builder.append(true)?;
         let partitions = Arc::new(builder.finish());
         // this means max size we can write is i64::MAX (~8EB)
         let size: i64 = (*size)
@@ -88,7 +88,7 @@ impl DataFileMetadata {
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(write_metadata_schema.as_ref().try_into_arrow()?),
+            Arc::new(add_files_schema.as_ref().try_into_arrow()?),
             vec![path, partitions, size, modification_time, data_change],
         )?)))
     }
@@ -137,8 +137,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         // fail if path does not end with a trailing slash
         if !path.path().ends_with('/') {
             return Err(Error::generic(format!(
-                "Path must end with a trailing slash: {}",
-                path
+                "Path must end with a trailing slash: {path}"
             )));
         }
         let path = path.join(&name)?;
@@ -149,12 +148,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
-        let metadata_size = metadata.size;
-        #[cfg(not(feature = "arrow-55"))]
-        let metadata_size: u64 = metadata_size
-            .try_into()
-            .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
-        if size != metadata_size {
+        if size != metadata.size {
             return Err(Error::generic(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
                 size, metadata.size
@@ -166,10 +160,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
-    /// metadata as an EngineData batch which matches the [write metadata] schema (where `<uuid>` is
-    /// a generated UUIDv4).
+    /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
+    /// is a generated UUIDv4).
     ///
-    /// [write metadata]: crate::transaction::get_write_metadata_schema
+    /// [add file metadata]: crate::transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
@@ -264,9 +258,8 @@ impl FileOpener for ParquetOpener {
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            #[cfg(feature = "arrow-55")]
             let mut reader = {
-                use crate::object_store::ObjectStoreScheme;
+                use object_store::ObjectStoreScheme;
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
                 // request which isn't supported by Azure. For now we just detect if the URL is
                 // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -287,13 +280,7 @@ impl FileOpener for ParquetOpener {
                     ParquetObjectReader::new(store, path)
                 }
             };
-            #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
-            let mut reader = {
-                // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
-                // in arrow 55)
-                let meta = store.head(&path).await?;
-                ParquetObjectReader::new(store, meta)
-            };
+
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
@@ -397,11 +384,10 @@ impl FileOpener for PresignedUrlOpener {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::slice;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::arrow::array::{Array, RecordBatch};
-    use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
-    use url::Url;
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -409,6 +395,10 @@ mod tests {
     use crate::EngineData;
 
     use itertools::Itertools;
+    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use url::Url;
+
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
 
@@ -438,13 +428,10 @@ mod tests {
             .schema()
             .clone();
 
-        let meta_size = meta.size;
-        #[cfg(not(feature = "arrow-55"))]
-        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
-            size: meta_size,
+            size: meta.size,
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -478,7 +465,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::get_write_metadata_schema()
+            crate::transaction::add_files_schema()
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),
@@ -573,7 +560,7 @@ mod tests {
 
         let data: Vec<RecordBatch> = parquet_handler
             .read_parquet_files(
-                &[parquet_file.clone()],
+                slice::from_ref(parquet_file),
                 Arc::new(physical_schema.try_into_kernel().unwrap()),
                 None,
             )
@@ -600,9 +587,11 @@ mod tests {
             .unwrap(),
         ));
 
-        assert!(parquet_handler
-            .write_parquet(&Url::parse("memory:///data").unwrap(), data)
-            .await
-            .is_err());
+        assert_result_error_with_message(
+            parquet_handler
+                .write_parquet(&Url::parse("memory:///data").unwrap(), data)
+                .await,
+            "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
+        );
     }
 }

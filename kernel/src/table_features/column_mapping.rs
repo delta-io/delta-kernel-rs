@@ -1,7 +1,9 @@
 //! Code to handle column mapping, including modes and schema transforms
 use super::ReaderFeature;
 use crate::actions::Protocol;
-use crate::schema::{ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField};
+use crate::schema::{
+    ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField, StructType,
+};
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
@@ -155,6 +157,12 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
         }
         None
     }
+    fn transform_variant(&mut self, _: &'a StructType) -> Option<Cow<'a, StructType>> {
+        // don't recurse into variant's fields, as they are not expected to have column mapping
+        // annotations
+        // TODO: this changes with icebergcompat right? see issue#1125 for icebergcompat.
+        None
+    }
 }
 
 #[cfg(test)]
@@ -301,7 +309,7 @@ mod tests {
             create_annotations(inner_id, inner_name),
             create_annotations(outer_id, outer_name)
         );
-        println!("{}", schema);
+        println!("{schema}");
         StructType::new([serde_json::from_str(&schema).unwrap()])
     }
 

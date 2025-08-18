@@ -1,5 +1,145 @@
 # Changelog
 
+## [v0.14.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.14.0/) (2025-08-01)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.13.0...v0.14.0)
+
+### 🏗️ Breaking changes
+1. Removed Table APIs: instead use `Snapshot` and `Transaction` directly. ([#976])
+2. Add support for Variant type and the variantType table feature (new `DataType::Variant` enum
+   variant and new `variantType-preview` and `variantShredding` Reader/Writer features) ([#1015])
+3. Expose post commit stats. Now, in `Transaction::commit` the `Committed` variant of the enum
+   includes a `post_commit_stats` field with info about the commits since checkpoint and log
+   compaction. ([#1079])
+4. Replace `Transaction::with_commit_info()` API with `with_engine_info()` API ([#997])
+5. Removed `DataType::decimal_unchecked` API ([#1087])
+6. `make_physical` takes column mapping and sets parquet field ids. breaking: (1)
+    `StructField::make_physical` is now an internal_api instead of a public function. Its signature
+    has also changed. And (2) If `ColumnMappingMode` is `None`, then the physical schema's name is
+    the logical name. Previously, kernel would unconditionally use the column mapping physical name,
+    even if column mapping mode is none. ([#1082])
+
+### 🚀 Features / new APIs
+
+1. *(ffi)* Added default-engine-rustls feature and extern "C" for .h file ([#1023])
+2. Add log segment constructor for timestamp to version conversion ([#895])
+3. Expose unshredded variant type as `DataType::unshredded_variant()` ([#1086])
+4. New ffi API for `get_domain_metadata()` ([#1041])
+5. Add append functions to ffi ([#962])
+6. Add try_new and `IntoEngineData` for Metadata action ([#1122])
+
+### 🐛 Bug Fixes
+
+1. Rename object_store PutMultipartOpts ([#1071], [#1090])
+2. Use object_store >= 0.12.3 for arrow 55 feature ([#1117])
+3. VARIANT follow-ups for SchemaTransform etc ([#1106])
+
+### 🚜 Refactor
+
+1. Downgrade stale `_last_checkpoint` log from `warn!` to `info!` ([#777])
+2. Exclude `tests/data` from release ([#1092])
+3. Deny panics in prod code ([#1113])
+
+### 🧪 Testing
+
+1. Add derive macro tests ([#514])
+2. Add unshredded variant read test ([#1088])
+3. *(ffi)* `AllocateErrorFn` should be able to allocate a nullptr ([#1105])
+4. Assert tests on error message instead of `is_err()` ([#1110])
+
+### ⚙️ Chores/CI
+
+1. Expose Snapshot and ListedLogFiles constructors behind internal api flag ([#1076])
+2. Only semver check released crates ([#1101])
+
+### Other
+
+1. Fix typos in README ([#1093])
+2. Fix typos in docstrings ([#1118])
+
+
+[#1023]: https://github.com/delta-io/delta-kernel-rs/pull/1023
+[#976]: https://github.com/delta-io/delta-kernel-rs/pull/976
+[#1071]: https://github.com/delta-io/delta-kernel-rs/pull/1071
+[#1076]: https://github.com/delta-io/delta-kernel-rs/pull/1076
+[#1015]: https://github.com/delta-io/delta-kernel-rs/pull/1015
+[#1079]: https://github.com/delta-io/delta-kernel-rs/pull/1079
+[#514]: https://github.com/delta-io/delta-kernel-rs/pull/514
+[#777]: https://github.com/delta-io/delta-kernel-rs/pull/777
+[#895]: https://github.com/delta-io/delta-kernel-rs/pull/895
+[#997]: https://github.com/delta-io/delta-kernel-rs/pull/997
+[#1086]: https://github.com/delta-io/delta-kernel-rs/pull/1086
+[#1090]: https://github.com/delta-io/delta-kernel-rs/pull/1090
+[#1088]: https://github.com/delta-io/delta-kernel-rs/pull/1088
+[#1093]: https://github.com/delta-io/delta-kernel-rs/pull/1093
+[#1092]: https://github.com/delta-io/delta-kernel-rs/pull/1092
+[#1087]: https://github.com/delta-io/delta-kernel-rs/pull/1087
+[#1041]: https://github.com/delta-io/delta-kernel-rs/pull/1041
+[#1101]: https://github.com/delta-io/delta-kernel-rs/pull/1101
+[#1113]: https://github.com/delta-io/delta-kernel-rs/pull/1113
+[#1105]: https://github.com/delta-io/delta-kernel-rs/pull/1105
+[#1117]: https://github.com/delta-io/delta-kernel-rs/pull/1117
+[#1118]: https://github.com/delta-io/delta-kernel-rs/pull/1118
+[#1106]: https://github.com/delta-io/delta-kernel-rs/pull/1106
+[#962]: https://github.com/delta-io/delta-kernel-rs/pull/962
+[#1122]: https://github.com/delta-io/delta-kernel-rs/pull/1122
+[#1110]: https://github.com/delta-io/delta-kernel-rs/pull/1110
+[#1082]: https://github.com/delta-io/delta-kernel-rs/pull/1082
+
+
+## [v0.13.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.13.0/) (2025-07-11)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.12.1...v0.13.0)
+
+### 🏗️ Breaking changes
+1. Add support for opaque engine expressions. Includes a number of changes: new `ExpressionType`s
+   (`OpaqueExpression`, `OpaquePredicate`, `Unknown`) and `Expression`/`Predicate` variants
+   (`Opaque`, `Unknown`), and visitors, transforms, and evaluators changed to support
+   opaque/unknown expressions/predicate. ([#686])
+2. Rename `Transaction::add_write_metadata` to `Transaction::add_files` ([#1019])
+
+### 🚀 Features / new APIs
+
+1. add ability to only retain SetTransaction actions <= SetTransactionRetentionDuration ([#1013])
+2. *(ffi)* Add timetravel by version number ([#1044])
+3. Introduce a crate for args that are common between examples ([#1046])
+4. Support reordering structs that are inside maps in default parquet reader ([#1060])
+5. Add default engine support for arrow eval of opaque expressions ([#980])
+5. Expose descriptive fields on Metadata action ([#1051])
+
+### 🐛 Bug Fixes
+
+1. Clippy fmt cleanup ([#1042])
+2. Examples: move logic into the thread::scope call so examples don't hang ([#1040])
+3. Remove panic from read_last_checkpoint ([#1022])
+4. Always write `_last_checkpoint` with parts = None ([#1053])
+5. Don't release `common` crate (used only by example programs)  ([#1065])
+
+### 🚜 Refactor
+
+1. Move various test util functions to test-utils crate ([#985])
+2. Define and use a cow helper for transforms ([#1057])
+3. Expand capability and usage of `Cow` helper for transforms ([#1061])
+
+
+[#985]: https://github.com/delta-io/delta-kernel-rs/pull/985
+[#1013]: https://github.com/delta-io/delta-kernel-rs/pull/1013
+[#1042]: https://github.com/delta-io/delta-kernel-rs/pull/1042
+[#1040]: https://github.com/delta-io/delta-kernel-rs/pull/1040
+[#1022]: https://github.com/delta-io/delta-kernel-rs/pull/1022
+[#1044]: https://github.com/delta-io/delta-kernel-rs/pull/1044
+[#1019]: https://github.com/delta-io/delta-kernel-rs/pull/1019
+[#1053]: https://github.com/delta-io/delta-kernel-rs/pull/1053
+[#1046]: https://github.com/delta-io/delta-kernel-rs/pull/1046
+[#1057]: https://github.com/delta-io/delta-kernel-rs/pull/1057
+[#1061]: https://github.com/delta-io/delta-kernel-rs/pull/1061
+[#1065]: https://github.com/delta-io/delta-kernel-rs/pull/1065
+[#686]: https://github.com/delta-io/delta-kernel-rs/pull/686
+[#1060]: https://github.com/delta-io/delta-kernel-rs/pull/1060
+[#980]: https://github.com/delta-io/delta-kernel-rs/pull/980
+[#1051]: https://github.com/delta-io/delta-kernel-rs/pull/1051
+
+
 ## [v0.12.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.12.1/) (2025-06-05)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.12.0...v0.12.1)

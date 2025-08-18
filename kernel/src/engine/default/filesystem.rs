@@ -4,10 +4,9 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
 use itertools::Itertools;
+use object_store::path::Path;
+use object_store::{DynObjectStore, ObjectStore};
 use url::Url;
-
-use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStore};
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
@@ -92,14 +91,11 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     Ok(meta) => {
                         let mut location = url.clone();
                         location.set_path(&format!("/{}", meta.location.as_ref()));
-                        let meta_size = meta.size;
-                        #[cfg(not(feature = "arrow-55"))]
-                        let meta_size = meta_size.try_into().expect("convert file size to u64");
                         sender
                             .send(Ok(FileMeta {
                                 location,
                                 last_modified: meta.last_modified.timestamp_millis(),
-                                size: meta_size,
+                                size: meta.size,
                             }))
                             .ok();
                     }
@@ -140,30 +136,26 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         self.task_executor.spawn(
             futures::stream::iter(files)
                 .map(move |(url, range)| {
-                    // Wasn't checking the scheme before calling to_file_path causing the url path to
-                    // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
-                    // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
-                    // details about why this check is necessary
-                    let path = if url.scheme() == "file" {
-                        let file_path = url.to_file_path().expect("Not a valid file path");
-                        Path::from_absolute_path(file_path).expect("Not able to be made into Path")
-                    } else {
-                        Path::from(url.path())
-                    };
                     let store = store.clone();
                     async move {
+                        // Wasn't checking the scheme before calling to_file_path causing the url path to
+                        // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
+                        // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
+                        // details about why this check is necessary
+                        let path = if url.scheme() == "file" {
+                            let file_path = url.to_file_path().map_err(|_| {
+                                Error::InvalidTableLocation(format!("Invalid file URL: {url}"))
+                            })?;
+                            Path::from_absolute_path(file_path).map_err(|e| {
+                                Error::InvalidTableLocation(format!("Invalid file path: {e}"))
+                            })?
+                        } else {
+                            Path::from(url.path())
+                        };
                         if url.is_presigned() {
                             // have to annotate type here or rustc can't figure it out
                             Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
                         } else if let Some(rng) = range {
-                            #[cfg(not(feature = "arrow-55"))]
-                            let rng = (rng
-                                .start
-                                .try_into()
-                                .map_err(|_| Error::generic("unable to convert usize to u64"))?)
-                                ..(rng.end.try_into().map_err(|_| {
-                                    Error::generic("unable to convert usize to u64")
-                                })?);
                             Ok(store.get_range(&path, rng).await?)
                         } else {
                             let result = store.get(&path).await?;
@@ -190,16 +182,15 @@ mod tests {
     use std::ops::Range;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::{local::LocalFileSystem, ObjectStore};
+    use itertools::Itertools;
+    use object_store::memory::InMemory;
+    use object_store::{local::LocalFileSystem, ObjectStore};
 
     use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::Engine as _;
-
-    use itertools::Itertools;
 
     use super::*;
 

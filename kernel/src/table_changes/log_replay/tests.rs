@@ -11,7 +11,7 @@ use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_features::ReaderFeature;
-use crate::utils::test_utils::{Action, LocalMockTable};
+use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
 
@@ -524,7 +524,7 @@ async fn data_skipping_filter() {
     let logical_schema = get_schema();
     let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
         Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
-        other => panic!("Unexpected result: {:?}", other),
+        other => panic!("Unexpected result: {other:?}"),
     };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
@@ -580,7 +580,10 @@ async fn failing_protocol() {
             .unwrap()
             .try_collect();
 
-    assert!(res.is_err());
+    assert_result_error_with_message(
+        res,
+        "Change data feed is unsupported for the table at version 0",
+    );
 }
 
 #[tokio::test]

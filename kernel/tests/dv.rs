@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanResult;
-use delta_kernel::{DeltaResult, Table};
+use delta_kernel::{DeltaResult, Snapshot};
 use test_utils::DefaultEngineExtension;
 
 use itertools::Itertools;
@@ -32,8 +32,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = DefaultEngine::new_local();
 
-    let table = Table::new(url);
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(url, engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(engine)?;
@@ -48,8 +47,7 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = DefaultEngine::new_local();
 
-    let table = Table::new(url);
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(url, engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(engine)?;

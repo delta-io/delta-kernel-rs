@@ -8,11 +8,13 @@ repository.workspace = true
 readme.workspace = true
 version.workspace = true
 
+# for cargo-release
 [package.metadata.release]
 release = false
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = [ "default-engine", "arrow" ] }
+delta_kernel = { path = "../kernel", features = [ "default-engine-rustls", "arrow" ] }
+object_store = "0.12.3"
 itertools = "0.14.0"
 serde_json = "1.0.140"
 url = "2.5.4"

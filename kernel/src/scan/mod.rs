@@ -16,10 +16,11 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
+use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ListedLogFiles, LogSegment};
+use crate::log_segment::LogSegment;
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::ToSchema as _;
 use crate::schema::{
@@ -36,8 +37,12 @@ pub(crate) mod data_skipping;
 pub mod log_replay;
 pub mod state;
 
+// safety: we define get_log_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
+#[allow(clippy::unwrap_used)]
 static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap());
+// safety: we define get_log_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
+#[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_log_schema().project(&[ADD_NAME, SIDECAR_NAME]).unwrap());
 
@@ -108,9 +113,10 @@ impl ScanBuilder {
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
-        let state_info = get_state_info(
+        let state_info = StateInfo::try_new(
             logical_schema.as_ref(),
             &self.snapshot.metadata().partition_columns,
+            self.snapshot.table_configuration().column_mapping_mode(),
         )?;
 
         let physical_predicate = match self.predicate {
@@ -328,7 +334,7 @@ pub fn get_transform_for_row(
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// `Transform`.
 pub(crate) enum TransformExpr {
-    Static(Expression),
+    Static(ExpressionRef),
     Partition(usize),
 }
 
@@ -429,7 +435,7 @@ impl Scan {
         &self.physical_schema
     }
 
-    /// Get the predicate [`Expression`] of the scan.
+    /// Get the predicate [`PredicateRef`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
         if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
             Some(predicate.clone())
@@ -446,7 +452,7 @@ impl Scan {
             .iter()
             .map(|field| match field {
                 ColumnType::Selected(col_name) => {
-                    TransformExpr::Static(ColumnName::new([col_name]).into())
+                    TransformExpr::Static(Arc::new(ColumnName::new([col_name]).into()))
                 }
                 ColumnType::Partition(idx) => TransformExpr::Partition(*idx),
             })
@@ -460,7 +466,7 @@ impl Scan {
     ///   scanned. The schema for each row can be obtained by calling [`scan_row_schema`].
     /// - `Vec<bool>`: A selection vector. If a row is at index `i` and this vector is `false` at
     ///   index `i`, then that row should *not* be processed (i.e. it is filtered out). If the vector
-    ///   is `true` at index `i` the row *should* be processed. If the selector vector is *shorter*
+    ///   is `true` at index `i` the row *should* be processed. If the selection vector is *shorter*
     ///   than the number of rows returned, missing elements are considered `true`, i.e. included in
     ///   the query. NB: If you are using the default engine and plan to call arrow's
     ///   `filter_record_batch`, you _need_ to extend this vector to the full length of the batch or
@@ -481,12 +487,12 @@ impl Scan {
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
     ///
-    /// The existing iterator is assumed contain data from a previous call to  `scan_metadata`,
+    /// The existing iterator is assumed to contain data from a previous call to `scan_metadata`.
     /// Engines may decide to cache the results of `scan_metadata` to avoid additional IO operations
     /// required to replay the log.
     ///
     /// As such the new scan's predicate must "contain" the previous scan's predicate. That is, the new
-    /// scan's predicate MUST skip all files the previous scan's predicate skipped, The new scan's
+    /// scan's predicate MUST skip all files the previous scan's predicate skipped. The new scan's
     /// predicate is also allowed to skip files the previous predicate kept. For example, if the previous
     /// scan predicate was
     /// ```sql
@@ -814,39 +820,45 @@ struct StateInfo {
     have_partition_cols: bool,
 }
 
-/// Get the state needed to process a scan, see [`StateInfo`] for details.
-fn get_state_info(logical_schema: &Schema, partition_columns: &[String]) -> DeltaResult<StateInfo> {
-    let mut have_partition_cols = false;
-    let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
-    // Loop over all selected fields and note if they are columns that will be read from the
-    // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-    // be filled in by evaluating an expression ([`ColumnType::Partition`])
-    let all_fields = logical_schema
-        .fields()
-        .enumerate()
-        .map(|(index, logical_field)| -> DeltaResult<_> {
-            if partition_columns.contains(logical_field.name()) {
-                // Store the index into the schema for this field. When we turn it into an
-                // expression in the inner loop, we will index into the schema and get the name and
-                // data type, which we need to properly materialize the column.
-                have_partition_cols = true;
-                Ok(ColumnType::Partition(index))
-            } else {
-                // Add to read schema, store field so we can build a `Column` expression later
-                // if needed (i.e. if we have partition columns)
-                let physical_field = logical_field.make_physical();
-                debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                let physical_name = physical_field.name.clone();
-                read_fields.push(physical_field);
-                Ok(ColumnType::Selected(physical_name))
-            }
+impl StateInfo {
+    /// Get the state needed to process a scan.
+    fn try_new(
+        logical_schema: &Schema,
+        partition_columns: &[String],
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
+        let mut have_partition_cols = false;
+        let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
+        // Loop over all selected fields and note if they are columns that will be read from the
+        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
+        // be filled in by evaluating an expression ([`ColumnType::Partition`])
+        let all_fields = logical_schema
+            .fields()
+            .enumerate()
+            .map(|(index, logical_field)| -> DeltaResult<_> {
+                if partition_columns.contains(logical_field.name()) {
+                    // Store the index into the schema for this field. When we turn it into an
+                    // expression in the inner loop, we will index into the schema and get the name and
+                    // data type, which we need to properly materialize the column.
+                    have_partition_cols = true;
+                    Ok(ColumnType::Partition(index))
+                } else {
+                    // Add to read schema, store field so we can build a `Column` expression later
+                    // if needed (i.e. if we have partition columns)
+                    let physical_field = logical_field.make_physical(column_mapping_mode);
+                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                    let physical_name = physical_field.name.clone();
+                    read_fields.push(physical_field);
+                    Ok(ColumnType::Selected(physical_name))
+                }
+            })
+            .try_collect()?;
+        Ok(StateInfo {
+            all_fields,
+            read_fields,
+            have_partition_cols,
         })
-        .try_collect()?;
-    Ok(StateInfo {
-        all_fields,
-        read_fields,
-        have_partition_cols,
-    })
+    }
 }
 
 pub fn selection_vector(
@@ -1006,7 +1018,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
-    use crate::Table;
+    use crate::Snapshot;
 
     use super::*;
 
@@ -1030,8 +1042,7 @@ mod tests {
             assert_eq!(
                 can_statically_skip_all_files(&predicate),
                 should_skip,
-                "Failed for predicate: {:#?}",
-                predicate
+                "Failed for predicate: {predicate:#?}"
             );
         }
     }
@@ -1171,8 +1182,7 @@ mod tests {
             let result = PhysicalPredicate::try_new(&predicate, &logical_schema).ok();
             assert_eq!(
                 result, expected,
-                "Failed for predicate: {:#?}, expected {:#?}, got {:#?}",
-                predicate, expected, result
+                "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
             );
         }
     }
@@ -1206,8 +1216,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(&engine, None).unwrap();
+        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let files = get_files_for_scan(scan, &engine).unwrap();
         assert_eq!(files.len(), 1);
@@ -1224,8 +1233,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(engine.as_ref(), None).unwrap();
+        let snapshot = Snapshot::try_new(url, engine.as_ref(), None).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let files: Vec<ScanResult> = scan.execute(engine).unwrap().try_collect().unwrap();
 
@@ -1241,8 +1249,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(engine.as_ref(), None).unwrap();
+        let snapshot = Snapshot::try_new(url, engine.as_ref(), None).unwrap();
         let version = snapshot.version();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let files: Vec<_> = scan
@@ -1276,8 +1283,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(engine.as_ref(), Some(0)).unwrap();
+        let snapshot = Snapshot::try_new(url.clone(), engine.as_ref(), Some(0)).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let files: Vec<_> = scan
             .scan_metadata(engine.as_ref())
@@ -1298,7 +1304,7 @@ mod tests {
             .into_iter()
             .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
             .collect();
-        let snapshot = table.snapshot(engine.as_ref(), Some(1)).unwrap();
+        let snapshot = Snapshot::try_new(url, engine.as_ref(), Some(1)).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let new_files: Vec<_> = scan
             .scan_metadata_from(engine.as_ref(), 0, files, None)
@@ -1367,8 +1373,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(&engine, None).unwrap();
+        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
         let scan = snapshot.into_scan_builder().build().unwrap();
         let data: Vec<_> = scan
             .replay_for_scan_metadata(&engine)
@@ -1388,8 +1393,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let table = Table::new(url);
-        let snapshot = Arc::new(table.snapshot(engine.as_ref(), None).unwrap());
+        let snapshot = Arc::new(Snapshot::try_new(url, engine.as_ref(), None).unwrap());
 
         // No predicate pushdown attempted, so the one data file should be returned.
         //
@@ -1432,8 +1436,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let table = Table::new(url);
-        let snapshot = Arc::new(table.snapshot(engine.as_ref(), None).unwrap());
+        let snapshot = Arc::new(Snapshot::try_new(url, engine.as_ref(), None).unwrap());
 
         // Predicate over a logically valid but physically missing column. No data files should be
         // returned because the column is inferred to be all-null.
@@ -1468,8 +1471,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let table = Table::new(url);
-        let snapshot = table.snapshot(&engine, None)?;
+        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
         let scan = snapshot.into_scan_builder().build()?;
         let files = get_files_for_scan(scan, &engine)?;
         // test case:

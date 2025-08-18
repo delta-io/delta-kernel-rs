@@ -8,13 +8,19 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::expressions::{ArrayData, MapData, Scalar, StructData};
+use crate::schema::{
+    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, EngineData, Error, FileMeta, RowVisitor as _};
+use crate::{
+    DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
+    IntoEngineData, RowVisitor as _,
+};
 
 use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
@@ -22,6 +28,9 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+
+const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
+const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
 pub mod set_transaction;
@@ -146,6 +155,23 @@ impl Default for Format {
     }
 }
 
+impl TryFrom<Format> for Scalar {
+    type Error = Error;
+
+    fn try_from(format: Format) -> DeltaResult<Self> {
+        let provider = Scalar::from(format.provider);
+        let options = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            format.options,
+        )
+        .map(Scalar::Map)?;
+        Ok(Scalar::Struct(StructData::try_new(
+            Format::to_schema().fields().cloned().collect(),
+            vec![provider, options],
+        )?))
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     any(test, feature = "internal-api"),
@@ -173,6 +199,57 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
+    // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
+    #[allow(dead_code)]
+    pub(crate) fn try_new(
+        name: Option<String>,
+        description: Option<String>,
+        schema: StructType,
+        partition_columns: Vec<String>,
+        created_time: i64,
+        configuration: HashMap<String, String>,
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            description,
+            // As of Delta Lake 0.3.0, user-facing APIs only allow the creation of tables where
+            // format = 'parquet' and options = {}. Support for reading other formats is present
+            // both for legacy reasons and to enable possible support for other formats in the
+            // future (See delta-io/delta#87).
+            format: Format::default(),
+            schema_string: serde_json::to_string(&schema)?,
+            partition_columns,
+            created_time: Some(created_time),
+            configuration,
+        })
+    }
+
+    // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn created_time(&self) -> Option<i64> {
+        self.created_time
+    }
+
     pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
         let mut visitor = MetadataVisitor::default();
         visitor.visit_rows_of(data)?;
@@ -185,6 +262,7 @@ impl Metadata {
         &self.configuration
     }
 
+    #[internal_api]
     pub(crate) fn parse_schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
@@ -198,8 +276,55 @@ impl Metadata {
     /// Parse the metadata configuration HashMap<String, String> into a TableProperties struct.
     /// Note that parsing is infallible -- any items that fail to parse are simply propagated
     /// through to the `TableProperties.unknown_properties` field.
+    #[internal_api]
     pub(crate) fn parse_table_properties(&self) -> TableProperties {
         TableProperties::from(self.configuration.iter())
+    }
+}
+
+// TODO: derive IntoEngineData instead (see issue #1083)
+impl IntoEngineData for Metadata {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let id = Scalar::from(self.id);
+        let name = Scalar::from(self.name);
+        let description = Scalar::from(self.description);
+        // For format, we need to provide individual scalars for provider and options
+        let format_provider = Scalar::from(self.format.provider);
+        let format_options = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.format.options,
+        )
+        .map(Scalar::Map)?;
+        let schema_string = Scalar::from(self.schema_string);
+        let partition_columns = Scalar::Array(ArrayData::try_new(
+            ArrayType::new(DataType::STRING, false),
+            self.partition_columns,
+        )?);
+        let created_time = Scalar::from(self.created_time);
+        let configuration = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.configuration,
+        )
+        .map(Scalar::Map)?;
+
+        let values = [
+            id,
+            name,
+            description,
+            format_provider,
+            format_options,
+            schema_string,
+            partition_columns,
+            created_time,
+            configuration,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
     }
 }
 
@@ -237,7 +362,7 @@ where
                 .collect()
         })
         .transpose()
-        .expect("Parsing FromStr should never fail with strum 'default'")
+        .ok()?
 }
 
 impl Protocol {
@@ -380,6 +505,52 @@ impl Protocol {
     }
 }
 
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
+impl IntoEngineData for Protocol {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        fn features_to_scalar<T>(
+            features: Option<impl IntoIterator<Item = T>>,
+        ) -> DeltaResult<Scalar>
+        where
+            T: Into<Scalar>,
+        {
+            match features {
+                Some(features) => {
+                    let features: Vec<Scalar> = features.into_iter().map(Into::into).collect();
+                    Ok(Scalar::Array(ArrayData::try_new(
+                        ArrayType::new(DataType::STRING, false),
+                        features,
+                    )?))
+                }
+                None => Ok(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+                    DataType::STRING,
+                    false,
+                ))))),
+            }
+        }
+
+        let min_reader_version = Scalar::from(self.min_reader_version);
+        let min_writer_version = Scalar::from(self.min_writer_version);
+
+        let reader_features = features_to_scalar(self.reader_features)?;
+        let writer_features = features_to_scalar(self.writer_features)?;
+
+        let values = [
+            min_reader_version,
+            min_writer_version,
+            reader_features,
+            writer_features,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
+}
+
 // given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
     table_features: &[T],
@@ -440,9 +611,65 @@ pub(crate) struct CommitInfo {
     /// write this field, but it is optional since many tables will not have this field (i.e. any
     /// tables not written by kernel).
     pub(crate) kernel_version: Option<String>,
-    /// A place for the engine to store additional metadata associated with this commit encoded as
-    /// a map of strings.
-    pub(crate) engine_commit_info: Option<HashMap<String, String>>,
+    /// A place for the engine to store additional metadata associated with this commit
+    pub(crate) engine_info: Option<String>,
+    /// A unique transaction identified for this commit. When the `catalogManaged` table feature is
+    /// enabled (not yet implemented), this field will be required. Otherwise, it is optional.
+    pub(crate) txn_id: Option<String>,
+}
+
+impl CommitInfo {
+    pub(crate) fn new(
+        timestamp: i64,
+        operation: Option<String>,
+        engine_info: Option<String>,
+    ) -> Self {
+        Self {
+            timestamp: Some(timestamp),
+            in_commit_timestamp: None,
+            operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
+            operation_parameters: None,
+            kernel_version: Some(format!("v{KERNEL_VERSION}")),
+            engine_info,
+            txn_id: None,
+        }
+    }
+}
+
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
+impl IntoEngineData for CommitInfo {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let timestamp = Scalar::from(self.timestamp);
+        let in_commit_timestamp = Scalar::from(self.in_commit_timestamp);
+        let operation = Scalar::from(self.operation);
+
+        let operation_parameters = MapData::try_new(
+            MapType::new(DataType::STRING, DataType::STRING, false),
+            self.operation_parameters.unwrap_or_default(),
+        )
+        .map(Scalar::Map)?;
+
+        let kernel_version = Scalar::from(self.kernel_version);
+        let engine_info = Scalar::from(self.engine_info);
+        let txn_id = Scalar::from(self.txn_id);
+
+        let values = [
+            timestamp,
+            in_commit_timestamp,
+            operation,
+            operation_parameters,
+            kernel_version,
+            engine_info,
+            txn_id,
+        ];
+
+        let evaluator = engine.evaluation_handler();
+        evaluator.create_one(schema, &values)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -710,10 +937,50 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::arrow::array::ListBuilder;
+    use crate::arrow::json::ReaderBuilder;
+    use crate::{
+        arrow::array::{
+            Array, Int32Array, Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+            StructArray,
+        },
+        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
+        arrow::record_batch::RecordBatch,
+        engine::arrow_data::ArrowEngineData,
+        engine::arrow_expression::ArrowEvaluationHandler,
+        schema::{ArrayType, DataType, MapType, StructField},
+        utils::test_utils::assert_result_error_with_message,
+        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    };
+    use serde_json::json;
+
+    // duplicated
+    struct ExprEngine(Arc<dyn EvaluationHandler>);
+
+    impl ExprEngine {
+        fn new() -> Self {
+            ExprEngine(Arc::new(ArrowEvaluationHandler))
+        }
+    }
+
+    impl Engine for ExprEngine {
+        fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
+            self.0.clone()
+        }
+
+        fn json_handler(&self) -> Arc<dyn JsonHandler> {
+            unimplemented!()
+        }
+
+        fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
+            unimplemented!()
+        }
+
+        fn storage_handler(&self) -> Arc<dyn StorageHandler> {
+            unimplemented!()
+        }
+    }
 
     #[test]
     fn test_metadata_schema() {
@@ -917,10 +1184,8 @@ mod tests {
                     MapType::new(DataType::STRING, DataType::STRING, false),
                 ),
                 StructField::nullable("kernelVersion", DataType::STRING),
-                StructField::nullable(
-                    "engineCommitInfo",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
-                ),
+                StructField::nullable("engineInfo", DataType::STRING),
+                StructField::nullable("txnId", DataType::STRING),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -993,15 +1258,6 @@ mod tests {
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
-
-        let protocol = Protocol::try_new(
-            4,
-            7,
-            Some([ReaderFeature::V2Checkpoint]),
-            Some([ReaderFeature::V2Checkpoint]),
-        )
-        .unwrap();
-        assert!(protocol.ensure_read_supported().is_err());
     }
 
     #[test]
@@ -1081,7 +1337,10 @@ mod tests {
             Some([WriterFeature::RowTracking]),
         )
         .unwrap();
-        assert!(protocol.ensure_write_supported().is_err());
+        assert_result_error_with_message(
+            protocol.ensure_write_supported(),
+            r#"Unsupported: Unknown WriterFeatures: "rowTracking". Supported WriterFeatures: "appendOnly", "deletionVectors", "invariants", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+        );
     }
 
     #[test]
@@ -1119,42 +1378,6 @@ mod tests {
 
     #[test]
     fn test_into_engine_data() {
-        use crate::arrow::array::{Int64Array, StringArray};
-        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-        use crate::arrow::record_batch::RecordBatch;
-
-        use crate::engine::arrow_data::ArrowEngineData;
-        use crate::engine::arrow_expression::ArrowEvaluationHandler;
-        use crate::IntoEngineData;
-        use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
-
-        // duplicated
-        struct ExprEngine(Arc<dyn EvaluationHandler>);
-
-        impl ExprEngine {
-            fn new() -> Self {
-                ExprEngine(Arc::new(ArrowEvaluationHandler))
-            }
-        }
-
-        impl Engine for ExprEngine {
-            fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
-                self.0.clone()
-            }
-
-            fn json_handler(&self) -> Arc<dyn JsonHandler> {
-                unimplemented!()
-            }
-
-            fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
-                unimplemented!()
-            }
-
-            fn storage_handler(&self) -> Arc<dyn StorageHandler> {
-                unimplemented!()
-            }
-        }
-
         let engine = ExprEngine::new();
 
         let set_transaction = SetTransaction {
@@ -1190,5 +1413,445 @@ mod tests {
         .unwrap();
 
         assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_commit_info_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let commit_info = CommitInfo::new(0, None, None);
+
+        let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
+
+        let record_batch: crate::arrow::array::RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let mut map_builder = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        )
+        .with_values_field(Field::new("value".to_string(), ArrowDataType::Utf8, false));
+        map_builder.append(true).unwrap();
+        let operation_parameters = Arc::new(map_builder.finish());
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(0)])),
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
+                operation_parameters,
+                Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(StringArray::from(vec![None::<String>])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_metadata_try_new() {
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
+
+        let metadata = Metadata::try_new(
+            Some("test_table".to_string()),
+            Some("description".to_string()),
+            schema.clone(),
+            vec!["year".to_string()],
+            1234567890,
+            config.clone(),
+        )
+        .unwrap();
+
+        assert!(!metadata.id.is_empty());
+        assert_eq!(metadata.name, Some("test_table".to_string()));
+        assert_eq!(
+            metadata.schema_string,
+            serde_json::to_string(&schema).unwrap()
+        );
+        assert_eq!(metadata.created_time, Some(1234567890));
+        assert_eq!(metadata.configuration, config);
+    }
+
+    #[test]
+    fn test_metadata_try_new_default() {
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+
+        assert!(!metadata.id.is_empty());
+        assert_eq!(metadata.name, None);
+        assert_eq!(metadata.description, None);
+    }
+
+    #[test]
+    fn test_metadata_unique_ids() {
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
+        let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        assert_ne!(m1.id, m2.id);
+    }
+
+    #[test]
+    fn test_format_try_from_scalar() {
+        let options = HashMap::from([
+            ("path".to_string(), "/delta/table".to_string()),
+            ("compressionType".to_string(), "snappy".to_string()),
+        ]);
+        let format = Format {
+            provider: "parquet".to_string(),
+            options,
+        };
+        let scalar = Scalar::try_from(format).unwrap();
+
+        let Scalar::Struct(struct_data) = scalar else {
+            panic!("Expected struct scalar");
+        };
+        assert_eq!(struct_data.fields()[0].name(), "provider");
+        assert_eq!(struct_data.fields()[1].name(), "options");
+
+        let Scalar::String(provider) = &struct_data.values()[0] else {
+            panic!("Expected string provider");
+        };
+        assert_eq!(provider, "parquet");
+
+        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+            panic!("Expected map options");
+        };
+        assert_eq!(map_data.pairs().len(), 2);
+    }
+
+    #[test]
+    fn test_format_default() {
+        let format = Format::default();
+        let expected = Format {
+            provider: "parquet".to_string(),
+            options: HashMap::new(),
+        };
+        assert_eq!(format, expected);
+    }
+
+    #[test]
+    fn test_format_empty_options() {
+        let format = Format {
+            provider: "parquet".to_string(),
+            options: HashMap::new(),
+        };
+        let scalar = Scalar::try_from(format).unwrap();
+
+        let Scalar::Struct(struct_data) = scalar else {
+            panic!("Expected struct");
+        };
+        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+            panic!("Expected map");
+        };
+        assert!(map_data.pairs().is_empty());
+    }
+
+    #[test]
+    fn test_format_special_characters() {
+        let options = HashMap::from([
+            ("path".to_string(), "/path/with spaces".to_string()),
+            ("unicode".to_string(), "测试🎉".to_string()),
+            ("empty".to_string(), "".to_string()),
+        ]);
+        let format = Format {
+            provider: "custom".to_string(),
+            options,
+        };
+        let scalar = Scalar::try_from(format).unwrap();
+
+        let Scalar::Struct(struct_data) = scalar else {
+            panic!("Expected struct");
+        };
+        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+            panic!("Expected map");
+        };
+        assert_eq!(map_data.pairs().len(), 3);
+    }
+
+    #[test]
+    fn test_metadata_into_engine_data() {
+        let engine = ExprEngine::new();
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+
+        let test_metadata = Metadata::try_new(
+            Some("test".to_string()),
+            Some("my table".to_string()),
+            schema.clone(),
+            vec!["part".to_string()],
+            123,
+            HashMap::from([("k".to_string(), "v".to_string())]),
+        )
+        .unwrap();
+
+        // have to get the id since it's random
+        let test_id = test_metadata.id.clone();
+
+        let actual: RecordBatch = test_metadata
+            .into_engine_data(Metadata::to_schema().into(), &engine)
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let expected_json = json!({
+            "id": test_id,
+            "name": "test",
+            "description": "my table",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+            "partitionColumns": ["part"],
+            "createdTime": 123,
+            "configuration": {
+                "k": "v"
+            }
+        }).to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_metadata_with_log_schema() {
+        let engine = ExprEngine::new();
+        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+
+        let metadata = Metadata::try_new(
+            Some("table".to_string()),
+            None, // test that omitting description will omit entire field
+            schema,
+            vec![],
+            456,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let metadata_id = metadata.id.clone();
+
+        // test with the full log schema that wraps metadata in a "metaData" field
+        let log_schema = get_log_schema().project(&[METADATA_NAME]).unwrap();
+        let actual: RecordBatch = metadata
+            .into_engine_data(log_schema, &engine)
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let expected_json = json!({
+            "metaData": {
+                "id": metadata_id,
+                "name": "table",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":false,\"metadata\":{}}]}",
+                "partitionColumns": [],
+                "createdTime": 456,
+                "configuration": {}
+            }
+        }).to_string();
+        let expected = ReaderBuilder::new(actual.schema())
+            .build(expected_json.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data() {
+        let engine = ExprEngine::new();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::ColumnMapping]),
+            Some([WriterFeature::DeletionVectors]),
+        )
+        .unwrap();
+
+        let engine_data = protocol
+            .clone()
+            .into_engine_data(Protocol::to_schema().into(), &engine);
+        let record_batch: RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
+        let protocol_fields = vec![
+            Field::new("minReaderVersion", ArrowDataType::Int32, false),
+            Field::new("minWriterVersion", ArrowDataType::Int32, false),
+            Field::new(
+                "readerFeatures",
+                ArrowDataType::List(list_field.clone()),
+                true, // nullable
+            ),
+            Field::new(
+                "writerFeatures",
+                ArrowDataType::List(list_field.clone()),
+                true, // nullable
+            ),
+        ];
+        let schema = Arc::new(Schema::new(protocol_fields.clone()));
+
+        let string_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
+        list_builder.values().append_value("columnMapping");
+        list_builder.append(true);
+        let reader_features_array = list_builder.finish();
+
+        let string_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
+        list_builder.values().append_value("deletionVectors");
+        list_builder.append(true);
+        let writer_features_array = list_builder.finish();
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(reader_features_array.clone()),
+                Arc::new(writer_features_array.clone()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+
+        // test with the full log schema that wraps protocol in a "protocol" field
+        let log_schema = get_log_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let engine_data = protocol.into_engine_data(log_schema, &engine);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "protocol",
+            ArrowDataType::Struct(protocol_fields.into()),
+            true,
+        )]));
+
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    Arc::new(Field::new("minReaderVersion", ArrowDataType::Int32, false)),
+                    Arc::new(Int32Array::from(vec![3])) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new("minWriterVersion", ArrowDataType::Int32, false)),
+                    Arc::new(Int32Array::from(vec![7])) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "readerFeatures",
+                        ArrowDataType::List(list_field.clone()),
+                        true,
+                    )),
+                    Arc::new(reader_features_array) as Arc<dyn Array>,
+                ),
+                (
+                    Arc::new(Field::new(
+                        "writerFeatures",
+                        ArrowDataType::List(list_field),
+                        true,
+                    )),
+                    Arc::new(writer_features_array) as Arc<dyn Array>,
+                ),
+            ]))],
+        )
+        .unwrap();
+
+        let record_batch: RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data_empty_features() {
+        let engine = ExprEngine::new();
+        let empty_features: Vec<String> = vec![];
+        let protocol =
+            Protocol::try_new(3, 7, Some(empty_features.clone()), Some(empty_features)).unwrap();
+
+        let engine_data = protocol
+            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .unwrap();
+        let record_batch: RecordBatch = engine_data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 4);
+
+        // reader/writer features are Some([]) lists
+        let reader_features_col = record_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<crate::arrow::array::ListArray>()
+            .unwrap();
+        assert_eq!(reader_features_col.len(), 1);
+        assert_eq!(reader_features_col.value(0).len(), 0); // empty list
+        let writer_features_col = record_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<crate::arrow::array::ListArray>()
+            .unwrap();
+        assert_eq!(writer_features_col.len(), 1);
+        assert_eq!(writer_features_col.value(0).len(), 0); // empty list
+    }
+
+    #[test]
+    fn test_protocol_into_engine_data_no_features() {
+        let engine = ExprEngine::new();
+        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+
+        let engine_data = protocol
+            .into_engine_data(Protocol::to_schema().into(), &engine)
+            .unwrap();
+        let record_batch: RecordBatch = engine_data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        assert_eq!(record_batch.num_rows(), 1);
+        assert_eq!(record_batch.num_columns(), 4);
+
+        // reader/writer features are null
+        assert!(record_batch.column(2).is_null(0));
+        assert!(record_batch.column(3).is_null(0));
     }
 }

@@ -56,7 +56,7 @@ impl Parse for HandleDescriptorParams {
                 field => {
                     return Err(Error::new(
                         ident.span(),
-                        format!("unknown or duplicated field `{}`", field),
+                        format!("unknown or duplicated field `{field}`"),
                     ));
                 }
             }

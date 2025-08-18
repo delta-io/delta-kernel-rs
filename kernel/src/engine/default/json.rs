@@ -8,11 +8,11 @@ use std::task::Poll;
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
+use object_store::path::Path;
+use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use tracing::warn;
 use url::Url;
 
@@ -258,16 +258,17 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOpts, PutOptions, PutPayload, PutResult, Result,
-    };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
     use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
+    use object_store::PutMultipartOptions;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
+        PutPayload, PutResult, Result,
+    };
     use serde_json::json;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
@@ -310,7 +311,7 @@ mod tests {
             let mut seen = HashSet::new();
             for key in ordered_keys.iter() {
                 if !seen.insert(key) {
-                    panic!("Duplicate key in OrderedGetStore: {}", key);
+                    panic!("Duplicate key in OrderedGetStore: {key}");
                 }
             }
 
@@ -355,7 +356,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            opts: PutMultipartOpts,
+            opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -532,13 +533,10 @@ mod tests {
         let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
-        let meta_size = meta.size;
-        #[cfg(not(feature = "arrow-55"))]
-        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta_size,
+            size: meta.size,
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -571,7 +569,7 @@ mod tests {
         // note we don't want to go over 1000 since we only buffer 1000 requests at a time
         let num_paths = 1000;
         let ordered_paths: Vec<Path> = (0..num_paths)
-            .map(|i| Path::from(format!("/test/path{}", i)))
+            .map(|i| Path::from(format!("/test/path{i}")))
             .collect();
         let jumbled_paths: Vec<_> = ordered_paths[100..400]
             .iter()
@@ -583,7 +581,7 @@ mod tests {
         let memory_store = InMemory::new();
         for (i, path) in ordered_paths.iter().enumerate() {
             memory_store
-                .put(path, Bytes::from(format!("content_{}", i)).into())
+                .put(path, Bytes::from(format!("content_{i}")).into())
                 .await
                 .unwrap();
         }
@@ -632,7 +630,7 @@ mod tests {
         // 2. we then set up an ObjectStore to resolves those paths in a jumbled order
         // 3. then call read_json_files and check that the results are in order
         let ordered_paths: Vec<Path> = (0..1000)
-            .map(|i| Path::from(format!("test/path{}", i)))
+            .map(|i| Path::from(format!("test/path{i}")))
             .collect();
 
         let test_list: &[(usize, Vec<Path>)] = &[
@@ -680,16 +678,13 @@ mod tests {
                 .map(|path| {
                     let store = store.clone();
                     async move {
-                        let url = Url::parse(&format!("memory:/{}", path)).unwrap();
+                        let url = Url::parse(&format!("memory:/{path}")).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
-                        let meta_size = meta.size;
-                        #[cfg(not(feature = "arrow-55"))]
-                        let meta_size = meta_size.try_into().unwrap();
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta_size,
+                            size: meta.size,
                         }
                     }
                 })
@@ -801,7 +796,7 @@ mod tests {
                 Err(Error::FileAlreadyExists(err_path)) => {
                     assert_eq!(err_path, object_path.to_string());
                 }
-                _ => panic!("Expected FileAlreadyExists error, got: {:?}", result),
+                _ => panic!("Expected FileAlreadyExists error, got: {result:?}"),
             }
         }
 

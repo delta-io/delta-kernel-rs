@@ -1,11 +1,11 @@
-# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.82+]][rustc]
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.84+]][rustc]
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
 [latest-version]: https://img.shields.io/crates/v/delta_kernel.svg
 [crates.io]: https://crates.io/crates/delta\_kernel
-[rustc-version-1.82+]: https://img.shields.io/badge/rustc-1.82+-lightgray.svg
-[rustc]: https://blog.rust-lang.org/2024/10/17/Rust-1.82.0/
+[rustc-version-1.84+]: https://img.shields.io/badge/rustc-1.84+-lightgray.svg
+[rustc]: https://blog.rust-lang.org/2025/01/09/Rust-1.84.0/
 [docs]: https://img.shields.io/docsrs/delta_kernel
 [docs.rs]: https://docs.rs/delta_kernel/latest/delta_kernel/
 
@@ -52,10 +52,10 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.12.1"
+delta_kernel = "0.14.0"
 
 # or turn on the default engine, based on arrow
-delta_kernel = { version = "0.12.1", features = ["default-engine", "arrow-55"] }
+delta_kernel = { version = "0.14.0", features = ["default-engine", "arrow-56"] }
 ```
 
 ### Feature flags
@@ -85,12 +85,12 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-54`: Use arrow version 54
 - `arrow-55`: Use arrow version 55
+- `arrow-56`: Use arrow version 56
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
-  specify it directly with `arrow-N`, e.g. `arrow-55`.
+  specify it directly with `arrow-N`, e.g. `arrow-56`.
 
 Note that if more than one `arrow-x` feature is enabled, kernel will use the _highest_ (latest)
 specified flag. This also means that if you use `--all-features` you will get the latest version of
@@ -122,9 +122,9 @@ projects.
 
 There are a few key concepts that will help in understanding kernel:
 
-1. The `Engine` trait encapsulates all the functionality and engine or connector needs to provide to
+1. The `Engine` trait encapsulates all the functionality an engine or connector needs to provide to
    the Delta Kernel in order to read/write the Delta table.
-2. The `DefaultEngine` is our default implementation of the the above trait. It lives in
+2. The `DefaultEngine` is our default implementation of the above trait. It lives in
    `engine/default`, and provides a reference implementation for all `Engine`
    functionality. `DefaultEngine` uses [arrow](https://docs.rs/arrow/latest/arrow/) as its in-memory
    data format.
@@ -140,9 +140,6 @@ Some design principles which should be considered:
   `DefaultEngine` _does_ use async quite heavily. It doesn't depend on a particular runtime however,
   and implementations could provide an "executor" based on tokio, smol, async-std, or whatever might
   be needed. Currently only a `tokio` based executor is provided.
-- Minimal `Table` API. The kernel intentionally exposes the concept of immutable versions of tables
-  through the snapshot API. This encourages users to think about the Delta table state more
-  accurately.
 - Prefer builder style APIs over object oriented ones.
 - "Simple" set of default-features enabled to provide the basic functionality with the least
   necessary amount of dependencies possible. Putting more complex optimizations or APIs behind
@@ -156,7 +153,7 @@ Some design principles which should be considered:
 - If using `emacs`, both [eglot](https://github.com/joaotavora/eglot) and
   [lsp-mode](https://github.com/emacs-lsp/lsp-mode) provide excellent integration with
   `rust-analyzer`. [rustic](https://github.com/brotzeit/rustic) is a nice mode as well.
-- When also developing in vscode its sometimes convenient to configure rust-analyzer in
+- When also developing in VS Code it's sometimes convenient to configure rust-analyzer in
   `.vscode/settings.json`.
 
 ```json

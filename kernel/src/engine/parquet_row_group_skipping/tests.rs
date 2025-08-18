@@ -211,6 +211,16 @@ fn test_get_stat_values() {
         None // Timestamp defaults to 96-bit, which doesn't get stats
     );
 
+    // Read a random column as Variant. The actual read does not need to be performed, as stats on
+    // Variant should always return None.
+    assert_eq!(
+        filter.get_min_stat(
+            &column_name!("chrono.date32"),
+            &DataType::unshredded_variant()
+        ),
+        None
+    );
+
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
     assert_eq!(
         filter.get_min_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
@@ -381,6 +391,16 @@ fn test_get_stat_values() {
     assert_eq!(
         filter.get_max_stat(&column_name!("chrono.timestamp"), &DataType::TIMESTAMP),
         None // Timestamp defaults to 96-bit, which doesn't get stats
+    );
+
+    // Read a random column as Variant. The actual read does not need to be performed, as stats on
+    // Variant should always return None.
+    assert_eq!(
+        filter.get_max_stat(
+            &column_name!("chrono.date32"),
+            &DataType::unshredded_variant()
+        ),
+        None
     );
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp

@@ -26,7 +26,7 @@ fn main() {
 
     // generate cxx bindings
     let output_file_hpp = target_dir
-        .join(format!("{}.hpp", package_name))
+        .join(format!("{package_name}.hpp"))
         .display()
         .to_string();
     let mut config_hpp = config.clone();
@@ -37,7 +37,7 @@ fn main() {
 
     // generate c bindings
     let output_file_h = target_dir
-        .join(format!("{}.h", package_name))
+        .join(format!("{package_name}.h"))
         .display()
         .to_string();
     config.language = Language::C;

@@ -356,18 +356,18 @@ impl Scalar {
 impl Display for Scalar {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Integer(i) => write!(f, "{}", i),
-            Self::Long(i) => write!(f, "{}", i),
-            Self::Short(i) => write!(f, "{}", i),
-            Self::Byte(i) => write!(f, "{}", i),
-            Self::Float(fl) => write!(f, "{}", fl),
-            Self::Double(fl) => write!(f, "{}", fl),
-            Self::String(s) => write!(f, "'{}'", s),
-            Self::Boolean(b) => write!(f, "{}", b),
-            Self::Timestamp(ts) => write!(f, "{}", ts),
-            Self::TimestampNtz(ts) => write!(f, "{}", ts),
-            Self::Date(d) => write!(f, "{}", d),
-            Self::Binary(b) => write!(f, "{:?}", b),
+            Self::Integer(i) => write!(f, "{i}"),
+            Self::Long(i) => write!(f, "{i}"),
+            Self::Short(i) => write!(f, "{i}"),
+            Self::Byte(i) => write!(f, "{i}"),
+            Self::Float(fl) => write!(f, "{fl}"),
+            Self::Double(fl) => write!(f, "{fl}"),
+            Self::String(s) => write!(f, "'{s}'"),
+            Self::Boolean(b) => write!(f, "{b}"),
+            Self::Timestamp(ts) => write!(f, "{ts}"),
+            Self::TimestampNtz(ts) => write!(f, "{ts}"),
+            Self::Date(d) => write!(f, "{d}"),
+            Self::Binary(b) => write!(f, "{b:?}"),
             Self::Decimal(d) => match d.scale().cmp(&0) {
                 Ordering::Equal => {
                     write!(f, "{}", d.bits())
@@ -681,7 +681,7 @@ impl PrimitiveType {
         require!(scale == dtype.scale(), parse_error());
         let int: i128 = match frac_part {
             None => int_part.parse()?,
-            Some(frac_part) => format!("{}{}", int_part, frac_part).parse()?,
+            Some(frac_part) => format!("{int_part}{frac_part}").parse()?,
         };
         Ok(Scalar::Decimal(DecimalData::try_new(int, dtype)?))
     }
@@ -692,6 +692,7 @@ mod tests {
     use std::f32::consts::PI;
 
     use crate::expressions::{column_expr, BinaryPredicateOp};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
 
     use super::*;
@@ -868,53 +869,59 @@ mod tests {
             Expr::literal("Cool"),
             column,
         ));
-        assert_eq!(&format!("{}", array_op), "10 IN (1, 2, 3)");
-        assert_eq!(&format!("{}", array_not_op), "NOT(10 IN (1, 2, 3))");
-        assert_eq!(&format!("{}", column_op), "3.1415927 IN Column(item)");
-        assert_eq!(&format!("{}", column_not_op), "NOT('Cool' IN Column(item))");
+        assert_eq!(&format!("{array_op}"), "10 IN (1, 2, 3)");
+        assert_eq!(&format!("{array_not_op}"), "NOT(10 IN (1, 2, 3))");
+        assert_eq!(&format!("{column_op}"), "3.1415927 IN Column(item)");
+        assert_eq!(&format!("{column_not_op}"), "NOT('Cool' IN Column(item))");
     }
 
     #[test]
     fn test_invalid_array() {
-        assert!(ArrayData::try_new(
-            ArrayType::new(DataType::INTEGER, false),
-            [Scalar::Integer(1), Scalar::String("s".to_string())],
-        )
-        .is_err());
+        assert_result_error_with_message(
+            ArrayData::try_new(
+                ArrayType::new(DataType::INTEGER, false),
+                [Scalar::Integer(1), Scalar::String("s".to_string())],
+            ),
+            "Schema error: Array scalar type mismatch: expected integer, got string",
+        );
 
-        assert!(
-            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]).is_err()
+        assert_result_error_with_message(
+            ArrayData::try_new(ArrayType::new(DataType::INTEGER, false), [1.into(), None]),
+            "Schema error: Array element cannot be null for non-nullable array",
         );
     }
 
     #[test]
     fn test_invalid_map() {
         // incorrect schema
-        assert!(MapData::try_new(
+        assert_result_error_with_message(MapData::try_new(
             MapType::new(DataType::STRING, DataType::INTEGER, false),
             [(Scalar::Integer(1), Scalar::String("s".to_string())),],
-        )
-        .is_err());
+        ), "Schema error: Map scalar type mismatch: expected key type string, got key type integer");
 
         // key must be non-null
-        assert!(MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, true),
-            [(
-                Scalar::Null(DataType::STRING),  // key
-                Scalar::String("s".to_string())  // val
-            ),],
-        )
-        .is_err());
+        assert_result_error_with_message(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::STRING, true),
+                [(
+                    Scalar::Null(DataType::STRING),  // key
+                    Scalar::String("s".to_string()), // val
+                )],
+            ),
+            "Schema error: Map key cannot be null",
+        );
 
         // val must be non-null if we have value_contains_null = false
-        assert!(MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            [(
-                Scalar::String("s".to_string()), // key
-                Scalar::Null(DataType::STRING)   // val
-            ),],
-        )
-        .is_err());
+        assert_result_error_with_message(
+            MapData::try_new(
+                MapType::new(DataType::STRING, DataType::STRING, false),
+                [(
+                    Scalar::String("s".to_string()), // key
+                    Scalar::Null(DataType::STRING),  // val
+                )],
+            ),
+            "Schema error: Null map value disallowed if map value_contains_null is false",
+        );
     }
 
     #[test]

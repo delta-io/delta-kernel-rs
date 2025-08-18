@@ -10,13 +10,13 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
-use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
-use delta_kernel::{Engine, FileMeta, Table};
+use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
+use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,
@@ -64,10 +64,9 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         Arc::new(TokioBackgroundExecutor::new()),
     ));
 
-    let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(location, engine.as_ref(), None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
@@ -117,10 +116,9 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
-    let table = Table::new(location);
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = table.snapshot(&engine, None).unwrap();
+    let snapshot = Snapshot::try_new(location, &engine, None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
@@ -171,10 +169,9 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
-    let table = Table::new(location);
     let expected_data = vec![batch];
 
-    let snapshot = table.snapshot(&engine, None)?;
+    let snapshot = Snapshot::try_new(location, &engine, None)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
@@ -245,9 +242,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-
-    let table = Table::new(location);
-    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
+    let snapshot = Arc::new(Snapshot::try_new(location, engine.as_ref(), None)?);
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -438,8 +433,7 @@ fn read_table_data(
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
 
-    let table = Table::new(url.clone());
-    let snapshot = table.snapshot(engine.as_ref(), None)?;
+    let snapshot = Snapshot::try_new(url.clone(), engine.as_ref(), None)?;
 
     let read_schema = select_cols.map(|select_cols| {
         let table_schema = snapshot.schema();
@@ -456,7 +450,7 @@ fn read_table_data(
         .build()?;
 
     sort_lines!(expected);
-    read_with_scan_metadata(table.location(), engine.as_ref(), &scan, &expected)?;
+    read_with_scan_metadata(&url, engine.as_ref(), &scan, &expected)?;
     read_with_execute(engine, &scan, &expected)?;
     Ok(())
 }
@@ -953,7 +947,7 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
-    let empty_struct = Expr::struct_from(vec![]);
+    let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
     let cases = vec![
         (Pred::literal(false), table_for_numbers(vec![])),
         (
@@ -1058,13 +1052,12 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let table = Table::new(location);
 
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
+    let snapshot = Arc::new(Snapshot::try_new(location, engine.as_ref(), None)?);
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
     let scan = snapshot
@@ -1121,13 +1114,12 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let table = Table::new(location);
 
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Arc::new(table.snapshot(engine.as_ref(), None)?);
+    let snapshot = Arc::new(Snapshot::try_new(location, engine.as_ref(), None)?);
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
     let scan = snapshot
@@ -1345,6 +1337,15 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
         "+----+--------------------+",
     ];
     let test_name = "compacted-log-files-table";
+    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_path = test_dir.path().join(test_name);
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}
+
+#[test]
+fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
+    let expected = include!("data/unshredded-variant.expected.in");
+    let test_name = "unshredded-variant";
     let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
