@@ -16,7 +16,7 @@ release = false
 delta_kernel = { path = "../kernel", features = [ "default-engine-rustls", "arrow" ] }
 object_store = "0.12.3"
 itertools = "0.14.0"
-serde_json = "1.0.140"
+serde_json = "1.0.142"
 tar = "0.4"
 tempfile = "3"
 url = "2.5.4"

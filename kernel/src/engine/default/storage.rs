@@ -64,7 +64,7 @@ where
 mod tests {
     use super::*;
 
-    use hdfs_native_object_store::HdfsObjectStore;
+    use hdfs_native_object_store::HdfsObjectStoreBuilder;
     use object_store::{self, path::Path};
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
@@ -79,9 +79,11 @@ mod tests {
     {
         let options_map = options
             .into_iter()
-            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
-            .collect();
-        let store = HdfsObjectStore::with_config(url.as_str(), options_map)?;
+            .map(|(k, v)| (k.as_ref().to_string(), v.into()));
+        let store = HdfsObjectStoreBuilder::new()
+            .with_url(url.as_str())
+            .with_config(options_map)
+            .build()?;
         let path = Path::parse(url.path())?;
         Ok((Box::new(store), path))
     }
