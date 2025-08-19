@@ -4,9 +4,8 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Snapshot};
 
 mod common;
-use common::load_test_data;
 
-use test_utils::DefaultEngineExtension;
+use test_utils::{load_test_data, DefaultEngineExtension};
 
 use itertools::Itertools;
 use test_utils::read_scan;
