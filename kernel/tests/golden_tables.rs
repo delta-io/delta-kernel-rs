@@ -27,9 +27,8 @@ use paste::paste;
 use url::Url;
 
 mod common;
-use common::load_test_data;
 
-use test_utils::to_arrow;
+use test_utils::{load_test_data, to_arrow};
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {

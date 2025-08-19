@@ -10,12 +10,10 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 
-use test_utils::DefaultEngineExtension;
-
 mod common;
-use common::load_test_data;
 
-use test_utils::to_arrow;
+use test_utils::DefaultEngineExtension;
+use test_utils::{load_test_data, to_arrow};
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,

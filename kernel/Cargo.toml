@@ -133,6 +133,7 @@ rustc_version = "0.4.1"
 [dev-dependencies]
 delta_kernel = { path = ".", features = ["arrow", "catalog-managed", "default-engine-rustls", "internal-api"] }
 test_utils = { path = "../test-utils" }
+criterion = "0.5"
 # Used for testing parse_url_opts extensibility
 hdfs-native-object-store = { version = "0.14.0" }
 hdfs-native = "0.11.1"
@@ -141,9 +142,11 @@ async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implemen
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
-tar = "0.4"
-zstd = "0.13"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
+
+[[bench]]
+name = "metadata_bench"
+harness = false
