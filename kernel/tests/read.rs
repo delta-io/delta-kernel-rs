@@ -947,7 +947,7 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
-    let empty_struct = Expr::struct_from(vec![]);
+    let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
     let cases = vec![
         (Pred::literal(false), table_for_numbers(vec![])),
         (
