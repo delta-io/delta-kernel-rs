@@ -3,10 +3,8 @@
 use std::slice;
 use std::str::FromStr;
 
-use crate::{
-    actions::visitors::InCommitTimestampVisitor, history_manager::error::LogHistoryError,
-    DeltaResult, Engine, Error, FileMeta, RowVisitor, Version,
-};
+use crate::actions::visitors::InCommitTimestampVisitor;
+use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor, Version};
 use delta_kernel_derive::internal_api;
 
 use url::Url;
@@ -253,24 +251,35 @@ impl ParsedLogPath<Url> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum InCommitTimestampError {
+    #[error("No In-commit timestamp found for commit at version {version}")]
+    NotFound { version: Version },
+    #[error("Failed to read the in commit timestamp for a commit at version {version}: {source}")]
+    FailedToReadTimestamp {
+        version: Version,
+        source: Box<dyn std::error::Error>,
+    },
+}
+
 impl ParsedLogPath<FileMeta> {
     /// Reads the in-commit timestamp for the given `commit_file`.
     ///
-    /// This returns a [`LogHistoryError::FailedToReadTimestampForCommit`] if this encounters an
+    /// This returns a [`InCommitTimestampError::FailedToReadTimestamp`] if this encounters an
     /// error while reading the file or visiting the rows.
     ///
-    /// This returns a [`LogHistoryError::InCommitTimestampNotFoundError`] if the in-commit timestamp
+    /// This returns a [`InCommitTimestampError::NotFound`] if the in-commit timestamp
     /// is not present in the commit file, or if the CommitInfo is not the first action in the
     /// commit.
     #[allow(unused)]
     pub(crate) fn read_in_commit_timestamp(
         &self,
         engine: &dyn Engine,
-    ) -> Result<i64, LogHistoryError> {
+    ) -> Result<i64, InCommitTimestampError> {
         debug_assert!(self.is_commit(), "File should be a commit");
-        let wrap_err = |error: Error| LogHistoryError::FailedToReadTimestampForCommit {
+        let wrap_err = |error: Error| InCommitTimestampError::FailedToReadTimestamp {
             version: self.version,
-            error: Box::new(error),
+            source: Box::new(error),
         };
 
         // Get an iterator over the actions in the commit file
@@ -283,7 +292,7 @@ impl ParsedLogPath<FileMeta> {
             )
             .map_err(wrap_err)?;
 
-        let not_found = || LogHistoryError::InCommitTimestampNotFoundError {
+        let not_found = || InCommitTimestampError::NotFound {
             version: self.version,
         };
 
@@ -311,7 +320,22 @@ impl ParsedLogPath<FileMeta> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs::OpenOptions;
+    use std::num::NonZero;
     use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    use crate::actions::{CommitInfo, Metadata, Protocol};
+    use crate::engine::sync::SyncEngine;
+    use crate::log_segment::LogSegment;
+    use crate::snapshot::Snapshot;
+    use crate::table_features::WriterFeature;
+    use crate::utils::test_utils::{Action, LocalMockTable};
+    use crate::Version;
+
+    use test_utils::delta_path_for_version;
+    use url::Url;
 
     use super::*;
 
@@ -732,5 +756,168 @@ mod tests {
             LogPathFileType::SinglePartCheckpoint
         ));
         assert_eq!(log_path.filename, "00000000000000000010.checkpoint.parquet");
+    }
+
+    //-------------------------//
+    //     Timestamp tests     //
+    //-------------------------//
+
+    fn timestamp_conversion_segment_from_snapshot(
+        engine: &dyn Engine,
+        snapshot: &Snapshot,
+        limit: Option<NonZero<usize>>,
+    ) -> DeltaResult<LogSegment> {
+        LogSegment::for_timestamp_conversion(
+            engine.storage_handler().as_ref(),
+            snapshot.log_segment().log_root.clone(),
+            snapshot.version(),
+            limit,
+        )
+    }
+
+    // Helper to set the file modification timestamp of a file
+    fn set_mod_time(mock_table: &LocalMockTable, commit_version: Version, timestamp: i64) {
+        let file_name = delta_path_for_version(commit_version, "json")
+            .filename()
+            .unwrap()
+            .to_string();
+        let path = mock_table.table_root().join("_delta_log/").join(file_name);
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+
+        let time = SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp.try_into().unwrap());
+        file.set_modified(time).unwrap();
+    }
+
+    async fn timestamp_test_mock_table() -> LocalMockTable {
+        let mut mock_table = LocalMockTable::new();
+
+        // 0: Has file modification timestamp 50
+        mock_table.commit([Action::Metadata(Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            ..Default::default()
+        }),
+            Action::Protocol(Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(vec![WriterFeature::InCommitTimestamp])).unwrap())
+        ]).await;
+        set_mod_time(&mock_table, 0, 50);
+
+        // 1: Has file modification timestamp 150
+        mock_table
+            .commit([Action::CommitInfo(CommitInfo {
+                ..Default::default()
+            })])
+            .await;
+        set_mod_time(&mock_table, 1, 150);
+
+        // 2: Has file modification timestamp 250
+        mock_table
+            .commit([Action::CommitInfo(CommitInfo {
+                ..Default::default()
+            })])
+            .await;
+        set_mod_time(&mock_table, 2, 250);
+
+        // 3: Has in-commit timestamp 300, file modification timestamp 350
+        mock_table.commit([
+            Action::CommitInfo(CommitInfo {
+                in_commit_timestamp: Some(300),
+                ..Default::default()
+            }),
+            Action::Metadata(Metadata {
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            configuration: HashMap::from_iter([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            ),
+                ("delta.inCommitTimestampEnablementVersion".to_string(), "3".to_string()),
+                ("delta.inCommitTimestampEnablementTimestamp".to_string(), "300".to_string())]),
+            ..Default::default()
+        }),
+            Action::Protocol(Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(vec![WriterFeature::InCommitTimestamp])).unwrap())
+        ]).await;
+        set_mod_time(&mock_table, 3, 350);
+
+        // 4: Has in-commit timestamp 400, file modification timestamp 450
+        mock_table
+            .commit([Action::CommitInfo(CommitInfo {
+                in_commit_timestamp: Some(400),
+                ..Default::default()
+            })])
+            .await;
+        set_mod_time(&mock_table, 4, 450);
+
+        mock_table
+    }
+
+    #[tokio::test]
+    async fn reading_in_commit_timestamp() {
+        let mock_table = timestamp_test_mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::try_new(path, &engine, None).unwrap();
+        let log_segment =
+            timestamp_conversion_segment_from_snapshot(&engine, &snapshot, None).unwrap();
+        let commits = log_segment.ascending_commit_files;
+
+        // File that has no In-commit timestamps
+        let mut res = commits[0].read_in_commit_timestamp(&engine);
+        assert!(
+            matches!(res, Err(InCommitTimestampError::NotFound { version: 0 })),
+            "{res:?} failed"
+        );
+
+        // File that doesn't exist
+        let mut fake_log_path = commits[0].clone();
+
+        let failing_path = if cfg!(windows) {
+            "C:\\phony\\path"
+        } else {
+            "/phony/path"
+        };
+
+        fake_log_path.location.location = Url::from_file_path(failing_path).unwrap();
+        res = fake_log_path.read_in_commit_timestamp(&engine);
+        assert!(
+            matches!(
+                res,
+                Err(InCommitTimestampError::FailedToReadTimestamp {
+                    version: 0,
+                    source: _
+                })
+            ),
+            "{res:?} failed"
+        );
+
+        // Files with In-commit timestamps
+        res = commits[3].read_in_commit_timestamp(&engine);
+        assert!(matches!(res, Ok(300)), "{res:?}");
+        res = commits[4].read_in_commit_timestamp(&engine);
+        assert!(matches!(res, Ok(400)), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn file_modification_conversion() {
+        let mock_table = timestamp_test_mock_table().await;
+        let engine = SyncEngine::new();
+        let path = Url::from_directory_path(mock_table.table_root()).unwrap();
+        let snapshot = Snapshot::try_new(path, &engine, None).unwrap();
+        let log_segment =
+            timestamp_conversion_segment_from_snapshot(&engine, &snapshot, None).unwrap();
+        let commits = log_segment.ascending_commit_files;
+
+        // Read the file modification timestamps
+        let ts = commits[0].file_modification_timestamp();
+        assert!(matches!(ts, 50));
+
+        let ts = commits[1].file_modification_timestamp();
+        assert!(matches!(ts, 150));
+
+        let ts = commits[2].file_modification_timestamp();
+        assert!(matches!(ts, 250));
+
+        // Read the in-commit timestamps
+        let ts = commits[3].read_in_commit_timestamp(&engine);
+        assert!(matches!(ts, Ok(300)));
+        let ts = commits[4].read_in_commit_timestamp(&engine);
+        assert!(matches!(ts, Ok(400)));
     }
 }

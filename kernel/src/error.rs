@@ -206,8 +206,6 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
-    #[error(transparent)]
-    LogHistoryError(#[from] crate::history_manager::error::LogHistoryError),
 }
 
 // Convenience constructors for Error types that take a String argument

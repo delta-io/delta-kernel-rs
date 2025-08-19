@@ -54,7 +54,6 @@ pub enum KernelError {
     LiteralExpressionTransformError,
     CheckpointWriteError,
     SchemaError,
-    LogHistoryError,
 }
 
 impl From<Error> for KernelError {
@@ -116,7 +115,6 @@ impl From<Error> for KernelError {
                 KernelError::LiteralExpressionTransformError
             }
             Error::Schema(_) => KernelError::SchemaError,
-            Error::LogHistoryError(_) => KernelError::LogHistoryError,
             _ => KernelError::UnknownError,
         }
     }
