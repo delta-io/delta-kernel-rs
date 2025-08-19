@@ -14,6 +14,8 @@
 //! git checkout your-branch
 //! cargo bench --bench metadata_bench -- --baseline main
 //! ```
+//!
+//! Follow-ups: <https://github.com/delta-io/delta-kernel-rs/issues/1185>
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +30,9 @@ use test_utils::load_test_data;
 use criterion::{criterion_group, criterion_main, Criterion};
 use tempfile::TempDir;
 use url::Url;
+
+// force scan metadata bench to use smaller sample size so test runs faster (100 -> 20)
+const SCAN_METADATA_BENCH_SAMPLE_SIZE: usize = 20;
 
 fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     // note this table _only_ has a _delta_log, no data files (can only do metadata reads)
@@ -62,7 +67,7 @@ fn scan_metadata_benchmark(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("scan_metadata");
-    group.sample_size(10);
+    group.sample_size(SCAN_METADATA_BENCH_SAMPLE_SIZE);
     group.bench_function("scan_metadata", |b| {
         b.iter(|| {
             let scan = snapshot
@@ -73,7 +78,7 @@ fn scan_metadata_benchmark(c: &mut Criterion) {
             let metadata_iter = scan
                 .scan_metadata(engine.as_ref())
                 .expect("Failed to get scan metadata");
-            // must consume to do work
+            // kernel scans are lazy, we must consume iterator to do the work we want to test
             for result in metadata_iter {
                 result.expect("Failed to process scan metadata");
             }
