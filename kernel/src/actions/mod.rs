@@ -8,10 +8,8 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-use crate::schema::{
-    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
-};
+use crate::expressions::{MapData, Scalar, StructData};
+use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
@@ -282,53 +280,32 @@ impl Metadata {
     }
 }
 
-// TODO: derive IntoEngineData instead (see issue #1083)
 impl IntoEngineData for Metadata {
     fn into_engine_data(
         self,
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let id = Scalar::from(self.id);
-        let name = Scalar::from(self.name);
-        let description = Scalar::from(self.description);
         // For format, we need to provide individual scalars for provider and options
-        let format_provider = Scalar::from(self.format.provider);
-        let format_options = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            self.format.options,
-        )
-        .map(Scalar::Map)?;
-        let schema_string = Scalar::from(self.schema_string);
-        let partition_columns = Scalar::Array(ArrayData::try_new(
-            ArrayType::new(DataType::STRING, false),
-            self.partition_columns,
-        )?);
-        let created_time = Scalar::from(self.created_time);
-        let configuration = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            self.configuration,
-        )
-        .map(Scalar::Map)?;
-
         let values = [
-            id,
-            name,
-            description,
-            format_provider,
-            format_options,
-            schema_string,
-            partition_columns,
-            created_time,
-            configuration,
+            self.id.into(),
+            self.name.into(),
+            self.description.into(),
+            self.format.provider.into(),
+            self.format.options.into(),
+            self.schema_string.into(),
+            self.partition_columns.into(),
+            self.created_time.into(),
+            self.configuration.into(),
         ];
 
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[derive(
+    Default, Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData, Serialize, Deserialize,
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -505,52 +482,6 @@ impl Protocol {
     }
 }
 
-// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
-impl IntoEngineData for Protocol {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        fn features_to_scalar<T>(
-            features: Option<impl IntoIterator<Item = T>>,
-        ) -> DeltaResult<Scalar>
-        where
-            T: Into<Scalar>,
-        {
-            match features {
-                Some(features) => {
-                    let features: Vec<Scalar> = features.into_iter().map(Into::into).collect();
-                    Ok(Scalar::Array(ArrayData::try_new(
-                        ArrayType::new(DataType::STRING, false),
-                        features,
-                    )?))
-                }
-                None => Ok(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
-                    DataType::STRING,
-                    false,
-                ))))),
-            }
-        }
-
-        let min_reader_version = Scalar::from(self.min_reader_version);
-        let min_writer_version = Scalar::from(self.min_writer_version);
-
-        let reader_features = features_to_scalar(self.reader_features)?;
-        let writer_features = features_to_scalar(self.writer_features)?;
-
-        let values = [
-            min_reader_version,
-            min_writer_version,
-            reader_features,
-            writer_features,
-        ];
-
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
-    }
-}
-
 // given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
     table_features: &[T],
@@ -588,7 +519,7 @@ where
     )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -633,42 +564,6 @@ impl CommitInfo {
             engine_info,
             txn_id: None,
         }
-    }
-}
-
-// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
-impl IntoEngineData for CommitInfo {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let timestamp = Scalar::from(self.timestamp);
-        let in_commit_timestamp = Scalar::from(self.in_commit_timestamp);
-        let operation = Scalar::from(self.operation);
-
-        let operation_parameters = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            self.operation_parameters.unwrap_or_default(),
-        )
-        .map(Scalar::Map)?;
-
-        let kernel_version = Scalar::from(self.kernel_version);
-        let engine_info = Scalar::from(self.engine_info);
-        let txn_id = Scalar::from(self.txn_id);
-
-        let values = [
-            timestamp,
-            in_commit_timestamp,
-            operation,
-            operation_parameters,
-            kernel_version,
-            engine_info,
-            txn_id,
-        ];
-
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
     }
 }
 
@@ -746,17 +641,12 @@ impl IntoEngineData for Add {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
+        // partition_values has the `allow_null_container_values` annotation, which is not available
+        // at runtime. Therefore, we must manually overwrite the Scalar::from implementation for it.
         let partition_values = MapData::try_new(
             MapType::new(DataType::STRING, DataType::STRING, true),
             self.partition_values,
-        )
-        .map(Scalar::Map)?;
-
-        let tags = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            self.tags.unwrap_or_default(),
-        )
-        .map(Scalar::Map)?;
+        )?;
 
         let (storage_type, path_or_inline_dv, offset, size_in_bytes, cardinality) =
             if let Some(dv) = self.deletion_vector {
@@ -772,25 +662,24 @@ impl IntoEngineData for Add {
             };
 
         let values = [
-            Scalar::from(self.path),
-            partition_values,
-            Scalar::from(self.size),
-            Scalar::from(self.modification_time),
-            Scalar::from(self.data_change),
-            Scalar::from(self.stats),
-            tags,
-            Scalar::from(storage_type),
-            Scalar::from(path_or_inline_dv),
-            Scalar::from(offset),
-            Scalar::from(size_in_bytes),
-            Scalar::from(cardinality),
-            Scalar::from(self.base_row_id),
-            Scalar::from(self.default_row_commit_version),
-            Scalar::from(self.clustering_provider),
+            self.path.into(),
+            Scalar::Map(partition_values),
+            self.size.into(),
+            self.modification_time.into(),
+            self.data_change.into(),
+            self.stats.into(),
+            self.tags.into(),
+            storage_type.into(),
+            path_or_inline_dv.into(),
+            offset.into(),
+            size_in_bytes.into(),
+            cardinality.into(),
+            self.base_row_id.into(),
+            self.default_row_commit_version.into(),
+            self.clustering_provider.into(),
         ];
 
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -972,7 +861,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct DomainMetadata {
     domain: String,
@@ -986,23 +875,6 @@ impl DomainMetadata {
     #[allow(unused)]
     fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
-    }
-}
-
-impl IntoEngineData for DomainMetadata {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let domain = Scalar::from(self.domain);
-        let configuration = Scalar::from(self.configuration);
-        let removed = Scalar::from(self.removed);
-
-        let values = [domain, configuration, removed];
-
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
     }
 }
 
@@ -1521,7 +1393,7 @@ mod tests {
             .into();
 
         let mut map_builder = create_string_map_builder(false);
-        map_builder.append(true).unwrap();
+        map_builder.append(false).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
 
         let expected = RecordBatch::try_new(
@@ -1654,7 +1526,7 @@ mod tests {
         let partition_values = Arc::new(partition_values_builder.finish());
 
         let mut tags_builder = create_string_map_builder(false);
-        tags_builder.append(true).unwrap();
+        tags_builder.append(false).unwrap();
         let tags = Arc::new(tags_builder.finish());
 
         let expected = RecordBatch::try_new(
