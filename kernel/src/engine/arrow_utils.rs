@@ -890,7 +890,7 @@ mod tests {
     }
 
     /// Generates the column mapping metadata for a logical struct field given the field id.
-    fn column_metadata(field_id: i64) -> HashMap<String, MetadataValue> {
+    fn column_mapping_metadata(field_id: i64) -> HashMap<String, MetadataValue> {
         kernel_fid_and_name(field_id, physical_name(field_id))
     }
 
@@ -899,7 +899,8 @@ mod tests {
         HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string())])
     }
 
-    /// Generates metadata for a kernel struct field with column mapping id `field_id`.
+    /// Generates appropriate column mapping metadata for a kernel struct field with column mapping
+    /// id `field_id`.
     fn kernel_fid_and_name(field_id: i64, name: impl AsRef<str>) -> HashMap<String, MetadataValue> {
         HashMap::from([
             (
@@ -967,11 +968,11 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
             .into();
@@ -1144,9 +1145,9 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
             ])
             .make_physical(mode)
             .into();
@@ -1164,9 +1165,9 @@ mod tests {
 
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
             ])
             .make_physical(mode)
             .into();
@@ -1189,7 +1190,7 @@ mod tests {
                 logical_name(0),
                 MapType::new(DataType::INTEGER, DataType::STRING, false),
             )
-            .with_metadata(column_metadata(0))])
+            .with_metadata(column_mapping_metadata(0))])
             .make_physical(mode)
             .into();
 
@@ -1217,11 +1218,11 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
             .into();
@@ -1251,11 +1252,11 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
             .into();
@@ -1316,19 +1317,19 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(3),
                     StructType::new([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4)),
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5)),
                     ]),
                 )
-                .with_metadata(column_metadata(3)),
+                .with_metadata(column_mapping_metadata(3)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
             .into();
@@ -1356,16 +1357,16 @@ mod tests {
                     logical_name(3),
                     StructType::new([
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5)),
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4)),
                     ]),
                 )
-                .with_metadata(column_metadata(3)),
+                .with_metadata(column_mapping_metadata(3)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
             ])
             .make_physical(mode)
             .into();
@@ -1391,15 +1392,15 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(3),
                     StructType::new([StructField::not_null(logical_name(4), DataType::INTEGER)
-                        .with_metadata(column_metadata(4))]),
+                        .with_metadata(column_mapping_metadata(4))]),
                 )
-                .with_metadata(column_metadata(3)),
+                .with_metadata(column_mapping_metadata(3)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
             .into();
@@ -1422,11 +1423,11 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
             .into();
@@ -1466,7 +1467,7 @@ mod tests {
                 logical_name(1),
                 ArrayType::new(DataType::INTEGER, false),
             )
-            .with_metadata(column_metadata(1))])
+            .with_metadata(column_mapping_metadata(1))])
             .make_physical(mode)
             .into();
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
@@ -1496,23 +1497,23 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
-                    .with_metadata(column_metadata(0)),
+                    .with_metadata(column_mapping_metadata(0)),
                 StructField::not_null(
                     logical_name(1),
                     ArrayType::new(
                         StructType::new([
                             StructField::not_null(logical_name(3), DataType::INTEGER)
-                                .with_metadata(column_metadata(3)),
+                                .with_metadata(column_mapping_metadata(3)),
                             StructField::not_null(logical_name(4), DataType::STRING)
-                                .with_metadata(column_metadata(4)),
+                                .with_metadata(column_mapping_metadata(4)),
                         ])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_metadata(1)),
+                .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
             .into();
@@ -1561,9 +1562,9 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
             .into();
@@ -1605,7 +1606,7 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
@@ -1613,14 +1614,14 @@ mod tests {
                             logical_name(4),
                             DataType::INTEGER,
                         )
-                        .with_metadata(column_metadata(4))])
+                        .with_metadata(column_mapping_metadata(4))])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_metadata(2)),
+                .with_metadata(column_mapping_metadata(2)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
             .into();
@@ -1666,23 +1667,23 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
                         StructType::new([
                             StructField::not_null(logical_name(6), DataType::STRING)
-                                .with_metadata(column_metadata(6)),
+                                .with_metadata(column_mapping_metadata(6)),
                             StructField::not_null(logical_name(5), DataType::INTEGER)
-                                .with_metadata(column_metadata(5)),
+                                .with_metadata(column_mapping_metadata(5)),
                         ])
                         .into(),
                         false,
                     ),
                 )
-                .with_metadata(column_metadata(2)),
+                .with_metadata(column_mapping_metadata(2)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
             .into();
@@ -1733,19 +1734,19 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
                     StructType::new([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
-                            .with_metadata(column_metadata(4)),
+                            .with_metadata(column_mapping_metadata(4)),
                         StructField::not_null(logical_name(5), DataType::STRING)
-                            .with_metadata(column_metadata(5)),
+                            .with_metadata(column_mapping_metadata(5)),
                     ]),
                 )
-                .with_metadata(column_metadata(2)),
+                .with_metadata(column_mapping_metadata(2)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
-                    .with_metadata(column_metadata(3)),
+                    .with_metadata(column_mapping_metadata(3)),
             ])
             .make_physical(mode)
             .into();
@@ -2077,9 +2078,9 @@ mod tests {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new([
                 StructField::nullable(logical_name(1), DataType::STRING)
-                    .with_metadata(column_metadata(1)),
+                    .with_metadata(column_mapping_metadata(1)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
-                    .with_metadata(column_metadata(2)),
+                    .with_metadata(column_mapping_metadata(2)),
             ])
             .make_physical(mode)
             .into();
