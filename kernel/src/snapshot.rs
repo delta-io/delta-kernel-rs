@@ -15,9 +15,12 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
-use crate::utils::{calculate_transaction_expiration_timestamp, try_parse_uri};
+use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
+
+mod builder;
+pub use builder::SnapshotBuilder;
 
 use tracing::debug;
 use url::Url;
@@ -50,51 +53,17 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
+    /// Create a new [`SnapshotBuilder`] to build a [`Snapshot`] for a given table root.
+    pub fn builder(table_root: Url) -> SnapshotBuilder {
+        SnapshotBuilder::new(table_root)
+    }
+
     #[internal_api]
     pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
         Self {
             log_segment,
             table_configuration,
         }
-    }
-
-    /// Create a new [`Snapshot`] instance for the given version by parsing the given uri string.
-    ///
-    /// # Parameters
-    ///
-    /// - `table_root`: string-encoded URI pointing at the table root (where `_delta_log` folder is
-    ///   located)
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
-    ///   version of the table.
-    pub fn try_from_uri(
-        uri: impl AsRef<str>,
-        engine: &dyn Engine,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let url = try_parse_uri(uri)?;
-        Self::try_new(url, engine, version)
-    }
-
-    /// Create a new [`Snapshot`] instance for the given version.
-    ///
-    /// # Parameters
-    ///
-    /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
-    ///   version of the table.
-    pub fn try_new(
-        table_root: Url,
-        engine: &dyn Engine,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let storage = engine.storage_handler();
-        let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, version)?;
-
-        // try_new_from_log_segment will ensure the protocol is supported
-        Self::try_new_from_log_segment(table_root, log_segment, engine)
     }
 
     /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
@@ -422,7 +391,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::try_new(url, &engine, Some(1)).unwrap();
+        let snapshot = Snapshot::builder(url).at_version(1).build(&engine).unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -440,7 +409,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
+        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -479,7 +448,12 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let old_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(1)).unwrap());
+        let old_snapshot = Arc::new(
+            Snapshot::builder(url.clone())
+                .at_version(1)
+                .build(&engine)
+                .unwrap(),
+        );
         // 1. new version < existing version: error
         let snapshot_res = Snapshot::try_new_from(old_snapshot.clone(), &engine, Some(0));
         assert!(matches!(
@@ -504,9 +478,15 @@ mod tests {
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
             let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-            let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+            let base_snapshot = Arc::new(
+                Snapshot::builder(url.clone())
+                    .at_version(0)
+                    .build(&engine)?,
+            );
             let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-            let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
+            let expected = Snapshot::builder(url.clone())
+                .at_version(1)
+                .build(&engine)?;
             assert_eq!(snapshot, expected.into());
             Ok(())
         }
@@ -551,9 +531,15 @@ mod tests {
             Arc::new(store.fork()),
             Arc::new(TokioBackgroundExecutor::new()),
         );
-        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+        let base_snapshot = Arc::new(
+            Snapshot::builder(url.clone())
+                .at_version(0)
+                .build(&engine)?,
+        );
         let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, None)?;
-        let expected = Snapshot::try_new(url.clone(), &engine, Some(0))?;
+        let expected = Snapshot::builder(url.clone())
+            .at_version(0)
+            .build(&engine)?;
         assert_eq!(snapshot, expected.into());
         // version exceeds latest version of the table = err
         assert!(matches!(
@@ -620,7 +606,11 @@ mod tests {
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
-        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+        let base_snapshot = Arc::new(
+            Snapshot::builder(url.clone())
+                .at_version(0)
+                .build(&engine)?,
+        );
         assert!(matches!(
             Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(2)),
             Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
@@ -727,11 +717,17 @@ mod tests {
         store.put(&path, crc.to_string().into()).await?;
 
         // base snapshot is at version 0
-        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+        let base_snapshot = Arc::new(
+            Snapshot::builder(url.clone())
+                .at_version(0)
+                .build(&engine)?,
+        );
 
         // first test: no new crc
         let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
+        let expected = Snapshot::builder(url.clone())
+            .at_version(1)
+            .build(&engine)?;
         assert_eq!(snapshot, expected.into());
         assert_eq!(
             snapshot
@@ -756,7 +752,9 @@ mod tests {
         });
         store.put(&path, crc.to_string().into()).await?;
         let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
+        let expected = Snapshot::builder(url.clone())
+            .at_version(1)
+            .build(&engine)?;
         assert_eq!(snapshot, expected.into());
         assert_eq!(
             snapshot
@@ -867,7 +865,7 @@ mod tests {
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::try_new(location, &engine, None).unwrap();
+        let snapshot = Snapshot::builder(location).build(&engine).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
         assert_eq!(
@@ -974,7 +972,7 @@ mod tests {
         .join("\n");
         add_commit(store.as_ref(), 1, commit).await.unwrap();
 
-        let snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, None)?);
+        let snapshot = Arc::new(Snapshot::builder(url.clone()).build(&engine)?);
 
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(

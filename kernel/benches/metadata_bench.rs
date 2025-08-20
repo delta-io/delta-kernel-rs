@@ -53,7 +53,8 @@ fn create_snapshot_benchmark(c: &mut Criterion) {
 
     c.bench_function("create_snapshot", |b| {
         b.iter(|| {
-            Snapshot::try_new(url.clone(), engine.as_ref(), None)
+            Snapshot::builder(url.clone())
+                .build(engine.as_ref())
                 .expect("Failed to create snapshot")
         })
     });
@@ -63,7 +64,9 @@ fn scan_metadata_benchmark(c: &mut Criterion) {
     let (_tempdir, url, engine) = setup();
 
     let snapshot = Arc::new(
-        Snapshot::try_new(url.clone(), engine.as_ref(), None).expect("Failed to create snapshot"),
+        Snapshot::builder(url.clone())
+            .build(engine.as_ref())
+            .expect("Failed to create snapshot"),
     );
 
     let mut group = c.benchmark_group("scan_metadata");

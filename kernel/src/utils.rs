@@ -23,6 +23,7 @@ pub(crate) use require;
 
 /// Try to parse string uri into a URL for a table path. This will do it's best to handle things
 /// like `/local/paths`, and even `../relative/paths`.
+#[allow(unused)]
 #[internal_api]
 pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
     let uri = uri.as_ref();
@@ -57,6 +58,7 @@ pub(crate) fn try_parse_uri(uri: impl AsRef<str>) -> DeltaResult<Url> {
     Ok(url)
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 enum UriType {
     LocalPath(PathBuf),
@@ -67,6 +69,7 @@ enum UriType {
 /// some kind or URL.
 ///
 /// Will return an error if the path is not valid.
+#[allow(unused)]
 fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
     let table_uri = table_uri.as_ref();
     let table_uri = if table_uri.ends_with('/') {
