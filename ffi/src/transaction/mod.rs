@@ -357,7 +357,6 @@ mod tests {
                         "engineInfo": "default_engine",
                         "operation": "UNKNOWN",
                         "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
-                        "operationParameters": {},
                     }
                 }),
                 json!({
