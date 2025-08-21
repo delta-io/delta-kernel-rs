@@ -1458,7 +1458,7 @@ mod tests {
         assert_eq!(reorder_indices, expect_reorder);
     }
 
-    fn nested_parquet_schema(parquet_names: NameFn) -> ArrowSchemaRef {
+    fn nested_parquet_schema(mode: ColumnMappingMode) -> ArrowSchemaRef {
         Arc::new(ArrowSchema::new(vec![
             ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
                 .with_metadata(arrow_fid(1)),
