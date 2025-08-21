@@ -220,6 +220,9 @@ fn generate_adds<'a>(
     engine: &dyn Engine,
     add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
+    // This function is a problem if we don't share stats as a string
+
+    // TODO: We need to perform to_json here
     let evaluation_handler = engine.evaluation_handler();
     let log_schema = get_log_add_schema();
 
@@ -320,7 +323,16 @@ mod tests {
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
             StructField::not_null("dataChange", DataType::BOOLEAN),
-            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable(
+                "stats",
+                DataType::struct_type(vec![
+                    StructField::nullable("numRecords", DataType::LONG),
+                    StructField::nullable("tightBounds", DataType::BOOLEAN),
+                    StructField::nullable("minValues", DataType::STRING),
+                    StructField::nullable("maxValues", DataType::STRING),
+                    StructField::nullable("nullCount", DataType::STRING),
+                ]),
+            ),
         ]);
         assert_eq!(*schema, expected.into());
     }

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use crate::actions::statistics::Statistics;
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::datatypes::{DataType, Field};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -91,9 +92,25 @@ impl DataFileMetadata {
         let size = Arc::new(Int64Array::from(vec![size]));
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let stats_str = serde_json::to_string(&stats)
-            .map_err(|e| Error::generic(format!("Failed to serialize stats: {e}")))
-            .map(|s| Arc::new(StringArray::from(vec![s])))?;
+        let stats = Arc::new(StructArray::try_new_with_length(
+            vec![
+                Field::new("numRecords", DataType::Int64, true),
+                Field::new("tightBounds", DataType::Boolean, true),
+                Field::new("nullCount", DataType::Utf8, true),
+                Field::new("minValues", DataType::Utf8, true),
+                Field::new("maxValues", DataType::Utf8, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(Int64Array::from(vec![stats.num_records])),
+                Arc::new(BooleanArray::from(vec![stats.tight_bounds])),
+                Arc::new(StringArray::from(vec![stats.null_count.clone()])),
+                Arc::new(StringArray::from(vec![stats.min_values.clone()])),
+                Arc::new(StringArray::from(vec![stats.max_values.clone()])),
+            ],
+            None,
+            1,
+        )?);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(parquet_write_response_schema().as_ref().try_into_arrow()?),
@@ -103,7 +120,7 @@ impl DataFileMetadata {
                 size,
                 modification_time,
                 data_change,
-                stats_str,
+                stats,
             ],
         )?)))
     }
@@ -171,7 +188,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             )));
         }
 
-        let stats = Statistics::new(num_records as u64);
+        let stats = Statistics::new(num_records);
         let file_meta = FileMeta::new(path, modification_time, size);
         Ok(DataFileMetadata::new(file_meta, stats))
     }

@@ -7,46 +7,44 @@ use serde::{Deserialize, Serialize};
 pub struct Statistics {
     /// The number of records in this data file.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_records: Option<u64>,
+    pub num_records: Option<i64>,
 
     /// Whether per-column statistics are currently tight, i.e. the min/maxValue actually exists in the file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tight_bounds: Option<bool>,
 
+    // TODO: Implement per-column statistics
+    // See (https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics)
     /// The number of `null` value for this column or an estimate thereof (depending on the `tight_bounds` value).
     /// For now, kernel-rs ignores this value.
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
-    pub null_count: Option<PerColumnStatistics>,
+    pub null_count: Option<String>,
 
     /// The minimum value per column in this file or an estimate thereof (depending on the `tight_bounds` value).
     /// For now, kernel-rs ignores this value.
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
-    pub min_values: Option<PerColumnStatistics>,
+    pub min_values: Option<String>,
 
     /// The maximum value per column in this file or an estimate thereof (depending on the `tight_bounds` value).
     /// For now, kernel-rs ignores this value.
     #[serde(skip_serializing_if = "Option::is_none", skip_deserializing)]
-    pub max_values: Option<PerColumnStatistics>,
+    pub max_values: Option<String>,
 }
 
 impl Statistics {
     /// Creates a new `Statistics` instance with the given number of records.
-    pub(crate) fn new(num_records: u64) -> Self {
+    ///
+    /// This is a convenience method since `num_records` as the only statistic used by kernel at this point and
+    /// Parquet writers might expose this value as `usize`, which is not an official data type in the Delta spec.
+    pub(crate) fn new(num_records: usize) -> Self {
         Self {
-            num_records: Some(num_records),
+            num_records: Some(num_records as i64),
             tight_bounds: None,
             null_count: None,
             min_values: None,
             max_values: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerColumnStatistics {
-    // TODO: Implement per-column statistics
-    // See (https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics)
 }
 
 #[cfg(test)]

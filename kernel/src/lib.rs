@@ -241,6 +241,10 @@ impl FileMeta {
 /// file to be added to the table. Kernel takes this information and extends it to the full add_file
 /// action schema, adding additional fields (e.g., baseRowID) as necessary.
 ///
+/// For now, we hide the structure of table schema-specific fields (i.e., `nullCount`, `minValues`, and
+/// `maxValues`) behind JSON-encoded strings since Kernel does not use these statistics at the moment.
+/// This will change in a future release.
+///
 /// [`add_files`]: crate::transaction::Transaction::add_files
 pub static PARQUET_WRITE_RESPONSE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
@@ -252,7 +256,16 @@ pub static PARQUET_WRITE_RESPONSE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
         StructField::not_null("size", DataType::LONG),
         StructField::not_null("modificationTime", DataType::LONG),
         StructField::not_null("dataChange", DataType::BOOLEAN),
-        StructField::nullable("stats", DataType::STRING),
+        StructField::nullable(
+            "stats",
+            DataType::struct_type(vec![
+                StructField::nullable("numRecords", DataType::LONG),
+                StructField::nullable("tightBounds", DataType::BOOLEAN),
+                StructField::nullable("minValues", DataType::STRING),
+                StructField::nullable("maxValues", DataType::STRING),
+                StructField::nullable("nullCount", DataType::STRING),
+            ]),
+        ),
     ]))
 });
 
