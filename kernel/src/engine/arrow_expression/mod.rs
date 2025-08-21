@@ -9,7 +9,7 @@ use crate::arrow::datatypes::{
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, Predicate, Scalar};
+use crate::expressions::{ArrayData, Expression, Predicate, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
@@ -251,6 +251,70 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             .try_collect()?;
         let record_batch =
             RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
+        Ok(Box::new(ArrowEngineData::new(record_batch)))
+    }
+
+    fn columnar_concat(
+        &self,
+        left: &dyn EngineData,
+        right: &dyn EngineData,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let left = left
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
+            .record_batch();
+        let right = right
+            .any_ref()
+            .downcast_ref::<ArrowEngineData>()
+            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
+            .record_batch();
+
+        // Verify both batches have the same number of rows
+        if left.num_rows() != right.num_rows() {
+            return Err(Error::generic(format!(
+                "Cannot concatenate batches with different row counts: {} vs {}",
+                left.num_rows(),
+                right.num_rows()
+            )));
+        }
+
+        // Combine the schemas by merging fields from both batches
+        let mut combined_fields = Vec::new();
+        combined_fields.extend_from_slice(left.schema().fields());
+        combined_fields.extend_from_slice(right.schema().fields());
+        let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
+
+        // Combine the columns by concatenating arrays from both batches
+        let mut combined_columns = Vec::new();
+        combined_columns.extend_from_slice(left.columns());
+        combined_columns.extend_from_slice(right.columns());
+
+        // Create the new RecordBatch with combined schema and columns
+        let record_batch = RecordBatch::try_new(combined_schema, combined_columns)?;
+        Ok(Box::new(ArrowEngineData::new(record_batch)))
+    }
+
+    fn into_engine_data(
+        &self,
+        schema: SchemaRef,
+        columns: Vec<ArrayData>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let arrow_columns: Vec<ArrayRef> = columns
+            .into_iter()
+            .map(|col| {
+                // Convert kernel ArrayData to Scalar::Array and then to Arrow ArrayRef
+                #[allow(deprecated)]
+                let num_rows = col.array_elements().len();
+                let scalar = Scalar::Array(col);
+                scalar.to_array(num_rows)
+            })
+            .try_collect()
+            .unwrap();
+        let record_batch = RecordBatch::try_new(
+            Arc::new(schema.as_ref().try_into_arrow().unwrap()),
+            arrow_columns,
+        )?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }

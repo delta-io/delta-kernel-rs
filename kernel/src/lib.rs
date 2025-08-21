@@ -85,6 +85,8 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
+use crate::expressions::ArrayData;
+
 use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
@@ -441,6 +443,20 @@ pub trait EvaluationHandler: AsAny {
     // NOTE: we should probably allow DataType instead of SchemaRef, but can expand that in the
     // future.
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Concatenate two [`EngineData`] column-wise into a single one.
+    fn columnar_concat(
+        &self,
+        left: &dyn EngineData,
+        right: &dyn EngineData,
+    ) -> DeltaResult<Box<dyn EngineData>>;
+
+    // Convert StructData created by Kernel into EngineData
+    fn into_engine_data(
+        &self,
+        schema: SchemaRef,
+        columns: Vec<ArrayData>,
+    ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 /// Internal trait to allow us to have a private `create_one` API that's implemented for all
