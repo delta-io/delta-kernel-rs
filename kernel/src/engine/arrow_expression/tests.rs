@@ -2,13 +2,14 @@ use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
-    ListArray, MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
+    ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
 
 use super::*;
+use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
@@ -899,4 +900,147 @@ fn test_null_scalar_map() -> DeltaResult<()> {
     assert!(map_array.is_null(0));
 
     Ok(())
+}
+
+#[test]
+fn test_to_json_with_struct_array() {
+    // Create a test struct array
+    let boolean_field = Arc::new(Field::new("bool_field", ArrowDataType::Boolean, true));
+    let int_field = Arc::new(Field::new("int_field", ArrowDataType::Int32, true));
+    let string_field = Arc::new(Field::new("string_field", ArrowDataType::Utf8, true));
+
+    let boolean_array = Arc::new(BooleanArray::from(vec![Some(true), Some(false), None]));
+    let int_array = Arc::new(Int32Array::from(vec![Some(42), None, Some(84)]));
+    let string_array = Arc::new(StringArray::from(vec![
+        Some("hello"),
+        Some("world"),
+        Some("test"),
+    ]));
+
+    let struct_array = StructArray::new(
+        vec![boolean_field, int_field, string_field].into(),
+        vec![boolean_array, int_array, string_array],
+        None,
+    );
+
+    // Test the to_json function
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(json_array.len(), 3);
+    assert_eq!(
+        json_array.value(0),
+        r#"{"bool_field":true,"int_field":42,"string_field":"hello"}"#
+    );
+    assert_eq!(
+        json_array.value(1),
+        r#"{"bool_field":false,"string_field":"world"}"#
+    );
+    assert_eq!(
+        json_array.value(2),
+        r#"{"int_field":84,"string_field":"test"}"#
+    );
+}
+
+#[test]
+fn test_to_json_with_null_struct() {
+    // Create a test struct array with a NullBuffer
+    let int_field = Arc::new(Field::new("int_field", ArrowDataType::Int32, true));
+    let int_array = Arc::new(Int32Array::from(vec![Some(42), Some(24)]));
+
+    let struct_array = StructArray::new(
+        vec![int_field].into(),
+        vec![int_array],
+        Some(crate::arrow::buffer::NullBuffer::new(
+            crate::arrow::buffer::BooleanBuffer::from(vec![true, false]),
+        )),
+    );
+
+    // Test the to_json function
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(json_array.len(), 2);
+    assert!(!json_array.is_null(0));
+    assert!(json_array.is_null(1));
+    assert_eq!(json_array.value(0), r#"{"int_field":42}"#);
+}
+
+#[test]
+fn test_to_json_with_non_struct_array() {
+    // Test that to_json fails when input is not a StructArray
+    let int_array = Int32Array::from(vec![1, 2, 3]);
+    let result = to_json(&int_array);
+    assert!(result.is_err());
+
+    let string_array = StringArray::from(vec!["hello", "world"]);
+    let result = to_json(&string_array);
+    assert!(result.is_err());
+
+    let boolean_array = BooleanArray::from(vec![true, false]);
+    let result = to_json(&boolean_array);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_to_json_with_empty_struct_array() {
+    // Test to_json with an empty struct array
+    let int_field = Arc::new(Field::new("int_field", ArrowDataType::Int32, true));
+    let int_array = Arc::new(Int32Array::from(Vec::<Option<i32>>::new()));
+
+    let struct_array = StructArray::new(vec![int_field].into(), vec![int_array], None);
+
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(json_array.len(), 0);
+}
+
+#[test]
+fn test_to_json_with_nested_struct() {
+    // Test to_json with nested struct fields
+    let inner_int_field = Arc::new(Field::new("inner_int", ArrowDataType::Int32, true));
+    let inner_string_field = Arc::new(Field::new("inner_string", ArrowDataType::Utf8, true));
+
+    let inner_int_array = Arc::new(Int32Array::from(vec![Some(10), None]));
+    let inner_string_array = Arc::new(StringArray::from(vec![Some("nested"), Some("value")]));
+
+    let inner_struct_array = Arc::new(StructArray::new(
+        vec![inner_int_field, inner_string_field].into(),
+        vec![inner_int_array, inner_string_array],
+        None,
+    ));
+
+    let outer_field = Arc::new(Field::new("outer_int", ArrowDataType::Int32, true));
+    let nested_field = Arc::new(Field::new(
+        "nested_struct",
+        ArrowDataType::Struct(
+            vec![
+                Field::new("inner_int", ArrowDataType::Int32, true),
+                Field::new("inner_string", ArrowDataType::Utf8, true),
+            ]
+            .into(),
+        ),
+        true,
+    ));
+
+    let outer_array = Arc::new(Int32Array::from(vec![Some(100), Some(200)]));
+
+    let struct_array = StructArray::new(
+        vec![outer_field, nested_field].into(),
+        vec![outer_array, inner_struct_array],
+        None,
+    );
+
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(json_array.len(), 2);
+    assert_eq!(
+        json_array.value(0),
+        r#"{"outer_int":100,"nested_struct":{"inner_int":10,"inner_string":"nested"}}"#
+    );
+    assert_eq!(
+        json_array.value(1),
+        r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
+    );
 }

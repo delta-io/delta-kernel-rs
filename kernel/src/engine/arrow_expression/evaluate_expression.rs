@@ -1,7 +1,7 @@
 //! Expression handling based on arrow-rs compute kernels.
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
@@ -11,6 +11,7 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::arrow::json::LineDelimitedWriter;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -19,7 +20,7 @@ use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate, Predicate, Scalar,
-    UnaryPredicate, UnaryPredicateOp,
+    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -85,6 +86,7 @@ pub fn evaluate_expression(
 ) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
+    use UnaryExpressionOp::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
@@ -118,6 +120,28 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
+        (Unary(UnaryExpression { op, expr }), data_type) => {
+            match op {
+                ToJson => {
+                    if let Some(data_type) = data_type {
+                        if data_type != &DataType::STRING {
+                            return Err(Error::generic(format!(
+                                "ToJson operator requires STRING output, but got {data_type:?}"
+                            )));
+                        }
+                    }
+                }
+            };
+
+            let input_arr = evaluate_expression(expr, batch, None)?;
+
+            type Operation = fn(&dyn Datum) -> Result<ArrayRef, ArrowError>;
+            let eval: Operation = match op {
+                ToJson => to_json,
+            };
+
+            Ok(eval(&input_arr)?)
+        }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -288,5 +312,61 @@ pub fn evaluate_predicate(
             }
         }
         Unknown(name) => Err(Error::unsupported(format!("Unknown predicate: {name:?}"))),
+    }
+}
+
+/// Converts a StructArray to JSON-encoded strings
+pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+    let (array_ref, _is_scalar) = input.get();
+    match array_ref.data_type() {
+        ArrowDataType::Struct(_) => {
+            let struct_array = array_ref.as_struct_opt().ok_or_else(|| {
+                ArrowError::InvalidArgumentError(
+                    "Expected struct array but got different type".to_string(),
+                )
+            })?;
+            let num_rows = struct_array.len();
+
+            // Convert each struct row to JSON
+            let mut json_strings = Vec::with_capacity(num_rows);
+
+            for i in 0..num_rows {
+                if struct_array.is_null(i) {
+                    json_strings.push(None);
+                } else {
+                    // Create a single-row RecordBatch from the struct row
+                    let row_batch = RecordBatch::try_new(
+                        std::sync::Arc::new(crate::arrow::datatypes::Schema::new(
+                            struct_array.fields().iter().cloned().collect::<Vec<_>>(),
+                        )),
+                        struct_array
+                            .columns()
+                            .iter()
+                            .map(|col| col.slice(i, 1))
+                            .collect(),
+                    )?;
+
+                    // Use LineDelimitedWriter to convert to JSON
+                    let mut writer = LineDelimitedWriter::new(Vec::new());
+                    writer.write(&row_batch)?;
+                    writer.finish()?;
+                    let json_bytes = writer.into_inner();
+
+                    // Convert bytes to string, removing the trailing newline
+                    let json_string = String::from_utf8(json_bytes).map_err(|e| {
+                        ArrowError::InvalidArgumentError(format!("Invalid UTF-8: {e}"))
+                    })?;
+                    let json_string = json_string.trim_end().to_string();
+
+                    json_strings.push(Some(json_string));
+                }
+            }
+
+            Ok(Arc::new(StringArray::from(json_strings)))
+        }
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "TO_JSON can only be applied to struct arrays, got {:?}",
+            array_ref.data_type()
+        ))),
     }
 }
