@@ -546,67 +546,71 @@ impl From<&[u8]> for Scalar {
     }
 }
 
-impl<T> From<Vec<T>> for Scalar
+impl<T> TryFrom<Vec<T>> for Scalar
 where
     T: Into<Scalar> + ToDataType,
 {
-    fn from(vec: Vec<T>) -> Self {
+    type Error = Error;
+
+    fn try_from(vec: Vec<T>) -> Result<Self, Self::Error> {
         let element_type = T::to_data_type();
         let array_type = ArrayType::new(element_type, false);
 
-        let array_data =
-            ArrayData::try_new(array_type, vec).expect("Failed to create ArrayData from Vec");
+        let array_data = ArrayData::try_new(array_type, vec)?;
 
-        Self::Array(array_data)
+        Ok(Self::Array(array_data))
     }
 }
 
-impl<T> From<Vec<Option<T>>> for Scalar
+impl<T> TryFrom<Vec<Option<T>>> for Scalar
 where
     T: Into<Scalar> + ToDataType,
 {
-    fn from(vec: Vec<Option<T>>) -> Self {
+    type Error = Error;
+
+    fn try_from(vec: Vec<Option<T>>) -> Result<Self, Self::Error> {
         let element_type = T::to_data_type();
         let array_type = ArrayType::new(element_type, true);
 
-        let array_data =
-            ArrayData::try_new(array_type, vec).expect("Failed to create ArrayData from Vec");
+        let array_data = ArrayData::try_new(array_type, vec)?;
 
-        Self::Array(array_data)
+        Ok(Self::Array(array_data))
     }
 }
 
-impl<K, V> From<HashMap<K, V>> for Scalar
+impl<K, V> TryFrom<HashMap<K, V>> for Scalar
 where
     K: Into<Scalar> + ToDataType,
     V: Into<Scalar> + ToDataType,
 {
-    fn from(map: HashMap<K, V>) -> Self {
+    type Error = Error;
+
+    fn try_from(map: HashMap<K, V>) -> Result<Self, Self::Error> {
         let key_type = K::to_data_type();
         let value_type = V::to_data_type();
         let map_type = MapType::new(key_type, value_type, false);
 
-        let map_data =
-            MapData::try_new(map_type, map).expect("Failed to create MapData from HashMap");
+        let map_data = MapData::try_new(map_type, map)?;
 
-        Self::Map(map_data)
+        Ok(Self::Map(map_data))
     }
 }
 
-impl<K, V> From<HashMap<K, Option<V>>> for Scalar
+impl<K, V> TryFrom<HashMap<K, Option<V>>> for Scalar
 where
     K: Into<Scalar> + ToDataType,
     V: Into<Scalar> + ToDataType,
 {
-    fn from(map: HashMap<K, Option<V>>) -> Self {
+    type Error = Error;
+
+    fn try_from(map: HashMap<K, Option<V>>) -> Result<Self, Self::Error> {
         let key_type = K::to_data_type();
         let value_type = V::to_data_type();
         let map_type = MapType::new(key_type, value_type, true);
 
-        let map_data =
-            MapData::try_new(map_type, map).expect("Failed to create MapData from HashMap");
+        let map_data = MapData::try_new(map_type, map)?;
 
-        Self::Map(map_data)
+        Ok(Self::Map(map_data))
     }
 }
 
@@ -1066,14 +1070,14 @@ mod tests {
     }
 
     #[test]
-    fn test_hashmap_conversion() {
+    fn test_hashmap_conversion() -> DeltaResult<()> {
         // Create a simple HashMap with string keys and integer values
         let mut map = HashMap::new();
         map.insert("key1".to_string(), 42i32);
         map.insert("key2".to_string(), 100i32);
 
         // Convert HashMap to Scalar
-        let scalar = Scalar::from(map);
+        let scalar = Scalar::try_from(map)?;
 
         // Verify the scalar is of Map type
         assert!(matches!(scalar, Scalar::Map(_)));
@@ -1100,10 +1104,12 @@ mod tests {
         } else {
             panic!("Expected Map scalar");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn test_hashmap_conversion_with_nullable_values() {
+    fn test_hashmap_conversion_with_nullable_values() -> DeltaResult<()> {
         // Create a HashMap with string keys and optional integer values
         let mut map = HashMap::new();
         map.insert("key1".to_string(), Some(42i32));
@@ -1111,7 +1117,7 @@ mod tests {
         map.insert("key3".to_string(), Some(100i32));
 
         // Convert HashMap to Scalar
-        let scalar = Scalar::from(map);
+        let scalar = Scalar::try_from(map)?;
 
         // Verify the scalar is of Map type
         assert!(matches!(scalar, Scalar::Map(_)));
@@ -1145,15 +1151,17 @@ mod tests {
         } else {
             panic!("Expected Map scalar");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion() {
+    fn test_vec_conversion() -> DeltaResult<()> {
         // Create a simple Vec with integer values
         let vec = vec![42i32, 100i32, 200i32];
 
         // Convert Vec to Scalar
-        let scalar = Scalar::from(vec);
+        let scalar = Scalar::try_from(vec)?;
 
         // Verify the scalar is of Array type
         assert!(matches!(scalar, Scalar::Array(_)));
@@ -1178,15 +1186,17 @@ mod tests {
         } else {
             panic!("Expected Array scalar");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion_with_nullable_values() {
+    fn test_vec_conversion_with_nullable_values() -> DeltaResult<()> {
         // Create a Vec with optional integer values
         let vec = vec![Some(42i32), None, Some(100i32)];
 
         // Convert Vec to Scalar
-        let scalar = Scalar::from(vec);
+        let scalar = Scalar::try_from(vec)?;
 
         // Verify the scalar is of Array type
         assert!(matches!(scalar, Scalar::Array(_)));
@@ -1211,13 +1221,15 @@ mod tests {
         } else {
             panic!("Expected Array scalar");
         }
+
+        Ok(())
     }
 
     #[test]
-    fn test_vec_conversion_different_types() {
+    fn test_vec_conversion_different_types() -> DeltaResult<()> {
         // Test with string Vec
         let string_vec = vec!["hello".to_string(), "world".to_string()];
-        let string_scalar = Scalar::from(string_vec);
+        let string_scalar = Scalar::try_from(string_vec)?;
 
         if let Scalar::Array(array_data) = string_scalar {
             let expected_array_type = ArrayType::new(DataType::STRING, false);
@@ -1228,7 +1240,7 @@ mod tests {
 
         // Test with bool Vec
         let bool_vec = vec![true, false, true];
-        let bool_scalar = Scalar::from(bool_vec);
+        let bool_scalar = Scalar::try_from(bool_vec)?;
 
         if let Scalar::Array(array_data) = bool_scalar {
             let expected_array_type = ArrayType::new(DataType::BOOLEAN, false);
@@ -1236,5 +1248,7 @@ mod tests {
         } else {
             panic!("Expected Array scalar");
         }
+
+        Ok(())
     }
 }

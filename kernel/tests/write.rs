@@ -74,6 +74,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
                 "timestamp": 0,
                 "operation": "UNKNOWN",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "operationParameters": {},
                 "engineInfo": "default engine",
             }
         });
@@ -225,6 +226,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
                 "timestamp": 0,
                 "operation": "UNKNOWN",
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                "operationParameters": {},
                 "engineInfo": "default engine",
             }
         })];
@@ -283,6 +285,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "timestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                    "operationParameters": {},
                 }
             }),
             json!({
@@ -447,6 +450,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "timestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                    "operationParameters": {},
                     "engineInfo": "default engine",
                 }
             }),
@@ -657,6 +661,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                     "timestamp": 0,
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
+                    "operationParameters": {},
                     "engineInfo": "default engine",
                 }
             }),

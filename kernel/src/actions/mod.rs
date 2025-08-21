@@ -8,8 +8,10 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{MapData, Scalar, StructData};
-use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
+use crate::expressions::{ArrayData, MapData, Scalar, StructData};
+use crate::schema::{
+    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::table_features::{
     ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
@@ -280,6 +282,7 @@ impl Metadata {
     }
 }
 
+// TODO: derive IntoEngineData instead (see issue #1083)
 impl IntoEngineData for Metadata {
     fn into_engine_data(
         self,
@@ -292,20 +295,18 @@ impl IntoEngineData for Metadata {
             self.name.into(),
             self.description.into(),
             self.format.provider.into(),
-            self.format.options.into(),
+            self.format.options.try_into()?,
             self.schema_string.into(),
-            self.partition_columns.into(),
+            self.partition_columns.try_into()?,
             self.created_time.into(),
-            self.configuration.into(),
+            self.configuration.try_into()?,
         ];
 
         engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
-#[derive(
-    Default, Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData, Serialize, Deserialize,
-)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -482,6 +483,45 @@ impl Protocol {
     }
 }
 
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
+impl IntoEngineData for Protocol {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        fn features_to_scalar<T>(
+            features: Option<impl IntoIterator<Item = T>>,
+        ) -> DeltaResult<Scalar>
+        where
+            T: Into<Scalar>,
+        {
+            match features {
+                Some(features) => {
+                    let features: Vec<Scalar> = features.into_iter().map(Into::into).collect();
+                    Ok(Scalar::Array(ArrayData::try_new(
+                        ArrayType::new(DataType::STRING, false),
+                        features,
+                    )?))
+                }
+                None => Ok(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
+                    DataType::STRING,
+                    false,
+                ))))),
+            }
+        }
+
+        let values = [
+            self.min_reader_version.into(),
+            self.min_writer_version.into(),
+            features_to_scalar(self.reader_features)?,
+            features_to_scalar(self.writer_features)?,
+        ];
+
+        engine.evaluation_handler().create_one(schema, &values)
+    }
+}
+
 // given `table_features`, check if they are subset of `supported_features`
 pub(crate) fn ensure_supported_features<T>(
     table_features: &[T],
@@ -519,7 +559,7 @@ where
     )))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -564,6 +604,27 @@ impl CommitInfo {
             engine_info,
             txn_id: None,
         }
+    }
+}
+
+// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
+impl IntoEngineData for CommitInfo {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let values = [
+            self.timestamp.into(),
+            self.in_commit_timestamp.into(),
+            self.operation.into(),
+            self.operation_parameters.unwrap_or_default().try_into()?,
+            self.kernel_version.into(),
+            self.engine_info.into(),
+            self.txn_id.into(),
+        ];
+
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -632,54 +693,6 @@ impl Add {
     #[allow(dead_code)]
     pub(crate) fn dv_unique_id(&self) -> Option<String> {
         self.deletion_vector.as_ref().map(|dv| dv.unique_id())
-    }
-}
-
-impl IntoEngineData for Add {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        // partition_values has the `allow_null_container_values` annotation, which is not available
-        // at runtime. Therefore, we must manually overwrite the Scalar::from implementation for it.
-        let partition_values = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, true),
-            self.partition_values,
-        )?;
-
-        let (storage_type, path_or_inline_dv, offset, size_in_bytes, cardinality) =
-            if let Some(dv) = self.deletion_vector {
-                (
-                    Some(dv.storage_type),
-                    Some(dv.path_or_inline_dv),
-                    dv.offset,
-                    Some(dv.size_in_bytes),
-                    Some(dv.cardinality),
-                )
-            } else {
-                (None, None, None, None, None)
-            };
-
-        let values = [
-            self.path.into(),
-            Scalar::Map(partition_values),
-            self.size.into(),
-            self.modification_time.into(),
-            self.data_change.into(),
-            self.stats.into(),
-            self.tags.into(),
-            storage_type.into(),
-            path_or_inline_dv.into(),
-            offset.into(),
-            size_in_bytes.into(),
-            cardinality.into(),
-            self.base_row_id.into(),
-            self.default_row_commit_version.into(),
-            self.clustering_provider.into(),
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -888,7 +901,7 @@ mod tests {
             Array, BooleanArray, Int32Array, Int64Array, MapBuilder, MapFieldNames, StringArray,
             StringBuilder, StructArray,
         },
-        arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema},
+        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
         arrow::record_batch::RecordBatch,
         engine::arrow_data::ArrowEngineData,
         engine::arrow_expression::ArrowEvaluationHandler,
@@ -1393,7 +1406,7 @@ mod tests {
             .into();
 
         let mut map_builder = create_string_map_builder(false);
-        map_builder.append(false).unwrap();
+        map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
 
         let expected = RecordBatch::try_new(
@@ -1405,166 +1418,6 @@ mod tests {
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
-                Arc::new(StringArray::from(vec![None::<String>])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_add_into_engine_data_empty_dv() {
-        let engine = ExprEngine::new();
-
-        let add = Add {
-            path: "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet".to_string(),
-            partition_values: HashMap::from([("year".to_string(), "2021".to_string())]),
-            size: 12345,
-            modification_time: 1234567890,
-            data_change: true,
-            stats: Some("{\"numRecords\":10}".to_string()),
-            tags: Some(HashMap::from([("tag1".to_string(), "value1".to_string())])),
-            deletion_vector: None,
-            base_row_id: Some(100),
-            default_row_commit_version: Some(1),
-            clustering_provider: Some("hilbert".to_string()),
-        };
-
-        let engine_data = add.into_engine_data(Add::to_schema().into(), &engine);
-
-        let record_batch: RecordBatch = engine_data
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-
-        let mut partition_values_builder = create_string_map_builder(true);
-        partition_values_builder.keys().append_value("year");
-        partition_values_builder.values().append_value("2021");
-        partition_values_builder.append(true).unwrap();
-        let partition_values = Arc::new(partition_values_builder.finish());
-
-        let mut tags_builder = create_string_map_builder(false);
-        tags_builder.keys().append_value("tag1");
-        tags_builder.values().append_value("value1");
-        tags_builder.append(true).unwrap();
-        let tags = Arc::new(tags_builder.finish());
-
-        let expected = RecordBatch::try_new(
-            record_batch.schema(),
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet",
-                ])),
-                partition_values,
-                Arc::new(Int64Array::from(vec![12345])),
-                Arc::new(Int64Array::from(vec![1234567890])),
-                Arc::new(BooleanArray::from(vec![true])),
-                Arc::new(StringArray::from(vec![Some("{\"numRecords\":10}")])),
-                tags,
-                Arc::new(StructArray::new_null(
-                    Fields::from(vec![
-                        Field::new("storageType", ArrowDataType::Utf8, false),
-                        Field::new("pathOrInlineDv", ArrowDataType::Utf8, false),
-                        Field::new("offset", ArrowDataType::Int32, true),
-                        Field::new("sizeInBytes", ArrowDataType::Int32, false),
-                        Field::new("cardinality", ArrowDataType::Int64, false),
-                    ]),
-                    1,
-                )),
-                Arc::new(Int64Array::from(vec![Some(100)])),
-                Arc::new(Int64Array::from(vec![Some(1)])),
-                Arc::new(StringArray::from(vec![Some("hilbert")])),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(record_batch, expected);
-    }
-
-    #[test]
-    fn test_add_into_engine_data_with_dv() {
-        let engine = ExprEngine::new();
-
-        let add = Add {
-            path: "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet".to_string(),
-            partition_values: HashMap::from([("year".to_string(), "SHOULD_BE_NONE".to_string())]), // TODO: test with None values
-            size: 12345,
-            modification_time: 1234567890,
-            data_change: false,
-            stats: None,
-            tags: None,
-            deletion_vector: Some(DeletionVectorDescriptor {
-                storage_type: "inline".to_string(),
-                path_or_inline_dv: "inline_dv_data".to_string(),
-                offset: None,
-                size_in_bytes: 100,
-                cardinality: 10,
-            }),
-            base_row_id: None,
-            default_row_commit_version: None,
-            clustering_provider: None,
-        };
-
-        let engine_data = add.into_engine_data(Add::to_schema().into(), &engine);
-
-        let record_batch: RecordBatch = engine_data
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
-
-        let mut partition_values_builder = create_string_map_builder(true);
-        partition_values_builder.keys().append_value("year");
-        partition_values_builder
-            .values()
-            .append_value("SHOULD_BE_NONE");
-        partition_values_builder.append(true).unwrap();
-        let partition_values = Arc::new(partition_values_builder.finish());
-
-        let mut tags_builder = create_string_map_builder(false);
-        tags_builder.append(false).unwrap();
-        let tags = Arc::new(tags_builder.finish());
-
-        let expected = RecordBatch::try_new(
-            record_batch.schema(),
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "part-00000-c9b90f86-73e6-46c8-93ba-ff6bfaf892a1-c000.snappy.parquet",
-                ])),
-                partition_values,
-                Arc::new(Int64Array::from(vec![12345])),
-                Arc::new(Int64Array::from(vec![1234567890])),
-                Arc::new(BooleanArray::from(vec![false])),
-                Arc::new(StringArray::from(vec![None::<String>])),
-                tags,
-                Arc::new(StructArray::from(vec![
-                    (
-                        Arc::new(Field::new("storageType", ArrowDataType::Utf8, false)),
-                        Arc::new(StringArray::from(vec!["inline"])) as Arc<dyn Array>,
-                    ),
-                    (
-                        Arc::new(Field::new("pathOrInlineDv", ArrowDataType::Utf8, false)),
-                        Arc::new(StringArray::from(vec!["inline_dv_data"])) as Arc<dyn Array>,
-                    ),
-                    (
-                        Arc::new(Field::new("offset", ArrowDataType::Int32, true)),
-                        Arc::new(Int32Array::from(vec![None::<i32>])) as Arc<dyn Array>,
-                    ),
-                    (
-                        Arc::new(Field::new("sizeInBytes", ArrowDataType::Int32, false)),
-                        Arc::new(Int32Array::from(vec![100])) as Arc<dyn Array>,
-                    ),
-                    (
-                        Arc::new(Field::new("cardinality", ArrowDataType::Int64, false)),
-                        Arc::new(Int64Array::from(vec![10])) as Arc<dyn Array>,
-                    ),
-                ])),
-                Arc::new(Int64Array::from(vec![None::<i64>])),
-                Arc::new(Int64Array::from(vec![None::<i64>])),
                 Arc::new(StringArray::from(vec![None::<String>])),
             ],
         )
