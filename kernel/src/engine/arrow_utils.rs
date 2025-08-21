@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
@@ -59,6 +59,34 @@ macro_rules! prim_array_cmp {
 }
 
 pub(crate) use prim_array_cmp;
+
+type FieldIndex = usize;
+
+/// contains information about a StructField matched to a parquet struct field
+///
+/// # Lifetime Parameters
+/// * `'k` - The lifetime of the referenced kernel StructField
+struct KernelFieldInfo<'k> {
+    /// The index of the struct field in its parent struct
+    parquet_index: FieldIndex,
+    /// A reference to the struct field
+    field: &'k StructField,
+}
+
+/// Contains a information about a parquet field and the matching `KernelFieldInfo` if one
+/// exists. Parquet struct fields are matched to Kernel fields in [`match_parquet_fields`].
+///
+/// # Lifetime Parameters
+/// * `'k` - The lifetime of the referenced kernel StructField
+/// * `'p` - The lifetime of the referenced parquet ArrowField
+struct MatchedParquetField<'p, 'k> {
+    /// The index of the parquet field
+    parquet_index: FieldIndex,
+    /// A reference to the parquet field in the arrow schema
+    parquet_field: &'p ArrowField,
+    /// If present, this is a `KernelFieldInfo` belonging to a matching kernel `StructField`
+    kernel_field_info: Option<KernelFieldInfo<'k>>,
+}
 
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
@@ -504,34 +532,6 @@ fn get_indices(
     ))
 }
 
-type FieldIndex = usize;
-
-/// contains information about a StructField matched to a parquet struct field
-///
-/// # Lifetime Parameters
-/// * `'k` - The lifetime of the referenced kernel StructField
-struct KernelFieldInfo<'k> {
-    /// The index of the struct field in its parent struct
-    parquet_index: FieldIndex,
-    /// A reference to the struct field
-    field: &'k StructField,
-}
-
-/// Contains a information about a parquet field and the matching `KernelFieldInfo` if one
-/// exists. Parquet struct fields are matched to Kernel fields in [`match_parquet_fields`].
-///
-/// # Lifetime Parameters
-/// * `'k` - The lifetime of the referenced kernel StructField
-/// * `'p` - The lifetime of the referenced parquet ArrowField
-struct MatchedParquetField<'p, 'k> {
-    /// The index of the parquet field
-    parquet_index: FieldIndex,
-    /// A reference to the parquet field in the arrow schema
-    parquet_field: &'p ArrowField,
-    /// If present, this is a `KernelFieldInfo` belonging to a matching kernel `StructField`
-    kernel_field_info: Option<KernelFieldInfo<'k>>,
-}
-
 /// Constructs an iterator where each parquet Field in `fields` is matched
 /// with a a kernel `KernelFieldInfo` representing a StructField.
 ///
@@ -541,16 +541,20 @@ fn match_parquet_fields<'k, 'p>(
     parquet_fields: &'p ArrowFields,
 ) -> impl Iterator<Item = MatchedParquetField<'p, 'k>> {
     type FieldId = i64;
-    // Construct a map from the field id to its StructField name.
-    let field_id_to_name: HashMap<FieldId, &String> = kernel_schema
-        .fields()
-        .filter_map(
-            |field| match field.get_config_value(&ColumnMetadataKey::ParquetFieldId) {
-                Some(MetadataValue::Number(fid)) => Some((*fid, field.name())),
-                _ => None,
-            },
-        )
-        .collect();
+
+    // Lazily construct a map from the field id to its StructField name.
+    let field_id_to_name: OnceLock<HashMap<FieldId, &String>> = OnceLock::new();
+    let init_field_map = || {
+        kernel_schema
+            .fields()
+            .filter_map(
+                |field| match field.get_config_value(&ColumnMetadataKey::ParquetFieldId) {
+                    Some(MetadataValue::Number(fid)) => Some((*fid, field.name())),
+                    _ => None,
+                },
+            )
+            .collect()
+    };
 
     parquet_fields
         .iter()
@@ -566,7 +570,13 @@ fn match_parquet_fields<'k, 'p>(
 
             // Get kernel field name by parquet field id if present. Otherwise fallback to using parquet name.
             let field_name = parquet_field_id
-                .and_then(|field_id| field_id_to_name.get(&field_id).copied())
+                .and_then(|field_id| {
+                    // If the fid to name map hasn't been initialized, construct it and get the field name
+                    field_id_to_name
+                        .get_or_init(init_field_map)
+                        .get(&field_id)
+                        .copied()
+                })
                 .unwrap_or_else(|| parquet_field.name());
 
             // Map the parquet ArrowField to the matching kernel KernelFieldInfo if present.
