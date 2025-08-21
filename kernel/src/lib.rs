@@ -452,7 +452,7 @@ pub trait EvaluationHandler: AsAny {
     ) -> DeltaResult<Box<dyn EngineData>>;
 
     // Convert StructData created by Kernel into EngineData
-    fn into_engine_data(
+    fn convert_to_engine_data(
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,

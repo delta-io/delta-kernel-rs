@@ -1048,18 +1048,8 @@ fn test_columnar_concat_empty_batches() {
     assert_eq!(result_batch.schema().field(1).name(), "name");
 }
 
-// let values = Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
-// let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
-// let field = Arc::new(Field::new("item", DataType::Int32, true));
-// let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
-
-// let schema = Schema::new([arr_field.clone()]);
-
-// let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
-// let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
-
 #[test]
-fn test_into_engine_data() {
+fn test_convert_to_engine_data() {
     let handler = ArrowEvaluationHandler;
 
     // Test with simple integer array
@@ -1074,7 +1064,7 @@ fn test_into_engine_data() {
     )]));
 
     let result = handler
-        .into_engine_data(schema.clone(), vec![int_array_data])
+        .convert_to_engine_data(schema.clone(), vec![int_array_data])
         .unwrap();
     let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
     let batch = arrow_data.record_batch();
@@ -1095,7 +1085,7 @@ fn test_into_engine_data() {
 }
 
 #[test]
-fn test_into_engine_data_multiple_columns() {
+fn test_convert_to_engine_data_multiple_columns() {
     let handler = ArrowEvaluationHandler;
 
     // Create multiple columns with different types
@@ -1118,7 +1108,7 @@ fn test_into_engine_data_multiple_columns() {
     ]));
 
     let result = handler
-        .into_engine_data(
+        .convert_to_engine_data(
             schema.clone(),
             vec![int_array_data, string_array_data, bool_array_data],
         )
@@ -1159,7 +1149,7 @@ fn test_into_engine_data_multiple_columns() {
 }
 
 #[test]
-fn test_into_engine_data_empty_array() {
+fn test_convert_to_engine_data_empty_array() {
     let handler = ArrowEvaluationHandler;
 
     // Test with empty array
@@ -1174,7 +1164,7 @@ fn test_into_engine_data_empty_array() {
     )]));
 
     let result = handler
-        .into_engine_data(schema.clone(), vec![empty_array_data])
+        .convert_to_engine_data(schema.clone(), vec![empty_array_data])
         .unwrap();
     let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
     let batch = arrow_data.record_batch();
@@ -1185,7 +1175,7 @@ fn test_into_engine_data_empty_array() {
 }
 
 #[test]
-fn test_into_engine_data_with_nulls() {
+fn test_convert_to_engine_data_with_nulls() {
     let handler = ArrowEvaluationHandler;
 
     // Test with array containing null values
@@ -1203,7 +1193,7 @@ fn test_into_engine_data_with_nulls() {
     )]));
 
     let result = handler
-        .into_engine_data(schema.clone(), vec![array_data])
+        .convert_to_engine_data(schema.clone(), vec![array_data])
         .unwrap();
     let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
     let batch = arrow_data.record_batch();
@@ -1223,7 +1213,7 @@ fn test_into_engine_data_with_nulls() {
 }
 
 #[test]
-fn test_into_engine_data_various_types() {
+fn test_convert_to_engine_data_various_types() {
     let handler = ArrowEvaluationHandler;
 
     // Test with various primitive types
@@ -1244,7 +1234,7 @@ fn test_into_engine_data_various_types() {
     ]));
 
     let result = handler
-        .into_engine_data(
+        .convert_to_engine_data(
             schema.clone(),
             vec![
                 ArrayData::try_new(ArrayType::new(KernelDataType::LONG, true), long_values)
@@ -1314,7 +1304,7 @@ fn test_into_engine_data_various_types() {
 }
 
 #[test]
-fn test_into_engine_data_schema_mismatch() {
+fn test_convert_to_engine_data_schema_mismatch() {
     let handler = ArrowEvaluationHandler;
 
     // Create data with 2 columns but schema with 1 column
@@ -1326,7 +1316,7 @@ fn test_into_engine_data_schema_mismatch() {
         // Missing second column in schema
     ]));
 
-    let result = handler.into_engine_data(
+    let result = handler.convert_to_engine_data(
         schema.clone(),
         vec![
             ArrayData::try_new(ArrayType::new(KernelDataType::INTEGER, true), int_values).unwrap(),

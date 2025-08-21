@@ -295,7 +295,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 
-    fn into_engine_data(
+    fn convert_to_engine_data(
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,
@@ -309,12 +309,9 @@ impl EvaluationHandler for ArrowEvaluationHandler {
                 let scalar = Scalar::Array(col);
                 scalar.to_array(num_rows)
             })
-            .try_collect()
-            .unwrap();
-        let record_batch = RecordBatch::try_new(
-            Arc::new(schema.as_ref().try_into_arrow().unwrap()),
-            arrow_columns,
-        )?;
+            .try_collect()?;
+        let record_batch =
+            RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), arrow_columns)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }
