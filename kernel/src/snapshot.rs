@@ -16,7 +16,7 @@ use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::calculate_transaction_expiration_timestamp;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, LogPath, Version};
 use delta_kernel_derive::internal_api;
 
 mod builder;
@@ -86,8 +86,13 @@ impl Snapshot {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
     ///   version of the table.
+    //
+    // TODO: need to integrate with SnapshotBuilder
+    //
+    // FIXME: DOCS
     pub fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
+        log_tail: impl IntoIterator<Item = LogPath>,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<Arc<Self>> {
@@ -117,6 +122,7 @@ impl Snapshot {
         let new_listed_files = ListedLogFiles::list(
             storage.as_ref(),
             &log_root,
+            log_tail.into_iter().map(|p| p.into()).collect(),
             Some(listing_start),
             new_version,
         )?;

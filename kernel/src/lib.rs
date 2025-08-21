@@ -82,7 +82,7 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
-use self::schema::{DataType, SchemaRef};
+use crate::schema::{DataType, SchemaRef};
 
 pub mod actions;
 pub mod checkpoint;
@@ -111,6 +111,8 @@ pub use utils::try_parse_uri;
 // for the below modules, we cannot introduce a macro to clean this up. rustfmt doesn't follow into
 // macros, and so will not format the files associated with these modules if we get too clever. see:
 // https://github.com/rust-lang/rustfmt/issues/3253
+
+pub use path::LogPath;
 
 #[cfg(feature = "internal-api")]
 pub mod path;

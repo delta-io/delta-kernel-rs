@@ -135,14 +135,19 @@ impl TableChanges {
     ///   defaults to the newest table version.
     pub fn try_new(
         table_root: Url,
+        log_tail: Vec<LogPath>,
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
+        let parsed_log_tail: Vec<ParsedLogPath> =
+            log_tail.clone().into_iter().map(|p| p.into()).collect();
+
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
+            parsed_log_tail,
             start_version,
             end_version,
         )?;
