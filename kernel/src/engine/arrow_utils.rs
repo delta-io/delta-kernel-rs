@@ -504,13 +504,15 @@ fn get_indices(
     ))
 }
 
-/// Contains information about a StructField
+type FieldIndex = usize;
+
+/// contains information about a StructField matched to a parquet struct field
 ///
 /// # Lifetime Parameters
 /// * `'k` - The lifetime of the referenced kernel StructField
 struct KernelFieldInfo<'k> {
     /// The index of the struct field in its parent struct
-    parquet_index: usize,
+    parquet_index: FieldIndex,
     /// A reference to the struct field
     field: &'k StructField,
 }
@@ -523,7 +525,7 @@ struct KernelFieldInfo<'k> {
 /// * `'p` - The lifetime of the referenced parquet ArrowField
 struct MatchedParquetField<'p, 'k> {
     /// The index of the parquet field
-    parquet_index: usize,
+    parquet_index: FieldIndex,
     /// A reference to the parquet field in the arrow schema
     parquet_field: &'p ArrowField,
     /// If present, this is a `KernelFieldInfo` belonging to a matching kernel `StructField`
@@ -538,8 +540,9 @@ fn match_parquet_fields<'k, 'p>(
     kernel_schema: &'k StructType,
     parquet_fields: &'p ArrowFields,
 ) -> impl Iterator<Item = MatchedParquetField<'p, 'k>> {
+    type FieldId = i64;
     // Construct a map from the field id to its StructField name.
-    let field_id_to_name: HashMap<i64, &String> = kernel_schema
+    let field_id_to_name: HashMap<FieldId, &String> = kernel_schema
         .fields()
         .filter_map(
             |field| match field.get_config_value(&ColumnMetadataKey::ParquetFieldId) {
@@ -559,7 +562,7 @@ fn match_parquet_fields<'k, 'p>(
             let parquet_field_id = parquet_field
                 .metadata()
                 .get(PARQUET_FIELD_ID_META_KEY)
-                .and_then(|x| x.parse::<i64>().ok());
+                .and_then(|x| x.parse::<FieldId>().ok());
 
             // Get kernel field name by parquet field id if present. Otherwise fallback to using parquet name.
             let field_name = parquet_field_id
