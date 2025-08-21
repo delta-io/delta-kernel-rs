@@ -75,6 +75,22 @@ impl ScanLogReplayProcessor {
     }
 }
 
+/// A representation of partition values for use as a cache key. This is just a sorted vector of
+/// raw partition key-value pairs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PartitionValues(Vec<(String, String)>);
+
+impl PartitionValues {
+    /// Create a new `PartitionValues` from raw HashMap of partition values (sorts entries). Note
+    /// that although sorting sounds painful, this is usually a very small number of entries (just
+    /// the number of partition columns in the table).
+    fn from_map(map: HashMap<String, String>) -> Self {
+        let mut entries: Vec<(String, String)> = map.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Self(entries)
+    }
+}
+
 /// A visitor that deduplicates a stream of add and remove actions into a stream of valid adds. Log
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
@@ -86,6 +102,12 @@ struct AddRemoveDedupVisitor<'seen> {
     transform: Option<Arc<Transform>>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
+    // Cache partition value combinations to transform expressions so we avoid re-creating
+    // transform Expressions for the same partition values. The size of this cache is O(N) where N =
+    // number of unique partition value combinations in an ActionsBatch. To be clear, this _is_ a
+    // cartesian product of partition values, but at worse is the same size as row_transform_exprs
+    // (unique for every row).
+    partition_cache: HashMap<PartitionValues, ExpressionRef>,
 }
 
 impl AddRemoveDedupVisitor<'_> {
@@ -119,6 +141,7 @@ impl AddRemoveDedupVisitor<'_> {
             transform,
             partition_filter,
             row_transform_exprs: Vec::new(),
+            partition_cache: HashMap::new(),
         }
     }
 
@@ -220,32 +243,44 @@ impl AddRemoveDedupVisitor<'_> {
         // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
         // removes), because they are needed to suppress earlier incompatible adds we might
         // encounter if the table's schema was replaced after the most recent checkpoint.
-        let partition_values = match &self.transform {
+        let (raw_partition_values, parsed_partition_values) = match &self.transform {
             Some(transform) if is_add => {
-                let partition_values =
+                let raw_partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values = self.parse_partition_values(transform, &partition_values)?;
-                if self.is_file_partition_pruned(&partition_values) {
+                let parsed_partition_values =
+                    self.parse_partition_values(transform, &raw_partition_values)?;
+                if self.is_file_partition_pruned(&parsed_partition_values) {
                     return Ok(false);
                 }
-                partition_values
+                (Some(raw_partition_values), parsed_partition_values)
             }
-            _ => Default::default(),
+            _ => (None, Default::default()),
         };
 
         // Check both adds and removes (skipping already-seen), but only transform and return adds
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
-        let transform = self
-            .transform
-            .as_ref()
-            .map(|transform| self.get_transform_expr(transform, partition_values))
-            .transpose()?;
-        if transform.is_some() {
-            // fill in any needed `None`s for previous rows
-            self.row_transform_exprs.resize_with(i, Default::default);
-            self.row_transform_exprs.push(transform);
+        if let Some(transform) = self.transform.as_ref() {
+            if let Some(raw_partition_values) = raw_partition_values {
+                // create cache key from partition values (just sorted partition values)
+                let cache_key = PartitionValues::from_map(raw_partition_values);
+
+                let transform_expr = if let Some(cached) = self.partition_cache.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    // missed: have to compute the transform expression
+                    let transform_expr =
+                        self.get_transform_expr(transform, parsed_partition_values)?;
+                    self.partition_cache
+                        .insert(cache_key, transform_expr.clone());
+                    transform_expr
+                };
+
+                // fill in any needed `None`s for previous rows
+                self.row_transform_exprs.resize_with(i, Default::default);
+                self.row_transform_exprs.push(Some(transform_expr));
+            }
         }
         Ok(true)
     }
@@ -377,6 +412,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let result = self.add_transform.evaluate(actions.as_ref())?;
+
         Ok(ScanMetadata::new(
             result,
             visitor.selection_vector,
