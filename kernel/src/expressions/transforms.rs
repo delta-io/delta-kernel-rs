@@ -3,9 +3,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, FieldModification,
-    JunctionPredicate, OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform,
-    UnaryPredicate,
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryPredicate,
 };
 use crate::utils::CowExt as _;
 
@@ -220,60 +219,50 @@ pub trait ExpressionTransform<'a> {
     /// Recursively transforms the children of a [`Transform`]. Returns `None` if all
     /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
     /// `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_expr_transform(
-        &mut self,
-        t: &'a Transform,
-    ) -> Option<Cow<'a, Transform>> {
-        use FieldModification::*;
-        
-        let mut any_changed = false;
-        let mut new_field_mods = std::collections::HashMap::new();
-        
-        // Transform field modifications
-        for (field_name, field_mod) in &t.field_mods {
-            let new_field_mod = match field_mod {
-                Drop => Drop,
-                Replace(expr) => {
-                    match self.transform_expr(expr)? {
-                        Cow::Borrowed(_) => Replace(expr.clone()),
-                        Cow::Owned(new_expr) => {
-                            any_changed = true;
-                            Replace(new_expr)
-                        }
-                    }
+    ///
+    /// TODO: Re-examine this design - we need hooks for users to modify individual transforms.
+    /// This will likely need more helper methods and better use of map_owned_or_else patterns.
+    fn recurse_into_expr_transform(&mut self, t: &'a Transform) -> Option<Cow<'a, Transform>> {
+        let mut any_field_changed = false;
+        let mut new_field_replacements = Vec::new();
+
+        // Transform field replacement expressions
+        for (field_name, replacement) in &t.field_replacements {
+            if let Some(new_replacement) = replacement.as_ref().map(|replacement| {
+                let transformed = self.transform_expr(replacement);
+                if !matches!(transformed, Some(Cow::Borrowed(_))) {
+                    any_field_changed = true;
                 }
-                Nested(nested_transform) => {
-                    match self.recurse_into_expr_transform(nested_transform)? {
-                        Cow::Borrowed(_) => Nested(nested_transform.clone()),
-                        Cow::Owned(new_transform) => {
-                            any_changed = true;
-                            Nested(new_transform)
-                        }
-                    }
-                }
-            };
-            new_field_mods.insert(field_name.clone(), new_field_mod);
-        }
-        
-        // Transform insertion expressions
-        let mut new_insertions = std::collections::HashMap::new();
-        for (key, exprs) in &t.insertions {
-            let nested_result = recurse_into_children(exprs, |e| self.transform_expr(e))?;
-            match nested_result {
-                Cow::Borrowed(_) => {
-                    new_insertions.insert(key.clone(), exprs.clone());
-                }
-                Cow::Owned(new_exprs) => {
-                    any_changed = true;
-                    new_insertions.insert(key.clone(), new_exprs);
-                }
+                transformed
+            }) {
+                new_field_replacements.push((field_name, new_replacement));
             }
         }
-        
-        if any_changed {
+
+        // Transform insertion expressions
+        let mut new_field_insertions = Vec::new();
+        for (key, exprs) in &t.field_insertions {
+            let new_exprs = recurse_into_children(exprs, |e| self.transform_expr(e));
+            if !matches!(new_exprs, Some(Cow::Borrowed(_))) {
+                any_field_changed = true;
+            }
+            if let Some(new_exprs) = new_exprs {
+                new_field_insertions.push((key, new_exprs));
+            }
+        }
+
+        if any_field_changed {
+            let field_replacements = new_field_replacements
+                .into_iter()
+                .map(|(name, replacement)| (name.to_owned(), replacement.map(Cow::into_owned)))
+                .collect();
+            let field_insertions = new_field_insertions
+                .into_iter()
+                .map(|(key, exprs)| (key.to_owned(), exprs.into_owned()))
+                .collect();
             Some(Cow::Owned(Transform {
-                field_mods: new_field_mods,
-                insertions: new_insertions,
+                field_replacements,
+                field_insertions,
             }))
         } else {
             Some(Cow::Borrowed(t))
@@ -530,10 +519,7 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
         self.depth_limited(Self::recurse_into_expr_opaque, expr)
     }
 
-    fn transform_expr_transform(
-        &mut self,
-        transform: &'a Transform,
-    ) -> Option<Cow<'a, Transform>> {
+    fn transform_expr_transform(&mut self, transform: &'a Transform) -> Option<Cow<'a, Transform>> {
         self.depth_limited(Self::recurse_into_expr_transform, transform)
     }
 }

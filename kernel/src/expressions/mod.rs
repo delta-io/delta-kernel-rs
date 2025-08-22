@@ -244,79 +244,47 @@ impl OpaqueExpression {
     }
 }
 
-/// A field modification operation within a Transform.
-#[derive(Debug, Clone, PartialEq)]
-pub enum FieldModification {
-    /// Remove this field from the output
-    Drop,
-    /// Replace the field with the result of evaluating this expression
-    Replace(Expression),
-    /// Apply a nested transform to a struct field
-    Nested(Transform),
-}
-
 /// A sparse transformation that efficiently represents modifications to struct schemas.
-/// 
+///
 /// Transform achieves O(changes) space complexity instead of O(schema_width) by only
-/// specifying fields that actually change, through field modifications and insertions.
+/// specifying fields that actually change, through field replacements and insertions.
 /// This is particularly efficient for wide schemas where only a few columns need to be
-/// renamed, dropped, or where partition columns need to be injected.
-#[derive(Debug, Clone, PartialEq)]
+/// modified/dropped, or where partition columns need to be injected.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Transform {
-    /// Modifications to existing fields, indexed by field name for O(1) lookup
-    pub field_mods: HashMap<String, FieldModification>,
+    /// Field replacements indexed by field name for O(1) lookup:
+    /// - `Some(expression)`: Replace the field with this expression
+    /// - `None`: Drop the field from output
+    /// - Absent key: Pass through field unchanged
+    pub field_replacements: HashMap<String, Option<Expression>>,
     /// New fields to insert at various positions. The key determines insertion point:
-    /// - `Some(field_name)`: Insert before the named field
+    /// - `Some(field_name)`: Insert before the named field  
     /// - `None`: Append at the end of the struct
-    pub insertions: HashMap<Option<String>, Vec<Expression>>,
+    pub field_insertions: HashMap<Option<String>, Vec<Expression>>,
 }
 
 impl Transform {
     /// Create a new empty transform
     pub fn new() -> Self {
-        Self {
-            field_mods: HashMap::new(),
-            insertions: HashMap::new(),
-        }
+        Self::default()
     }
 
-    /// Create a transform with a field modification
-    pub fn with_field_mod(mut self, name: impl Into<String>, modification: FieldModification) -> Self {
-        self.field_mods.insert(name.into(), modification);
+    /// Create a transform with a dropped field
+    pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
+        self.field_replacements.insert(name.into(), None);
+        self
+    }
+
+    /// Create a transform with a replaced field
+    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: Expression) -> Self {
+        self.field_replacements.insert(name.into(), Some(expr));
         self
     }
 
     /// Create a transform with an insertion
     pub fn with_insertion(mut self, after: Option<String>, exprs: Vec<Expression>) -> Self {
-        self.insertions.insert(after, exprs);
+        self.field_insertions.insert(after, exprs);
         self
-    }
-
-    /// Create a transform from field modifications
-    pub fn from_field_mods<I>(iter: I) -> Self
-    where
-        I: IntoIterator<Item = (String, FieldModification)>,
-    {
-        Self {
-            field_mods: iter.into_iter().collect(),
-            insertions: HashMap::new(),
-        }
-    }
-
-    /// Create a transform for partition injection (common use case)
-    pub fn partition_injection(partition_exprs: Vec<Expression>) -> Self {
-        let mut insertions = HashMap::new();
-        insertions.insert(None, partition_exprs); // Insert at end
-        Self {
-            field_mods: HashMap::new(),
-            insertions,
-        }
-    }
-}
-
-impl Default for Transform {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -765,8 +733,17 @@ impl Display for Expression {
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
             Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
-            Transform(transform) => write!(f, "Transform({} mods, {} insertions)", 
-                transform.field_mods.len(), transform.insertions.len()),
+            Transform(transform) => {
+                // TODO: Revisit Display for Expression::Transform
+                // Options: (1) print equivalent Expression::Struct, or (2) expanded sparse description
+                // Either way, should recurse into sub-expressions of the transform
+                write!(
+                    f,
+                    "Transform({} replacements, {} insertions)",
+                    transform.field_replacements.len(),
+                    transform.field_insertions.len()
+                )
+            }
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
