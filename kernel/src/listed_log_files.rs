@@ -41,31 +41,50 @@ pub(crate) struct ListedLogFiles {
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] that are between the provided `start_version`
-/// (inclusive) and `end_version` (inclusive). [`ParsedLogPath`] may be a commit or a checkpoint.
-/// If `start_version` is not specified, the files will begin from version number 0. If
-/// `end_version` is not specified, files up to the most recent version will be included.
+/// (inclusive) and `end_version` (inclusive) taking into account the `log_tail` which was
+/// (ostentibly) returned from the catalog. Note that the `log_tail` must strictly adhere to being
+/// a 'tail' - that is, it goes from X..Y (inclusive) and Y must be the latest version of the
+/// table. Note that if it overlaps with commits listed from the filesystem, the `log_tail` will
+/// take precedence.
 ///
-/// Note: this calls [`StorageHandler::list_from`] to get the list of log files.
+/// [`ParsedLogPath`] may be a commit or a checkpoint. If `start_version` is not specified, the
+/// files will begin from version number 0. If `end_version` is not specified, files up to the most
+/// recent version will be included.
+///
+/// Note: this may call [`StorageHandler::list_from`] to get the list of log files unless the
+/// provided log_tail covers the entire requested range.
+///
+/// TODO: consider renaming? `maybe_list_log_files`? `list_log_files_with_tail`?
 fn list_log_files(
     storage: &dyn StorageHandler,
     log_root: &Url,
+    log_tail: Vec<ParsedLogPath>,
     start_version: impl Into<Option<Version>>,
     end_version: impl Into<Option<Version>>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
     let start_version = start_version.into().unwrap_or(0);
-    let end_version = end_version.into();
-    let version_prefix = format!("{start_version:020}");
-    let start_from = log_root.join(&version_prefix)?;
 
-    Ok(storage
+    // start_from is log path to start listing from: the log root with zero-padded start version
+    let start_from = log_root.join(&format!("{start_version:020}"))?;
+    // end version is the earlier of: requested end version or the start version of the log_tail
+    let list_end_version = [log_tail.first().map(|f| f.version), end_version.into()]
+        .into_iter()
+        .flatten()
+        .min();
+
+    // since engine APIs don't limit listing, we just list from start_version and filter
+    let listed_files = storage
         .list_from(&start_from)?
         .map(|meta| ParsedLogPath::try_from(meta?))
         // TODO this filters out .crc files etc which start with "." - how do we want to use these kind of files?
         .filter_map_ok(identity)
         .take_while(move |path_res| match path_res {
-            Ok(path) => end_version.is_none_or(|end_version| end_version >= path.version),
+            Ok(path) => list_end_version.is_none_or(|end_version| end_version >= path.version),
             Err(_) => true,
-        }))
+        });
+
+    // return [listed_files, log_tail]
+    Ok(listed_files.chain(log_tail.into_iter().map(Ok)))
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -172,12 +191,14 @@ impl ListedLogFiles {
     pub(crate) fn list_commits(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let commits: Vec<_> = list_log_files(storage, log_root, start_version, end_version)?
-            .filter_ok(|log_file| matches!(log_file.file_type, LogPathFileType::Commit))
-            .try_collect()?;
+        let commits: Vec<_> =
+            list_log_files(storage, log_root, log_tail, start_version, end_version)?
+                .filter_ok(|log_file| matches!(log_file.file_type, LogPathFileType::Commit))
+                .try_collect()?;
         ListedLogFiles::try_new(commits, vec![], vec![], None)
     }
 
@@ -189,13 +210,14 @@ impl ListedLogFiles {
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
         // on config at some point
 
-        let log_files = list_log_files(storage, log_root, start_version, end_version)?;
+        let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
         log_files.process_results(|iter| {
             let mut ascending_commit_files = Vec::with_capacity(10);
@@ -263,11 +285,13 @@ impl ListedLogFiles {
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let listed_files = Self::list(
             storage,
             log_root,
+            log_tail,
             Some(checkpoint_metadata.version),
             end_version,
         )?;
@@ -293,4 +317,11 @@ impl ListedLogFiles {
         }
         Ok(listed_files)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // TODO: test the new log_tail stuff
 }
