@@ -1,6 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -244,6 +244,82 @@ impl OpaqueExpression {
     }
 }
 
+/// A field modification operation within a Transform.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldModification {
+    /// Remove this field from the output
+    Drop,
+    /// Replace the field with the result of evaluating this expression
+    Replace(Expression),
+    /// Apply a nested transform to a struct field
+    Nested(Transform),
+}
+
+/// A sparse transformation that efficiently represents modifications to struct schemas.
+/// 
+/// Transform achieves O(changes) space complexity instead of O(schema_width) by only
+/// specifying fields that actually change, through field modifications and insertions.
+/// This is particularly efficient for wide schemas where only a few columns need to be
+/// renamed, dropped, or where partition columns need to be injected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transform {
+    /// Modifications to existing fields, indexed by field name for O(1) lookup
+    pub field_mods: HashMap<String, FieldModification>,
+    /// New fields to insert at various positions. The key determines insertion point:
+    /// - `Some(field_name)`: Insert before the named field
+    /// - `None`: Append at the end of the struct
+    pub insertions: HashMap<Option<String>, Vec<Expression>>,
+}
+
+impl Transform {
+    /// Create a new empty transform
+    pub fn new() -> Self {
+        Self {
+            field_mods: HashMap::new(),
+            insertions: HashMap::new(),
+        }
+    }
+
+    /// Create a transform with a field modification
+    pub fn with_field_mod(mut self, name: impl Into<String>, modification: FieldModification) -> Self {
+        self.field_mods.insert(name.into(), modification);
+        self
+    }
+
+    /// Create a transform with an insertion
+    pub fn with_insertion(mut self, after: Option<String>, exprs: Vec<Expression>) -> Self {
+        self.insertions.insert(after, exprs);
+        self
+    }
+
+    /// Create a transform from field modifications
+    pub fn from_field_mods<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = (String, FieldModification)>,
+    {
+        Self {
+            field_mods: iter.into_iter().collect(),
+            insertions: HashMap::new(),
+        }
+    }
+
+    /// Create a transform for partition injection (common use case)
+    pub fn partition_injection(partition_exprs: Vec<Expression>) -> Self {
+        let mut insertions = HashMap::new();
+        insertions.insert(None, partition_exprs); // Insert at end
+        Self {
+            field_mods: HashMap::new(),
+            insertions,
+        }
+    }
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type
@@ -259,6 +335,9 @@ pub enum Expression {
     Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions
     Struct(Vec<ExpressionRef>),
+    /// A sparse transformation of a struct schema. More efficient than Struct for wide schemas
+    /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
+    Transform(Transform),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
@@ -410,6 +489,11 @@ impl Expression {
     /// Create a new struct expression
     pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
         Self::Struct(exprs.into_iter().map(Into::into).collect())
+    }
+
+    /// Create a new transform expression
+    pub fn transform(transform: Transform) -> Self {
+        Self::Transform(transform)
     }
 
     /// Create a new predicate `self IS NULL`
@@ -681,6 +765,8 @@ impl Display for Expression {
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
             Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
+            Transform(transform) => write!(f, "Transform({} mods, {} insertions)", 
+                transform.field_mods.len(), transform.insertions.len()),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))

@@ -3,8 +3,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::expressions::{
-    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryPredicate,
+    BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, FieldModification,
+    JunctionPredicate, OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform,
+    UnaryPredicate,
 };
 use crate::utils::CowExt as _;
 
@@ -59,6 +60,12 @@ pub trait ExpressionTransform<'a> {
     /// Called for each [`Expression::Unknown`] encountered during the traversal.
     fn transform_expr_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
         Some(Cow::Borrowed(name))
+    }
+
+    /// Called for each [`Transform`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_transform`] if they wish to recursively transform the children.
+    fn transform_expr_transform(&mut self, transform: &'a Transform) -> Option<Cow<'a, Transform>> {
+        self.recurse_into_expr_transform(transform)
     }
 
     /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
@@ -142,6 +149,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Struct(s) => self
                 .transform_expr_struct(s)?
                 .map_owned_or_else(expr, Expression::Struct),
+            Expression::Transform(t) => self
+                .transform_expr_transform(t)?
+                .map_owned_or_else(expr, Expression::Transform),
             Expression::Binary(b) => self
                 .transform_expr_binary(b)?
                 .map_owned_or_else(expr, Expression::Binary),
@@ -205,6 +215,69 @@ pub trait ExpressionTransform<'a> {
     ) -> Option<Cow<'a, OpaqueExpression>> {
         let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
         Some(nested_result.map_owned_or_else(o, |exprs| OpaqueExpression::new(o.op.clone(), exprs)))
+    }
+
+    /// Recursively transforms the children of a [`Transform`]. Returns `None` if all
+    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_transform(
+        &mut self,
+        t: &'a Transform,
+    ) -> Option<Cow<'a, Transform>> {
+        use FieldModification::*;
+        
+        let mut any_changed = false;
+        let mut new_field_mods = std::collections::HashMap::new();
+        
+        // Transform field modifications
+        for (field_name, field_mod) in &t.field_mods {
+            let new_field_mod = match field_mod {
+                Drop => Drop,
+                Replace(expr) => {
+                    match self.transform_expr(expr)? {
+                        Cow::Borrowed(_) => Replace(expr.clone()),
+                        Cow::Owned(new_expr) => {
+                            any_changed = true;
+                            Replace(new_expr)
+                        }
+                    }
+                }
+                Nested(nested_transform) => {
+                    match self.recurse_into_expr_transform(nested_transform)? {
+                        Cow::Borrowed(_) => Nested(nested_transform.clone()),
+                        Cow::Owned(new_transform) => {
+                            any_changed = true;
+                            Nested(new_transform)
+                        }
+                    }
+                }
+            };
+            new_field_mods.insert(field_name.clone(), new_field_mod);
+        }
+        
+        // Transform insertion expressions
+        let mut new_insertions = std::collections::HashMap::new();
+        for (key, exprs) in &t.insertions {
+            let nested_result = recurse_into_children(exprs, |e| self.transform_expr(e))?;
+            match nested_result {
+                Cow::Borrowed(_) => {
+                    new_insertions.insert(key.clone(), exprs.clone());
+                }
+                Cow::Owned(new_exprs) => {
+                    any_changed = true;
+                    new_insertions.insert(key.clone(), new_exprs);
+                }
+            }
+        }
+        
+        if any_changed {
+            Some(Cow::Owned(Transform {
+                field_mods: new_field_mods,
+                insertions: new_insertions,
+            }))
+        } else {
+            Some(Cow::Borrowed(t))
+        }
     }
 
     /// Recursively transforms the child of an [`Expression::Predicate`]. Returns `None` if all
@@ -455,6 +528,13 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
         expr: &'a OpaqueExpression,
     ) -> Option<Cow<'a, OpaqueExpression>> {
         self.depth_limited(Self::recurse_into_expr_opaque, expr)
+    }
+
+    fn transform_expr_transform(
+        &mut self,
+        transform: &'a Transform,
+    ) -> Option<Cow<'a, Transform>> {
+        self.depth_limited(Self::recurse_into_expr_transform, transform)
     }
 }
 
