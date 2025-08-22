@@ -1,5 +1,17 @@
 //! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
 //! files.
+
+// The current abstractions ([`LogSegment`] and [`ListedLogFiles`]) are designed to have the
+// following semantics:
+// - A [`LogSegment`] represents a contiguous section of the log, from a start_version to an
+//   end_version, with _all_ actions occurring on a table included in the log segment. There are
+//   two main 'varieties' (right now all the same `LogSegment` type, but could be two types in
+//   future): a 'complete' log segment (has ALL table actions), and an 'incremental' log segment
+//   (has only the actions between two versions, but not all actions against the table).
+//   Basically, a complete log segment is either 0-rooted or checkpoint rooted.
+// - [`ListedLogFiles`] represent a set of log files that are listed from the storage, and
+//   provides far fewer guarantees than a [`LogSegment`].
+
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
@@ -37,10 +49,11 @@ mod tests;
 ///     3. All checkpoint_parts must belong to the same checkpoint version, and must form a complete
 ///        version. Multi-part checkpoints must have all their parts.
 ///
-/// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
-/// and in `TableChanges` when built with [`LogSegment::for_table_changes`].
+/// [`LogSegment`]s used in [`Snapshot`]s are built with [`LogSegmentBuilder::build_complete`], and
+/// and are built for [`TableChanges`] with [`LogSegmentBuilder::build_incremental`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
+/// [`TableChanges`]: crate::table_changes::TableChanges
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct LogSegment {
@@ -57,7 +70,176 @@ pub(crate) struct LogSegment {
     pub latest_crc_file: Option<ParsedLogPath>,
 }
 
+/// A builder for constructing a [`LogSegment`]. One can specify the start/end versions, etc. and
+/// then call [`LogSegmentBuilder::build_complete`] or [`LogSegmentBuilder::build_incremental`] to
+/// create a [`LogSegment`].
+///
+/// Complete log segments include all actions for current table state (used for snapshot/scan/etc.)
+/// whereas incremental log segments include all actions between two versions. End version is
+/// inclusive.
+#[internal_api]
+pub(crate) struct LogSegmentBuilder {
+    log_root: Url,
+    end_version: Option<Version>,
+}
+
+impl LogSegmentBuilder {
+    fn new(log_root: Url) -> Self {
+        LogSegmentBuilder {
+            log_root,
+            end_version: None,
+        }
+    }
+
+    /// Sets the end version for the log segment. This is optional, and if not set, the LogSegment
+    /// will LIST to determine the end version at the latest version of the table.
+    #[internal_api]
+    pub(crate) fn with_end_version_opt(mut self, end_version: Option<Version>) -> Self {
+        self.end_version = end_version;
+        self
+    }
+
+    /// Constructs a complete [`LogSegment`]. Complete is defined as a `LogSegment` which includes
+    /// _all_ actions on a table up to and including the end version. These `LogSegment`s are used
+    /// for [`Snapshot`]s, [`Scan`]s, etc.
+    ///
+    /// Specifically, for a complete `Snapshot` at version `n`:
+    /// Its `LogSegment` is made of zero or one checkpoint, and all commits between the checkpoint
+    /// up to and including the end version `n`. Note that a checkpoint may be made of multiple
+    /// parts. All these parts will have the same checkpoint version. Also note the commits may be
+    /// included as individual commit files or as part of log-compaction files.
+    ///
+    /// [`Snapshot`]: crate::snapshot::Snapshot
+    /// [`Scan`]: crate::scan::Scan
+    #[internal_api]
+    pub(crate) fn build_complete(self, storage: &dyn StorageHandler) -> DeltaResult<LogSegment> {
+        let checkpoint_hint = LastCheckpointHint::try_read(storage, &self.log_root)?;
+        self.build_complete_impl(storage, checkpoint_hint)
+    }
+
+    // factored out for testing
+    fn build_complete_impl(
+        self,
+        storage: &dyn StorageHandler,
+        last_checkpoint_hint: Option<LastCheckpointHint>,
+    ) -> DeltaResult<LogSegment> {
+        let listed_files = match (last_checkpoint_hint, self.end_version) {
+            (Some(cp), None) => {
+                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &self.log_root, None)?
+            }
+            (Some(cp), Some(end_version)) if cp.version <= end_version => {
+                ListedLogFiles::list_with_checkpoint_hint(
+                    &cp,
+                    storage,
+                    &self.log_root,
+                    Some(end_version),
+                )?
+            }
+            _ => ListedLogFiles::list(storage, &self.log_root, None, self.end_version)?,
+        };
+
+        LogSegment::try_new(listed_files, self.log_root, self.end_version)
+    }
+
+    /// Constructs a incremental [`LogSegment`]. It is 'incremental' in the sense that it does
+    /// _not_ include all actions on a table, but only the actions between two versions [start,
+    /// end].
+    ///
+    /// This `LogSegment` is made of zero checkpoints and all commits between the specified start
+    /// and end versions (both inclusive).
+    ///
+    /// If no `end_version` is specified, we will LIST to determine the most recent version.
+    /// Start version is required and is inclusive.
+    #[internal_api]
+    pub(crate) fn build_incremental(
+        self,
+        start_version: Version,
+        storage: &dyn StorageHandler,
+    ) -> DeltaResult<LogSegment> {
+        if let Some(end_version) = self.end_version {
+            if start_version > end_version {
+                return Err(Error::generic(
+                    "Failed to build LogSegment: start_version cannot be greater than end_version",
+                ));
+            }
+        }
+
+        // TODO: compactions?
+        let listed_files = ListedLogFiles::list_commits(
+            storage,
+            &self.log_root,
+            Some(start_version),
+            self.end_version,
+        )?;
+        // - Here check that the start version is correct.
+        // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
+        // - [`ListedLogFiles::list_commits`] also checks that there are no gaps between commits.
+        // If all three are satisfied, this implies that all the desired commits are present.
+        require!(
+            listed_files
+                .ascending_commit_files
+                .first()
+                .is_some_and(|first_commit| first_commit.version == start_version),
+            Error::generic(format!(
+                "Expected the first commit to have version {start_version}"
+            ))
+        );
+        LogSegment::try_new(listed_files, self.log_root, self.end_version)
+    }
+
+    #[allow(unused)]
+    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
+    /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
+    /// `limit` specifies the maximum length of the returned log segment. The log segment may be
+    /// shorter than `limit` if there are missing commits.
+    ///
+    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
+    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
+    pub(crate) fn build_for_timestamp_conversion(
+        self,
+        storage: &dyn StorageHandler,
+        limit: Option<NonZero<usize>>,
+    ) -> DeltaResult<LogSegment> {
+        let end_version = self
+            .end_version
+            .ok_or_else(|| Error::generic("end_version must be set for timestamp conversion"))?;
+
+        // Compute the version to start listing from.
+        let start_from = limit
+            .map(|limit| match NonZero::<Version>::try_from(limit) {
+                Ok(limit) => Ok(Version::saturating_sub(end_version, limit.get() - 1)),
+                _ => Err(Error::generic(format!(
+                    "Invalid limit {limit} when building log segment in timestamp conversion",
+                ))),
+            })
+            .transpose()?;
+
+        // this is a list of commits with possible gaps, we want to take the latest contiguous
+        // chunk of commits
+        let mut listed_commits =
+            ListedLogFiles::list_commits(storage, &self.log_root, start_from, Some(end_version))?;
+
+        // remove gaps - return latest contiguous chunk of commits
+        let commits = &mut listed_commits.ascending_commit_files;
+        if !commits.is_empty() {
+            let mut start_idx = commits.len() - 1;
+            while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
+            {
+                start_idx -= 1;
+            }
+            commits.drain(..start_idx);
+        }
+
+        LogSegment::try_new(listed_commits, self.log_root, Some(end_version))
+    }
+}
+
 impl LogSegment {
+    /// Constructs a new [`LogSegmentBuilder`] with the given log root URL.
+    pub(crate) fn build(log_root: Url) -> LogSegmentBuilder {
+        LogSegmentBuilder::new(log_root)
+    }
+
     #[internal_api]
     pub(crate) fn try_new(
         listed_files: ListedLogFiles,
@@ -125,125 +307,6 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
         })
-    }
-
-    /// Constructs a [`LogSegment`] to be used for [`Snapshot`]. For a `Snapshot` at version `n`:
-    /// Its LogSegment is made of zero or one checkpoint, and all commits between the checkpoint up
-    /// to and including the end version `n`. Note that a checkpoint may be made of multiple
-    /// parts. All these parts will have the same checkpoint version.
-    ///
-    /// The options for constructing a LogSegment for Snapshot are as follows:
-    /// - `checkpoint_hint`: a `LastCheckpointHint` to start the log segment from (e.g. from reading the `last_checkpoint` file).
-    /// - `time_travel_version`: The version of the log that the Snapshot will be at.
-    ///
-    /// [`Snapshot`]: crate::snapshot::Snapshot
-    #[internal_api]
-    pub(crate) fn for_snapshot(
-        storage: &dyn StorageHandler,
-        log_root: Url,
-        checkpoint_hint: impl Into<Option<LastCheckpointHint>>,
-        time_travel_version: impl Into<Option<Version>>,
-    ) -> DeltaResult<Self> {
-        let time_travel_version = time_travel_version.into();
-
-        let listed_files = match (checkpoint_hint.into(), time_travel_version) {
-            (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None)?
-            }
-            (Some(cp), Some(end_version)) if cp.version <= end_version => {
-                ListedLogFiles::list_with_checkpoint_hint(
-                    &cp,
-                    storage,
-                    &log_root,
-                    Some(end_version),
-                )?
-            }
-            _ => ListedLogFiles::list(storage, &log_root, None, time_travel_version)?,
-        };
-
-        LogSegment::try_new(listed_files, log_root, time_travel_version)
-    }
-
-    /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between versions
-    /// `start_version` and `end_version`: Its LogSegment is made of zero checkpoints and all commits
-    /// between versions `start_version` (inclusive) and `end_version` (inclusive). If no `end_version`
-    /// is specified it will be the most recent version by default.
-    #[internal_api]
-    pub(crate) fn for_table_changes(
-        storage: &dyn StorageHandler,
-        log_root: Url,
-        start_version: Version,
-        end_version: impl Into<Option<Version>>,
-    ) -> DeltaResult<Self> {
-        let end_version = end_version.into();
-        if let Some(end_version) = end_version {
-            if start_version > end_version {
-                return Err(Error::generic(
-                    "Failed to build LogSegment: start_version cannot be greater than end_version",
-                ));
-            }
-        }
-
-        // TODO: compactions?
-        let listed_files =
-            ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
-        // - Here check that the start version is correct.
-        // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
-        // - [`ListedLogFiles::list_commits`] also checks that there are no gaps between commits.
-        // If all three are satisfied, this implies that all the desired commits are present.
-        require!(
-            listed_files
-                .ascending_commit_files
-                .first()
-                .is_some_and(|first_commit| first_commit.version == start_version),
-            Error::generic(format!(
-                "Expected the first commit to have version {start_version}"
-            ))
-        );
-        LogSegment::try_new(listed_files, log_root, end_version)
-    }
-
-    #[allow(unused)]
-    /// Constructs a [`LogSegment`] to be used for timestamp conversion. This [`LogSegment`] will
-    /// consist only of contiguous commit files up to `end_version` (inclusive). If present,
-    /// `limit` specifies the maximum length of the returned log segment. The log segment may be
-    /// shorter than `limit` if there are missing commits.
-    ///
-    // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
-    // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
-    pub(crate) fn for_timestamp_conversion(
-        storage: &dyn StorageHandler,
-        log_root: Url,
-        end_version: Version,
-        limit: Option<NonZero<usize>>,
-    ) -> DeltaResult<Self> {
-        // Compute the version to start listing from.
-        let start_from = limit
-            .map(|limit| match NonZero::<Version>::try_from(limit) {
-                Ok(limit) => Ok(Version::saturating_sub(end_version, limit.get() - 1)),
-                _ => Err(Error::generic(format!(
-                    "Invalid limit {limit} when building log segment in timestamp conversion",
-                ))),
-            })
-            .transpose()?;
-
-        // this is a list of commits with possible gaps, we want to take the latest contiguous
-        // chunk of commits
-        let mut listed_commits =
-            ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
-
-        // remove gaps - return latest contiguous chunk of commits
-        let commits = &mut listed_commits.ascending_commit_files;
-        if !commits.is_empty() {
-            let mut start_idx = commits.len() - 1;
-            while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
-            {
-                start_idx -= 1;
-            }
-            commits.drain(..start_idx);
-        }
-
-        LogSegment::try_new(listed_commits, log_root, Some(end_version))
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
