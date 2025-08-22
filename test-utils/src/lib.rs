@@ -10,21 +10,35 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::object_store::local::LocalFileSystem;
-use delta_kernel::object_store::memory::InMemory;
-use delta_kernel::object_store::{path::Path, ObjectStore};
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::executor::TaskExecutor;
+use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::DefaultEngine;
 use itertools::Itertools;
+use object_store::local::LocalFileSystem;
+use object_store::memory::InMemory;
+use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec};
 use url::Url;
+
+/// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
+/// dir it was unpacked into
+pub fn load_test_data(
+    test_parent_dir: &str,
+    test_name: &str,
+) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+    let path = format!("{test_parent_dir}/{test_name}.tar.zst");
+    let tar = zstd::Decoder::new(std::fs::File::open(path)?)?;
+    let mut archive = tar::Archive::new(tar);
+    let temp_dir = tempfile::tempdir()?;
+    archive.unpack(temp_dir.path())?;
+    Ok(temp_dir)
+}
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
 pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}

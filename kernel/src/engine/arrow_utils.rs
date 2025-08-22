@@ -838,42 +838,82 @@ pub(crate) fn to_json_bytes(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
+
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
         MapArray, MapBuilder, StructArray, StructBuilder,
     };
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
-        SchemaRef as ArrowSchemaRef,
+        DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
+        Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     };
     use crate::arrow::{
         array::AsArray,
         buffer::{OffsetBuffer, ScalarBuffer},
     };
 
-    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
+    use crate::schema::{
+        ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    };
+    use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
 
-    fn nested_parquet_schema() -> ArrowSchemaRef {
-        Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "nested",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new("int32", ArrowDataType::Int32, false),
-                        ArrowField::new("string", ArrowDataType::Utf8, false),
-                    ]
-                    .into(),
-                ),
-                false,
+    fn column_mapping_cases() -> [ColumnMappingMode; 1] {
+        [ColumnMappingMode::Name]
+    }
+
+    /// Generates the logical name for a field given its id.
+    /// This is "logical-{fieldId}".
+    fn logical_name(field_id: i64) -> String {
+        format!("logical-{field_id}")
+    }
+
+    /// Generates the physical name for a field given its id.
+    /// This is "physical-{fieldId}".
+    fn physical_name(field_id: i64) -> String {
+        format!("physical-{field_id}")
+    }
+
+    /// Generates the name that should be written to parquet from the field id.
+    /// This is the physical name for Id/Name modes, and logical name for None mode.
+    fn parquet_name(field_id: i64, mode: ColumnMappingMode) -> String {
+        match mode {
+            ColumnMappingMode::Id | ColumnMappingMode::Name => physical_name(field_id),
+            ColumnMappingMode::None => logical_name(field_id),
+        }
+    }
+
+    /// Generates the column mapping metadata for a logical struct field given the field id.
+    fn column_mapping_metadata(field_id: i64) -> HashMap<String, MetadataValue> {
+        kernel_fid_and_name(field_id, physical_name(field_id))
+    }
+
+    /// Generates metadata for a parquet field with id `field_id`.
+    fn arrow_fid(field_id: i64) -> HashMap<String, String> {
+        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string())])
+    }
+
+    /// Generates appropriate column mapping metadata for a kernel struct field with column mapping
+    /// id `field_id`.
+    fn kernel_fid_and_name(field_id: i64, name: impl AsRef<str>) -> HashMap<String, MetadataValue> {
+        HashMap::from([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                field_id.into(),
             ),
-            ArrowField::new("j", ArrowDataType::Int32, false),
-        ]))
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName
+                    .as_ref()
+                    .to_string(),
+                name.as_ref().to_string().into(),
+            ),
+        ])
     }
 
     #[test]
@@ -925,26 +965,36 @@ mod tests {
 
     #[test]
     fn simple_mask_indices() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::nullable("s", DataType::STRING),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new("s", ArrowDataType::Utf8, true),
-            ArrowField::new("i2", ArrowDataType::Int32, true),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 2];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::identity(1),
-            ReorderIndex::identity(2),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0)),
+                StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(0)),
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                    .with_metadata(arrow_fid(1)),
+                ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
+                    .with_metadata(arrow_fid(2)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 2];
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::identity(1),
+                ReorderIndex::identity(2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
@@ -1092,475 +1142,662 @@ mod tests {
 
     #[test]
     fn ensure_data_types_fails_correctly() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::nullable("s", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new("s", ArrowDataType::Utf8, true),
-        ]));
-        let res = get_requested_indices(&requested_schema, &parquet_schema);
-        assert_result_error_with_message(
-            res,
-            "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
-        );
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0)),
+                StructField::nullable(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(0)),
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                    .with_metadata(arrow_fid(1)),
+            ]));
+            let res = get_requested_indices(&requested_schema, &parquet_schema);
+            assert_result_error_with_message(
+                res,
+                "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
+            );
 
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::nullable("s", DataType::STRING),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new("s", ArrowDataType::Int32, true),
-        ]));
-        let res = get_requested_indices(&requested_schema, &parquet_schema);
-        assert_result_error_with_message(
-            res,
-            "Invalid argument error: Incorrect datatype. Expected Utf8, got Int32",
-        );
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0)),
+                StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false),
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, true),
+            ]));
+            let res = get_requested_indices(&requested_schema, &parquet_schema);
+            assert_result_error_with_message(
+                res,
+                "Invalid argument error: Incorrect datatype. Expected Utf8, got Int32",
+            );
+        })
     }
 
     #[test]
     fn mask_with_map() {
-        let requested_schema = Arc::new(StructType::new([StructField::not_null(
-            "map",
-            MapType::new(DataType::INTEGER, DataType::STRING, false),
-        )]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
-            "map",
-            "entries",
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new("s", ArrowDataType::Utf8, false),
-            false,
-            false,
-        )]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1];
-        let expect_reorder = vec![ReorderIndex::identity(0)];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([StructField::not_null(
+                logical_name(0),
+                MapType::new(DataType::INTEGER, DataType::STRING, false),
+            )
+            .with_metadata(column_mapping_metadata(0))])
+            .make_physical(mode)
+            .into();
+
+            // The key and value may have field ids not present in the delta schema
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new_map(
+                parquet_name(0, mode),
+                "entries",
+                ArrowField::new("i", ArrowDataType::Int32, false),
+                ArrowField::new("s", ArrowDataType::Utf8, false),
+                false,
+                false,
+            )
+            .with_metadata(arrow_fid(1))]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1];
+            let expect_reorder = vec![ReorderIndex::identity(0)];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn simple_reorder_indices() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::nullable("s", DataType::STRING),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i2", ArrowDataType::Int32, true),
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new("s", ArrowDataType::Utf8, true),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 2];
-        let expect_reorder = vec![
-            ReorderIndex::identity(2),
-            ReorderIndex::identity(0),
-            ReorderIndex::identity(1),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0)),
+                StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
+                    .with_metadata(arrow_fid(2)),
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(0)),
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                    .with_metadata(arrow_fid(1)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 2];
+            let expect_reorder = vec![
+                ReorderIndex::identity(2),
+                ReorderIndex::identity(0),
+                ReorderIndex::identity(1),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        })
     }
 
     #[test]
     fn simple_nullable_field_missing() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::nullable("s", DataType::STRING),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new("i2", ArrowDataType::Int32, true),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::identity(2),
-            ReorderIndex::missing(1, Arc::new(ArrowField::new("s", ArrowDataType::Utf8, true))),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0)),
+                StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(0)),
+                ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
+                    .with_metadata(arrow_fid(2)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1];
+            let expected_arrow_metadata = requested_schema
+                .field(parquet_name(1, mode))
+                .unwrap()
+                .metadata_with_string_values();
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::identity(2),
+                ReorderIndex::missing(
+                    1,
+                    Arc::new(
+                        ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                            .with_metadata(expected_arrow_metadata),
+                    ),
+                ),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
+    }
+
+    fn nested_parquet_schema(mode: ColumnMappingMode) -> ArrowSchemaRef {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
+                .with_metadata(arrow_fid(1)),
+            ArrowField::new(
+                parquet_name(3, mode),
+                ArrowDataType::Struct(
+                    vec![
+                        ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
+                            .with_metadata(arrow_fid(4)),
+                        ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
+                            .with_metadata(arrow_fid(5)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+            .with_metadata(arrow_fid(3)),
+            ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, false)
+                .with_metadata(arrow_fid(2)),
+        ]))
     }
 
     #[test]
     fn nested_indices() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null(
-                "nested",
-                StructType::new([
-                    StructField::not_null("int32", DataType::INTEGER),
-                    StructField::not_null("string", DataType::STRING),
-                ]),
-            ),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = nested_parquet_schema();
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 2, 3];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::nested(
-                1,
-                vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
-            ),
-            ReorderIndex::identity(2),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(
+                    logical_name(3),
+                    StructType::new([
+                        StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4)),
+                        StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5)),
+                    ]),
+                )
+                .with_metadata(column_mapping_metadata(3)),
+                StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = nested_parquet_schema(mode);
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 2, 3];
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::nested(
+                    1,
+                    vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
+                ),
+                ReorderIndex::identity(2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
-
     #[test]
     fn nested_indices_reorder() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null(
-                "nested",
-                StructType::new([
-                    StructField::not_null("string", DataType::STRING),
-                    StructField::not_null("int32", DataType::INTEGER),
-                ]),
-            ),
-            StructField::not_null("j", DataType::INTEGER),
-            StructField::not_null("i", DataType::INTEGER),
-        ]));
-        let parquet_schema = nested_parquet_schema();
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 2, 3];
-        let expect_reorder = vec![
-            ReorderIndex::identity(2),
-            ReorderIndex::nested(
-                0,
-                vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
-            ),
-            ReorderIndex::identity(1),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(
+                    logical_name(3),
+                    StructType::new([
+                        StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5)),
+                        StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4)),
+                    ]),
+                )
+                .with_metadata(column_mapping_metadata(3)),
+                StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = nested_parquet_schema(mode);
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 2, 3];
+            let expect_reorder = vec![
+                ReorderIndex::identity(2),
+                ReorderIndex::nested(
+                    0,
+                    vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+                ),
+                ReorderIndex::identity(1),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn nested_indices_mask_inner() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null(
-                "nested",
-                StructType::new([StructField::not_null("int32", DataType::INTEGER)]),
-            ),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = nested_parquet_schema();
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 3];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::nested(1, vec![ReorderIndex::identity(0)]),
-            ReorderIndex::identity(2),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(
+                    logical_name(3),
+                    StructType::new([StructField::not_null(logical_name(4), DataType::INTEGER)
+                        .with_metadata(column_mapping_metadata(4))]),
+                )
+                .with_metadata(column_mapping_metadata(3)),
+                StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = nested_parquet_schema(mode);
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 3];
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::nested(1, vec![ReorderIndex::identity(0)]),
+                ReorderIndex::identity(2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        })
     }
 
     #[test]
     fn simple_list_mask() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null("list", ArrayType::new(DataType::INTEGER, false)),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "list",
-                ArrowDataType::List(Arc::new(ArrowField::new(
-                    "nested",
-                    ArrowDataType::Int32,
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
+                    .with_metadata(column_mapping_metadata(2)),
+                StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(1)),
+                ArrowField::new(
+                    parquet_name(2, mode),
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "nested",
+                        ArrowDataType::Int32,
+                        false,
+                    ))),
                     false,
-                ))),
-                false,
-            ),
-            ArrowField::new("j", ArrowDataType::Int32, false),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 2];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::identity(1),
-            ReorderIndex::identity(2),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+                )
+                .with_metadata(arrow_fid(2)),
+                ArrowField::new(parquet_name(3, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(3)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 2];
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::identity(1),
+                ReorderIndex::identity(2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn list_skip_earlier_element() {
-        let requested_schema = Arc::new(StructType::new([StructField::not_null(
-            "list",
-            ArrayType::new(DataType::INTEGER, false),
-        )]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "list",
-                ArrowDataType::List(Arc::new(ArrowField::new(
-                    "nested",
-                    ArrowDataType::Int32,
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([StructField::not_null(
+                logical_name(1),
+                ArrayType::new(DataType::INTEGER, false),
+            )
+            .with_metadata(column_mapping_metadata(1))])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(0)),
+                ArrowField::new(
+                    parquet_name(1, mode),
+                    ArrowDataType::List(Arc::new(
+                        ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, false)
+                            .with_metadata(arrow_fid(2)),
+                    )),
                     false,
-                ))),
-                false,
-            ),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![1];
-        let expect_reorder = vec![ReorderIndex::identity(0)];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+                )
+                .with_metadata(arrow_fid(1)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![1];
+            let expect_reorder = vec![ReorderIndex::identity(0)];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn nested_indices_list() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null(
-                "list",
-                ArrayType::new(
-                    StructType::new([
-                        StructField::not_null("int32", DataType::INTEGER),
-                        StructField::not_null("string", DataType::STRING),
-                    ])
-                    .into(),
-                    false,
-                ),
-            ),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "list",
-                ArrowDataType::List(Arc::new(ArrowField::new(
-                    "nested",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new("int32", ArrowDataType::Int32, false),
-                            ArrowField::new("string", ArrowDataType::Utf8, false),
-                        ]
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(0), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(0)),
+                StructField::not_null(
+                    logical_name(1),
+                    ArrayType::new(
+                        StructType::new([
+                            StructField::not_null(logical_name(3), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(3)),
+                            StructField::not_null(logical_name(4), DataType::STRING)
+                                .with_metadata(column_mapping_metadata(4)),
+                        ])
                         .into(),
+                        false,
                     ),
+                )
+                .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(0)),
+                ArrowField::new(
+                    parquet_name(1, mode),
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "nested",
+                        ArrowDataType::Struct(
+                            vec![
+                                ArrowField::new(parquet_name(3, mode), ArrowDataType::Int32, false)
+                                    .with_metadata(arrow_fid(3)),
+                                ArrowField::new(parquet_name(4, mode), ArrowDataType::Utf8, false)
+                                    .with_metadata(arrow_fid(4)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    ))),
                     false,
-                ))),
-                false,
-            ),
-            ArrowField::new("j", ArrowDataType::Int32, false),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 2, 3];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::nested(
-                1,
-                vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
-            ),
-            ReorderIndex::identity(2),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+                )
+                .with_metadata(arrow_fid(1)),
+                ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(2)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 2, 3];
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::nested(
+                    1,
+                    vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
+                ),
+                ReorderIndex::identity(2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn nested_indices_unselected_list() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "list",
-                ArrowDataType::List(Arc::new(ArrowField::new(
-                    "nested",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new("int32", ArrowDataType::Int32, false),
-                            ArrowField::new("string", ArrowDataType::Utf8, false),
-                        ]
-                        .into(),
-                    ),
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(1)),
+                ArrowField::new(
+                    parquet_name(2, mode),
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "nested",
+                        ArrowDataType::Struct(
+                            vec![
+                                ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
+                                    .with_metadata(arrow_fid(4)),
+                                ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
+                                    .with_metadata(arrow_fid(5)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    ))),
                     false,
-                ))),
-                false,
-            ),
-            ArrowField::new("j", ArrowDataType::Int32, false),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 3];
-        let expect_reorder = vec![ReorderIndex::identity(0), ReorderIndex::identity(1)];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+                )
+                .with_metadata(arrow_fid(2)),
+                ArrowField::new(parquet_name(3, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(3)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 3];
+            let expect_reorder = vec![ReorderIndex::identity(0), ReorderIndex::identity(1)];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn nested_indices_list_mask_inner() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null(
-                "list",
-                ArrayType::new(
-                    StructType::new([StructField::not_null("int32", DataType::INTEGER)]).into(),
-                    false,
-                ),
-            ),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "list",
-                ArrowDataType::List(Arc::new(ArrowField::new(
-                    "nested",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new("int32", ArrowDataType::Int32, false),
-                            ArrowField::new("string", ArrowDataType::Utf8, false),
-                        ]
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(
+                    logical_name(2),
+                    ArrayType::new(
+                        StructType::new([StructField::not_null(
+                            logical_name(4),
+                            DataType::INTEGER,
+                        )
+                        .with_metadata(column_mapping_metadata(4))])
                         .into(),
+                        false,
                     ),
+                )
+                .with_metadata(column_mapping_metadata(2)),
+                StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(1)),
+                ArrowField::new(
+                    parquet_name(2, mode),
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "nested",
+                        ArrowDataType::Struct(
+                            vec![
+                                ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
+                                    .with_metadata(arrow_fid(4)),
+                                ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
+                                    .with_metadata(arrow_fid(5)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    ))),
                     false,
-                ))),
-                false,
-            ),
-            ArrowField::new("j", ArrowDataType::Int32, false),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 1, 3];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::nested(1, vec![ReorderIndex::identity(0)]),
-            ReorderIndex::identity(2),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+                )
+                .with_metadata(arrow_fid(2)),
+                ArrowField::new(parquet_name(3, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(3)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 1, 3];
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::nested(1, vec![ReorderIndex::identity(0)]),
+                ReorderIndex::identity(2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn nested_indices_list_mask_inner_reorder() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null(
-                "list",
-                ArrayType::new(
-                    StructType::new([
-                        StructField::not_null("string", DataType::STRING),
-                        StructField::not_null("int2", DataType::INTEGER),
-                    ])
-                    .into(),
-                    false,
-                ),
-            ),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", ArrowDataType::Int32, false), // field 0
-            ArrowField::new(
-                "list",
-                ArrowDataType::List(Arc::new(ArrowField::new(
-                    "nested",
-                    ArrowDataType::Struct(
-                        vec![
-                            ArrowField::new("int1", ArrowDataType::Int32, false), // field 1
-                            ArrowField::new("int2", ArrowDataType::Int32, false), // field 2
-                            ArrowField::new("string", ArrowDataType::Utf8, false), // field 3
-                        ]
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(
+                    logical_name(2),
+                    ArrayType::new(
+                        StructType::new([
+                            StructField::not_null(logical_name(6), DataType::STRING)
+                                .with_metadata(column_mapping_metadata(6)),
+                            StructField::not_null(logical_name(5), DataType::INTEGER)
+                                .with_metadata(column_mapping_metadata(5)),
+                        ])
                         .into(),
+                        false,
                     ),
+                )
+                .with_metadata(column_mapping_metadata(2)),
+                StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(1)),
+                ArrowField::new(
+                    parquet_name(2, mode),
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "nested",
+                        ArrowDataType::Struct(
+                            vec![
+                                ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
+                                    .with_metadata(arrow_fid(4)),
+                                ArrowField::new(parquet_name(5, mode), ArrowDataType::Int32, false)
+                                    .with_metadata(arrow_fid(5)),
+                                ArrowField::new(parquet_name(6, mode), ArrowDataType::Utf8, false)
+                                    .with_metadata(arrow_fid(6)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    ))),
                     false,
-                ))),
-                false,
-            ),
-            ArrowField::new("j", ArrowDataType::Int32, false), // field 4
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![0, 2, 3, 4];
-        let expect_reorder = vec![
-            ReorderIndex::identity(0),
-            ReorderIndex::nested(
-                1,
-                vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
-            ),
-            ReorderIndex::identity(2),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+                )
+                .with_metadata(arrow_fid(2)),
+                ArrowField::new(parquet_name(3, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(3)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![0, 2, 3, 4];
+            let expect_reorder = vec![
+                ReorderIndex::identity(0),
+                ReorderIndex::nested(
+                    1,
+                    vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
+                ),
+                ReorderIndex::identity(2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
     fn skipped_struct() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::not_null("i", DataType::INTEGER),
-            StructField::not_null(
-                "nested",
-                StructType::new([
-                    StructField::not_null("int32", DataType::INTEGER),
-                    StructField::not_null("string", DataType::STRING),
-                ]),
-            ),
-            StructField::not_null("j", DataType::INTEGER),
-        ]));
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new(
-                "skipped",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new("int32", ArrowDataType::Int32, false),
-                        ArrowField::new("string", ArrowDataType::Utf8, false),
-                    ]
-                    .into(),
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::not_null(logical_name(1), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::not_null(
+                    logical_name(2),
+                    StructType::new([
+                        StructField::not_null(logical_name(4), DataType::INTEGER)
+                            .with_metadata(column_mapping_metadata(4)),
+                        StructField::not_null(logical_name(5), DataType::STRING)
+                            .with_metadata(column_mapping_metadata(5)),
+                    ]),
+                )
+                .with_metadata(column_mapping_metadata(2)),
+                StructField::not_null(logical_name(3), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(3)),
+            ])
+            .make_physical(mode)
+            .into();
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new(
+                    "skipped",
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new(parquet_name(7, mode), ArrowDataType::Int32, false)
+                                .with_metadata(arrow_fid(7)),
+                            ArrowField::new(parquet_name(8, mode), ArrowDataType::Utf8, false)
+                                .with_metadata(arrow_fid(8)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )
+                .with_metadata(arrow_fid(6)),
+                ArrowField::new(parquet_name(3, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(3)),
+                ArrowField::new(
+                    parquet_name(2, mode),
+                    ArrowDataType::Struct(
+                        vec![
+                            ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
+                                .with_metadata(arrow_fid(4)),
+                            ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
+                                .with_metadata(arrow_fid(5)),
+                        ]
+                        .into(),
+                    ),
+                    false,
+                )
+                .with_metadata(arrow_fid(2)),
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::Int32, false)
+                    .with_metadata(arrow_fid(1)),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask = vec![2, 3, 4, 5];
+            let expect_reorder = vec![
+                ReorderIndex::identity(2),
+                ReorderIndex::nested(
+                    1,
+                    vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
                 ),
-                false,
-            ),
-            ArrowField::new("j", ArrowDataType::Int32, false),
-            ArrowField::new(
-                "nested",
-                ArrowDataType::Struct(
-                    vec![
-                        ArrowField::new("int32", ArrowDataType::Int32, false),
-                        ArrowField::new("string", ArrowDataType::Utf8, false),
-                    ]
-                    .into(),
-                ),
-                false,
-            ),
-            ArrowField::new("i", ArrowDataType::Int32, false),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask = vec![2, 3, 4, 5];
-        let expect_reorder = vec![
-            ReorderIndex::identity(2),
-            ReorderIndex::nested(
-                1,
-                vec![ReorderIndex::identity(0), ReorderIndex::identity(1)],
-            ),
-            ReorderIndex::identity(0),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+                ReorderIndex::identity(0),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
@@ -1660,7 +1897,7 @@ mod tests {
     fn nested_reorder_struct() {
         let arry1 = Arc::new(make_struct_array());
         let arry2 = Arc::new(make_struct_array());
-        let fields: Fields = vec![
+        let fields: ArrowFields = vec![
             Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
             Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
         ]
@@ -1732,7 +1969,7 @@ mod tests {
             Arc::new(list_sa),
             None,
         ));
-        let fields: Fields = vec![
+        let fields: ArrowFields = vec![
             Arc::new(ArrowField::new("b", ArrowDataType::Boolean, false)),
             Arc::new(ArrowField::new("c", ArrowDataType::Int32, false)),
         ]
@@ -1759,14 +1996,14 @@ mod tests {
     // boy howdy this is more complicated than expected
     fn build_arrow_map() -> MapArray {
         let key_struct_builder = StructBuilder::from_fields(
-            Fields::from(vec![
+            ArrowFields::from(vec![
                 ArrowField::new("k1", ArrowDataType::Int32, false),
                 ArrowField::new("k2", ArrowDataType::Int32, false),
             ]),
             1,
         );
         let value_struct_builder = StructBuilder::from_fields(
-            Fields::from(vec![
+            ArrowFields::from(vec![
                 ArrowField::new("v1", ArrowDataType::Int32, false),
                 ArrowField::new("v2", ArrowDataType::Int32, false),
             ]),
@@ -1838,25 +2075,46 @@ mod tests {
 
     #[test]
     fn no_matches() {
-        let requested_schema = Arc::new(StructType::new([
-            StructField::nullable("s", DataType::STRING),
-            StructField::nullable("i2", DataType::INTEGER),
-        ]));
-        let nots_field = ArrowField::new("NOTs", ArrowDataType::Utf8, true);
-        let noti2_field = ArrowField::new("NOTi2", ArrowDataType::Int32, true);
-        let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            nots_field.clone(),
-            noti2_field.clone(),
-        ]));
-        let (mask_indices, reorder_indices) =
-            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
-        let expect_mask: Vec<usize> = vec![];
-        let expect_reorder = vec![
-            ReorderIndex::missing(0, nots_field.with_name("s").into()),
-            ReorderIndex::missing(1, noti2_field.with_name("i2").into()),
-        ];
-        assert_eq!(mask_indices, expect_mask);
-        assert_eq!(reorder_indices, expect_reorder);
+        column_mapping_cases().into_iter().for_each(|mode| {
+            let requested_schema = StructType::new([
+                StructField::nullable(logical_name(1), DataType::STRING)
+                    .with_metadata(column_mapping_metadata(1)),
+                StructField::nullable(logical_name(2), DataType::INTEGER)
+                    .with_metadata(column_mapping_metadata(2)),
+            ])
+            .make_physical(mode)
+            .into();
+            let nots_field =
+                ArrowField::new("NOTs", ArrowDataType::Utf8, true).with_metadata(arrow_fid(3));
+            let noti2_field =
+                ArrowField::new("NOTi2", ArrowDataType::Int32, true).with_metadata(arrow_fid(4));
+            let parquet_schema = Arc::new(ArrowSchema::new(vec![
+                nots_field.clone(),
+                noti2_field.clone(),
+            ]));
+            let (mask_indices, reorder_indices) =
+                get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+            let expect_mask: Vec<usize> = vec![];
+
+            // Build expected arrow fields
+            let mut fields = requested_schema.fields();
+            let metadata1 = fields.next().unwrap().metadata_with_string_values();
+            let metadata2 = fields.next().unwrap().metadata_with_string_values();
+            let expected_field1 = ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                .with_metadata(metadata1)
+                .into();
+            let expected_field2 =
+                ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
+                    .with_metadata(metadata2)
+                    .into();
+
+            let expect_reorder = vec![
+                ReorderIndex::missing(0, expected_field1),
+                ReorderIndex::missing(1, expected_field2),
+            ];
+            assert_eq!(mask_indices, expect_mask);
+            assert_eq!(reorder_indices, expect_reorder);
+        });
     }
 
     #[test]
@@ -1897,17 +2155,17 @@ mod tests {
 
     #[test]
     fn test_arrow_broken_nested_null_masks() {
-        use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+        use crate::arrow::datatypes::{DataType, Field, Schema};
         use crate::engine::arrow_utils::fix_nested_null_masks;
         use crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
         // Parse some JSON into a nested schema
         let schema = Arc::new(Schema::new(vec![Field::new(
             "outer",
-            DataType::Struct(Fields::from(vec![
+            DataType::Struct(ArrowFields::from(vec![
                 Field::new(
                     "inner_nullable",
-                    DataType::Struct(Fields::from(vec![
+                    DataType::Struct(ArrowFields::from(vec![
                         Field::new("leaf_non_null", DataType::Int32, false),
                         Field::new("leaf_nullable", DataType::Int32, true),
                     ])),
@@ -1915,7 +2173,7 @@ mod tests {
                 ),
                 Field::new(
                     "inner_non_null",
-                    DataType::Struct(Fields::from(vec![
+                    DataType::Struct(ArrowFields::from(vec![
                         Field::new("leaf_non_null", DataType::Int32, false),
                         Field::new("leaf_nullable", DataType::Int32, true),
                     ])),

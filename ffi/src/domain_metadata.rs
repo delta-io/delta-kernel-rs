@@ -48,8 +48,8 @@ mod tests {
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
-    use delta_kernel::object_store::memory::InMemory;
     use delta_kernel::DeltaResult;
+    use object_store::memory::InMemory;
     use serde_json::json;
     use std::sync::Arc;
     use test_utils::add_commit;

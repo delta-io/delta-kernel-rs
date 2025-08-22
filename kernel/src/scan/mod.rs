@@ -16,10 +16,11 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
+use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ListedLogFiles, LogSegment};
+use crate::log_segment::LogSegment;
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::ToSchema as _;
 use crate::schema::{
@@ -333,7 +334,7 @@ pub fn get_transform_for_row(
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// `Transform`.
 pub(crate) enum TransformExpr {
-    Static(Expression),
+    Static(ExpressionRef),
     Partition(usize),
 }
 
@@ -434,7 +435,7 @@ impl Scan {
         &self.physical_schema
     }
 
-    /// Get the predicate [`Expression`] of the scan.
+    /// Get the predicate [`PredicateRef`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
         if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
             Some(predicate.clone())
@@ -451,7 +452,7 @@ impl Scan {
             .iter()
             .map(|field| match field {
                 ColumnType::Selected(col_name) => {
-                    TransformExpr::Static(ColumnName::new([col_name]).into())
+                    TransformExpr::Static(Arc::new(ColumnName::new([col_name]).into()))
                 }
                 ColumnType::Partition(idx) => TransformExpr::Partition(*idx),
             })

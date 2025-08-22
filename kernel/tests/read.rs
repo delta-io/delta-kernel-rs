@@ -10,13 +10,13 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
-use delta_kernel::object_store::{memory::InMemory, path::Path, ObjectStore};
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
+use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,
@@ -26,7 +26,7 @@ use url::Url;
 mod common;
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use test_utils::{read_scan, to_arrow};
+use test_utils::{load_test_data, read_scan, to_arrow};
 
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
@@ -947,7 +947,7 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
-    let empty_struct = Expr::struct_from(vec![]);
+    let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
     let cases = vec![
         (Pred::literal(false), table_for_numbers(vec![])),
         (
@@ -1318,7 +1318,7 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
         "+----+-----+---+----------------------+",
     ];
     let test_name = "timestamp-partitioned-table";
-    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }
@@ -1337,7 +1337,7 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
         "+----+--------------------+",
     ];
     let test_name = "compacted-log-files-table";
-    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }
@@ -1346,7 +1346,7 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
 fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = include!("data/unshredded-variant.expected.in");
     let test_name = "unshredded-variant";
-    let test_dir = common::load_test_data("./tests/data", test_name).unwrap();
+    let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
 }

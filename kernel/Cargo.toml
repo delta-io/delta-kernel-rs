@@ -41,10 +41,10 @@ pre-release-hook = [
 [dependencies]
 delta_kernel_derive = { path = "../derive-macros", version = "0.14.0" }
 bytes = "1.10"
-chrono = "0.4.40"
-indexmap = "2.9.0"
+chrono = "0.4.41"
+indexmap = "2.10.0"
 itertools = "0.14"
-roaring = "0.10.12"
+roaring = "0.11.2"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 strum = { version = "0.27", features = ["derive"] }
@@ -52,32 +52,17 @@ thiserror = "2"
 # only for structured logging
 tracing = { version = "0.1", features = ["log"] }
 url = "2"
-uuid = { version = "1.16.0", features = ["v4", "fast-rng"] }
+uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
 
 # optional deps
 futures = { version = "0.3", optional = true }
 # Used for fetching direct urls (like pre-signed urls)
-reqwest = { version = "0.12.15", default-features = false, optional = true }
+reqwest = { version = "0.12.23", default-features = false, optional = true }
 # optionally used with default engine (though not required)
-tokio = { version = "1.44", optional = true, features = ["rt-multi-thread"] }
-
-# arrow 54
-[dependencies.arrow_54]
-package = "arrow"
-version = "54.3"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
-optional = true
-[dependencies.parquet_54]
-package = "parquet"
-version = "54.3"
-features = ["async", "object_store"]
-optional = true
-[dependencies.object_store_54]
-package = "object_store"
-version = "0.11"
-features = ["aws", "azure", "gcp", "http"]
-optional = true
+tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
+# both arrow versions below are optional and require object_store
+object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
 
 # arrow 55
 [dependencies.arrow_55]
@@ -90,10 +75,17 @@ package = "parquet"
 version = "55"
 features = ["async", "object_store"]
 optional = true
-[dependencies.object_store_55]
-package = "object_store"
-version = "0.12.3"
-features = ["aws", "azure", "gcp", "http"]
+
+# arrow 56
+[dependencies.arrow_56]
+package = "arrow"
+version = "56"
+features = ["chrono-tz", "ffi", "json", "prettyprint"]
+optional = true
+[dependencies.parquet_56]
+package = "parquet"
+version = "56"
+features = ["async", "object_store"]
 optional = true
 
 [features]
@@ -105,12 +97,17 @@ internal-api = []
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-55"] # latest arrow version
+arrow = ["arrow-56"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
-arrow-54 = ["dep:arrow_54", "dep:parquet_54", "dep:object_store_54"]
-arrow-55 = ["dep:arrow_55", "dep:parquet_55", "dep:object_store_55"]
+
+arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store"]
+arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
+
+# WARNING: experimental feature, still under active development
+# enables new experimental catalog-managed tables support
+catalog-managed = []
 
 # this is an 'internal' feature flag which has all the shared bits from default-engine and
 # default-engine-rustls
@@ -134,19 +131,22 @@ default-engine-rustls = [
 rustc_version = "0.4.1"
 
 [dev-dependencies]
-delta_kernel = { path = ".", features = ["arrow", "default-engine-rustls", "internal-api"] }
+delta_kernel = { path = ".", features = ["arrow", "catalog-managed", "default-engine-rustls", "internal-api"] }
 test_utils = { path = "../test-utils" }
+criterion = "0.5"
 # Used for testing parse_url_opts extensibility
-hdfs-native-object-store = { version = "0.14.0" }
-hdfs-native = "0.11.1"
+hdfs-native-object-store = { version = "0.15.0" }
+hdfs-native = "0.12.2"
 walkdir = { version = "2.5.0" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
-tar = "0.4"
-zstd = "0.13"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
+
+[[bench]]
+name = "metadata_bench"
+harness = false

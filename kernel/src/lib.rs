@@ -99,7 +99,7 @@ pub mod table_properties;
 pub mod transaction;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-54", feature = "arrow-55"))]
+#[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
 pub use arrow_compat::*;
 
 pub mod kernel_predicates;
@@ -126,6 +126,13 @@ pub(crate) mod log_replay;
 pub mod log_segment;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod log_segment;
+
+#[cfg(feature = "internal-api")]
+pub mod last_checkpoint_hint;
+#[cfg(not(feature = "internal-api"))]
+pub(crate) mod last_checkpoint_hint;
+
+pub(crate) mod listed_log_files;
 
 #[cfg(feature = "internal-api")]
 pub mod history_manager;
@@ -204,15 +211,10 @@ impl TryFrom<DirEntry> for FileMeta {
                 last_modified.as_millis()
             ))
         })?;
-        let metadata_len = metadata.len();
-        #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
-        let metadata_len = metadata_len
-            .try_into()
-            .map_err(|_| Error::generic("unable to convert DirEntry metadata to file size"))?;
         Ok(FileMeta {
             location,
             last_modified,
-            size: metadata_len,
+            size: metadata.len(),
         })
     }
 }

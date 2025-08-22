@@ -77,7 +77,7 @@
 //! in the future, we can revisit this decision.
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
-//! [`LastCheckpointHint`]: crate::snapshot::LastCheckpointHint
+//! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
@@ -90,10 +90,11 @@ use crate::actions::{
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
+use crate::last_checkpoint_hint::LAST_CHECKPOINT_FILE_NAME;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::snapshot::{Snapshot, LAST_CHECKPOINT_FILE_NAME};
+use crate::snapshot::Snapshot;
 use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};

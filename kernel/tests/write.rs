@@ -17,13 +17,13 @@ use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 
-use delta_kernel::object_store::path::Path;
-use delta_kernel::object_store::ObjectStore;
 use delta_kernel::transaction::CommitResult;
 
 use test_utils::set_json_value;
 
 use itertools::Itertools;
+use object_store::path::Path;
+use object_store::ObjectStore;
 use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
