@@ -18,10 +18,10 @@ use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate, Predicate, Scalar,
-    UnaryPredicate, UnaryPredicateOp,
+    ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate, 
+    Predicate, Scalar, Transform, UnaryPredicate, UnaryPredicateOp,
 };
-use crate::schema::DataType;
+use crate::schema::{DataType, StructType};
 use itertools::Itertools;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -77,6 +77,97 @@ fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> Delt
     }
 }
 
+/// Evaluates a struct expression with given field expressions and output schema
+fn evaluate_struct_expression(
+    fields: &[ExpressionRef],
+    batch: &RecordBatch,
+    output_schema: &StructType,
+) -> DeltaResult<ArrayRef> {
+    let columns = fields
+        .iter()
+        .zip(output_schema.fields())
+        .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())));
+    let output_cols: Vec<ArrayRef> = columns.try_collect()?;
+    let output_fields: Vec<ArrowField> = output_cols
+        .iter()
+        .zip(output_schema.fields())
+        // This code is infallible: ArrowField::new does not return a Result and cannot fail,
+        // so the closure cannot actually produce an Err. Therefore, we can use .map instead of .try_collect.
+        .map(|(output_col, output_field)| {
+            ArrowField::new(
+                output_field.name(),
+                output_col.data_type().clone(),
+                output_col.is_nullable(),
+            )
+        })
+        .collect();
+    Ok(Arc::new(StructArray::try_new(output_fields.into(), output_cols, None)?))
+}
+
+/// Evaluates a transform expression by co-recursing through the output schema
+fn evaluate_transform_expression(
+    transform: &Transform,
+    batch: &RecordBatch,
+    output_schema: &StructType,
+) -> DeltaResult<ArrayRef> {
+    // Fail-fast validation: check that all field replacements reference valid output schema fields
+    for field_name in transform.field_replacements.keys() {
+        if !output_schema.field_names().contains(&field_name.as_str()) {
+            return Err(Error::generic(format!(
+                "Transform references invalid field '{}' not present in output schema", 
+                field_name
+            )));
+        }
+    }
+    
+    let mut output_expressions = Vec::new();
+    
+    // Process each field in the output schema in order
+    for field in output_schema.fields() {
+        let field_name = field.name();
+        
+        // Handle insertions before this field (only if field is not dropped)
+        let field_is_dropped = matches!(
+            transform.field_replacements.get(field_name), 
+            Some(None)
+        );
+        
+        if !field_is_dropped {
+            if let Some(insertion_exprs) = transform.field_insertions.get(&Some(field_name.to_string())) {
+                for expr in insertion_exprs {
+                    output_expressions.push(expr.clone());
+                }
+            }
+        }
+        
+        // Handle the field itself based on replacement rules
+        match transform.field_replacements.get(field_name) {
+            Some(Some(replacement_expr)) => {
+                // Field is replaced with this expression
+                output_expressions.push(replacement_expr.clone());
+            }
+            Some(None) => {
+                // Field is dropped - skip it
+                continue;
+            }
+            None => {
+                // Field passes through unchanged - create column reference
+                output_expressions.push(Arc::new(Expression::column([field_name])));
+            }
+        }
+    }
+    
+    // Handle insertions at the end of the struct  
+    if let Some(end_insertions) = transform.field_insertions.get(&None) {
+        for expr in end_insertions {
+            output_expressions.push(expr.clone());
+        }
+    }
+    
+    // Evaluate the resulting struct expression using the helper
+    evaluate_struct_expression(&output_expressions, batch, output_schema)
+}
+
 /// Evaluates a kernel expression over a record batch
 pub fn evaluate_expression(
     expression: &Expression,
@@ -89,27 +180,16 @@ pub fn evaluate_expression(
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
-            let columns = fields
-                .iter()
-                .zip(output_schema.fields())
-                .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())));
-            let output_cols: Vec<ArrayRef> = columns.try_collect()?;
-            let output_fields: Vec<ArrowField> = output_cols
-                .iter()
-                .zip(output_schema.fields())
-                .map(|(output_col, output_field)| -> DeltaResult<_> {
-                    Ok(ArrowField::new(
-                        output_field.name(),
-                        output_col.data_type().clone(),
-                        output_col.is_nullable(),
-                    ))
-                })
-                .try_collect()?;
-            let result = StructArray::try_new(output_fields.into(), output_cols, None)?;
-            Ok(Arc::new(result))
+            evaluate_struct_expression(fields, batch, output_schema)
         }
         (Struct(_), _) => Err(Error::generic(
             "Data type is required to evaluate struct expressions",
+        )),
+        (Transform(transform), Some(DataType::Struct(output_schema))) => {
+            evaluate_transform_expression(transform, batch, output_schema)
+        }
+        (Transform(_), _) => Err(Error::generic(
+            "Data type is required to evaluate transform expressions",
         )),
         (Predicate(pred), None | Some(&DataType::BOOLEAN)) => {
             let result = evaluate_predicate(pred, batch, false)?;
