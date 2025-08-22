@@ -18,7 +18,7 @@ use crate::engine::arrow_utils::prim_array_cmp;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
-    ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate, 
+    ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
     Predicate, Scalar, Transform, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::{DataType, StructType};
@@ -101,7 +101,11 @@ fn evaluate_struct_expression(
             )
         })
         .collect();
-    Ok(Arc::new(StructArray::try_new(output_fields.into(), output_cols, None)?))
+    Ok(Arc::new(StructArray::try_new(
+        output_fields.into(),
+        output_cols,
+        None,
+    )?))
 }
 
 /// Evaluates a transform expression by building expressions in input schema order
@@ -114,17 +118,17 @@ fn evaluate_transform_expression(
     let input_schema = batch.schema();
     let mut expressions = Vec::new();
     let mut used_insertion_keys = std::collections::HashSet::new();
-    
+
     // Handle prepends (insertions before any field)
     if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
-        expressions.extend(prepend_exprs.iter().cloned()); // cheap Arc clone 
+        expressions.extend(prepend_exprs.iter().cloned()); // cheap Arc clone
         used_insertion_keys.insert(None);
     }
-    
+
     // Process each input field in order
     for input_field in input_schema.fields() {
         let field_name = input_field.name();
-        
+
         // Handle the field based on replacement rules
         match transform.field_replacements.get(field_name) {
             Some(Some(replacement_expr)) => {
@@ -139,29 +143,34 @@ fn evaluate_transform_expression(
                 expressions.push(Arc::new(Expression::column([field_name])));
             }
         }
-        
+
         // Handle insertions after this input field
-        if let Some(insertion_exprs) = transform.field_insertions.get(&Some(field_name.to_string())) {
+        if let Some(insertion_exprs) = transform
+            .field_insertions
+            .get(&Some(field_name.to_string()))
+        {
             expressions.extend(insertion_exprs.iter().cloned()); // cheap Arc clone
             used_insertion_keys.insert(Some(field_name.to_string()));
         }
     }
-    
+
     // Validate all insertion keys were used (fail-fast validation)
     if used_insertion_keys.len() != transform.field_insertions.len() {
-        return Err(Error::generic("Some insertion keys don't reference valid input field names"));
+        return Err(Error::generic(
+            "Some insertion keys don't reference valid input field names",
+        ));
     }
-    
+
     // Validate expression count matches output schema
     if expressions.len() != output_schema.fields_len() {
         return Err(Error::generic(format!(
             "Expression count ({}) doesn't match output schema field count ({})",
-            expressions.len(), 
+            expressions.len(),
             output_schema.fields_len()
         )));
     }
-    
-    // Delegate to struct evaluation logic  
+
+    // Delegate to struct evaluation logic
     evaluate_struct_expression(&expressions, batch, output_schema)
 }
 
