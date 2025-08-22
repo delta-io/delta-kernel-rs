@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::{Arc, LazyLock};
 
@@ -14,11 +13,14 @@ use crate::expressions::{
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
 };
-use crate::schema::{DataType, PrimitiveType, SchemaRef, SchemaTransform, StructField, StructType};
+use crate::schema::{DataType, SchemaRef, SchemaTransform, StructField, StructType};
 use crate::{
     Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
 };
 
+pub(crate) use stats_schema::stats_schema;
+
+mod stats_schema;
 #[cfg(test)]
 mod tests;
 
@@ -76,42 +78,11 @@ impl DataSkippingFilter {
 
         // Convert all fields into nullable, as stats may not be available for all columns
         // (and usually aren't for partition columns).
-        struct NullableStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-            fn transform_struct_field(
-                &mut self,
-                field: &'a StructField,
-            ) -> Option<Cow<'a, StructField>> {
-                use Cow::*;
-                let field = match self.transform(&field.data_type)? {
-                    Borrowed(_) if field.is_nullable() => Borrowed(field),
-                    data_type => Owned(StructField {
-                        name: field.name.clone(),
-                        data_type: data_type.into_owned(),
-                        nullable: true,
-                        metadata: field.metadata.clone(),
-                    }),
-                };
-                Some(field)
-            }
-        }
-
-        // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
-        struct NullCountStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
-            fn transform_primitive(
-                &mut self,
-                _ptype: &'a PrimitiveType,
-            ) -> Option<Cow<'a, PrimitiveType>> {
-                Some(Cow::Owned(PrimitiveType::Long))
-            }
-        }
-
-        let stats_schema = NullableStatsTransform
+        let stats_schema = stats_schema::NullableStatsTransform
             .transform_struct(&referenced_schema)?
             .into_owned();
 
-        let nullcount_schema = NullCountStatsTransform
+        let nullcount_schema = stats_schema::NullCountStatsTransform
             .transform_struct(&stats_schema)?
             .into_owned();
         let stats_schema = Arc::new(StructType::new([
