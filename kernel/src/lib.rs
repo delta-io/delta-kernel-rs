@@ -445,13 +445,33 @@ pub trait EvaluationHandler: AsAny {
     fn null_row(&self, output_schema: SchemaRef) -> DeltaResult<Box<dyn EngineData>>;
 
     /// Concatenate two [`EngineData`] column-wise into a single one.
+    ///
+    /// It is the caller's responsibility to ensure that both [`EngineData`] are ordered in a way
+    /// that makes sense to concatenate them column-wise (i.e., row _N_ in the left data should
+    /// logically correspond to row _N_ in the right data). This function only validates that the
+    /// row counts match; it does not perform any row alignment or ordering checks.
+    ///
+    /// # Parameters
+    ///
+    /// - `left`: The left [`EngineData`] whose columns will appear first in the result
+    /// - `right`: The right [`EngineData`] whose columns will be appended after the left columns
     fn columnar_concat(
         &self,
         left: &dyn EngineData,
         right: &dyn EngineData,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    // Convert StructData created by Kernel into EngineData
+    /// Convert kernel [`ArrayData`] columns into [`EngineData`].
+    ///
+    /// This function takes a collection of [`ArrayData`] objects (representing individual columns)
+    /// and combines them into a single [`EngineData`] object according to the provided schema.
+    /// Each [`ArrayData`] in the `columns` vector represents one column of data, and the order
+    /// of columns in the vector should match the field order in the schema.
+    ///
+    /// # Parameters
+    ///
+    /// - `schema`: The schema describing the structure and types of the resulting [`EngineData`]
+    /// - `columns`: A vector of [`ArrayData`] objects, one per column, in schema field order
     fn convert_to_engine_data(
         &self,
         schema: SchemaRef,
