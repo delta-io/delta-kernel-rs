@@ -1087,23 +1087,22 @@ mod tests {
         assert_eq!(scalar.data_type(), DataType::from(expected_map_type));
 
         // Extract the MapData and verify contents
-        if let Scalar::Map(map_data) = scalar {
-            let pairs = map_data.pairs();
-            assert_eq!(pairs.len(), 2);
-
-            // Check that both expected pairs are present
-            let has_key1 = pairs.iter().any(|(k, v)| {
-                matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
-            });
-            let has_key2 = pairs.iter().any(|(k, v)| {
-                matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Integer(100))
-            });
-
-            assert!(has_key1, "Missing key1 -> 42 pair");
-            assert!(has_key2, "Missing key2 -> 100 pair");
-        } else {
+        let Scalar::Map(map_data) = scalar else {
             panic!("Expected Map scalar");
-        }
+        };
+        let pairs = map_data.pairs();
+        assert_eq!(pairs.len(), 2);
+        assert!(!map_data.map_type().value_contains_null());
+
+        // Check that both expected pairs are present
+        let has_key1 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
+        });
+        let has_key2 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Integer(100))
+        });
+        assert!(has_key1, "Missing key1 -> 42 pair");
+        assert!(has_key2, "Missing key2 -> 100 pair");
 
         Ok(())
     }
@@ -1127,30 +1126,26 @@ mod tests {
         assert_eq!(scalar.data_type(), DataType::from(expected_map_type));
 
         // Extract the MapData and verify contents
-        if let Scalar::Map(map_data) = scalar {
-            let pairs = map_data.pairs();
-            assert_eq!(pairs.len(), 3);
-
-            // Check that all expected pairs are present
-            let has_key1 = pairs.iter().any(|(k, v)| {
-                matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
-            });
-            let has_key2 = pairs.iter().any(|(k, v)| {
-                matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Null(_))
-            });
-            let has_key3 = pairs.iter().any(|(k, v)| {
-                matches!(k, Scalar::String(s) if s == "key3") && matches!(v, Scalar::Integer(100))
-            });
-
-            assert!(has_key1, "Missing key1 -> 42 pair");
-            assert!(has_key2, "Missing key2 -> null pair");
-            assert!(has_key3, "Missing key3 -> 100 pair");
-
-            // Verify the map type allows null values
-            assert!(map_data.map_type().value_contains_null());
-        } else {
+        let Scalar::Map(map_data) = scalar else {
             panic!("Expected Map scalar");
-        }
+        };
+        let pairs = map_data.pairs();
+        assert_eq!(pairs.len(), 3);
+        assert!(map_data.map_type().value_contains_null());
+
+        // Check that all expected pairs are present
+        let has_key1 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
+        });
+        let has_key2 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Null(_))
+        });
+        let has_key3 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key3") && matches!(v, Scalar::Integer(100))
+        });
+        assert!(has_key1, "Missing key1 -> 42 pair");
+        assert!(has_key2, "Missing key2 -> null pair");
+        assert!(has_key3, "Missing key3 -> 100 pair");
 
         Ok(())
     }
@@ -1171,21 +1166,18 @@ mod tests {
         assert_eq!(scalar.data_type(), DataType::from(expected_array_type));
 
         // Extract the ArrayData and verify contents
-        if let Scalar::Array(array_data) = scalar {
-            #[allow(deprecated)]
-            let elements = array_data.array_elements();
-            assert_eq!(elements.len(), 3);
-
-            // Check that all expected values are present
-            assert!(matches!(elements[0], Scalar::Integer(42)));
-            assert!(matches!(elements[1], Scalar::Integer(100)));
-            assert!(matches!(elements[2], Scalar::Integer(200)));
-
-            // Verify the array type doesn't allow null values
-            assert!(!array_data.array_type().contains_null());
-        } else {
+        let Scalar::Array(array_data) = scalar else {
             panic!("Expected Array scalar");
-        }
+        };
+        #[allow(deprecated)]
+        let elements = array_data.array_elements();
+        assert_eq!(elements.len(), 3);
+        assert!(!array_data.array_type().contains_null());
+
+        // Check that all expected values are present
+        assert!(matches!(elements[0], Scalar::Integer(42)));
+        assert!(matches!(elements[1], Scalar::Integer(100)));
+        assert!(matches!(elements[2], Scalar::Integer(200)));
 
         Ok(())
     }
@@ -1206,21 +1198,19 @@ mod tests {
         assert_eq!(scalar.data_type(), DataType::from(expected_array_type));
 
         // Extract the ArrayData and verify contents
-        if let Scalar::Array(array_data) = scalar {
-            #[allow(deprecated)]
-            let elements = array_data.array_elements();
-            assert_eq!(elements.len(), 3);
-
-            // Check that all expected values are present
-            assert!(matches!(elements[0], Scalar::Integer(42)));
-            assert!(matches!(elements[1], Scalar::Null(_)));
-            assert!(matches!(elements[2], Scalar::Integer(100)));
-
-            // Verify the array type allows null values
-            assert!(array_data.array_type().contains_null());
-        } else {
+        let Scalar::Array(array_data) = scalar else {
             panic!("Expected Array scalar");
-        }
+        };
+
+        #[allow(deprecated)]
+        let elements = array_data.array_elements();
+        assert_eq!(elements.len(), 3);
+        assert!(array_data.array_type().contains_null());
+
+        // Check that all expected values are present
+        assert!(matches!(elements[0], Scalar::Integer(42)));
+        assert!(matches!(elements[1], Scalar::Null(_)));
+        assert!(matches!(elements[2], Scalar::Integer(100)));
 
         Ok(())
     }
