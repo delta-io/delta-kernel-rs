@@ -54,7 +54,7 @@ impl Scalar {
     // NOTE: `ListBuilder` and `MapBuilder` are take generic element/key/value builders in order to
     // work with specific builder types directly. However, `array::make_builder` instantiates them
     // with `Box<dyn Builder>` instead, which greatly simplifies our job in working with them. We
-    // can just extract the builder trait,and let recursive calls cast it to the desired type.
+    // can just extract the builder trait, and let recursive calls cast it to the desired type.
     //
     // WARNING: List and map builders do _NOT_ require appending any child entries to NULL list/map
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
@@ -213,6 +213,24 @@ impl Scalar {
     }
 }
 
+impl ArrayData {
+    /// Convert kernel [`ArrayData`] to Arrow [`ArrayRef`].
+    pub fn to_arrow(&self) -> DeltaResult<ArrayRef> {
+        let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())?;
+
+        #[allow(deprecated)]
+        let num_elements = self.array_elements().len();
+        let mut builder = array::make_builder(&arrow_data_type, num_elements);
+
+        #[allow(deprecated)]
+        for element in self.array_elements() {
+            element.append_to(&mut builder, 1)?;
+        }
+
+        Ok(builder.finish())
+    }
+}
+
 #[derive(Debug)]
 pub struct ArrowEvaluationHandler;
 
@@ -302,13 +320,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let arrow_columns: Vec<ArrayRef> = columns
             .into_iter()
-            .map(|col| {
-                // Convert kernel ArrayData to Scalar::Array and then to Arrow ArrayRef
-                #[allow(deprecated)]
-                let num_rows = col.array_elements().len();
-                let scalar = Scalar::Array(col);
-                scalar.to_array(num_rows)
-            })
+            .map(|col| col.to_arrow())
             .try_collect()?;
         let record_batch =
             RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), arrow_columns)?;
