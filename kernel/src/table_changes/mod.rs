@@ -140,21 +140,15 @@ impl TableChanges {
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
-            log_root,
-            start_version,
-            end_version,
-        )?;
+        let log_segment = LogSegment::build(log_root)
+            .with_end_version_opt(end_version)
+            .build_incremental(start_version, engine.storage_handler().as_ref())?;
 
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
-        let start_snapshot = Arc::new(Snapshot::try_new(
-            table_root.as_url().clone(),
-            engine,
-            Some(start_version),
-        )?);
+        let start_snapshot =
+            Arc::new(Snapshot::build(table_root.as_url().clone()).build_at(start_version, engine)?);
         let end_snapshot = Snapshot::try_new_from(start_snapshot.clone(), engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using

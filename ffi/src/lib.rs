@@ -601,7 +601,11 @@ fn snapshot_impl(
     extern_engine: &dyn ExternEngine,
     version: Option<Version>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
-    let snapshot = Snapshot::try_new(url?, extern_engine.engine().as_ref(), version)?;
+    let snapshot = if let Some(v) = version {
+        Snapshot::build(url?).build_at(v, extern_engine.engine().as_ref())?
+    } else {
+        Snapshot::build(url?).build_latest(extern_engine.engine().as_ref())?
+    };
     Ok(Arc::new(snapshot).into())
 }
 
