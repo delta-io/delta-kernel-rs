@@ -117,7 +117,7 @@ fn evaluate_transform_expression(
     
     // Handle prepends (insertions before any field)
     if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
-        expressions.extend(prepend_exprs.iter().cloned()); // TODO: Use Cow<Expression> instead of cloning
+        expressions.extend(prepend_exprs.iter().cloned()); // cheap Arc clone 
         used_insertion_keys.insert(None);
     }
     
@@ -129,7 +129,7 @@ fn evaluate_transform_expression(
         match transform.field_replacements.get(field_name) {
             Some(Some(replacement_expr)) => {
                 // Field is replaced
-                expressions.push(replacement_expr.clone()); // TODO: Use Cow<Expression> instead of cloning
+                expressions.push(replacement_expr.clone()); // cheap Arc clone
             }
             Some(None) => {
                 // Field is dropped - skip it entirely
@@ -142,7 +142,7 @@ fn evaluate_transform_expression(
         
         // Handle insertions after this input field
         if let Some(insertion_exprs) = transform.field_insertions.get(&Some(field_name.to_string())) {
-            expressions.extend(insertion_exprs.iter().cloned()); // TODO: Use Cow<Expression> instead of cloning
+            expressions.extend(insertion_exprs.iter().cloned()); // cheap Arc clone
             used_insertion_keys.insert(Some(field_name.to_string()));
         }
     }
@@ -153,11 +153,11 @@ fn evaluate_transform_expression(
     }
     
     // Validate expression count matches output schema
-    if expressions.len() != output_schema.fields().len() {
+    if expressions.len() != output_schema.fields_len() {
         return Err(Error::generic(format!(
             "Expression count ({}) doesn't match output schema field count ({})",
             expressions.len(), 
-            output_schema.fields().len()
+            output_schema.fields_len()
         )));
     }
     

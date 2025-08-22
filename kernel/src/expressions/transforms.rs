@@ -242,7 +242,9 @@ pub trait ExpressionTransform<'a> {
         // Transform insertion expressions
         let mut new_field_insertions = Vec::new();
         for (key, exprs) in &t.field_insertions {
-            let new_exprs = recurse_into_children(exprs, |e| self.transform_expr(e));
+            let new_exprs = recurse_into_children(exprs, |e| {
+                self.transform_expr(e).map(|cow| cow.map_owned_or_else(e, Arc::new))
+            });
             if !matches!(new_exprs, Some(Cow::Borrowed(_))) {
                 any_field_changed = true;
             }
@@ -254,7 +256,7 @@ pub trait ExpressionTransform<'a> {
         if any_field_changed {
             let field_replacements = new_field_replacements
                 .into_iter()
-                .map(|(name, replacement)| (name.to_owned(), replacement.map(Cow::into_owned)))
+                .map(|(name, replacement)| (name.to_owned(), replacement.map(Cow::into_owned).map(Arc::new)))
                 .collect();
             let field_insertions = new_field_insertions
                 .into_iter()

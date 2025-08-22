@@ -256,11 +256,11 @@ pub struct Transform {
     /// - `Some(expression)`: Replace the field with this expression
     /// - `None`: Drop the field from output
     /// - Absent key: Pass through field unchanged
-    pub field_replacements: HashMap<String, Option<Expression>>,
+    pub field_replacements: HashMap<String, Option<ExpressionRef>>,
     /// New fields to insert at various positions. The key determines insertion point:
-    /// - `Some(field_name)`: Insert before the named field  
-    /// - `None`: Append at the end of the struct
-    pub field_insertions: HashMap<Option<String>, Vec<Expression>>,
+    /// - `Some(field_name)`: Insert after the named field  
+    /// - `None`: Prepend at the start of the struct
+    pub field_insertions: HashMap<Option<String>, Vec<ExpressionRef>>,
 }
 
 impl Transform {
@@ -276,13 +276,13 @@ impl Transform {
     }
 
     /// Create a transform with a replaced field
-    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: Expression) -> Self {
+    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
         self.field_replacements.insert(name.into(), Some(expr));
         self
     }
 
     /// Create a transform with an insertion
-    pub fn with_insertion(mut self, after: Option<String>, exprs: Vec<Expression>) -> Self {
+    pub fn with_insertion(mut self, after: Option<String>, exprs: Vec<ExpressionRef>) -> Self {
         self.field_insertions.insert(after, exprs);
         self
     }
