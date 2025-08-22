@@ -104,68 +104,65 @@ fn evaluate_struct_expression(
     Ok(Arc::new(StructArray::try_new(output_fields.into(), output_cols, None)?))
 }
 
-/// Evaluates a transform expression by co-recursing through the output schema
+/// Evaluates a transform expression by building expressions in input schema order
 fn evaluate_transform_expression(
     transform: &Transform,
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    // Fail-fast validation: check that all field replacements reference valid output schema fields
-    for field_name in transform.field_replacements.keys() {
-        if !output_schema.field_names().contains(&field_name.as_str()) {
-            return Err(Error::generic(format!(
-                "Transform references invalid field '{}' not present in output schema", 
-                field_name
-            )));
-        }
+    // Build expression list based on input schema order with insertions
+    let input_schema = batch.schema();
+    let mut expressions = Vec::new();
+    let mut used_insertion_keys = std::collections::HashSet::new();
+    
+    // Handle prepends (insertions before any field)
+    if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
+        expressions.extend(prepend_exprs.iter().cloned()); // TODO: Use Cow<Expression> instead of cloning
+        used_insertion_keys.insert(None);
     }
     
-    let mut output_expressions = Vec::new();
-    
-    // Process each field in the output schema in order
-    for field in output_schema.fields() {
-        let field_name = field.name();
+    // Process each input field in order
+    for input_field in input_schema.fields() {
+        let field_name = input_field.name();
         
-        // Handle insertions before this field (only if field is not dropped)
-        let field_is_dropped = matches!(
-            transform.field_replacements.get(field_name), 
-            Some(None)
-        );
-        
-        if !field_is_dropped {
-            if let Some(insertion_exprs) = transform.field_insertions.get(&Some(field_name.to_string())) {
-                for expr in insertion_exprs {
-                    output_expressions.push(expr.clone());
-                }
-            }
-        }
-        
-        // Handle the field itself based on replacement rules
+        // Handle the field based on replacement rules
         match transform.field_replacements.get(field_name) {
             Some(Some(replacement_expr)) => {
-                // Field is replaced with this expression
-                output_expressions.push(replacement_expr.clone());
+                // Field is replaced
+                expressions.push(replacement_expr.clone()); // TODO: Use Cow<Expression> instead of cloning
             }
             Some(None) => {
-                // Field is dropped - skip it
-                continue;
+                // Field is dropped - skip it entirely
             }
             None => {
-                // Field passes through unchanged - create column reference
-                output_expressions.push(Arc::new(Expression::column([field_name])));
+                // Field passes through unchanged
+                expressions.push(Arc::new(Expression::column([field_name])));
             }
         }
-    }
-    
-    // Handle insertions at the end of the struct  
-    if let Some(end_insertions) = transform.field_insertions.get(&None) {
-        for expr in end_insertions {
-            output_expressions.push(expr.clone());
+        
+        // Handle insertions after this input field
+        if let Some(insertion_exprs) = transform.field_insertions.get(&Some(field_name.to_string())) {
+            expressions.extend(insertion_exprs.iter().cloned()); // TODO: Use Cow<Expression> instead of cloning
+            used_insertion_keys.insert(Some(field_name.to_string()));
         }
     }
     
-    // Evaluate the resulting struct expression using the helper
-    evaluate_struct_expression(&output_expressions, batch, output_schema)
+    // Validate all insertion keys were used (fail-fast validation)
+    if used_insertion_keys.len() != transform.field_insertions.len() {
+        return Err(Error::generic("Some insertion keys don't reference valid input field names"));
+    }
+    
+    // Validate expression count matches output schema
+    if expressions.len() != output_schema.fields().len() {
+        return Err(Error::generic(format!(
+            "Expression count ({}) doesn't match output schema field count ({})",
+            expressions.len(), 
+            output_schema.fields().len()
+        )));
+    }
+    
+    // Delegate to struct evaluation logic  
+    evaluate_struct_expression(&expressions, batch, output_schema)
 }
 
 /// Evaluates a kernel expression over a record batch
