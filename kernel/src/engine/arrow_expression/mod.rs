@@ -288,15 +288,6 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
             .record_batch();
 
-        // Verify both batches have the same number of rows
-        if left.num_rows() != right.num_rows() {
-            return Err(Error::generic(format!(
-                "Cannot concatenate batches with different row counts: {} vs {}",
-                left.num_rows(),
-                right.num_rows()
-            )));
-        }
-
         // Combine the schemas by merging fields from both batches
         let mut combined_fields = Vec::new();
         combined_fields.extend_from_slice(left.schema().fields());
@@ -322,8 +313,8 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             .into_iter()
             .map(|col| col.to_arrow())
             .try_collect()?;
-        let record_batch =
-            RecordBatch::try_new(Arc::new(schema.as_ref().try_into_arrow()?), arrow_columns)?;
+        let schema = schema.as_ref().try_into_arrow()?;
+        let record_batch = RecordBatch::try_new(Arc::new(schema), arrow_columns)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
 }

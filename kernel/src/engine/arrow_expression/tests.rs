@@ -1,3 +1,4 @@
+use core::{f32, f64};
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
@@ -983,9 +984,9 @@ fn test_columnar_concat() {
         .as_any()
         .downcast_ref::<BooleanArray>()
         .unwrap();
-    assert_eq!(active_column.value(0), true);
-    assert_eq!(active_column.value(1), false);
-    assert_eq!(active_column.value(2), true);
+    assert!(active_column.value(0));
+    assert!(!active_column.value(1));
+    assert!(active_column.value(2));
 }
 
 #[test]
@@ -1008,7 +1009,9 @@ fn test_columnar_concat_mismatched_rows() {
     let result = handler.columnar_concat(&left_data, &right_data);
     assert!(result.is_err());
     if let Err(err) = result {
-        assert!(err.to_string().contains("different row counts"));
+        assert!(err
+            .to_string()
+            .contains("all columns in a record batch must have the same length"));
     }
 }
 
@@ -1144,8 +1147,8 @@ fn test_convert_to_engine_data_multiple_columns() {
         .as_any()
         .downcast_ref::<BooleanArray>()
         .unwrap();
-    assert_eq!(bool_array.value(0), true);
-    assert_eq!(bool_array.value(1), false);
+    assert!(bool_array.value(0));
+    assert!(!bool_array.value(1));
 }
 
 #[test]
@@ -1218,8 +1221,8 @@ fn test_convert_to_engine_data_various_types() {
 
     // Test with various primitive types
     let long_values = vec![Scalar::Long(9223372036854775807)];
-    let float_values = vec![Scalar::Float(3.14)];
-    let double_values = vec![Scalar::Double(2.718281828)];
+    let float_values = vec![Scalar::Float(f32::consts::PI)];
+    let double_values = vec![Scalar::Double(f64::consts::E)];
     let byte_values = vec![Scalar::Byte(127)];
     let short_values = vec![Scalar::Short(32767)];
     let binary_values = vec![Scalar::Binary(vec![0x42, 0x43, 0x44])];
@@ -1272,14 +1275,14 @@ fn test_convert_to_engine_data_various_types() {
         .as_any()
         .downcast_ref::<Float32Array>()
         .unwrap();
-    assert!((float_array.value(0) - 3.14).abs() < f32::EPSILON);
+    assert!((float_array.value(0) - f32::consts::PI).abs() < f32::EPSILON);
 
     let double_array = batch
         .column(2)
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    assert!((double_array.value(0) - 2.718281828).abs() < f64::EPSILON);
+    assert!((double_array.value(0) - f64::consts::E).abs() < f64::EPSILON);
 
     let byte_array = batch
         .column(3)
