@@ -482,6 +482,11 @@ fn visit_expression_impl(
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)
         }
+        Expression::Transform(_) => {
+            // Minimal FFI support: Transform expressions are treated as unknown
+            // TODO: Implement full Transform FFI support in future version
+            visit_unknown(visitor, sibling_list_id, "Transform")
+        }
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
 }

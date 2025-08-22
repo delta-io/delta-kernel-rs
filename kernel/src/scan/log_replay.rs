@@ -161,6 +161,11 @@ impl AddRemoveDedupVisitor<'_> {
         transform: &Transform,
         mut partition_values: HashMap<usize, (String, Scalar)>,
     ) -> DeltaResult<ExpressionRef> {
+        // TODO: Optimize with Expression::Transform for sparse transformations
+        // Current challenge: mapping between output schema positions (Transform/TransformExpr)
+        // and input schema field names (needed for Expression::Transform insertion positioning)
+        // This optimization would provide O(partition_count) vs O(schema_width) complexity
+
         let transforms = transform
             .iter()
             .map(|transform_expr| match transform_expr {
