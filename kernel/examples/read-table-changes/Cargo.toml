@@ -16,5 +16,4 @@ delta_kernel = { path = "../../../kernel", features = [
   "default-engine-rustls",
   "internal-api",
 ] }
-url = "2"
 itertools = "0.14"
