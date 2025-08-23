@@ -158,50 +158,49 @@ impl AddRemoveDedupVisitor<'_> {
     /// Compute an expression that will transform from physical to logical for a given Add file action
     fn get_transform_expr(
         &self,
-        sparse_transform: &[TransformExpr],
-        partition_values: HashMap<usize, (String, Scalar)>,
+        transform_spec: &Transform,
+        mut partition_values: HashMap<usize, (String, Scalar)>,
     ) -> DeltaResult<ExpressionRef> {
-        if sparse_transform.is_empty() {
+        if transform_spec.is_empty() {
             // No transformations needed - this shouldn't happen with current logic
             return Err(Error::InternalError(
-                "get_transform_expr called with empty sparse_transform".to_string()
+                "get_transform_expr called with empty transform_spec".to_string(),
             ));
         }
-        
-        let mut transform = crate::expressions::Transform::new();
-        
-        for transform_expr in sparse_transform {
-            match transform_expr {
+
+        let mut transform_expr = crate::expressions::Transform::new();
+
+        for transform in transform_spec {
+            match transform {
                 TransformExpr::StaticReplace(physical_field_name, replacement_expr) => {
-                    transform.field_replacements.insert(
-                        physical_field_name.clone(),
-                        Some(replacement_expr.clone())
-                    );
+                    transform_expr
+                        .field_replacements
+                        .insert(physical_field_name.clone(), Some(replacement_expr.clone()));
                 }
                 TransformExpr::StaticInsert(insert_after_physical_field, insertion_expr) => {
-                    transform.field_insertions
+                    transform_expr
+                        .field_insertions
                         .entry(insert_after_physical_field.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(insertion_expr.clone());
                 }
                 TransformExpr::Partition(logical_idx, insert_after_physical_field) => {
-                    let Some((_, partition_value)) = partition_values.get(logical_idx) else {
+                    let Some((_, partition_value)) = partition_values.remove(logical_idx) else {
                         return Err(Error::InternalError(format!(
                             "missing partition value for field index {logical_idx}"
                         )));
                     };
-                    
-                    let partition_expr = Arc::new(partition_value.clone().into());
-                    
-                    transform.field_insertions
+
+                    transform_expr
+                        .field_insertions
                         .entry(insert_after_physical_field.clone())
-                        .or_insert_with(Vec::new)
-                        .push(partition_expr);
+                        .or_default()
+                        .push(Arc::new(partition_value.into()));
                 }
             }
         }
-        
-        Ok(Arc::new(Expression::Transform(transform)))
+
+        Ok(Arc::new(Expression::Transform(transform_expr)))
     }
 
     fn is_file_partition_pruned(
@@ -266,7 +265,7 @@ impl AddRemoveDedupVisitor<'_> {
         let transform = self
             .transform
             .as_ref()
-            .map(|transform| self.get_transform_expr(transform.as_slice(), partition_values))
+            .map(|transform| self.get_transform_expr(transform, partition_values))
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
@@ -439,7 +438,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::actions::get_log_schema;
-    use crate::expressions::{column_name, Scalar};
+    use crate::expressions::Scalar;
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
@@ -548,20 +547,33 @@ mod tests {
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
-            let Expression::Transform(transform_def) = transform.unwrap().as_ref() else {
+            let Expr::Transform(transform_def) = transform.unwrap().as_ref() else {
                 panic!("Transform should always be a Transform expr");
             };
-            
+
             // With sparse transforms, we expect only insertions for partition columns
-            assert!(transform_def.field_replacements.is_empty(), "Should have no field replacements");
-            assert_eq!(transform_def.field_insertions.len(), 1, "Should have exactly one insertion");
-            
+            assert!(
+                transform_def.field_replacements.is_empty(),
+                "Should have no field replacements"
+            );
+            assert_eq!(
+                transform_def.field_insertions.len(),
+                1,
+                "Should have exactly one insertion"
+            );
+
             // The insertion should be after "value" field
-            let insertions = transform_def.field_insertions.get(&Some("value".to_string()))
+            let insertions = transform_def
+                .field_insertions
+                .get(&Some("value".to_string()))
                 .expect("Should have insertion after 'value' field");
-            assert_eq!(insertions.len(), 1, "Should have one partition column inserted");
-            
-            let Expression::Literal(ref scalar) = insertions[0].as_ref() else {
+            assert_eq!(
+                insertions.len(),
+                1,
+                "Should have one partition column inserted"
+            );
+
+            let Expr::Literal(ref scalar) = insertions[0].as_ref() else {
                 panic!("Expected partition insertion to be a literal");
             };
             assert_eq!(

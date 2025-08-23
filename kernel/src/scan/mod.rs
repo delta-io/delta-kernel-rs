@@ -317,7 +317,7 @@ pub enum ColumnType {
     Partition(usize),
 }
 
-/// A sparse transform holds only the TransformExpr entries that actually need transformation
+/// Describes what is ultimately a `Transform` expr, that holds only the TransformExpr entries that actually need transformation
 type Transform = Vec<TransformExpr>;
 
 /// utility method making it easy to get a transform for a particular row. If the requested row is
@@ -334,9 +334,11 @@ pub fn get_transform_for_row(
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// `Transform`.
 pub(crate) enum TransformExpr {
-    StaticReplace(String, ExpressionRef),        // Replace physical_field_name with expression
+    #[allow(unused)]
+    StaticReplace(String, ExpressionRef), // Replace physical_field_name with expression
+    #[allow(unused)]
     StaticInsert(Option<String>, ExpressionRef), // Insert expression after physical_field_name (None = prepend)
-    Partition(usize, Option<String>),            // (logical_index, insert_after_physical_field)
+    Partition(usize, Option<String>), // (logical_index, insert_after_physical_field)
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
@@ -448,10 +450,10 @@ impl Scan {
     /// Convert the parts of the transform that can be computed statically into `Expression`s. For
     /// parts that cannot be computed statically, include enough metadata so lower levels of
     /// processing can create and fill in an expression.
-    fn get_sparse_transform(all_fields: &[ColumnType]) -> Vec<TransformExpr> {
-        let mut sparse_transform = Vec::new();
+    fn get_sparse_transform(all_fields: &[ColumnType]) -> Transform {
+        let mut transform = Transform::new();
         let mut last_physical_field: Option<String> = None;
-        
+
         for field in all_fields {
             match field {
                 ColumnType::Selected(physical_name) => {
@@ -461,15 +463,15 @@ impl Scan {
                 }
                 ColumnType::Partition(logical_idx) => {
                     // Create insertion placeholder
-                    sparse_transform.push(TransformExpr::Partition(
+                    transform.push(TransformExpr::Partition(
                         *logical_idx,
-                        last_physical_field.clone()
+                        last_physical_field.clone(),
                     ));
                 }
             }
         }
-        
-        sparse_transform
+
+        transform
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
@@ -637,7 +639,11 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
         // needed (only when we have partition columns since column mapping is handled automatically)
-        let static_transform = self.have_partition_cols
+        //
+        // TODO: I think we need a way to apply an output schema to an EngineData without evaluating
+        // an expression over it first. Otherwise, we would not handle column mapping correctly.
+        let static_transform = self
+            .have_partition_cols
             .then(|| Arc::new(Scan::get_sparse_transform(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
