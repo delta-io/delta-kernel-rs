@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::iter;
+use std::marker::PhantomData;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,13 +45,14 @@ pub fn add_files_schema() -> &'static SchemaRef {
 ///
 /// ```rust,ignore
 /// // create a transaction
-/// let mut txn = table.new_transaction(&engine)?;
-/// // stage table changes (right now only commit info)
-/// txn.commit_info(Box::new(ArrowEngineData::new(engine_commit_info)));
+/// let mut txn = snapshot.transaction()?;
+/// // make table changes (e.g. add files to the table)
+/// txn.add_files(engine_data_of_files_to_add)?;
 /// // commit! (consume the transaction)
 /// txn.commit(&engine)?;
 /// ```
-pub struct Transaction {
+pub struct Transaction<S: State> {
+    state: S,
     read_snapshot: Arc<Snapshot>,
     operation: Option<String>,
     engine_info: Option<String>,
@@ -66,7 +68,7 @@ pub struct Transaction {
     commit_timestamp: i64,
 }
 
-impl std::fmt::Debug for Transaction {
+impl<S: State> std::fmt::Debug for Transaction<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
             "Transaction {{ read_snapshot version: {}, engine_info: {} }}",
@@ -76,7 +78,28 @@ impl std::fmt::Debug for Transaction {
     }
 }
 
-impl Transaction {
+trait State {}
+
+/// MetadataState is a marker trait for a transaction that can have metadata (table properties,
+/// etc.) modified.
+pub struct Metadata;
+struct Data;
+struct Committed {
+    commit_version: Version,
+    /// Post-commit stats that can be used by the engine to trigger actions like checkpointing or
+    /// log compaction.
+    post_commit_stats: PostCommitStats,
+}
+
+impl State for Metadata {}
+impl State for Data {}
+impl State for Committed {}
+
+trait MetadataOrData: State {}
+impl MetadataOrData for Metadata {}
+impl MetadataOrData for Data {}
+
+impl Transaction<Metadata> {
     /// Create a new transaction from a snapshot. The snapshot will be used to read the current
     /// state of the table (e.g. to read the current version).
     ///
@@ -99,6 +122,7 @@ impl Transaction {
             .ok_or_else(|| Error::generic("Failed to get current time for commit_timestamp"))?;
 
         Ok(Transaction {
+            state: Metadata,
             read_snapshot,
             operation: None,
             engine_info: None,
@@ -107,10 +131,36 @@ impl Transaction {
             commit_timestamp,
         })
     }
+}
+
+impl<S: MetadataOrData> Transaction<S> {
+    /// Set the operation that this transaction is performing. This string will be persisted in the
+    /// commit and visible to anyone who describes the table history.
+    pub fn with_operation(mut self, operation: String) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    /// Set the engine info field of this transaction's commit info action. This field is optional.
+    pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
+        self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
+    /// `last_updated` timestamp).
+    /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
+    /// different versions are disallowed in a single transaction. If a duplicate app_id is
+    /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
+    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
+        let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
+        self.set_transactions.push(set_transaction);
+        self
+    }
 
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
     /// will include the failed transaction in case of a conflict so the user can retry.
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<Transaction<Committed>> {
         // step 0: if there are txn(app_id, version) actions being committed, ensure that every
         // `app_id` is unique and create a row of `EngineData` for it.
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
@@ -155,51 +205,56 @@ impl Transaction {
 
         // step three: commit the actions as a json file in the log
         let json_handler = engine.json_handler();
+
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
-            Ok(()) => Ok(CommitResult::Committed {
-                version: commit_version,
-                post_commit_stats: PostCommitStats {
-                    commits_since_checkpoint: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_checkpoint()
-                        + 1,
-                    commits_since_log_compaction: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_log_compaction_or_checkpoint()
-                        + 1,
-                },
-            }),
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
+            Ok(()) => Ok(self.into_committed(commit_version)),
+            // FIXME: Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
             Err(e) => Err(e),
         }
     }
 
-    /// Set the operation that this transaction is performing. This string will be persisted in the
-    /// commit and visible to anyone who describes the table history.
-    pub fn with_operation(mut self, operation: String) -> Self {
-        self.operation = Some(operation);
-        self
+    /// Convert this transaction into a committed transaction. This is used to return the
+    /// committed transaction after a successful commit.
+    fn into_committed(self, commit_version: Version) -> Transaction<Committed> {
+        let post_commit_stats = PostCommitStats {
+            commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
+                + 1,
+            commits_since_log_compaction: self
+                .read_snapshot
+                .log_segment()
+                .commits_since_log_compaction_or_checkpoint()
+                + 1,
+        };
+        Transaction {
+            state: Committed {
+                commit_version,
+                post_commit_stats,
+            },
+            read_snapshot: self.read_snapshot,
+            operation: self.operation,
+            engine_info: self.engine_info,
+            add_files_metadata: self.add_files_metadata,
+            set_transactions: self.set_transactions,
+            commit_timestamp: self.commit_timestamp,
+        }
     }
+}
 
-    /// Set the engine info field of this transaction's commit info action. This field is optional.
-    pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
-        self.engine_info = Some(engine_info.into());
-        self
+impl Transaction<Metadata> {
+    /// Get the write context for this transaction. At the moment, this is constant for the whole
+    /// transaction.
+    // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
+    // that engines cannot call this method after a metadata change, since the write context could
+    // have invalid metadata.
+    pub fn get_write_context(&self) -> WriteContext {
+        let target_dir = self.read_snapshot.table_root();
+        let snapshot_schema = self.read_snapshot.schema();
+        let logical_to_physical = self.generate_logical_to_physical();
+        WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
     }
+}
 
-    /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
-    /// `last_updated` timestamp).
-    /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
-    /// different versions are disallowed in a single transaction. If a duplicate app_id is
-    /// included, the `commit` will fail (that is, we don't eagerly check app_id validity here).
-    pub fn with_transaction_id(mut self, app_id: String, version: i64) -> Self {
-        let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
-        self.set_transactions.push(set_transaction);
-        self
-    }
-
+impl<S: State> Transaction<S> {
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
@@ -212,18 +267,6 @@ impl Transaction {
             .filter(|f| !partition_columns.contains(f.name()))
             .map(|f| Expression::column([f.name()]));
         Expression::struct_from(fields)
-    }
-
-    /// Get the write context for this transaction. At the moment, this is constant for the whole
-    /// transaction.
-    // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
-    // that engines cannot call this method after a metadata change, since the write context could
-    // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
-        let target_dir = self.read_snapshot.table_root();
-        let snapshot_schema = self.read_snapshot.schema();
-        let logical_to_physical = self.generate_logical_to_physical();
-        WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -304,24 +347,6 @@ pub struct PostCommitStats {
     /// is considered a compaction for the purposes of this computation. Thus this is really the
     /// number of commits since a compaction OR a checkpoint.
     pub commits_since_log_compaction: u64,
-}
-
-/// Result of committing a transaction.
-#[derive(Debug)]
-pub enum CommitResult {
-    /// The transaction was successfully committed.
-    Committed {
-        /// the version of the table that was just committed
-        version: Version,
-        /// The [`PostCommitStats`] for this transaction
-        post_commit_stats: PostCommitStats,
-    },
-    /// This transaction conflicted with an existing version (at the version given). The transaction
-    /// is returned so the caller can resolve the conflict (along with the version which
-    /// conflicted).
-    // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
-    // update the transaction to a new version etc.
-    Conflict(Transaction, Version),
 }
 
 #[cfg(test)]
