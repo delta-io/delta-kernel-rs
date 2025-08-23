@@ -638,12 +638,11 @@ impl Scan {
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
-        // needed (only when we have partition columns since column mapping is handled automatically)
-        //
-        // TODO: I think we need a way to apply an output schema to an EngineData without evaluating
-        // an expression over it first. Otherwise, we would not handle column mapping correctly.
-        let static_transform = self
-            .have_partition_cols
+        // needed. We need transforms for:
+        // - Partition columns: Must be injected from partition values
+        // - Column mapping: Physical field names must be mapped to logical field names via output schema
+        let static_transform = (self.have_partition_cols
+            || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
             .then(|| Arc::new(Scan::get_sparse_transform(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),

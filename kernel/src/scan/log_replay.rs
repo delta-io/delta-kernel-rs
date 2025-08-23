@@ -156,18 +156,15 @@ impl AddRemoveDedupVisitor<'_> {
     }
 
     /// Compute an expression that will transform from physical to logical for a given Add file action
+    ///
+    /// An empty `transform_spec` is valid and represents the case where only column mapping is needed
+    /// (e.g., no partition columns to inject). The resulting empty `Expression::Transform` will
+    /// pass all input fields through unchanged while applying the output schema for name mapping.
     fn get_transform_expr(
         &self,
         transform_spec: &Transform,
         mut partition_values: HashMap<usize, (String, Scalar)>,
     ) -> DeltaResult<ExpressionRef> {
-        if transform_spec.is_empty() {
-            // No transformations needed - this shouldn't happen with current logic
-            return Err(Error::InternalError(
-                "get_transform_expr called with empty transform_spec".to_string(),
-            ));
-        }
-
         let mut transform_expr = crate::expressions::Transform::new();
 
         for transform in transform_spec {
