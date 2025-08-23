@@ -281,14 +281,17 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         // };
         // Short-circuit optimization: if this is an empty Transform (only column mapping, no actual transformations),
         // skip expression evaluation and directly apply the output schema to the input RecordBatch
-        let batch: RecordBatch = if let (Expression::Transform(transform), DataType::Struct(_)) = (&self.expression, &self.output_type) {
+        let batch: RecordBatch = if let (Expression::Transform(transform), DataType::Struct(_)) =
+            (&self.expression, &self.output_type)
+        {
             if transform.field_replacements.is_empty() && transform.field_insertions.is_empty() {
                 // Empty transform - just apply schema directly to input RecordBatch
                 let struct_array = StructArray::from(batch.clone());
                 apply_schema(&struct_array, &self.output_type)?
             } else {
                 // Non-empty transform - use normal evaluation path
-                let array_ref = evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
+                let array_ref =
+                    evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
                 apply_schema(&array_ref, &self.output_type)?
             }
         } else {
