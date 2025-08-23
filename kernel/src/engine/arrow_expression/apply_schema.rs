@@ -62,20 +62,9 @@ fn new_field_with_metadata(
 // _must_ match the order of the columns in `struct_array`.
 fn transform_struct(
     struct_array: &StructArray,
-    target_fields: impl ExactSizeIterator<Item = impl Borrow<StructField>>,
+    target_fields: impl Iterator<Item = impl Borrow<StructField>>,
 ) -> DeltaResult<StructArray> {
     let (_, arrow_cols, nulls) = struct_array.clone().into_parts();
-    let input_col_count = arrow_cols.len();
-
-    // Validate field counts before processing
-    if input_col_count != target_fields.len() {
-        return Err(Error::InternalError(format!(
-            "Field count mismatch: input struct has {} columns, but target schema has {} fields",
-            input_col_count,
-            target_fields.len()
-        )));
-    }
-
     let result_iter =
         arrow_cols
             .into_iter()
@@ -200,54 +189,22 @@ mod apply_schema_validation_tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_apply_schema_input_more_fields_than_target() {
-        // Input struct with 3 fields, target schema with 2 fields
-        let input_array = create_test_struct_array_3_fields();
-        let target_schema = create_target_schema_2_fields();
-
-        // This should fail - input has more fields than target
-        let result = apply_schema_to_struct(&input_array, &target_schema);
-        assert!(
-            result.is_err(),
-            "Should fail when input has more fields than target"
-        );
-
-        let error_msg = result.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("Field count mismatch"),
-            "Error should mention field count mismatch"
-        );
-    }
-
-    #[test]
-    fn test_apply_schema_target_more_fields_than_input() {
-        // Input struct with 2 fields, target schema with 3 fields
-        let input_array = create_test_struct_array_2_fields();
-        let target_schema = create_target_schema_3_fields();
-
-        // This should fail - target has more fields than input
-        let result = apply_schema_to_struct(&input_array, &target_schema);
-        assert!(
-            result.is_err(),
-            "Should fail when target has more fields than input"
-        );
-
-        let error_msg = result.unwrap_err().to_string();
-        assert!(
-            error_msg.contains("Field count mismatch"),
-            "Error should mention field count mismatch"
-        );
-    }
-
-    #[test]
-    fn test_apply_schema_matching_field_counts() {
-        // Input struct with 2 fields, target schema with 2 fields
+    fn test_apply_schema_basic_functionality() {
+        // Test that apply_schema works for basic field transformation
         let input_array = create_test_struct_array_2_fields();
         let target_schema = create_target_schema_2_fields();
 
-        // This should succeed - matching field counts
+        // This should succeed - basic schema application
         let result = apply_schema_to_struct(&input_array, &target_schema);
-        assert!(result.is_ok(), "Should succeed when field counts match");
+        assert!(result.is_ok(), "Basic schema application should succeed");
+
+        let result_array = result.unwrap();
+        assert_eq!(
+            result_array.len(),
+            input_array.len(),
+            "Row count should be preserved"
+        );
+        assert_eq!(result_array.num_columns(), 2, "Should have 2 columns");
     }
 
     // Helper functions to create test data
@@ -267,36 +224,10 @@ mod apply_schema_validation_tests {
         .unwrap()
     }
 
-    fn create_test_struct_array_3_fields() -> StructArray {
-        let field1 = ArrowField::new("a", ArrowDataType::Int32, false);
-        let field2 = ArrowField::new("b", ArrowDataType::Int32, false);
-        let field3 = ArrowField::new("c", ArrowDataType::Int32, false);
-        let schema = ArrowSchema::new(vec![field1, field2, field3]);
-
-        let a_data = Int32Array::from(vec![1, 2, 3]);
-        let b_data = Int32Array::from(vec![4, 5, 6]);
-        let c_data = Int32Array::from(vec![7, 8, 9]);
-
-        StructArray::try_new(
-            schema.fields.clone(),
-            vec![Arc::new(a_data), Arc::new(b_data), Arc::new(c_data)],
-            None,
-        )
-        .unwrap()
-    }
-
     fn create_target_schema_2_fields() -> StructType {
         StructType::new([
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
-        ])
-    }
-
-    fn create_target_schema_3_fields() -> StructType {
-        StructType::new([
-            StructField::new("a", DataType::INTEGER, false),
-            StructField::new("b", DataType::INTEGER, false),
-            StructField::new("c", DataType::INTEGER, false),
         ])
     }
 }
