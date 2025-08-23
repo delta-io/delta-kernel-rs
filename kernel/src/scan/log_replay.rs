@@ -147,10 +147,10 @@ impl AddRemoveDedupVisitor<'_> {
         transform
             .iter()
             .filter_map(|transform_expr| match transform_expr {
-                TransformExpr::Partition(field_idx) => {
+                TransformExpr::Partition(field_idx, _) => {
                     Some(self.parse_partition_value(*field_idx, partition_values))
                 }
-                TransformExpr::Static(_) => None,
+                TransformExpr::StaticReplace(_, _) | TransformExpr::StaticInsert(_, _) => None,
             })
             .try_collect()
     }
@@ -158,29 +158,50 @@ impl AddRemoveDedupVisitor<'_> {
     /// Compute an expression that will transform from physical to logical for a given Add file action
     fn get_transform_expr(
         &self,
-        transform: &Transform,
-        mut partition_values: HashMap<usize, (String, Scalar)>,
+        sparse_transform: &[TransformExpr],
+        partition_values: HashMap<usize, (String, Scalar)>,
     ) -> DeltaResult<ExpressionRef> {
-        // TODO: Optimize with Expression::Transform for sparse transformations
-        // Current challenge: mapping between output schema positions (Transform/TransformExpr)
-        // and input schema field names (needed for Expression::Transform insertion positioning)
-        // This optimization would provide O(partition_count) vs O(schema_width) complexity
-
-        let transforms = transform
-            .iter()
-            .map(|transform_expr| match transform_expr {
-                TransformExpr::Partition(field_idx) => {
-                    let Some((_, partition_value)) = partition_values.remove(field_idx) else {
+        if sparse_transform.is_empty() {
+            // No transformations needed - this shouldn't happen with current logic
+            return Err(Error::InternalError(
+                "get_transform_expr called with empty sparse_transform".to_string()
+            ));
+        }
+        
+        let mut transform = crate::expressions::Transform::new();
+        
+        for transform_expr in sparse_transform {
+            match transform_expr {
+                TransformExpr::StaticReplace(physical_field_name, replacement_expr) => {
+                    transform.field_replacements.insert(
+                        physical_field_name.clone(),
+                        Some(replacement_expr.clone())
+                    );
+                }
+                TransformExpr::StaticInsert(insert_after_physical_field, insertion_expr) => {
+                    transform.field_insertions
+                        .entry(insert_after_physical_field.clone())
+                        .or_insert_with(Vec::new)
+                        .push(insertion_expr.clone());
+                }
+                TransformExpr::Partition(logical_idx, insert_after_physical_field) => {
+                    let Some((_, partition_value)) = partition_values.get(logical_idx) else {
                         return Err(Error::InternalError(format!(
-                            "missing partition value for field index {field_idx}"
+                            "missing partition value for field index {logical_idx}"
                         )));
                     };
-                    Ok(Arc::new(partition_value.into()))
+                    
+                    let partition_expr = Arc::new(partition_value.clone().into());
+                    
+                    transform.field_insertions
+                        .entry(insert_after_physical_field.clone())
+                        .or_insert_with(Vec::new)
+                        .push(partition_expr);
                 }
-                TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
-            })
-            .try_collect()?;
-        Ok(Arc::new(Expression::Struct(transforms)))
+            }
+        }
+        
+        Ok(Arc::new(Expression::Transform(transform)))
     }
 
     fn is_file_partition_pruned(
@@ -245,7 +266,7 @@ impl AddRemoveDedupVisitor<'_> {
         let transform = self
             .transform
             .as_ref()
-            .map(|transform| self.get_transform_expr(transform, partition_values))
+            .map(|transform| self.get_transform_expr(transform.as_slice(), partition_values))
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
@@ -513,7 +534,7 @@ mod tests {
         let partition_cols = ["date".to_string()];
         let state_info =
             StateInfo::try_new(schema.as_ref(), &partition_cols, ColumnMappingMode::None).unwrap();
-        let static_transform = Some(Arc::new(Scan::get_static_transform(&state_info.all_fields)));
+        let static_transform = Some(Arc::new(Scan::get_sparse_transform(&state_info.all_fields)));
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -527,18 +548,21 @@ mod tests {
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
-            let Expr::Struct(inner) = transform.unwrap().as_ref() else {
-                panic!("Transform should always be a struct expr");
+            let Expression::Transform(transform_def) = transform.unwrap().as_ref() else {
+                panic!("Transform should always be a Transform expr");
             };
-            assert_eq!(inner.len(), 2, "expected two items in transform struct");
-
-            let Expr::Column(ref name) = inner[0].as_ref() else {
-                panic!("Expected first expression to be a column");
-            };
-            assert_eq!(name, &column_name!("value"), "First col should be 'value'");
-
-            let Expr::Literal(ref scalar) = inner[1].as_ref() else {
-                panic!("Expected second expression to be a literal");
+            
+            // With sparse transforms, we expect only insertions for partition columns
+            assert!(transform_def.field_replacements.is_empty(), "Should have no field replacements");
+            assert_eq!(transform_def.field_insertions.len(), 1, "Should have exactly one insertion");
+            
+            // The insertion should be after "value" field
+            let insertions = transform_def.field_insertions.get(&Some("value".to_string()))
+                .expect("Should have insertion after 'value' field");
+            assert_eq!(insertions.len(), 1, "Should have one partition column inserted");
+            
+            let Expression::Literal(ref scalar) = insertions[0].as_ref() else {
+                panic!("Expected partition insertion to be a literal");
             };
             assert_eq!(
                 scalar,
