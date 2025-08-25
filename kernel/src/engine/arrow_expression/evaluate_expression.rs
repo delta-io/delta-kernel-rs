@@ -1,7 +1,8 @@
 //! Expression handling based on arrow-rs compute kernels.
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StringArray, StringBuilder,
+    StructArray,
 };
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
@@ -11,6 +12,8 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::arrow::json::writer::{make_encoder, EncoderOptions};
+
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -19,7 +22,7 @@ use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate, Predicate, Scalar,
-    UnaryPredicate, UnaryPredicateOp,
+    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -85,6 +88,7 @@ pub fn evaluate_expression(
 ) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
+    use UnaryExpressionOp::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
@@ -118,6 +122,15 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
+        (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
+            None | Some(&DataType::STRING) => {
+                let input = evaluate_expression(expr, batch, None)?;
+                to_json(&input).map_err(Into::into)
+            }
+            Some(data_type) => Err(Error::generic(format!(
+                "ToJson operator requires STRING output, but got {data_type:?}"
+            ))),
+        },
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -288,5 +301,64 @@ pub fn evaluate_predicate(
             }
         }
         Unknown(name) => Err(Error::unsupported(format!("Unknown predicate: {name:?}"))),
+    }
+}
+
+/// Converts a StructArray to JSON-encoded strings
+pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+    let (array_ref, _is_scalar) = input.get();
+    match array_ref.data_type() {
+        ArrowDataType::Struct(_) => {
+            let struct_array = array_ref.as_struct_opt().ok_or_else(|| {
+                ArrowError::InvalidArgumentError(
+                    "Expected struct array but got different type".to_string(),
+                )
+            })?;
+
+            let num_rows = struct_array.len();
+            if num_rows == 0 {
+                return Ok(Arc::new(StringArray::from(Vec::<Option<String>>::new())));
+            }
+
+            // Create the encoder using make_encoder with "struct mode" (not "list mode")
+            let field = Arc::new(ArrowField::new_struct(
+                "root",
+                struct_array.fields().iter().cloned().collect::<Vec<_>>(),
+                true,
+            ));
+            let options = EncoderOptions::default()
+                .with_struct_mode(crate::arrow::json::StructMode::ObjectOnly);
+            let mut encoder = make_encoder(&field, struct_array, &options)?;
+
+            // Pre-allocate buffer and create string builder
+            const ROW_SIZE_ESTIMATE: usize = 64;
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * ROW_SIZE_ESTIMATE);
+            let mut json_buffer = Vec::with_capacity(ROW_SIZE_ESTIMATE);
+
+            for i in 0..num_rows {
+                if struct_array.is_null(i) {
+                    builder.append_null();
+                } else {
+                    // Clear and reuse buffer for this row
+                    json_buffer.clear();
+
+                    // Encode this row to JSON
+                    encoder.encode(i, &mut json_buffer);
+
+                    // Convert to string and append to builder
+                    let json_str = std::str::from_utf8(&json_buffer).map_err(|e| {
+                        ArrowError::InvalidArgumentError(format!("Invalid UTF-8: {e}"))
+                    })?;
+
+                    builder.append_value(json_str);
+                }
+            }
+
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "TO_JSON can only be applied to struct arrays, got {:?}",
+            array_ref.data_type()
+        ))),
     }
 }
