@@ -451,7 +451,7 @@ mod tests {
     fn test_identity_transforms() {
         let batch = create_test_batch();
         
-        // Test 1: Empty transform (identity)
+        // Test 1: Empty transform (identity) - should be exactly equal to input
         let transform = Transform::new();
         let output_schema = StructType::new(vec![
             StructField::new("a", DataType::INTEGER, false),
@@ -462,10 +462,18 @@ mod tests {
         let expr = Expr::Transform(transform);
         let result = evaluate_expression(&expr, &batch, Some(&DataType::Struct(Box::new(output_schema)))).unwrap();
         
-        // Verify structure is preserved
+        // For identity transform, output should be identical to input
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 3);
-        assert_eq!(struct_result.len(), 3);
+        let input_struct = StructArray::from(vec![
+            (batch.schema().field(0).clone(), batch.column(0).clone()),
+            (batch.schema().field(1).clone(), batch.column(1).clone()),
+            (batch.schema().field(2).clone(), batch.column(2).clone()),
+        ]);
+        
+        // Compare each column directly
+        for i in 0..3 {
+            assert_eq!(struct_result.column(i).as_ref(), input_struct.column(i).as_ref());
+        }
         
         // Test 2: Nested path identity (struct relocation without modification)
         let nested_batch = create_nested_test_batch();
@@ -480,157 +488,179 @@ mod tests {
         let expr_nested = Expr::Transform(transform_nested);
         let result_nested = evaluate_expression(&expr_nested, &nested_batch, Some(&DataType::Struct(Box::new(nested_output_schema)))).unwrap();
         
+        // Extract the original nested struct for comparison
+        let original_nested = nested_batch.column_by_name("nested").unwrap()
+            .as_any().downcast_ref::<StructArray>().unwrap();
         let nested_result = result_nested.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(nested_result.num_columns(), 2);
-        assert_eq!(nested_result.len(), 3);
+        
+        // Compare each column from nested struct directly
+        for i in 0..2 {
+            assert_eq!(nested_result.column(i).as_ref(), original_nested.column(i).as_ref());
+        }
     }
 
     #[test]
-    fn test_basic_field_operations() {
+    fn test_field_operations_and_multiple_insertions() {
         let batch = create_test_batch();
         
         let mut transform = Transform::new();
         
-        // Replace field 'a' with literal
+        // Replace field 'a' with column reference to 'b'
         transform.field_replacements.insert("a".to_string(), Some(column_expr_ref!("b")));
         
         // Drop field 'b'
         transform.field_replacements.insert("b".to_string(), None);
         
-        // Insert field at beginning (prepend)
-        transform.field_insertions.insert(None, vec![column_expr_ref!("c")]);
-        
-        // Insert field after 'c'
-        transform.field_insertions.insert(Some("c".to_string()), vec![Expr::literal(42).into()]);
-        
-        let output_schema = StructType::new(vec![
-            StructField::new("prepend", DataType::INTEGER, false),   // inserted at beginning
-            StructField::new("a", DataType::INTEGER, false),         // replaced with column b
-            StructField::new("c", DataType::INTEGER, false),         // passed through
-            StructField::new("after_c", DataType::INTEGER, false),   // inserted after c
+        // Multiple prepends (multiple insertions at same position)
+        transform.field_insertions.insert(None, vec![
+            Expr::literal(1).into(), 
+            Expr::literal(2).into(), 
+            column_expr_ref!("c")
         ]);
         
-        let expr = Expr::Transform(transform);
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::Struct(Box::new(output_schema)))).unwrap();
-        
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 4);
-        assert_eq!(struct_result.len(), 3);
-        
-        // Verify prepend field (should be column c values: [100, 200, 300])
-        let prepend_col = struct_result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(prepend_col.values(), &[100, 200, 300]);
-        
-        // Verify replaced field 'a' (should be column b values: [10, 20, 30])
-        let a_col = struct_result.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(a_col.values(), &[10, 20, 30]);
-        
-        // Verify passthrough field 'c' (should be original c values: [100, 200, 300])
-        let c_col = struct_result.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(c_col.values(), &[100, 200, 300]);
-        
-        // Verify insertion after c (should be literal 42)
-        let after_c_col = struct_result.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(after_c_col.values(), &[42, 42, 42]);
-    }
-
-    #[test]
-    fn test_combined_operations() {
-        let batch = create_test_batch();
-        
-        let mut transform = Transform::new();
-        
-        // Multiple replacements
-        transform.field_replacements.insert("a".to_string(), Some(Expr::literal(999).into()));
-        transform.field_replacements.insert("c".to_string(), Some(column_expr_ref!("a")));
-        
-        // Multiple insertions at different positions
-        transform.field_insertions.insert(None, vec![Expr::literal(1).into(), Expr::literal(2).into()]);
-        transform.field_insertions.insert(Some("a".to_string()), vec![column_expr_ref!("b")]);
-        transform.field_insertions.insert(Some("b".to_string()), vec![Expr::literal(888).into()]);
+        // Multiple insertions after 'c' (key feature: multiple at same position)
+        transform.field_insertions.insert(Some("c".to_string()), vec![
+            Expr::literal(42).into(),
+            column_expr_ref!("a"),  // references original column a
+            Expr::literal(99).into()
+        ]);
         
         let output_schema = StructType::new(vec![
             StructField::new("pre1", DataType::INTEGER, false),      // prepend 1
-            StructField::new("pre2", DataType::INTEGER, false),      // prepend 2
-            StructField::new("a", DataType::INTEGER, false),         // replaced with literal 999
-            StructField::new("after_a", DataType::INTEGER, false),   // inserted after a
-            StructField::new("b", DataType::INTEGER, false),         // passed through
-            StructField::new("after_b", DataType::INTEGER, false),   // inserted after b
-            StructField::new("c", DataType::INTEGER, false),         // replaced with original column a
+            StructField::new("pre2", DataType::INTEGER, false),      // prepend 2  
+            StructField::new("pre3", DataType::INTEGER, false),      // prepend 3 (column c)
+            StructField::new("a", DataType::INTEGER, false),         // replaced with column b
+            StructField::new("c", DataType::INTEGER, false),         // passed through
+            StructField::new("after_c1", DataType::INTEGER, false),  // first insertion after c
+            StructField::new("after_c2", DataType::INTEGER, false),  // second insertion after c
+            StructField::new("after_c3", DataType::INTEGER, false),  // third insertion after c
         ]);
         
         let expr = Expr::Transform(transform);
         let result = evaluate_expression(&expr, &batch, Some(&DataType::Struct(Box::new(output_schema)))).unwrap();
         
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 7);
+        assert_eq!(struct_result.num_columns(), 8);
         assert_eq!(struct_result.len(), 3);
         
-        // Verify prepends
+        // Verify multiple prepends (in order)
         let pre1_col = struct_result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(pre1_col.values(), &[1, 1, 1]);
         let pre2_col = struct_result.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(pre2_col.values(), &[2, 2, 2]);
+        let pre3_col = struct_result.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(pre3_col.values(), &[100, 200, 300]); // column c
         
-        // Verify replaced field 'a' (literal 999)
-        let a_col = struct_result.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(a_col.values(), &[999, 999, 999]);
+        // Verify replaced field 'a' (should be column b values: [10, 20, 30])
+        let a_col = struct_result.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a_col.values(), &[10, 20, 30]);
         
-        // Verify insertion after a (column b: [10, 20, 30])
-        let after_a_col = struct_result.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(after_a_col.values(), &[10, 20, 30]);
+        // Verify passthrough field 'c' (should be original c values: [100, 200, 300])
+        let c_col = struct_result.column(4).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(c_col.values(), &[100, 200, 300]);
         
-        // Verify passthrough field 'b' (original b: [10, 20, 30])
-        let b_col = struct_result.column(4).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(b_col.values(), &[10, 20, 30]);
-        
-        // Verify insertion after b (literal 888)
-        let after_b_col = struct_result.column(5).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(after_b_col.values(), &[888, 888, 888]);
-        
-        // Verify replaced field 'c' (original column a: [1, 2, 3])
-        let c_col = struct_result.column(6).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(c_col.values(), &[1, 2, 3]);
+        // Verify multiple insertions after c (in order)
+        let after_c1_col = struct_result.column(5).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(after_c1_col.values(), &[42, 42, 42]);
+        let after_c2_col = struct_result.column(6).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(after_c2_col.values(), &[1, 2, 3]); // original column a
+        let after_c3_col = struct_result.column(7).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(after_c3_col.values(), &[99, 99, 99]);
     }
 
     #[test]
     fn test_nested_path_transforms() {
         let nested_batch = create_nested_test_batch();
         
-        // Transform that modifies nested struct and moves it to new location
-        let mut transform = Transform::new()
+        // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
+        let transform_copy = Transform::new()
             .with_nested_input_path(["nested"]);
         
-        // Replace 'x' field in nested struct
-        transform.field_replacements.insert("x".to_string(), Some(Expr::literal(777).into()));
-        
-        // Insert new field in nested struct
-        transform.field_insertions.insert(Some("y".to_string()), vec![Expr::literal(555).into()]);
-        
-        let output_schema = StructType::new(vec![
-            StructField::new("x", DataType::INTEGER, false),         // replaced with literal 777
-            StructField::new("y", DataType::INTEGER, false),         // passed through
-            StructField::new("new_field", DataType::INTEGER, false), // inserted after y
+        let copy_output_schema = StructType::new(vec![
+            StructField::new("x", DataType::INTEGER, false),
+            StructField::new("y", DataType::INTEGER, false),
         ]);
         
-        let expr = Expr::Transform(transform);
-        let result = evaluate_expression(&expr, &nested_batch, Some(&DataType::Struct(Box::new(output_schema)))).unwrap();
+        let expr_copy = Expr::Transform(transform_copy);
+        let result_copy = evaluate_expression(&expr_copy, &nested_batch, Some(&DataType::Struct(Box::new(copy_output_schema)))).unwrap();
         
-        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_result.num_columns(), 3);
-        assert_eq!(struct_result.len(), 3);
+        // Verify the copy is identical to original nested struct
+        let copy_result = result_copy.as_any().downcast_ref::<StructArray>().unwrap();
+        let original_nested = nested_batch.column_by_name("nested").unwrap()
+            .as_any().downcast_ref::<StructArray>().unwrap();
         
-        // Verify replaced 'x' field (literal 777)
-        let x_col = struct_result.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(x_col.values(), &[777, 777, 777]);
+        for i in 0..2 {
+            assert_eq!(copy_result.column(i).as_ref(), original_nested.column(i).as_ref());
+        }
         
-        // Verify passthrough 'y' field (original nested.y: [10, 20, 30])
-        let y_col = struct_result.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(y_col.values(), &[10, 20, 30]);
+        // Test 2: Consume same nested struct multiple times with modifications
+        let mut transform_multi = Transform::new();
         
-        // Verify inserted field (literal 555)
-        let new_col = struct_result.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(new_col.values(), &[555, 555, 555]);
+        // Use nested struct as unmodified copy
+        transform_multi.field_insertions.insert(None, vec![
+            Expr::Transform(Transform::new().with_nested_input_path(["nested"])).into()
+        ]);
+        
+        // Keep original top-level field 'a'
+        // (field 'a' passes through unchanged)
+        
+        // Use nested struct again but modified
+        let mut modified_nested_transform = Transform::new()
+            .with_nested_input_path(["nested"]);
+        modified_nested_transform.field_replacements.insert("x".to_string(), Some(Expr::literal(999).into()));
+        
+        transform_multi.field_insertions.insert(Some("a".to_string()), vec![
+            Expr::Transform(modified_nested_transform).into()
+        ]);
+        
+        // Use nested struct a third time, accessing individual fields
+        transform_multi.field_insertions.insert(Some("a".to_string()), vec![
+            column_expr_ref!("nested.x"),
+            column_expr_ref!("nested.y")
+        ]);
+        
+        let multi_output_schema = StructType::new(vec![
+            StructField::new("unmodified_struct", DataType::Struct(Box::new(StructType::new(vec![
+                StructField::new("x", DataType::INTEGER, false),
+                StructField::new("y", DataType::INTEGER, false),
+            ]))), false),
+            StructField::new("a", DataType::INTEGER, false),                   // original field a
+            StructField::new("modified_struct", DataType::Struct(Box::new(StructType::new(vec![
+                StructField::new("x", DataType::INTEGER, false),
+                StructField::new("y", DataType::INTEGER, false),
+            ]))), false),
+            StructField::new("nested_x", DataType::INTEGER, false),           // individual field access
+            StructField::new("nested_y", DataType::INTEGER, false),           // individual field access
+        ]);
+        
+        let expr_multi = Expr::Transform(transform_multi);
+        let result_multi = evaluate_expression(&expr_multi, &nested_batch, Some(&DataType::Struct(Box::new(multi_output_schema)))).unwrap();
+        
+        let multi_result = result_multi.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(multi_result.num_columns(), 5);
+        
+        // Verify unmodified struct copy (column 0) is identical to original
+        let unmodified_struct = multi_result.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        for i in 0..2 {
+            assert_eq!(unmodified_struct.column(i).as_ref(), original_nested.column(i).as_ref());
+        }
+        
+        // Verify original field 'a' is preserved (column 1)
+        let a_col = multi_result.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(a_col.values(), &[100, 200, 300]);
+        
+        // Verify modified struct (column 2) has modified 'x' field
+        let modified_struct = multi_result.column(2).as_any().downcast_ref::<StructArray>().unwrap();
+        let modified_x = modified_struct.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(modified_x.values(), &[999, 999, 999]);  // modified
+        let modified_y = modified_struct.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(modified_y.values(), &[10, 20, 30]);     // unchanged
+        
+        // Verify individual field accesses (columns 3 and 4)
+        let nested_x_col = multi_result.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(nested_x_col.values(), &[1, 2, 3]);      // original nested.x
+        let nested_y_col = multi_result.column(4).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(nested_y_col.values(), &[10, 20, 30]);   // original nested.y
     }
 
     #[test]
