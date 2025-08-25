@@ -1,16 +1,20 @@
 //! Expression handling based on arrow-rs compute kernels.
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
+    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
+    RecordBatch, StringArray, StringBuilder, StructArray,
 };
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
+use crate::arrow::json::writer::{make_encoder, EncoderOptions};
+
+use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -19,7 +23,8 @@ use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate, Predicate, Scalar,
-    UnaryPredicate, UnaryPredicateOp,
+    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
+    VariadicExpressionOp,
 };
 use crate::schema::DataType;
 use itertools::Itertools;
@@ -85,6 +90,8 @@ pub fn evaluate_expression(
 ) -> DeltaResult<ArrayRef> {
     use BinaryExpressionOp::*;
     use Expression::*;
+    use UnaryExpressionOp::*;
+    use VariadicExpressionOp::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
@@ -118,6 +125,15 @@ pub fn evaluate_expression(
         (Predicate(_), Some(data_type)) => Err(Error::generic(format!(
             "Predicate evaluation produces boolean output, but caller expects {data_type:?}"
         ))),
+        (Unary(UnaryExpression { op: ToJson, expr }), result_type) => match result_type {
+            None | Some(&DataType::STRING) => {
+                let input = evaluate_expression(expr, batch, None)?;
+                Ok(to_json(&input)?)
+            }
+            Some(data_type) => Err(Error::generic(format!(
+                "ToJson operator requires STRING output, but got {data_type:?}"
+            ))),
+        },
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -131,6 +147,19 @@ pub fn evaluate_expression(
             };
 
             Ok(eval(&left_arr, &right_arr)?)
+        }
+        (
+            Variadic(VariadicExpression {
+                op: Coalesce,
+                exprs,
+            }),
+            result_type,
+        ) => {
+            let arrays: Vec<ArrayRef> = exprs
+                .iter()
+                .map(|expr| evaluate_expression(expr, batch, None))
+                .try_collect()?;
+            Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -288,5 +317,225 @@ pub fn evaluate_predicate(
             }
         }
         Unknown(name) => Err(Error::unsupported(format!("Unknown predicate: {name:?}"))),
+    }
+}
+
+/// Converts a StructArray to JSON-encoded strings
+pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
+    let (array_ref, _is_scalar) = input.get();
+    match array_ref.data_type() {
+        ArrowDataType::Struct(_) => {
+            let struct_array = array_ref.as_struct_opt().ok_or_else(|| {
+                ArrowError::InvalidArgumentError(
+                    "Expected struct array but got different type".to_string(),
+                )
+            })?;
+
+            let num_rows = struct_array.len();
+            if num_rows == 0 {
+                return Ok(Arc::new(StringArray::from(Vec::<Option<String>>::new())));
+            }
+
+            // Create the encoder using make_encoder with "struct mode" (not "list mode")
+            let field = Arc::new(ArrowField::new_struct(
+                "root",
+                struct_array.fields().iter().cloned().collect::<Vec<_>>(),
+                true,
+            ));
+            let options = EncoderOptions::default()
+                .with_struct_mode(crate::arrow::json::StructMode::ObjectOnly);
+            let mut encoder = make_encoder(&field, struct_array, &options)?;
+
+            // Pre-allocate buffer and create string builder
+            const ROW_SIZE_ESTIMATE: usize = 64;
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * ROW_SIZE_ESTIMATE);
+            let mut json_buffer = Vec::with_capacity(ROW_SIZE_ESTIMATE);
+
+            for i in 0..num_rows {
+                if struct_array.is_null(i) {
+                    builder.append_null();
+                } else {
+                    // Clear and reuse buffer for this row
+                    json_buffer.clear();
+
+                    // Encode this row to JSON
+                    encoder.encode(i, &mut json_buffer);
+
+                    // Convert to string and append to builder
+                    let json_str = std::str::from_utf8(&json_buffer).map_err(|e| {
+                        ArrowError::InvalidArgumentError(format!("Invalid UTF-8: {e}"))
+                    })?;
+
+                    builder.append_value(json_str);
+                }
+            }
+
+            Ok(Arc::new(builder.finish()))
+        }
+        _ => Err(ArrowError::InvalidArgumentError(format!(
+            "TO_JSON can only be applied to struct arrays, got {:?}",
+            array_ref.data_type()
+        ))),
+    }
+}
+
+/// Coalesce multiple arrays into one.
+///
+/// For each row, picks the first non-null value across the arrays. If the arrays are
+/// of different types, they must be castable to a common supertype.
+/// If `result_type` is provided, it must match the common supertype derived by [`common_supertype`].
+pub fn coalesce_arrays(
+    arrays: &[ArrayRef],
+    result_type: Option<&DataType>,
+) -> Result<ArrayRef, ArrowError> {
+    if arrays.is_empty() {
+        return Err(ArrowError::InvalidArgumentError(
+            "Need at least one array".into(),
+        ));
+    }
+
+    // Early exit for single array case
+    if arrays.len() == 1 {
+        let array = &arrays[0];
+
+        // Validate result type if provided
+        if let Some(result_type) = result_type {
+            let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
+            if array.data_type() != &result_arrow_type {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "Single array type {:?} does not match requested result type {result_type:?}",
+                    array.data_type()
+                )));
+            }
+        }
+
+        return Ok(array.clone());
+    }
+
+    // Validate all arrays have the same length and collect types
+    let num_rows = arrays[0].len();
+    let mut types = Vec::with_capacity(arrays.len());
+    for (i, arr) in arrays.iter().enumerate() {
+        if arr.len() != num_rows {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Array at index {i} has length {}, expected {num_rows}",
+                arr.len()
+            )));
+        }
+        types.push(arr.data_type());
+    }
+
+    // Find common type
+    let supertype = common_supertype(&types).ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!(
+            "Could not find common supertype for types: {types:?}"
+        ))
+    })?;
+
+    // Validate result type if provided
+    if let Some(result_type) = result_type {
+        let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
+        if result_arrow_type != supertype {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Requested result type {result_type:?} does not match common supertype {supertype:?}"
+            )));
+        }
+    }
+
+    // Cast arrays to common supertype and collect ArrayData for MutableArrayData
+    let (casted, array_data): (Vec<ArrayRef>, Vec<ArrayData>) = arrays
+        .iter()
+        .map(|arr| {
+            let casted_arr = if arr.data_type() == &supertype {
+                Ok(arr.clone())
+            } else {
+                cast(arr, &supertype)
+            };
+            casted_arr.map(|arr| {
+                let data = arr.to_data();
+                (arr, data)
+            })
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?
+        .into_iter()
+        .unzip();
+
+    // Build result
+    let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, num_rows);
+    for row in 0..num_rows {
+        // Find first non-null value for this row
+        match casted.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
+            Some((array_idx, _)) => {
+                mutable.extend(array_idx, row, row + 1);
+            }
+            None => {
+                mutable.extend_nulls(1);
+            }
+        }
+    }
+
+    Ok(make_array(mutable.freeze()))
+}
+
+/// Find a common supertype for a list of DataTypes via simple heuristics.
+///
+/// We currently only handle a limited set of types and just pick the "widest" type by Arrow's cast rules.
+fn common_supertype(types: &[&ArrowDataType]) -> Option<ArrowDataType> {
+    if types.is_empty() {
+        return None;
+    }
+
+    // Try pairwise promotion
+    types.iter().skip(1).try_fold(types[0].clone(), |acc, &t| {
+        if acc == *t {
+            Some(acc)
+        } else {
+            promote_types(&acc, t)
+        }
+    })
+}
+
+/// Promote two types to their common supertype
+fn promote_types(left: &ArrowDataType, right: &ArrowDataType) -> Option<ArrowDataType> {
+    use ArrowDataType::*;
+
+    match (left, right) {
+        // Same types
+        (a, b) if a == b => Some(a.clone()),
+
+        // Numeric type promotion (more specific patterns first)
+        // We always upcast to Float64 if floats and integers are mixed
+        (Float64, _) | (_, Float64) => Some(Float64),
+        (Float32, Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32) => {
+            Some(Float64)
+        }
+        (Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64, Float32) => Some(Float64),
+        (Float32, _) | (_, Float32) => Some(Float32),
+
+        // Integer promotion - signed takes precedence and we promote to wider types
+        (Int64, _) | (_, Int64) => Some(Int64),
+        (Int32, Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32) => Some(Int32),
+        (Int8 | Int16 | UInt8 | UInt16 | UInt32, Int32) => Some(Int32),
+        (Int16, Int8 | Int16 | UInt8 | UInt16) => Some(Int16),
+        (Int8 | UInt8 | UInt16, Int16) => Some(Int16),
+        (Int8, Int8 | UInt8) => Some(Int8),
+        (UInt8, Int8) => Some(Int8),
+
+        // Unsigned integer promotion
+        (UInt64, UInt8 | UInt16 | UInt32 | UInt64) => Some(UInt64),
+        (UInt8 | UInt16 | UInt32, UInt64) => Some(UInt64),
+        (UInt32, UInt8 | UInt16 | UInt32) => Some(UInt32),
+        (UInt8 | UInt16, UInt32) => Some(UInt32),
+        (UInt16, UInt8 | UInt16) => Some(UInt16),
+        (UInt8, UInt16) => Some(UInt16),
+
+        // String types
+        (Utf8, _) | (_, Utf8) => Some(Utf8),
+
+        // Boolean type (no promotion)
+        (Boolean, Boolean) => Some(Boolean),
+
+        // No common type found
+        _ => None,
     }
 }
