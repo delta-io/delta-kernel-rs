@@ -117,7 +117,7 @@ fn evaluate_transform_expression(
     let input_schema = batch.schema();
     let mut used_insertion_keys = 0;
     let mut used_replacement_keys = 0;
-    let mut nested_path: Vec<&String> = transform.nested_input_path.iter().collect();
+    let mut path: Vec<&String> = transform.input_path.as_ref().map_or_else(Vec::default, |path| path.iter().collect());
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
     let mut output_cols = Vec::new();
@@ -142,9 +142,9 @@ fn evaluate_transform_expression(
             } // else no replacement => dropped
         } else {
             // Field passes through unchanged
-            nested_path.push(field_name);
-            output_cols.push(extract_column(batch, nested_path.as_slice())?);
-            nested_path.pop();
+            path.push(field_name);
+            output_cols.push(extract_column(batch, path.as_slice())?);
+            path.pop();
         }
 
         // Handle insertions after this input field

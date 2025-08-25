@@ -252,9 +252,9 @@ impl OpaqueExpression {
 /// of partition columns need to be injected.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Transform {
-    /// If this transform does not manipulate top-level fields (empty input path), it must provide
-    /// the path to the struct whose fields it does manipulate.
-    pub nested_input_path: ColumnName,
+    /// If this transform does not manipulate top-level fields, it must provide a (non-empty) path
+    /// to the struct whose fields it does manipulate.
+    pub input_path: Option<ColumnName>,
     /// Field replacements:
     /// - `Some(expression)`: Replace the input field with this expression
     /// - `None`: Drop the input field from output
@@ -272,11 +272,11 @@ impl Transform {
         Self::default()
     }
 
-    pub fn with_nested_input_path<A>(mut self, path: impl IntoIterator<Item = A>) -> Self
+    pub fn with_input_path<A>(mut self, path: impl IntoIterator<Item = A>) -> Self
     where
         ColumnName: FromIterator<A>,
     {
-        self.nested_input_path = ColumnName::new(path);
+        self.input_path = Some(ColumnName::new(path));
         self
     }
 

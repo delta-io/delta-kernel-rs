@@ -285,8 +285,15 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                 // Empty transform optimization: Skip expression evaluation and directly apply the
                 // output schema to the input RecordBatch. This is used to cheaply apply a new
                 // output schema to existing data without changing it, e.g. for column mapping.
-                let struct_array = StructArray::from(batch.clone());
-                apply_schema(&struct_array, &self.output_type)?
+                let array = match transform.input_path {
+                    None => Arc::new(StructArray::from(batch.clone())),
+                    Some(ref path) => {
+                        // Fetch the requested input column and return it directly
+                        let expr = Expression::column(path.clone());
+                        evaluate_expression(&expr, batch, None)?
+                    }
+                };
+                apply_schema(&array, &self.output_type)?
             }
             (expr, output_type @ DataType::Struct(_)) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
