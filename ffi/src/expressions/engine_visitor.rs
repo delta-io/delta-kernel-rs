@@ -6,7 +6,8 @@ use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression,
     OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate, Scalar, StructData,
-    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp,
+    UnaryExpression, UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression,
+    VariadicExpressionOp,
 };
 
 use crate::expressions::{
@@ -17,6 +18,8 @@ use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitBinaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitVariadicFn =
+    extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 
@@ -162,6 +165,9 @@ pub struct EngineExpressionVisitor {
     /// Visits the `Divide` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_divide: VisitBinaryFn,
+    /// Visits the `Coalesce` variadic operator belonging to the list identified by `sibling_list_id`.
+    /// The operands will be in a list identified by `child_list_id`
+    pub visit_coalesce: VisitVariadicFn,
     /// Visits the `column` belonging to the list identified by `sibling_list_id`.
     pub visit_column:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
@@ -487,6 +493,16 @@ fn visit_expression_impl(
                 BinaryExpressionOp::Minus => visitor.visit_minus,
                 BinaryExpressionOp::Multiply => visitor.visit_multiply,
                 BinaryExpressionOp::Divide => visitor.visit_divide,
+            };
+            visit_fn(visitor.data, sibling_list_id, child_list_id);
+        }
+        Expression::Variadic(VariadicExpression { op, exprs }) => {
+            let child_list_id = call!(visitor, make_field_list, exprs.len());
+            for expr in exprs {
+                visit_expression_impl(visitor, expr, child_list_id);
+            }
+            let visit_fn = match op {
+                VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
