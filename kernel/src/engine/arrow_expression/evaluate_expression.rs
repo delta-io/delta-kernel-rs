@@ -403,9 +403,8 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Int32Array, ArrayRef, StructArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-    use crate::expressions::{Expression as Expr, Transform, column_expr, column_expr_ref};
+    use crate::expressions::{Expression as Expr, Transform, column_expr_ref};
     use crate::schema::{DataType, StructField, StructType};
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -464,21 +463,16 @@ mod tests {
         
         // For identity transform, output should be identical to input
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
-        let input_struct = StructArray::from(vec![
-            (batch.schema().field(0).clone(), batch.column(0).clone()),
-            (batch.schema().field(1).clone(), batch.column(1).clone()),
-            (batch.schema().field(2).clone(), batch.column(2).clone()),
-        ]);
         
-        // Compare each column directly
+        // Compare each column directly with original batch columns
         for i in 0..3 {
-            assert_eq!(struct_result.column(i).as_ref(), input_struct.column(i).as_ref());
+            assert_eq!(struct_result.column(i).as_ref(), batch.column(i).as_ref());
         }
         
         // Test 2: Nested path identity (struct relocation without modification)
         let nested_batch = create_nested_test_batch();
         let transform_nested = Transform::new()
-            .with_nested_input_path(["nested"]);
+            .with_input_path(["nested"]);
         
         let nested_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -574,7 +568,7 @@ mod tests {
         
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
         let transform_copy = Transform::new()
-            .with_nested_input_path(["nested"]);
+            .with_input_path(["nested"]);
         
         let copy_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -598,7 +592,7 @@ mod tests {
         
         // Use nested struct as unmodified copy
         transform_multi.field_insertions.insert(None, vec![
-            Expr::Transform(Transform::new().with_nested_input_path(["nested"])).into()
+            Expr::Transform(Transform::new().with_input_path(["nested"])).into()
         ]);
         
         // Keep original top-level field 'a'
@@ -606,7 +600,7 @@ mod tests {
         
         // Use nested struct again but modified
         let mut modified_nested_transform = Transform::new()
-            .with_nested_input_path(["nested"]);
+            .with_input_path(["nested"]);
         modified_nested_transform.field_replacements.insert("x".to_string(), Some(Expr::literal(999).into()));
         
         transform_multi.field_insertions.insert(Some("a".to_string()), vec![
