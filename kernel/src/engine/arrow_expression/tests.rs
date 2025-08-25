@@ -900,3 +900,125 @@ fn test_null_scalar_map() -> DeltaResult<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_string_view_arrays() {
+    use crate::arrow::array::StringViewArray;
+
+    // Create a StringViewArray instead of regular StringArray
+    let values = StringViewArray::from(vec![
+        "hi", "bye", "hi", "hi", "bye", "bye", "hi", "bye", "hi",
+    ]);
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
+    let field = Arc::new(Field::new("item", DataType::Utf8View, true));
+    let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
+    let schema = Schema::new([arr_field.clone()]);
+    let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+
+    let str_in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal("hi"),
+        column_expr!("item"),
+    );
+
+    // This should work with StringView arrays in lists
+    let result = evaluate_predicate(&str_in_op, &batch, false).unwrap();
+
+    // Each list contains "hi" so all should be true: ["hi","bye","hi"], ["hi","bye","bye"], ["hi","bye","hi"]
+    let expected = BooleanArray::from(vec![true, true, true]);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_list_view_arrays() {
+    use crate::arrow::array::{Int32Array, ListViewArray};
+
+    // Create a ListViewArray instead of regular ListArray
+    let values = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]));
+    // ListViewArray uses offsets and sizes
+    let offsets = ScalarBuffer::from(vec![0i32, 3, 6]);
+    let sizes = ScalarBuffer::from(vec![3i32, 3, 3]);
+    let field = Arc::new(Field::new("item", DataType::Int32, true));
+    let arr_field = Arc::new(Field::new("item", DataType::ListView(field.clone()), true));
+    let schema = Schema::new([arr_field.clone()]);
+
+    let array = ListViewArray::new(field.clone(), offsets, sizes, values, None);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array.clone())]).unwrap();
+
+    let in_op = Pred::binary(
+        BinaryPredicateOp::In,
+        Expr::literal(5),
+        column_expr!("item"),
+    );
+
+    // This should fail because ListView arrays are not yet supported by Arrow
+    let result = evaluate_predicate(&in_op, &batch, false);
+
+    assert!(
+        result.is_err(),
+        "Expected error for ListView arrays, got: {:?}",
+        result
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ListView arrays are not yet supported"),
+        "Expected ListView not supported error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_simple_string_view_comparison() {
+    use crate::arrow::array::StringViewArray;
+
+    // Create a simple batch with StringView column
+    let values = StringViewArray::from(vec!["apple", "banana", "cherry"]);
+    let field = Arc::new(Field::new("fruit", DataType::Utf8View, true));
+    let schema = Schema::new([field.clone()]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)]).unwrap();
+
+    // Simple equality comparison
+    let eq_op = Pred::binary(
+        BinaryPredicateOp::Equal,
+        column_expr!("fruit"),
+        Expr::literal("banana"),
+    );
+
+    // This should work with string view comparison
+    let result = evaluate_predicate(&eq_op, &batch, false).unwrap();
+
+    // Only "banana" should match
+    let expected = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn test_binary_view_comparison() {
+    use crate::arrow::array::BinaryViewArray;
+
+    // Create a simple batch with BinaryView column
+    let values = BinaryViewArray::from(vec![
+        b"apple".as_slice(),
+        b"banana".as_slice(),
+        b"cherry".as_slice(),
+    ]);
+    let field = Arc::new(Field::new("data", DataType::BinaryView, true));
+    let schema = Schema::new([field.clone()]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)]).unwrap();
+
+    // Simple equality comparison
+    let eq_op = Pred::binary(
+        BinaryPredicateOp::Equal,
+        column_expr!("data"),
+        Expr::literal(b"banana".as_slice()),
+    );
+
+    // This should work with binary view comparison
+    let result = evaluate_predicate(&eq_op, &batch, false).unwrap();
+
+    // Only "banana" should match
+    let expected = BooleanArray::from(vec![false, true, false]);
+    assert_eq!(result, expected);
+}

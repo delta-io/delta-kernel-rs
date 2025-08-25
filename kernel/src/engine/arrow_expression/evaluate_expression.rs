@@ -3,6 +3,7 @@ use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
 };
+use crate::arrow::compute;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
@@ -74,6 +75,57 @@ fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> Delt
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| ArrowError::SchemaError(format!("Not a struct: {field_name}")))?;
+    }
+}
+
+/// Normalizes view types to their non-view equivalents for compatibility
+fn normalize_view_types(arr: &ArrayRef) -> DeltaResult<ArrayRef> {
+    match arr.data_type() {
+        // String/Binary view types -> regular types
+        ArrowDataType::Utf8View => Ok(compute::cast(arr, &ArrowDataType::Utf8)?),
+        ArrowDataType::BinaryView => Ok(compute::cast(arr, &ArrowDataType::Binary)?),
+
+        // List view types -> regular List types (currently not supported by Arrow)
+        ArrowDataType::ListView(_) => {
+            Err(Error::invalid_expression(
+                "ListView arrays are not yet supported - Arrow doesn't support ListView→List casting".to_string()
+            ))
+        }
+        ArrowDataType::LargeListView(_) => {
+            Err(Error::invalid_expression(
+                "LargeListView arrays are not yet supported - Arrow doesn't support LargeListView→LargeList casting".to_string()
+            ))
+        }
+
+        // Lists containing view types -> Lists with regular types
+        ArrowDataType::List(field) => {
+            let normalized_element_type = match field.data_type() {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(arr.clone()), // No normalization needed
+            };
+            let new_field = Arc::new(ArrowField::new(
+                field.name(),
+                normalized_element_type,
+                field.is_nullable(),
+            ));
+            Ok(compute::cast(arr, &ArrowDataType::List(new_field))?)
+        }
+        ArrowDataType::LargeList(field) => {
+            let normalized_element_type = match field.data_type() {
+                ArrowDataType::Utf8View => ArrowDataType::Utf8,
+                ArrowDataType::BinaryView => ArrowDataType::Binary,
+                _ => return Ok(arr.clone()), // No normalization needed
+            };
+            let new_field = Arc::new(ArrowField::new(
+                field.name(),
+                normalized_element_type,
+                field.is_nullable(),
+            ));
+            Ok(compute::cast(arr, &ArrowDataType::LargeList(new_field))?)
+        }
+
+        _ => Ok(arr.clone()),
     }
 }
 
@@ -190,12 +242,16 @@ pub fn evaluate_predicate(
             // TODO: Factor out as a stand-alone function instead of a closure?
             let eval_in = || match (left, right) {
                 (Expression::Literal(_), Expression::Column(_)) => {
-                    let left = evaluate_expression(left, batch, None)?;
-                    let right = evaluate_expression(right, batch, None)?;
+                    let left = &evaluate_expression(left, batch, None)?;
+                    let right = &evaluate_expression(right, batch, None)?;
+                    // normalize view types to their non-view equivalents
+                    let left = normalize_view_types(left)?;
+                    let right = normalize_view_types(right)?;
+
+                    // Handle string IN operations
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
-                            let result = in_list_utf8(string_arr, list_arr)?;
-                            return Ok(result);
+                            return Ok(in_list_utf8(string_arr, list_arr)?);
                         }
                     }
 
@@ -256,8 +312,12 @@ pub fn evaluate_predicate(
                 (In, _) => return Ok(maybe_inverted(Cow::Owned(eval_in()?))?),
             };
 
-            let left = evaluate_expression(left, batch, None)?;
-            let right = evaluate_expression(right, batch, None)?;
+            let left = &evaluate_expression(left, batch, None)?;
+            let right = &evaluate_expression(right, batch, None)?;
+            // normalize view types to their non-view equivalents
+            let left = normalize_view_types(left)?;
+            let right = normalize_view_types(right)?;
+
             Ok(eval_fn(&left, &right)?)
         }
         Junction(JunctionPredicate { op, preds }) => {
