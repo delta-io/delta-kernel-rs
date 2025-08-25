@@ -1,11 +1,12 @@
 //! Some utilities for working with arrow data types
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
     engine::arrow_data::ArrowEngineData,
     schema::{DataType, Schema, SchemaRef, StructField, StructType},
@@ -20,10 +21,11 @@ use crate::arrow::array::{
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef, Fields,
-    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
+    Fields as ArrowFields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
+use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -57,6 +59,34 @@ macro_rules! prim_array_cmp {
 }
 
 pub(crate) use prim_array_cmp;
+
+type FieldIndex = usize;
+
+/// contains information about a StructField matched to a parquet struct field
+///
+/// # Lifetime Parameters
+/// * `'k` - The lifetime of the referenced kernel StructField
+struct KernelFieldInfo<'k> {
+    /// The index of the struct field in its parent struct
+    parquet_index: FieldIndex,
+    /// A reference to the struct field
+    field: &'k StructField,
+}
+
+/// Contains a information about a parquet field and the matching `KernelFieldInfo` if one
+/// exists. Parquet struct fields are matched to Kernel fields in [`match_parquet_fields`].
+///
+/// # Lifetime Parameters
+/// * `'k` - The lifetime of the referenced kernel StructField
+/// * `'p` - The lifetime of the referenced parquet ArrowField
+struct MatchedParquetField<'p, 'k> {
+    /// The index of the parquet field
+    parquet_index: FieldIndex,
+    /// A reference to the parquet field in the arrow schema
+    parquet_field: &'p ArrowField,
+    /// If present, this is a `KernelFieldInfo` belonging to a matching kernel `StructField`
+    kernel_field_info: Option<KernelFieldInfo<'k>>,
+}
 
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This
 /// returns a tuples of (mask_indices: Vec<parquet_schema_index>, reorder_indices:
@@ -297,7 +327,7 @@ fn validate_parquet_variant(field: &ArrowField) -> DeltaResult<()> {
 fn get_indices(
     start_parquet_offset: usize,
     requested_schema: &Schema,
-    fields: &Fields,
+    fields: &ArrowFields,
     mask_indices: &mut Vec<usize>,
 ) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
     let mut found_fields = HashSet::with_capacity(requested_schema.fields.len());
@@ -306,16 +336,23 @@ fn get_indices(
     // for each field, get its position in the parquet (via enumerate), a reference to the arrow
     // field, and info about where it appears in the requested_schema, or None if the field is not
     // requested
-    let all_field_info = fields.iter().enumerate().map(|(parquet_index, field)| {
-        let field_info = requested_schema.fields.get_full(field.name());
-        (parquet_index, field, field_info)
-    });
-    for (parquet_index, field, field_info) in all_field_info {
+    let matched_parquet_fields = match_parquet_fields(requested_schema, fields);
+    for MatchedParquetField {
+        parquet_index,
+        parquet_field: field,
+        kernel_field_info,
+    } in matched_parquet_fields
+    {
         debug!(
             "Getting indices for field {} with offset {parquet_offset}, with index {parquet_index}",
             field.name()
         );
-        if let Some((index, _, requested_field)) = field_info {
+        if let Some(KernelFieldInfo {
+            parquet_index: index,
+            field: requested_field,
+            ..
+        }) = kernel_field_info
+        {
             // If the field is a variant, make sure the parquet schema matches the unshredded variant
             // representation. This is to ensure that shredded reads are not performed.
             if requested_field.data_type == DataType::unshredded_variant() {
@@ -493,6 +530,71 @@ fn get_indices(
         parquet_offset + fields.len() - start_parquet_offset,
         reorder_indices,
     ))
+}
+
+/// Constructs an iterator where each parquet Field in `fields` is matched
+/// with a a kernel `KernelFieldInfo` representing a StructField.
+///
+/// The iterator returned has a [`MatchedParquetField`] for each element in `parquet_fields`.
+fn match_parquet_fields<'k, 'p>(
+    kernel_schema: &'k StructType,
+    parquet_fields: &'p ArrowFields,
+) -> impl Iterator<Item = MatchedParquetField<'p, 'k>> {
+    type FieldId = i64;
+
+    // Lazily construct a map from the field id to its StructField name.
+    let field_id_to_name: OnceLock<HashMap<FieldId, &String>> = OnceLock::new();
+    let init_field_map = || {
+        kernel_schema
+            .fields()
+            .filter_map(
+                |field| match field.get_config_value(&ColumnMetadataKey::ParquetFieldId) {
+                    Some(MetadataValue::Number(fid)) => Some((*fid, field.name())),
+                    _ => None,
+                },
+            )
+            .collect()
+    };
+
+    parquet_fields
+        .iter()
+        .enumerate()
+        // move is used to take ownership of the `get_matching_kernel_field` closure so that the
+        // iterator can be returned
+        .map(move |(parquet_index, parquet_field)| {
+            // Get the parquet field id
+            let parquet_field_id = parquet_field
+                .metadata()
+                .get(PARQUET_FIELD_ID_META_KEY)
+                .and_then(|x| x.parse::<FieldId>().ok());
+
+            // Get kernel field name by parquet field id if present. Otherwise fallback to using parquet name.
+            let field_name = parquet_field_id
+                .and_then(|field_id| {
+                    // If the fid to name map hasn't been initialized, construct it and get the field name
+                    field_id_to_name
+                        .get_or_init(init_field_map)
+                        .get(&field_id)
+                        .copied()
+                })
+                .unwrap_or_else(|| parquet_field.name());
+
+            // Map the parquet ArrowField to the matching kernel KernelFieldInfo if present.
+            let kernel_field_info =
+                kernel_schema
+                    .fields
+                    .get_full(field_name)
+                    .map(|(idx, _name, field)| KernelFieldInfo {
+                        parquet_index: idx,
+                        field,
+                    });
+
+            MatchedParquetField {
+                parquet_index,
+                parquet_field,
+                kernel_field_info,
+            }
+        })
 }
 
 /// Get the indices in `parquet_schema` of the specified columns in `requested_schema`. This returns
@@ -838,10 +940,7 @@ pub(crate) fn to_json_bytes(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
-
-    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use crate::arrow::array::{
         Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
@@ -864,8 +963,12 @@ mod tests {
 
     use super::*;
 
-    fn column_mapping_cases() -> [ColumnMappingMode; 1] {
-        [ColumnMappingMode::Name]
+    fn column_mapping_cases() -> [ColumnMappingMode; 3] {
+        [
+            ColumnMappingMode::Id,
+            ColumnMappingMode::Name,
+            ColumnMappingMode::None,
+        ]
     }
 
     /// Generates the logical name for a field given its id.
@@ -1287,6 +1390,82 @@ mod tests {
             assert_eq!(mask_indices, expect_mask);
             assert_eq!(reorder_indices, expect_reorder);
         });
+    }
+
+    #[test]
+    fn get_requested_indices_by_id_only() {
+        let requested_schema = StructType::new([
+            StructField::not_null("i_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(1, "i_physical")),
+            StructField::nullable("s_logical", DataType::STRING)
+                .with_metadata(kernel_fid_and_name(2, "s_physical")),
+            StructField::nullable("i2_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(3, "i2_physical")),
+        ])
+        .make_physical(ColumnMappingMode::Id)
+        .into();
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("not-i", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
+            ArrowField::new("not-i2", ArrowDataType::Int32, true).with_metadata(arrow_fid(3)),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![0, 1];
+        let expected_arrow_metadata = requested_schema
+            .field("s_physical")
+            .unwrap()
+            .metadata_with_string_values();
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::identity(2),
+            ReorderIndex::missing(
+                1,
+                Arc::new(
+                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
+                        .with_metadata(expected_arrow_metadata),
+                ),
+            ),
+        ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn get_requested_indices_by_id_falls_back_to_name() {
+        let requested_schema = StructType::new([
+            StructField::not_null("i_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(1, "i_physical")),
+            StructField::nullable("s_logical", DataType::STRING)
+                .with_metadata(kernel_fid_and_name(2, "s_physical")),
+            StructField::nullable("i2_logical", DataType::INTEGER)
+                .with_metadata(kernel_fid_and_name(3, "i2_physical")),
+        ])
+        .make_physical(ColumnMappingMode::Id)
+        .into();
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i_logical", ArrowDataType::Int32, false).with_metadata(arrow_fid(1)),
+            ArrowField::new("i2_physical", ArrowDataType::Int32, true).with_metadata(arrow_fid(3)),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![0, 1];
+        let expected_arrow_metadata = requested_schema
+            .field("s_physical")
+            .unwrap()
+            .metadata_with_string_values();
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::identity(2),
+            ReorderIndex::missing(
+                1,
+                Arc::new(
+                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
+                        .with_metadata(expected_arrow_metadata),
+                ),
+            ),
+        ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
     }
 
     fn nested_parquet_schema(mode: ColumnMappingMode) -> ArrowSchemaRef {
