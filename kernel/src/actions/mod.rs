@@ -894,15 +894,13 @@ impl DomainMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::ListBuilder;
-    use crate::arrow::json::ReaderBuilder;
     use crate::{
         arrow::array::{
-            Array, BooleanArray, Int32Array, Int64Array, MapBuilder, MapFieldNames, StringArray,
-            StringBuilder, StructArray,
+            Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+            MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
         },
         arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
-        arrow::record_batch::RecordBatch,
+        arrow::json::ReaderBuilder,
         engine::arrow_data::ArrowEngineData,
         engine::arrow_expression::ArrowEvaluationHandler,
         schema::{ArrayType, DataType, MapType, StructField},
@@ -1364,7 +1362,7 @@ mod tests {
         let engine_data =
             set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
 
-        let record_batch: crate::arrow::array::RecordBatch = engine_data
+        let record_batch: RecordBatch = engine_data
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -1398,7 +1396,7 @@ mod tests {
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
 
-        let record_batch: crate::arrow::array::RecordBatch = engine_data
+        let record_batch: RecordBatch = engine_data
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -1439,7 +1437,7 @@ mod tests {
         let engine_data =
             domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
 
-        let record_batch: crate::arrow::array::RecordBatch = engine_data
+        let record_batch: RecordBatch = engine_data
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -1819,14 +1817,14 @@ mod tests {
         let reader_features_col = record_batch
             .column(2)
             .as_any()
-            .downcast_ref::<crate::arrow::array::ListArray>()
+            .downcast_ref::<ListArray>()
             .unwrap();
         assert_eq!(reader_features_col.len(), 1);
         assert_eq!(reader_features_col.value(0).len(), 0); // empty list
         let writer_features_col = record_batch
             .column(3)
             .as_any()
-            .downcast_ref::<crate::arrow::array::ListArray>()
+            .downcast_ref::<ListArray>()
             .unwrap();
         assert_eq!(writer_features_col.len(), 1);
         assert_eq!(writer_features_col.value(0).len(), 0); // empty list

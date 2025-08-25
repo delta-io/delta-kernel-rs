@@ -553,12 +553,9 @@ where
     type Error = Error;
 
     fn try_from(vec: Vec<T>) -> Result<Self, Self::Error> {
-        let element_type = T::to_data_type();
-        let array_type = ArrayType::new(element_type, false);
-
+        let array_type = ArrayType::new(T::to_data_type(), false);
         let array_data = ArrayData::try_new(array_type, vec)?;
-
-        Ok(Self::Array(array_data))
+        Ok(array_data.into())
     }
 }
 
@@ -569,12 +566,9 @@ where
     type Error = Error;
 
     fn try_from(vec: Vec<Option<T>>) -> Result<Self, Self::Error> {
-        let element_type = T::to_data_type();
-        let array_type = ArrayType::new(element_type, true);
-
+        let array_type = ArrayType::new(T::to_data_type(), true);
         let array_data = ArrayData::try_new(array_type, vec)?;
-
-        Ok(Self::Array(array_data))
+        Ok(array_data.into())
     }
 }
 
@@ -586,13 +580,9 @@ where
     type Error = Error;
 
     fn try_from(map: HashMap<K, V>) -> Result<Self, Self::Error> {
-        let key_type = K::to_data_type();
-        let value_type = V::to_data_type();
-        let map_type = MapType::new(key_type, value_type, false);
-
+        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), false);
         let map_data = MapData::try_new(map_type, map)?;
-
-        Ok(Self::Map(map_data))
+        Ok(map_data.into())
     }
 }
 
@@ -604,13 +594,9 @@ where
     type Error = Error;
 
     fn try_from(map: HashMap<K, Option<V>>) -> Result<Self, Self::Error> {
-        let key_type = K::to_data_type();
-        let value_type = V::to_data_type();
-        let map_type = MapType::new(key_type, value_type, true);
-
+        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), true);
         let map_data = MapData::try_new(map_type, map)?;
-
-        Ok(Self::Map(map_data))
+        Ok(map_data.into())
     }
 }
 
@@ -621,6 +607,18 @@ impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
             Some(t) => t.into(),
             None => Self::Null(T::to_data_type()),
         }
+    }
+}
+
+impl From<ArrayData> for Scalar {
+    fn from(array_data: ArrayData) -> Self {
+        Self::Array(array_data)
+    }
+}
+
+impl From<MapData> for Scalar {
+    fn from(map_data: MapData) -> Self {
+        Self::Map(map_data)
     }
 }
 
