@@ -244,21 +244,21 @@ impl OpaqueExpression {
     }
 }
 
-/// A sparse transformation that efficiently represents modifications to struct schemas.
+/// A transformation that efficiently represents sparse modifications to struct schemas.
 ///
-/// Transform achieves O(changes) space complexity instead of O(schema_width) by only
-/// specifying fields that actually change, through field replacements and insertions.
-/// This is particularly efficient for wide schemas where only a few columns need to be
-/// modified/dropped, or where partition columns need to be injected.
+/// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
+/// specifying fields that actually change (inserted, replaced, or deleted).  This is particularly
+/// useful for wide schemas where only a few columns need to be modified/dropped, or where a handful
+/// of partition columns need to be injected.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Transform {
-    /// Field replacements indexed by field name for O(1) lookup:
-    /// - `Some(expression)`: Replace the field with this expression
-    /// - `None`: Drop the field from output
-    /// - Absent key: Pass through field unchanged
+    /// Field replacements:
+    /// - `Some(expression)`: Replace the input field with this expression
+    /// - `None`: Drop the input field from output
+    /// - Absent key: Pass input field through unchanged
     pub field_replacements: HashMap<String, Option<ExpressionRef>>,
     /// New fields to insert at various positions. The key determines insertion point:
-    /// - `Some(field_name)`: Insert after the named field  
+    /// - `Some(field_name)`: Insert after the named input field
     /// - `None`: Prepend at the start of the struct
     pub field_insertions: HashMap<Option<String>, Vec<ExpressionRef>>,
 }
@@ -286,6 +286,12 @@ impl Transform {
         self.field_insertions.insert(after, exprs);
         self
     }
+
+    /// True if this is the identity transform (all input fields pass through unchanged, with no new
+    /// fields inserted).
+    pub fn is_identity(&self) -> bool {
+        self.field_replacements.is_empty() && self.field_insertions.is_empty()
+    }
 }
 
 /// A SQL expression.
@@ -303,7 +309,7 @@ pub enum Expression {
     Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions
     Struct(Vec<ExpressionRef>),
-    /// A sparse transformation of a struct schema. More efficient than Struct for wide schemas
+    /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
     Transform(Transform),
     /// An expression that takes two expressions as input.

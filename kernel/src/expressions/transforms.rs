@@ -219,10 +219,13 @@ pub trait ExpressionTransform<'a> {
     /// Recursively transforms the children of a [`Transform`]. Returns `None` if all
     /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
     /// `Some(Cow::Borrowed)` otherwise.
-    ///
-    /// TODO: Re-examine this design - we need hooks for users to modify individual transforms.
-    /// This will likely need more helper methods and better use of map_owned_or_else patterns.
     fn recurse_into_expr_transform(&mut self, t: &'a Transform) -> Option<Cow<'a, Transform>> {
+        // TODO: Re-examine this design - we need hooks for users to modify individual transforms.
+        // This will likely need more helper methods and better use of map_owned_or_else patterns.
+        //
+        // TODO: What does it actually mean to change or remove a field transform? For now, we try
+        // to match the behavior of struct visitor, that a dropped field is simply dropped from the
+        // transformed struct. But there's an argument to be made that this is incorrect/dangerous.
         let mut any_field_changed = false;
         let mut new_field_replacements = Vec::new();
 
@@ -258,10 +261,8 @@ pub trait ExpressionTransform<'a> {
             let field_replacements = new_field_replacements
                 .into_iter()
                 .map(|(name, replacement)| {
-                    (
-                        name.to_owned(),
-                        replacement.map(Cow::into_owned).map(Arc::new),
-                    )
+                    let replacement = replacement.map(Cow::into_owned).map(Arc::new);
+                    (name.to_owned(), replacement)
                 })
                 .collect();
             let field_insertions = new_field_insertions

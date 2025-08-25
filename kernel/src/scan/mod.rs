@@ -317,8 +317,8 @@ pub enum ColumnType {
     Partition(usize),
 }
 
-/// Describes what is ultimately a `Transform` expr, that holds only the TransformExpr entries that actually need transformation
-type Transform = Vec<TransformExpr>;
+/// A list of field transforms that describes a transform expression to be created at scan time.
+type TransformSpec = Vec<FieldTransformSpec>;
 
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
@@ -332,13 +332,13 @@ pub fn get_transform_for_row(
 
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
-/// `Transform`.
-pub(crate) enum TransformExpr {
+/// [`TransformSpec`].
+pub(crate) enum FieldTransformSpec {
     #[allow(unused)]
     StaticReplace(String, ExpressionRef), // Replace physical_field_name with expression
     #[allow(unused)]
     StaticInsert(Option<String>, ExpressionRef), // Insert expression after physical_field_name (None = prepend)
-    Partition(usize, Option<String>), // (logical_index, insert_after_physical_field)
+    Partition(Option<String>, usize), // (insert_after_physical_field, logical_index)
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
@@ -447,31 +447,33 @@ impl Scan {
         }
     }
 
-    /// Convert the parts of the transform that can be computed statically into `Expression`s. For
-    /// parts that cannot be computed statically, include enough metadata so lower levels of
-    /// processing can create and fill in an expression.
-    fn get_sparse_transform(all_fields: &[ColumnType]) -> Transform {
-        let mut transform = Transform::new();
-        let mut last_physical_field: Option<String> = None;
+    /// Computes the transform spec for this scan. Static (query-level) transforms can already be
+    /// turned into expressions now, but file-level transforms like partition values can only be
+    /// described now; they are converted to expressions during the scan, using file metadata.
+    ///
+    /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
+    /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
+    /// from input to output unchanged and in the same relative order.
+    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
+        let mut transform_spec = TransformSpec::new();
+        let mut last_physical_field: Option<&str> = None;
 
         for field in all_fields {
             match field {
                 ColumnType::Selected(physical_name) => {
-                    // Track physical field for insertion point calculation
-                    last_physical_field = Some(physical_name.clone());
-                    // NO TransformExpr entry needed - field passes through automatically
+                    // Track physical field for calculating partition value insertion points.
+                    last_physical_field = Some(physical_name);
                 }
                 ColumnType::Partition(logical_idx) => {
-                    // Create insertion placeholder
-                    transform.push(TransformExpr::Partition(
+                    transform_spec.push(FieldTransformSpec::Partition(
+                        last_physical_field.map(String::from),
                         *logical_idx,
-                        last_physical_field.clone(),
                     ));
                 }
             }
         }
 
-        transform
+        transform_spec
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
@@ -643,7 +645,7 @@ impl Scan {
         // - Column mapping: Physical field names must be mapped to logical field names via output schema
         let static_transform = (self.have_partition_cols
             || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then(|| Arc::new(Scan::get_sparse_transform(&self.all_fields)));
+            .then(|| Arc::new(Scan::get_transform_spec(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
@@ -907,7 +909,7 @@ pub(crate) mod test_utils {
         JsonHandler,
     };
 
-    use super::{state::ScanCallback, Transform};
+    use super::{state::ScanCallback, TransformSpec};
 
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
@@ -994,7 +996,7 @@ pub(crate) mod test_utils {
     pub(crate) fn run_with_validate_callback<T: Clone>(
         batch: Vec<Box<ArrowEngineData>>,
         logical_schema: Option<SchemaRef>,
-        transform: Option<Arc<Transform>>,
+        transform_spec: Option<Arc<TransformSpec>>,
         expected_sel_vec: &[bool],
         context: T,
         validate_callback: ScanCallback<T>,
@@ -1007,7 +1009,7 @@ pub(crate) mod test_utils {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             logical_schema,
-            transform,
+            transform_spec,
             None,
         );
         let mut batch_count = 0;

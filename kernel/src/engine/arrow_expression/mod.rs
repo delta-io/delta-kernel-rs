@@ -279,33 +279,28 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //         batch.schema()
         //     )));
         // };
-        // Short-circuit optimization: if this is an empty Transform (only column mapping, no actual transformations),
-        // skip expression evaluation and directly apply the output schema to the input RecordBatch
-        let batch: RecordBatch = if let (Expression::Transform(transform), DataType::Struct(_)) =
-            (&self.expression, &self.output_type)
-        {
-            if transform.field_replacements.is_empty() && transform.field_insertions.is_empty() {
-                // Empty transform - just apply schema directly to input RecordBatch
+
+        let batch = match (&self.expression, &self.output_type) {
+            (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
+                // Empty transform optimization: Skip expression evaluation and directly apply the
+                // output schema to the input RecordBatch. This is used to cheaply apply a new
+                // output schema to existing data without changing it, e.g. for column mapping.
                 let struct_array = StructArray::from(batch.clone());
                 apply_schema(&struct_array, &self.output_type)?
-            } else {
-                // Non-empty transform - use normal evaluation path
-                let array_ref =
-                    evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
+            }
+            (expr, DataType::Struct(_)) => {
+                let array_ref = evaluate_expression(expr, batch, Some(&self.output_type))?;
                 apply_schema(&array_ref, &self.output_type)?
             }
-        } else {
-            // Non-transform expression - use normal evaluation path
-            let array_ref = evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
-            if let DataType::Struct(_) = self.output_type {
-                apply_schema(&array_ref, &self.output_type)?
-            } else {
+            (expr, output_type) => {
+                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
                 let array_ref = apply_schema_to(&array_ref, &self.output_type)?;
                 let arrow_type = ArrowDataType::try_from_kernel(&self.output_type)?;
                 let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
                 RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
             }
         };
+
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }

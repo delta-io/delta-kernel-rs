@@ -83,16 +83,14 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    let columns = fields
+    let output_cols: Vec<ArrayRef> = fields
         .iter()
         .zip(output_schema.fields())
-        .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())));
-    let output_cols: Vec<ArrayRef> = columns.try_collect()?;
+        .map(|(expr, field)| evaluate_expression(expr, batch, Some(field.data_type())))
+        .try_collect()?;
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
         .zip(output_schema.fields())
-        // This code is infallible: ArrowField::new does not return a Result and cannot fail,
-        // so the closure cannot actually produce an Err. Therefore, we can use .map instead of .try_collect.
         .map(|(output_col, output_field)| {
             ArrowField::new(
                 output_field.name(),
@@ -101,11 +99,8 @@ fn evaluate_struct_expression(
             )
         })
         .collect();
-    Ok(Arc::new(StructArray::try_new(
-        output_fields.into(),
-        output_cols,
-        None,
-    )?))
+    let data = StructArray::try_new(output_fields.into(), output_cols, None)?;
+    Ok(Arc::new(data))
 }
 
 /// Evaluates a transform expression by building expressions in input schema order
@@ -117,12 +112,13 @@ fn evaluate_transform_expression(
     // Build expression list based on input schema order with insertions
     let input_schema = batch.schema();
     let mut expressions = Vec::new();
-    let mut used_insertion_keys = std::collections::HashSet::new();
+    let mut used_insertion_keys = 0;
+    let mut used_replacement_keys = 0;
 
     // Handle prepends (insertions before any field)
     if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
         expressions.extend(prepend_exprs.iter().cloned()); // cheap Arc clone
-        used_insertion_keys.insert(None);
+        used_insertion_keys += 1;
     }
 
     // Process each input field in order
@@ -130,34 +126,36 @@ fn evaluate_transform_expression(
         let field_name = input_field.name();
 
         // Handle the field based on replacement rules
-        match transform.field_replacements.get(field_name) {
-            Some(Some(replacement_expr)) => {
-                // Field is replaced
-                expressions.push(replacement_expr.clone()); // cheap Arc clone
-            }
-            Some(None) => {
-                // Field is dropped - skip it entirely
-            }
-            None => {
-                // Field passes through unchanged
-                expressions.push(Arc::new(Expression::column([field_name])));
-            }
+        if let Some(replacement) = transform.field_replacements.get(field_name) {
+            used_replacement_keys += 1;
+            if let Some(expr) = replacement {
+                expressions.push(expr.clone());
+            } // else no replacement => dropped
+        } else {
+            // Field passes through unchanged
+            expressions.push(Arc::new(Expression::column([field_name])));
         }
 
         // Handle insertions after this input field
         if let Some(insertion_exprs) = transform
             .field_insertions
             .get(&Some(field_name.to_string()))
+        // TODO: Somehow impl Borrow
         {
             expressions.extend(insertion_exprs.iter().cloned()); // cheap Arc clone
-            used_insertion_keys.insert(Some(field_name.to_string()));
+            used_insertion_keys += 1;
         }
     }
 
-    // Validate all insertion keys were used (fail-fast validation)
-    if used_insertion_keys.len() != transform.field_insertions.len() {
+    // Validate all transforms were used
+    if used_insertion_keys != transform.field_insertions.len() {
         return Err(Error::generic(
             "Some insertion keys don't reference valid input field names",
+        ));
+    }
+    if used_replacement_keys != transform.field_replacements.len() {
+        return Err(Error::generic(
+            "Some replacement keys don't reference valid input field names",
         ));
     }
 
