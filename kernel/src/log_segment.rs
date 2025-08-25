@@ -149,7 +149,7 @@ impl LogSegment {
     }
 
     // factored out for testing
-    fn for_snapshot_impl(
+    pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
         checkpoint_hint: impl Into<Option<LastCheckpointHint>>,
