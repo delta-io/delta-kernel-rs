@@ -141,6 +141,17 @@ impl LogSegment {
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
+        time_travel_version: impl Into<Option<Version>>,
+    ) -> DeltaResult<Self> {
+        let time_travel_version = time_travel_version.into();
+        let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
+        Self::for_snapshot_impl(storage, log_root, checkpoint_hint, time_travel_version)
+    }
+
+    // factored out for testing
+    fn for_snapshot_impl(
+        storage: &dyn StorageHandler,
+        log_root: Url,
         checkpoint_hint: impl Into<Option<LastCheckpointHint>>,
         time_travel_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {

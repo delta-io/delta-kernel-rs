@@ -7,7 +7,6 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
-use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
@@ -92,11 +91,7 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let storage = engine.storage_handler();
         let log_root = table_root.join("_delta_log/")?;
-
-        let checkpoint_hint = LastCheckpointHint::try_read(storage.as_ref(), &log_root)?;
-
-        let log_segment =
-            LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_hint, version)?;
+        let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, version)?;
 
         // try_new_from_log_segment will ensure the protocol is supported
         Self::try_new_from_log_segment(table_root, log_segment, engine)
@@ -415,7 +410,6 @@ mod tests {
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::path::ParsedLogPath;
     use crate::utils::test_utils::string_array_to_engine_data;
     use test_utils::{add_commit, delta_path_for_version};
