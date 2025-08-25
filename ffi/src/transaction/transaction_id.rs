@@ -2,7 +2,7 @@ use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveTransaction;
 use crate::{
-    kernel_string_slice, ExternEngine, IntoExternResult, KernelStringSlice, SharedExternEngine,
+    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
 };
 use delta_kernel::transaction::Transaction;
@@ -49,30 +49,14 @@ pub unsafe extern "C" fn get_app_id_version(
     snapshot: Handle<SharedSnapshot>,
     app_id: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
-) -> ExternResult<i64> {
+) -> ExternResult<OptionalValue<i64>> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
     let engine = unsafe { engine.as_ref() };
     let app_id = unsafe { String::try_from_slice(&app_id) };
 
-    let version = get_app_id_version_impl(snapshot, app_id, engine);
-
-    if let Err(error) = version {
-        return Err(error).into_extern_result(&engine);
-    }
-
-    let version = version.unwrap();
-    match version {
-        Some(version) => ExternResult::Ok(version),
-        None => {
-            let error_string = "app_id not found in snapshot";
-            ExternResult::Err(unsafe {
-                engine.error_allocator().allocate_error(
-                    crate::error::KernelError::MissingDataError,
-                    kernel_string_slice!(error_string),
-                )
-            })
-        }
-    }
+    get_app_id_version_impl(snapshot, app_id, engine)
+        .map(OptionalValue::from)
+        .into_extern_result(&engine)
 }
 
 fn get_app_id_version_impl(
@@ -87,8 +71,7 @@ fn get_app_id_version_impl(
 mod tests {
     use super::*;
 
-    use crate::error::KernelError;
-    use crate::ffi_test_utils::{assert_extern_result_error_with_message, ok_or_panic};
+    use crate::ffi_test_utils::ok_or_panic;
     use crate::kernel_string_slice;
     use crate::tests::get_default_engine;
     use crate::transaction::{commit, transaction};
@@ -173,7 +156,7 @@ mod tests {
                     default_engine_handle.shallow_copy(),
                 )
             });
-            assert_eq!(version1, 1);
+            assert_eq!(version1, OptionalValue::Ok(1));
 
             let version2 = ok_or_panic(unsafe {
                 get_app_id_version(
@@ -182,22 +165,17 @@ mod tests {
                     default_engine_handle.shallow_copy(),
                 )
             });
-            assert_eq!(version2, 2);
+            assert_eq!(version2, OptionalValue::Ok(2));
 
             let app_id3 = "app_id3";
-            let version3 = unsafe {
+            let version3 = ok_or_panic(unsafe {
                 get_app_id_version(
                     Handle::from(snapshot.clone()),
                     kernel_string_slice!(app_id3),
                     default_engine_handle.shallow_copy(),
                 )
-            };
-            assert!(version3.is_err());
-            assert_extern_result_error_with_message(
-                version3,
-                KernelError::MissingDataError,
-                "app_id not found in snapshot",
-            );
+            });
+            assert_eq!(version3, OptionalValue::None);
         }
         Ok(())
     }
