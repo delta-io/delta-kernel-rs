@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -545,6 +546,60 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+impl<T> TryFrom<Vec<T>> for Scalar
+where
+    T: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(vec: Vec<T>) -> Result<Self, Self::Error> {
+        let array_type = ArrayType::new(T::to_data_type(), false);
+        let array_data = ArrayData::try_new(array_type, vec)?;
+        Ok(array_data.into())
+    }
+}
+
+impl<T> TryFrom<Vec<Option<T>>> for Scalar
+where
+    T: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(vec: Vec<Option<T>>) -> Result<Self, Self::Error> {
+        let array_type = ArrayType::new(T::to_data_type(), true);
+        let array_data = ArrayData::try_new(array_type, vec)?;
+        Ok(array_data.into())
+    }
+}
+
+impl<K, V> TryFrom<HashMap<K, V>> for Scalar
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(map: HashMap<K, V>) -> Result<Self, Self::Error> {
+        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), false);
+        let map_data = MapData::try_new(map_type, map)?;
+        Ok(map_data.into())
+    }
+}
+
+impl<K, V> TryFrom<HashMap<K, Option<V>>> for Scalar
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(map: HashMap<K, Option<V>>) -> Result<Self, Self::Error> {
+        let map_type = MapType::new(K::to_data_type(), V::to_data_type(), true);
+        let map_data = MapData::try_new(map_type, map)?;
+        Ok(map_data.into())
+    }
+}
+
 // NOTE: We "cheat" and use the macro support trait `ToDataType`
 impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
     fn from(t: Option<T>) -> Self {
@@ -552,6 +607,18 @@ impl<T: Into<Scalar> + ToDataType> From<Option<T>> for Scalar {
             Some(t) => t.into(),
             None => Self::Null(T::to_data_type()),
         }
+    }
+}
+
+impl From<ArrayData> for Scalar {
+    fn from(array_data: ArrayData) -> Self {
+        Self::Array(array_data)
+    }
+}
+
+impl From<MapData> for Scalar {
+    fn from(map_data: MapData) -> Self {
+        Self::Map(map_data)
     }
 }
 
@@ -998,5 +1065,178 @@ mod tests {
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
         assert!(!null.eq(&null));
+    }
+
+    #[test]
+    fn test_hashmap_conversion() -> DeltaResult<()> {
+        // Create a simple HashMap with string keys and integer values
+        let mut map = HashMap::new();
+        map.insert("key1".to_string(), 42i32);
+        map.insert("key2".to_string(), 100i32);
+
+        // Convert HashMap to Scalar
+        let scalar = Scalar::try_from(map)?;
+
+        // Verify the scalar is of Map type
+        assert!(matches!(scalar, Scalar::Map(_)));
+
+        // Verify the data type
+        let expected_map_type = MapType::new(DataType::STRING, DataType::INTEGER, false);
+        assert_eq!(scalar.data_type(), DataType::from(expected_map_type));
+
+        // Extract the MapData and verify contents
+        let Scalar::Map(map_data) = scalar else {
+            panic!("Expected Map scalar");
+        };
+        let pairs = map_data.pairs();
+        assert_eq!(pairs.len(), 2);
+        assert!(!map_data.map_type().value_contains_null());
+
+        // Check that both expected pairs are present
+        let has_key1 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
+        });
+        let has_key2 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Integer(100))
+        });
+        assert!(has_key1, "Missing key1 -> 42 pair");
+        assert!(has_key2, "Missing key2 -> 100 pair");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_hashmap_conversion_with_nullable_values() -> DeltaResult<()> {
+        // Create a HashMap with string keys and optional integer values
+        let mut map = HashMap::new();
+        map.insert("key1".to_string(), Some(42i32));
+        map.insert("key2".to_string(), None);
+        map.insert("key3".to_string(), Some(100i32));
+
+        // Convert HashMap to Scalar
+        let scalar = Scalar::try_from(map)?;
+
+        // Verify the scalar is of Map type
+        assert!(matches!(scalar, Scalar::Map(_)));
+
+        // Verify the data type (should have value_contains_null = true)
+        let expected_map_type = MapType::new(DataType::STRING, DataType::INTEGER, true);
+        assert_eq!(scalar.data_type(), DataType::from(expected_map_type));
+
+        // Extract the MapData and verify contents
+        let Scalar::Map(map_data) = scalar else {
+            panic!("Expected Map scalar");
+        };
+        let pairs = map_data.pairs();
+        assert_eq!(pairs.len(), 3);
+        assert!(map_data.map_type().value_contains_null());
+
+        // Check that all expected pairs are present
+        let has_key1 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
+        });
+        let has_key2 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Null(_))
+        });
+        let has_key3 = pairs.iter().any(|(k, v)| {
+            matches!(k, Scalar::String(s) if s == "key3") && matches!(v, Scalar::Integer(100))
+        });
+        assert!(has_key1, "Missing key1 -> 42 pair");
+        assert!(has_key2, "Missing key2 -> null pair");
+        assert!(has_key3, "Missing key3 -> 100 pair");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_vec_conversion() -> DeltaResult<()> {
+        // Create a simple Vec with integer values
+        let vec = vec![42i32, 100i32, 200i32];
+
+        // Convert Vec to Scalar
+        let scalar = Scalar::try_from(vec)?;
+
+        // Verify the scalar is of Array type
+        assert!(matches!(scalar, Scalar::Array(_)));
+
+        // Verify the data type
+        let expected_array_type = ArrayType::new(DataType::INTEGER, false);
+        assert_eq!(scalar.data_type(), DataType::from(expected_array_type));
+
+        // Extract the ArrayData and verify contents
+        let Scalar::Array(array_data) = scalar else {
+            panic!("Expected Array scalar");
+        };
+        #[allow(deprecated)]
+        let elements = array_data.array_elements();
+        assert_eq!(elements.len(), 3);
+        assert!(!array_data.array_type().contains_null());
+
+        // Check that all expected values are present
+        assert!(matches!(elements[0], Scalar::Integer(42)));
+        assert!(matches!(elements[1], Scalar::Integer(100)));
+        assert!(matches!(elements[2], Scalar::Integer(200)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_vec_conversion_with_nullable_values() -> DeltaResult<()> {
+        // Create a Vec with optional integer values
+        let vec = vec![Some(42i32), None, Some(100i32)];
+
+        // Convert Vec to Scalar
+        let scalar = Scalar::try_from(vec)?;
+
+        // Verify the scalar is of Array type
+        assert!(matches!(scalar, Scalar::Array(_)));
+
+        // Verify the data type (should have contains_null = true)
+        let expected_array_type = ArrayType::new(DataType::INTEGER, true);
+        assert_eq!(scalar.data_type(), DataType::from(expected_array_type));
+
+        // Extract the ArrayData and verify contents
+        let Scalar::Array(array_data) = scalar else {
+            panic!("Expected Array scalar");
+        };
+
+        #[allow(deprecated)]
+        let elements = array_data.array_elements();
+        assert_eq!(elements.len(), 3);
+        assert!(array_data.array_type().contains_null());
+
+        // Check that all expected values are present
+        assert!(matches!(elements[0], Scalar::Integer(42)));
+        assert!(matches!(elements[1], Scalar::Null(_)));
+        assert!(matches!(elements[2], Scalar::Integer(100)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_vec_conversion_different_types() -> DeltaResult<()> {
+        // Test with string Vec
+        let string_vec = vec!["hello".to_string(), "world".to_string()];
+        let string_scalar = Scalar::try_from(string_vec)?;
+
+        if let Scalar::Array(array_data) = string_scalar {
+            let expected_array_type = ArrayType::new(DataType::STRING, false);
+            assert_eq!(array_data.array_type(), &expected_array_type);
+        } else {
+            panic!("Expected Array scalar");
+        }
+
+        // Test with bool Vec
+        let bool_vec = vec![true, false, true];
+        let bool_scalar = Scalar::try_from(bool_vec)?;
+
+        if let Scalar::Array(array_data) = bool_scalar {
+            let expected_array_type = ArrayType::new(DataType::BOOLEAN, false);
+            assert_eq!(array_data.array_type(), &expected_array_type);
+        } else {
+            panic!("Expected Array scalar");
+        }
+
+        Ok(())
     }
 }
