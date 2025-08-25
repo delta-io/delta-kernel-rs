@@ -46,11 +46,6 @@ pub(crate) fn column_mapping_mode(
 /// When column mapping mode is enabled, verify that each field in the schema is annotated with a
 /// physical name and field_id; when not enabled, verify that no fields are annotated.
 pub fn validate_schema_column_mapping(schema: &Schema, mode: ColumnMappingMode) -> DeltaResult<()> {
-    if mode == ColumnMappingMode::Id {
-        // TODO: Support column mapping ID mode
-        return Err(Error::unsupported("Column mapping ID mode not supported"));
-    }
-
     let mut validator = ValidateColumnMappings {
         mode,
         path: vec![],
@@ -315,32 +310,34 @@ mod tests {
 
     #[test]
     fn test_column_mapping_enabled() {
-        [ColumnMappingMode::Name].into_iter().for_each(|mode| {
-            let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-            validate_schema_column_mapping(&schema, mode).unwrap();
+        [ColumnMappingMode::Name, ColumnMappingMode::Id]
+            .into_iter()
+            .for_each(|mode| {
+                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).unwrap();
 
-            // missing annotation
-            let schema = create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-            validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
-            let schema = create_schema("5", None, "4", "\"col-5f422f40\"");
-            validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
-            let schema = create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"");
-            validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
-            let schema = create_schema("5", "\"col-a7f4159c\"", "4", None);
-            validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
+                // missing annotation
+                let schema = create_schema(None, "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
+                let schema = create_schema("5", None, "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
+                let schema = create_schema("5", "\"col-a7f4159c\"", None, "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field id");
+                let schema = create_schema("5", "\"col-a7f4159c\"", "4", None);
+                validate_schema_column_mapping(&schema, mode).expect_err("missing field name");
 
-            // wrong-type field id annotation (string instead of int)
-            let schema = create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
-            validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
-            let schema = create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"");
-            validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
+                // wrong-type field id annotation (string instead of int)
+                let schema = create_schema("\"5\"", "\"col-a7f4159c\"", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
+                let schema = create_schema("5", "\"col-a7f4159c\"", "\"4\"", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field id");
 
-            // wrong-type field name annotation (int instead of string)
-            let schema = create_schema("5", "555", "4", "\"col-5f422f40\"");
-            validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
-            let schema = create_schema("5", "\"col-a7f4159c\"", "4", "444");
-            validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
-        });
+                // wrong-type field name annotation (int instead of string)
+                let schema = create_schema("5", "555", "4", "\"col-5f422f40\"");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
+                let schema = create_schema("5", "\"col-a7f4159c\"", "4", "444");
+                validate_schema_column_mapping(&schema, mode).expect_err("invalid field name");
+            });
     }
 
     #[test]

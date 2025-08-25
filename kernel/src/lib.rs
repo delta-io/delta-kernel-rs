@@ -604,14 +604,73 @@ pub trait JsonHandler: AsAny {
 /// implementation of Parquet data file functionalities to Delta Kernel.
 pub trait ParquetHandler: AsAny {
     /// Read and parse the Parquet file at given locations and return the data as EngineData with
-    /// the columns requested by physical schema . The ParquetHandler _must_ return exactly the
+    /// the columns requested by physical schema. The ParquetHandler _must_ return exactly the
     /// columns specified in `physical_schema`, and they _must_ be in schema order.
+    ///
+    /// # Resolving Parquet schema to the physical schema
+    ///
+    /// When reading the Parquet file, the columns are resolved from the Parquet schema to the
+    /// kernel's `physical_schema`. To do so, the parquet reader must match each Parquet column
+    /// to a [`StructField`] in the `physical_schema`. All columns in the returned `EngineData`
+    /// must be in the same order as specified in `physical_schema`.
+    ///
+    /// Parquet columns are matched to `physical_schema` [`StructField`]s using the following rules:
+    /// 1. **Field ID**: If a [`StructField`] in `physical_schema` contains a field ID
+    ///    (specified in [`ColumnMetadataKey::ParquetFieldId`] metadata), use the ID to
+    ///    match the Parquet column's field id
+    /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or no matching parquet field ID is found,
+    ///    fall back to matching by column name
+    ///
+    ///  If no matching Parquet column is found, `NULL` values are returned
+    ///  for nullable columns in `physical_schema`. For non-nullable columns, an error is returned.
+    ///
+    ///
+    /// ## Examples
+    ///
+    /// Consider a `physical_schema` with the following fields:
+    /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"parquet.field.id": 1`
+    /// - Column 1: `"s"` (string, nullable) with no field ID metadata
+    /// - Column 2: `"i2"` (integer, nullable) with no field ID metadata
+    ///
+    /// And a Parquet file containing these columns:
+    /// - Column 0: `"i2"` (integer, nullable) with field ID 3
+    /// - Column 1: `"i"` (integer, non-null) with field ID 1
+    /// - No `"s"` column present
+    ///
+    /// The column matching would work as follows:
+    /// - `"i_logical"` matches `"i"` by field ID (both have ID 1)
+    /// - `"i2"` matches `"i2"` by column name (no field ID to match on)
+    /// - `"s"` has no matching Parquet column, so NULL values are returned
+    ///
+    /// The returned data will contain exactly 3 columns in physical schema order:
+    /// `{i_logical: parquet[1], s: NULL.., i2: parquet[0]}`
     ///
     /// # Parameters
     ///
     /// - `files` - File metadata for files to be read.
     /// - `physical_schema` - Select list and order of columns to read from the Parquet file.
     /// - `predicate` - Optional push-down predicate hint (engine is free to ignore it).
+    ///
+    /// # Returns
+    /// A [`DeltaResult`] containing a [`FileDataReadResultIterator`].
+    /// Each element of the iterator is a [`DeltaResult`] of [`EngineData`]. The [`EngineData`]
+    /// has the contents of `files` and must match the provided `physical_schema`.
+    ///
+    /// Note: The [`FileDataReadResultIterator`] must emit data from files in the order that `files`
+    /// is given. For example if files ["a", "b"] is provided, then the engine data iterator must
+    /// first return all the engine data from file "a", _then_ all the engine data from file "b".
+    /// Moreover, for a given file, all of its [`EngineData`] and constituent rows must be in order
+    /// that they occur in the file. Consider a file with rows
+    /// (1, 2, 3). The following are legal iterator batches:
+    ///    iter: [EngineData(1, 2), EngineData(3)]
+    ///    iter: [EngineData(1), EngineData(2, 3)]
+    ///    iter: [EngineData(1, 2, 3)]
+    /// The following are illegal batches:
+    ///    iter: [EngineData(3), EngineData(1, 2)]
+    ///    iter: [EngineData(1), EngineData(3, 2)]
+    ///    iter: [EngineData(2, 1, 3)]
+    ///
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
