@@ -9,7 +9,7 @@ use crate::arrow::datatypes::{
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, Predicate, Scalar};
+use crate::expressions::{ArrayData, Expression, Predicate, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
@@ -28,6 +28,15 @@ pub mod opaque;
 mod tests;
 
 // TODO leverage scalars / Datum
+
+/// Helper function to extract a RecordBatch from EngineData, ensuring it's ArrowEngineData
+fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<&RecordBatch> {
+    engine_data
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()
+        .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))
+        .map(|arrow_data| arrow_data.record_batch())
+}
 
 impl Scalar {
     /// Convert scalar to arrow array.
@@ -54,7 +63,7 @@ impl Scalar {
     // NOTE: `ListBuilder` and `MapBuilder` are take generic element/key/value builders in order to
     // work with specific builder types directly. However, `array::make_builder` instantiates them
     // with `Box<dyn Builder>` instead, which greatly simplifies our job in working with them. We
-    // can just extract the builder trait,and let recursive calls cast it to the desired type.
+    // can just extract the builder trait, and let recursive calls cast it to the desired type.
     //
     // WARNING: List and map builders do _NOT_ require appending any child entries to NULL list/map
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
@@ -213,6 +222,24 @@ impl Scalar {
     }
 }
 
+impl ArrayData {
+    /// Convert kernel [`ArrayData`] to Arrow [`ArrayRef`].
+    pub fn to_arrow(&self) -> DeltaResult<ArrayRef> {
+        let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())?;
+
+        #[allow(deprecated)]
+        let num_elements = self.array_elements().len();
+        let mut builder = array::make_builder(&arrow_data_type, num_elements);
+
+        #[allow(deprecated)]
+        for element in self.array_elements() {
+            element.append_to(&mut builder, 1)?;
+        }
+
+        Ok(builder.finish())
+    }
+}
+
 #[derive(Debug)]
 pub struct ArrowEvaluationHandler;
 
@@ -253,6 +280,42 @@ impl EvaluationHandler for ArrowEvaluationHandler {
             RecordBatch::try_new(Arc::new(output_schema.as_ref().try_into_arrow()?), arrays)?;
         Ok(Box::new(ArrowEngineData::new(record_batch)))
     }
+
+    fn columnar_concat(
+        &self,
+        left: &dyn EngineData,
+        right: &dyn EngineData,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let left = extract_record_batch(left)?;
+        let right = extract_record_batch(right)?;
+
+        // Combine the schemas by merging fields from both batches
+        let mut combined_fields = left.schema().fields().to_vec();
+        combined_fields.extend_from_slice(right.schema().fields());
+        let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
+
+        // Combine the columns by concatenating arrays from both batches
+        let mut combined_columns = left.columns().to_vec();
+        combined_columns.extend_from_slice(right.columns());
+
+        // Create the new RecordBatch with combined schema and columns
+        let record_batch = RecordBatch::try_new(combined_schema, combined_columns)?;
+        Ok(Box::new(ArrowEngineData::new(record_batch)))
+    }
+
+    fn convert_to_engine_data(
+        &self,
+        schema: SchemaRef,
+        columns: Vec<ArrayData>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let arrow_columns: Vec<ArrayRef> = columns
+            .into_iter()
+            .map(|col| col.to_arrow())
+            .try_collect()?;
+        let schema = schema.as_ref().try_into_arrow()?;
+        let record_batch = RecordBatch::try_new(Arc::new(schema), arrow_columns)?;
+        Ok(Box::new(ArrowEngineData::new(record_batch)))
+    }
 }
 
 #[derive(Debug)]
@@ -265,11 +328,7 @@ pub struct DefaultExpressionEvaluator {
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
-        let batch = batch
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
+        let batch = extract_record_batch(batch)?;
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
@@ -301,11 +360,7 @@ pub struct DefaultPredicateEvaluator {
 impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
-        let batch = batch
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
+        let batch = extract_record_batch(batch)?;
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {

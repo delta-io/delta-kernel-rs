@@ -1,8 +1,10 @@
+use core::{f32, f64};
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
-    ListArray, MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
+    create_array, Array, ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array,
+    GenericStringArray, Int16Array, Int32Array, Int32Builder, Int64Array, Int8Array, ListArray,
+    MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -899,4 +901,433 @@ fn test_null_scalar_map() -> DeltaResult<()> {
     assert!(map_array.is_null(0));
 
     Ok(())
+}
+
+#[test]
+fn test_columnar_concat() {
+    let handler = ArrowEvaluationHandler;
+
+    // Create left batch with 2 columns (id, name)
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let left_batch = RecordBatch::try_new(
+        left_schema,
+        vec![
+            create_array!(Int32, [1, 2, 3]),
+            create_array!(Utf8, ["Alice", "Bob", "Charlie"]),
+        ],
+    )
+    .unwrap();
+    let left_data = ArrowEngineData::new(left_batch);
+
+    // Create right batch with 2 columns (age, active)
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("age", DataType::Int32, true),
+        Field::new("active", DataType::Boolean, false),
+    ]));
+    let right_batch = RecordBatch::try_new(
+        right_schema,
+        vec![
+            create_array!(Int32, [25, 30, 35]),
+            create_array!(Boolean, [true, false, true]),
+        ],
+    )
+    .unwrap();
+    let right_data = ArrowEngineData::new(right_batch);
+
+    // Test concatenation
+    let result = handler.columnar_concat(&left_data, &right_data).unwrap();
+    let result_batch: RecordBatch = result
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .unwrap()
+        .into();
+
+    // Verify the result has all 4 columns in the correct order
+    assert_eq!(result_batch.num_columns(), 4);
+    assert_eq!(result_batch.num_rows(), 3);
+
+    let schema = result_batch.schema();
+    assert_eq!(schema.field(0).name(), "id");
+    assert_eq!(schema.field(1).name(), "name");
+    assert_eq!(schema.field(2).name(), "age");
+    assert_eq!(schema.field(3).name(), "active");
+
+    // Verify the data is correct
+    let id_column = result_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(id_column.values(), &[1, 2, 3]);
+
+    let name_column = result_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<GenericStringArray<i32>>()
+        .unwrap();
+    assert_eq!(name_column.value(0), "Alice");
+    assert_eq!(name_column.value(1), "Bob");
+    assert_eq!(name_column.value(2), "Charlie");
+
+    let age_column = result_batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(age_column.values(), &[25, 30, 35]);
+
+    let active_column = result_batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(active_column.value(0));
+    assert!(!active_column.value(1));
+    assert!(active_column.value(2));
+}
+
+#[test]
+fn test_columnar_concat_mismatched_rows() {
+    let handler = ArrowEvaluationHandler;
+
+    // Create left batch with 3 rows
+    let left_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let left_batch =
+        RecordBatch::try_new(left_schema, vec![create_array!(Int32, [1, 2, 3])]).unwrap();
+    let left_data = ArrowEngineData::new(left_batch);
+
+    // Create right batch with 2 rows (different count)
+    let right_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let right_batch =
+        RecordBatch::try_new(right_schema, vec![create_array!(Utf8, ["Alice", "Bob"])]).unwrap();
+    let right_data = ArrowEngineData::new(right_batch);
+
+    // Test that concatenation fails with mismatched row counts
+    let result = handler.columnar_concat(&left_data, &right_data);
+    assert!(result.is_err());
+    if let Err(err) = result {
+        assert!(err
+            .to_string()
+            .contains("all columns in a record batch must have the same length"));
+    }
+}
+
+#[test]
+fn test_columnar_concat_empty_batches() {
+    let handler = ArrowEvaluationHandler;
+
+    // Create left batch with 0 rows
+    let left_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let left_batch = RecordBatch::try_new(
+        left_schema,
+        vec![Arc::new(Int32Array::from(vec![] as Vec<i32>))],
+    )
+    .unwrap();
+    let left_data = ArrowEngineData::new(left_batch);
+
+    // Create right batch with 0 rows
+    let right_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let right_batch = RecordBatch::try_new(
+        right_schema,
+        vec![Arc::new(StringArray::from(vec![] as Vec<&str>))],
+    )
+    .unwrap();
+    let right_data = ArrowEngineData::new(right_batch);
+
+    // Test concatenation of empty batches
+    let result = handler.columnar_concat(&left_data, &right_data).unwrap();
+    let result_batch: RecordBatch = result
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .unwrap()
+        .into();
+
+    assert_eq!(result_batch.num_columns(), 2);
+    assert_eq!(result_batch.num_rows(), 0);
+    assert_eq!(result_batch.schema().field(0).name(), "id");
+    assert_eq!(result_batch.schema().field(1).name(), "name");
+}
+
+#[test]
+fn test_convert_to_engine_data() {
+    let handler = ArrowEvaluationHandler;
+
+    // Test with simple integer array
+    let int_values = vec![1, 2, 3];
+    let int_array_data =
+        ArrayData::try_new(ArrayType::new(KernelDataType::INTEGER, false), int_values).unwrap();
+
+    let schema = Arc::new(StructType::new(vec![StructField::new(
+        "col1",
+        KernelDataType::INTEGER,
+        false,
+    )]));
+
+    let result = handler
+        .convert_to_engine_data(schema.clone(), vec![int_array_data])
+        .unwrap();
+    let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
+    let batch = arrow_data.record_batch();
+
+    assert_eq!(batch.num_columns(), 1);
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(batch.column(0).len(), 3);
+
+    // Verify the values
+    let int_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(int_array.value(0), 1);
+    assert_eq!(int_array.value(1), 2);
+    assert_eq!(int_array.value(2), 3);
+}
+
+#[test]
+fn test_convert_to_engine_data_multiple_columns() {
+    let handler = ArrowEvaluationHandler;
+
+    // Create multiple columns with different types
+    let int_values = vec![10, 20];
+    let int_array_data =
+        ArrayData::try_new(ArrayType::new(KernelDataType::INTEGER, true), int_values).unwrap();
+
+    let string_values = vec!["hello".to_string(), "world".to_string()];
+    let string_array_data =
+        ArrayData::try_new(ArrayType::new(KernelDataType::STRING, true), string_values).unwrap();
+
+    let bool_values = vec![true, false];
+    let bool_array_data =
+        ArrayData::try_new(ArrayType::new(KernelDataType::BOOLEAN, true), bool_values).unwrap();
+
+    let schema = Arc::new(StructType::new(vec![
+        StructField::new("int_col", KernelDataType::INTEGER, true),
+        StructField::new("str_col", KernelDataType::STRING, true),
+        StructField::new("bool_col", KernelDataType::BOOLEAN, true),
+    ]));
+
+    let result = handler
+        .convert_to_engine_data(
+            schema.clone(),
+            vec![int_array_data, string_array_data, bool_array_data],
+        )
+        .unwrap();
+
+    let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
+    let batch = arrow_data.record_batch();
+
+    assert_eq!(batch.num_columns(), 3);
+    assert_eq!(batch.num_rows(), 2);
+
+    // Verify integer column
+    let int_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(int_array.value(0), 10);
+    assert_eq!(int_array.value(1), 20);
+
+    // Verify string column
+    let string_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(string_array.value(0), "hello");
+    assert_eq!(string_array.value(1), "world");
+
+    // Verify boolean column
+    let bool_array = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert!(bool_array.value(0));
+    assert!(!bool_array.value(1));
+}
+
+#[test]
+fn test_convert_to_engine_data_empty_array() {
+    let handler = ArrowEvaluationHandler;
+
+    // Test with empty array
+    let empty_values: Vec<Scalar> = vec![];
+    let empty_array_data =
+        ArrayData::try_new(ArrayType::new(KernelDataType::INTEGER, true), empty_values).unwrap();
+
+    let schema = Arc::new(StructType::new(vec![StructField::new(
+        "col1",
+        KernelDataType::INTEGER,
+        true,
+    )]));
+
+    let result = handler
+        .convert_to_engine_data(schema.clone(), vec![empty_array_data])
+        .unwrap();
+    let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
+    let batch = arrow_data.record_batch();
+
+    assert_eq!(batch.num_columns(), 1);
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.column(0).len(), 0);
+}
+
+#[test]
+fn test_convert_to_engine_data_with_nulls() {
+    let handler = ArrowEvaluationHandler;
+
+    // Test with array containing null values
+    let values_with_nulls = vec![Some(42), None::<i32>, Some(84)];
+    let array_data = ArrayData::try_new(
+        ArrayType::new(KernelDataType::INTEGER, true),
+        values_with_nulls,
+    )
+    .unwrap();
+
+    let schema = Arc::new(StructType::new(vec![StructField::new(
+        "col1",
+        KernelDataType::INTEGER,
+        true,
+    )]));
+
+    let result = handler
+        .convert_to_engine_data(schema.clone(), vec![array_data])
+        .unwrap();
+    let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
+    let batch = arrow_data.record_batch();
+
+    assert_eq!(batch.num_columns(), 1);
+    assert_eq!(batch.num_rows(), 3);
+
+    let int_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    assert_eq!(int_array.value(0), 42);
+    assert!(int_array.is_null(1));
+    assert_eq!(int_array.value(2), 84);
+}
+
+#[test]
+fn test_convert_to_engine_data_various_types() {
+    let handler = ArrowEvaluationHandler;
+
+    // Test with various primitive types
+    let long_values = vec![Scalar::Long(9223372036854775807)];
+    let float_values = vec![Scalar::Float(f32::consts::PI)];
+    let double_values = vec![Scalar::Double(f64::consts::E)];
+    let byte_values = vec![Scalar::Byte(127)];
+    let short_values = vec![Scalar::Short(32767)];
+    let binary_values = vec![Scalar::Binary(vec![0x42, 0x43, 0x44])];
+
+    let schema = Arc::new(StructType::new(vec![
+        StructField::new("long_col", KernelDataType::LONG, true),
+        StructField::new("float_col", KernelDataType::FLOAT, true),
+        StructField::new("double_col", KernelDataType::DOUBLE, true),
+        StructField::new("byte_col", KernelDataType::BYTE, true),
+        StructField::new("short_col", KernelDataType::SHORT, true),
+        StructField::new("binary_col", KernelDataType::BINARY, true),
+    ]));
+
+    let result = handler
+        .convert_to_engine_data(
+            schema.clone(),
+            vec![
+                ArrayData::try_new(ArrayType::new(KernelDataType::LONG, true), long_values)
+                    .unwrap(),
+                ArrayData::try_new(ArrayType::new(KernelDataType::FLOAT, true), float_values)
+                    .unwrap(),
+                ArrayData::try_new(ArrayType::new(KernelDataType::DOUBLE, true), double_values)
+                    .unwrap(),
+                ArrayData::try_new(ArrayType::new(KernelDataType::BYTE, true), byte_values)
+                    .unwrap(),
+                ArrayData::try_new(ArrayType::new(KernelDataType::SHORT, true), short_values)
+                    .unwrap(),
+                ArrayData::try_new(ArrayType::new(KernelDataType::BINARY, true), binary_values)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+
+    let arrow_data = result.any_ref().downcast_ref::<ArrowEngineData>().unwrap();
+    let batch = arrow_data.record_batch();
+
+    assert_eq!(batch.num_columns(), 6);
+    assert_eq!(batch.num_rows(), 1);
+
+    // Verify each column type and value
+    let long_array = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(long_array.value(0), 9223372036854775807);
+
+    let float_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .unwrap();
+    assert!((float_array.value(0) - f32::consts::PI).abs() < f32::EPSILON);
+
+    let double_array = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!((double_array.value(0) - f64::consts::E).abs() < f64::EPSILON);
+
+    let byte_array = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Int8Array>()
+        .unwrap();
+    assert_eq!(byte_array.value(0), 127);
+
+    let short_array = batch
+        .column(4)
+        .as_any()
+        .downcast_ref::<Int16Array>()
+        .unwrap();
+    assert_eq!(short_array.value(0), 32767);
+
+    let binary_array = batch
+        .column(5)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(binary_array.value(0), &[0x42, 0x43, 0x44]);
+}
+
+#[test]
+fn test_convert_to_engine_data_schema_mismatch() {
+    let handler = ArrowEvaluationHandler;
+
+    // Create data with 2 columns but schema with 1 column
+    let int_values = vec![1, 2];
+    let string_values = vec!["test".to_string(), "data".to_string()];
+
+    let schema = Arc::new(StructType::new(vec![
+        StructField::new("col1", KernelDataType::INTEGER, true),
+        // Missing second column in schema
+    ]));
+
+    let result = handler.convert_to_engine_data(
+        schema.clone(),
+        vec![
+            ArrayData::try_new(ArrayType::new(KernelDataType::INTEGER, true), int_values).unwrap(),
+            ArrayData::try_new(ArrayType::new(KernelDataType::STRING, true), string_values)
+                .unwrap(),
+        ],
+    );
+
+    // This should fail because we have 2 columns but schema only defines 1
+    assert!(result.is_err());
 }
