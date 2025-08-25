@@ -415,6 +415,7 @@ impl StructType {
         self.fields.values()
     }
 
+    #[allow(unused)] // Most uses can leverage ExactSizeIterator::len instead
     pub(crate) fn fields_len(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()

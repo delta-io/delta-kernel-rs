@@ -334,11 +334,14 @@ pub fn get_transform_for_row(
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// [`TransformSpec`].
 pub(crate) enum FieldTransformSpec {
+    /// Replace the given physical field name with an expression
     #[allow(unused)]
-    StaticReplace(String, ExpressionRef), // Replace physical_field_name with expression
+    StaticReplace(String, ExpressionRef),
+    /// Insert the given expression after the given physical field name (None = prepend instead)
     #[allow(unused)]
-    StaticInsert(Option<String>, ExpressionRef), // Insert expression after physical_field_name (None = prepend)
-    Partition(Option<String>, usize), // (insert_after_physical_field, logical_index)
+    StaticInsert(Option<String>, ExpressionRef),
+    /// Insert the ith partition value after the given physical field name
+    Partition(Option<String>, usize),
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned

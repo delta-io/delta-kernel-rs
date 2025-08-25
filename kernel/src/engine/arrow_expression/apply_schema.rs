@@ -65,6 +65,7 @@ fn transform_struct(
     target_fields: impl Iterator<Item = impl Borrow<StructField>>,
 ) -> DeltaResult<StructArray> {
     let (_, arrow_cols, nulls) = struct_array.clone().into_parts();
+    let input_col_count = arrow_cols.len();
     let result_iter =
         arrow_cols
             .into_iter()
@@ -82,7 +83,12 @@ fn transform_struct(
             });
     let (transformed_fields, transformed_cols): (Vec<ArrowField>, Vec<ArrayRef>) =
         result_iter.process_results(|iter| iter.unzip())?;
-
+    if transformed_cols.len() != input_col_count {
+        return Err(Error::InternalError(format!(
+            "Passed struct had {input_col_count} columns, but transformed column has {}",
+            transformed_cols.len()
+        )));
+    }
     Ok(StructArray::try_new(
         transformed_fields.into(),
         transformed_cols,
