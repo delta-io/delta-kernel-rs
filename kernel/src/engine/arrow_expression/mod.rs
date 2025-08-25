@@ -29,6 +29,15 @@ mod tests;
 
 // TODO leverage scalars / Datum
 
+/// Helper function to extract a RecordBatch from EngineData, ensuring it's ArrowEngineData
+fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<&RecordBatch> {
+    engine_data
+        .any_ref()
+        .downcast_ref::<ArrowEngineData>()
+        .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))
+        .map(|arrow_data| arrow_data.record_batch())
+}
+
 impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
@@ -277,26 +286,16 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         left: &dyn EngineData,
         right: &dyn EngineData,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let left = left
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
-        let right = right
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
+        let left = extract_record_batch(left)?;
+        let right = extract_record_batch(right)?;
 
         // Combine the schemas by merging fields from both batches
-        let mut combined_fields = Vec::new();
-        combined_fields.extend_from_slice(left.schema().fields());
+        let mut combined_fields = left.schema().fields().to_vec();
         combined_fields.extend_from_slice(right.schema().fields());
         let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
 
         // Combine the columns by concatenating arrays from both batches
-        let mut combined_columns = Vec::new();
-        combined_columns.extend_from_slice(left.columns());
+        let mut combined_columns = left.columns().to_vec();
         combined_columns.extend_from_slice(right.columns());
 
         // Create the new RecordBatch with combined schema and columns
@@ -329,11 +328,7 @@ pub struct DefaultExpressionEvaluator {
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
-        let batch = batch
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
+        let batch = extract_record_batch(batch)?;
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
@@ -365,11 +360,7 @@ pub struct DefaultPredicateEvaluator {
 impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
-        let batch = batch
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
+        let batch = extract_record_batch(batch)?;
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
