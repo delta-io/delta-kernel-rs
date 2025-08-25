@@ -57,17 +57,21 @@ impl ProvidesColumnByName for StructArray {
 // }
 // ```
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-fn extract_column(mut parent: &dyn ProvidesColumnByName, col: &[String]) -> DeltaResult<ArrayRef> {
+fn extract_column(
+    mut parent: &dyn ProvidesColumnByName,
+    col: &[impl AsRef<str>],
+) -> DeltaResult<ArrayRef> {
     let mut field_names = col.iter();
-    let Some(mut field_name) = field_names.next() else {
+    let Some(field_name) = field_names.next() else {
         return Err(ArrowError::SchemaError("Empty column path".to_string()))?;
     };
+    let mut field_name = field_name.as_ref();
     loop {
         let child = parent
             .column_by_name(field_name)
             .ok_or_else(|| ArrowError::SchemaError(format!("No such field: {field_name}")))?;
         field_name = match field_names.next() {
-            Some(name) => name,
+            Some(name) => name.as_ref(),
             None => return Ok(child.clone()),
         };
         parent = child
@@ -111,13 +115,18 @@ fn evaluate_transform_expression(
 ) -> DeltaResult<ArrayRef> {
     // Build expression list based on input schema order with insertions
     let input_schema = batch.schema();
-    let mut expressions = Vec::new();
     let mut used_insertion_keys = 0;
     let mut used_replacement_keys = 0;
+    let mut nested_path: Vec<&String> = transform.nested_input_path.iter().collect();
+
+    // Collect output columns directly to avoid creating intermediate Expr::Column instances.
+    let mut output_cols = Vec::new();
 
     // Handle prepends (insertions before any field)
     if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
-        expressions.extend(prepend_exprs.iter().cloned()); // cheap Arc clone
+        for expr in prepend_exprs {
+            output_cols.push(evaluate_expression(expr, batch, None)?);
+        }
         used_insertion_keys += 1;
     }
 
@@ -129,11 +138,13 @@ fn evaluate_transform_expression(
         if let Some(replacement) = transform.field_replacements.get(field_name) {
             used_replacement_keys += 1;
             if let Some(expr) = replacement {
-                expressions.push(expr.clone());
+                output_cols.push(evaluate_expression(expr, batch, None)?);
             } // else no replacement => dropped
         } else {
             // Field passes through unchanged
-            expressions.push(Arc::new(Expression::column([field_name])));
+            nested_path.push(field_name);
+            output_cols.push(extract_column(batch, nested_path.as_slice())?);
+            nested_path.pop();
         }
 
         // Handle insertions after this input field
@@ -142,7 +153,9 @@ fn evaluate_transform_expression(
             .get(&Some(field_name.to_string()))
         // TODO: Somehow impl Borrow
         {
-            expressions.extend(insertion_exprs.iter().cloned()); // cheap Arc clone
+            for expr in insertion_exprs {
+                output_cols.push(evaluate_expression(expr, batch, None)?);
+            }
             used_insertion_keys += 1;
         }
     }
@@ -159,17 +172,27 @@ fn evaluate_transform_expression(
         ));
     }
 
-    // Validate expression count matches output schema
-    if expressions.len() != output_schema.fields_len() {
+    if output_cols.len() != output_schema.fields_len() {
         return Err(Error::generic(format!(
             "Expression count ({}) doesn't match output schema field count ({})",
-            expressions.len(),
+            output_cols.len(),
             output_schema.fields_len()
         )));
     }
 
-    // Delegate to struct evaluation logic
-    evaluate_struct_expression(&expressions, batch, output_schema)
+    let output_fields: Vec<ArrowField> = output_cols
+        .iter()
+        .zip(output_schema.fields())
+        .map(|(output_col, output_field)| {
+            ArrowField::new(
+                output_field.name(),
+                output_col.data_type().clone(),
+                output_col.is_nullable(),
+            )
+        })
+        .collect();
+    let data = StructArray::try_new(output_fields.into(), output_cols, None)?;
+    Ok(Arc::new(data))
 }
 
 /// Evaluates a kernel expression over a record batch

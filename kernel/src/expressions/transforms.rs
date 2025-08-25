@@ -270,6 +270,7 @@ pub trait ExpressionTransform<'a> {
                 .map(|(key, exprs)| (key.to_owned(), exprs.into_owned()))
                 .collect();
             Some(Cow::Owned(Transform {
+                nested_input_path: t.nested_input_path.clone(),
                 field_replacements,
                 field_insertions,
             }))
