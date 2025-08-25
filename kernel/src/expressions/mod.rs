@@ -483,10 +483,7 @@ impl Expression {
 
     /// Creates a new unary expression
     pub fn unary(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
-        Self::Unary(UnaryExpression {
-            op,
-            expr: Box::new(expr.into()),
-        })
+        Self::Unary(UnaryExpression::new(op, expr))
     }
 
     /// Creates a new binary expression lhs OP rhs
@@ -495,11 +492,7 @@ impl Expression {
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
-        Self::Binary(BinaryExpression {
-            op,
-            left: Box::new(lhs.into()),
-            right: Box::new(rhs.into()),
-        })
+        Self::Binary(BinaryExpression::new(op, lhs, rhs))
     }
 
     /// Creates a new opaque expression
