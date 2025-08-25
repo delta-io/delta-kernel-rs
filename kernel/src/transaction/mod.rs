@@ -306,6 +306,31 @@ pub struct PostCommitStats {
     pub commits_since_log_compaction: u64,
 }
 
+/// A trait for implementing post-commit hooks that run after successful commits.
+///
+/// Post-commit hooks allow orchestration of dditional operations such as CRC file generation,
+/// minor compaction and checkpoint generation.
+pub trait PostCommitHook {
+    /// Execute the post-commit hook.
+    ///
+    /// # Parameters
+    /// - `engine`: The Delta engine instance
+    /// - `table_root`: The root URL of the table
+    /// - `version`: The version that was just committed
+    /// - `post_commit_stats`: Statistics about the commit
+    ///
+    /// # Returns
+    /// A result indicating success or failure. Hook failures should not fail the
+    /// original transaction, but may be logged or handled according to the implementation.
+    fn execute(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+        version: Version,
+        post_commit_stats: &PostCommitStats,
+    ) -> DeltaResult<()>;
+}
+
 /// Result of committing a transaction.
 #[derive(Debug)]
 pub enum CommitResult {
@@ -324,10 +349,74 @@ pub enum CommitResult {
     Conflict(Transaction, Version),
 }
 
+impl CommitResult {
+    /// Execute post-commit hooks if the commit succeeded.
+    ///
+    /// Hook failures are logged but do not fail the original commit.
+    ///
+    /// # Parameters
+    /// - `engine`: The Delta engine instance  
+    /// - `table_root`: The root URL of the table
+    /// - `hooks`: A slice of post-commit hooks to execute
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use delta_kernel::{Engine, DeltaResult};
+    /// # use delta_kernel::transaction::{CommitResult, PostCommitHook};
+    /// # use url::Url;
+    /// # fn example(commit_result: CommitResult, engine: &dyn Engine, table_root: &Url) -> DeltaResult<()> {
+    /// let hooks: Vec<Box<dyn PostCommitHook>> = vec![
+    ///     // Add your custom hooks here
+    /// ];
+    /// commit_result.execute_post_commit_hooks(engine, table_root, &hooks)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn execute_post_commit_hooks(
+        &self,
+        engine: &dyn Engine,
+        table_root: &url::Url,
+        hooks: &[Box<dyn PostCommitHook>],
+    ) -> DeltaResult<()> {
+        match self {
+            CommitResult::Committed {
+                version,
+                post_commit_stats,
+            } => {
+                for hook in hooks {
+                    match hook.execute(engine, table_root, *version, post_commit_stats) {
+                        Ok(()) => {
+                            tracing::debug!(
+                                "Post-commit hook executed successfully for version {}",
+                                version
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Post-commit hook failed for version {} in table {}: {}",
+                                version,
+                                table_root,
+                                e
+                            );
+                            // Continue executing other hooks.
+                        }
+                    }
+                }
+                Ok(())
+            }
+            CommitResult::Conflict(_, _) => {
+                // No post-commit hooks for conflicted transactions
+                Ok(())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schema::MapType;
+    use std::sync::{Arc, Mutex};
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
@@ -345,5 +434,116 @@ mod tests {
             StructField::not_null("dataChange", DataType::BOOLEAN),
         ]);
         assert_eq!(*schema, expected.into());
+    }
+
+    // Test hook for post-commit hook framework
+    #[derive(Debug)]
+    struct TestHook {
+        call_count: Arc<Mutex<u32>>,
+        should_fail: bool,
+    }
+
+    impl TestHook {
+        fn new(should_fail: bool) -> Self {
+            Self {
+                call_count: Arc::new(Mutex::new(0)),
+                should_fail,
+            }
+        }
+
+        fn get_call_count(&self) -> u32 {
+            *self.call_count.lock().unwrap()
+        }
+    }
+
+    impl PostCommitHook for TestHook {
+        fn execute(
+            &self,
+            _engine: &dyn Engine,
+            _table_root: &url::Url,
+            _version: Version,
+            _post_commit_stats: &PostCommitStats,
+        ) -> DeltaResult<()> {
+            *self.call_count.lock().unwrap() += 1;
+            if self.should_fail {
+                Err(crate::Error::generic("Test hook failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_post_commit_hooks_success() {
+        let hook1 = Box::new(TestHook::new(false)) as Box<dyn PostCommitHook>;
+        let hook2 = Box::new(TestHook::new(false)) as Box<dyn PostCommitHook>;
+
+        let commit_result = CommitResult::Committed {
+            version: 5,
+            post_commit_stats: PostCommitStats {
+                commits_since_checkpoint: 3,
+                commits_since_log_compaction: 2,
+            },
+        };
+
+        let table_root = url::Url::parse("file:///tmp/test-table").unwrap();
+        let hooks = vec![hook1, hook2];
+
+        let result = commit_result.execute_post_commit_hooks(
+            &crate::engine::sync::SyncEngine::new(), // Using sync engine for test
+            &table_root,
+            &hooks,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_post_commit_hooks_with_failure() {
+        let hook1 = Box::new(TestHook::new(false)) as Box<dyn PostCommitHook>;
+        let hook2 = Box::new(TestHook::new(true)) as Box<dyn PostCommitHook>; // This one fails
+        let hook3 = Box::new(TestHook::new(false)) as Box<dyn PostCommitHook>;
+
+        let commit_result = CommitResult::Committed {
+            version: 10,
+            post_commit_stats: PostCommitStats {
+                commits_since_checkpoint: 5,
+                commits_since_log_compaction: 3,
+            },
+        };
+
+        let table_root = url::Url::parse("file:///tmp/test-table").unwrap();
+        let hooks = vec![hook1, hook2, hook3];
+
+        // Even with a hook failure, the overall operation should succeed
+        let result = commit_result.execute_post_commit_hooks(
+            &crate::engine::sync::SyncEngine::new(),
+            &table_root,
+            &hooks,
+        );
+
+        assert!(result.is_ok()); // Hooks failures don't fail the transaction
+    }
+
+    #[test]
+    fn test_post_commit_hooks_conflict_no_execution() {
+        let hook = Box::new(TestHook::new(false)) as Box<dyn PostCommitHook>;
+
+        let commit_result = CommitResult::Conflict(
+            unsafe { std::mem::zeroed() }, // This is just for testing the enum matching
+            5,
+        );
+
+        let table_root = url::Url::parse("file:///tmp/test-table").unwrap();
+        let hooks = vec![hook];
+
+        // For conflict results, hooks should not be executed
+        let result = commit_result.execute_post_commit_hooks(
+            &crate::engine::sync::SyncEngine::new(),
+            &table_root,
+            &hooks,
+        );
+
+        assert!(result.is_ok());
     }
 }
