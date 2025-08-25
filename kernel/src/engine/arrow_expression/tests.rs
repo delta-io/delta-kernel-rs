@@ -1,14 +1,14 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, AsArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    StructArray,
+    create_array, Array, ArrayRef, AsArray, BooleanArray, Float64Array, GenericStringArray,
+    Int32Array, Int32Builder, Int64Array, ListArray, MapArray, MapBuilder, MapFieldNames,
+    StringArray, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
-use crate::engine::arrow_expression::evaluate_expression::to_json;
+use crate::engine::arrow_expression::evaluate_expression::{coalesce_arrays, to_json};
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
@@ -1181,4 +1181,95 @@ fn benchmark_to_json_performance() {
             assert!(second_json.contains("\"name\":\"user_1\""));
         }
     }
+}
+
+#[test]
+fn test_coalesce_mixed_ints() {
+    let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+    let b: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(200), None]));
+
+    let result = coalesce_arrays(&[a, b], None).unwrap();
+    let arr = result.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        arr.iter().collect::<Vec<_>>(),
+        vec![Some(1), Some(200), Some(3)]
+    );
+}
+
+#[test]
+fn test_coalesce_int_and_float() {
+    let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, None]));
+    let b: ArrayRef = Arc::new(Float64Array::from(vec![None, Some(2.5), None]));
+
+    let result = coalesce_arrays(&[a, b], Some(&KernelDataType::DOUBLE)).unwrap();
+    let arr = result.as_any().downcast_ref::<Float64Array>().unwrap();
+    assert_eq!(arr.value(0), 1.0);
+    assert_eq!(arr.value(1), 2.5);
+    assert!(arr.is_null(2));
+}
+
+#[test]
+fn test_coalesce_strings() {
+    let a: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None]));
+    let b: ArrayRef = Arc::new(StringArray::from(vec![None, Some("b")]));
+
+    let result = coalesce_arrays(&[a, b], None).unwrap();
+    let arr = result.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(arr.value(0), "a");
+    assert_eq!(arr.value(1), "b");
+}
+
+#[test]
+fn test_coalesce_all_nulls() {
+    let a: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
+    let b: ArrayRef = Arc::new(Int32Array::from(vec![None, None]));
+
+    let result = coalesce_arrays(&[a, b], None).unwrap();
+    let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert!(arr.is_null(0));
+    assert!(arr.is_null(1));
+}
+
+#[test]
+fn test_coalesce_empty_arrays() {
+    let result = coalesce_arrays(&[], None);
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("The default engine currently does not support empty COALESCE statements"));
+}
+
+#[test]
+fn test_coalesce_mismatched_lengths() {
+    let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1)]));
+    let b: ArrayRef = Arc::new(Int32Array::from(vec![Some(2), Some(3)]));
+
+    let result = coalesce_arrays(&[a, b], None);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("has length"));
+}
+
+#[test]
+fn test_coalesce_wrong_result_type() {
+    let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+    let b: ArrayRef = Arc::new(Float64Array::from(vec![None, Some(2.5), None]));
+
+    let result = coalesce_arrays(&[a, b], Some(&KernelDataType::STRING));
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Requested result type"));
+}
+
+#[test]
+fn test_coalesce_single_array() {
+    let a: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+
+    let result = coalesce_arrays(&[a.clone()], None).unwrap();
+    let arr = result.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(arr.value(0), 1);
+    assert!(arr.is_null(1));
+    assert_eq!(arr.value(2), 3);
 }

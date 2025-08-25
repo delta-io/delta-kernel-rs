@@ -6,20 +6,21 @@ use itertools::Itertools;
 
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, NullBufferBuilder, RecordBatch, StringArray,
-    StructArray,
+    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
+    NullBufferBuilder, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -29,7 +30,7 @@ use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
     Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp,
+    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, StructType};
 
@@ -224,6 +225,7 @@ pub fn evaluate_expression(
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
+    use VariadicExpressionOp::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
@@ -268,6 +270,19 @@ pub fn evaluate_expression(
             };
 
             Ok(eval(&left_arr, &right_arr)?)
+        }
+        (
+            Variadic(VariadicExpression {
+                op: Coalesce,
+                exprs,
+            }),
+            result_type,
+        ) => {
+            let arrays: Vec<ArrayRef> = exprs
+                .iter()
+                .map(|expr| evaluate_expression(expr, batch, None))
+                .try_collect()?;
+            Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -488,6 +503,192 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
             "TO_JSON can only be applied to struct arrays, got {:?}",
             array_ref.data_type()
         ))),
+    }
+}
+
+/// Coalesce multiple arrays into one by selecting the first non-null value from each row.
+///
+/// This function implements SQL COALESCE semantics: for each row, it iterates through
+/// the input arrays from left to right and returns the first non-null value found. If all values
+/// are null for a given row, the result will be null for that row.
+///
+/// When arrays have different data types, they are automatically cast to a common supertype
+/// using the [`common_supertype`] utility. Refer to its documentation for more details on
+/// the supported type coercion cases.
+///
+/// # Parameters
+/// - `arrays`: Slice of Arrow arrays to coalesce.
+/// - `result_type`: Optional expected result type. If provided, must match the computed common supertype.
+///
+/// # Returns
+/// An `ArrayRef` containing the coalesced values with the same number of rows as the input arrays.
+///
+/// # Errors
+/// This function returns an `ArrowError` in the following cases:
+/// - **Empty input**: The default engine currently does not support empty COALESCE statements.
+/// - **Mismatched row counts**: Not all arrays have the same number of rows.
+/// - **No common supertype**: The input arrays have incompatible types that cannot be promoted to a common type.
+/// - **Invalid result type**: If `result_type` is provided but doesn't match the computed common supertype.
+/// - **Invalid cast operations**: Arrow's cast function fails when converting arrays to the common supertype.
+pub fn coalesce_arrays(
+    arrays: &[ArrayRef],
+    result_type: Option<&DataType>,
+) -> Result<ArrayRef, ArrowError> {
+    if arrays.is_empty() {
+        return Err(ArrowError::InvalidArgumentError(
+            "The default engine currently does not support empty COALESCE statements".into(),
+        ));
+    }
+
+    // Early exit for single array case
+    if arrays.len() == 1 {
+        let array = &arrays[0];
+
+        // Validate result type if provided
+        if let Some(result_type) = result_type {
+            let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
+            if array.data_type() != &result_arrow_type {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "Single array type {:?} does not match requested result type {result_type:?}",
+                    array.data_type()
+                )));
+            }
+        }
+
+        return Ok(array.clone());
+    }
+
+    // Validate all arrays have the same length and collect types
+    let num_rows = arrays[0].len();
+    let mut types = Vec::with_capacity(arrays.len());
+    for (i, arr) in arrays.iter().enumerate() {
+        if arr.len() != num_rows {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Array at index {i} has length {}, expected {num_rows}",
+                arr.len()
+            )));
+        }
+        types.push(arr.data_type());
+    }
+
+    // Find common type
+    let supertype = common_supertype(&types).ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!(
+            "Could not find common supertype for types: {types:?}"
+        ))
+    })?;
+
+    // Validate result type if provided
+    if let Some(result_type) = result_type {
+        let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
+        if result_arrow_type != supertype {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Requested result type {result_type:?} does not match common supertype {supertype:?}"
+            )));
+        }
+    }
+
+    // Cast arrays to common supertype and collect ArrayData for MutableArrayData
+    let (casted, array_data): (Vec<ArrayRef>, Vec<ArrayData>) = arrays
+        .iter()
+        .map(|arr| {
+            let arr = if arr.data_type() == &supertype {
+                arr.clone()
+            } else {
+                cast(arr, &supertype)?
+            };
+            let data = arr.to_data();
+            Ok((arr, data))
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?
+        .into_iter()
+        .unzip();
+
+    // Build result
+    let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, num_rows);
+    for row in 0..num_rows {
+        // Find first non-null value for this row
+        match casted.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
+            Some((array_idx, _)) => {
+                mutable.extend(array_idx, row, row + 1);
+            }
+            None => {
+                mutable.extend_nulls(1);
+            }
+        }
+    }
+
+    Ok(make_array(mutable.freeze()))
+}
+
+/// Find a common supertype for a list of DataTypes via simple heuristics.
+///
+/// We currently only handle a limited set of types and pick the "widest" compatible type without lossy conversions.
+///
+/// The promotion follows these principles:
+/// - Integer types promote to wider integer types (e.g., Int32 + Int64 → Int64)
+/// - Float types promote to wider float types (Float32 + Float64 → Float64)
+/// - Integers can promote to floats if they can be exactly represented:
+///   - Int8, Int16, UInt8, UInt16 can promote to Float32 (24-bit precision)
+///   - Int8, Int16, Int32, UInt8, UInt16, UInt32 can promote to Float64 (53-bit precision)
+/// - Mixed signed/unsigned integers promote to the wider signed type when safe
+/// - Other types (e.g., strings, booleans) do not have a common supertype
+fn common_supertype(types: &[&ArrowDataType]) -> Option<ArrowDataType> {
+    if types.is_empty() {
+        return None;
+    }
+
+    // Try pairwise promotion
+    types.iter().skip(1).try_fold(types[0].clone(), |acc, &t| {
+        if acc == *t {
+            Some(acc)
+        } else {
+            promote_types(&acc, t)
+        }
+    })
+}
+
+/// Promote two types to their common supertype
+fn promote_types(left: &ArrowDataType, right: &ArrowDataType) -> Option<ArrowDataType> {
+    use ArrowDataType::*;
+
+    match (left, right) {
+        // Same types
+        (a, b) if a == b => Some(a.clone()),
+
+        // Float type promotion
+        (Float64, Float32) | (Float32, Float64) => Some(Float64),
+
+        // Safe integer to float promotions
+        // Float32 can exactly represent integers up to 2^24
+        // Float64 can exactly represent integers up to 2^53
+        (Float32, Int8 | Int16 | UInt8 | UInt16) => Some(Float32),
+        (Int8 | Int16 | UInt8 | UInt16, Float32) => Some(Float32),
+        (Float64, Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32) => Some(Float64),
+        (Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32, Float64) => Some(Float64),
+
+        // Integer promotion - signed takes precedence and we promote to wider types
+        (Int64, Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32) => Some(Int64),
+        (Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32, Int64) => Some(Int64),
+        (Int32, Int8 | Int16 | UInt8 | UInt16) => Some(Int32),
+        (Int8 | Int16 | UInt8 | UInt16, Int32) => Some(Int32),
+        (Int16, Int8 | UInt8) => Some(Int16),
+        (Int8 | UInt8, Int16) => Some(Int16),
+
+        // Mixed signed/unsigned integer promotion to next larger signed type
+        (Int32, UInt32) | (UInt32, Int32) => Some(Int64),
+        (Int16, UInt16) | (UInt16, Int16) => Some(Int32),
+        (Int8, UInt8) | (UInt8, Int8) => Some(Int16),
+
+        // Unsigned integer promotion
+        (UInt64, UInt8 | UInt16 | UInt32) => Some(UInt64),
+        (UInt8 | UInt16 | UInt32, UInt64) => Some(UInt64),
+        (UInt32, UInt8 | UInt16) => Some(UInt32),
+        (UInt8 | UInt16, UInt32) => Some(UInt32),
+        (UInt16, UInt8) | (UInt8, UInt16) => Some(UInt16),
+
+        // No common type found
+        _ => None,
     }
 }
 
