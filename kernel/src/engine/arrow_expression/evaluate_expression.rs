@@ -113,11 +113,8 @@ fn evaluate_transform_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    // Build expression list based on input schema order with insertions
-    let input_schema = batch.schema();
     let mut used_insertion_keys = 0;
     let mut used_replacement_keys = 0;
-    let mut path: Vec<&String> = transform.input_path.as_ref().map_or_else(Vec::default, |path| path.iter().collect());
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
     let mut output_cols = Vec::new();
@@ -130,33 +127,71 @@ fn evaluate_transform_expression(
         used_insertion_keys += 1;
     }
 
-    // Process each input field in order
-    for input_field in input_schema.fields() {
-        let field_name = input_field.name();
+    // Extract source data and process fields based on input path
+    if let Some(input_path) = &transform.input_path {
+        // Working with a nested struct
+        let source_data = extract_column(batch, input_path)?;
+        let struct_array = source_data.as_any().downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::generic("Input path must point to a struct"))?;
 
-        // Handle the field based on replacement rules
-        if let Some(replacement) = transform.field_replacements.get(field_name) {
-            used_replacement_keys += 1;
-            if let Some(expr) = replacement {
-                output_cols.push(evaluate_expression(expr, batch, None)?);
-            } // else no replacement => dropped
-        } else {
-            // Field passes through unchanged
-            path.push(field_name);
-            output_cols.push(extract_column(batch, path.as_slice())?);
-            path.pop();
-        }
+        // Process each field in the nested struct
+        for input_field in struct_array.fields() {
+            let field_name = input_field.name();
 
-        // Handle insertions after this input field
-        if let Some(insertion_exprs) = transform
-            .field_insertions
-            .get(&Some(field_name.to_string()))
-        // TODO: Somehow impl Borrow
-        {
-            for expr in insertion_exprs {
-                output_cols.push(evaluate_expression(expr, batch, None)?);
+            // Handle the field based on replacement rules
+            if let Some(replacement) = transform.field_replacements.get(field_name) {
+                used_replacement_keys += 1;
+                if let Some(expr) = replacement {
+                    output_cols.push(evaluate_expression(expr, batch, None)?);
+                } // else no replacement => dropped
+            } else {
+                // Field passes through unchanged - extract directly from struct
+                let column = struct_array.column_by_name(field_name)
+                    .ok_or_else(|| Error::generic(format!("No such field: {field_name}")))?
+                    .clone();
+                output_cols.push(column);
             }
-            used_insertion_keys += 1;
+
+            // Handle insertions after this input field
+            if let Some(insertion_exprs) = transform
+                .field_insertions
+                .get(&Some(field_name.to_string()))
+            {
+                for expr in insertion_exprs {
+                    output_cols.push(evaluate_expression(expr, batch, None)?);
+                }
+                used_insertion_keys += 1;
+            }
+        }
+    } else {
+        // Working with top-level batch
+        for input_field in batch.schema().fields() {
+            let field_name = input_field.name();
+
+            // Handle the field based on replacement rules
+            if let Some(replacement) = transform.field_replacements.get(field_name) {
+                used_replacement_keys += 1;
+                if let Some(expr) = replacement {
+                    output_cols.push(evaluate_expression(expr, batch, None)?);
+                } // else no replacement => dropped
+            } else {
+                // Field passes through unchanged - extract directly from batch
+                let column = batch.column_by_name(field_name)
+                    .ok_or_else(|| Error::generic(format!("No such field: {field_name}")))?
+                    .clone();
+                output_cols.push(column);
+            }
+
+            // Handle insertions after this input field
+            if let Some(insertion_exprs) = transform
+                .field_insertions
+                .get(&Some(field_name.to_string()))
+            {
+                for expr in insertion_exprs {
+                    output_cols.push(evaluate_expression(expr, batch, None)?);
+                }
+                used_insertion_keys += 1;
+            }
         }
     }
 
