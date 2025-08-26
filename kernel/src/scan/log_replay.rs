@@ -147,11 +147,12 @@ impl AddRemoveDedupVisitor<'_> {
         transform_spec
             .iter()
             .filter_map(|field_transform| match field_transform {
-                FieldTransformSpec::Partition(_, field_idx) => {
+                FieldTransformSpec::PartitionColumn(_, field_idx) => {
                     Some(self.parse_partition_value(*field_idx, partition_values))
                 }
-                FieldTransformSpec::StaticReplace(_, _)
-                | FieldTransformSpec::StaticInsert(_, _) => None,
+                FieldTransformSpec::StaticInsert(_, _)
+                | FieldTransformSpec::StaticReplace(_, _)
+                | FieldTransformSpec::StaticDrop(_) => None,
             })
             .try_collect()
     }
@@ -170,13 +171,16 @@ impl AddRemoveDedupVisitor<'_> {
 
         for field_transform in transform_spec {
             transform = match field_transform {
-                FieldTransformSpec::StaticReplace(field_name, replacement_expr) => {
-                    transform.with_replaced_field(field_name.clone(), replacement_expr.clone())
-                }
                 FieldTransformSpec::StaticInsert(insert_after, insertion_expr) => {
                     transform.with_inserted_field(insert_after.clone(), insertion_expr.clone())
                 }
-                FieldTransformSpec::Partition(insert_after, logical_idx) => {
+                FieldTransformSpec::StaticReplace(field_name, replacement_expr) => {
+                    transform.with_replaced_field(field_name.clone(), replacement_expr.clone())
+                }
+                FieldTransformSpec::StaticDrop(field_name) => {
+                    transform.with_dropped_field(field_name.clone())
+                }
+                FieldTransformSpec::PartitionColumn(insert_after, logical_idx) => {
                     let Some((_, partition_value)) = partition_values.remove(logical_idx) else {
                         return Err(Error::InternalError(format!(
                             "missing partition value for field index {logical_idx}"

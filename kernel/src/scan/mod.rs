@@ -334,14 +334,23 @@ pub fn get_transform_for_row(
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// [`TransformSpec`].
 pub(crate) enum FieldTransformSpec {
-    /// Replace the given physical field name with an expression
-    #[allow(unused)]
-    StaticReplace(String, ExpressionRef),
-    /// Insert the given expression after the given physical field name (None = prepend instead)
+    /// Insert the given expression after the named input column (None = prepend instead)
+    // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
+    // which would usually be expressed as a drop+insert pair of transforms.
     #[allow(unused)]
     StaticInsert(Option<String>, ExpressionRef),
-    /// Insert the ith partition value after the given physical field name
-    Partition(Option<String>, usize),
+    /// Replace the named input column with an expression
+    // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
+    // to compute non-materialized row ids and row commit versions.
+    #[allow(unused)]
+    StaticReplace(String, ExpressionRef),
+    /// Drops the named input column
+    // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
+    // they should not appear in the query's output.
+    #[allow(unused)]
+    StaticDrop(String),
+    /// For each row of metadata, insert the ith partition value after the given physical field name
+    PartitionColumn(Option<String>, usize),
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
@@ -468,7 +477,7 @@ impl Scan {
                     last_physical_field = Some(physical_name);
                 }
                 ColumnType::Partition(logical_idx) => {
-                    transform_spec.push(FieldTransformSpec::Partition(
+                    transform_spec.push(FieldTransformSpec::PartitionColumn(
                         last_physical_field.map(String::from),
                         *logical_idx,
                     ));
