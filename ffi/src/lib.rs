@@ -131,18 +131,18 @@ impl KernelStringSlice {
     }
 }
 
-/// FFI-safe implementation for Rust's Option<T>
+/// FFI-safe implementation for Rust's `Option<T>`
 #[derive(PartialEq, Debug)]
 #[repr(C)]
 pub enum OptionalValue<T> {
-    Ok(T),
+    Some(T),
     None,
 }
 
 impl<T> From<Option<T>> for OptionalValue<T> {
     fn from(item: Option<T>) -> Self {
         match item {
-            Some(value) => OptionalValue::Ok(value),
+            Some(value) => OptionalValue::Some(value),
             None => OptionalValue::None,
         }
     }

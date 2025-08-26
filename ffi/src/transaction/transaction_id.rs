@@ -2,8 +2,8 @@ use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveTransaction;
 use crate::{
-    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
-    SharedSnapshot, TryFromStringSlice,
+    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue,
+    SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -15,7 +15,8 @@ use std::sync::Arc;
 /// A new handle to the transaction that will set the `app_id` version to `version` on commit
 ///
 /// # Safety
-/// Caller is responsible for passing [valid][Handle#Validity] handles. CONSUMES TRANSACTION
+/// Caller is responsible for passing [valid][Handle#Validity] handles. The `app_id` string slice must be valid.
+/// CONSUMES TRANSACTION
 #[no_mangle]
 pub unsafe extern "C" fn with_transaction_id(
     txn: Handle<ExclusiveTransaction>,
@@ -43,7 +44,8 @@ fn with_transaction_id_impl(
 /// The version number if found, or an error of type `MissingDataError` when the app_id was not set
 ///
 /// # Safety
-/// Caller must ensure [valid][Handle#Validity] handles are provided for snapshot and engine
+/// Caller must ensure [valid][Handle#Validity] handles are provided for snapshot and engine. The `app_id`
+/// string slice must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn get_app_id_version(
     snapshot: Handle<SharedSnapshot>,
@@ -156,7 +158,7 @@ mod tests {
                     default_engine_handle.shallow_copy(),
                 )
             });
-            assert_eq!(version1, OptionalValue::Ok(1));
+            assert_eq!(version1, OptionalValue::Some(1));
 
             let version2 = ok_or_panic(unsafe {
                 get_app_id_version(
@@ -165,7 +167,7 @@ mod tests {
                     default_engine_handle.shallow_copy(),
                 )
             });
-            assert_eq!(version2, OptionalValue::Ok(2));
+            assert_eq!(version2, OptionalValue::Some(2));
 
             let app_id3 = "app_id3";
             let version3 = ok_or_panic(unsafe {
