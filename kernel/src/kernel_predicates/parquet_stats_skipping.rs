@@ -1,11 +1,11 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
+use std::cmp::Ordering;
+
 use crate::expressions::{
     BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
 };
 use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
-
-use std::cmp::Ordering;
 
 #[cfg(test)]
 mod tests;

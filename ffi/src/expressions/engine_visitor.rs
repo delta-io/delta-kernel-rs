@@ -12,7 +12,8 @@ use delta_kernel::expressions::{
 use crate::expressions::{
     SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
 };
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
+use crate::handle::Handle;
+use crate::{kernel_string_slice, KernelStringSlice};
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);

@@ -1,10 +1,12 @@
-use clap::{Parser, Subcommand};
 use std::time::Duration;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use uc_client::{
-    models::{commits::Commit, credentials::Operation, CommitsRequest},
-    UCClient,
-};
+
+use clap::{Parser, Subcommand};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, EnvFilter};
+use uc_client::models::commits::Commit;
+use uc_client::models::credentials::Operation;
+use uc_client::models::CommitsRequest;
+use uc_client::UCClient;
 
 #[derive(Parser)]
 #[command(name = "uc-client")]

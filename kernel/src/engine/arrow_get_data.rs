@@ -1,13 +1,10 @@
+use crate::arrow::array::types::{GenericStringType, Int32Type, Int64Type};
 use crate::arrow::array::{
-    types::{GenericStringType, Int32Type, Int64Type},
     Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
     PrimitiveArray,
 };
-
-use crate::{
-    engine_data::{GetData, ListItem, MapItem},
-    DeltaResult,
-};
+use crate::engine_data::{GetData, ListItem, MapItem};
+use crate::DeltaResult;
 
 // actual impls (todo: could macro these)
 

@@ -1,11 +1,11 @@
-use crate::handle::Handle;
-use crate::{kernel_string_slice, AllocateStringFn, NullableCvoid, SharedSchema};
+use std::sync::Arc;
+
 use delta_kernel::transaction::WriteContext;
 use delta_kernel_ffi_macros::handle_descriptor;
 
-use std::sync::Arc;
-
 use super::ExclusiveTransaction;
+use crate::handle::Handle;
+use crate::{kernel_string_slice, AllocateStringFn, NullableCvoid, SharedSchema};
 
 /// A [`WriteContext`] that provides schema and path information needed for writing data.
 /// This is a shared reference that can be cloned and used across multiple consumers.

@@ -10,12 +10,11 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
+use super::handle::Handle;
 use crate::{
     ExclusiveEngineData, ExternEngine, ExternResult, IntoExternResult, KernelStringSlice,
     NullableCvoid, SharedExternEngine, SharedSchema, TryFromStringSlice,
 };
-
-use super::handle::Handle;
 
 #[repr(C)]
 pub struct FileMeta {
@@ -213,13 +212,15 @@ fn evaluate_expression_impl(
 
 #[cfg(test)]
 mod tests {
-    use super::{free_expression_evaluator, new_expression_evaluator};
-    use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
-    use delta_kernel::{
-        schema::{DataType, StructField, StructType},
-        Expression,
-    };
     use std::sync::Arc;
+
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel::Expression;
+
+    use super::{free_expression_evaluator, new_expression_evaluator};
+    use crate::handle::Handle;
+    use crate::tests::get_default_engine;
+    use crate::{free_engine, SharedSchema};
 
     #[test]
     fn test_new_expression_evaluator() {

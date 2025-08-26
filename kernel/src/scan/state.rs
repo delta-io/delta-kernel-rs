@@ -3,23 +3,19 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::actions::deletion_vector::deletion_treemap_to_bools;
-use crate::scan::get_transform_for_row;
-use crate::schema::Schema;
-use crate::utils::require;
-use crate::ExpressionRef;
-use crate::{
-    actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
-    engine_data::{GetData, RowVisitor, TypedGetData as _},
-    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
-    DeltaResult, Engine, EngineData, Error,
-};
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
+use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
+use crate::actions::visitors::visit_deletion_vector_at;
+use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::scan::get_transform_for_row;
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -229,11 +225,10 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
+    use super::{DvInfo, Stats};
     use crate::actions::get_log_schema;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
     use crate::ExpressionRef;
-
-    use super::{DvInfo, Stats};
 
     #[derive(Clone)]
     struct TestContext {

@@ -1,16 +1,15 @@
 //! Common code to be shared between all examples. Mostly argument parsing, and a few other
 //! utilities
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use clap::Args;
-use delta_kernel::{
-    arrow::array::RecordBatch,
-    engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
-    scan::Scan,
-    schema::Schema,
-    DeltaResult, Snapshot,
-};
-
+use delta_kernel::arrow::array::RecordBatch;
+use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::scan::Scan;
+use delta_kernel::schema::Schema;
+use delta_kernel::{DeltaResult, Snapshot};
 use url::Url;
 
 #[derive(Args)]

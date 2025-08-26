@@ -7,9 +7,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
-use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
+use crate::actions::{get_log_domain_metadata_schema, DomainMetadata, DOMAIN_METADATA_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};

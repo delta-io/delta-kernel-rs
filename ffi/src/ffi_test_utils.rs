@@ -1,9 +1,10 @@
 //! Utility functions used for tests in this crate.
 
-use crate::error::{EngineError, ExternResult, KernelError};
-use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 use std::os::raw::c_void;
 use std::ptr::NonNull;
+
+use crate::error::{EngineError, ExternResult, KernelError};
+use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
 // Used to allocate EngineErrors with test information from Rust tests
 #[cfg(test)]

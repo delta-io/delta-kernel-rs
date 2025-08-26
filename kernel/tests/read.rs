@@ -16,7 +16,9 @@ use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, Schema};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::memory::InMemory;
+use object_store::path::Path;
+use object_store::ObjectStore;
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
     record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,

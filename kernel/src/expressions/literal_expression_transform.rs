@@ -187,18 +187,15 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
-    use crate::expressions::{ArrayData, MapData};
-    use crate::schema::SchemaRef;
-    use crate::schema::StructType;
-    use crate::DataType as DeltaDataTypes;
-
     use paste::paste;
-
     use Expression as Expr;
+
+    use super::*;
+    use crate::expressions::{ArrayData, MapData};
+    use crate::schema::{SchemaRef, StructType};
+    use crate::DataType as DeltaDataTypes;
 
     // helper to take values/schema to pass to `create_one` and assert the result = expected
     fn assert_single_row_transform(

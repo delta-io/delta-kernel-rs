@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+use std::process::ExitCode;
+use std::sync::LazyLock;
+
+use clap::{Parser, Subcommand};
 use common::LocationArgs;
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
@@ -13,12 +18,6 @@ use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
 use delta_kernel::{DeltaResult, Error, ExpressionRef, Snapshot};
-
-use std::collections::HashMap;
-use std::process::ExitCode;
-use std::sync::LazyLock;
-
-use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]

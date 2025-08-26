@@ -3,6 +3,10 @@
 //! and parquet row group filtering. The evaluation is normally performed over [`Scalar`] values,
 //! but data skipping "evaluation" actually produces a transformed predicate that replaces column
 //! references with stats column references, which log replay will instruct the engine to evaluate.
+use std::cmp::Ordering;
+
+use tracing::{debug, warn};
+
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
     Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
@@ -10,9 +14,6 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
-
-use std::cmp::Ordering;
-use tracing::{debug, warn};
 
 pub(crate) mod parquet_stats_skipping;
 

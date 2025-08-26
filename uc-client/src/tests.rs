@@ -22,8 +22,9 @@ fn test_operation_display() {
 
 #[test]
 fn test_table_response_helpers() {
-    use crate::models::tables::TablesResponse;
     use std::collections::HashMap;
+
+    use crate::models::tables::TablesResponse;
 
     let table = TablesResponse {
         name: "my_table".to_string(),

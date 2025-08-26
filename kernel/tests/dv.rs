@@ -6,10 +6,9 @@ use std::path::PathBuf;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::scan::ScanResult;
 use delta_kernel::{DeltaResult, Snapshot};
-use test_utils::DefaultEngineExtension;
-
 use itertools::Itertools;
 use test_log::test;
+use test_utils::DefaultEngineExtension;
 
 fn count_total_scan_rows(
     scan_result_iter: impl Iterator<Item = DeltaResult<ScanResult>>,

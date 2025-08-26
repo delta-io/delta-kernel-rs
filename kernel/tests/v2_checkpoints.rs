@@ -1,14 +1,11 @@
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::engine::default::DefaultEngine;
-
 use delta_kernel::{DeltaResult, Snapshot};
 
 mod common;
 
-use test_utils::{load_test_data, DefaultEngineExtension};
-
 use itertools::Itertools;
-use test_utils::read_scan;
+use test_utils::{load_test_data, read_scan, DefaultEngineExtension};
 
 fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();

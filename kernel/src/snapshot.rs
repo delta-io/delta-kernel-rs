@@ -3,6 +3,10 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+use tracing::debug;
+use url::Url;
+
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
@@ -18,10 +22,6 @@ use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::utils::{calculate_transaction_expiration_timestamp, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, Version};
-use delta_kernel_derive::internal_api;
-
-use tracing::debug;
-use url::Url;
 
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
@@ -395,8 +395,6 @@ impl Snapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -405,20 +403,20 @@ mod tests {
     use object_store::path::Path;
     use object_store::ObjectStore;
     use serde_json::json;
+    use test_utils::{add_commit, delta_path_for_version};
 
+    use super::*;
     use crate::arrow::array::StringArray;
     use crate::arrow::record_batch::RecordBatch;
-    use crate::parquet::arrow::ArrowWriter;
-
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
+    use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
     use crate::utils::test_utils::string_array_to_engine_data;
-    use test_utils::{add_commit, delta_path_for_version};
 
     #[test]
     fn test_snapshot_read_metadata() {

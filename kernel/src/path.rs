@@ -2,11 +2,11 @@
 
 use std::str::FromStr;
 
-use crate::{DeltaResult, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
-
 use url::Url;
 use uuid::Uuid;
+
+use crate::{DeltaResult, Error, FileMeta, Version};
 
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;

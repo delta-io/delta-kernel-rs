@@ -10,7 +10,9 @@ pub mod arrow_expression;
 #[cfg(feature = "arrow-expression")]
 pub(crate) mod arrow_utils;
 #[cfg(feature = "internal-api")]
-pub use self::arrow_utils::{parse_json, to_json_bytes};
+pub use self::arrow_utils::parse_json;
+#[cfg(feature = "internal-api")]
+pub use self::arrow_utils::to_json_bytes;
 
 #[cfg(feature = "default-engine-base")]
 pub mod default;
@@ -29,17 +31,17 @@ pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use itertools::Itertools;
     use object_store::path::Path;
-    use std::sync::Arc;
+    use test_utils::delta_path_for_version;
     use url::Url;
 
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::{Engine, EngineData};
-
-    use test_utils::delta_path_for_version;
 
     fn test_list_from_should_sort_and_filter(
         engine: &dyn Engine,

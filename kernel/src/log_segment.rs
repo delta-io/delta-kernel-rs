@@ -3,12 +3,18 @@
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
+use itertools::Itertools;
+use tracing::{debug, warn};
+use url::Url;
+
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::listed_log_files::*;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::SchemaRef;
@@ -17,13 +23,6 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
     PredicateRef, RowVisitor, StorageHandler, Version,
 };
-use delta_kernel_derive::internal_api;
-
-use crate::listed_log_files::*;
-
-use itertools::Itertools;
-use tracing::{debug, warn};
-use url::Url;
 
 #[cfg(test)]
 mod tests;

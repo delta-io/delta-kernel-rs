@@ -1,13 +1,11 @@
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::get_log_txn_schema;
+pub(crate) use crate::actions::visitors::SetTransactionMap;
 use crate::actions::visitors::SetTransactionVisitor;
-use crate::actions::{SetTransaction, SET_TRANSACTION_NAME};
+use crate::actions::{get_log_txn_schema, SetTransaction, SET_TRANSACTION_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
-
-pub(crate) use crate::actions::visitors::SetTransactionMap;
 
 pub(crate) struct SetTransactionScanner {}
 
@@ -97,13 +95,13 @@ fn replay_for_app_ids(
 mod tests {
     use std::path::PathBuf;
 
+    use itertools::Itertools;
+
     use super::*;
+    use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
     use crate::utils::test_utils::parse_json_batch;
     use crate::Snapshot;
-
-    use crate::arrow::array::StringArray;
-    use itertools::Itertools;
 
     fn get_latest_transactions(
         path: &str,

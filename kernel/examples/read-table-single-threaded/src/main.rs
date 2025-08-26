@@ -4,11 +4,10 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
+use clap::Parser;
 use common::{LocationArgs, ScanArgs};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Snapshot};
-
-use clap::Parser;
 use itertools::Itertools;
 
 /// An example program that dumps out the data of a delta table. Struct and Map types are not

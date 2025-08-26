@@ -77,10 +77,11 @@
 extern crate self as delta_kernel;
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::fs::DirEntry;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::{cmp::Ordering, ops::Range};
 
 use bytes::Bytes;
 use url::Url;
@@ -145,12 +146,11 @@ pub(crate) mod history_manager;
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
-pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use snapshot::Snapshot;
-
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
+pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 use schema::{SchemaTransform, StructField, StructType};
+pub use snapshot::Snapshot;
 
 #[cfg(any(
     feature = "default-engine-native-tls",

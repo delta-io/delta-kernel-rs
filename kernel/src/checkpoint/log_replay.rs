@@ -30,6 +30,9 @@
 //!      actions selected for the checkpoint file
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
@@ -38,9 +41,6 @@ use crate::scan::data_skipping::DataSkippingFilter;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-use std::collections::HashSet;
-use std::sync::LazyLock;
 
 /// The [`CheckpointLogReplayProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions for inclusion in a V1 spec checkpoint file. This
@@ -490,11 +490,11 @@ impl RowVisitor for CheckpointVisitor<'_> {
 mod tests {
     use std::collections::HashSet;
 
+    use itertools::Itertools;
+
     use super::*;
     use crate::arrow::array::StringArray;
     use crate::utils::test_utils::{action_batch, parse_json_batch};
-
-    use itertools::Itertools;
 
     /// Helper function to create test batches from JSON strings
     fn create_batch(json_strings: Vec<&str>) -> DeltaResult<ActionsBatch> {

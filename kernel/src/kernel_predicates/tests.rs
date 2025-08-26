@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::*;
 use crate::expressions::{
     column_expr, column_name, column_pred, ArrayData, Expression as Expr, OpaqueExpressionOp,
@@ -6,10 +8,7 @@ use crate::expressions::{
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
 use crate::schema::ArrayType;
-use crate::DataType;
-use crate::DeltaResult;
-
-use std::collections::HashMap;
+use crate::{DataType, DeltaResult};
 
 macro_rules! expect_eq {
     ( $expr: expr, $expect: expr, $fmt: literal ) => {

@@ -2,14 +2,12 @@
 
 #[cfg(feature = "arrow-56")]
 mod arrow_compat_shims {
-    pub use arrow_56 as arrow;
-    pub use parquet_56 as parquet;
+    pub use {arrow_56 as arrow, parquet_56 as parquet};
 }
 
 #[cfg(all(feature = "arrow-55", not(feature = "arrow-56")))]
 mod arrow_compat_shims {
-    pub use arrow_55 as arrow;
-    pub use parquet_55 as parquet;
+    pub use {arrow_55 as arrow, parquet_55 as parquet};
 }
 
 // if nothing is enabled but we need arrow because of some other feature flag, throw compile-time

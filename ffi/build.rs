@@ -1,8 +1,9 @@
 extern crate cbindgen;
 
-use cbindgen::{Config, Language};
 use std::env;
 use std::path::{Path, PathBuf};
+
+use cbindgen::{Config, Language};
 
 fn get_target_dir(manifest_dir: &str) -> PathBuf {
     if let Ok(target) = env::var("CARGO_TARGET_DIR") {

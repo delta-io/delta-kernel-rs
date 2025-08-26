@@ -1,36 +1,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::Error as KernelError;
-use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
-
-use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
-use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
+use delta_kernel::arrow::array::{
+    ArrayRef, BinaryArray, Int32Array, StringArray, StructArray, TimestampMicrosecondArray,
+};
 use delta_kernel::arrow::buffer::NullBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::record_batch::RecordBatch;
-
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
-
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
-
-use test_utils::set_json_value;
-
+use delta_kernel::{DeltaResult, Engine, Error as KernelError, Snapshot, Version};
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use serde_json::json;
-use serde_json::Deserializer;
+use serde_json::{json, Deserializer};
 use tempfile::tempdir;
-
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-
-use test_utils::{create_table, engine_store_setup, setup_test_tables, test_read};
+use test_utils::{create_table, engine_store_setup, set_json_value, setup_test_tables, test_read};
 
 mod common;
 use url::Url;

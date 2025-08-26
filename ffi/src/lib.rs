@@ -8,14 +8,13 @@ use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use tracing::debug;
-use url::Url;
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::Version;
-use delta_kernel::{DeltaResult, Engine, EngineData};
+use delta_kernel::{DeltaResult, Engine, EngineData, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
+use tracing::debug;
+use url::Url;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
 // twice. So we tell it to ignore one of the declarations to avoid double-definition errors.
@@ -313,8 +312,7 @@ mod private {
         }
     }
 }
-pub use private::KernelBoolSlice;
-pub use private::KernelRowIndexArray;
+pub use private::{KernelBoolSlice, KernelRowIndexArray};
 
 /// # Safety
 ///
@@ -781,15 +779,17 @@ impl<T> Default for ReferenceSet<T> {
 
 #[cfg(test)]
 mod tests {
+    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::engine::default::DefaultEngine;
+    use object_store::memory::InMemory;
+    use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
+
     use super::*;
     use crate::error::{EngineError, KernelError};
     use crate::ffi_test_utils::{
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
     };
-    use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-    use object_store::memory::InMemory;
-    use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
     #[no_mangle]
     extern "C" fn allocate_null_err(_: KernelError, _: KernelStringSlice) -> *mut EngineError {

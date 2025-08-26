@@ -84,6 +84,9 @@
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
+use url::Url;
+
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -97,9 +100,6 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::Snapshot;
 use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
-use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
-
-use url::Url;
 
 mod log_replay;
 #[cfg(test)]

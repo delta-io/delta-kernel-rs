@@ -4,12 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
 use delta_kernel::{DeltaResult, Error};
-use tracing::{
-    field::{Field as TracingField, Visit},
-    Event as TracingEvent, Subscriber,
-};
+use tracing::field::{Field as TracingField, Visit};
+use tracing::{Event as TracingEvent, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Layer;
 
 use crate::{kernel_string_slice, KernelStringSlice};
 
@@ -273,7 +274,8 @@ where
 }
 
 fn get_event_dispatcher(callback: TracingEventFn, max_level: Level) -> tracing_core::Dispatch {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
     let filter: LevelFilter = max_level.into();
     let event_layer = EventLayer { callback }.with_filter(filter);
     let subscriber = Registry::default().with(event_layer);
@@ -356,7 +358,8 @@ fn get_log_line_dispatch(
     with_level: bool,
     with_target: bool,
 ) -> tracing_core::Dispatch {
-    use tracing_subscriber::{layer::SubscriberExt, registry::Registry};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
     let buffer = Arc::new(Mutex::new(vec![]));
     let writer = BufferedMessageWriter {
         current_buffer: buffer.clone(),
@@ -427,9 +430,8 @@ mod tests {
     use tracing::info;
     use tracing_subscriber::fmt::time::FormatTime;
 
-    use crate::TryFromStringSlice;
-
     use super::*;
+    use crate::TryFromStringSlice;
 
     // Because we have to access a global messages buffer, we have to force tests to run one at a
     // time

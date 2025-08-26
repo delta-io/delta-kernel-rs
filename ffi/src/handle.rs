@@ -497,8 +497,9 @@ pub use private::{Boolean, False, Handle, True, Unconstructable};
 mod tests {
     use std::sync::Arc;
 
-    use super::*;
     use delta_kernel_ffi_macros::handle_descriptor;
+
+    use super::*;
 
     #[allow(dead_code)]
     #[derive(Debug)]

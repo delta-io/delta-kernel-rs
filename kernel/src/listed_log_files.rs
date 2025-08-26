@@ -15,15 +15,14 @@
 use std::collections::HashMap;
 use std::convert::identity;
 
-use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::{DeltaResult, Error, StorageHandler, Version};
-
 use delta_kernel_derive::internal_api;
-
 use itertools::Itertools;
 use tracing::{info, warn};
 use url::Url;
+
+use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::path::{LogPathFileType, ParsedLogPath};
+use crate::{DeltaResult, Error, StorageHandler, Version};
 
 /// A struct to hold the result of listing log files. The commit and compaction files are guaranteed
 /// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts

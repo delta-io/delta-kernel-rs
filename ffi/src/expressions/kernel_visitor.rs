@@ -1,13 +1,14 @@
 //! Defines [`KernelExpressionVisitorState`]. This is a visitor that can be used to convert an
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
-use crate::{
-    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
-    ReferenceSet, TryFromStringSlice,
-};
 use delta_kernel::expressions::{
     BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, UnaryPredicateOp,
 };
 use delta_kernel::DeltaResult;
+
+use crate::{
+    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
+    ReferenceSet, TryFromStringSlice,
+};
 
 pub(crate) enum ExpressionOrPredicate {
     Expression(Expression),

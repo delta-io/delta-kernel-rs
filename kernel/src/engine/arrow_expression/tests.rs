@@ -1,5 +1,8 @@
 use std::ops::{Add, Div, Mul, Sub};
 
+use {Expression as Expr, Predicate as Pred};
+
+use super::*;
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
     ListArray, MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
@@ -7,8 +10,6 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
-
-use super::*;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
@@ -21,9 +22,6 @@ use crate::kernel_predicates::{
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::utils::test_utils::assert_result_error_with_message;
 use crate::EvaluationHandlerExtension as _;
-
-use Expression as Expr;
-use Predicate as Pred;
 
 #[test]
 fn test_array_column() {

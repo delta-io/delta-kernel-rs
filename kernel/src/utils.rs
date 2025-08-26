@@ -4,11 +4,11 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use delta_kernel_derive::internal_api;
+use url::Url;
+
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
-
-use url::Url;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -153,21 +153,22 @@ impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, 
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::actions::{get_log_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::sync::SyncEngine;
-    use crate::Engine;
-    use crate::EngineData;
+    use std::path::Path;
+    use std::sync::Arc;
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use serde::Serialize;
-    use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
+
+    use crate::actions::{get_log_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::SyncEngine;
+    use crate::{Engine, EngineData};
 
     #[derive(Serialize)]
     pub(crate) enum Action {

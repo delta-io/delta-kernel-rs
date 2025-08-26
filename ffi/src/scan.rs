@@ -12,6 +12,7 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
+use super::handle::Handle;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
 use crate::{
@@ -19,8 +20,6 @@ use crate::{
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
     NullableCvoid, SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
-
-use super::handle::Handle;
 
 // TODO: Why do we even need to expose a scan, when the only thing an engine can do with it is
 // handit back to the kernel by calling `scan_metadata_iter_init`? There isn't even an FFI method to

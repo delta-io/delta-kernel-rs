@@ -6,14 +6,13 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 
+use super::deletion_vector::DeletionVectorDescriptor;
+use super::domain_metadata::DomainMetadataMap;
+use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-
-use super::deletion_vector::DeletionVectorDescriptor;
-use super::domain_metadata::DomainMetadataMap;
-use super::*;
 
 #[derive(Default)]
 #[internal_api]
@@ -680,9 +679,7 @@ impl RowVisitor for InCommitTimestampVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::arrow::array::StringArray;
-
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
     use crate::table_features::{ReaderFeature, WriterFeature};

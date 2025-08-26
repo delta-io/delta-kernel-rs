@@ -4,10 +4,9 @@ use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use delta_kernel_derive::ToSchema;
 use roaring::RoaringTreemap;
 use url::Url;
-
-use delta_kernel_derive::ToSchema;
 
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
@@ -288,10 +287,9 @@ mod tests {
 
     use roaring::RoaringTreemap;
 
-    use crate::{engine::sync::SyncEngine, Engine};
-
-    use super::DeletionVectorDescriptor;
-    use super::*;
+    use super::{DeletionVectorDescriptor, *};
+    use crate::engine::sync::SyncEngine;
+    use crate::Engine;
 
     fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {

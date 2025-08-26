@@ -1,24 +1,33 @@
 //! EngineData related ffi code
 
+use std::ffi::c_void;
+
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow;
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::arrow::array::{
-    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
-    ArrayData, RecordBatch, StructArray,
-};
+use delta_kernel::arrow::array::ffi::FFI_ArrowArray;
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::arrow::array::ffi::FFI_ArrowSchema;
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::arrow::array::ArrayData;
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::arrow::array::RecordBatch;
+#[cfg(feature = "default-engine-base")]
+use delta_kernel::arrow::array::StructArray;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
-use std::ffi::c_void;
-
-use crate::ExclusiveEngineData;
-#[cfg(feature = "default-engine-base")]
-use crate::{ExternResult, IntoExternResult, SharedExternEngine};
 
 use super::handle::Handle;
+use crate::ExclusiveEngineData;
+#[cfg(feature = "default-engine-base")]
+use crate::ExternResult;
+#[cfg(feature = "default-engine-base")]
+use crate::IntoExternResult;
+#[cfg(feature = "default-engine-base")]
+use crate::SharedExternEngine;
 
 /// Get the number of rows in an engine data
 ///

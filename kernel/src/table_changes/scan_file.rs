@@ -2,9 +2,10 @@
 //! metadata required to generate a change data feed. [`CdfScanFile`] can be constructed using
 //! [`CdfScanFileVisitor`]. The visitor reads from engine data with the schema [`cdf_scan_row_schema`].
 //! You can convert engine data to this schema using the [`cdf_scan_row_expression`].
-use itertools::Itertools;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
+
+use itertools::Itertools;
 
 use super::log_replay::TableChangesScanMetadata;
 use crate::actions::visitors::visit_deletion_vector_at;
