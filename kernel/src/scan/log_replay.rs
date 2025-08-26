@@ -147,12 +147,12 @@ impl AddRemoveDedupVisitor<'_> {
         transform_spec
             .iter()
             .filter_map(|field_transform| match field_transform {
-                FieldTransformSpec::PartitionColumn(_, field_idx) => {
-                    Some(self.parse_partition_value(*field_idx, partition_values))
+                FieldTransformSpec::PartitionColumn { field_index, .. } => {
+                    Some(self.parse_partition_value(*field_index, partition_values))
                 }
-                FieldTransformSpec::StaticInsert(_, _)
-                | FieldTransformSpec::StaticReplace(_, _)
-                | FieldTransformSpec::StaticDrop(_) => None,
+                FieldTransformSpec::StaticInsert { .. }
+                | FieldTransformSpec::StaticReplace { .. }
+                | FieldTransformSpec::StaticDrop { .. } => None,
             })
             .try_collect()
     }
@@ -170,20 +170,22 @@ impl AddRemoveDedupVisitor<'_> {
         let mut transform = crate::expressions::Transform::new();
 
         for field_transform in transform_spec {
+            use FieldTransformSpec::*;
             transform = match field_transform {
-                FieldTransformSpec::StaticInsert(insert_after, insertion_expr) => {
-                    transform.with_inserted_field(insert_after.clone(), insertion_expr.clone())
+                StaticInsert { insert_after, expr } => {
+                    transform.with_inserted_field(insert_after.clone(), expr.clone())
                 }
-                FieldTransformSpec::StaticReplace(field_name, replacement_expr) => {
-                    transform.with_replaced_field(field_name.clone(), replacement_expr.clone())
+                StaticReplace { field_name, expr } => {
+                    transform.with_replaced_field(field_name.clone(), expr.clone())
                 }
-                FieldTransformSpec::StaticDrop(field_name) => {
-                    transform.with_dropped_field(field_name.clone())
-                }
-                FieldTransformSpec::PartitionColumn(insert_after, logical_idx) => {
-                    let Some((_, partition_value)) = partition_values.remove(logical_idx) else {
+                StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
+                PartitionColumn {
+                    field_index,
+                    insert_after,
+                } => {
+                    let Some((_, partition_value)) = partition_values.remove(field_index) else {
                         return Err(Error::InternalError(format!(
-                            "missing partition value for field index {logical_idx}"
+                            "missing partition value for field index {field_index}"
                         )));
                     };
 

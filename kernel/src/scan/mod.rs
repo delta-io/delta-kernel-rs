@@ -338,21 +338,30 @@ pub(crate) enum FieldTransformSpec {
     // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
     // which would usually be expressed as a drop+insert pair of transforms.
     #[allow(unused)]
-    StaticInsert(Option<String>, ExpressionRef),
+    StaticInsert {
+        insert_after: Option<String>,
+        expr: ExpressionRef,
+    },
     /// Replace the named input column with an expression
     // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
     // to compute non-materialized row ids and row commit versions.
     #[allow(unused)]
-    StaticReplace(String, ExpressionRef),
+    StaticReplace {
+        field_name: String,
+        expr: ExpressionRef,
+    },
     /// Drops the named input column
     // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
     // they should not appear in the query's output.
     #[allow(unused)]
-    StaticDrop(String),
+    StaticDrop { field_name: String },
     /// Inserts a partition column after the named input column. The partition column is identified
     /// by its field index in the logical table schema (the column is not present in the physical
     /// read schema). Its value varies from file to file and is obtained from file metadata.
-    PartitionColumn(Option<String>, usize),
+    PartitionColumn {
+        field_index: usize,
+        insert_after: Option<String>,
+    },
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
@@ -479,10 +488,10 @@ impl Scan {
                     last_physical_field = Some(physical_name);
                 }
                 ColumnType::Partition(logical_idx) => {
-                    transform_spec.push(FieldTransformSpec::PartitionColumn(
-                        last_physical_field.map(String::from),
-                        *logical_idx,
-                    ));
+                    transform_spec.push(FieldTransformSpec::PartitionColumn {
+                        insert_after: last_physical_field.map(String::from),
+                        field_index: *logical_idx,
+                    });
                 }
             }
         }
