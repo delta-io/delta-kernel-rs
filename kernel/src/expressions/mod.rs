@@ -247,31 +247,31 @@ impl OpaqueExpression {
 /// A transformation that efficiently represents sparse modifications to struct schemas.
 ///
 /// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
-/// specifying fields that actually change (inserted, replaced, or deleted).  This is particularly
-/// useful for wide schemas where only a few columns need to be modified/dropped, or where a handful
-/// of partition columns need to be injected.
+/// specifying those fields that actually change (inserted, replaced, or deleted). Any input field
+/// not specifically mentioned by the transform is passed through, unmodified and with the same
+/// relative field ordering. This is particularly useful for wide schemas where only a few columns
+/// need to be modified and/or dropped, or where a small number of columns need to be injected.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Transform {
-    /// If this transform does not manipulate top-level fields, it must provide a (non-empty) path
-    /// to the struct whose fields it does manipulate.
+    /// The path to the nested input struct this transform operates on (if any). If no path is
+    /// given, the transform operates directly on top-level columns.
     pub input_path: Option<ColumnName>,
-    /// Field replacements:
-    /// - `Some(expression)`: Replace the input field with this expression
-    /// - `None`: Drop the input field from output
-    /// - Absent key: Pass input field through unchanged
+    /// A set of fields names to be replaced, along with their replacement expression (if any). A
+    /// replaced field with no replacement expression will be dropped from the output.
     pub field_replacements: HashMap<String, Option<ExpressionRef>>,
-    /// New fields to insert at various positions. The key determines insertion point:
-    /// - `Some(field_name)`: Insert after the named input field
-    /// - `None`: Prepend at the start of the struct
+    /// A set of new fields to inject, organized by the name of field they should follow (if any).
     pub field_insertions: HashMap<Option<String>, Vec<ExpressionRef>>,
 }
 
 impl Transform {
-    /// Create a new empty transform
+    /// Create a new top-level identity transform. Field transforms and pathing can then be added as
+    /// desired, using the various `with_xxx` helper methods.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Specifies the path to input data this transform operates on. The path must reference a
+    /// struct whose fields will be transformed.
     pub fn with_input_path<A>(mut self, path: impl IntoIterator<Item = A>) -> Self
     where
         ColumnName: FromIterator<A>,
@@ -280,21 +280,23 @@ impl Transform {
         self
     }
 
-    /// Create a transform with a dropped field
+    /// Specifies a field to drop.
     pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
         self.field_replacements.insert(name.into(), None);
         self
     }
 
-    /// Create a transform with a replaced field
+    /// Specifies an expression to replace a field with.
     pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
         self.field_replacements.insert(name.into(), Some(expr));
         self
     }
 
-    /// Create a transform with an insertion
-    pub fn with_insertion(mut self, after: Option<String>, exprs: Vec<ExpressionRef>) -> Self {
-        self.field_insertions.insert(after, exprs);
+    /// Specifies an expression to insert after an optional predecessor. Multiple fields can be
+    /// inserted after the same predecessor, and they will be inserted in the relative order they
+    /// are registered.
+    pub fn with_inserted_field(mut self, after: Option<String>, expr: ExpressionRef) -> Self {
+        self.field_insertions.entry(after).or_default().push(expr);
         self
     }
 
@@ -302,6 +304,10 @@ impl Transform {
     /// fields inserted).
     pub fn is_identity(&self) -> bool {
         self.field_replacements.is_empty() && self.field_insertions.is_empty()
+    }
+
+    pub fn input_path(&self) -> Option<&ColumnName> {
+        self.input_path.as_ref()
     }
 }
 

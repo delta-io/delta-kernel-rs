@@ -169,31 +169,22 @@ impl AddRemoveDedupVisitor<'_> {
         let mut transform = crate::expressions::Transform::new();
 
         for field_transform in transform_spec {
-            match field_transform {
-                FieldTransformSpec::StaticReplace(physical_field_name, replacement_expr) => {
-                    transform
-                        .field_replacements
-                        .insert(physical_field_name.clone(), Some(replacement_expr.clone()));
+            transform = match field_transform {
+                FieldTransformSpec::StaticReplace(field_name, replacement_expr) => {
+                    transform.with_replaced_field(field_name.clone(), replacement_expr.clone())
                 }
-                FieldTransformSpec::StaticInsert(insert_after_physical_field, insertion_expr) => {
-                    transform
-                        .field_insertions
-                        .entry(insert_after_physical_field.clone())
-                        .or_default()
-                        .push(insertion_expr.clone());
+                FieldTransformSpec::StaticInsert(insert_after, insertion_expr) => {
+                    transform.with_inserted_field(insert_after.clone(), insertion_expr.clone())
                 }
-                FieldTransformSpec::Partition(insert_after_physical_field, logical_idx) => {
+                FieldTransformSpec::Partition(insert_after, logical_idx) => {
                     let Some((_, partition_value)) = partition_values.remove(logical_idx) else {
                         return Err(Error::InternalError(format!(
                             "missing partition value for field index {logical_idx}"
                         )));
                     };
 
-                    transform
-                        .field_insertions
-                        .entry(insert_after_physical_field.clone())
-                        .or_default()
-                        .push(Arc::new(partition_value.into()));
+                    let partition_value = Arc::new(partition_value.into());
+                    transform.with_inserted_field(insert_after.clone(), partition_value)
                 }
             }
         }

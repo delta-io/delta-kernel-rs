@@ -187,12 +187,14 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
 #[cfg(test)]
 mod apply_schema_validation_tests {
     use super::*;
+
+    use std::sync::Arc;
+
     use crate::arrow::array::{Int32Array, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::schema::{DataType, StructField, StructType};
-    use std::sync::Arc;
 
     #[test]
     fn test_apply_schema_basic_functionality() {

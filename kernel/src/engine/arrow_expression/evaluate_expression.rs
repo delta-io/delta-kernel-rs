@@ -26,7 +26,7 @@ use itertools::Itertools;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-trait ProvidesColumnByName {
+pub(super) trait ProvidesColumnByName {
     fn schema_fields(&self) -> &ArrowFields;
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;
 }
@@ -64,7 +64,7 @@ impl ProvidesColumnByName for StructArray {
 // }
 // ```
 // The path ["b", "d", "f"] would retrieve the int64 column while ["a", "b"] would produce an error.
-fn extract_column(
+pub(super) fn extract_column(
     mut parent: &dyn ProvidesColumnByName,
     col: &[impl AsRef<str>],
 ) -> DeltaResult<ArrayRef> {
@@ -136,8 +136,7 @@ fn evaluate_transform_expression(
 
     // Extract the input path, if any
     let source_data = transform
-        .input_path
-        .as_ref()
+        .input_path()
         .map(|path| extract_column(batch, path))
         .transpose()?;
 
@@ -154,6 +153,8 @@ fn evaluate_transform_expression(
         let field_name = input_field.name();
 
         // Handle the field based on replacement rules
+        //
+        // TODO: Somehow impl Borrow so we don't have to clone every field name of a wide struct.
         if let Some(replacement) = transform.field_replacements.get(field_name) {
             if let Some(expr) = replacement {
                 output_cols.push(evaluate_expression(expr, batch, None)?);
@@ -431,8 +432,11 @@ mod tests {
         let a_values = Int32Array::from(vec![1, 2, 3]);
         let b_values = Int32Array::from(vec![10, 20, 30]);
         let c_values = Int32Array::from(vec![100, 200, 300]);
-        let columns = vec![Arc::new(a_values), Arc::new(b_values), Arc::new(c_values)];
-        RecordBatch::try_new(Arc::new(schema), columns).unwrap()
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(a_values), Arc::new(b_values), Arc::new(c_values)],
+        )
+        .unwrap()
     }
 
     fn create_nested_test_batch() -> RecordBatch {
@@ -480,8 +484,12 @@ mod tests {
         ]);
 
         let expr = Expr::Transform(transform);
-        let result_type = Some(&DataType::Struct(Box::new(output_schema)));
-        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
 
         // For identity transform, output should be identical to input
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
@@ -501,8 +509,12 @@ mod tests {
         ]);
 
         let expr_nested = Expr::Transform(transform_nested);
-        let result_type = Some(&DataType::Struct(Box::new(nested_output_schema)));
-        let result_nested = evaluate_expression(&expr_nested, &nested_batch, result_type).unwrap();
+        let result_nested = evaluate_expression(
+            &expr_nested,
+            &nested_batch,
+            Some(&DataType::Struct(Box::new(nested_output_schema))),
+        )
+        .unwrap();
 
         // Extract the original nested struct for comparison
         let original_nested = nested_batch
@@ -571,8 +583,12 @@ mod tests {
         ]);
 
         let expr = Expr::Transform(transform);
-        let result_type = Some(&DataType::Struct(Box::new(output_schema)));
-        let result = evaluate_expression(&expr, &batch, result_type).unwrap();
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
 
         let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(struct_result.num_columns(), 8);
@@ -648,8 +664,12 @@ mod tests {
         ]);
 
         let expr_copy = Expr::Transform(transform_copy);
-        let result_type = Some(&DataType::Struct(Box::new(copy_output_schema)));
-        let result_copy = evaluate_expression(&expr_copy, &nested_batch, result_type).unwrap();
+        let result_copy = evaluate_expression(
+            &expr_copy,
+            &nested_batch,
+            Some(&DataType::Struct(Box::new(copy_output_schema))),
+        )
+        .unwrap();
 
         // Verify the copy is identical to original nested struct
         let copy_result = result_copy.as_any().downcast_ref::<StructArray>().unwrap();
@@ -687,8 +707,12 @@ mod tests {
         ]);
 
         let expr_modify = Expr::Transform(transform_modify);
-        let result_type = Some(&DataType::Struct(Box::new(modify_output_schema)));
-        let result_modify = evaluate_expression(&expr_modify, &nested_batch, result_type).unwrap();
+        let result_modify = evaluate_expression(
+            &expr_modify,
+            &nested_batch,
+            Some(&DataType::Struct(Box::new(modify_output_schema))),
+        )
+        .unwrap();
 
         let modify_result = result_modify
             .as_any()
@@ -735,8 +759,11 @@ mod tests {
         let output_schema = StructType::new(vec![StructField::new("a", DataType::INTEGER, false)]);
 
         let expr = Expr::Transform(transform);
-        let result_type = Some(&DataType::Struct(Box::new(output_schema.clone())));
-        let result = evaluate_expression(&expr, &batch, result_type);
+        let result = evaluate_expression(
+            &expr,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema.clone()))),
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("replacement keys"));
 
@@ -748,8 +775,11 @@ mod tests {
         );
 
         let expr2 = Expr::Transform(transform2);
-        let result_type = Some(&DataType::Struct(Box::new(output_schema.clone())));
-        let result2 = evaluate_expression(&expr2, &batch, result_type);
+        let result2 = evaluate_expression(
+            &expr2,
+            &batch,
+            Some(&DataType::Struct(Box::new(output_schema.clone()))),
+        );
         assert!(result2.is_err());
         assert!(result2.unwrap_err().to_string().contains("insertion keys"));
 
@@ -764,8 +794,11 @@ mod tests {
         ]);
 
         let expr3 = Expr::Transform(transform3);
-        let result_type = Some(&DataType::Struct(Box::new(wrong_output_schema)));
-        let result3 = evaluate_expression(&expr3, &batch, result_type);
+        let result3 = evaluate_expression(
+            &expr3,
+            &batch,
+            Some(&DataType::Struct(Box::new(wrong_output_schema))),
+        );
         assert!(result3.is_err());
         assert!(result3
             .unwrap_err()

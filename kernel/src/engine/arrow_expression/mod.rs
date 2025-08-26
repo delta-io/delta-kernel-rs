@@ -18,7 +18,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::{evaluate_expression, evaluate_predicate};
+use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
 
 mod apply_schema;
 pub mod evaluate_expression;
@@ -285,13 +285,9 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
                 // Empty transform optimization: Skip expression evaluation and directly apply the
                 // output schema to the input RecordBatch. This is used to cheaply apply a new
                 // output schema to existing data without changing it, e.g. for column mapping.
-                let array = match transform.input_path {
+                let array = match transform.input_path() {
                     None => Arc::new(StructArray::from(batch.clone())),
-                    Some(ref path) => {
-                        // Fetch the requested input column and return it directly
-                        let expr = Expression::column(path.clone());
-                        evaluate_expression(&expr, batch, None)?
-                    }
+                    Some(path) => extract_column(batch, path)?,
                 };
                 apply_schema(&array, &self.output_type)?
             }
