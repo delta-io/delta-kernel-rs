@@ -161,9 +161,9 @@ pub(crate) mod test_utils {
     use crate::Engine;
     use crate::EngineData;
 
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::ObjectStore;
     use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
+    use object_store::ObjectStore;
     use serde::Serialize;
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
@@ -270,6 +270,23 @@ pub(crate) mod test_utils {
         ]
         .into();
         parse_json_batch(json_strings)
+    }
+
+    // TODO: allow tests to pass in context (issue#1133)
+    pub(crate) fn assert_result_error_with_message<T, E: ToString>(
+        res: Result<T, E>,
+        message: &str,
+    ) {
+        match res {
+            Ok(_) => panic!("Expected error, but got Ok result"),
+            Err(error) => {
+                let error_str = error.to_string();
+                assert!(
+                    error_str.contains(message),
+                    "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
+                );
+            }
+        }
     }
 }
 

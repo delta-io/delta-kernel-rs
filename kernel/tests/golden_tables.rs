@@ -11,7 +11,6 @@ use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
 use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use delta_kernel::object_store::{local::LocalFileSystem, ObjectStore};
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -23,13 +22,13 @@ use delta_kernel::{DeltaResult, Snapshot};
 
 use futures::{stream::TryStreamExt, StreamExt};
 use itertools::Itertools;
+use object_store::{local::LocalFileSystem, ObjectStore};
 use paste::paste;
 use url::Url;
 
 mod common;
-use common::load_test_data;
 
-use test_utils::to_arrow;
+use test_utils::{load_test_data, to_arrow};
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
@@ -344,7 +343,7 @@ golden_test!(
 skip_test!("data-reader-partition-values": "Golden data needs to have 2021-09-08T11:11:11+00:00 as expected value for as_timestamp col");
 golden_test!("data-reader-primitives", latest_snapshot_test);
 golden_test!("data-reader-timestamp_ntz", latest_snapshot_test);
-skip_test!("data-reader-timestamp_ntz-id-mode": "id column mapping mode not supported");
+golden_test!("data-reader-timestamp_ntz-id-mode", latest_snapshot_test);
 golden_test!("data-reader-timestamp_ntz-name-mode", latest_snapshot_test);
 
 // TODO test with predicate
@@ -405,8 +404,7 @@ golden_test!("snapshot-repartitioned", latest_snapshot_test);
 golden_test!("snapshot-vacuumed", latest_snapshot_test);
 
 golden_test!("table-with-columnmapping-mode-name", latest_snapshot_test);
-// TODO fix column mapping
-skip_test!("table-with-columnmapping-mode-id": "id column mapping mode not supported");
+golden_test!("table-with-columnmapping-mode-id", latest_snapshot_test);
 
 // TODO scan at different versions
 golden_test!("time-travel-partition-changes-a", latest_snapshot_test);

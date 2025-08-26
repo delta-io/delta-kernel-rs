@@ -1,4 +1,4 @@
-//! Provides engine implementation that implement the required traits. The engine can optionally
+//! Provides an engine implementation that implements the required traits. The engine can optionally
 //! be built into the kernel by setting the `default-engine` feature flag. See the related module
 //! for more information.
 
@@ -29,8 +29,8 @@ pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 mod tests {
-    use crate::object_store::path::Path;
     use itertools::Itertools;
+    use object_store::path::Path;
     use std::sync::Arc;
     use url::Url;
 

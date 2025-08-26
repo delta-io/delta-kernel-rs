@@ -44,6 +44,7 @@ struct EnsureDataTypes {
 }
 
 /// Capture the compatibility between two data-types, as passed to [`ensure_data_types`]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) enum DataTypeCompat {
     /// The two types are the same
     Identical,
@@ -71,8 +72,13 @@ impl EnsureDataTypes {
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
             | (&DataType::STRING, ArrowDataType::Utf8)
+            | (&DataType::STRING, ArrowDataType::Utf8View)
+            | (&DataType::BINARY, ArrowDataType::BinaryView)
             | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
-            (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field)) => {
+            (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
+            | (DataType::Array(inner_type), ArrowDataType::LargeList(arrow_list_field))
+            | (DataType::Array(inner_type), ArrowDataType::ListView(arrow_list_field))
+            | (DataType::Array(inner_type), ArrowDataType::LargeListView(arrow_list_field)) => {
                 self.ensure_nullability(
                     "List",
                     inner_type.contains_null,
@@ -256,11 +262,14 @@ fn metadata_eq(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
 
@@ -336,28 +345,35 @@ mod tests {
             true
         )
         .is_ok());
-        assert!(ensure_data_types(
-            &DataType::unshredded_variant(),
-            &incorrect_variant_arrow_type(),
-            true
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::unshredded_variant(),
+                &incorrect_variant_arrow_type(),
+                true,
+            ),
+            // TODO(#1140): Arrow has different printing for different versions. We use the
+            // common prefix to check the error. Once the minimum version of arrow is greater
+            // than 55.1, assert the full message
+            "Invalid argument error: Incorrect datatype. Expected Struct",
         )
-        .is_err());
     }
 
     #[test]
     fn ensure_decimals() {
         assert!(ensure_data_types(
-            &DataType::decimal_unchecked(5, 2),
+            &DataType::decimal(5, 2).unwrap(),
             &ArrowDataType::Decimal128(5, 2),
             false
         )
         .is_ok());
-        assert!(ensure_data_types(
-            &DataType::decimal_unchecked(5, 2),
-            &ArrowDataType::Decimal128(5, 3),
-            false
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::decimal(5, 2).unwrap(),
+                &ArrowDataType::Decimal128(5, 3),
+                false,
+            ),
+            "Invalid argument error: Incorrect datatype. Expected Decimal128(5, 2), got Decimal128(5, 3)",
         )
-        .is_err());
     }
 
     #[test]
@@ -381,23 +397,26 @@ mod tests {
         )
         .is_ok());
 
-        assert!(ensure_data_types(
-            &DataType::Map(Box::new(MapType::new(
-                DataType::LONG,
-                DataType::STRING,
-                false
-            ))),
-            arrow_field.data_type(),
-            true
-        )
-        .is_err());
-
-        assert!(ensure_data_types(
-            &DataType::Map(Box::new(MapType::new(DataType::LONG, DataType::LONG, true))),
-            arrow_field.data_type(),
-            false
-        )
-        .is_err());
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Map(Box::new(MapType::new(
+                    DataType::LONG,
+                    DataType::STRING,
+                    false,
+                ))),
+                arrow_field.data_type(),
+                true,
+            ),
+            "Generic delta kernel error: Map has nullablily false in kernel and true in arrow",
+        );
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Map(Box::new(MapType::new(DataType::LONG, DataType::LONG, true))),
+                arrow_field.data_type(),
+                false,
+            ),
+            "Invalid argument error: Incorrect datatype. Expected long, got Utf8",
+        );
     }
 
     #[test]
@@ -409,17 +428,27 @@ mod tests {
         )
         .is_ok());
         assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-            &ArrowDataType::new_list(ArrowDataType::Int64, true),
+            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+            &ArrowDataType::new_large_list(ArrowDataType::Int64, true),
             false
         )
-        .is_err());
-        assert!(ensure_data_types(
-            &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
-            &ArrowDataType::new_list(ArrowDataType::Int64, false),
-            true
-        )
-        .is_err());
+        .is_ok());
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+                &ArrowDataType::new_list(ArrowDataType::Int64, true),
+                false,
+            ),
+            "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
+        );
+        assert_result_error_with_message(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &ArrowDataType::new_list(ArrowDataType::Int64, false),
+                true,
+            ),
+            "Generic delta kernel error: List has nullablily true in kernel and false in arrow",
+        );
     }
 
     #[test]
@@ -468,7 +497,10 @@ mod tests {
             Fields::from(vec![ArrowField::new("w", ArrowDataType::Int64, true)]),
             true,
         );
-        assert!(ensure_data_types(&kernel_simple, arrow_missing_simple.data_type(), true).is_err());
+        assert_result_error_with_message(
+            ensure_data_types(&kernel_simple, arrow_missing_simple.data_type(), true),
+            "Invalid argument error: Missing Struct fields x (Up to five missing fields shown)",
+        );
 
         let arrow_nullable_mismatch_simple = ArrowField::new_struct(
             "arrow_struct",
@@ -478,11 +510,49 @@ mod tests {
             ]),
             true,
         );
-        assert!(ensure_data_types(
-            &kernel_simple,
-            arrow_nullable_mismatch_simple.data_type(),
-            true
-        )
-        .is_err());
+        assert_result_error_with_message(
+            ensure_data_types(
+                &kernel_simple,
+                arrow_nullable_mismatch_simple.data_type(),
+                true,
+            ),
+            "Generic delta kernel error: w has nullablily true in kernel and false in arrow",
+        );
+    }
+
+    #[test]
+    fn ensure_views() {
+        assert_eq!(
+            ensure_data_types(&DataType::STRING, &ArrowDataType::Utf8View, true).unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(&DataType::BINARY, &ArrowDataType::BinaryView, true).unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &ArrowDataType::ListView(Arc::new(ArrowField::new_list_field(
+                    ArrowDataType::Int64,
+                    true
+                ))),
+                true
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(
+                &DataType::Array(Box::new(ArrayType::new(DataType::LONG, true))),
+                &ArrowDataType::LargeListView(Arc::new(ArrowField::new_list_field(
+                    ArrowDataType::Int64,
+                    true
+                ))),
+                true
+            )
+            .unwrap(),
+            DataTypeCompat::Identical
+        );
     }
 }

@@ -422,6 +422,16 @@ pub use __column_expr as column_expr;
 
 #[macro_export]
 #[doc(hidden)]
+macro_rules! __column_expr_ref {
+    ( $($name:tt)* ) => {
+        std::sync::Arc::new($crate::expressions::Expression::from($crate::__column_name!($($name)*)))
+    };
+}
+#[doc(inline)]
+pub use __column_expr_ref as column_expr_ref;
+
+#[macro_export]
+#[doc(hidden)]
 macro_rules! __column_pred {
     ( $($name:tt)* ) => {
         $crate::expressions::Predicate::from($crate::__column_name!($($name)*))

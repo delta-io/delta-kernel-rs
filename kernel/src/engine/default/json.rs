@@ -8,11 +8,11 @@ use std::task::Poll;
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
-use crate::object_store::path::Path;
-use crate::object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use bytes::{Buf, Bytes};
 use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
+use object_store::path::Path;
+use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
 use tracing::warn;
 use url::Url;
 
@@ -258,20 +258,17 @@ mod tests {
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    #[cfg(feature = "arrow-55")]
-    use crate::object_store::PutMultipartOptions;
-    #[cfg(not(feature = "arrow-55"))]
-    use crate::object_store::PutMultipartOpts;
-    use crate::object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
-        PutPayload, PutResult, Result,
-    };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
     use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
+    use object_store::PutMultipartOptions;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
+        PutPayload, PutResult, Result,
+    };
     use serde_json::json;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
@@ -359,8 +356,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            #[cfg(not(feature = "arrow-55"))] opts: PutMultipartOpts,
-            #[cfg(feature = "arrow-55")] opts: PutMultipartOptions,
+            opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -537,13 +533,10 @@ mod tests {
         let location = Path::from_url_path(url.path()).unwrap();
         let meta = store.head(&location).await.unwrap();
 
-        let meta_size = meta.size;
-        #[cfg(not(feature = "arrow-55"))]
-        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta_size,
+            size: meta.size,
         }];
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
@@ -688,13 +681,10 @@ mod tests {
                         let url = Url::parse(&format!("memory:/{path}")).unwrap();
                         let location = Path::from(path.as_ref());
                         let meta = store.head(&location).await.unwrap();
-                        let meta_size = meta.size;
-                        #[cfg(not(feature = "arrow-55"))]
-                        let meta_size = meta_size.try_into().unwrap();
                         FileMeta {
                             location: url,
                             last_modified: meta.last_modified.timestamp_millis(),
-                            size: meta_size,
+                            size: meta.size,
                         }
                     }
                 })

@@ -565,8 +565,8 @@ mod tests {
         unsafe { h.drop_handle() };
 
         let f = Foo {
-            x: rand::random::<usize>(),
-            y: rand::random::<usize>().to_string(),
+            x: rand::random::<u64>() as usize,
+            y: rand::random::<u64>().to_string(),
         };
         let s = format!("{f:?}");
         let mut h: Handle<MutableFoo> = Box::new(f).into();
@@ -576,8 +576,8 @@ mod tests {
         unsafe { h.drop_handle() };
 
         let b = Bar {
-            x: rand::random::<usize>(),
-            y: rand::random::<usize>().to_string(),
+            x: rand::random::<u64>() as usize,
+            y: rand::random::<u64>().to_string(),
         };
         let s = format!("{b:?}");
         let h: Handle<SharedBar> = Arc::new(b).into();
@@ -589,8 +589,8 @@ mod tests {
         unsafe { h.drop_handle() };
 
         let b = Bar {
-            x: rand::random::<usize>(),
-            y: rand::random::<usize>().to_string(),
+            x: rand::random::<u64>() as usize,
+            y: rand::random::<u64>().to_string(),
         };
         let s = b.squawk();
         let t: Arc<dyn Baz> = Arc::new(b);
@@ -604,8 +604,8 @@ mod tests {
         let s2 = s;
         unsafe { h.drop_handle() };
 
-        let randstr = rand::random::<usize>().to_string();
-        let randint = rand::random::<usize>();
+        let randstr = rand::random::<u64>().to_string();
+        let randint = rand::random::<u64>() as usize;
 
         let b = Bar {
             x: randint,

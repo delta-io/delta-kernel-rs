@@ -5,16 +5,15 @@ edition = "2021"
 publish = false
 
 [dependencies]
-arrow = { version = "55", features = ["prettyprint", "chrono-tz"] }
+arrow = { version = "56", features = ["prettyprint", "chrono-tz"] }
 clap = { version = "4.5", features = ["derive"] }
 common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
-  "arrow-55",
-  "default-engine",
+  "arrow-56",
+  "default-engine-rustls",
   "internal-api",
 ] }
 env_logger = "0.11.8"
-itertools = "0.14"
 spmc = "0.3.0"
 url = "2"
 

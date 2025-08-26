@@ -280,7 +280,7 @@ impl TryFromArrow<&ArrowDataType> for DataType {
                     let value_type_nullable = struct_fields[1].is_nullable();
                     Ok(MapType::new(key_type, value_type, value_type_nullable).into())
                 } else {
-                    panic!("DataType::Map should contain a struct field child");
+                    unreachable!("DataType::Map should contain a struct field child");
                 }
             }
             // Dictionary types are just an optimized in-memory representation of an array.
