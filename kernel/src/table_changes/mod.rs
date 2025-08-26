@@ -140,12 +140,9 @@ impl TableChanges {
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
-        let log_segment = LogSegment::for_table_changes(
-            engine.storage_handler().as_ref(),
-            log_root,
-            start_version,
-            end_version,
-        )?;
+        let log_segment = LogSegment::build(log_root)
+            .with_end_version_opt(end_version)
+            .build_incremental(start_version, engine.storage_handler().as_ref())?;
 
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
