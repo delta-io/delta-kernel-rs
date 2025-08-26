@@ -31,7 +31,7 @@ use crate::scan::test_utils::{
 };
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
-    DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
+    DeltaResult, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
 };
 
