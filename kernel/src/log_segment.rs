@@ -19,7 +19,10 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
-use crate::listed_log_files::*;
+#[cfg(feature = "internal-api")]
+pub use crate::listed_log_files::ListedLogFiles;
+#[cfg(not(feature = "internal-api"))]
+use crate::listed_log_files::ListedLogFiles;
 
 use itertools::Itertools;
 use tracing::{debug, warn};

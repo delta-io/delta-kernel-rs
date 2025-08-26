@@ -183,7 +183,8 @@ impl StructField {
     /// NOTE: Caller affirms that the schema was already validated by
     /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
-    pub fn physical_name(&self) -> &str {
+    #[internal_api]
+    pub(crate) fn physical_name(&self) -> &str {
         match self
             .metadata
             .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
