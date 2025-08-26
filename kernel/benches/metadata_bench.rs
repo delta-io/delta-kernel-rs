@@ -91,7 +91,7 @@ fn scan_metadata_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-fn get_workloads() -> Vec<WorkloadSpec> {
+fn get_workloads() -> Vec<(WorkloadSpec, String)> {
     let workloads_dir = "./benches/workloads/";
     println!("current: {:?}", std::env::current_dir());
 
@@ -116,11 +116,9 @@ fn get_workloads() -> Vec<WorkloadSpec> {
             match fs::read_to_string(&path) {
                 Ok(json_content) => match serde_json::from_str::<WorkloadSpec>(&json_content) {
                     Ok(workload) => {
-                        println!(
-                            "Successfully parsed workload from: {:?}",
-                            path.file_name().unwrap()
-                        );
-                        workloads.push(workload);
+                        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+                        println!("Successfully parsed workload from: {:?}", filename);
+                        workloads.push((workload, filename));
                     }
                     Err(e) => {
                         eprintln!("Failed to parse JSON from {:?}: {}", path, e);
@@ -151,7 +149,7 @@ fn temp_benchmark(c: &mut Criterion) {
     for workload in workloads {
         // Access the data
         match workload {
-            WorkloadSpec::ReadMetadata(read_metadata) => {
+            (WorkloadSpec::ReadMetadata(read_metadata), name) => {
                 println!("Table root: {}", read_metadata.table_root);
                 println!("Version: {:?}", read_metadata.version);
                 println!("Predicate: {:?}", read_metadata.predicate);
@@ -183,7 +181,7 @@ fn temp_benchmark(c: &mut Criterion) {
                     .predicate
                     .as_ref()
                     .map(|pred| Arc::new(Predicate::BooleanExpression(pred.0.clone())));
-                group.bench_function("scan_metadata", |b| {
+                group.bench_function(format!("scan_metadata: {name}"), |b| {
                     b.iter(|| {
                         let scan = snapshot
                             .clone() // arc
