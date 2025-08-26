@@ -171,8 +171,12 @@ fn temp_benchmark(c: &mut Criterion) {
                 );
 
                 let snapshot = Arc::new(
-                    Snapshot::try_new(read_metadata.table_root, engine.as_ref(), None)
-                        .expect("Failed to create snapshot"),
+                    Snapshot::try_new(
+                        read_metadata.table_root,
+                        engine.as_ref(),
+                        read_metadata.version,
+                    )
+                    .expect("Failed to create snapshot"),
                 );
                 println!("snapshot schema: {:?}", snapshot.schema());
                 let predicate = read_metadata
