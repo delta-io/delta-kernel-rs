@@ -1,11 +1,12 @@
+use delta_kernel::snapshot::Snapshot;
+use delta_kernel::DeltaResult;
+
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
     SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
-use delta_kernel::snapshot::Snapshot;
-use delta_kernel::DeltaResult;
 
 /// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific domain in this snapshot
 ///
@@ -39,6 +40,15 @@ fn get_domain_metadata_impl(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::DeltaResult;
+    use object_store::memory::InMemory;
+    use serde_json::json;
+    use test_utils::add_commit;
+
     use super::*;
     use crate::error::KernelError;
     use crate::ffi_test_utils::{
@@ -46,13 +56,6 @@ mod tests {
         recover_string,
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
-    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use delta_kernel::engine::default::DefaultEngine;
-    use delta_kernel::DeltaResult;
-    use object_store::memory::InMemory;
-    use serde_json::json;
-    use std::sync::Arc;
-    use test_utils::add_commit;
 
     #[tokio::test]
     async fn test_domain_metadata() -> DeltaResult<()> {

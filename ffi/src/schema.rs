@@ -1,9 +1,10 @@
 use std::os::raw::c_void;
 
+use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
+
 use crate::handle::Handle;
 use crate::scan::CStringMap;
 use crate::{kernel_string_slice, KernelStringSlice, SharedSchema};
-use delta_kernel::schema::{ArrayType, DataType, MapType, PrimitiveType, StructType};
 
 /// The `EngineSchemaVisitor` defines a visitor system to allow engines to build their own
 /// representation of a schema from a particular schema within kernel.

@@ -10,7 +10,8 @@
 //! A generic trait [TaskExecutor] can be implemented with your preferred async
 //! runtime. Behind the `tokio` feature flag, we provide a both a single-threaded
 //! and multi-threaded executor based on Tokio.
-use futures::{future::BoxFuture, Future};
+use futures::future::BoxFuture;
+use futures::Future;
 
 use crate::DeltaResult;
 
@@ -43,12 +44,13 @@ pub trait TaskExecutor: Send + Sync + 'static {
 
 #[cfg(any(feature = "tokio", test))]
 pub mod tokio {
-    use super::TaskExecutor;
-    use futures::TryFutureExt;
-    use futures::{future::BoxFuture, Future};
     use std::sync::mpsc::channel;
+
+    use futures::future::BoxFuture;
+    use futures::{Future, TryFutureExt};
     use tokio::runtime::RuntimeFlavor;
 
+    use super::TaskExecutor;
     use crate::DeltaResult;
 
     /// A [`TaskExecutor`] that uses the tokio single-threaded runtime in a

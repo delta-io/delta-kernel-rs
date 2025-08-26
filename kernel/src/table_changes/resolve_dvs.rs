@@ -153,21 +153,20 @@ pub(crate) fn resolve_scan_file_dv(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Write, path::PathBuf};
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::path::PathBuf;
 
     use bytes::BufMut;
     use itertools::Itertools;
     use roaring::RoaringTreemap;
 
-    use crate::{
-        actions::deletion_vector::DeletionVectorDescriptor,
-        engine::sync::SyncEngine,
-        scan::state::DvInfo,
-        table_changes::scan_file::{CdfScanFile, CdfScanFileType},
-        Error,
-    };
-
     use super::resolve_scan_file_dv;
+    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::engine::sync::SyncEngine;
+    use crate::scan::state::DvInfo;
+    use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
+    use crate::Error;
 
     fn treemap_to_dv_descriptor(map: RoaringTreemap) -> DeletionVectorDescriptor {
         let buf = Vec::new();

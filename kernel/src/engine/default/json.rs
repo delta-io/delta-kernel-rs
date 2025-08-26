@@ -5,22 +5,25 @@ use std::ops::Range;
 use std::sync::{mpsc, Arc};
 use std::task::Poll;
 
-use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
-use crate::arrow::json::ReaderBuilder;
-use crate::arrow::record_batch::RecordBatch;
 use bytes::{Buf, Bytes};
-use futures::stream::{self, BoxStream};
+use futures::stream::{
+    BoxStream, {self},
+};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
+use object_store::{
+    DynObjectStore, GetResultPayload, PutMode, {self},
+};
 use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
+use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use crate::arrow::json::ReaderBuilder;
+use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::parse_json as arrow_parse_json;
-use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine::arrow_utils::{parse_json as arrow_parse_json, to_json_bytes};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -251,6 +254,16 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
 
+    use futures::future;
+    use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    };
+    use serde_json::json;
+
     use crate::actions::get_log_schema;
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
@@ -260,16 +273,6 @@ mod tests {
     };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
-    use futures::future;
-    use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use object_store::memory::InMemory;
-    use object_store::PutMultipartOptions;
-    use object_store::{
-        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutOptions,
-        PutPayload, PutResult, Result,
-    };
-    use serde_json::json;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {

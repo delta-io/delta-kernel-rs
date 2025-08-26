@@ -9,7 +9,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::log_replay::get_scan_metadata_transform_expr;
+use self::log_replay::{get_scan_metadata_transform_expr, scan_action_iter};
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
@@ -22,16 +22,13 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
 use crate::scan::state::{DvInfo, Stats};
-use crate::schema::ToSchema as _;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    StructType,
+    StructType, ToSchema as _,
 };
 use crate::snapshot::Snapshot;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
-
-use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
 pub mod log_replay;
@@ -874,24 +871,22 @@ pub fn selection_vector(
 // some utils that are used in file_stream.rs and state.rs tests
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::arrow::array::StringArray;
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use itertools::Itertools;
     use std::sync::Arc;
 
-    use crate::log_replay::ActionsBatch;
-    use crate::{
-        actions::get_log_schema,
-        engine::{
-            arrow_data::ArrowEngineData,
-            sync::{json::SyncJsonHandler, SyncEngine},
-        },
-        scan::log_replay::scan_action_iter,
-        schema::SchemaRef,
-        JsonHandler,
-    };
+    use itertools::Itertools;
 
-    use super::{state::ScanCallback, Transform};
+    use super::state::ScanCallback;
+    use super::Transform;
+    use crate::actions::get_log_schema;
+    use crate::arrow::array::StringArray;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::json::SyncJsonHandler;
+    use crate::engine::sync::SyncEngine;
+    use crate::log_replay::ActionsBatch;
+    use crate::scan::log_replay::scan_action_iter;
+    use crate::schema::SchemaRef;
+    use crate::utils::test_utils::string_array_to_engine_data;
+    use crate::JsonHandler;
 
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
@@ -1011,6 +1006,7 @@ pub(crate) mod test_utils {
 mod tests {
     use std::path::PathBuf;
 
+    use super::*;
     use crate::arrow::array::BooleanArray;
     use crate::arrow::compute::filter_record_batch;
     use crate::arrow::record_batch::RecordBatch;
@@ -1019,8 +1015,6 @@ mod tests {
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
     use crate::Snapshot;
-
-    use super::*;
 
     #[test]
     fn test_static_skipping() {

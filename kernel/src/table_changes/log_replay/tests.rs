@@ -1,5 +1,10 @@
-use super::table_changes_action_iter;
-use super::TableChangesScanMetadata;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use itertools::Itertools;
+
+use super::{table_changes_action_iter, TableChangesScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
@@ -12,13 +17,7 @@ use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_features::ReaderFeature;
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
-use crate::Predicate;
-use crate::{DeltaResult, Engine, Error, Version};
-
-use itertools::Itertools;
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use crate::{DeltaResult, Engine, Error, Predicate, Version};
 
 fn get_schema() -> StructType {
     StructType::new([

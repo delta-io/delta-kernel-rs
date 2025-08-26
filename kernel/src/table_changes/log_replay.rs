@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
+
 use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
@@ -24,8 +26,6 @@ use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
-
-use itertools::Itertools;
 
 #[cfg(test)]
 mod tests;

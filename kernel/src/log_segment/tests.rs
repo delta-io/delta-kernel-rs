@@ -1,12 +1,16 @@
-use std::sync::LazyLock;
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock};
 
 use futures::executor::block_on;
 use itertools::Itertools;
-use object_store::{memory::InMemory, path::Path, ObjectStore};
+use object_store::memory::InMemory;
+use object_store::path::Path;
+use object_store::ObjectStore;
 use test_log::test;
+use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 use url::Url;
 
+use super::*;
 use crate::actions::visitors::AddVisitor;
 use crate::actions::{
     get_log_add_schema, get_log_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
@@ -30,9 +34,6 @@ use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
 };
-use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
-
-use super::*;
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
 // that the parquet reader properly infers nullcount = rowcount for missing columns. The two

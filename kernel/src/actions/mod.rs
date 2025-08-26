@@ -7,6 +7,12 @@ use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use url::Url;
+use visitors::{MetadataVisitor, ProtocolVisitor};
+
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{ArrayData, MapData, Scalar, StructData};
 use crate::schema::{
@@ -21,13 +27,6 @@ use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
     IntoEngineData, RowVisitor as _,
 };
-
-use url::Url;
-use visitors::{MetadataVisitor, ProtocolVisitor};
-
-use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
@@ -893,21 +892,20 @@ impl DomainMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{
-        arrow::array::{
-            Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-            MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
-        },
-        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
-        arrow::json::ReaderBuilder,
-        engine::arrow_data::ArrowEngineData,
-        engine::arrow_expression::ArrowEvaluationHandler,
-        schema::{ArrayType, DataType, MapType, StructField},
-        utils::test_utils::assert_result_error_with_message,
-        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
-    };
     use serde_json::json;
+
+    use super::*;
+    use crate::arrow::array::{
+        Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+        MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+    };
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use crate::arrow::json::ReaderBuilder;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_expression::ArrowEvaluationHandler;
+    use crate::schema::{ArrayType, DataType, MapType, StructField};
+    use crate::utils::test_utils::assert_result_error_with_message;
+    use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);

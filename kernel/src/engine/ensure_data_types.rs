@@ -1,20 +1,16 @@
 //! Helpers to ensure that kernel data types match arrow data types
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Deref,
-};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 use itertools::Itertools;
 
 use super::arrow_conversion::TryIntoArrow as _;
-use crate::{
-    engine::arrow_utils::make_arrow_error,
-    schema::{DataType, MetadataValue, StructField},
-    utils::require,
-    DeltaResult, Error,
-};
+use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+use crate::engine::arrow_utils::make_arrow_error;
+use crate::schema::{DataType, MetadataValue, StructField};
+use crate::utils::require;
+use crate::{DeltaResult, Error};
 
 /// Ensure a kernel data type matches an arrow data type. This only ensures that the actual "type"
 /// is the same, but does so recursively into structs, and ensures lists and maps have the correct
@@ -264,19 +260,18 @@ fn metadata_eq(
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Fields};
-
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
     use crate::utils::test_utils::assert_result_error_with_message;
 
-    use super::*;
-
     #[test]
     fn accepts_safe_decimal_casts() {
-        use super::can_upcast_to_decimal;
         use ArrowDataType::*;
+
+        use super::can_upcast_to_decimal;
 
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 0i8));
         assert!(can_upcast_to_decimal(&Decimal128(1, 0), 2u8, 1i8));
@@ -313,8 +308,9 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_decimal_casts() {
-        use super::can_upcast_to_decimal;
         use ArrowDataType::*;
+
+        use super::can_upcast_to_decimal;
 
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, 1i8));
         assert!(!can_upcast_to_decimal(&Decimal128(2, 0), 2u8, -1i8));

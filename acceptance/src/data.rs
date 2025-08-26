@@ -1,19 +1,22 @@
-use std::{path::Path, sync::Arc};
+use std::path::Path;
+use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, RecordBatch};
 use delta_kernel::arrow::compute::{
     concat_batches, filter_record_batch, lexsort_to_indices, take, SortColumn,
 };
 use delta_kernel::arrow::datatypes::{DataType, Schema};
-
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error};
-use futures::{stream::TryStreamExt, StreamExt};
+use delta_kernel::{DeltaResult, Engine, Error};
+use futures::stream::TryStreamExt;
+use futures::StreamExt;
 use itertools::Itertools;
-use object_store::{local::LocalFileSystem, ObjectStore};
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
 
 use crate::{TestCaseInfo, TestResult};
 

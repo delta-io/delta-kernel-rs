@@ -1,8 +1,8 @@
-use super::*;
+use std::collections::HashMap;
 
+use super::*;
 use crate::expressions::column_name;
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
-use std::collections::HashMap;
 
 const TRUE: Option<bool> = Some(true);
 const FALSE: Option<bool> = Some(false);

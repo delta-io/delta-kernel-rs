@@ -7,22 +7,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{Array, AsArray, StructArray};
-use delta_kernel::arrow::compute::{concat_batches, take};
-use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
-use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
-use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
-use delta_kernel::parquet::arrow::async_reader::{
-    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+use delta_kernel::arrow::compute::{
+    concat_batches, filter_record_batch, lexsort_to_indices, take, SortColumn,
 };
-
+use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
+use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::parquet::arrow::async_reader::{
+    ParquetObjectReader, ParquetRecordBatchStreamBuilder,
+};
 use delta_kernel::{DeltaResult, Snapshot};
-
-use futures::{stream::TryStreamExt, StreamExt};
+use futures::stream::TryStreamExt;
+use futures::StreamExt;
 use itertools::Itertools;
-use object_store::{local::LocalFileSystem, ObjectStore};
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
 use paste::paste;
 use url::Url;
 

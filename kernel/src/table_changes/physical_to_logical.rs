@@ -3,16 +3,15 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use crate::expressions::Scalar;
-use crate::scan::{parse_partition_value, ColumnType};
-use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
-use crate::{DeltaResult, Error, Expression};
-
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{
     ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
     REMOVE_CHANGE_TYPE,
 };
+use crate::expressions::Scalar;
+use crate::scan::{parse_partition_value, ColumnType};
+use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
+use crate::{DeltaResult, Error, Expression};
 
 /// Returns a map from change data feed column name to an expression that generates the row data.
 fn get_cdf_columns(scan_file: &CdfScanFile) -> DeltaResult<HashMap<&str, Expression>> {

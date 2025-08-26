@@ -13,8 +13,9 @@ use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, Pre
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::{Scalar, TransformExpr};
-use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{
+    ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -410,9 +411,12 @@ pub(crate) fn scan_action_iter(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
+    use super::scan_action_iter;
     use crate::actions::get_log_schema;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_name, Scalar};
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
@@ -421,15 +425,9 @@ mod tests {
         run_with_validate_callback,
     };
     use crate::scan::{Scan, StateInfo};
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
-    use crate::Expression as Expr;
-    use crate::{
-        engine::sync::SyncEngine,
-        schema::{DataType, SchemaRef, StructField, StructType},
-        ExpressionRef,
-    };
-
-    use super::scan_action_iter;
+    use crate::{Expression as Expr, ExpressionRef};
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs

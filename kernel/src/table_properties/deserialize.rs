@@ -5,12 +5,12 @@
 use std::num::NonZero;
 use std::time::Duration;
 
+use tracing::warn;
+
 use super::*;
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
-
-use tracing::warn;
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;

@@ -183,16 +183,15 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
-    use object_store::{local::LocalFileSystem, ObjectStore};
-
+    use object_store::ObjectStore;
     use test_utils::delta_path_for_version;
 
+    use super::*;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::Engine as _;
-
-    use super::*;
 
     #[tokio::test]
     async fn test_read_files() {

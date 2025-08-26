@@ -1,13 +1,13 @@
 //! Utities for reading the `_last_checkpoint` file. Maybe this file should instead go under
 //! log_segment module since it should only really be used there? as hint for listing?
 
-use crate::schema::Schema;
-use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
-
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use url::Url;
+
+use crate::schema::Schema;
+use crate::{DeltaResult, Error, StorageHandler, Version};
 
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate

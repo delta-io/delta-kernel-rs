@@ -1,6 +1,9 @@
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::{self, Display};
+use std::fmt::{
+    Display, {self},
+};
+
+use serde::{Deserialize, Serialize};
 
 // note this is a subset of actual get tables response
 #[derive(Debug, Clone, Serialize, Deserialize)]

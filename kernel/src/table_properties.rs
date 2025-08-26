@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::time::Duration;
 
+use strum::EnumString;
+
 use crate::expressions::ColumnName;
 use crate::table_features::ColumnMappingMode;
 use crate::{Error, Version};
-
-use strum::EnumString;
 
 mod deserialize;
 pub use deserialize::ParseIntervalError;
@@ -217,10 +217,10 @@ pub enum CheckpointPolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::expressions::column_name;
     use std::collections::HashMap;
+
+    use super::*;
+    use crate::expressions::column_name;
 
     #[test]
     fn known_key_unknown_val() {

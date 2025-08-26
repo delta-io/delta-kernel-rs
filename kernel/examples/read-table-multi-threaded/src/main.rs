@@ -7,14 +7,13 @@ use std::thread;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
+use clap::Parser;
 use common::{LocationArgs, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
-
-use clap::Parser;
 use url::Url;
 
 /// An example program that reads a table using multiple threads. This shows the use of the

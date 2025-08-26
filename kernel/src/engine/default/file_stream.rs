@@ -5,14 +5,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
-use crate::arrow::array::RecordBatch;
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
 use tracing::error;
 
 use super::executor::TaskExecutor;
+use crate::arrow::array::RecordBatch;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta};
 

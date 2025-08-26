@@ -1,12 +1,11 @@
 use std::fs::File;
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
-
 use super::read_files;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
 

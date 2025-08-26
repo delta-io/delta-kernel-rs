@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
+use itertools::Itertools;
+
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use itertools::Itertools;
-
 use crate::error::Error;
 use crate::schema::{
     ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
@@ -297,14 +297,13 @@ impl TryFromArrow<&ArrowDataType> for DataType {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::engine::arrow_conversion::ArrowField;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
-    use crate::{
-        schema::{DataType, StructField},
-        DeltaResult,
-    };
-    use std::collections::HashMap;
+    use crate::schema::{DataType, StructField};
+    use crate::DeltaResult;
 
     #[test]
     fn test_metadata_string_conversion() -> DeltaResult<()> {

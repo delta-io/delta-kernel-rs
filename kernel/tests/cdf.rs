@@ -3,17 +3,15 @@ use std::error;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
-use itertools::Itertools;
-
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
+use itertools::Itertools;
 
 mod common;
 
-use test_utils::DefaultEngineExtension;
-use test_utils::{load_test_data, to_arrow};
+use test_utils::{load_test_data, to_arrow, DefaultEngineExtension};
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,

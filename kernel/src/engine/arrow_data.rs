@@ -1,6 +1,6 @@
-use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
-use crate::schema::{ColumnName, DataType};
-use crate::{DeltaResult, Error};
+use std::collections::{HashMap, HashSet};
+
+use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{Int32Type, Int64Type};
@@ -8,11 +8,10 @@ use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, FieldRef};
-use tracing::debug;
-
-use std::collections::{HashMap, HashSet};
-
 pub use crate::engine::arrow_utils::fix_nested_null_masks;
+use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
+use crate::schema::{ColumnName, DataType};
+use crate::{DeltaResult, Error};
 
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
 ///

@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -17,6 +16,7 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use self::storage::parse_url_opts;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
@@ -169,10 +169,11 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
+    use object_store::local::LocalFileSystem;
+
     use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
-    use object_store::local::LocalFileSystem;
 
     #[test]
     fn test_default_engine() {

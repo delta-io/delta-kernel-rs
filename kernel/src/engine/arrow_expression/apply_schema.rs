@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
+use super::super::arrow_utils::make_arrow_error;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
-use crate::arrow::datatypes::Schema as ArrowSchema;
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
-
-use super::super::arrow_utils::make_arrow_error;
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};

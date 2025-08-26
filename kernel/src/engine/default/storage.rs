@@ -1,11 +1,11 @@
-use object_store::parse_url_opts as parse_url_opts_object_store;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, RwLock};
+
 use object_store::path::Path;
-use object_store::{Error, ObjectStore};
+use object_store::{parse_url_opts as parse_url_opts_object_store, Error, ObjectStore};
 use url::Url;
 
 use crate::Error as DeltaError;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
 
 /// Alias for convenience
 type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), Error>;
@@ -62,10 +62,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
-    use object_store::{self, path::Path};
+    use object_store::path::Path;
+    use object_store::{self};
+
+    use super::*;
 
     /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
     fn parse_url_opts_hdfs_native<I, K, V>(

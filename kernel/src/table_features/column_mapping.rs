@@ -1,4 +1,9 @@
 //! Code to handle column mapping, including modes and schema transforms
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
+use strum::EnumString;
+
 use super::ReaderFeature;
 use crate::actions::Protocol;
 use crate::schema::{
@@ -6,11 +11,6 @@ use crate::schema::{
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
-
-use std::borrow::Cow;
-
-use serde::{Deserialize, Serialize};
-use strum::EnumString;
 
 /// Modes of column mapping a table can be in
 #[derive(Debug, EnumString, Serialize, Deserialize, Copy, Clone, PartialEq, Eq)]
@@ -162,9 +162,10 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::schema::StructType;
-    use std::collections::HashMap;
 
     #[test]
     fn test_column_mapping_mode() {

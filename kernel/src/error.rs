@@ -1,19 +1,17 @@
 //! Definitions of errors that the delta kernel can encounter
 
-use std::{
-    backtrace::{Backtrace, BacktraceStatus},
-    num::ParseIntError,
-    str::Utf8Error,
-};
+use std::backtrace::{Backtrace, BacktraceStatus};
+use std::num::ParseIntError;
+use std::str::Utf8Error;
 
-use crate::schema::{DataType, StructType};
-use crate::table_properties::ParseIntervalError;
-use crate::Version;
+#[cfg(feature = "default-engine-base")]
+use object_store;
 
 #[cfg(feature = "default-engine-base")]
 use crate::arrow::error::ArrowError;
-#[cfg(feature = "default-engine-base")]
-use object_store;
+use crate::schema::{DataType, StructType};
+use crate::table_properties::ParseIntervalError;
+use crate::Version;
 
 /// A [`std::result::Result`] that has the kernel [`Error`] as the error variant
 pub type DeltaResult<T, E = Error> = std::result::Result<T, E>;

@@ -274,13 +274,13 @@ fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use itertools::assert_equal;
 
+    use super::*;
     use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField};
     use crate::table_changes::CDF_FIELDS;
     use crate::Error;
-    use itertools::assert_equal;
 
     #[test]
     fn table_changes_checks_enable_cdf_flag() {

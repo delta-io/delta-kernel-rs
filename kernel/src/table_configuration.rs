@@ -10,6 +10,7 @@
 //! [`Schema`]: crate::schema::Schema
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
 use url::Url;
 
 use crate::actions::{ensure_supported_features, Metadata, Protocol};
@@ -21,7 +22,6 @@ use crate::table_features::{
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
-use delta_kernel_derive::internal_api;
 
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
@@ -350,13 +350,12 @@ mod test {
 
     use url::Url;
 
+    use super::TableConfiguration;
     use crate::actions::{Metadata, Protocol};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
-
-    use super::TableConfiguration;
 
     #[test]
     fn dv_supported_not_enabled() {

@@ -74,9 +74,9 @@ impl StorageHandler for SyncStorageHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::Write;
-    use std::time::{Duration, SystemTime};
-    use std::{fs::File, time::UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use bytes::{BufMut, BytesMut};
     use itertools::Itertools;

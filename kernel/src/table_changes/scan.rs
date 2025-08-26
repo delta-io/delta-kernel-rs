@@ -6,16 +6,15 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use crate::actions::deletion_vector::split_vector;
-use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
-use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
-
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{TableChanges, CDF_FIELDS};
+use crate::actions::deletion_vector::split_vector;
+use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
+use crate::schema::{SchemaRef, StructType};
+use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -363,8 +362,7 @@ mod tests {
     use crate::expressions::{column_expr, Scalar};
     use crate::scan::{ColumnType, PhysicalPredicate};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::table_changes::TableChanges;
-    use crate::table_changes::COMMIT_VERSION_COL_NAME;
+    use crate::table_changes::{TableChanges, COMMIT_VERSION_COL_NAME};
     use crate::Predicate;
 
     #[test]

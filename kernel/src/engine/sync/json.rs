@@ -1,14 +1,14 @@
-use std::{fs::File, io::BufReader, io::Write};
+use std::fs::File;
+use std::io::{BufReader, Write};
 
-use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use crate::arrow::json::ReaderBuilder;
 use tempfile::NamedTempFile;
 use url::Url;
 
 use super::read_files;
+use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::arrow::json::ReaderBuilder;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::parse_json as arrow_parse_json;
-use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine::arrow_utils::{parse_json as arrow_parse_json, to_json_bytes};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -95,14 +95,16 @@ impl JsonHandler for SyncJsonHandler {
 }
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tempfile::TempDir;
+    use url::Url;
+
     use super::*;
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use serde_json::json;
-    use std::path::Path;
-    use std::sync::Arc;
-    use tempfile::TempDir;
-    use url::Url;
 
     // Helper function to create test data
     fn create_test_data(values: Vec<&str>) -> DeltaResult<Box<dyn EngineData>> {

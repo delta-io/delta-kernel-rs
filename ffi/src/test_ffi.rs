@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use crate::expressions::{SharedExpression, SharedPredicate};
-use crate::handle::Handle;
 use delta_kernel::expressions::{
     column_expr, column_pred, ArrayData, BinaryExpressionOp, BinaryPredicateOp, Expression as Expr,
     MapData, OpaqueExpressionOp, OpaquePredicateOp, Predicate as Pred, Scalar,
@@ -15,6 +13,9 @@ use delta_kernel::kernel_predicates::{
 };
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 use delta_kernel::DeltaResult;
+
+use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::handle::Handle;
 
 #[derive(Debug, PartialEq)]
 struct OpaqueTestOp(String);

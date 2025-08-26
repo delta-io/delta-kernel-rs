@@ -1,15 +1,17 @@
 //! This module holds functionality for managing transactions.
 mod write_context;
 
-use crate::error::{ExternResult, IntoExternResult};
-use crate::handle::Handle;
-use crate::KernelStringSlice;
-use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
-use crate::{DeltaResult, ExternEngine, Snapshot, Url};
-use crate::{ExclusiveEngineData, SharedExternEngine};
+use std::sync::Arc;
+
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
-use std::sync::Arc;
+
+use crate::error::{ExternResult, IntoExternResult};
+use crate::handle::Handle;
+use crate::{
+    unwrap_and_parse_path_as_url, DeltaResult, ExclusiveEngineData, ExternEngine,
+    KernelStringSlice, SharedExternEngine, Snapshot, TryFromStringSlice, Url,
+};
 
 /// A handle representing an exclusive transaction on a Delta table. (Similar to a Box<_>)
 ///
@@ -131,7 +133,7 @@ pub unsafe extern "C" fn commit(
 
 #[cfg(test)]
 mod tests {
-    use delta_kernel::schema::{DataType, StructField, StructType};
+    use std::sync::Arc;
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
     use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -141,29 +143,20 @@ mod tests {
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-
-    use delta_kernel_ffi::engine_data::get_engine_data;
-    use delta_kernel_ffi::engine_data::ArrowFFIData;
-
+    use delta_kernel::schema::{DataType, StructField, StructType};
+    use delta_kernel_ffi::engine_data::{get_engine_data, ArrowFFIData};
     use delta_kernel_ffi::ffi_test_utils::{allocate_str, ok_or_panic, recover_string};
     use delta_kernel_ffi::tests::get_default_engine;
-
-    use crate::{free_engine, free_schema, kernel_string_slice};
-    use write_context::{free_write_context, get_write_context, get_write_path, get_write_schema};
-
-    use test_utils::{set_json_value, setup_test_tables, test_read};
-
     use itertools::Itertools;
     use object_store::path::Path;
     use object_store::ObjectStore;
-    use serde_json::json;
-    use serde_json::Deserializer;
-
-    use std::sync::Arc;
+    use serde_json::{json, Deserializer};
+    use tempfile::tempdir;
+    use test_utils::{set_json_value, setup_test_tables, test_read};
+    use write_context::{free_write_context, get_write_context, get_write_path, get_write_schema};
 
     use super::*;
-
-    use tempfile::tempdir;
+    use crate::{free_engine, free_schema, kernel_string_slice};
 
     fn create_arrow_ffi_from_json(
         schema: ArrowSchema,

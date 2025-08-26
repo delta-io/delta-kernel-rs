@@ -4,13 +4,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
-use crate::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
-};
-use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
@@ -18,11 +11,18 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
+use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
+use crate::parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
@@ -387,20 +387,19 @@ mod tests {
     use std::slice;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::arrow::array::{Array, RecordBatch};
+    use itertools::Itertools;
+    use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+    use url::Url;
 
+    use super::*;
+    use crate::arrow::array::{Array, RecordBatch};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::EngineData;
-
-    use itertools::Itertools;
-    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
-    use url::Url;
-
     use crate::utils::test_utils::assert_result_error_with_message;
-
-    use super::*;
+    use crate::EngineData;
 
     fn into_record_batch(
         engine_data: DeltaResult<Box<dyn EngineData>>,

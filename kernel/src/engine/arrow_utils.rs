@@ -4,19 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::sync::{Arc, OnceLock};
 
-use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
-use crate::engine::ensure_data_types::DataTypeCompat;
-use crate::schema::{ColumnMetadataKey, MetadataValue};
-use crate::{
-    engine::arrow_data::ArrowEngineData,
-    schema::{DataType, Schema, SchemaRef, StructField, StructType},
-    utils::require,
-    DeltaResult, EngineData, Error,
-};
+use delta_kernel_derive::internal_api;
+use itertools::Itertools;
+use tracing::debug;
 
+use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, RecordBatch, StringArray, StructArray,
+    make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray, OffsetSizeTrait,
+    RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
@@ -25,11 +20,16 @@ use crate::arrow::datatypes::{
     Fields as ArrowFields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
-use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
-use delta_kernel_derive::internal_api;
-use itertools::Itertools;
-use tracing::debug;
+use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::parquet::arrow::{ProjectionMask, PARQUET_FIELD_ID_META_KEY};
+use crate::parquet::schema::types::SchemaDescriptor;
+use crate::schema::{
+    ColumnMetadataKey, DataType, MetadataValue, Schema, SchemaRef, StructField, StructType,
+};
+use crate::utils::require;
+use crate::{DeltaResult, EngineData, Error};
 
 macro_rules! prim_array_cmp {
     ( $left_arr: ident, $right_arr: ident, $(($data_ty: pat, $prim_ty: ty)),+ ) => {
@@ -942,26 +942,21 @@ pub(crate) fn to_json_bytes(
 mod tests {
     use std::sync::Arc;
 
+    use super::*;
     use crate::arrow::array::{
-        Array, ArrayRef as ArrowArrayRef, BooleanArray, GenericListArray, Int32Array, Int32Builder,
-        MapArray, MapBuilder, StructArray, StructBuilder,
+        Array, ArrayRef as ArrowArrayRef, AsArray, BooleanArray, GenericListArray, Int32Array,
+        Int32Builder, MapArray, MapBuilder, StructArray, StructBuilder,
     };
+    use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields,
         Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     };
-    use crate::arrow::{
-        array::AsArray,
-        buffer::{OffsetBuffer, ScalarBuffer},
-    };
-
     use crate::schema::{
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
-
-    use super::*;
 
     fn column_mapping_cases() -> [ColumnMappingMode; 3] {
         [

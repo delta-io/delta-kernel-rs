@@ -5,7 +5,6 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{
     ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
 };
-
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
@@ -18,11 +17,11 @@ use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
-
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
-use object_store::{path::Path, ObjectStore};
+use object_store::path::Path;
+use object_store::ObjectStore;
 use serde_json::{json, to_vec};
 use url::Url;
 

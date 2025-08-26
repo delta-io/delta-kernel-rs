@@ -1,11 +1,12 @@
 //! Utility functions for the variant type and variant-related table features.
 
+use std::borrow::Cow;
+
 use crate::actions::Protocol;
 use crate::schema::{Schema, SchemaTransform, StructType};
 use crate::table_features::{ReaderFeature, WriterFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
-use std::borrow::Cow;
 
 /// Schema visitor that checks if any column in the schema uses VARIANT type
 #[derive(Debug, Default)]

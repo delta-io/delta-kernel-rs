@@ -1,12 +1,12 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
-use crate::log_replay::HasSelectionVector;
-use crate::schema::{ColumnName, DataType};
-use crate::{AsAny, DeltaResult, Error};
+use std::collections::HashMap;
 
 use tracing::debug;
 
-use std::collections::HashMap;
+use crate::log_replay::HasSelectionVector;
+use crate::schema::{ColumnName, DataType};
+use crate::{AsAny, DeltaResult, Error};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///

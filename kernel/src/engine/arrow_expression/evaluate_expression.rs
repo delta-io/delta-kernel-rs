@@ -1,4 +1,9 @@
 //! Expression handling based on arrow-rs compute kernels.
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use itertools::Itertools;
+
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, RecordBatch, StructArray,
@@ -22,9 +27,6 @@ use crate::expressions::{
     UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
-use itertools::Itertools;
-use std::borrow::Cow;
-use std::sync::Arc;
 
 trait ProvidesColumnByName {
     fn column_by_name(&self, name: &str) -> Option<&ArrayRef>;

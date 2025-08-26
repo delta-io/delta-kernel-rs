@@ -1,15 +1,15 @@
 //! CRC (version checksum) file
 use std::sync::LazyLock;
 
+use delta_kernel_derive::ToSchema;
+
 use super::visitors::{visit_metadata_at, visit_protocol_at};
 use super::{Add, DomainMetadata, Metadata, Protocol, SetTransaction};
 use crate::actions::PROTOCOL_NAME;
 use crate::engine_data::GetData;
-use crate::schema::ToSchema as _;
-use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, ToSchema as _};
 use crate::utils::require;
 use crate::{DeltaResult, Error, RowVisitor};
-use delta_kernel_derive::ToSchema;
 
 /// Though technically not an action, we include the CRC (version checksum) file here. A [CRC file]
 /// must:
@@ -140,13 +140,11 @@ impl RowVisitor for CrcProtocolMetadataVisitor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::sync::Arc;
 
-    use crate::arrow::array::StringArray;
-
+    use super::*;
     use crate::actions::{Format, Metadata, Protocol};
+    use crate::arrow::array::StringArray;
     use crate::engine::sync::SyncEngine;
     use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
