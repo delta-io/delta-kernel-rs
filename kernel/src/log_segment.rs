@@ -152,12 +152,10 @@ impl LogSegment {
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
-        checkpoint_hint: impl Into<Option<LastCheckpointHint>>,
-        time_travel_version: impl Into<Option<Version>>,
+        checkpoint_hint: Option<LastCheckpointHint>,
+        time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let time_travel_version = time_travel_version.into();
-
-        let listed_files = match (checkpoint_hint.into(), time_travel_version) {
+        let listed_files = match (checkpoint_hint, time_travel_version) {
             (Some(cp), None) => {
                 ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None)?
             }
