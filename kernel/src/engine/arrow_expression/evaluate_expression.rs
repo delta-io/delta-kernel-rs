@@ -150,11 +150,9 @@ fn evaluate_transform_expression(
 
     // Process each input field in order (unified logic for both cases)
     for input_field in source_data.schema_fields() {
-        let field_name = input_field.name();
+        let field_name = input_field.name().as_ref();
 
         // Handle the field based on replacement rules
-        //
-        // TODO: Somehow impl Borrow so we don't have to clone every field name of a wide struct.
         if let Some(replacement) = transform.field_replacements.get(field_name) {
             if let Some(expr) = replacement {
                 output_cols.push(evaluate_expression(expr, batch, None)?);
@@ -166,7 +164,8 @@ fn evaluate_transform_expression(
         }
 
         // Handle insertions after this input field
-        if let Some(insertion_exprs) = transform.field_insertions.get(&Some(field_name.clone())) {
+        let field_name = Some(Cow::Borrowed(field_name));
+        if let Some(insertion_exprs) = transform.field_insertions.get(&field_name) {
             for expr in insertion_exprs {
                 output_cols.push(evaluate_expression(expr, batch, None)?);
             }
@@ -563,7 +562,7 @@ mod tests {
 
         // Multiple insertions after 'c' (key feature: multiple at same position)
         transform.field_insertions.insert(
-            Some("c".to_string()),
+            Some(Cow::Borrowed("c")),
             vec![
                 Expr::literal(42).into(),
                 column_expr_ref!("a"), // references original column a
@@ -698,7 +697,7 @@ mod tests {
         // Insert a new field after 'y'
         transform_modify
             .field_insertions
-            .insert(Some("y".to_string()), vec![Expr::literal(555).into()]);
+            .insert(Some(Cow::Borrowed("y")), vec![Expr::literal(555).into()]);
 
         let modify_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
@@ -770,7 +769,7 @@ mod tests {
         // Test unused insertion keys
         let mut transform2 = Transform::new();
         transform2.field_insertions.insert(
-            Some("nonexistent".to_string()),
+            Some(Cow::Borrowed("nonexistent")),
             vec![Expr::literal(1).into()],
         );
 

@@ -1,5 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -244,6 +245,14 @@ impl OpaqueExpression {
     }
 }
 
+/// An optional field name. When using a [`Transform`] to insert new fields, this is used to specify
+/// which field, if any, the new fields should be inserted after.
+///
+/// NOTE: This unusual type is necessary because `Option` does not impl `Borrow` and a hash map with
+/// `Option<String>` keys can only be probed with owned strings. In contrast, `Cow` _does_ impl
+/// `Borrow` so we can probe the map with borrowed keys, e.g. `Some(Cow::Borrowed("key"))`.
+pub type FieldNameOpt = Option<Cow<'static, str>>;
+
 /// A transformation that efficiently represents sparse modifications to struct schemas.
 ///
 /// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
@@ -260,7 +269,7 @@ pub struct Transform {
     /// replaced field with no replacement expression will be dropped from the output.
     pub field_replacements: HashMap<String, Option<ExpressionRef>>,
     /// A set of new fields to inject, organized by the name of field they should follow (if any).
-    pub field_insertions: HashMap<Option<String>, Vec<ExpressionRef>>,
+    pub field_insertions: HashMap<FieldNameOpt, Vec<ExpressionRef>>,
 }
 
 impl Transform {
@@ -296,6 +305,7 @@ impl Transform {
     /// inserted after the same predecessor, and they will be inserted in the relative order they
     /// are registered.
     pub fn with_inserted_field(mut self, after: Option<String>, expr: ExpressionRef) -> Self {
+        let after = after.map(Cow::Owned);
         self.field_insertions.entry(after).or_default().push(expr);
         self
     }

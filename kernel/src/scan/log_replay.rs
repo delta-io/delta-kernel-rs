@@ -424,7 +424,7 @@ pub(crate) fn scan_action_iter(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
     use crate::actions::get_log_schema;
     use crate::expressions::Scalar;
@@ -554,7 +554,7 @@ mod tests {
             // The insertion should be after "value" field
             let insertions = transform_def
                 .field_insertions
-                .get(&Some("value".to_string()))
+                .get(&Some(Cow::Borrowed("value")))
                 .expect("Should have insertion after 'value' field");
             assert_eq!(
                 insertions.len(),
