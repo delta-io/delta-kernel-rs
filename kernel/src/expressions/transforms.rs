@@ -61,10 +61,10 @@ pub trait ExpressionTransform<'a> {
         Some(Cow::Borrowed(name))
     }
 
-    /// Called for each [`Transform`] encountered during the traversal. Implementations can
-    /// call [`Self::recurse_into_expr_transform`] if they wish to recursively transform the children.
+    /// Called for each [`Transform`] encountered during the traversal. By default, it is a no-op
+    /// that simply returns its argument and does _NOT_ recurse into its children.
     fn transform_expr_transform(&mut self, transform: &'a Transform) -> Option<Cow<'a, Transform>> {
-        self.recurse_into_expr_transform(transform)
+        Some(Cow::Borrowed(transform))
     }
 
     /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
@@ -214,69 +214,6 @@ pub trait ExpressionTransform<'a> {
     ) -> Option<Cow<'a, OpaqueExpression>> {
         let nested_result = recurse_into_children(&o.exprs, |e| self.transform_expr(e))?;
         Some(nested_result.map_owned_or_else(o, |exprs| OpaqueExpression::new(o.op.clone(), exprs)))
-    }
-
-    /// Recursively transforms the children of a [`Transform`]. Returns `None` if all
-    /// children were removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
-    /// `Some(Cow::Borrowed)` otherwise.
-    fn recurse_into_expr_transform(&mut self, t: &'a Transform) -> Option<Cow<'a, Transform>> {
-        // TODO: Re-examine this design - we need hooks for users to modify individual transforms.
-        // This will likely need more helper methods and better use of map_owned_or_else patterns.
-        //
-        // TODO: What does it actually mean to change or remove a field transform? For now, we try
-        // to match the behavior of struct visitor, that a dropped field is simply dropped from the
-        // transformed struct. But there's an argument to be made that this is incorrect/dangerous.
-        let mut any_field_changed = false;
-        let mut new_field_replacements = Vec::new();
-
-        // Transform field replacement expressions
-        for (field_name, replacement) in &t.field_replacements {
-            if let Some(new_replacement) = replacement.as_ref().map(|replacement| {
-                let transformed = self.transform_expr(replacement);
-                if !matches!(transformed, Some(Cow::Borrowed(_))) {
-                    any_field_changed = true;
-                }
-                transformed
-            }) {
-                new_field_replacements.push((field_name, new_replacement));
-            }
-        }
-
-        // Transform insertion expressions
-        let mut new_field_insertions = Vec::new();
-        for (key, exprs) in &t.field_insertions {
-            let new_exprs = recurse_into_children(exprs, |e| {
-                self.transform_expr(e)
-                    .map(|cow| cow.map_owned_or_else(e, Arc::new))
-            });
-            if !matches!(new_exprs, Some(Cow::Borrowed(_))) {
-                any_field_changed = true;
-            }
-            if let Some(new_exprs) = new_exprs {
-                new_field_insertions.push((key, new_exprs));
-            }
-        }
-
-        if any_field_changed {
-            let field_replacements = new_field_replacements
-                .into_iter()
-                .map(|(name, replacement)| {
-                    let replacement = replacement.map(Cow::into_owned).map(Arc::new);
-                    (name.to_owned(), replacement)
-                })
-                .collect();
-            let field_insertions = new_field_insertions
-                .into_iter()
-                .map(|(key, exprs)| (key.to_owned(), exprs.into_owned()))
-                .collect();
-            Some(Cow::Owned(Transform {
-                input_path: t.input_path.clone(),
-                field_replacements,
-                field_insertions,
-            }))
-        } else {
-            Some(Cow::Borrowed(t))
-        }
     }
 
     /// Recursively transforms the child of an [`Expression::Predicate`]. Returns `None` if all
@@ -527,10 +464,6 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
         expr: &'a OpaqueExpression,
     ) -> Option<Cow<'a, OpaqueExpression>> {
         self.depth_limited(Self::recurse_into_expr_opaque, expr)
-    }
-
-    fn transform_expr_transform(&mut self, transform: &'a Transform) -> Option<Cow<'a, Transform>> {
-        self.depth_limited(Self::recurse_into_expr_transform, transform)
     }
 }
 

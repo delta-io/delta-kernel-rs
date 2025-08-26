@@ -438,6 +438,16 @@ mod tests {
         .unwrap()
     }
 
+    /// Helper function to validate Int32Array columns in test results
+    fn validate_i32_column(result: &StructArray, idx: usize, expected: &[i32]) {
+        let col = result
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col.values(), expected);
+    }
+
     fn create_nested_test_batch() -> RecordBatch {
         let inner_schema = ArrowSchema::new(vec![
             ArrowField::new("x", ArrowDataType::Int32, false),
@@ -594,60 +604,20 @@ mod tests {
         assert_eq!(struct_result.len(), 3);
 
         // Verify multiple prepends (in order)
-        let pre1_col = struct_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(pre1_col.values(), &[1, 1, 1]);
-        let pre2_col = struct_result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(pre2_col.values(), &[2, 2, 2]);
-        let pre3_col = struct_result
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(pre3_col.values(), &[100, 200, 300]); // column c
+        validate_i32_column(struct_result, 0, &[1, 1, 1]);
+        validate_i32_column(struct_result, 1, &[2, 2, 2]);
+        validate_i32_column(struct_result, 2, &[100, 200, 300]); // column c
 
         // Verify replaced field 'a' (should be column b values: [10, 20, 30])
-        let a_col = struct_result
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(a_col.values(), &[10, 20, 30]);
+        validate_i32_column(struct_result, 3, &[10, 20, 30]);
 
         // Verify passthrough field 'c' (should be original c values: [100, 200, 300])
-        let c_col = struct_result
-            .column(4)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(c_col.values(), &[100, 200, 300]);
+        validate_i32_column(struct_result, 4, &[100, 200, 300]);
 
         // Verify multiple insertions after c (in order)
-        let after_c1_col = struct_result
-            .column(5)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(after_c1_col.values(), &[42, 42, 42]);
-        let after_c2_col = struct_result
-            .column(6)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(after_c2_col.values(), &[1, 2, 3]); // original column a
-        let after_c3_col = struct_result
-            .column(7)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(after_c3_col.values(), &[99, 99, 99]);
+        validate_i32_column(struct_result, 5, &[42, 42, 42]);
+        validate_i32_column(struct_result, 6, &[1, 2, 3]); // original column a
+        validate_i32_column(struct_result, 7, &[99, 99, 99]);
     }
 
     #[test]
@@ -721,28 +691,13 @@ mod tests {
         assert_eq!(modify_result.len(), 3);
 
         // Verify replaced 'x' field (literal 777)
-        let x_col = modify_result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(x_col.values(), &[777, 777, 777]);
+        validate_i32_column(modify_result, 0, &[777, 777, 777]);
 
         // Verify passthrough 'y' field (original nested.y: [10, 20, 30])
-        let y_col = modify_result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(y_col.values(), &[10, 20, 30]);
+        validate_i32_column(modify_result, 1, &[10, 20, 30]);
 
         // Verify inserted field (literal 555)
-        let new_col = modify_result
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(new_col.values(), &[555, 555, 555]);
+        validate_i32_column(modify_result, 2, &[555, 555, 555]);
     }
 
     #[test]
@@ -750,11 +705,7 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let mut transform = Transform::new();
-        transform
-            .field_replacements
-            .insert("nonexistent".to_string(), Some(Expr::literal(1).into()));
-
+        let transform = Transform::new().with_replaced_field("missing", Expr::literal(1).into());
         let output_schema = StructType::new(vec![StructField::new("a", DataType::INTEGER, false)]);
 
         let expr = Expr::Transform(transform);
@@ -783,8 +734,7 @@ mod tests {
         assert!(result2.unwrap_err().to_string().contains("insertion keys"));
 
         // Test column count mismatch
-        let mut transform3 = Transform::new();
-        transform3.field_replacements.insert("a".to_string(), None); // drops field a
+        let transform3 = Transform::new().with_dropped_field("a");
 
         let wrong_output_schema = StructType::new(vec![
             StructField::new("a", DataType::INTEGER, false), // expects a field that was dropped

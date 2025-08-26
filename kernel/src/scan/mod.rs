@@ -349,7 +349,9 @@ pub(crate) enum FieldTransformSpec {
     // they should not appear in the query's output.
     #[allow(unused)]
     StaticDrop(String),
-    /// For each row of metadata, insert the ith partition value after the given physical field name
+    /// Inserts a partition column after the named input column. The partition column is identified
+    /// by its field index in the logical table schema (the column is not present in the physical
+    /// read schema). Its value varies from file to file and is obtained from file metadata.
     PartitionColumn(Option<String>, usize),
 }
 
