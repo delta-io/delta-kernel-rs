@@ -225,7 +225,8 @@ fn build_snapshot_with_uuid_checkpoint_parquet() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -254,7 +255,8 @@ fn build_snapshot_with_uuid_checkpoint_json() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -296,7 +298,8 @@ fn build_snapshot_with_correct_last_uuid_checkpoint() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -332,7 +335,8 @@ fn build_snapshot_with_multiple_incomplete_multipart_checkpoints() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -371,7 +375,8 @@ fn build_snapshot_with_out_of_date_last_checkpoint() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -413,7 +418,8 @@ fn build_snapshot_with_correct_last_multipart_checkpoint() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -456,7 +462,7 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None);
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None);
     assert_result_error_with_message(
         log_segment,
         "Invalid Checkpoint: Had a _last_checkpoint hint but didn't find any checkpoints",
@@ -493,7 +499,7 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None);
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None);
     assert_result_error_with_message(
         log_segment,
         "Invalid Checkpoint: _last_checkpoint indicated that checkpoint should have 1 parts, but \
@@ -524,7 +530,8 @@ fn build_snapshot_with_missing_checkpoint_part_no_hint() {
         None,
     );
 
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, None).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, None).unwrap();
 
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
@@ -570,7 +577,8 @@ fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpo
     );
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, Some(checkpoint_metadata), None)
+            .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -603,7 +611,7 @@ fn build_snapshot_without_checkpoints() {
 
     ///////// Specify no checkpoint or end version /////////
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, None).unwrap();
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), None, None).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -616,7 +624,8 @@ fn build_snapshot_without_checkpoints() {
     assert_eq!(versions, expected_versions);
 
     ///////// Specify  only end version /////////
-    let log_segment = LogSegment::for_snapshot(storage.as_ref(), log_root, None, Some(2)).unwrap();
+    let log_segment =
+        LogSegment::for_snapshot_impl(storage.as_ref(), log_root, None, Some(2)).unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -657,8 +666,13 @@ fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         None,
     );
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, Some(4)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        Some(checkpoint_metadata),
+        Some(4),
+    )
+    .unwrap();
     let commit_files = log_segment.ascending_commit_files;
     let checkpoint_parts = log_segment.checkpoint_parts;
 
@@ -695,8 +709,13 @@ fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         Some(&checkpoint_metadata),
     );
 
-    let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_metadata, Some(4)).unwrap();
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        Some(checkpoint_metadata),
+        Some(4),
+    )
+    .unwrap();
 
     assert_eq!(log_segment.checkpoint_parts[0].version, 3);
     assert_eq!(log_segment.ascending_commit_files.len(), 1);
@@ -1352,7 +1371,8 @@ fn create_segment_for(
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None);
-    LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), None, version_to_load).unwrap()
+    LogSegment::for_snapshot_impl(storage.as_ref(), log_root.clone(), None, version_to_load)
+        .unwrap()
 }
 
 #[test]
