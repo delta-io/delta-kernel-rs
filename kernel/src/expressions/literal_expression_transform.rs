@@ -2,7 +2,6 @@
 //! ordered list of leaf values (scalars) into an [`Expression`] with a literal value for each leaf.
 
 use std::borrow::Cow;
-use std::mem;
 use std::ops::Deref as _;
 
 use tracing::debug;
@@ -71,8 +70,11 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
     }
 
     fn set_error(&mut self, error: Error) {
-        if let Err(e) = mem::replace(&mut self.error, Err(error)) {
-            debug!("Overwriting error that was already set: {e}");
+        // Only set when the error not yet set
+        if let Ok(()) = self.error {
+            self.error = Err(error);
+        } else if let Err(ref existing_error) = self.error {
+            debug!("Trying to overwrite an existing error: {existing_error} with {error:?}");
         }
     }
 }
@@ -132,11 +134,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         let field_exprs = self.stack.split_off(mark);
 
         if field_exprs.len() != struct_type.fields_len() {
-            // Only set InsufficientScalars error if there isn't already an error set
-            // (e.g., a type mismatch error that prevented expressions from being created)
-            if self.error.is_ok() {
-                self.set_error(Error::InsufficientScalars);
-            }
+            self.set_error(Error::InsufficientScalars);
             return None;
         }
 
