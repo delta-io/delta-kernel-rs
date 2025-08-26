@@ -132,7 +132,11 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         let field_exprs = self.stack.split_off(mark);
 
         if field_exprs.len() != struct_type.fields_len() {
-            self.set_error(Error::InsufficientScalars);
+            // Only set InsufficientScalars error if there isn't already an error set
+            // (e.g., a type mismatch error that prevented expressions from being created)
+            if self.error.is_ok() {
+                self.set_error(Error::InsufficientScalars);
+            }
             return None;
         }
 

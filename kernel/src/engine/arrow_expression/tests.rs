@@ -821,10 +821,13 @@ fn test_create_one_mismatching_scalar_types() {
     let values: &[Scalar] = &[Scalar::Long(10)];
     let schema = Arc::new(StructType::new([StructField::not_null(
         "version",
-        DeltaDataTypes::INTEGER,
+        KernelDataType::INTEGER,
     )]));
     let handler = ArrowEvaluationHandler;
-    assert!(handler.create_one(schema, values).is_err());
+    assert_result_error_with_message(
+        handler.create_one(schema, values),
+        "Schema error: Mismatched scalar type while creating Expression: expected Integer, got Long",
+    );
 }
 
 #[test]
