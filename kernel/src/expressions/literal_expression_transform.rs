@@ -71,10 +71,10 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
 
     fn set_error(&mut self, error: Error) {
         // Only set when the error not yet set
-        if let Ok(()) = self.error {
-            self.error = Err(error);
-        } else if let Err(ref existing_error) = self.error {
+        if let Err(ref existing_error) = self.error {
             debug!("Trying to overwrite an existing error: {existing_error:?} with {error:?}");
+        } else {
+            self.error = Err(error);
         }
     }
 }
