@@ -6,7 +6,7 @@ This example shows a program that reads a table using multiple threads. This sho
 `scan_metadata`, `global_scan_state`, and `visit_scan_files` methods, that can be used to partition work
 to either multiple threads, or workers (in the case of a distributed engine).
 
-You can run this from the same directory as this `README.md` by running `cargo run -- [args]`.
+You can run this example from anywhere in this repository by running `cargo run -p read-table-multi-threaded -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
 We use a single-producer-multi-consumer channel to send each file and its metadata that needs to be
 read out to a pool of threads. The data is sent as a [`ScanFile`], a struct we define that holds all
@@ -25,7 +25,7 @@ thread has exited (which closes that last sender).
 
 # Examples
 
-Assuming you're running in the directory this README is in:
+Assuming you're running in the directory of this example:
 
 - Read and print the table in `kernel/tests/data/table-with-dv-small/`:
 
@@ -34,10 +34,6 @@ Assuming you're running in the directory this README is in:
 - Get usage info:
 
 `cargo run -- --help`
-
-- Use the sync engine to read `kernel/tests/data/basic_partitioned/`
-
-`cargo run -- -e sync ../../../kernel/tests/data/basic_partitioned/`
 
 - Read some giant table using 100 threads:
 
