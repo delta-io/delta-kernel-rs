@@ -900,3 +900,38 @@ fn test_null_scalar_map() -> DeltaResult<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_apply_schema_column_count_mismatch() {
+    use super::apply_schema::apply_schema;
+    use crate::schema::StructType;
+
+    // Create a struct array with 3 columns
+    let struct_array = StructArray::from(vec![
+        (
+            Arc::new(Field::new("a", DataType::Int32, false)),
+            create_array!(Int32, [1]) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("b", DataType::Int32, false)),
+            create_array!(Int32, [2]) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("c", DataType::Int32, false)),
+            create_array!(Int32, [3]) as ArrayRef,
+        ),
+    ]);
+
+    // Create a schema with only 2 fields (mismatch)
+    let schema = KernelDataType::Struct(Box::new(StructType::new([
+        StructField::not_null("a", KernelDataType::INTEGER),
+        StructField::not_null("b", KernelDataType::INTEGER),
+    ])));
+
+    let result = apply_schema(&struct_array, &schema);
+
+    assert_result_error_with_message(
+        result,
+        "Passed struct had 3 columns, but transformed column has 2",
+    );
+}
