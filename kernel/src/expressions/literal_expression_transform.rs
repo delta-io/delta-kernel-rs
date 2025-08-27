@@ -74,7 +74,7 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
         if let Ok(()) = self.error {
             self.error = Err(error);
         } else if let Err(ref existing_error) = self.error {
-            debug!("Trying to overwrite an existing error: {existing_error} with {error:?}");
+            debug!("Trying to overwrite an existing error: {existing_error:?} with {error:?}");
         }
     }
 }
