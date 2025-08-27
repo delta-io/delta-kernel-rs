@@ -143,7 +143,7 @@ impl DataSkippingFilter {
 
         let skipping_evaluator = engine.evaluation_handler().new_predicate_evaluator(
             stats_schema.clone(),
-            as_sql_data_skipping_predicate(&predicate)?.into(),
+            Arc::new(as_sql_data_skipping_predicate(&predicate)?),
         );
 
         let filter_evaluator = engine

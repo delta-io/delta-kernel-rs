@@ -228,7 +228,7 @@ impl Transaction {
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
-            logical_to_physical.into(),
+            Arc::new(logical_to_physical),
         )
     }
 
@@ -260,7 +260,7 @@ fn generate_adds<'a>(
         )]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             add_files_schema.clone(),
-            adds_expr.into(),
+            Arc::new(adds_expr),
             log_schema.clone().into(),
         );
         adds_evaluator.evaluate(add_files_batch)

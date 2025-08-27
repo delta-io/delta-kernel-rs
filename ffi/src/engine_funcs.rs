@@ -160,7 +160,7 @@ pub unsafe extern "C" fn new_expression_evaluator(
     let engine = unsafe { engine.clone_as_arc() };
     let input_schema = unsafe { input_schema.clone_as_arc() };
     let output_type: DataType = output_type.as_ref().clone().into();
-    let expression = expression.clone().into();
+    let expression = Arc::new(expression.clone());
     new_expression_evaluator_impl(engine, input_schema, expression, output_type)
 }
 
