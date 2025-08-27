@@ -343,32 +343,40 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
     LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
-fn get_add_transform_expr() -> Expression {
+fn get_add_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
-    Expression::Struct(vec![
-        column_expr_ref!("add.path"),
-        column_expr_ref!("add.size"),
-        column_expr_ref!("add.modificationTime"),
-        column_expr_ref!("add.stats"),
-        column_expr_ref!("add.deletionVector"),
-        Arc::new(Expression::Struct(vec![column_expr_ref!(
-            "add.partitionValues"
-        )])),
-    ])
+    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+        Arc::new(Expression::Struct(vec![
+            column_expr_ref!("add.path"),
+            column_expr_ref!("add.size"),
+            column_expr_ref!("add.modificationTime"),
+            column_expr_ref!("add.stats"),
+            column_expr_ref!("add.deletionVector"),
+            Arc::new(Expression::Struct(vec![column_expr_ref!(
+                "add.partitionValues"
+            )])),
+        ]))
+    });
+    EXPR.clone()
 }
 
 // TODO: remove once `scan_metadata_from` is pub.
 #[allow(unused)]
-pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
+pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
-    Expression::Struct(vec![Arc::new(Expression::Struct(vec![
-        column_expr_ref!("path"),
-        column_expr_ref!("fileConstantValues.partitionValues"),
-        column_expr_ref!("size"),
-        column_expr_ref!("modificationTime"),
-        column_expr_ref!("stats"),
-        column_expr_ref!("deletionVector"),
-    ]))])
+    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+        Arc::new(Expression::Struct(vec![Arc::new(Expression::Struct(
+            vec![
+                column_expr_ref!("path"),
+                column_expr_ref!("fileConstantValues.partitionValues"),
+                column_expr_ref!("size"),
+                column_expr_ref!("modificationTime"),
+                column_expr_ref!("stats"),
+                column_expr_ref!("deletionVector"),
+            ],
+        ))]))
+    });
+    EXPR.clone()
 }
 
 impl LogReplayProcessor for ScanLogReplayProcessor {

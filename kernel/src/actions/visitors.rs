@@ -1079,13 +1079,15 @@ mod tests {
 
     fn transform_batch(batch: Box<dyn EngineData>) -> Box<dyn EngineData> {
         let engine = SyncEngine::new();
+        let expression =
+            Expression::Struct(vec![Arc::new(Expression::Struct(vec![column_expr_ref!(
+                "commitInfo.inCommitTimestamp"
+            )]))]);
         engine
             .evaluation_handler()
             .new_expression_evaluator(
                 get_log_schema().clone(),
-                Expression::Struct(vec![Arc::new(Expression::Struct(vec![column_expr_ref!(
-                    "commitInfo.inCommitTimestamp"
-                )]))]),
+                expression.into(),
                 InCommitTimestampVisitor::schema().into(),
             )
             .evaluate(batch.as_ref())

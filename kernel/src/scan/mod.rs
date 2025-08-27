@@ -788,7 +788,7 @@ impl Scan {
                         read_result,
                         self.physical_schema(),
                         self.logical_schema(),
-                        &scan_file.transform,
+                        scan_file.transform.clone(),
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
