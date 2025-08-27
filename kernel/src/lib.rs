@@ -90,7 +90,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
-pub(crate) mod log_compaction;
+pub mod log_compaction;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;

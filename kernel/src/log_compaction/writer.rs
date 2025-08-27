@@ -27,8 +27,7 @@ pub(crate) fn should_compact(commit_version: Version, compaction_interval: Versi
 ///
 /// [`CheckpointWriter`]: crate::checkpoint::CheckpointWriter
 #[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct LogCompactionWriter {
+pub struct LogCompactionWriter {
     table_root: Url,
     start_version: Version,
     end_version: Version,
@@ -38,8 +37,7 @@ pub(crate) struct LogCompactionWriter {
 }
 
 impl LogCompactionWriter {
-    #[allow(dead_code)]
-    pub(crate) fn try_new(
+    pub fn try_new(
         table_root: Url,
         start_version: Version,
         end_version: Version,
@@ -65,8 +63,7 @@ impl LogCompactionWriter {
     }
 
     /// Get the path where the compaction file will be written
-    #[allow(dead_code)]
-    pub(crate) fn compaction_path(&self) -> DeltaResult<Url> {
+    pub fn compaction_path(&self) -> DeltaResult<Url> {
         Ok(self.compaction_path.location.clone())
     }
 
@@ -76,8 +73,7 @@ impl LogCompactionWriter {
     /// but specifically for the version range specified in the constructor.
     /// It reuses the CheckpointLogReplayProcessor to ensure consistent reconciliation
     /// logic with checkpoint creation.
-    #[allow(dead_code)]
-    pub(crate) fn compaction_data(
+    pub fn compaction_data(
         &mut self,
         engine: &dyn Engine,
     ) -> DeltaResult<LogCompactionDataIterator> {
@@ -206,8 +202,7 @@ impl LogCompactionWriter {
 ///
 /// This iterator provides the reconciled actions that should be written
 /// to the compaction file. It follows a similar pattern to CheckpointDataIterator.
-#[allow(dead_code)]
-pub(crate) struct LogCompactionDataIterator {
+pub struct LogCompactionDataIterator {
     /// The nested iterator that yields compaction batches with action counts
     pub(crate) compaction_batch_iterator:
         Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
@@ -219,14 +214,12 @@ pub(crate) struct LogCompactionDataIterator {
 
 impl LogCompactionDataIterator {
     /// Get the total number of actions in the compaction
-    #[allow(dead_code)]
-    pub(crate) fn total_actions(&self) -> i64 {
+    pub fn total_actions(&self) -> i64 {
         self.actions_count
     }
 
     /// Get the total number of add actions in the compaction
-    #[allow(dead_code)]
-    pub(crate) fn total_add_actions(&self) -> i64 {
+    pub fn total_add_actions(&self) -> i64 {
         self.add_actions_count
     }
 }

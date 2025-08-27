@@ -68,7 +68,8 @@ fn test_invalid_version_range() {
     let end_version = 10; // Invalid: start > end
     let retention_millis = 7 * 24 * 60 * 60 * 1000;
 
-    let result = LogCompactionWriter::try_new(table_root, start_version, end_version, retention_millis);
+    let result =
+        LogCompactionWriter::try_new(table_root, start_version, end_version, retention_millis);
 
     assert!(result.is_err());
     assert!(result

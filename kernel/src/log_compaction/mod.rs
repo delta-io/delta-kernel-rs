@@ -21,7 +21,7 @@
 //!
 //! ## Example
 //!
-//! ```ignore
+//! ```no_run
 //! # use std::sync::Arc;
 //! # use delta_kernel::log_compaction::{LogCompactionDataIterator, LogCompactionWriter};
 //! # use delta_kernel::{Engine, Snapshot, DeltaResult, Error, FileMeta};
@@ -34,21 +34,27 @@
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
-//! let engine: &dyn Engine = todo!(); /* create engine instance */
-//!
+//! # fn example(engine: &dyn Engine) -> DeltaResult<()> {
 //! // Create a snapshot for the table
-//! let snapshot = Arc::new(Snapshot::try_from_uri("./path/to/table", &engine, None)?);
+//! let snapshot = Arc::new(Snapshot::try_from_uri("./path/to/table", engine, None)?);
 //!
 //! // Create a log compaction writer for versions 10-20
 //! let mut writer = snapshot.compact_log(10, 20)?;
 //!
 //! // Get the compaction path and data
 //! let compaction_path = writer.compaction_path()?;
-//! let compaction_data = writer.compaction_data(&engine)?;
+//! let compaction_data = writer.compaction_data(engine)?;
 //!
 //! // Write the compaction data to object storage
-//! let _metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
+//! let metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
+//!
+//! // Get fresh data iterator for finalization
+//! let final_data = writer.compaction_data(engine)?;
+//!
+//! // Finalize the compaction
+//! writer.finalize(engine, &metadata, final_data)?;
 //! # Ok(())
+//! # }
 //! ```
 //!
 //! ## When to Use Log Compaction
@@ -79,6 +85,8 @@ use crate::actions::{
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 
 mod writer;
+
+pub use writer::{LogCompactionDataIterator, LogCompactionWriter};
 
 #[cfg(test)]
 mod tests;

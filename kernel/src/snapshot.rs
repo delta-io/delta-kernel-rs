@@ -9,6 +9,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::listed_log_files::ListedLogFiles;
+use crate::log_compaction::LogCompactionWriter;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -248,6 +249,55 @@ impl Snapshot {
     /// and the overall checkpoint process.
     pub fn checkpoint(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
         CheckpointWriter::try_new(self)
+    }
+
+    /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
+    ///
+    /// Log compaction aggregates commit files in a version range into a single compacted file,
+    /// improving performance by reducing the number of files to process during log replay.
+    ///
+    /// # Parameters
+    /// - `start_version`: The first version to include in the compaction (inclusive)
+    /// - `end_version`: The last version to include in the compaction (inclusive)
+    ///
+    /// # Returns
+    /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::{Engine, Snapshot, DeltaResult};
+    /// # async fn example() -> DeltaResult<()> {
+    /// let engine: Arc<dyn Engine> = todo!();
+    /// let snapshot = Arc::new(Snapshot::try_from_uri("./path/to/table", &*engine, None)?);
+    ///
+    /// // Compact commits 10-20 into a single file
+    /// let writer = snapshot.compact_log(10, 20)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// See the [`crate::log_compaction`] module documentation for more details.
+    pub fn compact_log(
+        &self,
+        start_version: Version,
+        end_version: Version,
+    ) -> DeltaResult<LogCompactionWriter> {
+        // Use default retention period (7 days) similar to checkpoints
+        const SECONDS_PER_MINUTE: u64 = 60;
+        const MINUTES_PER_HOUR: u64 = 60;
+        const HOURS_PER_DAY: u64 = 24;
+        const DEFAULT_RETENTION_SECS: u64 =
+            7 * HOURS_PER_DAY * MINUTES_PER_HOUR * SECONDS_PER_MINUTE;
+
+        let retention_millis = DEFAULT_RETENTION_SECS * 1000;
+
+        LogCompactionWriter::try_new(
+            self.table_root().clone(),
+            start_version,
+            end_version,
+            retention_millis as i64,
+        )
     }
 
     /// Log segment this snapshot uses
@@ -989,5 +1039,31 @@ mod tests {
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
         Ok(())
+    }
+
+    #[test]
+    fn test_compact_log() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
+
+        // Test creating a log compaction writer
+        let writer = snapshot.compact_log(0, 1).unwrap();
+        let path = writer.compaction_path().unwrap();
+
+        // Verify the path format is correct
+        let expected_filename = "00000000000000000000.00000000000000000001.compacted.json";
+        assert!(path.to_string().ends_with(expected_filename));
+
+        // Test invalid version range
+        let result = snapshot.compact_log(2, 1);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid version range"));
     }
 }
