@@ -7,7 +7,7 @@ use std::iter::Peekable;
 use std::ops::Deref;
 
 /// A (possibly nested) column name.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord)]
 pub struct ColumnName {
     path: Vec<String>,
 }

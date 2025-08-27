@@ -1,6 +1,7 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -244,6 +245,82 @@ impl OpaqueExpression {
     }
 }
 
+/// An optional field name. When using a [`Transform`] to insert new fields, this is used to specify
+/// which field, if any, the new fields should be inserted after.
+///
+/// NOTE: This unusual type is necessary because `Option` does not impl `Borrow` and a hash map with
+/// `Option<String>` keys can only be probed with owned strings. In contrast, `Cow` _does_ impl
+/// `Borrow` so we can probe the map with borrowed keys, e.g. `Some(Cow::Borrowed("key"))`.
+pub type FieldNameOpt = Option<Cow<'static, str>>;
+
+/// A transformation that efficiently represents sparse modifications to struct schemas.
+///
+/// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
+/// specifying those fields that actually change (inserted, replaced, or deleted). Any input field
+/// not specifically mentioned by the transform is passed through, unmodified and with the same
+/// relative field ordering. This is particularly useful for wide schemas where only a few columns
+/// need to be modified and/or dropped, or where a small number of columns need to be injected.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Transform {
+    /// The path to the nested input struct this transform operates on (if any). If no path is
+    /// given, the transform operates directly on top-level columns.
+    pub input_path: Option<ColumnName>,
+    /// A set of fields names to be replaced, along with their replacement expression (if any). A
+    /// replaced field with no replacement expression will be dropped from the output.
+    pub field_replacements: HashMap<String, Option<ExpressionRef>>,
+    /// A set of new fields to inject, organized by the name of field they should follow (if any).
+    pub field_insertions: HashMap<FieldNameOpt, Vec<ExpressionRef>>,
+}
+
+impl Transform {
+    /// Create a new top-level identity transform. Field transforms and pathing can then be added as
+    /// desired, using the various `with_xxx` helper methods.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Specifies the path to input data this transform operates on. The path must reference a
+    /// struct whose fields will be transformed.
+    pub fn with_input_path<A>(mut self, path: impl IntoIterator<Item = A>) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        self.input_path = Some(ColumnName::new(path));
+        self
+    }
+
+    /// Specifies a field to drop.
+    pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
+        self.field_replacements.insert(name.into(), None);
+        self
+    }
+
+    /// Specifies an expression to replace a field with.
+    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
+        self.field_replacements.insert(name.into(), Some(expr));
+        self
+    }
+
+    /// Specifies an expression to insert after an optional predecessor. Multiple fields can be
+    /// inserted after the same predecessor, and they will be inserted in the relative order they
+    /// are registered.
+    pub fn with_inserted_field(mut self, after: Option<String>, expr: ExpressionRef) -> Self {
+        let after = after.map(Cow::Owned);
+        self.field_insertions.entry(after).or_default().push(expr);
+        self
+    }
+
+    /// True if this is the identity transform (all input fields pass through unchanged, with no new
+    /// fields inserted).
+    pub fn is_identity(&self) -> bool {
+        self.field_replacements.is_empty() && self.field_insertions.is_empty()
+    }
+
+    pub fn input_path(&self) -> Option<&ColumnName> {
+        self.input_path.as_ref()
+    }
+}
+
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type
@@ -259,6 +336,9 @@ pub enum Expression {
     Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions
     Struct(Vec<ExpressionRef>),
+    /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
+    /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
+    Transform(Transform),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
@@ -410,6 +490,11 @@ impl Expression {
     /// Create a new struct expression
     pub fn struct_from(exprs: impl IntoIterator<Item = impl Into<Arc<Self>>>) -> Self {
         Self::Struct(exprs.into_iter().map(Into::into).collect())
+    }
+
+    /// Create a new transform expression
+    pub fn transform(transform: Transform) -> Self {
+        Self::Transform(transform)
     }
 
     /// Create a new predicate `self IS NULL`
@@ -681,6 +766,17 @@ impl Display for Expression {
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
             Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
+            Transform(transform) => {
+                // TODO: Revisit Display for Expression::Transform
+                // Options: (1) print equivalent Expression::Struct, or (2) expanded sparse description
+                // Either way, should recurse into sub-expressions of the transform
+                write!(
+                    f,
+                    "Transform({} replacements, {} insertions)",
+                    transform.field_replacements.len(),
+                    transform.field_insertions.len()
+                )
+            }
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
