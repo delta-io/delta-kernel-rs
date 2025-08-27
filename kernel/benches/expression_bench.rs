@@ -13,6 +13,7 @@
 //! cargo bench --bench expression_bench -- --baseline main
 //! ```
 
+use std::hint::black_box;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
@@ -21,7 +22,7 @@ use delta_kernel::arrow::array::{
 use delta_kernel::arrow::datatypes::{DataType, Field, Fields};
 use delta_kernel::engine::arrow_expression::evaluate_expression::to_json;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Creates a test struct array with realistic data for benchmarking.
 fn create_test_struct_array(num_rows: usize) -> StructArray {
