@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, UnaryPredicate,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryPredicate,
 };
 use crate::utils::CowExt as _;
 
@@ -59,6 +59,12 @@ pub trait ExpressionTransform<'a> {
     /// Called for each [`Expression::Unknown`] encountered during the traversal.
     fn transform_expr_unknown(&mut self, name: &'a String) -> Option<Cow<'a, String>> {
         Some(Cow::Borrowed(name))
+    }
+
+    /// Called for each [`Transform`] encountered during the traversal. By default, it is a no-op
+    /// that simply returns its argument and does _NOT_ recurse into its children.
+    fn transform_expr_transform(&mut self, transform: &'a Transform) -> Option<Cow<'a, Transform>> {
+        Some(Cow::Borrowed(transform))
     }
 
     /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
@@ -142,6 +148,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Struct(s) => self
                 .transform_expr_struct(s)?
                 .map_owned_or_else(expr, Expression::Struct),
+            Expression::Transform(t) => self
+                .transform_expr_transform(t)?
+                .map_owned_or_else(expr, Expression::Transform),
             Expression::Binary(b) => self
                 .transform_expr_binary(b)?
                 .map_owned_or_else(expr, Expression::Binary),
