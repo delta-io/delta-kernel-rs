@@ -816,6 +816,21 @@ fn test_create_one_nested_null() {
 }
 
 #[test]
+fn test_create_one_mismatching_scalar_types() {
+    // Scalar is a LONG but schema specifies INTEGER
+    let values: &[Scalar] = &[Scalar::Long(10)];
+    let schema = Arc::new(StructType::new([StructField::not_null(
+        "version",
+        KernelDataType::INTEGER,
+    )]));
+    let handler = ArrowEvaluationHandler;
+    assert_result_error_with_message(
+        handler.create_one(schema, values),
+        "Schema error: Mismatched scalar type while creating Expression: expected Integer, got Long",
+    );
+}
+
+#[test]
 fn test_create_one_not_null_struct() {
     let values: &[Scalar] = &[
         Scalar::Null(KernelDataType::INTEGER),
