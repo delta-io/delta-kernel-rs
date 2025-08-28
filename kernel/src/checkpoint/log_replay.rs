@@ -942,78 +942,138 @@ mod tests {
 
     // ERROR COVERAGE TESTS - These tests specifically target error paths to improve code coverage
 
-    /// Mock GetData implementation that can simulate type errors for testing error paths
-    struct MockErrorGetData {
-        error_on_field: &'static str,
-        error_type: &'static str,
-    }
+    // Test-only mock utilities module to avoid coverage noise
+    mod test_mocks {
+        use super::*;
 
-    impl MockErrorGetData {
-        fn new(error_on_field: &'static str, error_type: &'static str) -> Self {
-            Self {
-                error_on_field,
-                error_type,
+        /// Mock GetData implementation that can simulate type errors for testing error paths
+        pub(super) struct MockErrorGetData {
+            error_on_field: &'static str,
+            error_type: &'static str,
+        }
+
+        impl MockErrorGetData {
+            pub(super) fn new(error_on_field: &'static str, error_type: &'static str) -> Self {
+                Self {
+                    error_on_field,
+                    error_type,
+                }
+            }
+
+            pub(super) fn default() -> Self {
+                Self::new("", "")
             }
         }
 
-        fn default() -> Self {
-            Self::new("", "")
-        }
-    }
+        impl<'a> GetData<'a> for MockErrorGetData {
+            fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+                if field_name == self.error_on_field && self.error_type == "str" {
+                    Err(
+                        Error::UnexpectedColumnType(format!("{field_name} is not of type str"))
+                            .with_backtrace(),
+                    )
+                } else {
+                    Ok(None)
+                }
+            }
 
-    impl<'a> GetData<'a> for MockErrorGetData {
-        fn get_str(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
-            if field_name == self.error_on_field && self.error_type == "str" {
-                Err(
-                    Error::UnexpectedColumnType(format!("{field_name} is not of type str"))
-                        .with_backtrace(),
-                )
-            } else {
+            fn get_int(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i32>> {
+                if field_name == self.error_on_field && self.error_type == "int" {
+                    Err(
+                        Error::UnexpectedColumnType(format!("{field_name} is not of type i32"))
+                            .with_backtrace(),
+                    )
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn get_long(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+                if field_name == self.error_on_field && self.error_type == "long" {
+                    Err(
+                        Error::UnexpectedColumnType(format!("{field_name} is not of type i64"))
+                            .with_backtrace(),
+                    )
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn get_bool(&'a self, _: usize, _: &str) -> DeltaResult<Option<bool>> {
+                Ok(None)
+            }
+            fn get_list(
+                &'a self,
+                _: usize,
+                _: &str,
+            ) -> DeltaResult<Option<crate::engine_data::ListItem<'a>>> {
+                Ok(None)
+            }
+            fn get_map(
+                &'a self,
+                _: usize,
+                _: &str,
+            ) -> DeltaResult<Option<crate::engine_data::MapItem<'a>>> {
                 Ok(None)
             }
         }
 
-        fn get_int(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<i32>> {
-            if field_name == self.error_on_field && self.error_type == "int" {
-                Err(
-                    Error::UnexpectedColumnType(format!("{field_name} is not of type i32"))
-                        .with_backtrace(),
-                )
-            } else {
-                Ok(None)
-            }
+        /// Flexible mock for complex field error scenarios
+        pub(super) struct FlexibleMock {
+            pub(super) error_field: &'static str,
         }
 
-        fn get_long(&'a self, _row_index: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-            if field_name == self.error_on_field && self.error_type == "long" {
-                Err(
-                    Error::UnexpectedColumnType(format!("{field_name} is not of type i64"))
-                        .with_backtrace(),
-                )
-            } else {
+        impl<'a> GetData<'a> for FlexibleMock {
+            fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
+                if field_name == "txn.appId" {
+                    Ok(Some("test_app"))
+                } else if field_name == "remove.path" {
+                    Ok(Some("test_path"))
+                } else if field_name.contains(self.error_field) {
+                    Err(
+                        Error::UnexpectedColumnType(format!("{field_name} is not of type str"))
+                            .with_backtrace(),
+                    )
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn get_long(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i64>> {
+                if field_name.contains(self.error_field) {
+                    Err(
+                        Error::UnexpectedColumnType(format!("{field_name} is not of type i64"))
+                            .with_backtrace(),
+                    )
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn get_int(&'a self, _: usize, _: &str) -> DeltaResult<Option<i32>> {
                 Ok(None)
             }
-        }
-
-        // Unused methods - just return Ok(None)
-        fn get_bool(&'a self, _: usize, _: &str) -> DeltaResult<Option<bool>> {
-            Ok(None)
-        }
-        fn get_list(
-            &'a self,
-            _: usize,
-            _: &str,
-        ) -> DeltaResult<Option<crate::engine_data::ListItem<'a>>> {
-            Ok(None)
-        }
-        fn get_map(
-            &'a self,
-            _: usize,
-            _: &str,
-        ) -> DeltaResult<Option<crate::engine_data::MapItem<'a>>> {
-            Ok(None)
+            fn get_bool(&'a self, _: usize, _: &str) -> DeltaResult<Option<bool>> {
+                Ok(None)
+            }
+            fn get_list(
+                &'a self,
+                _: usize,
+                _: &str,
+            ) -> DeltaResult<Option<crate::engine_data::ListItem<'a>>> {
+                Ok(None)
+            }
+            fn get_map(
+                &'a self,
+                _: usize,
+                _: &str,
+            ) -> DeltaResult<Option<crate::engine_data::MapItem<'a>>> {
+                Ok(None)
+            }
         }
     }
+
+    use test_mocks::*;
 
     /// Helper function to create a standard checkpoint visitor for error testing
     fn create_test_visitor<'a>(
@@ -1096,57 +1156,6 @@ mod tests {
 
     #[test]
     fn test_checkpoint_visitor_complex_field_errors() {
-        // Generic mock that can simulate errors for specific field patterns
-        struct FlexibleMock {
-            error_field: &'static str,
-        }
-        impl<'a> GetData<'a> for FlexibleMock {
-            fn get_str(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<&'a str>> {
-                if field_name == "txn.appId" {
-                    Ok(Some("test_app"))
-                } else if field_name == "remove.path" {
-                    Ok(Some("test_path"))
-                } else if field_name.contains(self.error_field) {
-                    Err(
-                        Error::UnexpectedColumnType(format!("{field_name} is not of type str"))
-                            .with_backtrace(),
-                    )
-                } else {
-                    Ok(None)
-                }
-            }
-            fn get_long(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-                if field_name.contains(self.error_field) {
-                    Err(
-                        Error::UnexpectedColumnType(format!("{field_name} is not of type i64"))
-                            .with_backtrace(),
-                    )
-                } else {
-                    Ok(None)
-                }
-            }
-            fn get_int(&'a self, _: usize, _: &str) -> DeltaResult<Option<i32>> {
-                Ok(None)
-            }
-            fn get_bool(&'a self, _: usize, _: &str) -> DeltaResult<Option<bool>> {
-                Ok(None)
-            }
-            fn get_list(
-                &'a self,
-                _: usize,
-                _: &str,
-            ) -> DeltaResult<Option<crate::engine_data::ListItem<'a>>> {
-                Ok(None)
-            }
-            fn get_map(
-                &'a self,
-                _: usize,
-                _: &str,
-            ) -> DeltaResult<Option<crate::engine_data::MapItem<'a>>> {
-                Ok(None)
-            }
-        }
-
         // Test txn.lastUpdated with retention enabled
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
