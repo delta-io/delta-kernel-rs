@@ -529,55 +529,44 @@ pub fn coalesce_arrays(
     arrays: &[ArrayRef],
     result_type: Option<&DataType>,
 ) -> Result<ArrayRef, ArrowError> {
-    if arrays.is_empty() {
+    let Some((first, rest)) = arrays.split_first() else {
         return Err(ArrowError::InvalidArgumentError(
             "The default engine currently does not support empty COALESCE statements".into(),
         ));
+    };
+
+    // Validate against the expected output type, if provided
+    if let Some(result_type) = result_type {
+        let result_type = result_type.try_into_arrow()?;
+        if first.data_type() != &result_type {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Requested result type {result_type:?} does not match arrays' data type {:?}",
+                first.data_type()
+            )));
+        }
     }
 
     // Early exit for single array case
-    if arrays.len() == 1 {
-        let array = &arrays[0];
-
-        // Validate result type if provided
-        if let Some(result_type) = result_type {
-            let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
-            if array.data_type() != &result_arrow_type {
-                return Err(ArrowError::InvalidArgumentError(format!(
-                    "Single array type {:?} does not match requested result type {result_type:?}",
-                    array.data_type()
-                )));
-            }
-        }
-
-        return Ok(array.clone());
+    if rest.is_empty() {
+        return Ok(first.clone());
     }
 
-    // Validate all arrays have the same length and same data type
-    let num_rows = arrays[0].len();
-    let expected_type = arrays[0].data_type();
-    for (i, arr) in arrays.iter().skip(1).enumerate() {
-        if arr.len() != num_rows {
+    // Verify all arrays have the same length and data type
+    for (i, arr) in rest.iter().enumerate() {
+        if arr.len() != first.len() {
             return Err(ArrowError::InvalidArgumentError(format!(
-                "Array at index {i} has length {}, expected {num_rows}",
-                arr.len()
+                "Array at index {} has length {}, expected {}",
+                i + 1,
+                arr.len(),
+                first.len()
             )));
         }
-        if arr.data_type() != expected_type {
+        if arr.data_type() != first.data_type() {
             return Err(ArrowError::InvalidArgumentError(format!(
-                "Array at index {i} has type {:?}, but expected {:?}",
+                "Array at index {} has type {:?}, but expected {:?}",
+                i + 1,
                 arr.data_type(),
-                expected_type
-            )));
-        }
-    }
-
-    // Validate result type if provided
-    if let Some(result_type) = result_type {
-        let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
-        if result_arrow_type != *expected_type {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "Requested result type {result_type:?} does not match arrays' data type {expected_type:?}"
+                first.data_type()
             )));
         }
     }
@@ -586,16 +575,12 @@ pub fn coalesce_arrays(
     let array_data: Vec<ArrayData> = arrays.iter().map(|arr| arr.to_data()).collect();
 
     // Build result
-    let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, num_rows);
-    for row in 0..num_rows {
+    let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, first.len());
+    for row in 0..first.len() {
         // Find first non-null value for this row
         match arrays.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
-            Some((array_idx, _)) => {
-                mutable.extend(array_idx, row, row + 1);
-            }
-            None => {
-                mutable.extend_nulls(1);
-            }
+            Some((array_idx, _)) => mutable.extend(array_idx, row, row + 1),
+            None => mutable.extend_nulls(1),
         }
     }
 
@@ -960,18 +945,22 @@ mod tests {
     #[test]
     fn test_coalesce_arrays_same_type() {
         // Test with Int32 arrays
-        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None, Some(3), None]));
-        let arr2 = Arc::new(Int32Array::from(vec![None, Some(2), Some(4), None]));
-        let arr3 = Arc::new(Int32Array::from(vec![None, None, None, Some(5)]));
+        let arr1 = Int32Array::from(vec![Some(1), None, Some(3), None, None, Some(8), None]);
+        let arr2 = Int32Array::from(vec![None, Some(2), Some(4), None, Some(6), None, None]);
+        let arr3 = Int32Array::from(vec![None, None, None, Some(5), Some(7), Some(9), None]);
 
-        let result = coalesce_arrays(&[arr1, arr2, arr3], None).unwrap();
+        let result =
+            coalesce_arrays(&[Arc::new(arr1), Arc::new(arr2), Arc::new(arr3)], None).unwrap();
         let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
 
-        assert_eq!(result_array.len(), 4);
+        assert_eq!(result_array.len(), 7);
         assert_eq!(result_array.value(0), 1); // From arr1
         assert_eq!(result_array.value(1), 2); // From arr2
         assert_eq!(result_array.value(2), 3); // From arr1
         assert_eq!(result_array.value(3), 5); // From arr3
+        assert_eq!(result_array.value(4), 6); // From arr2
+        assert_eq!(result_array.value(5), 8); // From arr1
+        assert!(result_array.is_null(6));
 
         // Test with String arrays
         let str_arr1 = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
@@ -1018,7 +1007,7 @@ mod tests {
         let result = coalesce_arrays(&[int32_arr, int64_arr], None);
         assert_result_error_with_message(
             result,
-            "Array at index 0 has type Int64, but expected Int32",
+            "Array at index 1 has type Int64, but expected Int32",
         );
 
         // Test Int32 vs String - should fail
@@ -1028,7 +1017,7 @@ mod tests {
         let result2 = coalesce_arrays(&[int_arr, str_arr], None);
         assert_result_error_with_message(
             result2,
-            "Array at index 0 has type Utf8, but expected Int32",
+            "Array at index 1 has type Utf8, but expected Int32",
         );
     }
 
@@ -1039,7 +1028,7 @@ mod tests {
         let arr2 = Arc::new(Int32Array::from(vec![Some(3), Some(4), Some(5)]));
 
         let result = coalesce_arrays(&[arr1, arr2], None);
-        assert_result_error_with_message(result, "Array at index 0 has length 3, expected 2");
+        assert_result_error_with_message(result, "Array at index 1 has length 3, expected 2");
     }
 
     #[test]
@@ -1062,7 +1051,7 @@ mod tests {
         let result2 = coalesce_arrays(&[arr1, arr2], Some(&DataType::STRING));
         assert_result_error_with_message(
             result2,
-            "Requested result type Primitive(String) does not match arrays' data type Int32",
+            "Requested result type Utf8 does not match arrays' data type Int32",
         );
     }
 }
