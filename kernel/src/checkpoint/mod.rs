@@ -333,10 +333,7 @@ impl CheckpointWriter {
             size_in_bytes,
         );
 
-        let last_checkpoint_path = LastCheckpointHint::path(
-            &self.snapshot
-            .log_segment()
-            .log_root)?;
+        let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         engine.json_handler().write_json_file(
