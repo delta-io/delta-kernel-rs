@@ -115,7 +115,7 @@ pub async fn assert_scan_metadata(
     test_case: &TestCaseInfo,
 ) -> TestResult<()> {
     let table_root = test_case.table_root()?;
-    let snapshot = Snapshot::try_new(table_root, engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder(table_root).build(engine.as_ref())?;
     let scan = snapshot.into_scan_builder().build()?;
     let mut schema = None;
     let batches: Vec<RecordBatch> = scan

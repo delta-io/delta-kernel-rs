@@ -73,7 +73,7 @@ async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(TokioBackgroundExecutor::new()),
     )?;
 
-    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    let snapshot = Snapshot::builder(url).build(&engine)?;
     assert_eq!(snapshot.version(), 1);
 
     Ok(())

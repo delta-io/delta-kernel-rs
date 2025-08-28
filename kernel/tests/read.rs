@@ -66,7 +66,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = Snapshot::try_new(location, engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder(location).build(engine.as_ref())?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
@@ -118,7 +118,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = Snapshot::try_new(location, &engine, None)?;
+    let snapshot = Snapshot::builder(location).build(&engine)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let mut files = 0;
@@ -171,7 +171,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_data = vec![batch];
 
-    let snapshot = Snapshot::try_new(location, &engine, None)?;
+    let snapshot = Snapshot::builder(location).build(&engine)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
@@ -242,7 +242,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Arc::new(Snapshot::try_new(location, engine.as_ref(), None)?);
+    let snapshot = Arc::new(Snapshot::builder(location).build(engine.as_ref())?);
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -433,7 +433,7 @@ fn read_table_data(
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
 
-    let snapshot = Snapshot::try_new(url.clone(), engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder(url.clone()).build(engine.as_ref())?;
 
     let read_schema = select_cols.map(|select_cols| {
         let table_schema = snapshot.schema();
@@ -1057,7 +1057,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Arc::new(Snapshot::try_new(location, engine.as_ref(), None)?);
+    let snapshot = Arc::new(Snapshot::builder(location).build(engine.as_ref())?);
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
     let scan = snapshot
@@ -1119,7 +1119,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Arc::new(Snapshot::try_new(location, engine.as_ref(), None)?);
+    let snapshot = Arc::new(Snapshot::builder(location).build(engine.as_ref())?);
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
     let scan = snapshot

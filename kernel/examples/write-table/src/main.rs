@@ -125,7 +125,7 @@ async fn create_or_get_base_snapshot(
     schema_str: &str,
 ) -> DeltaResult<Snapshot> {
     // Check if table already exists
-    match Snapshot::try_new(url.clone(), engine, None) {
+    match Snapshot::builder(url.clone()).build(engine) {
         Ok(snapshot) => {
             println!("✓ Found existing table at version {}", snapshot.version());
             Ok(snapshot)
@@ -135,7 +135,7 @@ async fn create_or_get_base_snapshot(
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(url, &schema).await?;
-            Snapshot::try_new(url.clone(), engine, None)
+            Snapshot::builder(url.clone()).build(engine)
         }
     }
 }
@@ -294,7 +294,7 @@ async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
 ) -> DeltaResult<()> {
-    let snapshot = Snapshot::try_new(table_url.clone(), &engine, None)?;
+    let snapshot = Snapshot::builder(table_url.clone()).build(&engine)?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let batches: Vec<RecordBatch> = scan

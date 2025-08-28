@@ -404,7 +404,7 @@ pub fn test_read(
     url: &Url,
     engine: Arc<dyn Engine>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::try_new(url.clone(), engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder(url.clone()).build(engine.as_ref())?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
     let formatted = pretty_format_batches(&batches).unwrap().to_string();

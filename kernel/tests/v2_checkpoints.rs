@@ -15,12 +15,9 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
     let test_path = test_dir.path().join(test_name.as_ref());
 
     let engine = DefaultEngine::new_local();
-    let snapshot = Snapshot::try_from_uri(
-        test_path.to_str().expect("table path to string"),
-        engine.as_ref(),
-        None,
-    )
-    .unwrap();
+    let url =
+        delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string")).unwrap();
+    let snapshot = Snapshot::builder(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
 
