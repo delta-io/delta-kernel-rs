@@ -98,6 +98,12 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
+#[cfg(all(
+    feature = "cloud",
+    not(any(feature = "arrow-54", feature = "arrow-55"))
+))]
+compile_error! {"'cloud' feature requires 'arrow-54' or 'arrow-55'"}
+
 mod arrow_compat;
 #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
 pub use arrow_compat::*;

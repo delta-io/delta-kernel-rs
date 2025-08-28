@@ -346,6 +346,7 @@ where
 impl Protocol {
     /// Try to create a new Protocol instance from reader/writer versions and table features. This
     /// can fail if the protocol is invalid.
+    #[internal_api]
     pub(crate) fn try_new(
         min_reader_version: i32,
         min_writer_version: i32,

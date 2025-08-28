@@ -60,9 +60,10 @@ futures = { version = "0.3", optional = true }
 # Used for fetching direct urls (like pre-signed urls)
 reqwest = { version = "0.12.23", default-features = false, optional = true }
 # optionally used with default engine (though not required)
+
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
-object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
+object_store = { version = "0.12.3", optional = true }
 
 # arrow 55
 [dependencies.arrow_55]
@@ -97,11 +98,12 @@ internal-api = []
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-56"] # latest arrow version
+arrow = ["arrow-56", "cloud"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
 arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store"]
 arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store"]
+cloud = ["object_store?/aws", "object_store?/azure", "object_store?/gcp", "object_store?/http"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 
