@@ -4,19 +4,34 @@
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.14.0...v0.15.0)
 
+### 🏗️ Breaking changes
+1. Rename `default-engine` feature to `default-engine-native-tls` ([#1100])
+2. Add arrow 56 support, drop arrow 54 ([#1141])
+3. Add `catalogManaged` (and `catalogOwned-preview`) table features + `catalog-managed`
+   _experimental_ feature flag ([#1165])
+4. `ExpressionRef` instead of owned `Expression` for transforms ([#1171]): `Expression::Struct` now
+   takes a `Vec<ExpressionRef>` instead of `Vec<Expression>`
+5. Add support for Column Mapping Id Mode ([#1056]): significantly changes the semantics (`Engine`
+   trait requirements) of the parquet handler in column mapping id mode. See
+   `ParquetHandler::read_parquet_files` docs for details.
+6. `StructField.physical_name` is no longer public (internal-api) ([#1186])
+7. Add support for sparse transform expressions ([#1199]): adds a new `Expression::Transform`
+   variant.
+8. Expression evaluators take `ExpressionRef` as input ([#1221]):
+   - `EvaluationHandler::new_expression_evaluator` and `EvaluationHandler::new_predicate_evaluator`
+   take Arc instead of owned expression/predicate.
+   - `scan::state::transform_to_logical` takes owned `Option<ExpressionRef>` instead of a borrowed
+   reference.
+   - `transaction::WriteContext::logical_to_physical` returns an Arc instead of a borrowed reference
 
 ### 🚀 Features / new APIs
 
 1. Impl IntoEngineData for Protocol action ([#1136])
 2. Add txnId to commit info ([#1148])
 3. *(catalog-managed)* Experimental uc client ([#1164])
-4. Feat!(catalog-managed): add catalog-managed table features + feature flag ([#1165])
-5. Implement `IntoEngineData` for `DomainMetadata` ([#1169])
-6. Add support for Column Mapping Id Mode ([#1056])
-7. Add example for table writes ([#1119])
-8. *(ffi)* Add `visit_expression_literal_date` ([#1096])
-9. Add support for sparse transform expressions ([#1199])
-10. Expression evaluators take ExpressionRef as input ([#1221])
+4. Implement `IntoEngineData` for `DomainMetadata` ([#1169])
+5. Add example for table writes ([#1119])
+6. *(ffi)* Add `visit_expression_literal_date` ([#1096])
 
 ### 🐛 Bug Fixes
 
@@ -24,18 +39,14 @@
 2. Support arrow views in ensure_data_types ([#1028])
 3. Make `ListedLogFiles` internal-api ([#1209])
 4. Provide accurate error when evaluating a different type in LiteralExpressionTransform ([#1207])
-
-### ⚡ Performance
-
-1. ExpressionRef instead of owned for transforms ([#1171])
+5. Fix failing test and improve indentation test error message ([#1135])
 
 ### 🚜 Refactor
 
 1. Contiguous commit file checking inside `ListedLogFiles::try_new()` ([#1107])
 2. New listed_log_files module ([#1150])
 3. Move LastCheckpointHint to separate module ([#1154])
-4. Make `StructField.physical_name` internal ([#1186])
-5. *(catalog-managed)* Push down _last_checkpoint read into LogSegment ([#1204])
+4. *(catalog-managed)* Push down _last_checkpoint read into LogSegment ([#1204])
 
 ### 🧪 Testing
 
@@ -47,15 +58,9 @@
 
 1. Appease clippy in rustc 1.89 ([#1151])
 2. Bump MSRV to 1.84 ([#1142])
-3. Rename default-engine feature to default-engine-native-tls ([#1100])
-4. Add arrow 56, drop arrow 54 ([#1141])
-5. Remove object store versioning ([#1161])
-6. Remove unused deps from examples ([#1175])
-7. Update deps ([#1181])
-
-### Other
-
-1. Fix failing test and improve indentation test error message ([#1135])
+3. Remove object store versioning ([#1161])
+4. Remove unused deps from examples ([#1175])
+5. Update deps ([#1181])
 
 
 [#1135]: https://github.com/delta-io/delta-kernel-rs/pull/1135
