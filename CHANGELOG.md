@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.15.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.15.1/) (2025-08-28)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.15.0...v0.15.1)
+
+
+### 🐛 Bug Fixes
+
+1. Make ListedLogFiles::try_new internal-api (again) ([#1226])
+
+
+[#1226]: https://github.com/delta-io/delta-kernel-rs/pull/1226
+
+
 ## [v0.15.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.15.0/) (2025-08-28)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.14.0...v0.15.0)
