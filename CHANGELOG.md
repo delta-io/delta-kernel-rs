@@ -1,5 +1,96 @@
 # Changelog
 
+## [v0.15.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.15.0/) (2025-08-28)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.14.0...v0.15.0)
+
+
+### 🚀 Features / new APIs
+
+1. Impl IntoEngineData for Protocol action ([#1136])
+2. Add txnId to commit info ([#1148])
+3. *(catalog-managed)* Experimental uc client ([#1164])
+4. Feat!(catalog-managed): add catalog-managed table features + feature flag ([#1165])
+5. Implement `IntoEngineData` for `DomainMetadata` ([#1169])
+6. Add support for Column Mapping Id Mode ([#1056])
+7. Add example for table writes ([#1119])
+8. *(ffi)* Add `visit_expression_literal_date` ([#1096])
+9. Add support for sparse transform expressions ([#1199])
+10. Expression evaluators take ExpressionRef as input ([#1221])
+
+### 🐛 Bug Fixes
+
+1. Match arrow versions in examples ([#1166])
+2. Support arrow views in ensure_data_types ([#1028])
+3. Make `ListedLogFiles` internal-api ([#1209])
+4. Provide accurate error when evaluating a different type in LiteralExpressionTransform ([#1207])
+
+### ⚡ Performance
+
+1. ExpressionRef instead of owned for transforms ([#1171])
+
+### 🚜 Refactor
+
+1. Contiguous commit file checking inside `ListedLogFiles::try_new()` ([#1107])
+2. New listed_log_files module ([#1150])
+3. Move LastCheckpointHint to separate module ([#1154])
+4. Make `StructField.physical_name` internal ([#1186])
+5. *(catalog-managed)* Push down _last_checkpoint read into LogSegment ([#1204])
+
+### 🧪 Testing
+
+1. Add metadata-only regression test ([#1183])
+2. Parameterize column mapping tests to check different modes ([#1176])
+3. Add apply_schema mismatch test ([#1210])
+
+### ⚙️ Chores/CI
+
+1. Appease clippy in rustc 1.89 ([#1151])
+2. Bump MSRV to 1.84 ([#1142])
+3. Rename default-engine feature to default-engine-native-tls ([#1100])
+4. Add arrow 56, drop arrow 54 ([#1141])
+5. Remove object store versioning ([#1161])
+6. Remove unused deps from examples ([#1175])
+7. Update deps ([#1181])
+
+### Other
+
+1. Fix failing test and improve indentation test error message ([#1135])
+
+
+[#1135]: https://github.com/delta-io/delta-kernel-rs/pull/1135
+[#1136]: https://github.com/delta-io/delta-kernel-rs/pull/1136
+[#1107]: https://github.com/delta-io/delta-kernel-rs/pull/1107
+[#1148]: https://github.com/delta-io/delta-kernel-rs/pull/1148
+[#1151]: https://github.com/delta-io/delta-kernel-rs/pull/1151
+[#1142]: https://github.com/delta-io/delta-kernel-rs/pull/1142
+[#1100]: https://github.com/delta-io/delta-kernel-rs/pull/1100
+[#1150]: https://github.com/delta-io/delta-kernel-rs/pull/1150
+[#1154]: https://github.com/delta-io/delta-kernel-rs/pull/1154
+[#1141]: https://github.com/delta-io/delta-kernel-rs/pull/1141
+[#1161]: https://github.com/delta-io/delta-kernel-rs/pull/1161
+[#1166]: https://github.com/delta-io/delta-kernel-rs/pull/1166
+[#1164]: https://github.com/delta-io/delta-kernel-rs/pull/1164
+[#1165]: https://github.com/delta-io/delta-kernel-rs/pull/1165
+[#1171]: https://github.com/delta-io/delta-kernel-rs/pull/1171
+[#1175]: https://github.com/delta-io/delta-kernel-rs/pull/1175
+[#1028]: https://github.com/delta-io/delta-kernel-rs/pull/1028
+[#1183]: https://github.com/delta-io/delta-kernel-rs/pull/1183
+[#1181]: https://github.com/delta-io/delta-kernel-rs/pull/1181
+[#1176]: https://github.com/delta-io/delta-kernel-rs/pull/1176
+[#1169]: https://github.com/delta-io/delta-kernel-rs/pull/1169
+[#1056]: https://github.com/delta-io/delta-kernel-rs/pull/1056
+[#1186]: https://github.com/delta-io/delta-kernel-rs/pull/1186
+[#1209]: https://github.com/delta-io/delta-kernel-rs/pull/1209
+[#1119]: https://github.com/delta-io/delta-kernel-rs/pull/1119
+[#1096]: https://github.com/delta-io/delta-kernel-rs/pull/1096
+[#1204]: https://github.com/delta-io/delta-kernel-rs/pull/1204
+[#1199]: https://github.com/delta-io/delta-kernel-rs/pull/1199
+[#1210]: https://github.com/delta-io/delta-kernel-rs/pull/1210
+[#1207]: https://github.com/delta-io/delta-kernel-rs/pull/1207
+[#1221]: https://github.com/delta-io/delta-kernel-rs/pull/1221
+
+
 ## [v0.14.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.14.0/) (2025-08-01)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.13.0...v0.14.0)
