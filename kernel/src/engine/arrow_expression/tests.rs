@@ -1,14 +1,14 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
-    ListArray, MapArray, MapBuilder, MapFieldNames, StringBuilder, StructArray,
+    create_array, Array, ArrayRef, AsArray, BooleanArray, GenericStringArray, Int32Array,
+    Int32Builder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
+    StructArray,
 };
-use crate::arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
-
-use super::*;
+use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
     ArrowOpaquePredicateOp,
@@ -21,6 +21,8 @@ use crate::kernel_predicates::{
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
 use crate::utils::test_utils::assert_result_error_with_message;
 use crate::EvaluationHandlerExtension as _;
+
+use super::*;
 
 use Expression as Expr;
 use Predicate as Pred;
@@ -949,4 +951,234 @@ fn test_apply_schema_column_count_mismatch() {
         result,
         "Passed struct had 3 columns, but transformed column has 2",
     );
+}
+
+#[test]
+fn test_to_json_with_struct_array() {
+    // Create a test struct array
+    let boolean_field = Arc::new(Field::new("bool_field", ArrowDataType::Boolean, true));
+    let int_field = Arc::new(Field::new("int_field", ArrowDataType::Int32, true));
+    let string_field = Arc::new(Field::new("string_field", ArrowDataType::Utf8, true));
+
+    let boolean_array = Arc::new(BooleanArray::from(vec![
+        Some(true),
+        Some(false),
+        None,
+        None,
+        None,
+    ]));
+    let int_array = Arc::new(Int32Array::from(vec![Some(42), None, Some(84), None, None]));
+    let string_array = Arc::new(StringArray::from(vec![
+        Some("hello"),
+        Some("world"),
+        Some("test"),
+        None,
+        None,
+    ]));
+
+    let struct_array = StructArray::new(
+        vec![boolean_field, int_field, string_field].into(),
+        vec![boolean_array, int_array, string_array],
+        Some(NullBuffer::new(BooleanBuffer::from(vec![
+            true, true, true, true, false,
+        ]))),
+    );
+
+    // Test the to_json function
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(json_array.len(), 5);
+    assert_eq!(
+        json_array.value(0),
+        r#"{"bool_field":true,"int_field":42,"string_field":"hello"}"#
+    );
+    assert_eq!(
+        json_array.value(1),
+        r#"{"bool_field":false,"string_field":"world"}"#
+    );
+    assert_eq!(
+        json_array.value(2),
+        r#"{"int_field":84,"string_field":"test"}"#
+    );
+    // All fields of the struct row are null
+    assert_eq!(json_array.value(3), r#"{}"#);
+    // The struct row itself is null
+    assert!(json_array.is_null(4));
+}
+
+#[test]
+fn test_to_json_with_null_struct() {
+    // Create a test struct array with a NullBuffer
+    let int_field = Arc::new(Field::new("int_field", ArrowDataType::Int32, true));
+    let int_array = Arc::new(Int32Array::from(vec![Some(42), Some(24)]));
+
+    let struct_array = StructArray::new(
+        vec![int_field].into(),
+        vec![int_array],
+        Some(crate::arrow::buffer::NullBuffer::new(
+            crate::arrow::buffer::BooleanBuffer::from(vec![true, false]),
+        )),
+    );
+
+    // Test the to_json function
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(json_array.len(), 2);
+    assert!(!json_array.is_null(0));
+    assert!(json_array.is_null(1));
+    assert_eq!(json_array.value(0), r#"{"int_field":42}"#);
+}
+
+#[test]
+fn test_to_json_with_non_struct_array() {
+    // Test that to_json fails when input is not a StructArray
+    let int_array = Int32Array::from(vec![1, 2, 3]);
+    let result = to_json(&int_array);
+    assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
+
+    let string_array = StringArray::from(vec!["hello", "world"]);
+    let result = to_json(&string_array);
+    assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
+
+    let boolean_array = BooleanArray::from(vec![true, false]);
+    let result = to_json(&boolean_array);
+    assert_result_error_with_message(result, "TO_JSON can only be applied to struct arrays");
+}
+
+#[test]
+fn test_to_json_with_empty_struct_array() {
+    // Test to_json with an empty struct array
+    let int_field = Arc::new(Field::new("int_field", ArrowDataType::Int32, true));
+    let int_array = Arc::new(Int32Array::from(Vec::<Option<i32>>::new()));
+
+    let struct_array = StructArray::new(vec![int_field].into(), vec![int_array], None);
+
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(json_array.len(), 0);
+}
+
+#[test]
+fn test_to_json_with_nested_struct() {
+    // Test to_json with nested struct fields
+    let inner_int_field = Arc::new(Field::new("inner_int", ArrowDataType::Int32, true));
+    let inner_string_field = Arc::new(Field::new("inner_string", ArrowDataType::Utf8, true));
+
+    let inner_int_array = Arc::new(Int32Array::from(vec![Some(10), None]));
+    let inner_string_array = Arc::new(StringArray::from(vec![Some("nested"), Some("value")]));
+
+    let inner_struct_array = Arc::new(StructArray::new(
+        vec![inner_int_field, inner_string_field].into(),
+        vec![inner_int_array, inner_string_array],
+        None,
+    ));
+
+    let outer_field = Arc::new(Field::new("outer_int", ArrowDataType::Int32, true));
+    let nested_field = Arc::new(Field::new(
+        "nested_struct",
+        ArrowDataType::Struct(
+            vec![
+                Field::new("inner_int", ArrowDataType::Int32, true),
+                Field::new("inner_string", ArrowDataType::Utf8, true),
+            ]
+            .into(),
+        ),
+        true,
+    ));
+
+    let outer_array = Arc::new(Int32Array::from(vec![Some(100), Some(200)]));
+
+    let struct_array = StructArray::new(
+        vec![outer_field, nested_field].into(),
+        vec![outer_array, inner_struct_array],
+        None,
+    );
+
+    let result = to_json(&struct_array).unwrap();
+    let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+    assert_eq!(json_array.len(), 2);
+    assert_eq!(
+        json_array.value(0),
+        r#"{"outer_int":100,"nested_struct":{"inner_int":10,"inner_string":"nested"}}"#
+    );
+    assert_eq!(
+        json_array.value(1),
+        r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
+    );
+}
+
+#[test]
+#[ignore]
+fn benchmark_to_json_performance() {
+    use std::time::Instant;
+
+    // Create a large test struct array for performance testing
+    fn create_large_test_struct_array(num_rows: usize) -> StructArray {
+        let mut id_builder = Int32Builder::with_capacity(num_rows);
+        let mut name_builder = StringBuilder::with_capacity(num_rows, num_rows * 20);
+        let mut score_builder = crate::arrow::array::Float64Builder::with_capacity(num_rows);
+        let mut active_builder = crate::arrow::array::BooleanBuilder::with_capacity(num_rows);
+
+        for i in 0..num_rows {
+            id_builder.append_value(i as i32);
+            name_builder.append_value(format!("user_{i}"));
+            score_builder.append_value((i as f64) * 0.1 + 100.0);
+            active_builder.append_value(i % 3 != 0);
+        }
+
+        let fields = Fields::from(vec![
+            Arc::new(Field::new("id", DataType::Int32, false)),
+            Arc::new(Field::new("name", DataType::Utf8, false)),
+            Arc::new(Field::new("score", DataType::Float64, false)),
+            Arc::new(Field::new("active", DataType::Boolean, false)),
+        ]);
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(id_builder.finish()),
+            Arc::new(name_builder.finish()),
+            Arc::new(score_builder.finish()),
+            Arc::new(active_builder.finish()),
+        ];
+
+        StructArray::new(fields, arrays, None)
+    }
+
+    // Test with different sizes to measure performance characteristics
+    let test_sizes = [100, 1000, 5000, 100000];
+    for &size in &test_sizes {
+        let large_struct = create_large_test_struct_array(size);
+
+        let start = Instant::now();
+        let result = to_json(&large_struct).unwrap();
+        let duration = start.elapsed();
+
+        println!(
+            "to_json processed {} rows in {:?} ({:.2} μs/row)",
+            size,
+            duration,
+            duration.as_micros() as f64 / size as f64
+        );
+
+        // Verify correctness
+        assert_eq!(result.len(), size);
+        let string_array = result.as_string::<i32>();
+
+        // Check a few sample results
+        if size > 0 {
+            let first_json = string_array.value(0);
+            assert!(first_json.contains("\"id\":0"));
+            assert!(first_json.contains("\"name\":\"user_0\""));
+            assert!(first_json.contains("\"score\":100"));
+            assert!(first_json.contains("\"active\":false"));
+        }
+
+        if size > 1 {
+            let second_json = string_array.value(1);
+            assert!(second_json.contains("\"id\":1"));
+            assert!(second_json.contains("\"name\":\"user_1\""));
+        }
+    }
 }

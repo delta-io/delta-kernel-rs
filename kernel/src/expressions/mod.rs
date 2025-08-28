@@ -53,6 +53,13 @@ pub enum BinaryPredicateOp {
     In,
 }
 
+/// A unary expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryExpressionOp {
+    /// Convert struct data to JSON-encoded strings
+    ToJson,
+}
+
 /// A binary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryExpressionOp {
@@ -193,6 +200,14 @@ pub struct BinaryPredicate {
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
     pub right: Box<Expression>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnaryExpression {
+    /// The operator.
+    pub op: UnaryExpressionOp,
+    /// The input expression.
+    pub expr: Box<Expression>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -339,6 +354,8 @@ pub enum Expression {
     /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
     /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
     Transform(Transform),
+    /// An expression that takes one expression as input.
+    Unary(UnaryExpression),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
@@ -413,6 +430,13 @@ impl JunctionPredicateOp {
             And => Or,
             Or => And,
         }
+    }
+}
+
+impl UnaryExpression {
+    fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self { op, expr }
     }
 }
 
@@ -542,17 +566,18 @@ impl Expression {
         Predicate::distinct(self, other)
     }
 
+    /// Creates a new unary expression
+    pub fn unary(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+        Self::Unary(UnaryExpression::new(op, expr))
+    }
+
     /// Creates a new binary expression lhs OP rhs
     pub fn binary(
         op: BinaryExpressionOp,
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
-        Self::Binary(BinaryExpression {
-            op,
-            left: Box::new(lhs.into()),
-            right: Box::new(rhs.into()),
-        })
+        Self::Binary(BinaryExpression::new(op, lhs, rhs))
     }
 
     /// Creates a new opaque expression
@@ -725,6 +750,15 @@ impl PartialEq for OpaqueExpression {
     }
 }
 
+impl Display for UnaryExpressionOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use UnaryExpressionOp::*;
+        match self {
+            ToJson => write!(f, "TO_JSON"),
+        }
+    }
+}
+
 impl Display for BinaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use BinaryExpressionOp::*;
@@ -777,6 +811,7 @@ impl Display for Expression {
                     transform.field_insertions.len()
                 )
             }
+            Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
