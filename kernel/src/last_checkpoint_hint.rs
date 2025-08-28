@@ -12,7 +12,7 @@ use url::Url;
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
 /// the latest checkpoint without a full directory listing.
-pub(crate) const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
+const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
