@@ -9,7 +9,8 @@ use crate::actions::visitors::SelectionVectorVisitor;
 use crate::error::DeltaResult;
 use crate::expressions::{
     column_expr, joined_column_expr, BinaryPredicateOp, ColumnName, Expression as Expr,
-    JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef, Scalar,
+    ExpressionRef, JunctionPredicateOp, OpaquePredicateOpRef, Predicate as Pred, PredicateRef,
+    Scalar,
 };
 use crate::kernel_predicates::{
     DataSkippingPredicateEvaluator, KernelPredicateEvaluator, KernelPredicateEvaluatorDefaults,
@@ -67,9 +68,10 @@ impl DataSkippingFilter {
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
     ) -> Option<Self> {
-        static STATS_EXPR: LazyLock<Expr> = LazyLock::new(|| column_expr!("add.stats"));
-        static FILTER_PRED: LazyLock<Pred> =
-            LazyLock::new(|| column_expr!("output").distinct(Expr::literal(false)));
+        static STATS_EXPR: LazyLock<ExpressionRef> =
+            LazyLock::new(|| Arc::new(column_expr!("add.stats")));
+        static FILTER_PRED: LazyLock<PredicateRef> =
+            LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
         let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
@@ -141,7 +143,7 @@ impl DataSkippingFilter {
 
         let skipping_evaluator = engine.evaluation_handler().new_predicate_evaluator(
             stats_schema.clone(),
-            as_sql_data_skipping_predicate(&predicate)?,
+            Arc::new(as_sql_data_skipping_predicate(&predicate)?),
         );
 
         let filter_evaluator = engine

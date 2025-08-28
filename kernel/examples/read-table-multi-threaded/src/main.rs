@@ -227,7 +227,7 @@ fn do_work(
                 read_result,
                 &scan_state.physical_schema,
                 &scan_state.logical_schema,
-                &scan_file.transform,
+                scan_file.transform.clone(),
             )
             .unwrap();
 
