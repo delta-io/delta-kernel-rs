@@ -2,8 +2,8 @@ use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveTransaction;
 use crate::{
-    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue,
-    SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
+    SharedSnapshot, TryFromStringSlice,
 };
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Snapshot};
@@ -26,16 +26,16 @@ pub unsafe extern "C" fn with_transaction_id(
 ) -> ExternResult<Handle<ExclusiveTransaction>> {
     let txn = unsafe { txn.into_inner() };
     let engine = unsafe { engine.as_ref() };
-    with_transaction_id_impl(*txn, app_id, version).into_extern_result(&engine)
+    let app_id_string: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
+    with_transaction_id_impl(*txn, app_id_string, version).into_extern_result(&engine)
 }
 
 fn with_transaction_id_impl(
     txn: Transaction,
-    app_id: KernelStringSlice,
+    app_id: DeltaResult<String>,
     version: i64,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let app_id_string: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&app_id) };
-    Ok(Box::new(txn.with_transaction_id(app_id_string?, version)).into())
+    Ok(Box::new(txn.with_transaction_id(app_id?, version)).into())
 }
 
 /// Retrieves the version associated with an app_id from a snapshot.
