@@ -393,7 +393,7 @@ fn read_with_scan_metadata(
                 read_result,
                 scan.physical_schema(),
                 scan.logical_schema(),
-                &scan_file.transform,
+                scan_file.transform.clone(),
             )
             .unwrap();
             let record_batch = to_arrow(logical).unwrap();

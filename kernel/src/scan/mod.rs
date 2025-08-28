@@ -778,8 +778,7 @@ impl Scan {
                     None,
                 )?;
 
-                // Arc clones
-                let engine = engine.clone();
+                let engine = engine.clone(); // Arc clone
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
@@ -788,7 +787,7 @@ impl Scan {
                         read_result,
                         self.physical_schema(),
                         self.logical_schema(),
-                        &scan_file.transform,
+                        scan_file.transform.clone(), // Arc clone
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest

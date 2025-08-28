@@ -9,7 +9,9 @@ use crate::error::Error;
 use crate::path::ParsedLogPath;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
-use crate::{DataType, DeltaResult, Engine, EngineData, Expression, IntoEngineData, Version};
+use crate::{
+    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version,
+};
 
 use url::Url;
 
@@ -223,7 +225,11 @@ impl Transaction {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
-        WriteContext::new(target_dir.clone(), snapshot_schema, logical_to_physical)
+        WriteContext::new(
+            target_dir.clone(),
+            snapshot_schema,
+            Arc::new(logical_to_physical),
+        )
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -254,7 +260,7 @@ fn generate_adds<'a>(
         )]);
         let adds_evaluator = evaluation_handler.new_expression_evaluator(
             add_files_schema.clone(),
-            adds_expr,
+            Arc::new(adds_expr),
             log_schema.clone().into(),
         );
         adds_evaluator.evaluate(add_files_batch)
@@ -268,11 +274,11 @@ fn generate_adds<'a>(
 pub struct WriteContext {
     target_dir: Url,
     schema: SchemaRef,
-    logical_to_physical: Expression,
+    logical_to_physical: ExpressionRef,
 }
 
 impl WriteContext {
-    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: Expression) -> Self {
+    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: ExpressionRef) -> Self {
         WriteContext {
             target_dir,
             schema,
@@ -288,8 +294,8 @@ impl WriteContext {
         &self.schema
     }
 
-    pub fn logical_to_physical(&self) -> &Expression {
-        &self.logical_to_physical
+    pub fn logical_to_physical(&self) -> ExpressionRef {
+        self.logical_to_physical.clone()
     }
 }
 

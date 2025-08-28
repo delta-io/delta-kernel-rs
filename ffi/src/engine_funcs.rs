@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use delta_kernel::schema::{DataType, Schema, SchemaRef};
 use delta_kernel::{
-    DeltaResult, EngineData, Error, Expression, ExpressionEvaluator, FileDataReadResultIterator,
+    DeltaResult, EngineData, Error, Expression, ExpressionEvaluator, ExpressionRef,
+    FileDataReadResultIterator,
 };
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -159,21 +160,21 @@ pub unsafe extern "C" fn new_expression_evaluator(
     let engine = unsafe { engine.clone_as_arc() };
     let input_schema = unsafe { input_schema.clone_as_arc() };
     let output_type: DataType = output_type.as_ref().clone().into();
+    let expression = Arc::new(expression.clone());
     new_expression_evaluator_impl(engine, input_schema, expression, output_type)
 }
 
 fn new_expression_evaluator_impl(
     extern_engine: Arc<dyn ExternEngine>,
     input_schema: SchemaRef,
-    expression: &Expression,
+    expression: ExpressionRef,
     output_type: DataType,
 ) -> Handle<SharedExpressionEvaluator> {
     let engine = extern_engine.engine();
-    let evaluator = engine.evaluation_handler().new_expression_evaluator(
-        input_schema,
-        expression.clone(),
-        output_type,
-    );
+    let evaluator =
+        engine
+            .evaluation_handler()
+            .new_expression_evaluator(input_schema, expression, output_type);
     evaluator.into()
 }
 
