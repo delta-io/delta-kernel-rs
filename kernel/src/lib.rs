@@ -412,7 +412,7 @@ pub trait EvaluationHandler: AsAny {
     fn new_expression_evaluator(
         &self,
         input_schema: SchemaRef,
-        expression: Expression,
+        expression: ExpressionRef,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
 
@@ -430,7 +430,7 @@ pub trait EvaluationHandler: AsAny {
     fn new_predicate_evaluator(
         &self,
         input_schema: SchemaRef,
-        predicate: Predicate,
+        predicate: PredicateRef,
     ) -> Arc<dyn PredicateEvaluator>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
@@ -462,7 +462,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.try_into_expr()?;
 
-        let eval = self.new_expression_evaluator(null_row_schema, row_expr, schema.into());
+        let eval = self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into());
         eval.evaluate(null_row.as_ref())
     }
 }
