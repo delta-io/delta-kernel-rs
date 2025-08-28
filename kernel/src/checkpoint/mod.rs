@@ -90,7 +90,7 @@ use crate::actions::{
 };
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::Scalar;
-use crate::last_checkpoint_hint::LAST_CHECKPOINT_FILE_NAME;
+use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
@@ -333,11 +333,10 @@ impl CheckpointWriter {
             size_in_bytes,
         );
 
-        let last_checkpoint_path = self
-            .snapshot
+        let last_checkpoint_path = LastCheckpointHint::path(
+            &self.snapshot
             .log_segment()
-            .log_root
-            .join(LAST_CHECKPOINT_FILE_NAME)?;
+            .log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
         engine.json_handler().write_json_file(
