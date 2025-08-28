@@ -412,10 +412,11 @@ impl StructType {
         self.fields.get_index_of(name.as_ref())
     }
 
-    pub fn fields(&self) -> impl Iterator<Item = &StructField> {
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = &StructField> {
         self.fields.values()
     }
 
+    #[allow(unused)] // Most uses can leverage ExactSizeIterator::len instead
     pub(crate) fn fields_len(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()
