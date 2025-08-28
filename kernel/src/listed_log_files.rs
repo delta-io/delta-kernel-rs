@@ -118,6 +118,7 @@ impl ListedLogFiles {
     // Note: for now we expose the constructor as pub(crate) to allow for use in testing. Ideally,
     // we should explore entirely encapsulating ListedLogFiles within LogSegment - currently
     // LogSegment constructor requires a ListedLogFiles.
+    #[internal_api]
     pub(crate) fn try_new(
         ascending_commit_files: Vec<ParsedLogPath>,
         ascending_compaction_files: Vec<ParsedLogPath>,
