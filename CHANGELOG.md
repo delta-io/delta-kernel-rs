@@ -37,7 +37,7 @@
 
 1. Match arrow versions in examples ([#1166])
 2. Support arrow views in ensure_data_types ([#1028])
-3. Make `ListedLogFiles` internal-api ([#1209])
+3. Make `ListedLogFiles` internal-api again ([#1209])
 4. Provide accurate error when evaluating a different type in LiteralExpressionTransform ([#1207])
 5. Fix failing test and improve indentation test error message ([#1135])
 
