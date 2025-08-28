@@ -13,7 +13,7 @@ use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
 use crate::arrow::compute::kernels::comparison::in_list_utf8;
 use crate::arrow::compute::kernels::numeric::{add, div, mul, sub};
-use crate::arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene};
+use crate::arrow::compute::{and_kleene, is_not_null, is_null, not, or_kleene};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit, TimeUnit,
 };
@@ -512,13 +512,9 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 /// the input arrays from left to right and returns the first non-null value found. If all values
 /// are null for a given row, the result will be null for that row.
 ///
-/// When arrays have different data types, they are automatically cast to a common supertype
-/// using the [`common_supertype`] utility. Refer to its documentation for more details on
-/// the supported type coercion cases.
-///
 /// # Parameters
-/// - `arrays`: Slice of Arrow arrays to coalesce.
-/// - `result_type`: Optional expected result type. If provided, must match the computed common supertype.
+/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the same data type.
+/// - `result_type`: Optional expected result type. If provided, must match the arrays' data type.
 ///
 /// # Returns
 /// An `ArrayRef` containing the coalesced values with the same number of rows as the input arrays.
@@ -527,9 +523,8 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
 /// This function returns an `ArrowError` in the following cases:
 /// - **Empty input**: The default engine currently does not support empty COALESCE statements.
 /// - **Mismatched row counts**: Not all arrays have the same number of rows.
-/// - **No common supertype**: The input arrays have incompatible types that cannot be promoted to a common type.
-/// - **Invalid result type**: If `result_type` is provided but doesn't match the computed common supertype.
-/// - **Invalid cast operations**: Arrow's cast function fails when converting arrays to the common supertype.
+/// - **Mismatched data types**: Not all arrays have exactly the same data type.
+/// - **Invalid result type**: If `result_type` is provided but doesn't match the arrays' data type.
 pub fn coalesce_arrays(
     arrays: &[ArrayRef],
     result_type: Option<&DataType>,
@@ -558,57 +553,43 @@ pub fn coalesce_arrays(
         return Ok(array.clone());
     }
 
-    // Validate all arrays have the same length and collect types
+    // Validate all arrays have the same length and same data type
     let num_rows = arrays[0].len();
-    let mut types = Vec::with_capacity(arrays.len());
-    for (i, arr) in arrays.iter().enumerate() {
+    let expected_type = arrays[0].data_type();
+    for (i, arr) in arrays.iter().skip(1).enumerate() {
         if arr.len() != num_rows {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "Array at index {i} has length {}, expected {num_rows}",
                 arr.len()
             )));
         }
-        types.push(arr.data_type());
-    }
-
-    // Find common type
-    let supertype = common_supertype(&types).ok_or_else(|| {
-        ArrowError::InvalidArgumentError(format!(
-            "Could not find common supertype for types: {types:?}"
-        ))
-    })?;
-
-    // Validate result type if provided
-    if let Some(result_type) = result_type {
-        let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
-        if result_arrow_type != supertype {
+        if arr.data_type() != expected_type {
             return Err(ArrowError::InvalidArgumentError(format!(
-                "Requested result type {result_type:?} does not match common supertype {supertype:?}"
+                "Array at index {i} has type {:?}, but expected {:?}",
+                arr.data_type(),
+                expected_type
             )));
         }
     }
 
-    // Cast arrays to common supertype and collect ArrayData for MutableArrayData
-    let (casted, array_data): (Vec<ArrayRef>, Vec<ArrayData>) = arrays
-        .iter()
-        .map(|arr| {
-            let arr = if arr.data_type() == &supertype {
-                arr.clone()
-            } else {
-                cast(arr, &supertype)?
-            };
-            let data = arr.to_data();
-            Ok((arr, data))
-        })
-        .collect::<Result<Vec<_>, ArrowError>>()?
-        .into_iter()
-        .unzip();
+    // Validate result type if provided
+    if let Some(result_type) = result_type {
+        let result_arrow_type: ArrowDataType = result_type.try_into_arrow()?;
+        if result_arrow_type != *expected_type {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Requested result type {result_type:?} does not match arrays' data type {expected_type:?}"
+            )));
+        }
+    }
+
+    // Collect ArrayData for MutableArrayData
+    let array_data: Vec<ArrayData> = arrays.iter().map(|arr| arr.to_data()).collect();
 
     // Build result
     let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, num_rows);
     for row in 0..num_rows {
         // Find first non-null value for this row
-        match casted.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
+        match arrays.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
             Some((array_idx, _)) => {
                 mutable.extend(array_idx, row, row + 1);
             }
@@ -621,86 +602,16 @@ pub fn coalesce_arrays(
     Ok(make_array(mutable.freeze()))
 }
 
-/// Find a common supertype for a list of DataTypes via simple heuristics.
-///
-/// We currently only handle a limited set of types and pick the "widest" compatible type without lossy conversions.
-///
-/// The promotion follows these principles:
-/// - Integer types promote to wider integer types (e.g., Int32 + Int64 → Int64)
-/// - Float types promote to wider float types (Float32 + Float64 → Float64)
-/// - Integers can promote to floats if they can be exactly represented:
-///   - Int8, Int16, UInt8, UInt16 can promote to Float32 (24-bit precision)
-///   - Int8, Int16, Int32, UInt8, UInt16, UInt32 can promote to Float64 (53-bit precision)
-/// - Mixed signed/unsigned integers promote to the wider signed type when safe
-/// - Other types (e.g., strings, booleans) do not have a common supertype
-fn common_supertype(types: &[&ArrowDataType]) -> Option<ArrowDataType> {
-    if types.is_empty() {
-        return None;
-    }
-
-    // Try pairwise promotion
-    types.iter().skip(1).try_fold(types[0].clone(), |acc, &t| {
-        if acc == *t {
-            Some(acc)
-        } else {
-            promote_types(&acc, t)
-        }
-    })
-}
-
-/// Promote two types to their common supertype
-fn promote_types(left: &ArrowDataType, right: &ArrowDataType) -> Option<ArrowDataType> {
-    use ArrowDataType::*;
-
-    match (left, right) {
-        // Same types
-        (a, b) if a == b => Some(a.clone()),
-
-        // Float type promotion
-        (Float64, Float32) | (Float32, Float64) => Some(Float64),
-
-        // Safe integer to float promotions
-        // Float32 can exactly represent integers up to 2^24
-        // Float64 can exactly represent integers up to 2^53
-        (Float32, Int8 | Int16 | UInt8 | UInt16) => Some(Float32),
-        (Int8 | Int16 | UInt8 | UInt16, Float32) => Some(Float32),
-        (Float64, Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32) => Some(Float64),
-        (Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32, Float64) => Some(Float64),
-
-        // Integer promotion - signed takes precedence and we promote to wider types
-        (Int64, Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32) => Some(Int64),
-        (Int8 | Int16 | Int32 | UInt8 | UInt16 | UInt32, Int64) => Some(Int64),
-        (Int32, Int8 | Int16 | UInt8 | UInt16) => Some(Int32),
-        (Int8 | Int16 | UInt8 | UInt16, Int32) => Some(Int32),
-        (Int16, Int8 | UInt8) => Some(Int16),
-        (Int8 | UInt8, Int16) => Some(Int16),
-
-        // Mixed signed/unsigned integer promotion to next larger signed type
-        (Int32, UInt32) | (UInt32, Int32) => Some(Int64),
-        (Int16, UInt16) | (UInt16, Int16) => Some(Int32),
-        (Int8, UInt8) | (UInt8, Int8) => Some(Int16),
-
-        // Unsigned integer promotion
-        (UInt64, UInt8 | UInt16 | UInt32) => Some(UInt64),
-        (UInt8 | UInt16 | UInt32, UInt64) => Some(UInt64),
-        (UInt32, UInt8 | UInt16) => Some(UInt32),
-        (UInt8 | UInt16, UInt32) => Some(UInt32),
-        (UInt16, UInt8) | (UInt8, UInt16) => Some(UInt16),
-
-        // No common type found
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int32Array, StructArray};
+    use crate::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{column_expr_ref, Expression as Expr, Transform};
     use crate::schema::{DataType, StructField, StructType};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -1044,5 +955,114 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Data type is required"));
+    }
+
+    #[test]
+    fn test_coalesce_arrays_same_type() {
+        // Test with Int32 arrays
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None, Some(3), None]));
+        let arr2 = Arc::new(Int32Array::from(vec![None, Some(2), Some(4), None]));
+        let arr3 = Arc::new(Int32Array::from(vec![None, None, None, Some(5)]));
+
+        let result = coalesce_arrays(&[arr1, arr2, arr3], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result_array.len(), 4);
+        assert_eq!(result_array.value(0), 1); // From arr1
+        assert_eq!(result_array.value(1), 2); // From arr2
+        assert_eq!(result_array.value(2), 3); // From arr1
+        assert_eq!(result_array.value(3), 5); // From arr3
+
+        // Test with String arrays
+        let str_arr1 = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
+        let str_arr2 = Arc::new(StringArray::from(vec![None, Some("b"), None]));
+
+        let str_result = coalesce_arrays(&[str_arr1, str_arr2], None).unwrap();
+        let str_result_array = str_result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(str_result_array.len(), 3);
+        assert_eq!(str_result_array.value(0), "a"); // From str_arr1
+        assert_eq!(str_result_array.value(1), "b"); // From str_arr2
+        assert_eq!(str_result_array.value(2), "c"); // From str_arr1
+    }
+
+    #[test]
+    fn test_coalesce_arrays_all_nulls() {
+        let arr1 = Arc::new(Int32Array::from(vec![None, None, None]));
+        let arr2 = Arc::new(Int32Array::from(vec![None, None, None]));
+
+        let result = coalesce_arrays(&[arr1, arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result_array.len(), 3);
+        assert!(result_array.is_null(0));
+        assert!(result_array.is_null(1));
+        assert!(result_array.is_null(2));
+    }
+
+    #[test]
+    fn test_coalesce_arrays_single_array() {
+        let arr = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let result = coalesce_arrays(&[arr.clone()], None).unwrap();
+
+        // Should return the same array
+        assert_eq!(result.as_ref(), arr.as_ref());
+    }
+
+    #[test]
+    fn test_coalesce_arrays_type_mismatch_error() {
+        // Test Int32 vs Int64 - should fail
+        let int32_arr = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let int64_arr = Arc::new(Int64Array::from(vec![None, Some(2)]));
+
+        let result = coalesce_arrays(&[int32_arr, int64_arr], None);
+        assert_result_error_with_message(
+            result,
+            "Array at index 0 has type Int64, but expected Int32",
+        );
+
+        // Test Int32 vs String - should fail
+        let int_arr = Arc::new(Int32Array::from(vec![Some(1)]));
+        let str_arr = Arc::new(StringArray::from(vec![Some("hello")]));
+
+        let result2 = coalesce_arrays(&[int_arr, str_arr], None);
+        assert_result_error_with_message(
+            result2,
+            "Array at index 0 has type Utf8, but expected Int32",
+        );
+    }
+
+    #[test]
+    fn test_coalesce_arrays_length_mismatch_error() {
+        // Test arrays with different lengths - should fail
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), Some(2)]));
+        let arr2 = Arc::new(Int32Array::from(vec![Some(3), Some(4), Some(5)]));
+
+        let result = coalesce_arrays(&[arr1, arr2], None);
+        assert_result_error_with_message(result, "Array at index 0 has length 3, expected 2");
+    }
+
+    #[test]
+    fn test_coalesce_arrays_empty_input_error() {
+        // Test with empty arrays slice - should fail
+        let result = coalesce_arrays(&[], None);
+        assert_result_error_with_message(result, "empty COALESCE statements");
+    }
+
+    #[test]
+    fn test_coalesce_arrays_result_type_validation() {
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let arr2 = Arc::new(Int32Array::from(vec![None, Some(2)]));
+
+        // Test with matching result type - should succeed
+        let result = coalesce_arrays(&[arr1.clone(), arr2.clone()], Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Test with mismatched result type - should fail
+        let result2 = coalesce_arrays(&[arr1, arr2], Some(&DataType::STRING));
+        assert_result_error_with_message(
+            result2,
+            "Requested result type Primitive(String) does not match arrays' data type Int32",
+        );
     }
 }
