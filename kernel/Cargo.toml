@@ -141,6 +141,8 @@ hdfs-native-object-store = { version = "0.15.0" }
 hdfs-native = "0.12.2"
 walkdir = { version = "2.5.0" }
 async-trait = "0.1" # only used for our custom SlowGetStore ObjectStore implementation
+dhat = "0.3" # for DHAT tests
+rayon = "1.10" # for DHAT tests
 paste = "1.0"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 tempfile = "3"
