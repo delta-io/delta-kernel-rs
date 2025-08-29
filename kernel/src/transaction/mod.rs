@@ -234,13 +234,11 @@ fn generate_adds<'a>(
         // Create a struct expression that transforms all fields, converting the stats struct to JSON
         let field_expressions: Vec<Expression> = write_response_schema
             .fields()
-            .map(|f| {
-                let field_name = f.name();
-                if field_name == "stats" {
-                    Expression::unary(UnaryExpressionOp::ToJson, Expression::column([field_name]))
-                } else {
-                    Expression::column([field_name])
+            .map(|f| match f.name().as_str() {
+                "stats" => {
+                    Expression::unary(UnaryExpressionOp::ToJson, Expression::column([f.name()]))
                 }
+                _ => Expression::column([f.name()]),
             })
             .collect();
 
@@ -339,13 +337,7 @@ mod tests {
             StructField::not_null("dataChange", DataType::BOOLEAN),
             StructField::nullable(
                 "stats",
-                DataType::struct_type(vec![
-                    StructField::nullable("numRecords", DataType::LONG),
-                    StructField::nullable("tightBounds", DataType::BOOLEAN),
-                    StructField::nullable("minValues", DataType::STRING),
-                    StructField::nullable("maxValues", DataType::STRING),
-                    StructField::nullable("nullCount", DataType::STRING),
-                ]),
+                DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
             ),
         ]);
         assert_eq!(*schema, expected.into());

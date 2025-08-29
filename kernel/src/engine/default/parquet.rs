@@ -5,15 +5,13 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use itertools::Itertools;
 use object_store::path::Path;
 use object_store::DynObjectStore;
 use uuid::Uuid;
 
-use crate::actions::statistics::Statistics;
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::Field;
+use crate::arrow::datatypes::{DataType, Field};
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
@@ -24,8 +22,8 @@ use crate::parquet::arrow::arrow_reader::{
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use crate::parquet_write_response_schema;
 use crate::schema::SchemaRef;
-use crate::{parquet_write_response_schema, statistics_fields};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -33,6 +31,16 @@ use crate::{
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
+
+/// Statistics about a data file (typically a parquet file).
+///
+/// For now, it only tracks the number of records. Once Kernel supports more statistics,
+/// this struct will be extended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStatistics {
+    /// Number of records in the file.
+    num_records: usize,
+}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -45,11 +53,11 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
-    stats: Statistics,
+    stats: FileStatistics,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta, stats: Statistics) -> Self {
+    pub fn new(file_meta: FileMeta, stats: FileStatistics) -> Self {
         Self { file_meta, stats }
     }
 
@@ -95,21 +103,9 @@ impl DataFileMetadata {
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
 
-        // Convert kernel StructFields to arrow Fields
-        let arrow_stats_fields: Vec<Field> = statistics_fields()
-            .iter()
-            .map(|field| field.try_into_arrow())
-            .try_collect()?;
-
         let stats = Arc::new(StructArray::try_new_with_length(
-            arrow_stats_fields.into(),
-            vec![
-                Arc::new(Int64Array::from(vec![stats.num_records])),
-                Arc::new(BooleanArray::from(vec![stats.tight_bounds])),
-                Arc::new(StringArray::from(vec![stats.null_count.clone()])),
-                Arc::new(StringArray::from(vec![stats.min_values.clone()])),
-                Arc::new(StringArray::from(vec![stats.max_values.clone()])),
-            ],
+            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![stats.num_records as i64]))],
             None,
             1,
         )?);
@@ -190,7 +186,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
             )));
         }
 
-        let stats = Statistics::new(num_records);
+        let stats = FileStatistics { num_records };
         let file_meta = FileMeta::new(path, modification_time, size);
         Ok(DataFileMetadata::new(file_meta, stats))
     }
@@ -492,7 +488,7 @@ mod tests {
         let size = 1_000_000;
         let last_modified = 10000000000;
         let num_records = 10;
-        let stats = Statistics::new(num_records);
+        let stats = FileStatistics { num_records };
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
         let data_file_metadata = DataFileMetadata::new(file_metadata, stats);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
@@ -516,99 +512,9 @@ mod tests {
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
 
-        // Convert Statistics struct into an Arrow StructArray to match the actual implementation
-        let arrow_stats_fields: Vec<Field> = statistics_fields()
-            .iter()
-            .map(|field| field.try_into_arrow())
-            .try_collect()
-            .unwrap();
-
         let stats_struct = StructArray::try_new_with_length(
-            arrow_stats_fields.into(),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(num_records as i64)])),
-                Arc::new(BooleanArray::from(vec![None::<bool>])), // tight_bounds
-                Arc::new(StringArray::from(vec![None::<String>])), // null_count
-                Arc::new(StringArray::from(vec![None::<String>])), // min_values
-                Arc::new(StringArray::from(vec![None::<String>])), // max_values
-            ],
-            None,
-            1,
-        )
-        .unwrap();
-
-        let expected = RecordBatch::try_new(
-            Arc::new(
-                parquet_write_response_schema()
-                    .as_ref()
-                    .try_into_arrow()
-                    .unwrap(),
-            ),
-            vec![
-                Arc::new(StringArray::from(vec![location.to_string()])),
-                Arc::new(partition_values),
-                Arc::new(Int64Array::from(vec![size as i64])),
-                Arc::new(Int64Array::from(vec![last_modified])),
-                Arc::new(BooleanArray::from(vec![data_change])),
-                Arc::new(stats_struct),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(actual.record_batch(), &expected);
-    }
-
-    #[tokio::test]
-    async fn test_as_record_batch_without_stats() {
-        let location = Url::parse("file:///test_url").unwrap();
-        let size = 1_000_000;
-        let last_modified = 10000000000;
-        let stats = Statistics {
-            num_records: None,
-            tight_bounds: None,
-            null_count: None,
-            min_values: None,
-            max_values: None,
-        };
-        let file_metadata = FileMeta::new(location.clone(), last_modified, size);
-        let data_file_metadata = DataFileMetadata::new(file_metadata, stats);
-        let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
-        let data_change = true;
-        let actual = data_file_metadata
-            .as_record_batch(&partition_values, data_change)
-            .unwrap();
-        let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
-
-        let mut partition_values_builder = MapBuilder::new(
-            Some(MapFieldNames {
-                entry: "key_value".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            }),
-            StringBuilder::new(),
-            StringBuilder::new(),
-        );
-        partition_values_builder.keys().append_value("partition1");
-        partition_values_builder.values().append_value("a");
-        partition_values_builder.append(true).unwrap();
-        let partition_values = partition_values_builder.finish();
-
-        // Convert Statistics struct into an Arrow StructArray to match the actual implementation
-        let arrow_stats_fields: Vec<Field> = statistics_fields()
-            .iter()
-            .map(|field| field.try_into_arrow())
-            .try_collect()
-            .unwrap();
-
-        let stats_struct = StructArray::try_new_with_length(
-            arrow_stats_fields.into(),
-            vec![
-                Arc::new(Int64Array::from(vec![None::<i64>])), // num_records
-                Arc::new(BooleanArray::from(vec![None::<bool>])), // tight_bounds
-                Arc::new(StringArray::from(vec![None::<String>])), // null_count
-                Arc::new(StringArray::from(vec![None::<String>])), // min_values
-                Arc::new(StringArray::from(vec![None::<String>])), // max_values
-            ],
+            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![num_records as i64]))],
             None,
             1,
         )
@@ -686,7 +592,7 @@ mod tests {
         assert!(now - last_modified < 10_000);
 
         // check that statistics are correctly written
-        let expected_stats = Statistics::new(3);
+        let expected_stats = FileStatistics { num_records: 3 };
         assert_eq!(stats, expected_stats);
 
         // check we can read back
