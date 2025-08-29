@@ -991,8 +991,8 @@ mod tests {
 
     #[test]
     fn test_coalesce_arrays_single_array() {
-        let arr = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
-        let result = coalesce_arrays(&[arr.clone()], None).unwrap();
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let result = coalesce_arrays(std::slice::from_ref(&arr), None).unwrap();
 
         // Should return the same array
         assert_eq!(result.as_ref(), arr.as_ref());
