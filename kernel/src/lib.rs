@@ -75,14 +75,14 @@ extern crate self as delta_kernel;
 
 use std::any::Any;
 use std::fs::DirEntry;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 use std::{cmp::Ordering, ops::Range};
 
 use bytes::Bytes;
 use url::Url;
 
-use self::schema::{DataType, SchemaRef};
+use self::schema::{DataType, MapType, SchemaRef};
 
 pub mod actions;
 pub mod checkpoint;
@@ -228,6 +228,40 @@ impl FileMeta {
             size,
         }
     }
+}
+
+/// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
+/// a Parquet write operation back to Kernel.
+///
+/// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
+/// for constructing an add_file (and soon remove_file) action. Each row represents metadata about a
+/// file to be added to the table. Kernel takes this information and extends it to the full add_file
+/// action schema, adding additional fields (e.g., baseRowID) as necessary.
+///
+/// For now, Kernel only supports the number of records as a file statistic.
+/// This will change in a future release.
+///
+/// [`add_files`]: crate::transaction::Transaction::add_files
+pub static PARQUET_WRITE_RESPONSE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new(vec![
+        StructField::not_null("path", DataType::STRING),
+        StructField::not_null(
+            "partitionValues",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        ),
+        StructField::not_null("size", DataType::LONG),
+        StructField::not_null("modificationTime", DataType::LONG),
+        StructField::not_null("dataChange", DataType::BOOLEAN),
+        StructField::nullable(
+            "stats",
+            DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
+        ),
+    ]))
+});
+
+/// Returns a reference to the [`PARQUET_WRITE_RESPONSE_SCHEMA`].
+pub fn parquet_write_response_schema() -> &'static SchemaRef {
+    &PARQUET_WRITE_RESPONSE_SCHEMA
 }
 
 /// Extension trait that makes it easier to work with traits objects that implement [`Any`],
