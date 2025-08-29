@@ -477,13 +477,19 @@ impl Scan {
     /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
     /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
     /// from input to output unchanged and in the same relative order.
-    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
+    pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
         let mut transform_spec = TransformSpec::new();
         let mut last_physical_field: Option<&str> = None;
 
         for field in all_fields {
             match field {
                 ColumnType::Selected(physical_name) => {
+                    // Create explicit transform spec for selected columns
+                    // This is needed when the field list has been filtered (e.g., for CDF)
+                    transform_spec.push(FieldTransformSpec::StaticInsert {
+                        insert_after: last_physical_field.map(String::from),
+                        expr: Arc::new(ColumnName::new([physical_name]).into()),
+                    });
                     // Track physical field for calculating partition value insertion points.
                     last_physical_field = Some(physical_name);
                 }

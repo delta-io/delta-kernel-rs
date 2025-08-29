@@ -7,12 +7,13 @@ use tracing::debug;
 use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
+use crate::scan::state::transform_to_logical;
 use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
-use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
+use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{TableChanges, CDF_FIELDS};
@@ -255,7 +256,7 @@ impl TableChangesScan {
             .flatten_ok() // Iterator-Result
             .map(move |resolved_scan_file| -> DeltaResult<_> {
                 read_scan_file(
-                    engine.as_ref(),
+                    engine.clone(),
                     resolved_scan_file?,
                     self.table_root(),
                     self.logical_schema(),
@@ -274,7 +275,7 @@ impl TableChangesScan {
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
 /// The result is a fallible iterator of [`ScanResult`] containing the logical data.
 fn read_scan_file(
-    engine: &dyn Engine,
+    engine: Arc<dyn Engine>,
     resolved_scan_file: ResolvedCdfScanFile,
     table_root: &Url,
     logical_schema: &SchemaRef,
@@ -287,14 +288,13 @@ fn read_scan_file(
         mut selection_vector,
     } = resolved_scan_file;
 
-    let physical_to_logical_expr =
-        physical_to_logical_expr(&scan_file, logical_schema.as_ref(), all_fields)?;
+    // Generate expression transform for CDF (similar to scan path)
+    let transform_expr = get_cdf_transform_expr(&scan_file, logical_schema.as_ref(), all_fields)?;
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
-    let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
-        physical_schema.clone(),
-        Arc::new(physical_to_logical_expr),
-        logical_schema.clone().into(),
-    );
+    // Clone schemas for use in the closure
+    let physical_schema_for_read = physical_schema.clone();
+    let physical_schema_for_transform = physical_schema.clone();
+    let logical_schema_for_transform = logical_schema.clone();
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
@@ -308,12 +308,17 @@ fn read_scan_file(
     let read_result_iter =
         engine
             .parquet_handler()
-            .read_parquet_files(&[file], physical_schema, None)?;
+            .read_parquet_files(&[file], physical_schema_for_read, None)?;
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
-        // to transform the physical data into the correct logical form
-        let logical = phys_to_logical_eval.evaluate(batch.as_ref());
+        let logical = transform_to_logical(
+            engine.as_ref(),
+            batch,
+            &physical_schema_for_transform,
+            logical_schema_for_transform.as_ref(),
+            Some(transform_expr.clone()),
+        );
         let len = logical.as_ref().map_or(0, |res| res.len());
         // need to split the dv_mask. what's left in dv_mask covers this result, and rest
         // will cover the following results. we `take()` out of `selection_vector` to avoid

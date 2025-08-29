@@ -1,18 +1,77 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use itertools::Itertools;
-
 use crate::expressions::Scalar;
-use crate::scan::{parse_partition_value, ColumnType};
-use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
-use crate::{DeltaResult, Error, Expression};
+use crate::scan::{log_replay::create_transform_expr, ColumnType, Scan};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::{DeltaResult, Error, Expression, ExpressionRef};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{
     ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
     REMOVE_CHANGE_TYPE,
 };
+
+/// Creates a transform expression that converts physical CDF file data to logical CDF output.
+///
+/// This combines table data (using regular scan transform logic) with computed CDF metadata
+/// to produce the complete logical Change Data Feed row structure.
+pub(crate) fn get_cdf_transform_expr(
+    scan_file: &CdfScanFile,
+    logical_schema: &StructType,
+    all_fields: &[ColumnType],
+) -> DeltaResult<ExpressionRef> {
+    // Separate table fields from CDF metadata fields
+    // Table fields (regular columns + partitions) will be read from the physical file
+    // CDF metadata fields will be computed based on scan context
+    let table_fields: Vec<_> = all_fields
+        .iter()
+        .filter_map(|field| match field {
+            ColumnType::Selected(col_name) => {
+                if col_name != CHANGE_TYPE_COL_NAME
+                    && col_name != COMMIT_VERSION_COL_NAME
+                    && col_name != COMMIT_TIMESTAMP_COL_NAME
+                {
+                    Some(ColumnType::Selected(col_name.clone()))
+                } else {
+                    None
+                }
+            }
+            ColumnType::Partition(idx) => Some(ColumnType::Partition(*idx)),
+        })
+        .collect();
+
+    // Create transform expression for table data (reuses regular scan logic)
+    let table_transform_spec = Scan::get_transform_spec(&table_fields);
+    let table_expr = create_transform_expr(
+        &table_transform_spec,
+        &scan_file.partition_values,
+        logical_schema,
+    )?;
+
+    // Append CDF metadata expressions to complete the logical schema
+    let cdf_columns = get_cdf_columns(scan_file)?;
+    let table_exprs = if let Expression::Struct(exprs) = table_expr.as_ref() {
+        exprs.clone()
+    } else {
+        return Err(Error::InternalError(
+            "Expected struct expression from table transform".to_string(),
+        ));
+    };
+
+    let mut all_exprs = table_exprs;
+
+    // Add CDF metadata expressions in the same order as they appear in the logical schema
+    for field in all_fields {
+        if let ColumnType::Selected(col_name) = field {
+            if let Some(cdf_expr) = cdf_columns.get(col_name.as_str()) {
+                all_exprs.push(Arc::new(cdf_expr.clone()));
+            }
+        }
+    }
+
+    Ok(Arc::new(Expression::Struct(all_exprs)))
+}
 
 /// Returns a map from change data feed column name to an expression that generates the row data.
 fn get_cdf_columns(scan_file: &CdfScanFile) -> DeltaResult<HashMap<&str, Expression>> {
@@ -29,40 +88,6 @@ fn get_cdf_columns(scan_file: &CdfScanFile) -> DeltaResult<HashMap<&str, Express
         (COMMIT_TIMESTAMP_COL_NAME, timestamp.into()),
     ];
     Ok(expressions.into_iter().collect())
-}
-
-/// Generates the expression used to convert physical data from the `scan_file` path into logical
-/// data matching the `logical_schema`
-pub(crate) fn physical_to_logical_expr(
-    scan_file: &CdfScanFile,
-    logical_schema: &StructType,
-    all_fields: &[ColumnType],
-) -> DeltaResult<Expression> {
-    let mut cdf_columns = get_cdf_columns(scan_file)?;
-    let all_fields = all_fields
-        .iter()
-        .map(|field| match field {
-            ColumnType::Partition(field_idx) => {
-                let field = logical_schema.fields.get_index(*field_idx);
-                let Some((_, field)) = field else {
-                    return Err(Error::generic(
-                        "logical schema did not contain expected field, can't transform data",
-                    ));
-                };
-                let name = field.physical_name();
-                let value_expression =
-                    parse_partition_value(scan_file.partition_values.get(name), field.data_type())?;
-                Ok(value_expression.into())
-            }
-            ColumnType::Selected(field_name) => {
-                // Remove to take ownership
-                let generated_column = cdf_columns.remove(field_name.as_str());
-                Ok(generated_column.unwrap_or_else(|| ColumnName::new([field_name]).into()))
-            }
-        })
-        .map(|expr| expr.map(Arc::new))
-        .try_collect()?;
-    Ok(Expression::Struct(all_fields))
 }
 
 /// Gets the physical schema that will be used to read data in the `scan_file` path.
@@ -86,7 +111,7 @@ mod tests {
     use crate::expressions::{column_expr, Expression as Expr, Scalar};
     use crate::scan::ColumnType;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::table_changes::physical_to_logical::physical_to_logical_expr;
+    use crate::table_changes::physical_to_logical::get_cdf_transform_expr;
     use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
     use crate::table_changes::{
         ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
@@ -120,7 +145,10 @@ mod tests {
                 ColumnType::Selected(COMMIT_TIMESTAMP_COL_NAME.to_string()),
             ];
             let phys_to_logical_expr =
-                physical_to_logical_expr(&scan_file, &logical_schema, &all_fields).unwrap();
+                get_cdf_transform_expr(&scan_file, &logical_schema, &all_fields)
+                    .unwrap()
+                    .as_ref()
+                    .clone();
             let expected_expr = Expr::struct_from([
                 column_expr!("id"),
                 Scalar::Long(20).into(),
