@@ -1000,11 +1000,6 @@ mod tests {
                     Ok(Some("test_app"))
                 } else if field_name == "remove.path" {
                     Ok(Some("test_path"))
-                } else if field_name.contains(self.error_field) {
-                    Err(
-                        Error::UnexpectedColumnType(format!("{field_name} is not of type str"))
-                            .with_backtrace(),
-                    )
                 } else {
                     Ok(None)
                 }
