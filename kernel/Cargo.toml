@@ -63,6 +63,8 @@ reqwest = { version = "0.12.23", default-features = false, optional = true }
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
+# TODO: Remove this once https://github.com/apache/arrow-rs/pull/8244 ships
+comfy-table = { version = "~7.1", optional = true }
 
 # arrow 55
 [dependencies.arrow_55]
@@ -100,8 +102,8 @@ integration-test = ["hdfs-native-object-store/integration-test"]
 arrow = ["arrow-56"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store"]
-arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store"]
+arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store", "comfy-table"]
+arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store", "comfy-table"]
 arrow-conversion = ["need-arrow"]
 arrow-expression = ["need-arrow"]
 
