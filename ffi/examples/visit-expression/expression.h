@@ -296,17 +296,28 @@ DEFINE_VARIADIC(visit_expr_or, Or)
 DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 #undef DEFINE_VARIADIC
 
+// Sort by field name, breaking ties by pointer address to ensure stability.
 int transform_op_cmp(const void* a, const void* b) {
   const struct TransformOp* op_a = ((ExpressionItem*)a)->ref;
   const struct TransformOp* op_b = ((ExpressionItem*)b)->ref;
   if (op_a->field_name == NULL && op_b->field_name == NULL) {
-    return 0;
+    // break tie below
   } else if (op_a->field_name == NULL) {
     return -1;
   } else if (op_b->field_name == NULL) {
     return 1;
   } else {
-    return strcmp(op_a->field_name, op_b->field_name);
+    int cmp = strcmp(op_a->field_name, op_b->field_name);
+    if (cmp != 0) {
+      return cmp;
+    } // else break tie below
+  }
+  if (op_a < op_b) {
+    return -1;
+  } else if (op_a > op_b) {
+    return 1;
+  } else {
+    return 0;
   }
 }
 
@@ -320,7 +331,7 @@ void visit_transform_expr(
   transform->input_path = get_expr_list(data, input_path_list_id);
   transform->ops = get_expr_list(data, child_list_id);
   // stable sort the ops by field name to ensure deterministic output
-  mergesort(
+  qsort(
       transform->ops.list,
       transform->ops.len,
       sizeof(ExpressionItem),
