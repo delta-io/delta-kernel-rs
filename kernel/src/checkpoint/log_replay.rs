@@ -987,37 +987,6 @@ mod tests {
                     Ok(None)
                 }
             }
-
-            fn get_long(&'a self, _: usize, field_name: &str) -> DeltaResult<Option<i64>> {
-                if field_name == self.error_on_field && self.error_type == "long" {
-                    Err(
-                        Error::UnexpectedColumnType(format!("{field_name} is not of type i64"))
-                            .with_backtrace(),
-                    )
-                } else {
-                    Ok(None)
-                }
-            }
-
-            // Unused methods - required by trait but not covered by tests
-            // Note: These one-liner methods may show as uncovered but are just trait boilerplate
-            fn get_bool(&'a self, _: usize, _: &str) -> DeltaResult<Option<bool>> {
-                Ok(None)
-            }
-            fn get_list(
-                &'a self,
-                _: usize,
-                _: &str,
-            ) -> DeltaResult<Option<crate::engine_data::ListItem<'a>>> {
-                Ok(None)
-            }
-            fn get_map(
-                &'a self,
-                _: usize,
-                _: &str,
-            ) -> DeltaResult<Option<crate::engine_data::MapItem<'a>>> {
-                Ok(None)
-            }
         }
 
         /// Flexible mock for complex field error scenarios
@@ -1050,29 +1019,6 @@ mod tests {
                 } else {
                     Ok(None)
                 }
-            }
-
-            // Unused methods - required by trait but not covered by tests
-            // Note: These one-liner methods may show as uncovered but are just trait boilerplate
-            fn get_int(&'a self, _: usize, _: &str) -> DeltaResult<Option<i32>> {
-                Ok(None)
-            }
-            fn get_bool(&'a self, _: usize, _: &str) -> DeltaResult<Option<bool>> {
-                Ok(None)
-            }
-            fn get_list(
-                &'a self,
-                _: usize,
-                _: &str,
-            ) -> DeltaResult<Option<crate::engine_data::ListItem<'a>>> {
-                Ok(None)
-            }
-            fn get_map(
-                &'a self,
-                _: usize,
-                _: &str,
-            ) -> DeltaResult<Option<crate::engine_data::MapItem<'a>>> {
-                Ok(None)
             }
         }
     }
