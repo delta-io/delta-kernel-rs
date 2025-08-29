@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
     OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression,
-    UnaryPredicate,
+    UnaryPredicate, VariadicExpression,
 };
 use crate::utils::CowExt as _;
 
@@ -118,6 +118,15 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_binary(pred)
     }
 
+    /// Called for each [`VariadicExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_variadic`] if they wish to recursively transform the children.
+    fn transform_expr_variadic(
+        &mut self,
+        expr: &'a VariadicExpression,
+    ) -> Option<Cow<'a, VariadicExpression>> {
+        self.recurse_into_expr_variadic(expr)
+    }
+
     /// Called for each [`JunctionPredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_pred_junction`] if they wish to recursively transform the children.
     fn transform_pred_junction(
@@ -167,6 +176,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Binary(b) => self
                 .transform_expr_binary(b)?
                 .map_owned_or_else(expr, Expression::Binary),
+            Expression::Variadic(v) => self
+                .transform_expr_variadic(v)?
+                .map_owned_or_else(expr, Expression::Variadic),
             Expression::Opaque(o) => self
                 .transform_expr_opaque(o)?
                 .map_owned_or_else(expr, Expression::Opaque),
@@ -287,6 +299,17 @@ pub trait ExpressionTransform<'a> {
         let right = self.transform_expr(&b.right)?;
         let f = |(left, right)| BinaryExpression::new(b.op, left, right);
         Some((left, right).map_owned_or_else(b, f))
+    }
+
+    /// Recursively transforms a variadic expression's children. Returns `None` if all children were
+    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_variadic(
+        &mut self,
+        v: &'a VariadicExpression,
+    ) -> Option<Cow<'a, VariadicExpression>> {
+        let nested_result = recurse_into_children(&v.exprs, |e| self.transform_expr(e))?;
+        Some(nested_result.map_owned_or_else(v, |exprs| VariadicExpression::new(v.op, exprs)))
     }
 
     /// Recursively transforms a junction predicate's children. Returns `None` if all children were
