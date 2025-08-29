@@ -131,6 +131,23 @@ impl KernelStringSlice {
     }
 }
 
+/// FFI-safe implementation for Rust's `Option<T>`
+#[derive(PartialEq, Debug)]
+#[repr(C)]
+pub enum OptionalValue<T> {
+    Some(T),
+    None,
+}
+
+impl<T> From<Option<T>> for OptionalValue<T> {
+    fn from(item: Option<T>) -> Self {
+        match item {
+            Some(value) => OptionalValue::Some(value),
+            None => OptionalValue::None,
+        }
+    }
+}
+
 /// Creates a new [`KernelStringSlice`] from a string reference (which must be an identifier, to
 /// ensure it is not immediately dropped). This is the safest way to create a kernel string slice.
 ///
