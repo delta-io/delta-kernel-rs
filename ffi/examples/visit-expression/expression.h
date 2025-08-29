@@ -560,12 +560,14 @@ void free_expression_item(ExpressionItem ref) {
       struct TransformExpression* transform = ref.ref;
       free_expression_list(transform->input_path);
       free_expression_list(transform->ops);
+      free(transform);
       break;
     }
     case TransformOp: {
       struct TransformOp* op = ref.ref;
       free(op->field_name);
       free_expression_list(op->expr);
+      free(op);
       break;
     }
     case OpaqueExpression: {
