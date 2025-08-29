@@ -99,7 +99,7 @@ fn try_main() -> DeltaResult<()> {
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    let snapshot = Snapshot::builder(url).build(&engine)?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
@@ -227,7 +227,7 @@ fn do_work(
                 read_result,
                 &scan_state.physical_schema,
                 &scan_state.logical_schema,
-                &scan_file.transform,
+                scan_file.transform.clone(),
             )
             .unwrap();
 

@@ -292,7 +292,7 @@ fn read_scan_file(
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
-        physical_to_logical_expr,
+        Arc::new(physical_to_logical_expr),
         logical_schema.clone().into(),
     );
     // Determine if the scan file was derived from a deletion vector pair

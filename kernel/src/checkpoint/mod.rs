@@ -45,8 +45,9 @@
 //!
 //! let engine: &dyn Engine = todo!(); /* create engine instance */
 //!
-//! // Create a snapshot for the table at the version you want to checkpoint (None = latest)
-//! let snapshot = Arc::new(Snapshot::try_from_uri("./tests/data/app-txn-no-checkpoint", engine, None)?);
+//! // Create a snapshot for the table at the version you want to checkpoint
+//! let url = delta_kernel::try_parse_uri("./tests/data/app-txn-no-checkpoint")?;
+//! let snapshot = Arc::new(Snapshot::builder(url).build(engine)?);
 //!
 //! // Create a checkpoint writer from the snapshot
 //! let mut writer = snapshot.checkpoint()?;

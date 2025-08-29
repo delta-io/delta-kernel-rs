@@ -98,15 +98,15 @@ pub fn transform_to_logical(
     physical_data: Box<dyn EngineData>,
     physical_schema: &SchemaRef,
     logical_schema: &Schema,
-    transform: &Option<ExpressionRef>,
+    transform: Option<ExpressionRef>,
 ) -> DeltaResult<Box<dyn EngineData>> {
     match transform {
-        Some(ref transform) => engine
+        Some(transform) => engine
             .evaluation_handler()
             .new_expression_evaluator(
                 physical_schema.clone(),
-                transform.as_ref().clone(), // TODO: Maybe eval should take a ref
-                logical_schema.clone().into(),
+                transform,
+                logical_schema.clone().into(), // TODO: expensive deep clone!
             )
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),

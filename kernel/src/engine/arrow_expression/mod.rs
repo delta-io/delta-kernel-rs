@@ -1,7 +1,7 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch};
+use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -9,7 +9,7 @@ use crate::arrow::datatypes::{
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, Predicate, Scalar};
+use crate::expressions::{Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
@@ -18,7 +18,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::{evaluate_expression, evaluate_predicate};
+use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
 
 mod apply_schema;
 pub mod evaluate_expression;
@@ -220,7 +220,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
-        expression: Expression,
+        expression: ExpressionRef,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator> {
         Arc::new(DefaultExpressionEvaluator {
@@ -233,7 +233,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_predicate_evaluator(
         &self,
         schema: SchemaRef,
-        predicate: Predicate,
+        predicate: PredicateRef,
     ) -> Arc<dyn PredicateEvaluator> {
         Arc::new(DefaultPredicateEvaluator {
             input_schema: schema,
@@ -258,7 +258,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
     input_schema: SchemaRef,
-    expression: Expression,
+    expression: ExpressionRef,
     output_type: DataType,
 }
 
@@ -279,15 +279,31 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //         batch.schema()
         //     )));
         // };
-        let array_ref = evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
-        let batch: RecordBatch = if let DataType::Struct(_) = self.output_type {
-            apply_schema(&array_ref, &self.output_type)?
-        } else {
-            let array_ref = apply_schema_to(&array_ref, &self.output_type)?;
-            let arrow_type = ArrowDataType::try_from_kernel(&self.output_type)?;
-            let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
-            RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+
+        let batch = match (self.expression.as_ref(), &self.output_type) {
+            (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
+                // Empty transform optimization: Skip expression evaluation and directly apply the
+                // output schema to the input RecordBatch. This is used to cheaply apply a new
+                // output schema to existing data without changing it, e.g. for column mapping.
+                let array = match transform.input_path() {
+                    None => Arc::new(StructArray::from(batch.clone())),
+                    Some(path) => extract_column(batch, path)?,
+                };
+                apply_schema(&array, &self.output_type)?
+            }
+            (expr, output_type @ DataType::Struct(_)) => {
+                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
+                apply_schema(&array_ref, output_type)?
+            }
+            (expr, output_type) => {
+                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
+                let array_ref = apply_schema_to(&array_ref, output_type)?;
+                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
+                let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+                RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+            }
         };
+
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }
@@ -295,7 +311,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
     input_schema: SchemaRef,
-    predicate: Predicate,
+    predicate: PredicateRef,
 }
 
 impl PredicateEvaluator for DefaultPredicateEvaluator {
