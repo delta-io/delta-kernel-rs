@@ -24,6 +24,5 @@ url = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
-wiremock = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.5", features = ["derive", "env"] }
