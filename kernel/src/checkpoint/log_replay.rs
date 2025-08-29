@@ -999,6 +999,8 @@ mod tests {
                 }
             }
 
+            // Unused methods - required by trait but not covered by tests
+            // Note: These one-liner methods may show as uncovered but are just trait boilerplate
             fn get_bool(&'a self, _: usize, _: &str) -> DeltaResult<Option<bool>> {
                 Ok(None)
             }
@@ -1050,6 +1052,8 @@ mod tests {
                 }
             }
 
+            // Unused methods - required by trait but not covered by tests
+            // Note: These one-liner methods may show as uncovered but are just trait boilerplate
             fn get_int(&'a self, _: usize, _: &str) -> DeltaResult<Option<i32>> {
                 Ok(None)
             }
