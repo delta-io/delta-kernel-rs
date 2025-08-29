@@ -132,6 +132,14 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
 }
 
+/// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
+///
+/// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
+/// schema in a top-level "add" struct.
+pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
+    Arc::new(StructType::new([StructField::nullable(ADD_NAME, schema)]))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     any(test, feature = "internal-api"),
@@ -675,7 +683,7 @@ pub(crate) struct Add {
 
     /// Default generated Row ID of the first row in the file. The default generated Row IDs
     /// of the other rows in the file can be reconstructed by adding the physical index of the
-    /// row within the file to the base Row ID
+    /// row within the file to the base Row ID.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub base_row_id: Option<i64>,
 
@@ -883,6 +891,17 @@ pub(crate) struct DomainMetadata {
 }
 
 impl DomainMetadata {
+    /// Create a new DomainMetadata action.
+    // TODO: Discuss if we should remove `removed` from this method and introduce a dedicated
+    // method for removed domain metadata.
+    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
+        DomainMetadata {
+            domain,
+            configuration,
+            removed,
+        }
+    }
+
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
@@ -904,7 +923,6 @@ mod tests {
         engine::arrow_data::ArrowEngineData,
         engine::arrow_expression::ArrowEvaluationHandler,
         schema::{ArrayType, DataType, MapType, StructField},
-        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
@@ -1298,22 +1316,11 @@ mod tests {
                 WriterFeature::AppendOnly,
                 WriterFeature::DeletionVectors,
                 WriterFeature::Invariants,
+                WriterFeature::RowTracking,
             ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([ReaderFeature::DeletionVectors]),
-            Some([WriterFeature::RowTracking]),
-        )
-        .unwrap();
-        assert_result_error_with_message(
-            protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "rowTracking". Supported WriterFeatures: "appendOnly", "deletionVectors", "invariants", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
-        );
     }
 
     #[test]

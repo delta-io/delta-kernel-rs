@@ -134,8 +134,20 @@ pub struct TableProperties {
     /// 'classic' for classic Delta Lake checkpoints. 'v2' for v2 checkpoints.
     pub checkpoint_policy: Option<CheckpointPolicy>,
 
-    /// whether to enable row tracking during writes.
+    /// Whether to enable row tracking for the table.
+    ///
+    /// When row tracking is enabled, all rows are guaranteed to have a row ID and commit version.
     pub enable_row_tracking: Option<bool>,
+
+    /// Whether to explicitly suspend generating row tracking metadata during writes even if
+    /// row tracking is supported.
+    pub row_tracking_suspended: Option<bool>,
+
+    /// The name of the internal column that contains the materialized row ID.
+    pub materialized_row_id_column_name: Option<String>,
+
+    /// The name of the internal column that contains the materialized row commit version.
+    pub materialized_row_commit_version_column_name: Option<String>,
 
     /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
     /// associates a monotonically increasing timestamp with each commit by storing it in the
@@ -282,6 +294,15 @@ mod tests {
             ("delta.tuneFileSizesForRewrites", "true"),
             ("delta.checkpointPolicy", "v2"),
             ("delta.enableRowTracking", "true"),
+            (
+                "delta.rowTracking.materializedRowIdColumnName",
+                "_row-id-col-some_uuid",
+            ),
+            (
+                "delta.rowTracking.materializedRowCommitVersionColumnName",
+                "_row-commit-version-col-some_uuid",
+            ),
+            ("delta.rowTrackingSuspended", "false"),
             ("delta.enableInCommitTimestamps", "true"),
             ("delta.inCommitTimestampEnablementVersion", "15"),
             ("delta.inCommitTimestampEnablementTimestamp", "1612345678"),
@@ -310,6 +331,11 @@ mod tests {
             tune_file_sizes_for_rewrites: Some(true),
             checkpoint_policy: Some(CheckpointPolicy::V2),
             enable_row_tracking: Some(true),
+            materialized_row_id_column_name: Some("_row-id-col-some_uuid".to_string()),
+            materialized_row_commit_version_column_name: Some(
+                "_row-commit-version-col-some_uuid".to_string(),
+            ),
+            row_tracking_suspended: Some(false),
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),

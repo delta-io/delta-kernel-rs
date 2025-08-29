@@ -235,38 +235,11 @@ pub async fn create_table(
     schema: SchemaRef,
     partition_columns: &[&str],
     use_37_protocol: bool,
-    enable_timestamp_without_timezone: bool,
-    enable_variant: bool,
-    enable_column_mapping: bool,
+    reader_features: Vec<&str>,
+    writer_features: Vec<&str>,
 ) -> Result<Url, Box<dyn std::error::Error>> {
     let table_id = "test_id";
     let schema = serde_json::to_string(&schema)?;
-
-    let (reader_features, writer_features) = {
-        let mut reader_features = vec![];
-        let mut writer_features = vec![];
-        if enable_timestamp_without_timezone {
-            reader_features.push("timestampNtz");
-            writer_features.push("timestampNtz");
-        }
-        if enable_variant {
-            reader_features.push("variantType");
-            writer_features.push("variantType");
-            // We can add shredding features as well as we are allowed to write unshredded variants
-            // into shredded tables and shredded reads are explicitly blocked in the default
-            // engine's parquet reader.
-            reader_features.push("variantShredding-preview");
-            writer_features.push("variantShredding-preview");
-        }
-        if enable_column_mapping {
-            reader_features.push("columnMapping");
-            // TODO: (#1124) we don't actually support column mapping writes yet, but have some
-            // tests that do column mapping on writes. for now omit the writer feature to let tests
-            // run, but after actual support this should be enabled.
-            // writer_features.push("columnMapping");
-        }
-        (reader_features, writer_features)
-    };
 
     let protocol = if use_37_protocol {
         json!({
@@ -285,6 +258,27 @@ pub async fn create_table(
             }
         })
     };
+
+    let configuration = {
+        let mut config = serde_json::Map::new();
+
+        if reader_features.contains(&"columnMapping") {
+            config.insert("delta.columnMapping.mode".to_string(), json!("name"));
+        }
+        if writer_features.contains(&"rowTracking") {
+            config.insert(
+                "delta.materializedRowIdColumnName".to_string(),
+                json!("some_dummy_column_name"),
+            );
+            config.insert(
+                "delta.materializedRowCommitVersionColumnName".to_string(),
+                json!("another_dummy_column_name"),
+            );
+        }
+
+        config
+    };
+
     let metadata = json!({
         "metaData": {
             "id": table_id,
@@ -294,7 +288,7 @@ pub async fn create_table(
             },
             "schemaString": schema,
             "partitionColumns": partition_columns,
-            "configuration": {"delta.columnMapping.mode": "name"},
+            "configuration": configuration,
             "createdTime": 1677811175819u64
         }
     });
@@ -346,9 +340,8 @@ pub async fn setup_test_tables(
                 schema.clone(),
                 partition_columns,
                 true,
-                false,
-                false,
-                false,
+                vec![],
+                vec![],
             )
             .await?,
             engine_37,
@@ -362,9 +355,8 @@ pub async fn setup_test_tables(
                 schema,
                 partition_columns,
                 false,
-                false,
-                false,
-                false,
+                vec![],
+                vec![],
             )
             .await?,
             engine_11,
@@ -403,7 +395,7 @@ pub fn test_read(
     expected: &ArrowEngineData,
     url: &Url,
     engine: Arc<dyn Engine>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> DeltaResult<()> {
     let snapshot = Snapshot::builder(url.clone()).build(engine.as_ref())?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
