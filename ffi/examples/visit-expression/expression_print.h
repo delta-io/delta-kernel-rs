@@ -84,6 +84,31 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       print_expression_item_list(var->exprs, depth + 1);
       break;
     }
+    case Transform: {
+      struct TransformExpression* transform = ref.ref;
+      printf("Transform\n");
+      print_expression_item_list(transform->input_path, depth + 1);
+      print_expression_item_list(transform-> ops, depth + 1);
+      break;
+    }
+    case TransformOp: {
+      struct TransformOp* transform_op = ref.ref;
+      if (transform_op->is_insert) {
+        if (transform_op->field_name) {
+          printf("Insert(%s)\n", transform_op->field_name);
+        } else {
+          printf("Prepend\n");
+        }
+      } else {
+        if (transform_op->expr.len > 0) {
+          printf("Replace(%s)\n", transform_op->field_name);
+        } else {
+          printf("Drop(%s)\n", transform_op->field_name);
+        }
+      }
+      print_expression_item_list(transform_op->expr, depth + 1);
+      break;
+    }
     case OpaqueExpression: {
       struct OpaqueExpression* opaque = ref.ref;
       visit_kernel_opaque_expression_op_name(opaque->op, "OpaqueExpression", print_opaque_op_name);
