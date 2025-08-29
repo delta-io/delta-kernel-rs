@@ -6,14 +6,14 @@ use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
-use crate::object_store::path::Path;
-use crate::object_store::DynObjectStore;
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use futures::StreamExt;
+use object_store::path::Path;
+use object_store::DynObjectStore;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -148,12 +148,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
 
         let metadata = self.store.head(&Path::from_url_path(path.path())?).await?;
         let modification_time = metadata.last_modified.timestamp_millis();
-        let metadata_size = metadata.size;
-        #[cfg(not(feature = "arrow-55"))]
-        let metadata_size: u64 = metadata_size
-            .try_into()
-            .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to u64"))?;
-        if size != metadata_size {
+        if size != metadata.size {
             return Err(Error::generic(format!(
                 "Size mismatch after writing parquet file: expected {}, got {}",
                 size, metadata.size
@@ -263,9 +258,8 @@ impl FileOpener for ParquetOpener {
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            #[cfg(feature = "arrow-55")]
             let mut reader = {
-                use crate::object_store::ObjectStoreScheme;
+                use object_store::ObjectStoreScheme;
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
                 // request which isn't supported by Azure. For now we just detect if the URL is
                 // pointing to azure and if so, do a HEAD request so we can pass in file size to the
@@ -286,13 +280,7 @@ impl FileOpener for ParquetOpener {
                     ParquetObjectReader::new(store, path)
                 }
             };
-            #[cfg(all(feature = "arrow-54", not(feature = "arrow-55")))]
-            let mut reader = {
-                // TODO avoid IO by converting passed file meta to ObjectMeta (no longer an issue
-                // in arrow 55)
-                let meta = store.head(&path).await?;
-                ParquetObjectReader::new(store, meta)
-            };
+
             let metadata = ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
@@ -400,8 +388,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::arrow::array::{Array, RecordBatch};
-    use crate::object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
-    use url::Url;
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -409,6 +395,8 @@ mod tests {
     use crate::EngineData;
 
     use itertools::Itertools;
+    use object_store::{local::LocalFileSystem, memory::InMemory, ObjectStore};
+    use url::Url;
 
     use crate::utils::test_utils::assert_result_error_with_message;
 
@@ -440,13 +428,10 @@ mod tests {
             .schema()
             .clone();
 
-        let meta_size = meta.size;
-        #[cfg(not(feature = "arrow-55"))]
-        let meta_size = meta_size.try_into().unwrap();
         let files = &[FileMeta {
             location: url.clone(),
             last_modified: meta.last_modified.timestamp(),
-            size: meta_size,
+            size: meta.size,
         }];
 
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));

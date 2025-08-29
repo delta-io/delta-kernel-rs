@@ -38,11 +38,7 @@ fn transaction_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let snapshot = Arc::new(Snapshot::try_from_uri(
-        url?,
-        extern_engine.engine().as_ref(),
-        None,
-    )?);
+    let snapshot = Arc::new(Snapshot::builder(url?).build(extern_engine.engine().as_ref())?);
     let transaction = snapshot.transaction();
     Ok(Box::new(transaction?).into())
 }
@@ -139,8 +135,6 @@ mod tests {
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::object_store::path::Path;
-    use delta_kernel::object_store::ObjectStore;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
 
@@ -156,6 +150,8 @@ mod tests {
     use test_utils::{set_json_value, setup_test_tables, test_read};
 
     use itertools::Itertools;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
     use serde_json::json;
     use serde_json::Deserializer;
 

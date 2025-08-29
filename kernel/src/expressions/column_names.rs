@@ -7,7 +7,7 @@ use std::iter::Peekable;
 use std::ops::Deref;
 
 /// A (possibly nested) column name.
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord)]
 pub struct ColumnName {
     path: Vec<String>,
 }
@@ -419,6 +419,16 @@ macro_rules! __column_expr {
 }
 #[doc(inline)]
 pub use __column_expr as column_expr;
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __column_expr_ref {
+    ( $($name:tt)* ) => {
+        std::sync::Arc::new($crate::expressions::Expression::from($crate::__column_name!($($name)*)))
+    };
+}
+#[doc(inline)]
+pub use __column_expr_ref as column_expr_ref;
 
 #[macro_export]
 #[doc(hidden)]

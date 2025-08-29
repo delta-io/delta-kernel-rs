@@ -183,3 +183,59 @@ pub(crate) fn apply_schema_to(array: &ArrayRef, schema: &DataType) -> DeltaResul
     };
     Ok(array)
 }
+
+#[cfg(test)]
+mod apply_schema_validation_tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use crate::arrow::array::{Int32Array, StructArray};
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
+    use crate::schema::{DataType, StructField, StructType};
+
+    #[test]
+    fn test_apply_schema_basic_functionality() {
+        // Test that apply_schema works for basic field transformation
+        let input_array = create_test_struct_array_2_fields();
+        let target_schema = create_target_schema_2_fields();
+
+        // This should succeed - basic schema application
+        let result = apply_schema_to_struct(&input_array, &target_schema);
+        assert!(result.is_ok(), "Basic schema application should succeed");
+
+        let result_array = result.unwrap();
+        assert_eq!(
+            result_array.len(),
+            input_array.len(),
+            "Row count should be preserved"
+        );
+        assert_eq!(result_array.num_columns(), 2, "Should have 2 columns");
+    }
+
+    // Helper functions to create test data
+    fn create_test_struct_array_2_fields() -> StructArray {
+        let field1 = ArrowField::new("a", ArrowDataType::Int32, false);
+        let field2 = ArrowField::new("b", ArrowDataType::Int32, false);
+        let schema = ArrowSchema::new(vec![field1, field2]);
+
+        let a_data = Int32Array::from(vec![1, 2, 3]);
+        let b_data = Int32Array::from(vec![4, 5, 6]);
+
+        StructArray::try_new(
+            schema.fields.clone(),
+            vec![Arc::new(a_data), Arc::new(b_data)],
+            None,
+        )
+        .unwrap()
+    }
+
+    fn create_target_schema_2_fields() -> StructType {
+        StructType::new([
+            StructField::new("a", DataType::INTEGER, false),
+            StructField::new("b", DataType::INTEGER, false),
+        ])
+    }
+}

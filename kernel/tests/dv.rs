@@ -32,7 +32,7 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = DefaultEngine::new_local();
 
-    let snapshot = Snapshot::try_new(url, engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder(url).build(engine.as_ref())?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(engine)?;
@@ -47,7 +47,7 @@ fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = DefaultEngine::new_local();
 
-    let snapshot = Snapshot::try_new(url, engine.as_ref(), None)?;
+    let snapshot = Snapshot::builder(url).build(engine.as_ref())?;
     let scan = snapshot.into_scan_builder().build()?;
 
     let stream = scan.execute(engine)?;

@@ -183,7 +183,8 @@ impl StructField {
     /// NOTE: Caller affirms that the schema was already validated by
     /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
-    pub fn physical_name(&self) -> &str {
+    #[internal_api]
+    pub(crate) fn physical_name(&self) -> &str {
         match self
             .metadata
             .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
@@ -411,10 +412,11 @@ impl StructType {
         self.fields.get_index_of(name.as_ref())
     }
 
-    pub fn fields(&self) -> impl Iterator<Item = &StructField> {
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = &StructField> {
         self.fields.values()
     }
 
+    #[allow(unused)] // Most uses can leverage ExactSizeIterator::len instead
     pub(crate) fn fields_len(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()

@@ -1,7 +1,7 @@
 //! Expression handling based on arrow-rs compute kernels.
 use std::sync::Arc;
 
-use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch};
+use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
 };
@@ -9,7 +9,7 @@ use crate::arrow::datatypes::{
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, Predicate, Scalar};
+use crate::expressions::{Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
@@ -18,7 +18,7 @@ use itertools::Itertools;
 use tracing::debug;
 
 use apply_schema::{apply_schema, apply_schema_to};
-use evaluate_expression::{evaluate_expression, evaluate_predicate};
+use evaluate_expression::{evaluate_expression, evaluate_predicate, extract_column};
 
 mod apply_schema;
 pub mod evaluate_expression;
@@ -28,40 +28,6 @@ pub mod opaque;
 mod tests;
 
 // TODO leverage scalars / Datum
-
-// This trait is a hack, needed because [`array::StructBuilder::field_builders`] was not added until
-// arrow-55, and `StructBuilder::field_builder` (available in all versions) only works for concrete
-// builders. We can't ask for `dyn ArrayBuilder` directly (the method requires `Sized` types), nor
-// can we ask for `Box<dyn ArrayBuilder>` (which is what the builder actually stores internally),
-// because the `Box` derefs `&dyn ArrayBuilder` _before_ being downcast to `Any`. Instead, we must
-// wrap the builder in a trait that can call `StructBuilder::field_builder` once the type is known,
-// with a trivial implementation of the same trait for `Box<dyn ArrayBuilder>` that
-// `array::make_builder` returns (and populates list and map builders with).
-//
-// Once we drop support for older arrow versions, we can change [`Scalar::append`] below to take
-// `&mut dyn ArrayBuilder` directly and cast it as needed.
-trait ArrayBuilderAs {
-    fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T>;
-}
-
-impl ArrayBuilderAs for Box<dyn ArrayBuilder> {
-    fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T> {
-        self.as_any_mut().downcast_mut()
-    }
-}
-
-#[cfg(not(feature = "arrow-55"))]
-struct StructFieldBuilder<'a> {
-    builder: &'a mut array::StructBuilder,
-    field_index: usize,
-}
-
-#[cfg(not(feature = "arrow-55"))]
-impl ArrayBuilderAs for StructFieldBuilder<'_> {
-    fn array_builder_as<T: ArrayBuilder>(&mut self) -> Option<&mut T> {
-        self.builder.field_builder::<T>(self.field_index)
-    }
-}
 
 impl Scalar {
     /// Convert scalar to arrow array.
@@ -94,11 +60,11 @@ impl Scalar {
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
     // (possibly NULL) entries in order to preserve consistent row counts between the struct and its
     // fields.
-    fn append_to(&self, builder: &mut impl ArrayBuilderAs, num_rows: usize) -> DeltaResult<()> {
+    fn append_to(&self, builder: &mut dyn ArrayBuilder, num_rows: usize) -> DeltaResult<()> {
         use Scalar::*;
         macro_rules! builder_as {
             ($t:ty) => {{
-                builder.array_builder_as::<$t>().ok_or_else(|| {
+                builder.as_any_mut().downcast_mut::<$t>().ok_or_else(|| {
                     Error::invalid_expression(format!("Invalid builder for {}", self.data_type()))
                 })?
             }};
@@ -137,19 +103,7 @@ impl Scalar {
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
-                    // TODO: Get rid of this alternate code path when we drop arrow-54 support.
-                    #[cfg(not(feature = "arrow-55"))]
-                    for (field_index, value) in data.values().iter().enumerate() {
-                        let builder = &mut StructFieldBuilder {
-                            builder,
-                            field_index,
-                        };
-                        value.append_to(builder, 1)?;
-                    }
-
-                    #[cfg(feature = "arrow-55")]
                     let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(feature = "arrow-55")]
                     for (builder, value) in field_builders.zip(data.values()) {
                         value.append_to(builder, 1)?;
                     }
@@ -184,14 +138,14 @@ impl Scalar {
     }
 
     fn append_null(
-        builder: &mut impl ArrayBuilderAs,
+        builder: &mut dyn ArrayBuilder,
         data_type: &DataType,
         num_rows: usize,
     ) -> DeltaResult<()> {
         // Almost the same as above -- differs only in the data type parameter
         macro_rules! builder_as {
             ($t:ty) => {{
-                builder.array_builder_as::<$t>().ok_or_else(|| {
+                builder.as_any_mut().downcast_mut::<$t>().ok_or_else(|| {
                     Error::invalid_expression(format!("Invalid builder for {data_type}"))
                 })?
             }};
@@ -232,19 +186,7 @@ impl Scalar {
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
-                    // TODO: Get rid of this alternate code path when we drop arrow-54 support.
-                    #[cfg(not(feature = "arrow-55"))]
-                    for (field_index, field) in stype.fields().enumerate() {
-                        let builder = &mut StructFieldBuilder {
-                            builder,
-                            field_index,
-                        };
-                        Self::append_null(builder, &field.data_type, 1)?;
-                    }
-
-                    #[cfg(feature = "arrow-55")]
                     let field_builders = builder.field_builders_mut().iter_mut();
-                    #[cfg(feature = "arrow-55")]
                     for (builder, field) in field_builders.zip(stype.fields()) {
                         Self::append_null(builder, &field.data_type, 1)?;
                     }
@@ -278,7 +220,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_expression_evaluator(
         &self,
         schema: SchemaRef,
-        expression: Expression,
+        expression: ExpressionRef,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator> {
         Arc::new(DefaultExpressionEvaluator {
@@ -291,7 +233,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
     fn new_predicate_evaluator(
         &self,
         schema: SchemaRef,
-        predicate: Predicate,
+        predicate: PredicateRef,
     ) -> Arc<dyn PredicateEvaluator> {
         Arc::new(DefaultPredicateEvaluator {
             input_schema: schema,
@@ -316,7 +258,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
 #[derive(Debug)]
 pub struct DefaultExpressionEvaluator {
     input_schema: SchemaRef,
-    expression: Expression,
+    expression: ExpressionRef,
     output_type: DataType,
 }
 
@@ -337,15 +279,31 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
         //         batch.schema()
         //     )));
         // };
-        let array_ref = evaluate_expression(&self.expression, batch, Some(&self.output_type))?;
-        let batch: RecordBatch = if let DataType::Struct(_) = self.output_type {
-            apply_schema(&array_ref, &self.output_type)?
-        } else {
-            let array_ref = apply_schema_to(&array_ref, &self.output_type)?;
-            let arrow_type = ArrowDataType::try_from_kernel(&self.output_type)?;
-            let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
-            RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+
+        let batch = match (self.expression.as_ref(), &self.output_type) {
+            (Expression::Transform(transform), DataType::Struct(_)) if transform.is_identity() => {
+                // Empty transform optimization: Skip expression evaluation and directly apply the
+                // output schema to the input RecordBatch. This is used to cheaply apply a new
+                // output schema to existing data without changing it, e.g. for column mapping.
+                let array = match transform.input_path() {
+                    None => Arc::new(StructArray::from(batch.clone())),
+                    Some(path) => extract_column(batch, path)?,
+                };
+                apply_schema(&array, &self.output_type)?
+            }
+            (expr, output_type @ DataType::Struct(_)) => {
+                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
+                apply_schema(&array_ref, output_type)?
+            }
+            (expr, output_type) => {
+                let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
+                let array_ref = apply_schema_to(&array_ref, output_type)?;
+                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
+                let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+                RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
+            }
         };
+
         Ok(Box::new(ArrowEngineData::new(batch)))
     }
 }
@@ -353,7 +311,7 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
 #[derive(Debug)]
 pub struct DefaultPredicateEvaluator {
     input_schema: SchemaRef,
-    predicate: Predicate,
+    predicate: PredicateRef,
 }
 
 impl PredicateEvaluator for DefaultPredicateEvaluator {

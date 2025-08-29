@@ -182,7 +182,7 @@ fn try_main() -> DeltaResult<()> {
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    let snapshot = Snapshot::builder(url).build(&engine)?;
 
     match cli.command {
         Commands::TableVersion => {
