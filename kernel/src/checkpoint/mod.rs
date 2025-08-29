@@ -101,7 +101,7 @@ use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
 use url::Url;
 
-mod log_replay;
+pub(crate) mod log_replay;
 #[cfg(test)]
 mod tests;
 
