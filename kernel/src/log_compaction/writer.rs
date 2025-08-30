@@ -11,7 +11,7 @@ use crate::log_replay::LogReplayProcessor;
 
 /// Utility function to determine if log compaction should be performed
 /// based on the commit version and compaction interval.
-#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn should_compact(commit_version: Version, compaction_interval: Version) -> bool {
     // Commits start at 0, so we add one to the commit version to check if we've hit the interval
     compaction_interval > 0
@@ -166,11 +166,7 @@ impl LogCompactionWriter {
     }
 
     /// List commit files in the specified version range
-    #[allow(dead_code)]
-    pub(crate) fn list_commit_files(
-        &self,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Vec<ParsedLogPath<FileMeta>>> {
+    fn list_commit_files(&self, engine: &dyn Engine) -> DeltaResult<Vec<ParsedLogPath<FileMeta>>> {
         let log_root = self.table_root.join("_delta_log/")?;
 
         // Get all files in the _delta_log directory
@@ -200,7 +196,6 @@ impl LogCompactionWriter {
     }
 
     /// Create a log segment from the commit files
-    #[allow(dead_code)]
     pub(crate) fn create_log_segment(
         &self,
         mut commit_files: Vec<ParsedLogPath<FileMeta>>,

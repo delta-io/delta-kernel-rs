@@ -52,10 +52,9 @@
 //! // Write the compaction data to object storage
 //! let metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
 //!
-//! // Get fresh data iterator for finalization
-//! let final_data = writer.compaction_data(&engine)?;
+//! // Important: all data must be written before finalizing the compacted log
 //!
-//! // Finalize the compaction
+//! // Finalize the compaction by passing metadata and exhausted data iterator
 //! writer.finalize(&engine, &metadata, final_data)?;
 //! # Ok(())
 //! # }
