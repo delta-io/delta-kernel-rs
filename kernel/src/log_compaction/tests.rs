@@ -2,6 +2,7 @@ use super::writer::{should_compact, LogCompactionDataIterator, LogCompactionWrit
 use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::path::ParsedLogPath;
 use crate::{DeltaResult, EngineData, FileMeta};
+use std::sync::Arc;
 use url::Url;
 
 #[test]
@@ -332,6 +333,99 @@ fn test_log_compaction_data_iterator_debug() {
 }
 
 #[test]
+fn test_finalize_with_real_params() {
+    // Test finalize method with actual parameters
+    let table_root = Url::parse("memory:///test-table").unwrap();
+    let writer = LogCompactionWriter::new(table_root.clone(), 1, 5, 1000).unwrap();
+    
+    // Create mock metadata
+    let metadata = FileMeta {
+        location: table_root.join("_delta_log/00000000000000000001.00000000000000000005.compacted.json").unwrap(),
+        last_modified: 1234567890,
+        size: 5000,
+    };
+    
+    // Create mock iterator
+    let iterator = LogCompactionDataIterator {
+        batches: vec![].into_iter(),
+        total_actions: 100,
+        total_add_actions: 50,
+    };
+    
+    // Mock engine - we can't use real engine in first commit
+    // but we can test that finalize accepts the parameters
+    // The actual finalize just returns Ok(()) for now
+    struct MockEngine;
+    impl crate::Engine for MockEngine {
+        fn evaluation_handler(&self) -> Arc<dyn crate::EvaluationHandler> {
+            unimplemented!()
+        }
+        fn storage_handler(&self) -> Arc<dyn crate::StorageHandler> {
+            unimplemented!()
+        }
+        fn parquet_handler(&self) -> Arc<dyn crate::ParquetHandler> {
+            unimplemented!()
+        }
+        fn json_handler(&self) -> Arc<dyn crate::JsonHandler> {
+            unimplemented!()
+        }
+    }
+    
+    let engine = MockEngine;
+    let result = writer.finalize(&engine, &metadata, iterator);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_writer_debug_impl() {
+    // Test Debug implementation for LogCompactionWriter
+    let table_root = Url::parse("memory:///test-table").unwrap();
+    let writer = LogCompactionWriter::new(table_root.clone(), 5, 10, 1000).unwrap();
+    
+    let debug_str = format!("{:?}", writer);
+    assert!(debug_str.contains("LogCompactionWriter"));
+    assert!(debug_str.contains("start_version: 5"));
+    assert!(debug_str.contains("end_version: 10"));
+}
+
+#[test]
+fn test_compaction_data_iterator_consumption() {
+    // Test that iterator can be consumed properly
+    let batch1: Box<dyn EngineData> = Box::new(MockEngineData { _value: 1 });
+    let batch2: Box<dyn EngineData> = Box::new(MockEngineData { _value: 2 });
+    
+    let mut iterator = LogCompactionDataIterator {
+        batches: vec![batch1, batch2].into_iter(),
+        total_actions: 50,
+        total_add_actions: 25,
+    };
+    
+    // Consume first batch
+    assert!(iterator.next().is_some());
+    assert_eq!(iterator.total_actions(), 50);
+    assert_eq!(iterator.total_add_actions(), 25);
+    
+    // Consume second batch
+    assert!(iterator.next().is_some());
+    
+    // Iterator should be exhausted
+    assert!(iterator.next().is_none());
+}
+
+#[test]
+fn test_should_compact_edge_cases() {
+    // Test more edge cases for should_compact
+    assert!(should_compact(999, 1000)); // (999 + 1) % 1000 == 0
+    assert!(!should_compact(1000, 1000)); // (1000 + 1) % 1000 != 0
+    assert!(should_compact(1999, 1000)); // (1999 + 1) % 1000 == 0
+    
+    // Test with interval of 1 - would compact every version after 0
+    assert!(should_compact(1, 1)); // commit_version > 0 && (1 + 1) % 1 == 0 -> true
+    assert!(should_compact(2, 1)); // commit_version > 0 && (2 + 1) % 1 == 0 -> true
+    assert!(should_compact(100, 1)); // commit_version > 0 && (100 + 1) % 1 == 0 -> true
+}
+
+#[test]
 fn test_parsed_log_path_filtering() {
     // Test the file filtering logic in list_commit_files
     let table_root = Url::parse("memory:///test-table").unwrap();
@@ -394,6 +488,68 @@ fn test_parsed_log_path_filtering() {
     assert_eq!(commit_files.len(), 2);
     assert_eq!(commit_files[0].version, 5);
     assert_eq!(commit_files[1].version, 6);
+}
+
+#[test]
+fn test_writer_getters() {
+    // Test that all getter methods work correctly
+    let table_root = Url::parse("memory:///test-table").unwrap();
+    let writer = LogCompactionWriter::new(
+        table_root.clone(),
+        42,
+        100,
+        7 * 24 * 60 * 60 * 1000, // 7 days
+    ).unwrap();
+    
+    // Test compaction_path getter
+    let path = writer.compaction_path().unwrap();
+    assert!(path.to_string().contains("00000000000000000042.00000000000000000100.compacted.json"));
+}
+
+#[test]
+fn test_zero_versions() {
+    // Test with version 0 which is valid
+    let table_root = Url::parse("memory:///test-table").unwrap();
+    let writer = LogCompactionWriter::new(table_root.clone(), 0, 0, 0);
+    assert!(writer.is_ok());
+    
+    let writer = writer.unwrap();
+    let path = writer.compaction_path().unwrap();
+    assert!(path.to_string().contains("00000000000000000000.00000000000000000000.compacted.json"));
+}
+
+#[test]
+fn test_very_large_retention_millis() {
+    // Test with very large retention timestamp
+    let table_root = Url::parse("memory:///test-table").unwrap();
+    let retention_millis = i64::MAX;
+    
+    let writer = LogCompactionWriter::new(
+        table_root.clone(),
+        1,
+        10,
+        retention_millis,
+    );
+    
+    assert!(writer.is_ok());
+    let writer = writer.unwrap();
+    assert!(writer.compaction_path().is_ok());
+}
+
+#[test]
+fn test_negative_retention_millis() {
+    // Test with negative retention (which might mean no retention)
+    let table_root = Url::parse("memory:///test-table").unwrap();
+    let retention_millis = -1;
+    
+    let writer = LogCompactionWriter::new(
+        table_root.clone(),
+        1,
+        10,
+        retention_millis,
+    );
+    
+    assert!(writer.is_ok());
 }
 
 #[test]
