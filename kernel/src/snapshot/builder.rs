@@ -43,6 +43,12 @@ impl SnapshotBuilder {
         self
     }
 
+    /// Set the `version` [Option] explicitly.
+    pub fn set_version(mut self, version: Option<Version>) -> Self {
+        self.version = version;
+        self
+    }
+
     /// Create a new [`Snapshot`] instance.
     ///
     /// # Parameters
