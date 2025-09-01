@@ -26,6 +26,8 @@ use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec};
 use url::Url;
 
+pub mod workload_runner;
+
 /// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
 /// dir it was unpacked into
 pub fn load_test_data(
