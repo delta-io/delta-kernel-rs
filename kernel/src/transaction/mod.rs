@@ -264,7 +264,7 @@ impl Transaction {
     /// granularity.
     ///
     /// The metadata passed in here is expected to be taken from the output of a scan of the
-    /// table (i.e. using [`scan_builder`]).
+    /// table (i.e. using [`Transaction::scan_builder`]).
     /// The expected schema for `remove_metadata` is given by [`crate::scan::scan_row_schema`].
     pub fn remove_files(&mut self, remove_metadata: Box<dyn EngineData>) {
         // Avoid warnings until implementation
