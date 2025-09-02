@@ -88,25 +88,21 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       struct TransformExpression* transform = ref.ref;
       printf("Transform\n");
       print_expression_item_list(transform->input_path, depth + 1);
-      print_expression_item_list(transform-> ops, depth + 1);
+      print_expression_item_list(transform->field_transforms, depth + 1);
       break;
     }
-    case TransformOp: {
-      struct TransformOp* transform_op = ref.ref;
-      if (transform_op->is_insert) {
-        if (transform_op->field_name) {
-          printf("Insert(%s)\n", transform_op->field_name);
-        } else {
-          printf("Prepend\n");
-        }
+    case FieldTransform: {
+      struct FieldTransform* field_transform = ref.ref;
+      if (!field_transform->field_name) {
+        printf("Prepend\n");
+      } else if (!field_transform->exprs.len) {
+        printf("Drop(%s)\n", field_transform->field_name);
+      } else if (field_transform->is_replace) {
+        printf("Replace(%s)\n", field_transform->field_name);
       } else {
-        if (transform_op->expr.len > 0) {
-          printf("Replace(%s)\n", transform_op->field_name);
-        } else {
-          printf("Drop(%s)\n", transform_op->field_name);
-        }
+        printf("Insert(%s)\n", field_transform->field_name);
       }
-      print_expression_item_list(transform_op->expr, depth + 1);
+      print_expression_item_list(field_transform->exprs, depth + 1);
       break;
     }
     case OpaqueExpression: {

@@ -1,6 +1,9 @@
 //! Defines [`EngineExpressionVisitor`]. This is a visitor that can be used to convert the kernel's
 //! [`Expression`] or [`Predicate`] to an engine's native expression format.
-use std::ffi::c_void;
+use crate::expressions::{
+    SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
+};
+use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
@@ -10,10 +13,8 @@ use delta_kernel::expressions::{
     UnaryPredicateOp,
 };
 
-use crate::expressions::{
-    SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
-};
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
+use std::borrow::Cow;
+use std::ffi::c_void;
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
@@ -172,39 +173,44 @@ pub struct EngineExpressionVisitor {
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
     /// Visits a `Transform` expression belonging to the list identified by `sibling_list_id`.
     /// The `input_path_list_id` identifies the transform's input path (0 = no path).
-    /// The `child_list_id` identifies the transform's operations (0 = identity transform).
+    /// The `child_list_id` identifies the transform's field operations (0 = identity transform).
     pub visit_transform_expr: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
         input_path_list_id: usize,
         child_list_id: usize,
     ),
-    /// Visits one operation of a `Transform` expression belonging to the list identified by
-    /// `sibling_list_id`. The `field_name` identifies the input field the operation relates to
-    /// (NULL = no field name). The `child_list_id` is a single-item list identifying the
-    /// operation's expression (0 = no expression).
+    /// Visits one field transform of a `Transform` expression belonging to the list identified by
+    /// `sibling_list_id`.
     ///
-    /// The operations of a transform are modeled as `(is_insert, field_name, expr)` triples. The
-    /// field name always references a field of the input struct. Both the field name and the
-    /// expression are optional, with valid combinations given by the following truth table:
+    /// A field transform is modeled as the triple `(field_name, expr_list, is_replace)`, as
+    /// described by the truth table below. The field name (if present) always references a field of
+    /// the input struct. Both the field name and the expression list are optional:
     ///
-    /// |is_insert? |field_name? |expr? |meaning|
+    /// |field_name? |expr_list? |is_replace? |meaning|
     /// |-|-|-|-|
-    /// | NO  | NO  |  *  | INVALID - replacements always require a field name
-    /// | NO  | YES | NO  | Drop the named input field (it has no replacement)
-    /// | NO  | YES | YES | Replace the named field with the expr
-    /// | YES |  *  | NO  | INVALID - insertions always require an expression
-    /// | YES | NO  | YES | Insert the expression just before the first input field
-    /// | YES | YES | YES | Insert the expression after the the named input field
+    /// | NO  | NO  | *   | NO-OP (prepend an empty list of expressions to the output)
+    /// | NO  | YES | *   | Prepend a list of expressions to the output
+    /// | YES | NO  | NO  | NO-OP (insert an empty list of expressions after the named input field)
+    /// | YES | NO  | YES | Drop the named input field
+    /// | YES | YES | NO  | Insert a list of expressions after the named input field
+    /// | YES | YES | YES | Replace the named input field with a list of expressions
     ///
-    /// NOTE: Insertion order is significant -- if multiple insertions reference the same input
-    /// field, they should be inserted as a group, in the order given, at the insertion point.
-    pub visit_transform_op: extern "C" fn(
+    /// NOTE: Treating list id 0 as an empty list yields a simplified truth table:
+    ///
+    /// |field_name? |is_replace? |meaning|
+    /// |-|-|-|
+    /// | NO  | *   | Prepend a (possibly empty) list of expressions to the output
+    /// | YES | NO  | Insert a (possibly empty)  list of expressions after the named input field
+    /// | YES | YES | Replace the named input field with a (possibly empty) list of expressions
+    ///
+    /// NOTE: Expressions in each insertion list must be emitted in order at the insertion point.
+    pub visit_field_transform: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
-        is_insert: bool,
         field_name: *const KernelStringSlice,
         child_list_id: usize,
+        is_replace: bool,
     ),
     /// Visits the operator (`op`) and children (`child_list_id`) of an opaque expression belonging
     /// to the list identified by `sibling_list_id`.
@@ -395,52 +401,78 @@ fn visit_expression_transform(
         visit_expression_column(visitor, name, path_list_id);
     };
 
-    // Flatten all the ops into a single list of "child" expressions
-    let op_count = transform.field_replacements.len()
+    // Create one field transform for each named input field (plus one more for the prepended
+    // fields, if any). This is a set union, so don't double count fields that appear in both.
+    let field_transform_count = transform.field_insertions.len()
         + transform
-            .field_insertions
-            .values()
-            .map(Vec::len)
-            .sum::<usize>();
-    let op_list_id = call!(visitor, make_field_list, op_count);
+            .field_replacements
+            .keys()
+            .filter(|field_name| {
+                !transform
+                    .field_insertions
+                    .contains_key(&Some(Cow::Borrowed(field_name)))
+            })
+            .count();
+    let field_transform_list_id = call!(visitor, make_field_list, field_transform_count);
 
-    // First, the replacements, with their optional child expression
-    for (field_name, expr) in &transform.field_replacements {
-        let mut expr_list_id = 0;
-        if let Some(expr) = expr {
-            expr_list_id = call!(visitor, make_field_list, 1);
-            visit_expression_impl(visitor, expr, expr_list_id);
+    // Process field replacements. Process insertions for replaced fields at the same time.
+    for (field_name, replacement) in &transform.field_replacements {
+        let replacement = replacement.as_slice();
+        let insertions = transform
+            .field_insertions
+            .get(&Some(Cow::Borrowed(field_name)))
+            .map_or_else(|| Cow::Owned(Vec::new()), Cow::Borrowed);
+
+        let mut child_list_id = 0;
+        let child_list_len = replacement.len() + insertions.len();
+        if child_list_len > 0 {
+            child_list_id = call!(visitor, make_field_list, child_list_len);
+            for expr in replacement {
+                visit_expression_impl(visitor, expr, child_list_id);
+            }
+            for expr in insertions.as_ref() {
+                visit_expression_impl(visitor, expr, child_list_id);
+            }
         }
-        let field_name = kernel_string_slice!(field_name);
+
         call!(
             visitor,
-            visit_transform_op,
-            op_list_id,
-            false,
-            &field_name,
-            expr_list_id
+            visit_field_transform,
+            field_transform_list_id,
+            &kernel_string_slice!(field_name),
+            child_list_id,
+            true // input field is replaced by these insertions
         );
     }
 
-    // Then the insertions, with their optional name and list of child expressions
+    // Process any insertions that were not already handled in the previous loop
     for (field_name, exprs) in &transform.field_insertions {
+        if let Some(field_name) = field_name {
+            if transform
+                .field_replacements
+                .contains_key(field_name.as_ref())
+            {
+                continue; // already processed in the other loop
+            }
+        }
+
         // Field name is optional and string slices are finicky, so we have to do a little dance:
         // 1. Build an Option<KernelStringSlice> (None => None)
         // 2. Create a pointer from that option (None => NULL)
         let field_name = field_name.as_ref().map(|name| kernel_string_slice!(name));
         let field_name = field_name.as_ref().map_or_else(std::ptr::null, |name| name);
+        let expr_list_id = call!(visitor, make_field_list, exprs.len());
         for expr in exprs {
-            let expr_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, expr, expr_list_id);
-            call!(
-                visitor,
-                visit_transform_op,
-                op_list_id,
-                true,
-                field_name,
-                expr_list_id
-            );
         }
+        call!(
+            visitor,
+            visit_field_transform,
+            field_transform_list_id,
+            field_name,
+            expr_list_id,
+            false // input field passes through unchanged, followed by these insertions
+        );
     }
 
     call!(
@@ -448,7 +480,7 @@ fn visit_expression_transform(
         visit_transform_expr,
         sibling_list_id,
         path_list_id,
-        op_list_id
+        field_transform_list_id
     );
 }
 

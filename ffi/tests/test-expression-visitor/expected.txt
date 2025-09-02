@@ -34,7 +34,6 @@ StructExpression
       String(prepended)
     Insert(a)
       String(first)
-    Insert(a)
       Transform
         Drop(gone)
         Replace(stub)
@@ -43,7 +42,6 @@ StructExpression
           Boolean(1)
         Insert(y)
           Boolean(0)
-    Insert(a)
       String(third)
     Drop(dropme)
     Replace(replaceme)

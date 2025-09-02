@@ -59,7 +59,7 @@ enum ExpressionType {
   Unary,
   Column,
   Transform,
-  TransformOp,
+  FieldTransform,
   OpaqueExpression,
   OpaquePredicate,
   Unknown,
@@ -92,12 +92,12 @@ struct Unary {
 };
 struct TransformExpression {
   ExpressionItemList input_path;
-  ExpressionItemList ops;
+  ExpressionItemList field_transforms;
 };
-struct TransformOp {
-  bool is_insert;
+struct FieldTransform {
   char* field_name;
-  ExpressionItemList expr;
+  ExpressionItemList exprs;
+  bool is_replace;
 };
 struct OpaqueExpression {
   HandleSharedOpaqueExpressionOp op;
@@ -298,8 +298,8 @@ DEFINE_VARIADIC(visit_expr_struct_expr, StructExpression)
 
 // Sort by field name, breaking ties by pointer address to ensure stability.
 int transform_op_cmp(const void* a, const void* b) {
-  const struct TransformOp* op_a = ((ExpressionItem*)a)->ref;
-  const struct TransformOp* op_b = ((ExpressionItem*)b)->ref;
+  const struct FieldTransform* op_a = ((ExpressionItem*)a)->ref;
+  const struct FieldTransform* op_b = ((ExpressionItem*)b)->ref;
   if (op_a->field_name == NULL && op_b->field_name == NULL) {
     // break tie below
   } else if (op_a->field_name == NULL) {
@@ -329,27 +329,29 @@ void visit_transform_expr(
 {
   struct TransformExpression* transform = malloc(sizeof(struct TransformExpression));
   transform->input_path = get_expr_list(data, input_path_list_id);
-  transform->ops = get_expr_list(data, child_list_id);
+  transform->field_transforms = get_expr_list(data, child_list_id);
+
   // stable sort the ops by field name to ensure deterministic output
   qsort(
-      transform->ops.list,
-      transform->ops.len,
+      transform->field_transforms.list,
+      transform->field_transforms.len,
       sizeof(ExpressionItem),
       transform_op_cmp);
+
   put_expr_item(data, sibling_list_id, transform, Transform);
 }
-void visit_transform_op(
+void visit_field_transform(
     void* data,
     uintptr_t sibling_list_id,
-    bool is_insert,
     const KernelStringSlice* field_name,
-    uintptr_t child_list_id)
+    uintptr_t child_list_id,
+    bool is_replace)
 {
-  struct TransformOp* op = malloc(sizeof(struct TransformOp));
-  op->is_insert = is_insert;
-  op->field_name = field_name? allocate_string(*field_name) : NULL;
-  op->expr = get_expr_list(data, child_list_id);
-  put_expr_item(data, sibling_list_id, op, TransformOp);
+  struct FieldTransform* field_transform = malloc(sizeof(struct FieldTransform));
+  field_transform->field_name = field_name? allocate_string(*field_name) : NULL;
+  field_transform->exprs = get_expr_list(data, child_list_id);
+  field_transform->is_replace = is_replace;
+  put_expr_item(data, sibling_list_id, field_transform, FieldTransform);
 }
 void visit_opaque_expr(
     void *data,
@@ -446,7 +448,7 @@ uintptr_t make_field_list(void* data, uintptr_t reserve) {
 
 ExpressionItemList construct_expression(SharedExpression* expression) {
   ExpressionBuilder data = { 0 };
-  make_field_list(&data, 0); // list id 0 is the invalid/missing list
+  make_field_list(&data, 0); // list id 0 is the invalid/missing/empty list
 
   EngineExpressionVisitor visitor = {
     .data = &data,
@@ -484,7 +486,7 @@ ExpressionItemList construct_expression(SharedExpression* expression) {
     .visit_column = visit_expr_column,
     .visit_struct_expr = visit_expr_struct_expr,
     .visit_transform_expr = visit_transform_expr,
-    .visit_transform_op = visit_transform_op,
+    .visit_field_transform = visit_field_transform,
     .visit_opaque_pred = visit_opaque_pred,
     .visit_opaque_expr = visit_opaque_expr,
     .visit_unknown = visit_unknown,
@@ -559,15 +561,15 @@ void free_expression_item(ExpressionItem ref) {
     case Transform: {
       struct TransformExpression* transform = ref.ref;
       free_expression_list(transform->input_path);
-      free_expression_list(transform->ops);
+      free_expression_list(transform->field_transforms);
       free(transform);
       break;
     }
-    case TransformOp: {
-      struct TransformOp* op = ref.ref;
-      free(op->field_name);
-      free_expression_list(op->expr);
-      free(op);
+    case FieldTransform: {
+      struct FieldTransform* field_transform = ref.ref;
+      free(field_transform->field_name);
+      free_expression_list(field_transform->exprs);
+      free(field_transform);
       break;
     }
     case OpaqueExpression: {
