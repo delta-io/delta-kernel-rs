@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryPredicate,
+    OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression,
+    UnaryPredicate,
 };
 use crate::utils::CowExt as _;
 
@@ -81,6 +82,15 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_not(pred)
     }
 
+    /// Called for each [`UnaryExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_unary`] if they wish to recursively transform the child.
+    fn transform_expr_unary(
+        &mut self,
+        expr: &'a UnaryExpression,
+    ) -> Option<Cow<'a, UnaryExpression>> {
+        self.recurse_into_expr_unary(expr)
+    }
+
     /// Called for each [`UnaryPredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_pred_unary`] if they wish to recursively transform the child.
     fn transform_pred_unary(
@@ -151,6 +161,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Transform(t) => self
                 .transform_expr_transform(t)?
                 .map_owned_or_else(expr, Expression::Transform),
+            Expression::Unary(u) => self
+                .transform_expr_unary(u)?
+                .map_owned_or_else(expr, Expression::Unary),
             Expression::Binary(b) => self
                 .transform_expr_binary(b)?
                 .map_owned_or_else(expr, Expression::Binary),
@@ -251,6 +264,16 @@ pub trait ExpressionTransform<'a> {
         let right = self.transform_expr(&b.right)?;
         let f = |(left, right)| BinaryPredicate::new(b.op, left, right);
         Some((left, right).map_owned_or_else(b, f))
+    }
+
+    /// Recursively transforms a unary expression's child. Returns `None` if the child was removed,
+    /// `Some(Cow::Owned)` if the child was changed, and `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_unary(
+        &mut self,
+        u: &'a UnaryExpression,
+    ) -> Option<Cow<'a, UnaryExpression>> {
+        let nested_result = self.transform_expr(&u.expr)?;
+        Some(nested_result.map_owned_or_else(u, |expr| UnaryExpression::new(u.op, expr)))
     }
 
     /// Recursively transforms a binary expression's children. Returns `None` if at least one child

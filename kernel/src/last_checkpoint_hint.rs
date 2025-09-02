@@ -12,7 +12,7 @@ use url::Url;
 /// Name of the _last_checkpoint file that provides metadata about the last checkpoint
 /// created for the table. This file is used as a hint for the engine to quickly locate
 /// the latest checkpoint without a full directory listing.
-pub(crate) const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
+const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
 // Note: Schema can not be derived because the checkpoint schema is only known at runtime.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,6 +37,11 @@ pub(crate) struct LastCheckpointHint {
 }
 
 impl LastCheckpointHint {
+    // Returns the path the last checkpoint file given the log root of a table.
+    pub(crate) fn path(log_root: &Url) -> DeltaResult<Url> {
+        Ok(log_root.join(LAST_CHECKPOINT_FILE_NAME)?)
+    }
+
     /// Try reading the `_last_checkpoint` file.
     ///
     /// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without
@@ -49,7 +54,7 @@ impl LastCheckpointHint {
         storage: &dyn StorageHandler,
         log_root: &Url,
     ) -> DeltaResult<Option<LastCheckpointHint>> {
-        let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
+        let file_path = Self::path(log_root)?;
         match storage.read_files(vec![(file_path, None)])?.next() {
             Some(Ok(data)) => Ok(serde_json::from_slice(&data)
                 .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
