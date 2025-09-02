@@ -16,7 +16,7 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
@@ -358,6 +358,7 @@ pub(crate) enum FieldTransformSpec {
     /// Inserts a partition column after the named input column. The partition column is identified
     /// by its field index in the logical table schema (the column is not present in the physical
     /// read schema). Its value varies from file to file and is obtained from file metadata.
+    /// This also covers metadata columns like CDF columns that vary per file.
     PartitionColumn {
         field_index: usize,
         insert_after: Option<String>,
@@ -477,7 +478,7 @@ impl Scan {
     /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
     /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
     /// from input to output unchanged and in the same relative order.
-    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
+    pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
         let mut transform_spec = TransformSpec::new();
         let mut last_physical_field: Option<&str> = None;
 
@@ -810,6 +811,71 @@ impl Scan {
             .map(|x| x?);
         Ok(result)
     }
+}
+
+/// Builds a transform expression from a transform spec and field values.
+/// This is a shared utility used by both regular scans and CDF scans.
+pub(crate) fn build_transform_expr(
+    transform_spec: &[FieldTransformSpec],
+    mut field_values: HashMap<usize, (String, Expression)>,
+) -> DeltaResult<ExpressionRef> {
+    let mut transform = crate::expressions::Transform::new();
+
+    for field_transform in transform_spec {
+        use FieldTransformSpec::*;
+        transform = match field_transform {
+            StaticInsert { insert_after, expr } => {
+                transform.with_inserted_field(insert_after.clone(), expr.clone())
+            }
+            StaticReplace { field_name, expr } => {
+                transform.with_replaced_field(field_name.clone(), expr.clone())
+            }
+            StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
+            PartitionColumn {
+                field_index,
+                insert_after,
+            } => {
+                if let Some((_, field_value)) = field_values.remove(field_index) {
+                    let field_value = Arc::new(field_value);
+                    transform.with_inserted_field(insert_after.clone(), field_value)
+                } else {
+                    // Missing field value is fine - this might be a partition column that doesn't
+                    // exist in this file or a CDF metadata column that isn't applicable
+                    transform
+                }
+            }
+        }
+    }
+
+    Ok(Arc::new(Expression::Transform(transform)))
+}
+
+/// Parse partition values for the given transform spec and convert them to expressions.
+/// This is a shared utility used by both regular scans and CDF scans.
+pub(crate) fn parse_partition_values_to_expressions(
+    logical_schema: &StructType,
+    transform_spec: &[FieldTransformSpec],
+    partition_values: &HashMap<String, String>,
+) -> DeltaResult<HashMap<usize, (String, Expression)>> {
+    let mut result = HashMap::new();
+
+    for field_transform in transform_spec {
+        if let FieldTransformSpec::PartitionColumn { field_index, .. } = field_transform {
+            let field = logical_schema.fields.get_index(*field_index);
+            let Some((_, field)) = field else {
+                continue;
+            };
+            let name = field.physical_name();
+
+            // Check if this field is a traditional partition column (has partition values)
+            if let Some(value_str) = partition_values.get(name) {
+                let partition_value = parse_partition_value(Some(value_str), field.data_type())?;
+                result.insert(*field_index, (name.to_string(), partition_value.into()));
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// Get the schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.

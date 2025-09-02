@@ -2,8 +2,6 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
-
 use super::data_skipping::DataSkippingFilter;
 use super::{ScanMetadata, TransformSpec};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -12,7 +10,7 @@ use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
-use crate::scan::{FieldTransformSpec, Scalar};
+
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::utils::require;
@@ -122,85 +120,9 @@ impl AddRemoveDedupVisitor<'_> {
         }
     }
 
-    fn parse_partition_value(
-        &self,
-        field_idx: usize,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<(usize, (String, Scalar))> {
-        let field = self.logical_schema.fields.get_index(field_idx);
-        let Some((_, field)) = field else {
-            return Err(Error::InternalError(format!(
-                "out of bounds partition column field index {field_idx}"
-            )));
-        };
-        let name = field.physical_name();
-        let partition_value =
-            super::parse_partition_value(partition_values.get(name), field.data_type())?;
-        Ok((field_idx, (name.to_string(), partition_value)))
-    }
-
-    fn parse_partition_values(
-        &self,
-        transform_spec: &TransformSpec,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
-        transform_spec
-            .iter()
-            .filter_map(|field_transform| match field_transform {
-                FieldTransformSpec::PartitionColumn { field_index, .. } => {
-                    Some(self.parse_partition_value(*field_index, partition_values))
-                }
-                FieldTransformSpec::StaticInsert { .. }
-                | FieldTransformSpec::StaticReplace { .. }
-                | FieldTransformSpec::StaticDrop { .. } => None,
-            })
-            .try_collect()
-    }
-
-    /// Compute an expression that will transform from physical to logical for a given Add file action
-    ///
-    /// An empty `transform_spec` is valid and represents the case where only column mapping is needed
-    /// (e.g., no partition columns to inject). The resulting empty `Expression::Transform` will
-    /// pass all input fields through unchanged while applying the output schema for name mapping.
-    fn get_transform_expr(
-        &self,
-        transform_spec: &TransformSpec,
-        mut partition_values: HashMap<usize, (String, Scalar)>,
-    ) -> DeltaResult<ExpressionRef> {
-        let mut transform = crate::expressions::Transform::new();
-
-        for field_transform in transform_spec {
-            use FieldTransformSpec::*;
-            transform = match field_transform {
-                StaticInsert { insert_after, expr } => {
-                    transform.with_inserted_field(insert_after.clone(), expr.clone())
-                }
-                StaticReplace { field_name, expr } => {
-                    transform.with_replaced_field(field_name.clone(), expr.clone())
-                }
-                StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
-                PartitionColumn {
-                    field_index,
-                    insert_after,
-                } => {
-                    let Some((_, partition_value)) = partition_values.remove(field_index) else {
-                        return Err(Error::InternalError(format!(
-                            "missing partition value for field index {field_index}"
-                        )));
-                    };
-
-                    let partition_value = Arc::new(partition_value.into());
-                    transform.with_inserted_field(insert_after.clone(), partition_value)
-                }
-            }
-        }
-
-        Ok(Arc::new(Expression::Transform(transform)))
-    }
-
     fn is_file_partition_pruned(
         &self,
-        partition_values: &HashMap<usize, (String, Scalar)>,
+        partition_values: &HashMap<usize, (String, Expression)>,
     ) -> bool {
         if partition_values.is_empty() {
             return false;
@@ -208,11 +130,24 @@ impl AddRemoveDedupVisitor<'_> {
         let Some(partition_filter) = &self.partition_filter else {
             return false;
         };
-        let partition_values: HashMap<_, _> = partition_values
+        // Only use literal expressions for partition pruning (traditional partitions)
+        // Skip dynamic expressions like CDF metadata columns
+        let literal_partition_values: HashMap<_, _> = partition_values
             .values()
-            .map(|(k, v)| (ColumnName::new([k]), v.clone()))
+            .filter_map(|(k, v)| {
+                if let Expression::Literal(scalar) = v {
+                    Some((ColumnName::new([k]), scalar.clone()))
+                } else {
+                    None
+                }
+            })
             .collect();
-        let evaluator = DefaultKernelPredicateEvaluator::from(partition_values);
+
+        if literal_partition_values.is_empty() {
+            return false;
+        }
+
+        let evaluator = DefaultKernelPredicateEvaluator::from(literal_partition_values);
         evaluator.eval_sql_where(partition_filter) == Some(false)
     }
 
@@ -244,7 +179,11 @@ impl AddRemoveDedupVisitor<'_> {
             Some(transform) if is_add => {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values = self.parse_partition_values(transform, &partition_values)?;
+                let partition_values = super::parse_partition_values_to_expressions(
+                    &self.logical_schema,
+                    transform,
+                    &partition_values,
+                )?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -260,7 +199,7 @@ impl AddRemoveDedupVisitor<'_> {
         let transform = self
             .transform_spec
             .as_ref()
-            .map(|transform| self.get_transform_expr(transform, partition_values))
+            .map(|transform| super::build_transform_expr(transform, partition_values))
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
