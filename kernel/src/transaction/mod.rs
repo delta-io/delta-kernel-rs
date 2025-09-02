@@ -7,6 +7,7 @@ use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn
 use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
 use crate::path::ParsedLogPath;
+use crate::scan::ScanBuilder;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{
@@ -28,7 +29,7 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
+/// This function specifies the schema for the add_files metadata.
 /// Concretely, it is the expected schema for engine data passed to [`add_files`].
 ///
 /// Each row represents metadata about a file to be added to the table.
@@ -66,6 +67,7 @@ pub struct Transaction {
     // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
+    is_data_change: bool,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -107,6 +109,7 @@ impl Transaction {
             add_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
+            is_data_change: true,
         })
     }
 
@@ -178,6 +181,14 @@ impl Transaction {
         }
     }
 
+    // Set whether this transaction represents a logical data change for the table.
+    // Operations are not a data change when they just reorganize rows within files
+    // but do not add, remove or modify the data in the table otherwise.
+    pub fn with_is_data_change(mut self, is_data_change: bool) -> Self {
+        self.is_data_change = is_data_change;
+        self
+    }
+
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
@@ -232,6 +243,13 @@ impl Transaction {
         )
     }
 
+    // Creates a new [`ScanBuilder`] that can read the table in the given transaction.
+    // The transaction offers snapshot isolation, this method can be called multiple
+    // times and each Scan produced by the builder will read at a consistent snapshot.
+    pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
+        todo!("implement")
+    }
+
     /// Add files to include in this transaction. This API generally enables the engine to
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
@@ -239,6 +257,19 @@ impl Transaction {
     /// The expected schema for `add_metadata` is given by [`add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
+    }
+
+    /// Provide a list of files to remove from the table in this transaction. This API together
+    /// with add_files allows engines to delete and update rows at the table at a file level
+    /// granularity.
+    ///
+    /// The metadata passed in here is expected to be taken from the output of a scan of the
+    /// table (i.e. using [`scan_builder`]).
+    /// The expected schema for `remove_metadata` is given by [`crate::scan::scan_row_schema`].
+    pub fn remove_files(&mut self, remove_metadata: Box<dyn EngineData>) {
+        // Avoid warnings until implementation
+        drop(remove_metadata);
+        todo!("implement remove files method")
     }
 }
 
