@@ -752,7 +752,10 @@ mod tests {
             &batch,
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
-        assert!(result.unwrap_err().to_string().contains("reference invalid input field names"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
         // Test unused insertion keys
         let transform2 = Transform::new_top_level()
@@ -765,7 +768,10 @@ mod tests {
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().to_string().contains("reference invalid input field names"));
+        assert!(result2
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
         // Test column count mismatch
         let transform3 = Transform::new_top_level().with_dropped_field("a");
