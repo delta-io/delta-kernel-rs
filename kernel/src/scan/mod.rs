@@ -857,25 +857,37 @@ pub(crate) fn parse_partition_values_to_expressions(
     transform_spec: &[FieldTransformSpec],
     partition_values: &HashMap<String, String>,
 ) -> DeltaResult<HashMap<usize, (String, Expression)>> {
-    let mut result = HashMap::new();
-
-    for field_transform in transform_spec {
-        if let FieldTransformSpec::PartitionColumn { field_index, .. } = field_transform {
-            let field = logical_schema.fields.get_index(*field_index);
+    transform_spec
+        .iter()
+        .filter_map(|field_transform| match field_transform {
+            FieldTransformSpec::PartitionColumn { field_index, .. } => Some(*field_index),
+            FieldTransformSpec::StaticInsert { .. }
+            | FieldTransformSpec::StaticReplace { .. }
+            | FieldTransformSpec::StaticDrop { .. } => None,
+        })
+        .filter_map(|field_index| {
+            // Get field info from logical schema (with proper error handling)
+            let field = logical_schema.fields.get_index(field_index);
             let Some((_, field)) = field else {
-                continue;
+                return Some(Err(Error::InternalError(format!(
+                    "out of bounds partition column field index {field_index}"
+                ))));
             };
             let name = field.physical_name();
 
-            // Check if this field is a traditional partition column (has partition values)
+            // Only include partition columns that have actual values
             if let Some(value_str) = partition_values.get(name) {
-                let partition_value = parse_partition_value(Some(value_str), field.data_type())?;
-                result.insert(*field_index, (name.to_string(), partition_value.into()));
+                let partition_value: Result<Scalar, Error> =
+                    parse_partition_value(Some(value_str), field.data_type());
+                match partition_value {
+                    Ok(value) => Some(Ok((field_index, (name.to_string(), value.into())))),
+                    Err(e) => Some(Err(e)),
+                }
+            } else {
+                None // Skip missing partition columns
             }
-        }
-    }
-
-    Ok(result)
+        })
+        .try_collect()
 }
 
 /// Get the schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.

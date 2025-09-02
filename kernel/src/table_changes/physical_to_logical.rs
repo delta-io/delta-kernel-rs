@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::expressions::{Expression, ExpressionRef, Scalar};
 use crate::scan::FieldTransformSpec;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::DeltaResult;
+use crate::{DeltaResult, Error};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{
@@ -37,7 +37,9 @@ pub(crate) fn get_cdf_expressions_by_index(
         if let FieldTransformSpec::PartitionColumn { field_index, .. } = field_transform {
             let field = logical_schema.fields.get_index(*field_index);
             let Some((_, field)) = field else {
-                continue;
+                return Err(Error::generic(
+                    "logical schema did not contain expected field, can't transform data",
+                ));
             };
             let field_name = field.name();
 
@@ -73,17 +75,54 @@ pub(crate) fn create_unified_transform_expr(
     logical_schema: &StructType,
     transform_spec: &[FieldTransformSpec],
 ) -> DeltaResult<ExpressionRef> {
-    // Start with traditional partition values using the shared utility
+    // 🔥 TWO-STEP APPROACH: Clean separation of concerns
+    // Print for debugging, but avoid requiring Debug on FieldTransformSpec.
+    eprintln!(
+        "🔍 DEBUG: logical_schema fields: {:?}",
+        logical_schema
+            .fields()
+            .map(|f| f.name())
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "🔍 DEBUG: transform_spec details: {:?}",
+        transform_spec
+            .iter()
+            .map(|spec| match spec {
+                FieldTransformSpec::PartitionColumn {
+                    field_index,
+                    insert_after,
+                } => Some(format!(
+                    "PartitionColumn(field_index: {}, insert_after: {:?})",
+                    field_index, insert_after
+                )),
+                _ => Some("Other".to_string()),
+            })
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "🔍 DEBUG: scan_file.partition_values: {:?}",
+        scan_file.partition_values
+    );
+
+    // Step 1: Handle regular partition columns (automatically skips CDF metadata)
     let mut field_values = crate::scan::parse_partition_values_to_expressions(
         logical_schema,
         transform_spec,
-        &scan_file.partition_values,
+        &scan_file.partition_values, // Only contains real partition columns
     )?;
 
-    // Add CDF metadata expressions
+    eprintln!("🔍 DEBUG: field_values: {:?}", field_values);
+
+    // Step 2: Add back only the requested CDF metadata columns
     let cdf_expressions = get_cdf_expressions_by_index(scan_file, logical_schema, transform_spec)?;
+    eprintln!("🔍 DEBUG: cdf_expressions: {:?}", cdf_expressions);
     field_values.extend(cdf_expressions);
 
-    // Use the shared transform building utility
-    crate::scan::build_transform_expr(transform_spec, field_values)
+    // Build the final transform expression
+    let result = crate::scan::build_transform_expr(transform_spec, field_values)?;
+    eprintln!("🔍 DEBUG: result: {:?}", result);
+    eprintln!("--------------------------------");
+
+    Ok(result)
 }
