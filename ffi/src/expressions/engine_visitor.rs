@@ -13,7 +13,6 @@ use delta_kernel::expressions::{
     UnaryPredicateOp,
 };
 
-use std::borrow::Cow;
 use std::ffi::c_void;
 
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
@@ -394,45 +393,46 @@ fn visit_expression_transform(
     transform: &Transform,
     sibling_list_id: usize,
 ) {
+    let Transform {
+        input_path,
+        field_transforms,
+        prepended_fields,
+    } = transform;
+
     // Treat the input path like a column expression
     let mut path_list_id = 0;
-    if let Some(ref name) = transform.input_path {
+    if let Some(ref column_name) = input_path {
         path_list_id = call!(visitor, make_field_list, 1);
-        visit_expression_column(visitor, name, path_list_id);
+        visit_expression_column(visitor, column_name, path_list_id);
     };
 
-    // Create one field transform for each named input field (plus one more for the prepended
-    // fields, if any). This is a set union, so don't double count fields that appear in both.
-    let field_transform_count = transform.field_insertions.len()
-        + transform
-            .field_replacements
-            .keys()
-            .filter(|field_name| {
-                !transform
-                    .field_insertions
-                    .contains_key(&Some(Cow::Borrowed(field_name)))
-            })
-            .count();
+    // Emit one field transform for each named input field (ignoring no-ops), plus one more for the
+    // prepended field list (if any).
+    let prepended_count = if prepended_fields.is_empty() { 0 } else { 1 };
+    let field_transform_count = prepended_count + field_transforms.len();
     let field_transform_list_id = call!(visitor, make_field_list, field_transform_count);
 
-    // Process field replacements. Process insertions for replaced fields at the same time.
-    for (field_name, replacement) in &transform.field_replacements {
-        let replacement = replacement.as_slice();
-        let insertions = transform
-            .field_insertions
-            .get(&Some(Cow::Borrowed(field_name)))
-            .map_or_else(|| Cow::Owned(Vec::new()), Cow::Borrowed);
+    // Process the prepend first (if any)
+    if !prepended_fields.is_empty() {
+        let child_list_id = call!(visitor, make_field_list, prepended_fields.len());
+        for expr in prepended_fields {
+            visit_expression_impl(visitor, expr, child_list_id);
+        }
+        call!(
+            visitor,
+            visit_field_transform,
+            field_transform_list_id,
+            std::ptr::null(),
+            child_list_id,
+            false // doesn't matter, no field name
+        );
+    }
 
-        let mut child_list_id = 0;
-        let child_list_len = replacement.len() + insertions.len();
-        if child_list_len > 0 {
-            child_list_id = call!(visitor, make_field_list, child_list_len);
-            for expr in replacement {
-                visit_expression_impl(visitor, expr, child_list_id);
-            }
-            for expr in insertions.as_ref() {
-                visit_expression_impl(visitor, expr, child_list_id);
-            }
+    // Process each field transform in turn
+    for (field_name, field_transform) in field_transforms {
+        let child_list_id = call!(visitor, make_field_list, field_transform.insertions.len());
+        for expr in &field_transform.insertions {
+            visit_expression_impl(visitor, expr, child_list_id);
         }
 
         call!(
@@ -441,40 +441,11 @@ fn visit_expression_transform(
             field_transform_list_id,
             &kernel_string_slice!(field_name),
             child_list_id,
-            true // input field is replaced by these insertions
+            field_transform.is_replace
         );
     }
 
-    // Process any insertions that were not already handled in the previous loop
-    for (field_name, exprs) in &transform.field_insertions {
-        if let Some(field_name) = field_name {
-            if transform
-                .field_replacements
-                .contains_key(field_name.as_ref())
-            {
-                continue; // already processed in the other loop
-            }
-        }
-
-        // Field name is optional and string slices are finicky, so we have to do a little dance:
-        // 1. Build an Option<KernelStringSlice> (None => None)
-        // 2. Create a pointer from that option (None => NULL)
-        let field_name = field_name.as_ref().map(|name| kernel_string_slice!(name));
-        let field_name = field_name.as_ref().map_or_else(std::ptr::null, |name| name);
-        let expr_list_id = call!(visitor, make_field_list, exprs.len());
-        for expr in exprs {
-            visit_expression_impl(visitor, expr, expr_list_id);
-        }
-        call!(
-            visitor,
-            visit_field_transform,
-            field_transform_list_id,
-            field_name,
-            expr_list_id,
-            false // input field passes through unchanged, followed by these insertions
-        );
-    }
-
+    // Attach the field transforms to the parent transform
     call!(
         visitor,
         visit_transform_expr,

@@ -95,12 +95,12 @@ void print_tree_helper(ExpressionItem ref, int depth) {
       struct FieldTransform* field_transform = ref.ref;
       if (!field_transform->field_name) {
         printf("Prepend\n");
+      } else if (!field_transform->is_replace) {
+        printf("Insert(%s)\n", field_transform->field_name);
       } else if (!field_transform->exprs.len) {
         printf("Drop(%s)\n", field_transform->field_name);
-      } else if (field_transform->is_replace) {
-        printf("Replace(%s)\n", field_transform->field_name);
       } else {
-        printf("Insert(%s)\n", field_transform->field_name);
+        printf("Replace(%s)\n", field_transform->field_name);
       }
       print_expression_item_list(field_transform->exprs, depth + 1);
       break;

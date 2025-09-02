@@ -108,16 +108,15 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     )
     .unwrap();
 
-    let nested_transform = Transform::new()
+    let nested_transform = Transform::new_top_level()
         .with_dropped_field("gone")
         .with_replaced_field("stub", Expr::literal("replaced").into())
         .with_inserted_field(Some("x".to_string()), Expr::literal(true).into())
         .with_inserted_field(Some("y".to_string()), Expr::literal(false).into());
-    let top_level_transform = Transform::new()
-        .with_input_path(column_name!("foo.bar.baz"))
+    let top_level_transform = Transform::new_nested(column_name!("foo.bar.baz"))
         .with_dropped_field("dropme")
         .with_replaced_field("replaceme", Expr::literal(42).into())
-        .with_inserted_field(None, Expr::literal("prepended").into())
+        .with_inserted_field(None::<&str>, Expr::literal("prepended").into())
         .with_inserted_field(Some("a".to_string()), Expr::literal("first").into())
         .with_inserted_field(
             Some("a".to_string()),
