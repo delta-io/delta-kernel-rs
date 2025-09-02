@@ -38,6 +38,7 @@ fn get_segment(
     let log_segment = LogSegment::for_table_changes(
         engine.storage_handler().as_ref(),
         log_root,
+        vec![],
         start_version,
         end_version,
     )?;

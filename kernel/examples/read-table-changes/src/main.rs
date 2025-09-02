@@ -28,7 +28,8 @@ fn main() -> DeltaResult<()> {
     let cli = Cli::parse();
     let url = delta_kernel::try_parse_uri(cli.location_args.path.as_str())?;
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let table_changes = TableChanges::try_new(url, &engine, cli.start_version, cli.end_version)?;
+    let table_changes =
+        TableChanges::try_new(url, vec![], &engine, cli.start_version, cli.end_version)?;
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan

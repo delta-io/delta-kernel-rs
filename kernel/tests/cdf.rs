@@ -27,6 +27,7 @@ fn read_cdf_for_table(
     let engine = DefaultEngine::new_local();
     let table_changes = TableChanges::try_new(
         test_path,
+        vec![],
         engine.as_ref(),
         start_version,
         end_version.into(),

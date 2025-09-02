@@ -58,7 +58,7 @@ pub struct TableChangesScan {
 /// # let path = "./tests/data/table-with-cdf";
 /// # let engine = DefaultEngine::new_local();
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
-/// # let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+/// # let table_changes = TableChanges::try_new(url, vec![], engine.as_ref(), 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
@@ -374,7 +374,8 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+        let table_changes =
+            TableChanges::try_new(url, vec![], engine.as_ref(), 0, Some(1)).unwrap();
 
         let scan = table_changes.into_scan_builder().build().unwrap();
         // Note that this table is not partitioned. `part` is a regular field
@@ -399,7 +400,8 @@ mod tests {
         let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+        let table_changes =
+            TableChanges::try_new(url, vec![], engine.as_ref(), 0, Some(1)).unwrap();
 
         let schema = table_changes
             .schema()
