@@ -900,18 +900,20 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    // Use batch size of 1 to force one record per string input
-    let mut decoder = ReaderBuilder::new(schema.clone())
-        .with_batch_size(1)
-        .build_decoder()?;
+    let mut decoder = ReaderBuilder::new(schema.clone()).build_decoder()?;
     let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
         let mut reader = BufReader::new(json_string.unwrap_or("{}").as_bytes());
-        let buf = reader.fill_buf()?;
-        let read = buf.len();
-        require!(
-            decoder.decode(buf)? == read,
-            Error::missing_data("Incomplete JSON string")
-        );
+        // loop to fill + empty the buffer until end of input. note that we can't just one-shot
+        // attempt to decode the entire thing since the buffer might only contain part of the JSON.
+        // see: https://github.com/delta-io/delta-kernel-rs/pull/1244
+        loop {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            let consumed = decoder.decode(buf)?;
+            reader.consume(consumed);
+        }
         let Some(batch) = decoder.flush()? else {
             return Err(Error::missing_data("Expected data"));
         };
