@@ -1,18 +1,17 @@
 //! Functionality to create and execute table changes scans over the data in the delta table
 
-use std::sync::Arc;
-
 use itertools::Itertools;
+use std::sync::Arc;
 use tracing::debug;
 use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
-use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
+use crate::scan::{ColumnType, PhysicalPredicate, Scan, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, Expression, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
-use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
+use super::physical_to_logical::scan_file_physical_schema;
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{TableChanges, CDF_FIELDS};
@@ -147,10 +146,9 @@ impl TableChangesScanBuilder {
                     .iter()
                     .any(|field| field.name() == logical_field.name())
                 {
-                    // CDF Columns are generated, so they do not have a column mapping. These will
-                    // be processed separately and used to build an expression when transforming physical
-                    // data to logical.
-                    Ok(ColumnType::Selected(logical_field.name().to_string()))
+                    // CDF Columns are generated metadata columns that vary per file (similar to partition columns).
+                    // They will be processed through the transform infrastructure.
+                    Ok(ColumnType::Partition(index))
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
@@ -287,12 +285,22 @@ fn read_scan_file(
         mut selection_vector,
     } = resolved_scan_file;
 
-    let physical_to_logical_expr =
-        physical_to_logical_expr(&scan_file, logical_schema.as_ref(), all_fields)?;
+    // Create transform spec and unified transform expression using shared utilities
+    let transform_spec = Scan::get_transform_spec(all_fields);
+    let physical_to_logical_expr = if transform_spec.is_empty() {
+        // No transforms needed - create identity transform for column mapping only
+        Arc::new(Expression::Transform(crate::expressions::Transform::new()))
+    } else {
+        super::physical_to_logical::create_unified_transform_expr(
+            &scan_file,
+            logical_schema.as_ref(),
+            &transform_spec,
+        )?
+    };
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
-        Arc::new(physical_to_logical_expr),
+        physical_to_logical_expr,
         logical_schema.clone().into(),
     );
     // Determine if the scan file was derived from a deletion vector pair
@@ -383,9 +391,9 @@ mod tests {
             vec![
                 ColumnType::Selected("part".to_string()),
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Selected("_change_type".to_string()),
-                ColumnType::Selected("_commit_version".to_string()),
-                ColumnType::Selected("_commit_timestamp".to_string()),
+                ColumnType::Partition(2), // _change_type
+                ColumnType::Partition(3), // _commit_version
+                ColumnType::Partition(4), // _commit_timestamp
             ]
             .into()
         );
@@ -416,7 +424,7 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Selected("_commit_version".to_string()),
+                ColumnType::Partition(1), // _commit_version (index 1 in projected schema)
             ]
             .into()
         );
