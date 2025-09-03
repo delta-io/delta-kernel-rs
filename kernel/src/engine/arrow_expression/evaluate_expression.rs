@@ -809,9 +809,8 @@ mod tests {
         // Test column count mismatch -- too few output schema fields
         let transform3 = Transform::new_top_level().with_dropped_field("a");
 
-        let wrong_output_schema = StructType::new(vec![
-            StructField::not_null("c", DataType::INTEGER),
-        ]);
+        let wrong_output_schema =
+            StructType::new(vec![StructField::not_null("c", DataType::INTEGER)]);
 
         let expr3 = Expr::Transform(transform3);
         let result3 = evaluate_expression(
