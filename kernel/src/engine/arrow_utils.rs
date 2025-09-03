@@ -906,12 +906,30 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         .build_decoder()?;
     let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
         let mut reader = BufReader::new(json_string.unwrap_or("{}").as_bytes());
-        let buf = reader.fill_buf()?;
-        let read = buf.len();
-        require!(
-            decoder.decode(buf)? == read,
-            Error::missing_data("Incomplete JSON string")
-        );
+        // loop to fill + empty the buffer until end of input. note that we can't just one-shot
+        // attempt to decode the entire thing since the buffer might only contain part of the JSON.
+        // see: https://github.com/delta-io/delta-kernel-rs/pull/1244
+        loop {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            // from `decode` docs:
+            // > Read JSON objects from `buf`, returning the number of bytes read
+            // > This method returns once `batch_size` objects have been parsed since the last call
+            // > to [`Self::flush`], or `buf` is exhausted. Any remaining bytes should be included
+            // > in the next call to [`Self::decode`]
+            //
+            // if we attempt a `parse_one` of e.g. "{}{}", we will parse the first "{}" successfully
+            // then decode will always return immediately sinee we have read `batch_size = 1`,
+            // leading to an infinite loop. Since we always just want to parse one record here, we
+            // detect this by checking if we always consume the entire buffer, and error if not.
+            let consumed = decoder.decode(buf)?;
+            if consumed != buf.len() {
+                return Err(Error::generic("Malformed JSON: Multiple JSON objects"));
+            }
+            reader.consume(consumed);
+        }
         let Some(batch) = decoder.flush()? else {
             return Err(Error::missing_data("Expected data"));
         };
@@ -1048,11 +1066,17 @@ mod tests {
 
         let input: Vec<Option<&str>> = vec![Some("{}{}")];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("multiple objects (complete)");
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
+        ));
 
         let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("multiple objects (partial)");
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
+        ));
 
         let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b"}"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
@@ -1064,6 +1088,24 @@ mod tests {
         assert_eq!(result.column(0).null_count(), 2);
         assert_eq!(result.column(1).null_count(), 2);
         assert_eq!(result.column(2).null_count(), 2);
+    }
+
+    #[test]
+    fn test_parse_json_with_long_strings() {
+        // See issue#1139: https://github.com/delta-io/delta-kernel-rs/issues/1139
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "long_val",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let long_string = "a".repeat(1_000_000); // 1MB string
+        let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
+        let input: Vec<Option<&str>> = vec![Some(&json_string)];
+
+        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let long_col = batch.column(0).as_string::<i32>();
+        assert_eq!(long_col.value(0), long_string);
     }
 
     #[test]
