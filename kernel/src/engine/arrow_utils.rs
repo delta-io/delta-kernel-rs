@@ -1075,24 +1075,21 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_json_with_long_strings() -> DeltaResult<()> {
+    fn test_parse_json_with_long_strings() {
         // See issue#1139: https://github.com/delta-io/delta-kernel-rs/issues/1139
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "long_val",
             ArrowDataType::Utf8,
             true,
         )]));
-
         let long_string = "a".repeat(1_000_000); // 1MB string
-        let json_string = format!(r#"{{"long_val": "{}"}}"#, long_string);
+        let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
         let input: Vec<Option<&str>> = vec![Some(&json_string)];
 
-        let batch = parse_json_impl(&input.into(), schema.clone())?;
-
+        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);
-        Ok(())
     }
 
     #[test]
