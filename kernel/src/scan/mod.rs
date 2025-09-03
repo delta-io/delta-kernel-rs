@@ -333,6 +333,7 @@ pub fn get_transform_for_row(
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// [`TransformSpec`].
+#[derive(Clone)]
 pub(crate) enum FieldTransformSpec {
     /// Insert the given expression after the named input column (None = prepend instead)
     // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
@@ -850,6 +851,41 @@ pub(crate) fn build_transform_expr(
     Ok(Arc::new(Expression::Transform(transform)))
 }
 
+/// Parse field expressions for the given transform spec and convert them to indexed expressions.
+/// This is a unified utility that handles both partition values and CDF metadata as expressions.
+pub(crate) fn parse_field_values_to_expressions(
+    logical_schema: &StructType,
+    transform_spec: &[FieldTransformSpec],
+    field_expressions: &HashMap<String, Expression>,
+) -> DeltaResult<HashMap<usize, (String, Expression)>> {
+    let mut result = HashMap::new();
+
+    // Process all partition columns in the transform spec
+    for field_transform in transform_spec {
+        if let FieldTransformSpec::PartitionColumn { field_index, .. } = field_transform {
+            let field = logical_schema.fields.get_index(*field_index);
+            let Some((_, field)) = field else {
+                return Err(Error::InternalError(format!(
+                    "out of bounds partition column field index {field_index}"
+                )));
+            };
+            let field_name = field.name();
+
+            // Check if we have an expression for this field (logical name first, then physical name)
+            let expression = field_expressions
+                .get(field_name)
+                .or_else(|| field_expressions.get(field.physical_name()));
+
+            if let Some(expr) = expression {
+                result.insert(*field_index, (field_name.to_string(), expr.clone()));
+            }
+            // If not found, skip this field (will be handled as Null by build_transform_expr)
+        }
+    }
+
+    Ok(result)
+}
+
 /// Parse partition values for the given transform spec and convert them to expressions.
 /// This is a shared utility used by both regular scans and CDF scans.
 pub(crate) fn parse_partition_values_to_expressions(
@@ -857,37 +893,29 @@ pub(crate) fn parse_partition_values_to_expressions(
     transform_spec: &[FieldTransformSpec],
     partition_values: &HashMap<String, String>,
 ) -> DeltaResult<HashMap<usize, (String, Expression)>> {
-    transform_spec
-        .iter()
-        .filter_map(|field_transform| match field_transform {
-            FieldTransformSpec::PartitionColumn { field_index, .. } => Some(*field_index),
-            FieldTransformSpec::StaticInsert { .. }
-            | FieldTransformSpec::StaticReplace { .. }
-            | FieldTransformSpec::StaticDrop { .. } => None,
-        })
-        .filter_map(|field_index| {
-            // Get field info from logical schema (with proper error handling)
-            let field = logical_schema.fields.get_index(field_index);
-            let Some((_, field)) = field else {
-                return Some(Err(Error::InternalError(format!(
-                    "out of bounds partition column field index {field_index}"
-                ))));
-            };
-            let name = field.physical_name();
+    // Convert string partition values to expressions first
+    let mut field_expressions = HashMap::new();
 
-            // Only include partition columns that have actual values
-            if let Some(value_str) = partition_values.get(name) {
-                let partition_value: Result<Scalar, Error> =
-                    parse_partition_value(Some(value_str), field.data_type());
-                match partition_value {
-                    Ok(value) => Some(Ok((field_index, (name.to_string(), value.into())))),
-                    Err(e) => Some(Err(e)),
-                }
-            } else {
-                None // Skip missing partition columns
+    for field_transform in transform_spec {
+        if let FieldTransformSpec::PartitionColumn { field_index, .. } = field_transform {
+            let field = logical_schema.fields.get_index(*field_index);
+            let Some((_, field)) = field else {
+                return Err(Error::InternalError(format!(
+                    "out of bounds partition column field index {field_index}"
+                )));
+            };
+            let physical_name = field.physical_name();
+
+            // Convert string partition value to expression if present
+            if let Some(value_str) = partition_values.get(physical_name) {
+                let partition_value = parse_partition_value(Some(value_str), field.data_type())?;
+                field_expressions.insert(physical_name.to_string(), partition_value.into());
             }
-        })
-        .try_collect()
+        }
+    }
+
+    // Use the unified function with the converted expressions
+    parse_field_values_to_expressions(logical_schema, transform_spec, &field_expressions)
 }
 
 /// Get the schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.
