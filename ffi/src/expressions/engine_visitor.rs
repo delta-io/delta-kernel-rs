@@ -170,20 +170,22 @@ pub struct EngineExpressionVisitor {
     /// The sub-expressions (fields) of the struct are in a list identified by `child_list_id`
     pub visit_struct_expr:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
-    /// Visits a `Transform` expression belonging to the list identified by `sibling_list_id`.
-    /// The `input_path_list_id` identifies the transform's input path (0 = no path).
-    /// The `child_list_id` identifies the transform's field operations (0 = identity transform).
+    /// Visits a `Transform` expression belonging to the list identified by `sibling_list_id`. The
+    /// `input_path_list_id` is a single-item list containing transform's input path as a column
+    /// reference (0 = no path). The `field_transform_list_id` identifies the list of field
+    /// transforms to apply (0 = identity transform). See also [`visit_field_transform`].
     pub visit_transform_expr: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
         input_path_list_id: usize,
-        child_list_id: usize,
+        field_transform_list_id: usize,
     ),
-    /// Visits one field transform of a `Transform` expression belonging to the list identified by
+    /// Visits one field transform of a `Transform` expression that owns the list identified by
     /// `sibling_list_id`.
     ///
     /// A field transform is modeled as the triple `(field_name, expr_list, is_replace)`, as
-    /// described by the truth table below. The field name (if present) always references a field of
+    /// described by the truth table below. The `expr_list_id` identifies the list of expressions
+    /// the field transform should emit. The field name (if present) always references a field of
     /// the input struct. Both the field name and the expression list are optional:
     ///
     /// |field_name? |expr_list? |is_replace? |meaning|
@@ -208,7 +210,7 @@ pub struct EngineExpressionVisitor {
         data: *mut c_void,
         sibling_list_id: usize,
         field_name: *const KernelStringSlice,
-        child_list_id: usize,
+        expr_list_id: usize,
         is_replace: bool,
     ),
     /// Visits the operator (`op`) and children (`child_list_id`) of an opaque expression belonging
@@ -430,8 +432,8 @@ fn visit_expression_transform(
 
     // Process each field transform in turn
     for (field_name, field_transform) in field_transforms {
-        let child_list_id = call!(visitor, make_field_list, field_transform.insertions.len());
-        for expr in &field_transform.insertions {
+        let child_list_id = call!(visitor, make_field_list, field_transform.exprs.len());
+        for expr in &field_transform.exprs {
             visit_expression_impl(visitor, expr, child_list_id);
         }
 

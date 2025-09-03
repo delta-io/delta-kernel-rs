@@ -163,7 +163,7 @@ fn evaluate_transform_expression(
 
         // Process any insertions that come after this field
         if let Some(field_transform) = field_transform {
-            for expr in &field_transform.insertions {
+            for expr in &field_transform.exprs {
                 output_cols.push(evaluate_expression(expr, batch, None)?);
             }
             used_field_transforms += 1;

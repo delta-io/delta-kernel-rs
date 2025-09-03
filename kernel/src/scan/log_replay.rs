@@ -560,7 +560,7 @@ mod tests {
             let (field_name, field_transform) = field_transforms.next().unwrap();
             assert_eq!(field_name, "value");
             assert!(!field_transform.is_replace);
-            let [expr] = &field_transform.insertions[..] else {
+            let [expr] = &field_transform.exprs[..] else {
                 panic!("Expected a single insertion");
             };
             let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {

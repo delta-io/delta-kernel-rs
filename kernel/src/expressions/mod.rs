@@ -263,9 +263,9 @@ impl OpaqueExpression {
 /// could insert 0+ new fields after the target, or could replace the target with 0+ a new fields).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FieldTransform {
-    /// The set of expressions to insert at the target location.
-    pub insertions: Vec<ExpressionRef>,
-    /// If true, the insertions will replace the target input field instead of following after it.
+    /// The list of expressions this field transform emits at the target location.
+    pub exprs: Vec<ExpressionRef>,
+    /// If true, the output expressions replace the input field instead of following after it.
     pub is_replace: bool,
 }
 
@@ -316,21 +316,21 @@ impl Transform {
     /// Specifies an expression to replace a field with.
     pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
         let field_transform = self.field_transform(name);
-        field_transform.insertions.push(expr);
+        field_transform.exprs.push(expr);
         field_transform.is_replace = true;
         self
     }
 
-    /// Specifies an expression to insert after an optional predecessor. Multiple fields can be
-    /// inserted after the same predecessor, and they will be emitted in the same order they were
-    /// registered.
+    /// Specifies an expression to insert after an optional predecessor (None = prepend, emit the
+    /// expression before the first input field). Multiple fields can be inserted after the same
+    /// predecessor, and they will be emitted in the same order they were registered.
     pub fn with_inserted_field(
         mut self,
         after: Option<impl Into<String>>,
         expr: ExpressionRef,
     ) -> Self {
         match after {
-            Some(field_name) => self.field_transform(field_name).insertions.push(expr),
+            Some(field_name) => self.field_transform(field_name).exprs.push(expr),
             None => self.prepended_fields.push(expr),
         }
         self
@@ -826,7 +826,7 @@ impl Display for Expression {
                     sep = ", ";
                 }
                 for (field_name, field_transform) in &transform.field_transforms {
-                    let insertions = &field_transform.insertions;
+                    let insertions = &field_transform.exprs;
                     if insertions.is_empty() {
                         if field_transform.is_replace {
                             write!(f, "{sep}drop {field_name}")?;
