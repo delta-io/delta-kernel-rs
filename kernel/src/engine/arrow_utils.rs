@@ -914,9 +914,19 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
             if buf.is_empty() {
                 break;
             }
+            // from `decode` docs:
+            // > Read JSON objects from `buf`, returning the number of bytes read
+            // > This method returns once `batch_size` objects have been parsed since the last call
+            // > to [`Self::flush`], or `buf` is exhausted. Any remaining bytes should be included
+            // > in the next call to [`Self::decode`]
+            //
+            // if we attempt a `parse_one` of e.g. "{}{}", we will parse the first "{}" successfully
+            // then decode will always return immediately sinee we have read `batch_size = 1`,
+            // leading to an infinite loop. Since we always just want to parse one record here, we
+            // detect this by checking if we always consume the entire buffer, and error if not.
             let consumed = decoder.decode(buf)?;
-            if consumed == 0 {
-                return Err(Error::generic("JSON decoder made no progress"));
+            if consumed != buf.len() {
+                return Err(Error::missing_data("Multiple JSON objects"));
             }
             reader.consume(consumed);
         }
