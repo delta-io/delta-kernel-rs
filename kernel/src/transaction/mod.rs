@@ -1,4 +1,6 @@
-use std::collections::HashSet;
+use crate::SchemaTransform;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
@@ -14,11 +16,19 @@ use crate::actions::{
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
+    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
+    get_log_remove_schema, get_log_txn_schema,
+};
+use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::LogRoot;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
+};
+use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
@@ -27,6 +37,7 @@ use crate::{
     RowVisitor, Version,
 };
 use delta_kernel_derive::internal_api;
+use url::Url;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -45,7 +56,6 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
     ]))
 });
 
-/// Returns a reference to the mandatory fields in an add action.
 ///
 /// Note this does not include "dataChange" which is a required field but
 /// but should be set on the transactoin level. Getting the full schema
@@ -127,6 +137,7 @@ pub struct Transaction {
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
+    remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -181,6 +192,7 @@ impl Transaction {
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
+            remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
             domain_metadata_additions: vec![],
@@ -252,6 +264,7 @@ impl Transaction {
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
+
         let commit_version = self.read_snapshot.version() + 1;
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
@@ -265,9 +278,12 @@ impl Transaction {
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
-        // Convert EngineData to FilteredEngineData with all rows selected
+
+        let remove_actions = self.generate_remove_actions(engine)?;
+
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .chain(remove_actions);
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
@@ -693,7 +709,118 @@ impl Transaction {
             error,
         }
     }
+    /// Remove files from the table in this transaction. This API generally enables the engine to
+    /// delete data (at file-level granularity) from the table. Note that this API can be called
+    /// multiple times to remove multiple batches.
+    ///
+    /// the expected schema for `remove_metadata` is given by [`scan_row_schema`] it, is expected
+    /// this will be the result of passing [`FilteredEngineData`] returned from a scan
+    /// with rows modified for removal (selected rows in FilteredEngineData are the ones to be removed).
+    pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
+        self.remove_files_metadata.push(remove_metadata);
+    }
+
+    fn generate_remove_actions<'a>(
+        &'a self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+        // This is a workaround due to the fact that expression evaluation happens
+        // on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
+        // required fields.
+        // TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
+        // on FilteredEngineData directly.
+        struct NullableStatsTransform;
+        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                use Cow::*;
+                let field = match self.transform(&field.data_type)? {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
+                        name: field.name.clone(),
+                        data_type: data_type.into_owned(),
+                        nullable: true,
+                        metadata: field.metadata.clone(),
+                    }),
+                };
+                Some(field)
+            }
+        }
+
+        let input_schema = scan_row_schema();
+        let target_schema = NullableStatsTransform
+            .transform_struct(get_log_remove_schema())
+            .ok_or_else(|| Error::generic("Failed to transform remove schema"))?
+            .into_owned();
+        let evaluation_handler = engine.evaluation_handler();
+
+        Ok(self
+            .remove_files_metadata
+            .iter()
+            .map(move |file_metadata_batch| {
+                let transform = Expression::transform(
+                    Transform::new_top_level()
+                        .with_inserted_field(
+                            Some("path"),
+                            Expression::literal(self.commit_timestamp).into(),
+                        )
+                        .with_inserted_field(
+                            Some("path"),
+                            Expression::literal(self.data_change).into(),
+                        )
+                        .with_inserted_field(
+                            // extended_file_metadata
+                            Some("path"),
+                            Expression::literal(true).into(),
+                        )
+                        .with_inserted_field(
+                            Some("path"),
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"])
+                                .into(),
+                        )
+                        // tags
+                        .with_inserted_field(
+                            Some("stats"),
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+                        )
+                        .with_inserted_field(
+                            Some("deletionVector"),
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
+                                .into(),
+                        )
+                        .with_inserted_field(
+                            Some("deletionVector"),
+                            Expression::column([
+                                FILE_CONSTANT_VALUES_NAME,
+                                DEFAULT_ROW_COMMIT_VERSION_NAME,
+                            ])
+                            .into(),
+                        )
+                        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+                        .with_dropped_field("modificationTime"),
+                );
+                let expr = Expression::struct_from([transform]);
+                let file_action_eval = evaluation_handler.new_expression_evaluator(
+                    input_schema.clone(),
+                    Arc::new(expr),
+                    target_schema.clone().into(),
+                );
+
+                let updated_engine_data =
+                    file_action_eval.evaluate(&*file_metadata_batch.data())?;
+                FilteredEngineData::try_new(
+                    updated_engine_data,
+                    file_metadata_batch.selection_vector().to_vec(),
+                )
+            }))
+    }
 }
+
+// Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
+// actions using an expression to transform the data (in a single pass) from [`input_schema`] into
+// [`target_schema`].
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
 /// write table data.
