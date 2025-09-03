@@ -65,11 +65,11 @@ impl RowVisitor for FilterVisitor {
 struct FilteredEngineData {
     engine_data: Arc<dyn EngineData>,
     selection_vector: Vec<bool>,
-    root_schema: Arc<Schema>,
 }
 
 struct Dataframe {
-    engine_data: FilteredEngineData,
+    engine_data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>>>,
+    root_schema: Arc<Schema>,
     plan: LogicalPlanNode,
 }
 
@@ -86,6 +86,18 @@ enum LogicalPlanNode {
     },
 }
 
+///
+///
+///
+///  Ideally, this should be used like so:
+///
+///
+///  let df = read_parquet
+///               .filter(state.AddRemoveDedupFilter(), vec!["add,path", "add.dv_info", "remove.path", "remove.dv_info"])
+///               .filter(state.DataSkippingStatsFilter(), vec!["add.stats"])
+///               .filter(state.PartitionPruningFilter(), vec!["add.parition_values"])
+///               .project(vec!["add.path", "add.size", "add.dv_info"])
+///
 impl Dataframe {
     fn filter(self, filter: Arc<dyn Filter>, column_names: &'static [ColumnName]) -> Self {
         Self {
@@ -95,6 +107,7 @@ impl Dataframe {
                 filter,
                 column_names,
             },
+            root_schema: self.root_schema,
         }
     }
     fn select(self, column_names: Vec<ColumnName>) -> Self {
@@ -104,6 +117,7 @@ impl Dataframe {
                 child: self.plan.into(),
                 column_names,
             },
+            root_schema: self.root_schema,
         }
     }
     fn schema(&self) -> Arc<Schema> {
@@ -123,72 +137,117 @@ impl Dataframe {
                     .unwrap(),
             }
         }
-        recurse(&self.plan, &self.engine_data.root_schema)
+        recurse(&self.plan, &self.root_schema)
     }
 
-    fn execute(self, engine: Arc<dyn Engine>) -> FilteredEngineData {
+    fn execute(self, engine: Arc<dyn Engine>) -> Box<Dataframe> {
         fn recurse(
             engine: &dyn Engine,
             node: LogicalPlanNode,
-            engine_data: FilteredEngineData,
-        ) -> FilteredEngineData {
+            schema: Arc<Schema>,
+            engine_data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>>>,
+        ) -> Box<Dataframe> {
             match node {
-                LogicalPlanNode::Root => engine_data,
+                LogicalPlanNode::Root => Box::new(Dataframe {
+                    engine_data,
+                    root_schema: schema.into(),
+                    plan: LogicalPlanNode::Root,
+                }),
                 LogicalPlanNode::Filter {
                     child,
                     filter,
                     column_names,
                 } => {
-                    let child_engine_data = recurse(engine, *child, engine_data);
+                    let child_df = recurse(engine, *child, schema, engine_data);
+                    let Dataframe {
+                        engine_data,
+                        root_schema,
+                        plan,
+                    } = *child_df;
+
                     let mut visitor = FilterVisitor {
                         filter,
                         column_names,
                         result: vec![],
                     };
-                    child_engine_data
-                        .engine_data
-                        .visit_rows(column_names, &mut visitor);
-                    FilteredEngineData {
-                        engine_data: child_engine_data.engine_data,
-                        selection_vector: visitor.result,
-                        root_schema: child_engine_data.root_schema,
-                    }
+                    let new_iter = Box::new(engine_data.map_ok(move |batch| {
+                        batch.engine_data.visit_rows(column_names, &mut visitor);
+
+                        let mut selection_vector = vec![];
+                        std::mem::swap(&mut selection_vector, &mut visitor.result);
+
+                        let new_selection_vector = batch
+                            .selection_vector
+                            .iter()
+                            .zip(selection_vector)
+                            .map(|(a, b)| *a && b)
+                            .collect_vec();
+                        FilteredEngineData {
+                            engine_data: batch.engine_data,
+                            selection_vector: new_selection_vector,
+                        }
+                    }));
+                    Box::new(Dataframe {
+                        engine_data: new_iter,
+                        root_schema,
+                        // The plan is fully resolved at this point. So it is == to Root
+                        plan,
+                    })
                 }
                 LogicalPlanNode::Select {
                     child,
                     column_names,
                 } => {
-                    let child_engine_data = recurse(engine, *child, engine_data);
+                    let child_df = recurse(engine, *child, schema, engine_data);
+                    let Dataframe {
+                        engine_data,
+                        root_schema,
+                        plan,
+                    } = *child_df;
 
                     // This only really works for root-level fields, but can easily be generalized
-                    let new_schema = child_engine_data
-                        .root_schema
+                    let new_schema = root_schema
                         .project(&column_names.iter().map(|x| x.to_string()).collect_vec())
                         .unwrap();
-
                     let expression: Expression = Expression::struct_from(
                         column_names
                             .into_iter()
                             .map(|name| Expression::Column(name)),
                     );
                     let eval = engine.evaluation_handler().new_expression_evaluator(
-                        child_engine_data.root_schema,
+                        root_schema,
                         expression,
                         new_schema.clone().into(),
                     );
 
-                    let new_engine_data = eval
-                        .evaluate(child_engine_data.engine_data.as_ref())
-                        .unwrap();
-                    FilteredEngineData {
-                        engine_data: new_engine_data.into(),
-                        selection_vector: child_engine_data.selection_vector,
+                    let new_iter = engine_data.map_ok(move |batch| {
+                        let FilteredEngineData {
+                            engine_data,
+                            selection_vector,
+                        } = batch;
+                        let new_engine_data = eval.evaluate(engine_data.as_ref()).unwrap();
+
+                        FilteredEngineData {
+                            engine_data: new_engine_data.into(),
+                            selection_vector,
+                        }
+                    });
+
+                    Box::new(Dataframe {
+                        engine_data: Box::new(new_iter),
                         root_schema: new_schema,
-                    }
+                        // The plan is fully resolved at this point. So it is == to Root
+                        plan,
+                    })
                 }
             }
         }
-        recurse(engine.as_ref(), self.plan, self.engine_data)
+        recurse(
+            engine.as_ref(),
+            self.plan,
+            self.root_schema,
+            self.engine_data,
+        )
     }
 }
 
