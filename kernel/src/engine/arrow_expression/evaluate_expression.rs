@@ -138,7 +138,7 @@ fn evaluate_transform_expression(
         output_schema_iter
             .next()
             .map(|field| field.data_type())
-            .ok_or_else(|| Error::generic("Output schema mismatch"))
+            .ok_or_else(|| Error::generic("Too few fields in output schema"))
     };
 
     // Handle prepends (insertions before any field)
@@ -189,7 +189,7 @@ fn evaluate_transform_expression(
 
     // Verify we consumed all output schema fields
     if output_schema_iter.next().is_some() {
-        return Err(Error::generic("Output schema mismatch"));
+        return Err(Error::generic("Too many fields in output schema"));
     }
 
     // Build the final struct
