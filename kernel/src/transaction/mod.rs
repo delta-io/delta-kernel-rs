@@ -285,6 +285,7 @@ fn generate_adds<'a>(
 
     add_files_metadata.map(move |add_files_batch| {
         // Step 1: Nest numRecords inside a stats struct
+        // TODO: Migrate this to a Transform expression once they support nested structs (see #1247)
         let intermediate_expr =
             Expression::struct_from(add_files_schema.fields().map(|f| match f.name().as_str() {
                 "numRecords" => Expression::struct_from([Expression::column([f.name()])]),
