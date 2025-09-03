@@ -16,7 +16,6 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
-
 use delta_kernel::transaction::CommitResult;
 
 use test_utils::set_json_value;
@@ -1148,3 +1147,4 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     Ok(())
 }
+

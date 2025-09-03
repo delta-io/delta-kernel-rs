@@ -3,7 +3,7 @@ use std::iter;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
+use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema};
 use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
 use crate::path::ParsedLogPath;
@@ -28,7 +28,21 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
+pub(crate) static REMOVE_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new(vec![
+        StructField::not_null("path", DataType::STRING),
+        StructField::nullable("deletionTimestamp", DataType::LONG),
+        StructField::not_null("dataChange", DataType::BOOLEAN),
+        StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
+        StructField::nullable(
+            "partitionValues",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        ),
+        StructField::nullable("size", DataType::LONG),
+    ]))
+});
+
+/// This function specifies the schema for the add_files metadata.
 /// Concretely, it is the expected schema for engine data passed to [`add_files`].
 ///
 /// Each row represents metadata about a file to be added to the table.
@@ -36,6 +50,16 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 /// [`add_files`]: crate::transaction::Transaction::add_files
 pub fn add_files_schema() -> &'static SchemaRef {
     &ADD_FILES_SCHEMA
+}
+
+/// This function specifies the schema for the remove_files metadata.
+/// Concretely, it is the expected schema for engine data passed to [`remove_files`].
+///
+/// Each row represents metadata about a file to be removed from the table.
+///
+/// [`remove_files`]: crate::transaction::Transaction::remove_files
+pub fn remove_files_schema() -> &'static SchemaRef {
+    &REMOVE_FILES_SCHEMA
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -57,6 +81,7 @@ pub struct Transaction {
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
+    remove_files_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -105,6 +130,7 @@ impl Transaction {
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
+            remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
         })
@@ -144,10 +170,22 @@ impl Transaction {
         let commit_info_schema = get_log_commit_info_schema().clone();
 
         let commit_info_action = commit_info.into_engine_data(commit_info_schema, engine);
-        let add_actions = generate_adds(engine, self.add_files_metadata.iter().map(|a| a.as_ref()));
+        let add_actions = generate_file_actions(
+            add_files_schema().clone(),
+            get_log_add_schema().clone(),
+            self.add_files_metadata.iter().map(|a| a.as_ref()),
+            engine,
+        );
+        let remove_actions = generate_file_actions(
+            remove_files_schema().clone(),
+            get_log_remove_schema().clone(),
+            self.remove_files_metadata.iter().map(|a| a.as_ref()),
+            engine,
+        );
 
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
+            .chain(remove_actions)
             .chain(set_transaction_actions);
 
         // step two: set new commit version (current_version + 1) and path to write
@@ -240,30 +278,39 @@ impl Transaction {
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
+
+    /// Remove files from the table in this transaction. This API generally enables the engine to
+    /// delete data (at file-level granularity) from the table. Note that this API can be called
+    /// multiple times to remove multiple batches.
+    ///
+    /// The expected schema for `remove_metadata` is given by [`remove_files_schema`].
+    pub fn remove_files(&mut self, remove_metadata: Box<dyn EngineData>) {
+        self.remove_files_metadata.push(remove_metadata);
+    }
 }
 
-// convert add_files_metadata into add actions using an expression to transform the data in a single
-// pass
-fn generate_adds<'a>(
+// Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
+// actions using an expression to transform the data (in a single pass) from [`input_schema`] into
+// [`target_schema`].
+fn generate_file_actions<'a>(
+    input_schema: SchemaRef,
+    target_schema: SchemaRef,
+    file_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
     engine: &dyn Engine,
-    add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
     let evaluation_handler = engine.evaluation_handler();
-    let add_files_schema = add_files_schema();
-    let log_schema = get_log_add_schema();
-
-    add_files_metadata.map(move |add_files_batch| {
-        let adds_expr = Expression::struct_from([Expression::struct_from(
-            add_files_schema
+    file_metadata.map(move |file_metadata_batch| {
+        let file_action_expr = Expression::struct_from([Expression::struct_from(
+            input_schema
                 .fields()
                 .map(|f| Expression::column([f.name()])),
         )]);
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
-            add_files_schema.clone(),
-            Arc::new(adds_expr),
-            log_schema.clone().into(),
+        let file_action_eval = evaluation_handler.new_expression_evaluator(
+            input_schema.clone(),
+            Arc::new(file_action_expr),
+            target_schema.clone().into(),
         );
-        adds_evaluator.evaluate(add_files_batch)
+        file_action_eval.evaluate(file_metadata_batch)
     })
 }
 
@@ -349,6 +396,23 @@ mod tests {
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
             StructField::not_null("dataChange", DataType::BOOLEAN),
+        ]);
+        assert_eq!(*schema, expected.into());
+    }
+
+    #[test]
+    fn test_remove_files_schema() {
+        let schema = remove_files_schema();
+        let expected = StructType::new(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::nullable("deletionTimestamp", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
+            StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
+            StructField::nullable(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::nullable("size", DataType::LONG),
         ]);
         assert_eq!(*schema, expected.into());
     }
