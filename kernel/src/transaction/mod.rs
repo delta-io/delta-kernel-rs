@@ -2,6 +2,17 @@ use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema};
+use crate::actions::{CommitInfo, SetTransaction};
+use crate::error::Error;
+use crate::path::ParsedLogPath;
+use crate::schema::{MapType, SchemaRef, StructField, StructType};
+use crate::snapshot::Snapshot;
+use crate::{
+    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version,
+};
 
 use url::Url;
 
@@ -38,7 +49,6 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
     ]))
 });
 
-/// Returns a reference to the mandatory fields in an add action.
 ///
 /// Note this does not include "dataChange" which is a required field but
 /// but should be set on the transactoin level. Getting the full schema
@@ -100,6 +110,16 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
     Arc::new(StructType::new(fields))
 }
 
+/// This function specifies the schema for the remove_files metadata.
+/// Concretely, it is the expected schema for engine data passed to [`remove_files`].
+///
+/// Each row represents metadata about a file to be removed from the table.
+///
+/// [`remove_files`]: crate::transaction::Transaction::remove_files
+pub fn remove_files_schema() -> &'static SchemaRef {
+    &REMOVE_FILES_SCHEMA
+}
+
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
 /// to the table may be staged via the transaction methods before calling `commit` to commit the
 /// changes to the table.
@@ -119,6 +139,7 @@ pub struct Transaction {
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
+    remove_files_metadata: Vec<Box<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -164,6 +185,7 @@ impl Transaction {
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
+            remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
             data_change: None,
@@ -206,6 +228,26 @@ impl Transaction {
 
         // Step 3: Generate add actions with or without row tracking metadata
 
+        let commit_info_action = commit_info.into_engine_data(commit_info_schema, engine);
+        let add_actions = generate_file_actions(
+            add_files_schema().clone(),
+            get_log_add_schema().clone(),
+            self.add_files_metadata.iter().map(|a| a.as_ref()),
+            engine,
+        );
+        let remove_actions = generate_remove_actions(
+            remove_files_schema().clone(),
+            get_log_remove_schema().clone(),
+            self.remove_files_metadata.iter().map(|a| a.as_ref()),
+            engine,
+        );
+
+        let actions = iter::once(commit_info_action)
+            .chain(add_actions)
+            .chain(remove_actions)
+            .chain(set_transaction_actions);
+
+        // step two: set new commit version (current_version + 1) and path to write
         let commit_version = self.read_snapshot.version() + 1;
         let add_actions = if self
             .read_snapshot
@@ -460,6 +502,40 @@ impl Transaction {
             add_actions.chain(iter::once(domain_metadata_action)),
         ))
     }
+
+    /// Remove files from the table in this transaction. This API generally enables the engine to
+    /// delete data (at file-level granularity) from the table. Note that this API can be called
+    /// multiple times to remove multiple batches.
+    ///
+    /// The expected schema for `remove_metadata` is given by [`remove_files_schema`].
+    pub fn remove_files(&mut self, remove_metadata: Box<dyn EngineData>) {
+        self.remove_files_metadata.push(remove_metadata);
+    }
+}
+
+// Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
+// actions using an expression to transform the data (in a single pass) from [`input_schema`] into
+// [`target_schema`].
+fn generate_file_actions<'a>(
+    input_schema: SchemaRef,
+    target_schema: SchemaRef,
+    file_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
+    engine: &dyn Engine,
+) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
+    let evaluation_handler = engine.evaluation_handler();
+    file_metadata.map(move |file_metadata_batch| {
+        let file_action_expr = Expression::struct_from([Expression::struct_from(
+            input_schema
+                .fields()
+                .map(|f| Expression::column([f.name()])),
+        )]);
+        let file_action_eval = evaluation_handler.new_expression_evaluator(
+            input_schema.clone(),
+            Arc::new(file_action_expr),
+            target_schema.clone().into(),
+        );
+        file_action_eval.evaluate(file_metadata_batch)
+    })
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -577,5 +653,22 @@ mod tests {
         ]);
         assert_eq!(*schema, expected.into());
         Ok(())
+    }
+
+    #[test]
+    fn test_remove_files_schema() {
+        let schema = remove_files_schema();
+        let expected = StructType::new(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::nullable("deletionTimestamp", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
+            StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
+            StructField::nullable(
+                "partitionValues",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::nullable("size", DataType::LONG),
+        ]);
+        assert_eq!(*schema, expected.into());
     }
 }
