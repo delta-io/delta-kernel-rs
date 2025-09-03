@@ -225,9 +225,9 @@ pub fn evaluate_expression(
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema)
         }
-        (Struct(_), _) => Err(Error::generic(
-            "Data type is required to evaluate struct expressions",
-        )),
+        (Struct(_), dt) => Err(Error::Generic(format!(
+            "Struct expression expects a DataType::Struct result, but got {dt:?}"
+        ))),
         (Transform(transform), Some(DataType::Struct(output_schema))) => {
             evaluate_transform_expression(transform, batch, output_schema)
         }
