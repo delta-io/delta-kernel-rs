@@ -915,6 +915,9 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
                 break;
             }
             let consumed = decoder.decode(buf)?;
+            if consumed == 0 {
+                return Err(Error::generic("JSON decoder made no progress"));
+            }
             reader.consume(consumed);
         }
         let Some(batch) = decoder.flush()? else {
