@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
 use crate::expressions::{Expression, ExpressionRef, Scalar};
 use crate::scan::FieldTransformSpec;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::DeltaResult;
+use std::collections::HashSet;
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{
@@ -17,53 +16,15 @@ pub(crate) fn scan_file_physical_schema(
     physical_schema: &StructType,
 ) -> SchemaRef {
     if scan_file.scan_type == CdfScanFileType::Cdc {
+        // CDC files have _change_type in physical data, add it to physical schema
         let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
         let fields = physical_schema.fields().cloned().chain(Some(change_type));
         StructType::new(fields).into()
     } else {
+        // Add/Remove files have no CDF metadata in physical data
+        // CDF columns will be added via StaticReplace transforms
         physical_schema.clone().into()
     }
-}
-
-/// Create CDF metadata expressions map for the unified transform approach
-pub(crate) fn get_cdf_metadata_expressions(scan_file: &CdfScanFile) -> HashMap<String, Expression> {
-    let mut cdf_expressions = HashMap::new();
-
-    // Add _change_type expression only for Add/Remove files
-    // For CDC files, _change_type already exists in physical data, so skip it
-    match scan_file.scan_type {
-        CdfScanFileType::Cdc => {
-            // Skip _change_type - it already exists in physical schema
-        }
-        CdfScanFileType::Add => {
-            cdf_expressions.insert(
-                CHANGE_TYPE_COL_NAME.to_string(),
-                Expression::literal(ADD_CHANGE_TYPE),
-            );
-        }
-        CdfScanFileType::Remove => {
-            cdf_expressions.insert(
-                CHANGE_TYPE_COL_NAME.to_string(),
-                Expression::literal(REMOVE_CHANGE_TYPE),
-            );
-        }
-    }
-
-    // Add _commit_version expression
-    cdf_expressions.insert(
-        COMMIT_VERSION_COL_NAME.to_string(),
-        Expression::literal(scan_file.commit_version),
-    );
-
-    // Add _commit_timestamp expression
-    if let Ok(timestamp) = Scalar::timestamp_from_millis(scan_file.commit_timestamp) {
-        cdf_expressions.insert(
-            COMMIT_TIMESTAMP_COL_NAME.to_string(),
-            Expression::literal(timestamp),
-        );
-    }
-
-    cdf_expressions
 }
 
 /// Create the unified transform expression that handles both partition and CDF metadata columns
@@ -72,72 +33,76 @@ pub(crate) fn create_unified_transform_expr(
     logical_schema: &StructType,
     transform_spec: &[FieldTransformSpec],
 ) -> DeltaResult<ExpressionRef> {
-    // 🎯 UNIFIED APPROACH: Both partition columns and CDF metadata through single transform system
-
-    // Create unified map of all field expressions (partition + CDF metadata)
-    let mut field_expressions = HashMap::new();
-
-    // Add partition values as expressions
-    for field_transform in transform_spec {
-        if let FieldTransformSpec::PartitionColumn { field_index, .. } = field_transform {
-            let field = logical_schema.fields.get_index(*field_index);
-            let Some((_, field)) = field else {
-                continue;
-            };
-
-            let physical_name = field.physical_name();
-            if let Some(value_str) = scan_file.partition_values.get(physical_name) {
-                let partition_value =
-                    crate::scan::parse_partition_value(Some(value_str), field.data_type())?;
-                field_expressions.insert(physical_name.to_string(), partition_value.into());
-            }
-        }
-    }
-
-    // Add CDF metadata expressions (these will override partition values if there's a name conflict)
-    let cdf_expressions = get_cdf_metadata_expressions(scan_file);
-    field_expressions.extend(cdf_expressions);
-
-    // Parse field expressions using the unified function
-    let field_values = crate::scan::parse_field_values_to_expressions(
+    // Step 1: Parse partition values using existing utility
+    let mut field_values = crate::scan::parse_partition_values_to_expressions(
         logical_schema,
         transform_spec,
-        &field_expressions,
+        &scan_file.partition_values,
     )?;
 
-    // Special handling for CDC files: adjust _commit_version insertion point
-    if scan_file.scan_type == CdfScanFileType::Cdc {
-        // For CDC files, _commit_version should be inserted after _change_type (not after "name")
-        // We need to create a custom transform spec for this case
-        let mut custom_transform_spec = transform_spec.to_vec();
+    // Step 2: Create CDF metadata expressions only for fields present in logical schema
+    let cdf_expressions = create_cdf_field_expressions(scan_file, logical_schema)?;
 
-        // Find the _commit_version entry and update its insert_after
-        for field_transform in &mut custom_transform_spec {
-            if let FieldTransformSpec::PartitionColumn {
-                field_index,
-                insert_after,
-            } = field_transform
-            {
-                if let Some((_, field)) = logical_schema.fields.get_index(*field_index) {
-                    if field.name() == COMMIT_VERSION_COL_NAME {
-                        *insert_after = Some(CHANGE_TYPE_COL_NAME.to_string());
-                        break;
-                    }
-                }
+    // Step 3: Add CDF expressions to field_values, using unified utility
+    let cdf_field_values = crate::scan::parse_field_values_to_expressions(
+        logical_schema,
+        transform_spec,
+        &cdf_expressions,
+    )?;
+
+    // Merge CDF field values with partition field values
+    field_values.extend(cdf_field_values);
+
+    // Step 4: Use shared utility to build the complete transform
+    crate::scan::build_transform_expr(transform_spec, field_values)
+}
+
+/// Create CDF metadata expressions for fields that exist in the logical schema
+fn create_cdf_field_expressions(
+    scan_file: &CdfScanFile,
+    logical_schema: &StructType,
+) -> DeltaResult<std::collections::HashMap<String, Expression>> {
+    use std::collections::HashMap;
+
+    let mut cdf_expressions = HashMap::new();
+
+    // Only create expressions for CDF fields that exist in the logical schema
+    let logical_field_names: HashSet<&str> = logical_schema
+        .fields()
+        .map(|field| field.name().as_str())
+        .collect();
+
+    // Add _change_type if present in logical schema
+    if logical_field_names.contains(CHANGE_TYPE_COL_NAME) {
+        let change_type_expr = match scan_file.scan_type {
+            CdfScanFileType::Add => Expression::literal(ADD_CHANGE_TYPE),
+            CdfScanFileType::Remove => Expression::literal(REMOVE_CHANGE_TYPE),
+            CdfScanFileType::Cdc => {
+                // For CDC files, _change_type exists physically - no need to add expression
+                // It will be handled by the normal column mapping
+                return Ok(cdf_expressions);
             }
-        }
-
-        // TODO: Fix _commit_timestamp column ordering for CDC files
-        // Currently _commit_timestamp gets inserted after "name" (last physical field) instead of
-        // after _commit_version. This causes incorrect column ordering:
-        // Current: [id, name, birthday, _commit_version, _commit_timestamp, _change_type]
-        // Correct: [id, name, birthday, _change_type, _commit_version, _commit_timestamp]
-        // Need to also update _commit_timestamp's insert_after to point to _commit_version.
-
-        // Build transform with custom spec
-        return crate::scan::build_transform_expr(&custom_transform_spec, field_values);
+        };
+        cdf_expressions.insert(CHANGE_TYPE_COL_NAME.to_string(), change_type_expr);
     }
 
-    // Build the final transform expression (for Add/Remove files)
-    crate::scan::build_transform_expr(transform_spec, field_values)
+    // Add _commit_version if present in logical schema
+    if logical_field_names.contains(COMMIT_VERSION_COL_NAME) {
+        cdf_expressions.insert(
+            COMMIT_VERSION_COL_NAME.to_string(),
+            Expression::literal(scan_file.commit_version),
+        );
+    }
+
+    // Add _commit_timestamp if present in logical schema
+    if logical_field_names.contains(COMMIT_TIMESTAMP_COL_NAME) {
+        if let Ok(timestamp) = Scalar::timestamp_from_millis(scan_file.commit_timestamp) {
+            cdf_expressions.insert(
+                COMMIT_TIMESTAMP_COL_NAME.to_string(),
+                Expression::literal(timestamp),
+            );
+        }
+    }
+
+    Ok(cdf_expressions)
 }

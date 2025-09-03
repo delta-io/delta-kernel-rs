@@ -146,9 +146,10 @@ impl TableChangesScanBuilder {
                     .iter()
                     .any(|field| field.name() == logical_field.name())
                 {
-                    // CDF Columns are generated metadata columns that vary per file (similar to partition columns).
-                    // They will be processed through the transform infrastructure.
-                    Ok(ColumnType::Partition(index))
+                    // CDF Columns are generated, so they do not have a column mapping. These will
+                    // be processed separately and used to build an expression when transforming physical
+                    // data to logical.
+                    Ok(ColumnType::Selected(logical_field.name().to_string()))
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
@@ -391,9 +392,9 @@ mod tests {
             vec![
                 ColumnType::Selected("part".to_string()),
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Partition(2), // _change_type
-                ColumnType::Partition(3), // _commit_version
-                ColumnType::Partition(4), // _commit_timestamp
+                ColumnType::Selected("_change_type".to_string()),
+                ColumnType::Selected("_commit_version".to_string()),
+                ColumnType::Selected("_commit_timestamp".to_string())
             ]
             .into()
         );
@@ -424,7 +425,7 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Partition(1), // _commit_version (index 1 in projected schema)
+                ColumnType::Selected("_commit_version".to_string()), // CDF fields are Selected, not Partition
             ]
             .into()
         );
