@@ -752,7 +752,11 @@ mod tests {
         // Test unused replacement keys
         let transform =
             Transform::new_top_level().with_replaced_field("missing", Expr::literal(1).into());
-        let output_schema = StructType::new(vec![StructField::new("a", DataType::INTEGER, false)]);
+        let output_schema = StructType::new(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
 
         let expr = Expr::Transform(transform);
         let result = evaluate_expression(
@@ -781,13 +785,13 @@ mod tests {
             .to_string()
             .contains("reference invalid input field names"));
 
-        // Test column count mismatch
+        // Test column count mismatch -- too many output schema fields
         let transform3 = Transform::new_top_level().with_dropped_field("a");
 
         let wrong_output_schema = StructType::new(vec![
-            StructField::new("a", DataType::INTEGER, false), // expects a field that was dropped
-            StructField::new("b", DataType::INTEGER, false),
-            StructField::new("c", DataType::INTEGER, false),
+            StructField::not_null("a", DataType::INTEGER), // expects a field that was dropped
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
         ]);
 
         let expr3 = Expr::Transform(transform3);
@@ -800,7 +804,26 @@ mod tests {
         assert!(result3
             .unwrap_err()
             .to_string()
-            .contains("Expression count"));
+            .contains("Too many fields in output schema"));
+
+        // Test column count mismatch -- too few output schema fields
+        let transform3 = Transform::new_top_level().with_dropped_field("a");
+
+        let wrong_output_schema = StructType::new(vec![
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
+
+        let expr3 = Expr::Transform(transform3);
+        let result3 = evaluate_expression(
+            &expr3,
+            &batch,
+            Some(&DataType::Struct(Box::new(wrong_output_schema))),
+        );
+        assert!(result3.is_err());
+        assert!(result3
+            .unwrap_err()
+            .to_string()
+            .contains("Too few fields in output schema"));
 
         // Test missing output schema
         let transform4 = Transform::new_top_level();
