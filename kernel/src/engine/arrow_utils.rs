@@ -926,7 +926,7 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
             // detect this by checking if we always consume the entire buffer, and error if not.
             let consumed = decoder.decode(buf)?;
             if consumed != buf.len() {
-                return Err(Error::missing_data("Multiple JSON objects"));
+                return Err(Error::generic("Malformed JSON: Multiple JSON objects"));
             }
             reader.consume(consumed);
         }
@@ -1066,11 +1066,17 @@ mod tests {
 
         let input: Vec<Option<&str>> = vec![Some("{}{}")];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("multiple objects (complete)");
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
+        ));
 
         let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("multiple objects (partial)");
+        assert!(matches!(
+            result.unwrap_err(),
+            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
+        ));
 
         let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b"}"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
