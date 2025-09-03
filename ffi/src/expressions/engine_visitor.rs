@@ -181,7 +181,7 @@ pub struct EngineExpressionVisitor {
         field_transform_list_id: usize,
     ),
     /// Visits one field transform of a `Transform` expression that owns the list identified by
-    /// `sibling_list_id`.
+    /// `sibling_list_id`. Each field transform has a different insertion point (no duplicates).
     ///
     /// A field transform is modeled as the triple `(field_name, expr_list, is_replace)`, as
     /// described by the truth table below. The `expr_list_id` identifies the list of expressions
@@ -205,7 +205,7 @@ pub struct EngineExpressionVisitor {
     /// | YES | NO  | Insert a (possibly empty)  list of expressions after the named input field
     /// | YES | YES | Replace the named input field with a (possibly empty) list of expressions
     ///
-    /// NOTE: Expressions in each insertion list must be emitted in order at the insertion point.
+    /// NOTE: The expressions of each field transform must be emitted in order at the insertion point.
     pub visit_field_transform: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
