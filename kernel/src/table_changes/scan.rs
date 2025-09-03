@@ -394,7 +394,7 @@ mod tests {
                 ColumnType::Selected("id".to_string()),
                 ColumnType::Selected("_change_type".to_string()),
                 ColumnType::Selected("_commit_version".to_string()),
-                ColumnType::Selected("_commit_timestamp".to_string())
+                ColumnType::Selected("_commit_timestamp".to_string()),
             ]
             .into()
         );
@@ -425,7 +425,7 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Selected("_commit_version".to_string()), // CDF fields are Selected, not Partition
+                ColumnType::Selected("_commit_version".to_string()),
             ]
             .into()
         );
