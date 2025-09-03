@@ -25,7 +25,7 @@ url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.15.1" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.15.2" }
 
 [build-dependencies]
 cbindgen = "0.29"

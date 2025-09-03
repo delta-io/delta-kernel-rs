@@ -1,5 +1,20 @@
 # Changelog
 
+## [v0.15.2](https://github.com/delta-io/delta-kernel-rs/tree/v0.15.2/) (2025-09-03)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.15.1...v0.15.2)
+
+
+### 🐛 Bug Fixes
+
+1. pin `comfy-table` at `7.1.4` to restore kernel MSRV ([#1231])
+2. Arrow json decoder fix for breakage on long json string ([#1244])
+
+
+[#1231]: https://github.com/delta-io/delta-kernel-rs/pull/1231
+[#1244]: https://github.com/delta-io/delta-kernel-rs/pull/1244
+
+
 ## [v0.15.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.15.1/) (2025-08-28)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.15.0...v0.15.1)
