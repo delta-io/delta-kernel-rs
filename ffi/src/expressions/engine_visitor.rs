@@ -173,7 +173,7 @@ pub struct EngineExpressionVisitor {
     /// Visits a `Transform` expression belonging to the list identified by `sibling_list_id`. The
     /// `input_path_list_id` is a single-item list containing transform's input path as a column
     /// reference (0 = no path). The `field_transform_list_id` identifies the list of field
-    /// transforms to apply (0 = identity transform). See also [`visit_field_transform`].
+    /// transforms to apply (0 = identity transform). See also [`Self::visit_field_transform`].
     pub visit_transform_expr: extern "C" fn(
         data: *mut c_void,
         sibling_list_id: usize,
