@@ -900,7 +900,10 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    let mut decoder = ReaderBuilder::new(schema.clone()).build_decoder()?;
+    // Use batch size of 1 to force one record per string input
+    let mut decoder = ReaderBuilder::new(schema.clone())
+        .with_batch_size(1)
+        .build_decoder()?;
     let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
         let mut reader = BufReader::new(json_string.unwrap_or("{}").as_bytes());
         // loop to fill + empty the buffer until end of input. note that we can't just one-shot
