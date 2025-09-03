@@ -16,19 +16,7 @@ use crate::{
 
 use url::Url;
 
-/// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
-/// a Parquet write operation back to Kernel.
-///
-/// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
-/// for constructing an add_file (and soon remove_file) action. Each row represents metadata about a
-/// file to be added to the table. Kernel takes this information and extends it to the full add_file
-/// action schema, adding additional fields (e.g., baseRowID) as necessary.
-///
-/// For now, Kernel only supports the number of records as a file statistic.
-/// This will change in a future release.
-///
-/// [`add_files`]: crate::transaction::Transaction::add_files
-/// [`ParquetHandler`]: crate::ParquetHandler
+/// The static instance referenced by [`add_files_schema`].
 pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
         StructField::not_null("path", DataType::STRING),
@@ -43,12 +31,19 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
-/// Concretely, it is the expected schema for engine data passed to [`add_files`].
+/// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
+/// a Parquet write operation back to Kernel.
 ///
-/// Each row represents metadata about a file to be added to the table.
+/// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
+/// for constructing an add_file (and soon remove_file) action. Each row represents metadata about a
+/// file to be added to the table. Kernel takes this information and extends it to the full add_file
+/// action schema, adding additional fields (e.g., baseRowID) as necessary.
+///
+/// For now, Kernel only supports the number of records as a file statistic.
+/// This will change in a future release.
 ///
 /// [`add_files`]: crate::transaction::Transaction::add_files
+/// [`ParquetHandler`]: crate::ParquetHandler
 pub fn add_files_schema() -> &'static SchemaRef {
     &ADD_FILES_SCHEMA
 }
@@ -70,7 +65,7 @@ pub(crate) static INTERMEDIATE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock:
     ]))
 });
 
-pub fn intermediate_add_files_schema() -> &'static SchemaRef {
+fn intermediate_add_files_schema() -> &'static SchemaRef {
     &INTERMEDIATE_ADD_FILES_SCHEMA
 }
 

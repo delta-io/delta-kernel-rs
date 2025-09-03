@@ -43,6 +43,7 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
+    // NB: We use usize instead of u64 since arrow uses usize for record batch sizes
     num_records: usize,
 }
 
