@@ -118,7 +118,7 @@ pub fn current_time_ms() -> DeltaResult<i64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))?;
-    
+
     i64::try_from(now.as_millis())
         .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::iter;
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
 use crate::actions::{CommitInfo, SetTransaction};

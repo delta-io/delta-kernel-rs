@@ -37,16 +37,16 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
             reference_time_millis - (DEFAULT_RETENTION_SECS as i64 * MILLIS_PER_SECOND),
         ),
         // Zero retention
-        (Some(Duration::from_secs(0)), reference_time_millis),
+        (Some(0), reference_time_millis),
         // Custom retention (e.g., 2000 seconds)
         (
-            Some(Duration::from_secs(2_000)),
+            Some(2_000 * MILLIS_PER_SECOND),
             reference_time_millis - (2_000 * MILLIS_PER_SECOND),
         ),
     ];
 
     for (retention, expected_timestamp) in test_cases {
-        let result = deleted_file_retention_timestamp_with_time(retention, reference_time)?;
+        let result = deleted_file_retention_timestamp_with_time(retention, reference_time_millis)?;
         assert_eq!(result, expected_timestamp);
     }
 
