@@ -430,8 +430,7 @@ fn deleted_file_retention_timestamp_with_time(
     now_ms: i64,
 ) -> DeltaResult<i64> {
     // Use provided retention duration or default (7 days)
-    let retention_ms =
-        retention_ms.unwrap_or_else((DEFAULT_RETENTION_SECS * MILLIS_PER_SECOND) as i64);
+    let retention_ms = retention_ms.unwrap_or((DEFAULT_RETENTION_SECS * MILLIS_PER_SECOND) as i64);
 
     // Simple subtraction - will produce negative values if retention > now
     Ok(now_ms - retention_ms)
