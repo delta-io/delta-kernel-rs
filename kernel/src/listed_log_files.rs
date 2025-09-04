@@ -105,29 +105,30 @@ fn list_log_files(
     // if the log_tail covers the entire requested range (i.e. starts at or before start_version),
     // we skip listing entirely. note that if we don't include this check, we will end up listing
     // then just filtering all the files we listed.
-    let listed_files =
-        if log_tail_start.is_some_and(|tail_start| tail_start.version <= start_version) {
-            // log_tail covers the entire requested range, so no listing is required
-            Box::new(std::iter::empty()) as Box<dyn Iterator<Item = DeltaResult<ParsedLogPath>>>
-        } else {
+
+    let listed_files = log_tail_start
+        // log_tail covers the entire requested range, so no listing is required
+        .is_none_or(|tail_start| start_version < tail_start.version)
+        .then(|| -> DeltaResult<_> {
             // NOTE: since engine APIs don't limit listing, we list from start_version and filter
-            Box::new(
-                storage
-                    .list_from(&start_from)?
-                    .map(|meta| ParsedLogPath::try_from(meta?))
-                    // NOTE: this filters out .crc files etc which start with "." - some engines
-                    // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
-                    // doesn't care about these files. Critically, note these are _different_ than
-                    // normal `version.crc` files which are listed + captured normally. Additionally
-                    // we likely aren't even 'seeing' these files since lexicographically the string
-                    // "." comes before the string "0".
-                    .filter_map_ok(identity)
-                    .take_while(move |path_res| match path_res {
-                        Ok(path) => path.version <= list_end_version,
-                        Err(_) => true,
-                    }),
-            ) as Box<dyn Iterator<Item = DeltaResult<ParsedLogPath>>>
-        };
+            Ok(storage
+                .list_from(&start_from)?
+                .map(|meta| ParsedLogPath::try_from(meta?))
+                // NOTE: this filters out .crc files etc which start with "." - some engines
+                // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
+                // doesn't care about these files. Critically, note these are _different_ than
+                // normal `version.crc` files which are listed + captured normally. Additionally
+                // we likely aren't even 'seeing' these files since lexicographically the string
+                // "." comes before the string "0".
+                .filter_map_ok(identity)
+                .take_while(move |path_res| match path_res {
+                    Ok(path) => path.version <= list_end_version,
+                    Err(_) => true,
+                }))
+        })
+        .transpose()?
+        .into_iter()
+        .flatten();
 
     // return chained [listed_files..log_tail], filtering log_tail by the requested range
     let filtered_log_tail = log_tail
@@ -605,38 +606,47 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[1], CommitSource::Catalog);
     }
 
-    // TODO: check that we _actually_ don't list
     #[test]
     fn test_log_tail_covers_entire_range_no_listing() {
-        // when log_tail covers the entire requested range, no filesystem listing should occur
-        let log_files = vec![
-            (0, LogPathFileType::Commit, CommitSource::Filesystem),
-            (1, LogPathFileType::Commit, CommitSource::Filesystem),
-            (2, LogPathFileType::Commit, CommitSource::Filesystem),
-        ];
-        let (storage, log_root) = create_storage(log_files);
+        // test-only storage handler that panics if you use it
+        struct StorageThatPanics {}
+        impl StorageHandler for StorageThatPanics {
+            fn list_from(
+                &self,
+                _path: &Url,
+            ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+                panic!("list_from used");
+            }
+            fn read_files(
+                &self,
+                _files: Vec<crate::FileSlice>,
+            ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
+                panic!("read_files used");
+            }
+        }
 
-        // log_tail covers versions 0-2, which is the entire range we'll request
+        // when log_tail covers the entire requested range, no filesystem listing should occur
+        // log_tail covers versions 0-2, which includes the entire range we'll request
         let log_tail = vec![
             make_parsed_log_path_with_source(0, LogPathFileType::Commit, CommitSource::Catalog),
             make_parsed_log_path_with_source(1, LogPathFileType::Commit, CommitSource::Catalog),
             make_parsed_log_path_with_source(2, LogPathFileType::Commit, CommitSource::Catalog),
         ];
 
-        // Request range 1-2, which is covered by log_tail starting at 0
-        let result: Vec<_> =
-            list_log_files(storage.as_ref(), &log_root, log_tail, Some(1), Some(2))
-                .unwrap()
-                .try_collect()
-                .unwrap();
+        let storage = StorageThatPanics {};
+        let url = Url::parse("memory:///anything").unwrap();
+        let result: Vec<_> = list_log_files(&storage, &url, log_tail, Some(0), Some(2))
+            .unwrap()
+            .try_collect()
+            .unwrap();
 
-        // Should only get filtered log_tail entries (versions 1-2), no filesystem listing
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].version, 1);
-        assert_eq!(result[1].version, 2);
-        // Both should be from catalog (log_tail), proving filesystem wasn't accessed
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].version, 0);
+        assert_eq!(result[1].version, 1);
+        assert_eq!(result[2].version, 2);
         assert_source(&result[0], CommitSource::Catalog);
         assert_source(&result[1], CommitSource::Catalog);
+        assert_source(&result[2], CommitSource::Catalog);
     }
 
     #[test]
