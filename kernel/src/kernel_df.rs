@@ -1,9 +1,10 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{cell::RefCell, collections::HashSet, sync::Arc};
 
 use itertools::Itertools;
 use parquet_56::schema;
 
 use crate::{
+    checkpoint::log_replay::CheckpointVisitor,
     engine_data::{self, GetData},
     schema::{ColumnName, DataType, Schema},
     DeltaResult, Engine, EngineData, Expression, RowVisitor,
@@ -11,8 +12,31 @@ use crate::{
 
 pub trait Filter {
     fn input_types(&self) -> &'static [DataType];
-    fn execute<'b>(&self, row_count: usize, getters: &[&dyn GetData<'b>])
-        -> DeltaResult<Vec<bool>>;
+    fn execute<'b>(
+        &self,
+        row_count: usize,
+        getters: &[&'b dyn GetData<'b>],
+    ) -> DeltaResult<Vec<bool>>;
+}
+
+struct CheckpointFilter<'seen>(RefCell<CheckpointVisitor<'seen>>);
+
+impl<'seen> Filter for CheckpointFilter<'seen> {
+    fn input_types(&self) -> &'static [DataType] {
+        todo!()
+    }
+
+    fn execute<'b>(
+        &self,
+        row_count: usize,
+        getters: &[&'b dyn GetData<'b>],
+    ) -> DeltaResult<Vec<bool>> {
+        let mut selection_vector = vec![];
+        for i in 0..row_count {
+            selection_vector.push(self.0.borrow_mut().is_valid_action(i, getters)?)
+        }
+        Ok(selection_vector)
+    }
 }
 
 // Could even become a macro:
