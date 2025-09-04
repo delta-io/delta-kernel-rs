@@ -181,7 +181,7 @@ mod tests {
 
     fn create_file_metadata(
         path: &str,
-        num_rows: i64,
+        file_size: i64,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
         let schema = ArrowSchema::new(vec![
             Field::new("path", ArrowDataType::Utf8, false),
@@ -214,7 +214,7 @@ mod tests {
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {file_size}, "modificationTime": {current_time}, "dataChange": true}}"#,
         );
 
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
@@ -235,9 +235,12 @@ mod tests {
         writer.write(batch).expect("Writing batch");
 
         // writer must be closed to write footer
-        let res = writer.close().unwrap();
+        writer.close().unwrap();
 
-        create_file_metadata(file_path, res.num_rows)
+        // Get the actual file size from the filesystem
+        let file_size = std::fs::metadata(&full_path)?.len();
+
+        create_file_metadata(file_path, file_size as i64)
     }
 
     #[tokio::test]
@@ -344,7 +347,14 @@ mod tests {
             // (otherwise timestamps are non-deterministic and paths are random UUIDs)
             set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
             set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
-            set_json_value(&mut parsed_commits[1], "add.size", json!(0))?;
+            // Get the actual file size for comparison
+            let expected_file_size =
+                std::fs::metadata(&format!("{table_path_str}my_file.parquet"))?.len();
+            set_json_value(
+                &mut parsed_commits[1],
+                "add.size",
+                json!(expected_file_size),
+            )?;
 
             let expected_commit = vec![
                 json!({
@@ -360,7 +370,7 @@ mod tests {
                     "add": {
                         "path": "my_file.parquet",
                         "partitionValues": {},
-                        "size": 0,
+                        "size": expected_file_size,
                         "modificationTime": 0,
                         "dataChange": true
                     }

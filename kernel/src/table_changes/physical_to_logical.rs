@@ -99,6 +99,7 @@ mod tests {
             let scan_file = CdfScanFile {
                 scan_type,
                 path: "fake_path".to_string(),
+                size: 1000,
                 dv_info: Default::default(),
                 remove_dv: None,
                 partition_values: HashMap::from([("age".to_string(), "20".to_string())]),

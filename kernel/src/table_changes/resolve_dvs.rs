@@ -194,6 +194,7 @@ mod tests {
         CdfScanFile {
             scan_type,
             path: "fake_path".to_string(),
+            size: 1000,
             dv_info,
             remove_dv,
             partition_values: HashMap::new(),
