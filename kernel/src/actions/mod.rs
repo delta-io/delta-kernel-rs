@@ -594,6 +594,7 @@ impl CommitInfo {
         timestamp: i64,
         operation: Option<String>,
         engine_info: Option<String>,
+        txn_id: Option<String>,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
@@ -602,7 +603,7 @@ impl CommitInfo {
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
-            txn_id: None,
+            txn_id,
         }
     }
 }
@@ -1392,7 +1393,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None);
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
 

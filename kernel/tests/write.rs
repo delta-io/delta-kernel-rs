@@ -671,6 +671,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
+                    "txnId": "test-txn-id",
                 }
             }),
             json!({

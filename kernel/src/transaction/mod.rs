@@ -97,6 +97,8 @@ pub struct Transaction {
     // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
+    /// A unique transaction identifier for this commit. This will be included in the commit info.
+    txn_id: Option<String>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -138,6 +140,7 @@ impl Transaction {
             add_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
+            txn_id: None,  // Default to None, only set when explicitly requested
         })
     }
 
@@ -170,6 +173,7 @@ impl Transaction {
             self.commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
+            self.txn_id.clone(),
         );
 
         let commit_info_schema = get_log_commit_info_schema().clone();
@@ -219,6 +223,13 @@ impl Transaction {
     /// Set the engine info field of this transaction's commit info action. This field is optional.
     pub fn with_engine_info(mut self, engine_info: impl Into<String>) -> Self {
         self.engine_info = Some(engine_info.into());
+        self
+    }
+
+    /// Set the transaction ID for this transaction's commit info action. This field is optional.
+    /// If not set, a random UUID will be generated.
+    pub fn with_txn_id(mut self, txn_id: impl Into<String>) -> Self {
+        self.txn_id = Some(txn_id.into());
         self
     }
 
