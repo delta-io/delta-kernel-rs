@@ -152,3 +152,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 [[bench]]
 name = "metadata_bench"
 harness = false
+
+[[bench]]
+name = "expression_bench"
+harness = false
