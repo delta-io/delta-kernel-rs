@@ -17,7 +17,7 @@ use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, EngineData, Snapshot};
+use delta_kernel::{DeltaResult, Engine, EngineData, Error, Snapshot};
 
 use itertools::Itertools;
 use object_store::local::LocalFileSystem;
@@ -238,7 +238,7 @@ pub async fn create_table(
     enable_timestamp_without_timezone: bool,
     enable_variant: bool,
     enable_column_mapping: bool,
-) -> Result<Url, Box<dyn std::error::Error>> {
+) -> DeltaResult<Url> {
     let table_id = "test_id";
     let schema = serde_json::to_string(&schema)?;
 
@@ -323,14 +323,13 @@ pub async fn setup_test_tables(
     partition_columns: &[&str],
     local_directory: Option<&Url>,
     table_base_name: &str,
-) -> Result<
+) -> DeltaResult<
     Vec<(
         Url,
         DefaultEngine<TokioBackgroundExecutor>,
         Arc<dyn ObjectStore>,
         &'static str,
     )>,
-    Box<dyn std::error::Error>,
 > {
     let table_name_11 = format!("{table_base_name}_11");
     let table_name_37 = format!("{table_base_name}_37");
@@ -403,7 +402,7 @@ pub fn test_read(
     expected: &ArrowEngineData,
     url: &Url,
     engine: Arc<dyn Engine>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> DeltaResult<()> {
     let snapshot = Snapshot::builder(url.clone()).build(engine.as_ref())?;
     let scan = snapshot.into_scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
@@ -425,12 +424,12 @@ pub fn set_json_value(
     value: &mut serde_json::Value,
     path: &str,
     new_value: serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> DeltaResult<()> {
     let mut path_string = path.replace(".", "/");
     path_string.insert(0, '/');
     let v = value
         .pointer_mut(&path_string)
-        .ok_or_else(|| format!("key '{path}' not found"))?;
+        .ok_or_else(|| Error::generic(format!("key '{path}' not found")))?;
     *v = new_value;
     Ok(())
 }
