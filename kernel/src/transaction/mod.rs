@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_txn_schema};
 use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
+use crate::expressions::UnaryExpressionOp;
 use crate::path::ParsedLogPath;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
@@ -15,6 +16,7 @@ use crate::{
 
 use url::Url;
 
+/// The static instance referenced by [`add_files_schema`].
 pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new(vec![
         StructField::not_null("path", DataType::STRING),
@@ -25,17 +27,46 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::not_null("size", DataType::LONG),
         StructField::not_null("modificationTime", DataType::LONG),
         StructField::not_null("dataChange", DataType::BOOLEAN),
+        StructField::nullable("numRecords", DataType::LONG),
     ]))
 });
 
-/// This function specifies the schema for the add_files metadata (and soon remove_files metadata).
-/// Concretely, it is the expected schema for engine data passed to [`add_files`].
+/// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
+/// a Parquet write operation back to Kernel.
 ///
-/// Each row represents metadata about a file to be added to the table.
+/// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
+/// for constructing an add_file (and soon remove_file) action. Each row represents metadata about a
+/// file to be added to the table. Kernel takes this information and extends it to the full add_file
+/// action schema, adding additional fields (e.g., baseRowID) as necessary.
+///
+/// For now, Kernel only supports the number of records as a file statistic.
+/// This will change in a future release.
 ///
 /// [`add_files`]: crate::transaction::Transaction::add_files
+/// [`ParquetHandler`]: crate::ParquetHandler
 pub fn add_files_schema() -> &'static SchemaRef {
     &ADD_FILES_SCHEMA
+}
+
+pub(crate) static INTERMEDIATE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new(vec![
+        StructField::not_null("path", DataType::STRING),
+        StructField::not_null(
+            "partitionValues",
+            MapType::new(DataType::STRING, DataType::STRING, true),
+        ),
+        StructField::not_null("size", DataType::LONG),
+        StructField::not_null("modificationTime", DataType::LONG),
+        StructField::not_null("dataChange", DataType::BOOLEAN),
+        StructField::nullable(
+            "stats",
+            DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
+        ),
+    ]))
+});
+
+fn intermediate_add_files_schema() -> &'static SchemaRef {
+    &INTERMEDIATE_ADD_FILES_SCHEMA
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -242,28 +273,48 @@ impl Transaction {
     }
 }
 
-// convert add_files_metadata into add actions using an expression to transform the data in a single
-// pass
+/// Convert file metadata provided by the engine into protocol-compliant add actions.
 fn generate_adds<'a>(
     engine: &dyn Engine,
     add_files_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
     let evaluation_handler = engine.evaluation_handler();
     let add_files_schema = add_files_schema();
+    let intermediate_schema = intermediate_add_files_schema();
     let log_schema = get_log_add_schema();
 
     add_files_metadata.map(move |add_files_batch| {
-        let adds_expr = Expression::struct_from([Expression::struct_from(
-            add_files_schema
-                .fields()
-                .map(|f| Expression::column([f.name()])),
-        )]);
-        let adds_evaluator = evaluation_handler.new_expression_evaluator(
+        // Step 1: Nest numRecords inside a stats struct
+        // TODO: Migrate this to a Transform expression once they support nested structs (see #1247)
+        let intermediate_expr =
+            Expression::struct_from(add_files_schema.fields().map(|f| match f.name().as_str() {
+                "numRecords" => Expression::struct_from([Expression::column([f.name()])]),
+                _ => Expression::column([f.name()]),
+            }));
+        let intermediate_evaluator = evaluation_handler.new_expression_evaluator(
             add_files_schema.clone(),
+            Arc::new(intermediate_expr),
+            intermediate_schema.clone().into(),
+        );
+        let add_files_batch = intermediate_evaluator.evaluate(add_files_batch)?;
+
+        // Step 2: Convert stats to JSON string
+        let field_expressions: Vec<Expression> = intermediate_schema
+            .fields()
+            .map(|f| match f.name().as_str() {
+                "stats" => {
+                    Expression::unary(UnaryExpressionOp::ToJson, Expression::column([f.name()]))
+                }
+                _ => Expression::column([f.name()]),
+            })
+            .collect();
+        let adds_expr = Expression::struct_from([Expression::struct_from(field_expressions)]);
+        let adds_evaluator = evaluation_handler.new_expression_evaluator(
+            intermediate_schema.clone(),
             Arc::new(adds_expr),
             log_schema.clone().into(),
         );
-        adds_evaluator.evaluate(add_files_batch)
+        adds_evaluator.evaluate(add_files_batch.as_ref())
     })
 }
 
@@ -349,6 +400,7 @@ mod tests {
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
             StructField::not_null("dataChange", DataType::BOOLEAN),
+            StructField::nullable("numRecords", DataType::LONG),
         ]);
         assert_eq!(*schema, expected.into());
     }
