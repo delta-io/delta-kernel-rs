@@ -104,12 +104,7 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties
         .set_transaction_retention_duration
         .map(|duration| -> DeltaResult<i64> {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to get current time: {e}")))?;
-
-            let now_ms = i64::try_from(now.as_millis())
-                .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
+            let now_ms = current_time_ms()?;
 
             let expiration_ms = i64::try_from(duration.as_millis())
                 .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
@@ -117,6 +112,15 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
             Ok(now_ms - expiration_ms)
         })
         .transpose()
+}
+
+pub fn current_time_ms() -> DeltaResult<i64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))?;
+    
+    i64::try_from(now.as_millis())
+        .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
 // Extension trait for Cow<'_, T>

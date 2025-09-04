@@ -83,7 +83,7 @@
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
@@ -96,7 +96,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::Snapshot;
-use crate::utils::calculate_transaction_expiration_timestamp;
+use crate::utils::{calculate_transaction_expiration_timestamp, current_time_ms};
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
@@ -112,6 +112,7 @@ const HOURS_PER_DAY: u64 = 24;
 /// The default retention period for deleted files in seconds.
 /// This is set to 7 days, which is the default in delta-spark.
 const DEFAULT_RETENTION_SECS: u64 = 7 * HOURS_PER_DAY * MINUTES_PER_HOUR * SECONDS_PER_MINUTE;
+const MILLIS_PER_SECOND: u64 = 1_000;
 
 /// Schema of the `_last_checkpoint` file
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
@@ -404,10 +405,11 @@ impl CheckpointWriter {
             .deleted_file_retention_duration;
 
         deleted_file_retention_timestamp_with_time(
-            retention_duration,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to calculate system time: {e}")))?,
+            retention_duration
+                .map(|duration| i64::try_from(duration.as_millis()))
+                .transpose()
+                .map_err(|_| Error::checkpoint_write("Retention duration exceeds i64 millisecond range"))?,
+            current_time_ms()?,
         )
     }
 }
@@ -416,26 +418,18 @@ impl CheckpointWriter {
 /// This is factored out to allow testing with an injectable time and duration parameter.
 ///
 /// # Parameters
-/// - `retention_duration`: The duration to retain deleted files. The table property
-///   `deleted_file_retention_duration` is passed here. If `None`, defaults to 7 days.
-/// - `now_duration`: The current time as a [`Duration`]. This allows for testing with
+/// - `retention_ms`: The duration to retain deleted files in milliseconds. It is set from the table property
+///   `deleted_file_retention_duration`. If `None`, defaults to 7 days.
+/// - `now_ms`: The current time in milliseconds as an i64. This allows for testing with
 ///   a specific time instead of using `SystemTime::now()`.
 ///
 /// # Returns: The timestamp in milliseconds since epoch
 fn deleted_file_retention_timestamp_with_time(
-    retention_duration: Option<Duration>,
-    now_duration: Duration,
+    retention_ms: Option<i64>,
+    now_ms: i64,
 ) -> DeltaResult<i64> {
     // Use provided retention duration or default (7 days)
-    let retention_duration =
-        retention_duration.unwrap_or_else(|| Duration::from_secs(DEFAULT_RETENTION_SECS));
-
-    // Convert to milliseconds for remove action deletion_timestamp comparison
-    let now_ms = i64::try_from(now_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Current timestamp exceeds i64 millisecond range"))?;
-
-    let retention_ms = i64::try_from(retention_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Retention duration exceeds i64 millisecond range"))?;
+    let retention_ms = retention_ms.unwrap_or_else(|| (DEFAULT_RETENTION_SECS * MILLIS_PER_SECOND) as i64);
 
     // Simple subtraction - will produce negative values if retention > now
     Ok(now_ms - retention_ms)

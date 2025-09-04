@@ -125,11 +125,7 @@ impl Transaction {
             .ensure_write_supported()?;
 
         // TODO: unify all these into a (safer) `fn current_time_ms()`
-        let commit_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_millis()).ok())
-            .ok_or_else(|| Error::generic("Failed to get current time for commit_timestamp"))?;
+        let commit_timestamp = crate::current_time_ms()?;
 
         Ok(Transaction {
             read_snapshot,

@@ -105,6 +105,8 @@ pub use arrow_compat::*;
 pub mod kernel_predicates;
 pub(crate) mod utils;
 
+pub use utils::current_time_ms;
+
 #[cfg(feature = "internal-api")]
 pub use utils::try_parse_uri;
 
