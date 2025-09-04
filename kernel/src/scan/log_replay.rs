@@ -167,7 +167,7 @@ impl AddRemoveDedupVisitor<'_> {
         transform_spec: &TransformSpec,
         mut partition_values: HashMap<usize, (String, Scalar)>,
     ) -> DeltaResult<ExpressionRef> {
-        let mut transform = crate::expressions::Transform::new();
+        let mut transform = crate::expressions::Transform::new_top_level();
 
         for field_transform in transform_spec {
             use FieldTransformSpec::*;
@@ -438,7 +438,7 @@ pub(crate) fn scan_action_iter(
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, collections::HashMap, sync::Arc};
+    use std::{collections::HashMap, sync::Arc};
 
     use crate::actions::get_log_schema;
     use crate::expressions::Scalar;
@@ -550,40 +550,24 @@ mod tests {
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
-            let Expr::Transform(transform_def) = transform.unwrap().as_ref() else {
+            let Expr::Transform(transform) = transform.unwrap().as_ref() else {
                 panic!("Transform should always be a Transform expr");
             };
 
-            // With sparse transforms, we expect only insertions for partition columns
-            assert!(
-                transform_def.field_replacements.is_empty(),
-                "Should have no field replacements"
-            );
-            assert_eq!(
-                transform_def.field_insertions.len(),
-                1,
-                "Should have exactly one insertion"
-            );
-
-            // The insertion should be after "value" field
-            let insertions = transform_def
-                .field_insertions
-                .get(&Some(Cow::Borrowed("value")))
-                .expect("Should have insertion after 'value' field");
-            assert_eq!(
-                insertions.len(),
-                1,
-                "Should have one partition column inserted"
-            );
-
-            let Expr::Literal(ref scalar) = insertions[0].as_ref() else {
-                panic!("Expected partition insertion to be a literal");
+            // With sparse transforms, we expect only one insertion for the partition column
+            assert!(transform.prepended_fields.is_empty());
+            let mut field_transforms = transform.field_transforms.iter();
+            let (field_name, field_transform) = field_transforms.next().unwrap();
+            assert_eq!(field_name, "value");
+            assert!(!field_transform.is_replace);
+            let [expr] = &field_transform.exprs[..] else {
+                panic!("Expected a single insertion");
             };
-            assert_eq!(
-                scalar,
-                &Scalar::Date(expected_date_offset),
-                "Didn't get expected date offset"
-            );
+            let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {
+                panic!("Expected a literal date");
+            };
+            assert_eq!(*date_offset, expected_date_offset);
+            assert!(field_transforms.next().is_none());
         }
 
         for res in iter {
