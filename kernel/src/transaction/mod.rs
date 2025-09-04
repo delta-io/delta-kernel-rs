@@ -9,6 +9,7 @@ use crate::expressions::UnaryExpressionOp;
 use crate::path::ParsedLogPath;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
+use crate::utils::current_time_ms;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version,
 };
@@ -123,8 +124,7 @@ impl Transaction {
             .table_configuration()
             .ensure_write_supported()?;
 
-        // TODO: unify all these into a (safer) `fn current_time_ms()`
-        let commit_timestamp = crate::current_time_ms()?;
+        let commit_timestamp = current_time_ms()?;
 
         Ok(Transaction {
             read_snapshot,

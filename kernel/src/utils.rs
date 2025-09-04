@@ -114,7 +114,7 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
         .transpose()
 }
 
-pub fn current_time_ms() -> DeltaResult<i64> {
+pub(crate) fn current_time_ms() -> DeltaResult<i64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| Error::generic(format!("System time before Unix epoch: {e}")))?;
