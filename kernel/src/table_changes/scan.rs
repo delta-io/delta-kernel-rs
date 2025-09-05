@@ -8,7 +8,7 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::{ColumnType, PhysicalPredicate, Scan, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::{DeltaResult, Engine, Expression, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::scan_file_physical_schema;
@@ -412,9 +412,21 @@ mod tests {
             vec![
                 ColumnType::Selected("part".to_string()),
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Selected("_change_type".to_string()),
-                ColumnType::Selected("_commit_version".to_string()),
-                ColumnType::Selected("_commit_timestamp".to_string()),
+                ColumnType::Metadata {
+                    physical_name: "_change_type".to_string(),
+                    logical_index: 2,
+                    use_as_selected: false,
+                },
+                ColumnType::Metadata {
+                    physical_name: "_commit_version".to_string(),
+                    logical_index: 3,
+                    use_as_selected: false,
+                },
+                ColumnType::Metadata {
+                    physical_name: "_commit_timestamp".to_string(),
+                    logical_index: 4,
+                    use_as_selected: false,
+                },
             ]
             .into()
         );
@@ -445,7 +457,11 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Selected("_commit_version".to_string()),
+                ColumnType::Metadata {
+                    physical_name: "_commit_version".to_string(),
+                    logical_index: 1,
+                    use_as_selected: false,
+                },
             ]
             .into()
         );

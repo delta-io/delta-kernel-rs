@@ -927,14 +927,17 @@ pub(crate) fn parse_partition_values_to_expressions(
             };
             let physical_name = field.physical_name();
 
-            // Convert string partition value to expression if present
-            if let Some(value_str) = partition_values.get(physical_name) {
-                let partition_value = parse_partition_value(Some(value_str), field.data_type())?;
-                result.insert(
-                    *field_index,
-                    (field.name().to_string(), partition_value.into()),
-                );
-            }
+            // Convert string partition value to expression, handling both present and null values
+            let partition_value = if let Some(value_str) = partition_values.get(physical_name) {
+                parse_partition_value(Some(value_str), field.data_type())?
+            } else {
+                // If partition value is not present, it means it's null
+                parse_partition_value(None, field.data_type())?
+            };
+            result.insert(
+                *field_index,
+                (field.name().to_string(), partition_value.into()),
+            );
         }
     }
 
