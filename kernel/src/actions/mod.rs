@@ -602,7 +602,7 @@ impl CommitInfo {
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
-            txn_id: None,
+            txn_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
