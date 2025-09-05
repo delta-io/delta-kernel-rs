@@ -344,7 +344,6 @@ mod tests {
             // set timestamps to 0 and paths to known string values for comparison
             // (otherwise timestamps are non-deterministic and paths are random UUIDs)
             set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
-            set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!("test-txn-id"))?;
             set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
             set_json_value(&mut parsed_commits[1], "add.size", json!(0))?;
 
@@ -356,7 +355,6 @@ mod tests {
                         "operation": "UNKNOWN",
                         "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                         "operationParameters": {},
-                        "txnId": "test-txn-id",
                     }
                 }),
                 json!({
