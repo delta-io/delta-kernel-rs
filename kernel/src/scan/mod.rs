@@ -315,6 +315,11 @@ pub enum ColumnType {
     Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
+    // A CDF metadata column that can be either computed (Add/Remove) or selected (CDC)
+    Metadata {
+        field_index: usize,
+        physical_name: String,
+    },
 }
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
@@ -493,6 +498,14 @@ impl Scan {
                     transform_spec.push(FieldTransformSpec::PartitionColumn {
                         insert_after: last_physical_field.map(String::from),
                         field_index: *logical_idx,
+                    });
+                }
+                ColumnType::Metadata { field_index, .. } => {
+                    // Metadata columns are treated as partition columns by default
+                    // (should be converted before reaching this point in CDF scans)
+                    transform_spec.push(FieldTransformSpec::PartitionColumn {
+                        insert_after: last_physical_field.map(String::from),
+                        field_index: *field_index,
                     });
                 }
             }

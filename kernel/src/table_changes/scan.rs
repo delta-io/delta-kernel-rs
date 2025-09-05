@@ -14,7 +14,7 @@ use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::scan_file_physical_schema;
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::{scan_metadata_to_scan_file, CdfScanFileType};
-use super::{TableChanges, CDF_FIELDS, CHANGE_TYPE_COL_NAME};
+use super::{TableChanges, CDF_FIELDS};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -146,9 +146,11 @@ impl TableChangesScanBuilder {
                     .iter()
                     .any(|field| field.name() == logical_field.name())
                 {
-                    // CDF Columns are generated metadata columns that vary per file (similar to partition columns).
-                    // They will be processed through the transform infrastructure.
-                    Ok(ColumnType::Partition(index))
+                    // CDF Columns are metadata columns that can be computed or selected based on file type
+                    Ok(ColumnType::Metadata {
+                        field_index: index,
+                        physical_name: logical_field.name().to_string(),
+                    })
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
@@ -285,25 +287,38 @@ fn read_scan_file(
         mut selection_vector,
     } = resolved_scan_file;
 
-    // Create mutable copy for testing CDC file handling
-    let mut all_fields_vec = all_fields.to_vec();
+    // Convert only _change_type Metadata column based on scan file type
+    let all_fields_converted: Vec<ColumnType> = all_fields
+        .iter()
+        .map(|field_type| match field_type {
+            ColumnType::Metadata {
+                field_index,
+                physical_name,
+            } if physical_name == "_change_type" => {
+                match scan_file.scan_type {
+                    CdfScanFileType::Cdc => {
+                        // For CDC files, _change_type exists in physical data
+                        ColumnType::Selected(physical_name.clone())
+                    }
+                    CdfScanFileType::Add | CdfScanFileType::Remove => {
+                        // For Add/Remove files, _change_type is computed
+                        ColumnType::Partition(*field_index)
+                    }
+                }
+            }
+            ColumnType::Metadata { field_index, .. } => {
+                // Other metadata columns are always computed (Partition)
+                ColumnType::Partition(*field_index)
+            }
+            // All other column types remain unchanged
+            other => other.clone(),
+        })
+        .collect();
 
-    println!("🔍 DEBUG: all_fields_vec: {:?}", all_fields_vec);
-
-    // If CDC file, replace the partition _change_type with a selected _change_type
-    if scan_file.scan_type == CdfScanFileType::Cdc {
-        if let Some(pos) = all_fields_vec
-            .iter()
-            .position(|f| matches!(f, ColumnType::Partition(idx) if *idx == 3))
-        {
-            all_fields_vec[pos] = ColumnType::Selected(CHANGE_TYPE_COL_NAME.to_string());
-        }
-    }
-
-    println!("🔍 DEBUG: all_fields_vec: {:?}", all_fields_vec);
+    println!("🔍 DEBUG: all_fields_converted: {:?}", all_fields_converted);
 
     // Create transform spec and unified transform expression using shared utilities
-    let transform_spec = Scan::get_transform_spec(&all_fields_vec);
+    let transform_spec = Scan::get_transform_spec(&all_fields_converted);
     let physical_to_logical_expr = if transform_spec.is_empty() {
         // No transforms needed - create identity transform for column mapping only
         Arc::new(Expression::Transform(crate::expressions::Transform::new()))
@@ -408,9 +423,18 @@ mod tests {
             vec![
                 ColumnType::Selected("part".to_string()),
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Partition(2), // _change_type
-                ColumnType::Partition(3), // _commit_version
-                ColumnType::Partition(4), // _commit_timestamp
+                ColumnType::Metadata {
+                    field_index: 2,
+                    physical_name: "_change_type".to_string()
+                },
+                ColumnType::Metadata {
+                    field_index: 3,
+                    physical_name: "_commit_version".to_string()
+                },
+                ColumnType::Metadata {
+                    field_index: 4,
+                    physical_name: "_commit_timestamp".to_string()
+                },
             ]
             .into()
         );
@@ -441,7 +465,10 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Partition(1), // _commit_version (index 1 in projected schema)
+                ColumnType::Metadata {
+                    field_index: 1,
+                    physical_name: "_commit_version".to_string()
+                },
             ]
             .into()
         );
