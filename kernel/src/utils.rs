@@ -356,4 +356,20 @@ mod tests {
             "s3://foo/__unitystorage/catalogs/cid/tables/tid/"
         );
     }
+
+    #[test]
+    fn test_time_functions_consistency_montonicity() {
+        let time1_ms = current_time_ms().unwrap();
+        let time1_duration = current_time_duration().unwrap();
+        let time2_duration = current_time_duration().unwrap();
+        let time2_ms = current_time_ms().unwrap();
+
+        // time1_ms < time1_duration < time2_duration < time2_ms (monotonicity)
+        // time1_duration and time1_ms should be consistent (< 1 second apart)
+        assert!(time1_duration.as_millis() as i64 - time1_ms < 1000);
+        // same for time2_duration - time1_duration
+        assert!(time2_duration.checked_sub(time1_duration).unwrap() < Duration::from_secs(1));
+        // same for time2_ms and time2_duration
+        assert!(time2_ms - (time2_duration.as_millis() as i64) < 1000);
+    }
 }
