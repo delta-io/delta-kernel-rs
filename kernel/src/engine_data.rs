@@ -1,12 +1,13 @@
 //! Traits that engines need to implement in order to pass data between themselves and kernel.
 
-use crate::log_replay::HasSelectionVector;
-use crate::schema::{ColumnName, DataType};
-use crate::{AsAny, DeltaResult, Error};
+use std::collections::HashMap;
 
 use tracing::debug;
 
-use std::collections::HashMap;
+use crate::expressions::ArrayData;
+use crate::log_replay::HasSelectionVector;
+use crate::schema::{ColumnName, DataType, SchemaRef};
+use crate::{AsAny, DeltaResult, Error};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
@@ -246,7 +247,8 @@ pub trait RowVisitor {
 /// # use std::any::Any;
 /// # use delta_kernel::DeltaResult;
 /// # use delta_kernel::engine_data::{RowVisitor, EngineData, GetData};
-/// # use delta_kernel::expressions::ColumnName;
+/// # use delta_kernel::expressions::{ArrayData, ColumnName};
+/// # use delta_kernel::schema::SchemaRef;
 /// struct MyDataType; // Whatever the engine wants here
 /// impl MyDataType {
 ///   fn do_extraction<'a>(&self) -> Vec<&'a dyn GetData<'a>> {
@@ -264,6 +266,9 @@ pub trait RowVisitor {
 ///   fn len(&self) -> usize {
 ///     todo!() // actually get the len here
 ///   }
+///   fn append_columns(&self, schema: SchemaRef, columns: Vec<ArrayData>) -> DeltaResult<Box<dyn EngineData>> {
+///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
+///   }
 /// }
 /// ```
 pub trait EngineData: AsAny {
@@ -279,7 +284,34 @@ pub trait EngineData: AsAny {
     /// Return the number of items (rows) in blob
     fn len(&self) -> usize;
 
+    /// Returns true if the data is empty (i.e., has no rows).
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Append new columns provided by Kernel to the existing data.
+    ///
+    /// This method creates a new [`EngineData`] instance that combines the existing columns
+    /// with the provided new columns. The original data remains unchanged.
+    ///
+    /// # Parameters
+    /// - `schema`: The schema of the columns being appended (not the entire resulting schema).
+    ///   This schema must describe exactly the columns being added in the `columns` parameter.
+    /// - `columns`: The column data to append. Each [`ArrayData`] corresponds to one field in the schema.
+    ///
+    /// # Returns
+    /// A new `EngineData` instance containing both the original columns and the appended columns.
+    /// The schema of the result will contain all original fields followed by the new schema fields.
+    ///
+    /// # Errors
+    /// Returns an error if:
+    /// - The number of rows in any appended column doesn't match the existing data.
+    /// - The number of new columns doesn't match the number of schema fields.
+    /// - Data type conversion to the engine's native data types fails.
+    /// - The engine cannot create the combined data structure.
+    fn append_columns(
+        &self,
+        schema: SchemaRef,
+        columns: Vec<ArrayData>,
+    ) -> DeltaResult<Box<dyn EngineData>>;
 }
