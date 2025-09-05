@@ -289,7 +289,7 @@ fn read_scan_file(
         mut selection_vector,
     } = resolved_scan_file;
 
-    // No need to convert field types since we're using Selected for CDF columns
+    // Handle CDF columns differently for CDC vs Add/Remove files
     let mut all_fields_converted = all_fields.to_vec();
 
     // Set scan_type use_as_selected to true if cdc file for change_type column

@@ -364,10 +364,10 @@ pub(crate) enum FieldTransformSpec {
     // they should not appear in the query's output.
     #[allow(unused)]
     StaticDrop { field_name: String },
-    /// Inserts a partition column after the named input column. The partition column is identified
-    /// by its field index in the logical table schema (the column is not present in the physical
-    /// read schema). Its value varies from file to file and is obtained from file metadata.
-    /// This also covers metadata columns like CDF columns that vary per file.
+    /// Inserts a metadata-derived column after the named input column. This covers:
+    /// - Partition columns: identified by field index, values from file metadata
+    /// - CDF metadata columns: _change_type, _commit_version, _commit_timestamp
+    /// These columns are not present in physical data and must be generated per file.
     PartitionColumn {
         field_index: usize,
         insert_after: Option<String>,
@@ -860,8 +860,8 @@ pub(crate) fn build_transform_expr(
                     let field_value = Arc::new(field_value);
                     transform.with_inserted_field(insert_after.clone(), field_value)
                 } else {
-                    // Missing field value is fine - this might be a partition column that doesn't
-                    // exist in this file or a CDF metadata column that isn't applicable
+                    // Missing field value - skip this transform step.
+                    // This can happen when a metadata column isn't applicable to this file type.
                     transform
                 }
             }

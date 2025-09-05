@@ -66,13 +66,20 @@ pub(crate) fn get_cdf_metadata_expressions(scan_file: &CdfScanFile) -> HashMap<S
     cdf_expressions
 }
 
-/// Create the unified transform expression that handles both partition and CDF metadata columns
+/// Create a unified transform expression for CDF that handles both partition columns and CDF metadata.
+///
+/// This function replaces the old approach of building struct expressions manually by using the
+/// shared transform system. It combines:
+/// - Partition values (as literal expressions) 
+/// - CDF metadata (_change_type, _commit_version, _commit_timestamp)
+/// 
+/// The result is an Expression::Transform that can convert physical data to logical CDF format.
 pub(crate) fn create_unified_transform_expr(
     scan_file: &CdfScanFile,
     logical_schema: &StructType,
     transform_spec: &[FieldTransformSpec],
 ) -> DeltaResult<ExpressionRef> {
-    // 🎯 UNIFIED APPROACH: Both partition columns and CDF metadata through single transform system
+    // Unified approach: Both partition columns and CDF metadata through single transform system
 
     // Create unified map of all field expressions (partition + CDF metadata)
     let mut field_expressions = HashMap::new();

@@ -124,12 +124,10 @@ impl AddRemoveDedupVisitor<'_> {
         &self,
         partition_values: &HashMap<usize, (String, Expression)>,
     ) -> bool {
-        if partition_values.is_empty() {
-            return false;
-        }
         let Some(partition_filter) = &self.partition_filter else {
             return false;
         };
+
         // Only use literal expressions for partition pruning (traditional partitions)
         // Skip dynamic expressions like CDF metadata columns
         let literal_partition_values: HashMap<_, _> = partition_values
