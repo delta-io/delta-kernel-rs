@@ -250,8 +250,8 @@ impl ListedLogFiles {
         let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
         log_files.process_results(|iter| {
-            let mut ascending_commit_files = Vec::with_capacity(10);
-            let mut ascending_compaction_files = Vec::with_capacity(2);
+            let mut ascending_commit_files = Vec::new();
+            let mut ascending_compaction_files = Vec::new();
             let mut checkpoint_parts = vec![];
             let mut latest_crc_file: Option<ParsedLogPath> = None;
 
