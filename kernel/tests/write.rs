@@ -231,7 +231,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         validate_txn_id(&parsed_commits[0]["commitInfo"]);
 
         // set timestamps to 0, paths and txn_id to known string values for comparison
-        // (otherwise timestamps are non-deterministic, and paths and txn_id are random UUIDs)
+        // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
         set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
 
