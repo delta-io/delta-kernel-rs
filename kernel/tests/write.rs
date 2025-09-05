@@ -36,7 +36,7 @@ mod common;
 use url::Url;
 
 #[tokio::test]
-async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_commit_info() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -87,9 +87,10 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
 // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
 fn check_action_timestamps<'a>(
     parsed_commits: impl Iterator<Item = &'a serde_json::Value>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> DeltaResult<()> {
     let now: i64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| KernelError::generic(format!("failed to get elapsed time: {e}")))?
         .as_millis()
         .try_into()
         .unwrap();
@@ -131,7 +132,7 @@ async fn write_data_and_check_result_and_stats(
     schema: SchemaRef,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> DeltaResult<()> {
     let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(engine.as_ref())?);
     let mut txn = snapshot.transaction()?;
 
@@ -190,7 +191,7 @@ async fn write_data_and_check_result_and_stats(
 }
 
 #[tokio::test]
-async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_commit_info_action() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -237,7 +238,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -325,7 +326,44 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_no_add_actions() -> DeltaResult<()> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let engine = Arc::new(engine);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(engine.as_ref())?);
+        let txn = snapshot.transaction()?;
+
+        // Commit without adding any add files
+        txn.commit(engine.as_ref())?;
+
+        let commit1 = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let parsed_actions: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        // Verify that there only is a commit info action
+        assert_eq!(parsed_actions.len(), 1, "Expected only one action");
+        assert!(parsed_actions[0].get("commitInfo").is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_append_twice() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -358,7 +396,7 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_partitioned() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -500,7 +538,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_invalid_schema() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
@@ -561,7 +599,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[tokio::test]
-async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_write_txn_actions() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -627,7 +665,8 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap() = serde_json::Value::Number(0.into());
 
         let time_ms: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| KernelError::generic(format!("failed to get elapsed time: {e}")))?
             .as_millis()
             .try_into()
             .unwrap();
@@ -695,7 +734,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_timestamp_ntz() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -779,7 +818,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_append_variant() -> DeltaResult<()> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     fn unshredded_variant_schema_flipped() -> DataType {
@@ -1018,7 +1057,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_shredded_variant_read_rejection() -> DeltaResult<()> {
     // Ensure that shredded variants are rejected by the default engine's parquet reader
 
     // setup tracing
