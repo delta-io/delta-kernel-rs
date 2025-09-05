@@ -69,7 +69,7 @@ comfy-table = { version = "~7.1", optional = true }
 # arrow 55
 [dependencies.arrow_55]
 package = "arrow"
-version = "~55.1"
+version = "55"
 features = ["chrono-tz", "ffi", "json", "prettyprint"]
 optional = true
 [dependencies.parquet_55]
