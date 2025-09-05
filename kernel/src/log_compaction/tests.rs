@@ -292,7 +292,9 @@ impl EngineData for MockEngineData {
         _columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         // For testing purposes, just return a new MockEngineData with the same value
-        Ok(Box::new(MockEngineData { _value: self._value }))
+        Ok(Box::new(MockEngineData {
+            _value: self._value,
+        }))
     }
 }
 
