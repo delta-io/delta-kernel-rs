@@ -180,7 +180,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use itertools::Itertools;
     use object_store::memory::InMemory;
@@ -193,6 +193,7 @@ mod tests {
     use crate::Engine as _;
 
     use super::*;
+    use crate::utils::current_time_duration;
 
     #[tokio::test]
     async fn test_read_files() {
@@ -241,7 +242,7 @@ mod tests {
     async fn test_file_meta_is_correct() {
         let store = Arc::new(InMemory::new());
 
-        let begin_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let begin_time = current_time_duration().unwrap();
 
         let data = Bytes::from("kernel-data");
         let name = delta_path_for_version(1, "json");
