@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use delta_kernel::Error as KernelError;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
+use uuid::Uuid;
 
 use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
@@ -35,6 +36,15 @@ use test_utils::{create_table, engine_store_setup, setup_test_tables, test_read}
 mod common;
 use url::Url;
 
+fn validate_txn_id(commit_info: &serde_json::Value) {
+    let txn_id = commit_info["txnId"]
+        .as_str()
+        .expect("txnId should be present in commitInfo");
+    Uuid::parse_str(txn_id).expect("txnId should be valid UUID format");
+}
+
+const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -63,11 +73,11 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
         let mut parsed_commit: serde_json::Value = serde_json::from_slice(&commit1.bytes().await?)?;
-        *parsed_commit
-            .get_mut("commitInfo")
-            .unwrap()
-            .get_mut("timestamp")
-            .unwrap() = serde_json::Value::Number(0.into());
+
+        validate_txn_id(&parsed_commit["commitInfo"]);
+
+        set_json_value(&mut parsed_commit, "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commit, "commitInfo.txnId", json!(ZERO_UUID))?;
 
         let expected_commit = json!({
             "commitInfo": {
@@ -76,6 +86,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
                 "engineInfo": "default engine",
+                "txnId": ZERO_UUID,
             }
         });
 
@@ -217,9 +228,12 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // set timestamps to 0 and paths to known string values for comparison
-        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
+
+        // set timestamps to 0, paths and txn_id to known string values for comparison
+        // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
 
         let expected_commit = vec![json!({
             "commitInfo": {
@@ -228,6 +242,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
                 "engineInfo": "default engine",
+                "txnId": ZERO_UUID
             }
         })];
 
@@ -270,10 +285,13 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
         // before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
+        // check that the txn_id is valid before we clear it for comparison
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
 
-        // set timestamps to 0 and paths to known string values for comparison
-        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        // set timestamps to 0, paths and txn_id to known string values for comparison
+        // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
         set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -286,6 +304,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
+                    "txnId": ZERO_UUID
                 }
             }),
             json!({
@@ -437,10 +456,13 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
         // before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
+        // check that the txn_id is valid before we clear it for comparison
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
 
-        // set timestamps to 0 and paths to known string values for comparison
-        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        // set timestamps to 0, paths and txn_id to known string values for comparison
+        // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
         set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -454,6 +476,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
+                    "txnId": ZERO_UUID
                 }
             }),
             json!({
@@ -620,11 +643,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        *parsed_commits[0]
-            .get_mut("commitInfo")
-            .unwrap()
-            .get_mut("timestamp")
-            .unwrap() = serde_json::Value::Number(0.into());
+        set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0)).unwrap();
 
         let time_ms: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -663,6 +682,10 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         assert!((last_updated.as_i64().unwrap() - time_ms).abs() < 10_000);
         *last_updated = serde_json::Value::Number(2.into());
 
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
+
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+
         let expected_commit = vec![
             json!({
                 "commitInfo": {
@@ -671,6 +694,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
+                    "txnId": ZERO_UUID
                 }
             }),
             json!({

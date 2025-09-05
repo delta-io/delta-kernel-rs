@@ -602,7 +602,7 @@ impl CommitInfo {
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
-            txn_id: None,
+            txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
     }
 }
@@ -1393,6 +1393,7 @@ mod tests {
         let engine = ExprEngine::new();
 
         let commit_info = CommitInfo::new(0, None, None);
+        let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
 
@@ -1416,7 +1417,7 @@ mod tests {
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
-                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(StringArray::from(vec![commit_info_txn_id])),
             ],
         )
         .unwrap();
