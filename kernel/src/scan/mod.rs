@@ -320,7 +320,7 @@ pub enum ColumnType {
     // Else, use the metadata column as a partition column
     Metadata {
         physical_name: String,
-        logical_index: usize,
+        logical_idx: usize,
         use_as_selected: bool,
     },
 }
@@ -497,22 +497,22 @@ impl Scan {
                 ColumnType::Selected(physical_name)
                 | ColumnType::Metadata {
                     physical_name,
-                    logical_index: _,
+                    logical_idx: _,
                     use_as_selected: true,
                 } => {
                     // Track physical field for calculating partition value insertion points.
                     last_physical_field = Some(physical_name);
                 }
                 // Share logic for Partition and Metadata{use_as_selected: false}
-                ColumnType::Partition(logical_index)
+                ColumnType::Partition(logical_idx)
                 | ColumnType::Metadata {
                     physical_name: _,
-                    logical_index,
+                    logical_idx,
                     use_as_selected: false,
                 } => {
                     transform_spec.push(FieldTransformSpec::PartitionColumn {
                         insert_after: last_physical_field.map(String::from),
-                        field_index: *logical_index,
+                        field_index: *logical_idx,
                     });
                 }
             }
@@ -927,13 +927,8 @@ pub(crate) fn parse_partition_values_to_expressions(
             };
             let physical_name = field.physical_name();
 
-            // Convert string partition value to expression, handling both present and null values
-            let partition_value = if let Some(value_str) = partition_values.get(physical_name) {
-                parse_partition_value(Some(value_str), field.data_type())?
-            } else {
-                // If partition value is not present, it means it's null
-                parse_partition_value(None, field.data_type())?
-            };
+            // Convert string partition value to expression
+            let partition_value = parse_partition_value(partition_values.get(physical_name), field.data_type())?;
             result.insert(
                 *field_index,
                 (field.name().to_string(), partition_value.into()),

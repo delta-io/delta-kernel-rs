@@ -150,7 +150,7 @@ impl TableChangesScanBuilder {
                     // data to logical.
                     Ok(ColumnType::Metadata {
                         physical_name: logical_field.name().to_string(),
-                        logical_index: index,
+                        logical_idx: index,
                         use_as_selected: false,
                     })
                 } else {
@@ -299,11 +299,11 @@ fn read_scan_file(
             .map(|field| match field {
                 ColumnType::Metadata {
                     physical_name,
-                    logical_index,
+                    logical_idx,
                     use_as_selected: false,
                 } if physical_name == super::CHANGE_TYPE_COL_NAME => ColumnType::Metadata {
                     physical_name,
-                    logical_index,
+                    logical_idx,
                     use_as_selected: true,
                 },
                 other => other,
@@ -414,17 +414,17 @@ mod tests {
                 ColumnType::Selected("id".to_string()),
                 ColumnType::Metadata {
                     physical_name: "_change_type".to_string(),
-                    logical_index: 2,
+                    logical_idx: 2,
                     use_as_selected: false,
                 },
                 ColumnType::Metadata {
                     physical_name: "_commit_version".to_string(),
-                    logical_index: 3,
+                    logical_idx: 3,
                     use_as_selected: false,
                 },
                 ColumnType::Metadata {
                     physical_name: "_commit_timestamp".to_string(),
-                    logical_index: 4,
+                    logical_idx: 4,
                     use_as_selected: false,
                 },
             ]
@@ -459,7 +459,7 @@ mod tests {
                 ColumnType::Selected("id".to_string()),
                 ColumnType::Metadata {
                     physical_name: "_commit_version".to_string(),
-                    logical_index: 1,
+                    logical_idx: 1,
                     use_as_selected: false,
                 },
             ]

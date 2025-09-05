@@ -86,13 +86,10 @@ pub(crate) fn create_unified_transform_expr(
             };
 
             let physical_name = field.physical_name();
-            // Handle both present values and null values properly
-            let partition_value = if let Some(value_str) = scan_file.partition_values.get(physical_name) {
-                crate::scan::parse_partition_value(Some(value_str), field.data_type())?
-            } else {
-                // If partition value is not present, it means it's null
-                crate::scan::parse_partition_value(None, field.data_type())?
-            };
+            let partition_value = crate::scan::parse_partition_value(
+                scan_file.partition_values.get(physical_name), 
+                field.data_type()
+            )?;
             field_expressions.insert(physical_name.to_string(), partition_value.into());
         }
     }
