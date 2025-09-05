@@ -30,7 +30,7 @@ pub struct ArrowEngineData {
 }
 
 /// Helper function to extract a RecordBatch from EngineData, ensuring it's ArrowEngineData
-pub fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<&RecordBatch> {
+pub(crate) fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<&RecordBatch> {
     let Some(arrow_data) = engine_data.any_ref().downcast_ref::<ArrowEngineData>() else {
         return Err(Error::engine_data_type("ArrowEngineData"));
     };
@@ -214,7 +214,7 @@ impl EngineData for ArrowEngineData {
         visitor.visit(self.len(), &getters)
     }
 
-    fn try_append_columns(
+    fn append_columns(
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,
@@ -435,7 +435,7 @@ mod tests {
         ]));
 
         // Test the append_columns method
-        let arrow_data = arrow_data.try_append_columns(new_schema, new_columns)?;
+        let arrow_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(arrow_data.as_ref())?;
 
         // Verify the result
@@ -493,7 +493,7 @@ mod tests {
             true,
         )]));
 
-        let result = arrow_data.try_append_columns(new_schema, new_columns);
+        let result = arrow_data.append_columns(new_schema, new_columns);
         assert_result_error_with_message(
             result,
             "all columns in a record batch must have the same length",
@@ -524,7 +524,7 @@ mod tests {
             StructField::new("email", DataType::STRING, true), // Extra field in schema
         ]));
 
-        let result = arrow_data.try_append_columns(new_schema, new_columns);
+        let result = arrow_data.append_columns(new_schema, new_columns);
         assert_result_error_with_message(
             result,
             "number of columns(2) must match number of fields(3)",
@@ -558,7 +558,7 @@ mod tests {
             true,
         )]));
 
-        let result_data = arrow_data.try_append_columns(new_schema, new_columns)?;
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
 
         assert_eq!(result_batch.num_columns(), 2);
@@ -585,7 +585,7 @@ mod tests {
         let new_columns = vec![];
         let new_schema = Arc::new(StructType::new([]));
 
-        let result_data = arrow_data.try_append_columns(new_schema, new_columns)?;
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
 
         // Should be identical to original
@@ -625,7 +625,7 @@ mod tests {
             StructField::new("age", DataType::INTEGER, true),
         ]));
 
-        let result_data = arrow_data.try_append_columns(new_schema, new_columns)?;
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
 
         assert_eq!(result_batch.num_columns(), 3);
@@ -668,7 +668,7 @@ mod tests {
             StructField::new("flag", DataType::BOOLEAN, false),
         ]));
 
-        let result_data = arrow_data.try_append_columns(new_schema, new_columns)?;
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
 
         assert_eq!(result_batch.num_columns(), 4);
@@ -715,7 +715,7 @@ mod tests {
             false,
         )]));
 
-        let result_data = arrow_data.try_append_columns(new_schema, new_columns)?;
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
         let result_batch = extract_record_batch(result_data.as_ref())?;
 
         assert_eq!(result_batch.num_columns(), 3);

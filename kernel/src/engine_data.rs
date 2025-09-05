@@ -266,7 +266,7 @@ pub trait RowVisitor {
 ///   fn len(&self) -> usize {
 ///     todo!() // actually get the len here
 ///   }
-///   fn try_append_columns(&self, schema: SchemaRef, columns: Vec<ArrayData>) -> DeltaResult<Box<dyn EngineData>> {
+///   fn append_columns(&self, schema: SchemaRef, columns: Vec<ArrayData>) -> DeltaResult<Box<dyn EngineData>> {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
 /// }
@@ -309,7 +309,7 @@ pub trait EngineData: AsAny {
     /// - The number of new columns doesn't match the number of schema fields.
     /// - Data type conversion to the engine's native data types fails.
     /// - The engine cannot create the combined data structure.
-    fn try_append_columns(
+    fn append_columns(
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,
