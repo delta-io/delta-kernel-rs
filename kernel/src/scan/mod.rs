@@ -315,10 +315,13 @@ pub enum ColumnType {
     Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
-    // A CDF metadata column that can be either computed (Add/Remove) or selected (CDC)
+    // Metadata column that could be selected from data or added back in.
+    // If use_as_selected is true, use the metadata column as a selected column
+    // Else, use the metadata column as a partition column
     Metadata {
-        field_index: usize,
         physical_name: String,
+        logical_index: usize,
+        use_as_selected: bool,
     },
 }
 
@@ -490,22 +493,26 @@ impl Scan {
 
         for field in all_fields {
             match field {
-                ColumnType::Selected(physical_name) => {
+                // Share logic for Selected and Metadata{use_as_selected: true}
+                ColumnType::Selected(physical_name)
+                | ColumnType::Metadata {
+                    physical_name,
+                    logical_index: _,
+                    use_as_selected: true,
+                } => {
                     // Track physical field for calculating partition value insertion points.
                     last_physical_field = Some(physical_name);
                 }
-                ColumnType::Partition(logical_idx) => {
+                // Share logic for Partition and Metadata{use_as_selected: false}
+                ColumnType::Partition(logical_index)
+                | ColumnType::Metadata {
+                    physical_name: _,
+                    logical_index,
+                    use_as_selected: false,
+                } => {
                     transform_spec.push(FieldTransformSpec::PartitionColumn {
                         insert_after: last_physical_field.map(String::from),
-                        field_index: *logical_idx,
-                    });
-                }
-                ColumnType::Metadata { field_index, .. } => {
-                    // Metadata columns are treated as partition columns by default
-                    // (should be converted before reaching this point in CDF scans)
-                    transform_spec.push(FieldTransformSpec::PartitionColumn {
-                        insert_after: last_physical_field.map(String::from),
-                        field_index: *field_index,
+                        field_index: *logical_index,
                     });
                 }
             }
@@ -883,11 +890,12 @@ pub(crate) fn parse_field_values_to_expressions(
                 )));
             };
             let field_name = field.name();
+            let physical_name = field.physical_name();
 
-            // Check if we have an expression for this field (logical name first, then physical name)
+            // Check if we have an expression for this field (physical name first, then logical name)
             let expression = field_expressions
-                .get(field_name)
-                .or_else(|| field_expressions.get(field.physical_name()));
+                .get(physical_name)
+                .or_else(|| field_expressions.get(field_name));
 
             if let Some(expr) = expression {
                 result.insert(*field_index, (field_name.to_string(), expr.clone()));
@@ -906,9 +914,9 @@ pub(crate) fn parse_partition_values_to_expressions(
     transform_spec: &[FieldTransformSpec],
     partition_values: &HashMap<String, String>,
 ) -> DeltaResult<HashMap<usize, (String, Expression)>> {
-    // Convert string partition values to expressions first
-    let mut field_expressions = HashMap::new();
+    let mut result = HashMap::new();
 
+    // Process all partition columns in the transform spec
     for field_transform in transform_spec {
         if let FieldTransformSpec::PartitionColumn { field_index, .. } = field_transform {
             let field = logical_schema.fields.get_index(*field_index);
@@ -922,13 +930,15 @@ pub(crate) fn parse_partition_values_to_expressions(
             // Convert string partition value to expression if present
             if let Some(value_str) = partition_values.get(physical_name) {
                 let partition_value = parse_partition_value(Some(value_str), field.data_type())?;
-                field_expressions.insert(physical_name.to_string(), partition_value.into());
+                result.insert(
+                    *field_index,
+                    (field.name().to_string(), partition_value.into()),
+                );
             }
         }
     }
 
-    // Use the unified function with the converted expressions
-    parse_field_values_to_expressions(logical_schema, transform_spec, &field_expressions)
+    Ok(result)
 }
 
 /// Get the schema that scan rows (from [`Scan::scan_metadata`]) will be returned with.

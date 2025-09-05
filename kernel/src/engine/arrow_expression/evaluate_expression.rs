@@ -192,9 +192,6 @@ fn evaluate_transform_expression(
         ));
     }
 
-    println!("🔍 DEBUG: output_cols: {:?}", output_cols);
-    println!("🔍 DEBUG: output_schema: {:?}", output_schema);
-    println!("--------------------------------");
     if output_cols.len() != output_schema.fields_len() {
         return Err(Error::generic(format!(
             "Expression count ({}) doesn't match output schema field count ({})",
