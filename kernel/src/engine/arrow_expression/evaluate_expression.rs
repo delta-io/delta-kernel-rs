@@ -127,18 +127,14 @@ fn evaluate_transform_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    let mut used_insertion_keys = 0;
-    let mut used_replacement_keys = 0;
+    let mut used_field_transforms = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
     let mut output_cols = Vec::new();
 
     // Handle prepends (insertions before any field)
-    if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
-        for expr in prepend_exprs {
-            output_cols.push(evaluate_expression(expr, batch, None)?);
-        }
-        used_insertion_keys += 1;
+    for expr in &transform.prepended_fields {
+        output_cols.push(evaluate_expression(expr, batch, None)?);
     }
 
     // Extract the input path, if any
@@ -157,41 +153,31 @@ fn evaluate_transform_expression(
 
     // Process each input field in order (unified logic for both cases)
     for input_field in source_data.schema_fields() {
-        let field_name = input_field.name().as_ref();
+        let field_name: &str = input_field.name();
 
-        // Handle the field based on replacement rules
-        if let Some(replacement) = transform.field_replacements.get(field_name) {
-            if let Some(expr) = replacement {
-                output_cols.push(evaluate_expression(expr, batch, None)?);
-            } // else no replacement => dropped
-            used_replacement_keys += 1;
-        } else {
-            // Field passes through unchanged - extract based on source type
+        // Any field that isn't replaced passes through unchanged
+        let field_transform = transform.field_transforms.get(field_name);
+        if !field_transform.is_some_and(|t| t.is_replace) {
             output_cols.push(extract_column(source_data, &[field_name])?);
         }
 
-        // Handle insertions after this input field
-        let field_name = Some(Cow::Borrowed(field_name));
-        if let Some(insertion_exprs) = transform.field_insertions.get(&field_name) {
-            for expr in insertion_exprs {
+        // Process any insertions that come after this field
+        if let Some(field_transform) = field_transform {
+            for expr in &field_transform.exprs {
                 output_cols.push(evaluate_expression(expr, batch, None)?);
             }
-            used_insertion_keys += 1;
+            used_field_transforms += 1;
         }
     }
 
-    // Validate all transforms were used
-    if used_insertion_keys != transform.field_insertions.len() {
+    // Verify that all field transforms were used
+    if used_field_transforms != transform.field_transforms.len() {
         return Err(Error::generic(
-            "Some insertion keys don't reference valid input field names",
-        ));
-    }
-    if used_replacement_keys != transform.field_replacements.len() {
-        return Err(Error::generic(
-            "Some replacement keys don't reference valid input field names",
+            "Some field transforms reference invalid input field names",
         ));
     }
 
+    // Verify that the lengths match before attempting to zip them below.
     if output_cols.len() != output_schema.fields_len() {
         return Err(Error::generic(format!(
             "Expression count ({}) doesn't match output schema field count ({})",
@@ -565,7 +551,7 @@ mod tests {
         let batch = create_test_batch();
 
         // Test 1: Empty transform (identity) - should be exactly equal to input
-        let transform = Transform::new();
+        let transform = Transform::new_top_level();
         let output_schema = StructType::new(vec![
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
@@ -590,7 +576,7 @@ mod tests {
 
         // Test 2: Nested path identity (struct relocation without modification)
         let nested_batch = create_nested_test_batch();
-        let transform_nested = Transform::new().with_input_path(["nested"]);
+        let transform_nested = Transform::new_nested(["nested"]);
 
         let nested_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -630,35 +616,15 @@ mod tests {
     fn test_field_operations_and_multiple_insertions() {
         let batch = create_test_batch();
 
-        let mut transform = Transform::new();
-
-        // Replace field 'a' with column reference to 'b'
-        transform
-            .field_replacements
-            .insert("a".to_string(), Some(column_expr_ref!("b")));
-
-        // Drop field 'b'
-        transform.field_replacements.insert("b".to_string(), None);
-
-        // Multiple prepends (multiple insertions at same position)
-        transform.field_insertions.insert(
-            None,
-            vec![
-                Expr::literal(1).into(),
-                Expr::literal(2).into(),
-                column_expr_ref!("c"),
-            ],
-        );
-
-        // Multiple insertions after 'c' (key feature: multiple at same position)
-        transform.field_insertions.insert(
-            Some(Cow::Borrowed("c")),
-            vec![
-                Expr::literal(42).into(),
-                column_expr_ref!("a"), // references original column a
-                Expr::literal(99).into(),
-            ],
-        );
+        let transform = Transform::new_top_level()
+            .with_replaced_field("a", column_expr_ref!("b"))
+            .with_dropped_field("b")
+            .with_inserted_field(None::<&str>, Expr::literal(1).into())
+            .with_inserted_field(None::<&str>, Expr::literal(2).into())
+            .with_inserted_field(None::<&str>, column_expr_ref!("c"))
+            .with_inserted_field(Some("c"), Expr::literal(42).into())
+            .with_inserted_field(Some("c"), column_expr_ref!("a"))
+            .with_inserted_field(Some("c"), Expr::literal(99).into());
 
         let output_schema = StructType::new(vec![
             StructField::new("pre1", DataType::INTEGER, false), // prepend 1
@@ -705,7 +671,7 @@ mod tests {
         let nested_batch = create_nested_test_batch();
 
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
-        let transform_copy = Transform::new().with_input_path(["nested"]);
+        let transform_copy = Transform::new_nested(["nested"]);
 
         let copy_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false),
@@ -737,17 +703,9 @@ mod tests {
         }
 
         // Test 2: Modify nested struct and relocate it
-        let mut transform_modify = Transform::new().with_input_path(["nested"]);
-
-        // Replace 'x' field with a literal value
-        transform_modify
-            .field_replacements
-            .insert("x".to_string(), Some(Expr::literal(777).into()));
-
-        // Insert a new field after 'y'
-        transform_modify
-            .field_insertions
-            .insert(Some(Cow::Borrowed("y")), vec![Expr::literal(555).into()]);
+        let transform_modify = Transform::new_nested(["nested"])
+            .with_replaced_field("x".to_string(), Expr::literal(777).into())
+            .with_inserted_field(Some("y"), Expr::literal(555).into());
 
         let modify_output_schema = StructType::new(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
@@ -785,7 +743,8 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let transform = Transform::new().with_replaced_field("missing", Expr::literal(1).into());
+        let transform =
+            Transform::new_top_level().with_replaced_field("missing", Expr::literal(1).into());
         let output_schema = StructType::new(vec![StructField::new("a", DataType::INTEGER, false)]);
 
         let expr = Expr::Transform(transform);
@@ -794,15 +753,14 @@ mod tests {
             &batch,
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("replacement keys"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
         // Test unused insertion keys
-        let mut transform2 = Transform::new();
-        transform2.field_insertions.insert(
-            Some(Cow::Borrowed("nonexistent")),
-            vec![Expr::literal(1).into()],
-        );
+        let transform2 = Transform::new_top_level()
+            .with_inserted_field(Some("nonexistent"), Expr::literal(1).into());
 
         let expr2 = Expr::Transform(transform2);
         let result2 = evaluate_expression(
@@ -811,10 +769,13 @@ mod tests {
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().to_string().contains("insertion keys"));
+        assert!(result2
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
         // Test column count mismatch
-        let transform3 = Transform::new().with_dropped_field("a");
+        let transform3 = Transform::new_top_level().with_dropped_field("a");
 
         let wrong_output_schema = StructType::new(vec![
             StructField::new("a", DataType::INTEGER, false), // expects a field that was dropped
@@ -835,7 +796,7 @@ mod tests {
             .contains("Expression count"));
 
         // Test missing output schema
-        let transform4 = Transform::new();
+        let transform4 = Transform::new_top_level();
         let expr4 = Expr::Transform(transform4);
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());

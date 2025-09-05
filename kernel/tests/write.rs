@@ -294,7 +294,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "partitionValues": {},
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
             json!({
@@ -303,7 +304,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "partitionValues": {},
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
         ];
@@ -462,7 +464,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
             json!({
@@ -473,7 +476,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
         ];

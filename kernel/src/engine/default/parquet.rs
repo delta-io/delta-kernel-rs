@@ -36,16 +36,23 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
     readahead: usize,
 }
 
-/// Metadata of a data file (typically a parquet file), currently just includes the file metadata
-/// but will expand to include file statistics and other metadata in the future.
+/// Metadata of a data file (typically a parquet file).
+///
+/// Currently just includes the the number of records as statistics, but will expand to include
+/// more statistics and other metadata in the future.
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
+    // NB: We use usize instead of u64 since arrow uses usize for record batch sizes
+    num_records: usize,
 }
 
 impl DataFileMetadata {
-    pub fn new(file_meta: FileMeta) -> Self {
-        Self { file_meta }
+    pub fn new(file_meta: FileMeta, num_records: usize) -> Self {
+        Self {
+            file_meta,
+            num_records,
+        }
     }
 
     // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
@@ -61,6 +68,7 @@ impl DataFileMetadata {
                     last_modified,
                     size,
                 },
+            num_records,
         } = self;
         let add_files_schema = crate::transaction::add_files_schema();
 
@@ -87,9 +95,18 @@ impl DataFileMetadata {
         let size = Arc::new(Int64Array::from(vec![size]));
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
+        let num_records = Arc::new(Int64Array::from(vec![*num_records as i64]));
+
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(add_files_schema.as_ref().try_into_arrow()?),
-            vec![path, partitions, size, modification_time, data_change],
+            vec![
+                path,
+                partitions,
+                size,
+                modification_time,
+                data_change,
+                num_records,
+            ],
         )?)))
     }
 }
@@ -123,6 +140,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     ) -> DeltaResult<DataFileMetadata> {
         let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
         let record_batch = batch.record_batch();
+        let num_records = record_batch.num_rows();
 
         let mut buffer = vec![];
         let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
@@ -156,7 +174,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         }
 
         let file_meta = FileMeta::new(path, modification_time, size);
-        Ok(DataFileMetadata::new(file_meta))
+        Ok(DataFileMetadata::new(file_meta, num_records))
     }
 
     /// Write `data` to `{path}/<uuid>.parquet` as parquet using ArrowWriter and return the parquet
@@ -455,8 +473,9 @@ mod tests {
         let location = Url::parse("file:///test_url").unwrap();
         let size = 1_000_000;
         let last_modified = 10000000000;
+        let num_records = 10;
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
-        let data_file_metadata = DataFileMetadata::new(file_metadata);
+        let data_file_metadata = DataFileMetadata::new(file_metadata, num_records);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let data_change = true;
         let actual = data_file_metadata
@@ -470,16 +489,14 @@ mod tests {
                 .try_into_arrow()
                 .unwrap(),
         );
-        let key_builder = StringBuilder::new();
-        let val_builder = StringBuilder::new();
         let mut partition_values_builder = MapBuilder::new(
             Some(MapFieldNames {
                 entry: "key_value".to_string(),
                 key: "key".to_string(),
                 value: "value".to_string(),
             }),
-            key_builder,
-            val_builder,
+            StringBuilder::new(),
+            StringBuilder::new(),
         );
         partition_values_builder.keys().append_value("partition1");
         partition_values_builder.values().append_value("a");
@@ -493,6 +510,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
                 Arc::new(BooleanArray::from(vec![data_change])),
+                Arc::new(Int64Array::from(vec![num_records as i64])),
             ],
         )
         .unwrap();
@@ -526,6 +544,7 @@ mod tests {
                     last_modified,
                     size,
                 },
+            num_records,
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 
@@ -548,6 +567,7 @@ mod tests {
         assert_eq!(&expected_location.join(filename).unwrap(), location);
         assert_eq!(expected_size, size);
         assert!(now - last_modified < 10_000);
+        assert_eq!(num_records, 3);
 
         // check we can read back
         let path = Path::from_url_path(location.path()).unwrap();
