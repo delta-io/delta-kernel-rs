@@ -148,7 +148,8 @@ impl TableChangesScanBuilder {
                 {
                     // CDF Columns are generated metadata columns that vary per file (similar to partition columns).
                     // They will be processed through the transform infrastructure.
-                    Ok(ColumnType::Partition(index))
+                    // Ok(ColumnType::Partition(index))
+                    Ok(ColumnType::Selected(logical_field.name().to_string()))
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)

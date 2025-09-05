@@ -105,39 +105,6 @@ pub(crate) fn create_unified_transform_expr(
         &field_expressions,
     )?;
 
-    // Special handling for CDC files: adjust _commit_version insertion point
-    if scan_file.scan_type == CdfScanFileType::Cdc {
-        // For CDC files, _commit_version should be inserted after _change_type (not after "name")
-        // We need to create a custom transform spec for this case
-        let mut custom_transform_spec = transform_spec.to_vec();
-
-        // Find the _commit_version entry and update its insert_after
-        for field_transform in &mut custom_transform_spec {
-            if let FieldTransformSpec::PartitionColumn {
-                field_index,
-                insert_after,
-            } = field_transform
-            {
-                if let Some((_, field)) = logical_schema.fields.get_index(*field_index) {
-                    if field.name() == COMMIT_VERSION_COL_NAME {
-                        *insert_after = Some(CHANGE_TYPE_COL_NAME.to_string());
-                        break;
-                    }
-                }
-            }
-        }
-
-        // TODO: Fix _commit_timestamp column ordering for CDC files
-        // Currently _commit_timestamp gets inserted after "name" (last physical field) instead of
-        // after _commit_version. This causes incorrect column ordering:
-        // Current: [id, name, birthday, _commit_version, _commit_timestamp, _change_type]
-        // Correct: [id, name, birthday, _change_type, _commit_version, _commit_timestamp]
-        // Need to also update _commit_timestamp's insert_after to point to _commit_version.
-
-        // Build transform with custom spec
-        return crate::scan::build_transform_expr(&custom_transform_spec, field_values);
-    }
-
     // Build the final transform expression (for Add/Remove files)
     crate::scan::build_transform_expr(transform_spec, field_values)
 }
