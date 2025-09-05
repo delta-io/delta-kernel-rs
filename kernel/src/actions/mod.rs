@@ -469,7 +469,18 @@ impl Protocol {
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
-                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
+                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)?;
+
+                // ensure that there is no illegal combination of features
+                if writer_features.contains(&WriterFeature::RowTracking)
+                    && !writer_features.contains(&WriterFeature::DomainMetadata)
+                {
+                    Err(Error::invalid_protocol(
+                        "rowTracking feature requires domainMetadata to also be enabled",
+                    ))
+                } else {
+                    Ok(())
+                }
             }
             Some(_) => {
                 // there are features, but we're not on 7, so the protocol is actually broken
@@ -914,15 +925,17 @@ impl DomainMetadata {
 mod tests {
     use super::*;
     use crate::{
-        arrow::array::{
-            Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-            MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+        arrow::{
+            array::{
+                Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+                MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+            },
+            datatypes::{DataType as ArrowDataType, Field, Schema},
+            json::ReaderBuilder,
         },
-        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
-        arrow::json::ReaderBuilder,
-        engine::arrow_data::ArrowEngineData,
-        engine::arrow_expression::ArrowEvaluationHandler,
+        engine::{arrow_data::ArrowEngineData, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
+        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
@@ -1315,12 +1328,32 @@ mod tests {
             Some(vec![
                 WriterFeature::AppendOnly,
                 WriterFeature::DeletionVectors,
+                WriterFeature::DomainMetadata,
                 WriterFeature::Invariants,
                 WriterFeature::RowTracking,
             ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
+    }
+
+    #[test]
+    fn test_illegal_writer_feature_combination() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                // No domain metadata even though that is required
+                WriterFeature::RowTracking,
+            ]),
+        )
+        .unwrap();
+
+        assert_result_error_with_message(
+            protocol.ensure_write_supported(),
+            "rowTracking feature requires domainMetadata to also be enabled",
+        );
     }
 
     #[test]

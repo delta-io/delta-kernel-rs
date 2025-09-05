@@ -41,7 +41,7 @@ async fn create_row_tracking_table(
         &[],    // no partition columns
         true,   // use 37 protocol
         vec![], // no reader features
-        vec!["rowTracking"],
+        vec!["domainMetadata", "rowTracking"],
     )
     .await
     .map_err(|e| Error::generic(format!("Failed to create table: {e}")))?;
