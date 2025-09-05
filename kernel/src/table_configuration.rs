@@ -342,6 +342,61 @@ impl TableConfiguration {
             )),
         }
     }
+
+    /// Returns `true` if the table supports writing domain metadata.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7.
+    /// - Have the [`WriterFeature::DomainMetadata`] writer feature.
+    #[allow(unused)]
+    pub(crate) fn is_domain_metadata_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::DomainMetadata)
+    }
+
+    /// Returns `true` if the table supports writing row tracking metadata.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7.
+    /// - Have the [`WriterFeature::RowTracking`] writer feature.
+    #[allow(unused)]
+    pub(crate) fn is_row_tracking_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::RowTracking)
+    }
+
+    /// Returns `true` if row tracking is enabled for this table.
+    ///
+    /// In order to enable row tracking the table must:
+    /// - Support row tracking (see [`Self::is_row_tracking_supported`]).
+    /// - Have the `delta.enableRowTracking` table property set to `true`.
+    #[allow(unused)]
+    pub(crate) fn is_row_tracking_enabled(&self) -> bool {
+        self.is_row_tracking_supported()
+            && self.table_properties().enable_row_tracking.unwrap_or(false)
+    }
+
+    /// Returns `true` if row tracking is suspended for this table.
+    ///
+    /// Row tracking is suspended when the `delta.rowTrackingSuspended` table property is set to `true`.
+    /// Note that:
+    /// - If row tracking is not supported, it is implicitly suspended.
+    /// - Row tracking can be _supported_ but _suspended_ at the same time.
+    /// - Row tracking cannot be _enabled_ while _suspended_.
+    #[allow(unused)]
+    pub(crate) fn is_row_tracking_suspended(&self) -> bool {
+        // We do not check whether row tracking is enabled here but rely on the table properties to
+        // be in a valid state.
+        !self.is_row_tracking_supported()
+            || self
+                .table_properties()
+                .row_tracking_suspended
+                .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
