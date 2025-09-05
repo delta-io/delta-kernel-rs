@@ -190,10 +190,10 @@ mod tests {
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
+    use crate::utils::current_time_duration;
     use crate::Engine as _;
 
     use super::*;
-    use crate::utils::current_time_duration;
 
     #[tokio::test]
     async fn test_read_files() {

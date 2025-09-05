@@ -74,17 +74,17 @@ impl StorageHandler for SyncStorageHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::Write;
     use std::time::Duration;
-    use std::fs::File;
 
     use bytes::{BufMut, BytesMut};
     use itertools::Itertools;
     use url::Url;
 
     use super::SyncStorageHandler;
-    use crate::StorageHandler;
     use crate::utils::current_time_duration;
+    use crate::StorageHandler;
 
     /// generate json filenames that follow the spec (numbered padded to 20 chars)
     fn get_json_filename(index: usize) -> String {

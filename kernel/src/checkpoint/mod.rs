@@ -403,10 +403,7 @@ impl CheckpointWriter {
             .table_properties()
             .deleted_file_retention_duration;
 
-        deleted_file_retention_timestamp_with_time(
-            retention_duration,
-            current_time_duration()?,
-        )
+        deleted_file_retention_timestamp_with_time(retention_duration, current_time_duration()?)
     }
 }
 
