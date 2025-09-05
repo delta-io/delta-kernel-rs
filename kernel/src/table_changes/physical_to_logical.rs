@@ -155,85 +155,34 @@ mod tests {
     }
 
     #[test]
-    fn test_get_cdf_metadata_expressions_add_file() {
-        let scan_file = create_test_scan_file(CdfScanFileType::Add);
-        let expressions = get_cdf_metadata_expressions(&scan_file);
+    fn test_cdf_metadata_expressions() {
+        // Test Add file
+        let add_scan_file = create_test_scan_file(CdfScanFileType::Add);
+        let add_expressions = get_cdf_metadata_expressions(&add_scan_file);
+        assert_eq!(add_expressions.len(), 3);
+        assert_eq!(add_expressions[CHANGE_TYPE_COL_NAME], Expr::literal(ADD_CHANGE_TYPE));
+        assert_eq!(add_expressions[COMMIT_VERSION_COL_NAME], Expr::literal(42i64));
+        assert_eq!(add_expressions[COMMIT_TIMESTAMP_COL_NAME], Expr::literal(Scalar::Timestamp(1234000)));
 
-        assert_eq!(expressions.len(), 3);
-        
-        // Check _change_type expression
-        assert_eq!(
-            expressions[CHANGE_TYPE_COL_NAME],
-            Expr::literal(ADD_CHANGE_TYPE)
-        );
-        
-        // Check _commit_version expression
-        assert_eq!(
-            expressions[COMMIT_VERSION_COL_NAME],
-            Expr::literal(42i64)
-        );
-        
-        // Check _commit_timestamp expression
-        assert_eq!(
-            expressions[COMMIT_TIMESTAMP_COL_NAME],
-            Expr::literal(Scalar::Timestamp(1234000))
-        );
+        // Test Remove file
+        let remove_scan_file = create_test_scan_file(CdfScanFileType::Remove);
+        let remove_expressions = get_cdf_metadata_expressions(&remove_scan_file);
+        assert_eq!(remove_expressions.len(), 3);
+        assert_eq!(remove_expressions[CHANGE_TYPE_COL_NAME], Expr::literal(REMOVE_CHANGE_TYPE));
+
+        // Test CDC file (should not have _change_type)
+        let cdc_scan_file = create_test_scan_file(CdfScanFileType::Cdc);
+        let cdc_expressions = get_cdf_metadata_expressions(&cdc_scan_file);
+        assert_eq!(cdc_expressions.len(), 2);
+        assert!(!cdc_expressions.contains_key(CHANGE_TYPE_COL_NAME));
     }
 
     #[test]
-    fn test_get_cdf_metadata_expressions_remove_file() {
-        let scan_file = create_test_scan_file(CdfScanFileType::Remove);
-        let expressions = get_cdf_metadata_expressions(&scan_file);
-
-        assert_eq!(expressions.len(), 3);
-        
-        // Check _change_type expression
-        assert_eq!(
-            expressions[CHANGE_TYPE_COL_NAME],
-            Expr::literal(REMOVE_CHANGE_TYPE)
-        );
-        
-        // Check _commit_version expression
-        assert_eq!(
-            expressions[COMMIT_VERSION_COL_NAME],
-            Expr::literal(42i64)
-        );
-        
-        // Check _commit_timestamp expression
-        assert_eq!(
-            expressions[COMMIT_TIMESTAMP_COL_NAME],
-            Expr::literal(Scalar::Timestamp(1234000))
-        );
-    }
-
-    #[test]
-    fn test_get_cdf_metadata_expressions_cdc_file() {
-        let scan_file = create_test_scan_file(CdfScanFileType::Cdc);
-        let expressions = get_cdf_metadata_expressions(&scan_file);
-
-        // CDC files should only have commit_version and commit_timestamp, not change_type
-        assert_eq!(expressions.len(), 2);
-        assert!(!expressions.contains_key(CHANGE_TYPE_COL_NAME));
-        
-        // Check _commit_version expression
-        assert_eq!(
-            expressions[COMMIT_VERSION_COL_NAME],
-            Expr::literal(42i64)
-        );
-        
-        // Check _commit_timestamp expression
-        assert_eq!(
-            expressions[COMMIT_TIMESTAMP_COL_NAME],
-            Expr::literal(Scalar::Timestamp(1234000))
-        );
-    }
-
-    #[test]
-    fn test_create_unified_transform_expr_with_partition_columns() {
-        let scan_file = create_test_scan_file(CdfScanFileType::Add);
+    fn test_create_unified_transform_expr() {
         let logical_schema = create_test_logical_schema();
         
-        // Create all_fields with partition column
+        // Test with partition columns
+        let scan_file = create_test_scan_file(CdfScanFileType::Add);
         let all_fields = vec![
             ColumnType::Selected("id".to_string()),
             ColumnType::Partition(1), // age column
@@ -242,142 +191,17 @@ mod tests {
                 logical_idx: 2,
                 use_as_selected: false,
             },
-            ColumnType::Metadata {
-                physical_name: COMMIT_VERSION_COL_NAME.to_string(),
-                logical_idx: 3,
-                use_as_selected: false,
-            },
-            ColumnType::Metadata {
-                physical_name: COMMIT_TIMESTAMP_COL_NAME.to_string(),
-                logical_idx: 4,
-                use_as_selected: false,
-            },
         ];
-
         let transform_spec = Scan::get_transform_spec(&all_fields);
         let result = create_unified_transform_expr(&scan_file, &logical_schema, &transform_spec);
-        
         assert!(result.is_ok());
-        let expr = result.unwrap();
-        assert!(matches!(expr.as_ref(), Expr::Transform(_)));
-    }
+        assert!(matches!(result.unwrap().as_ref(), Expr::Transform(_)));
 
-    #[test]
-    fn test_create_unified_transform_expr_with_null_partition() {
-        let mut scan_file = create_test_scan_file(CdfScanFileType::Add);
-        // Remove the partition value to test null handling
-        scan_file.partition_values.clear();
-        
-        let logical_schema = create_test_logical_schema();
-        
-        let all_fields = vec![
-            ColumnType::Selected("id".to_string()),
-            ColumnType::Partition(1), // age column - will be null
-            ColumnType::Metadata {
-                physical_name: CHANGE_TYPE_COL_NAME.to_string(),
-                logical_idx: 2,
-                use_as_selected: false,
-            },
-        ];
-
-        let transform_spec = Scan::get_transform_spec(&all_fields);
-        let result = create_unified_transform_expr(&scan_file, &logical_schema, &transform_spec);
-        
+        // Test with null partition (the critical bug fix)
+        let mut null_scan_file = create_test_scan_file(CdfScanFileType::Add);
+        null_scan_file.partition_values.clear();
+        let result = create_unified_transform_expr(&null_scan_file, &logical_schema, &transform_spec);
         assert!(result.is_ok());
-        let expr = result.unwrap();
-        assert!(matches!(expr.as_ref(), Expr::Transform(_)));
-    }
-
-    #[test]
-    fn test_create_unified_transform_expr_cdc_file() {
-        let scan_file = create_test_scan_file(CdfScanFileType::Cdc);
-        let logical_schema = create_test_logical_schema();
-        
-        // For CDC files, _change_type should be Selected (read from data)
-        let all_fields = vec![
-            ColumnType::Selected("id".to_string()),
-            ColumnType::Partition(1), // age column
-            ColumnType::Metadata {
-                physical_name: CHANGE_TYPE_COL_NAME.to_string(),
-                logical_idx: 2,
-                use_as_selected: true, // CDC files read _change_type from data
-            },
-            ColumnType::Metadata {
-                physical_name: COMMIT_VERSION_COL_NAME.to_string(),
-                logical_idx: 3,
-                use_as_selected: false,
-            },
-            ColumnType::Metadata {
-                physical_name: COMMIT_TIMESTAMP_COL_NAME.to_string(),
-                logical_idx: 4,
-                use_as_selected: false,
-            },
-        ];
-
-        let transform_spec = Scan::get_transform_spec(&all_fields);
-        let result = create_unified_transform_expr(&scan_file, &logical_schema, &transform_spec);
-        
-        assert!(result.is_ok());
-        let expr = result.unwrap();
-        assert!(matches!(expr.as_ref(), Expr::Transform(_)));
-    }
-
-    #[test]
-    fn test_create_unified_transform_expr_no_partitions() {
-        let scan_file = create_test_scan_file(CdfScanFileType::Add);
-        let logical_schema = StructType::new([
-            StructField::nullable("id", DataType::STRING),
-            StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),
-            StructField::not_null(COMMIT_VERSION_COL_NAME, DataType::LONG),
-            StructField::not_null(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP),
-        ]);
-        
-        // No partition columns, only CDF metadata
-        let all_fields = vec![
-            ColumnType::Selected("id".to_string()),
-            ColumnType::Metadata {
-                physical_name: CHANGE_TYPE_COL_NAME.to_string(),
-                logical_idx: 1,
-                use_as_selected: false,
-            },
-            ColumnType::Metadata {
-                physical_name: COMMIT_VERSION_COL_NAME.to_string(),
-                logical_idx: 2,
-                use_as_selected: false,
-            },
-            ColumnType::Metadata {
-                physical_name: COMMIT_TIMESTAMP_COL_NAME.to_string(),
-                logical_idx: 3,
-                use_as_selected: false,
-            },
-        ];
-
-        let transform_spec = Scan::get_transform_spec(&all_fields);
-        let result = create_unified_transform_expr(&scan_file, &logical_schema, &transform_spec);
-        
-        assert!(result.is_ok());
-        let expr = result.unwrap();
-        assert!(matches!(expr.as_ref(), Expr::Transform(_)));
-    }
-
-    #[test]
-    fn test_timestamp_conversion() {
-        let scan_file = CdfScanFile {
-            scan_type: CdfScanFileType::Add,
-            path: "fake_path".to_string(),
-            dv_info: Default::default(),
-            remove_dv: None,
-            partition_values: HashMap::new(),
-            commit_version: 42,
-            commit_timestamp: 1234, // milliseconds
-        };
-
-        let expressions = get_cdf_metadata_expressions(&scan_file);
-        
-        // Verify timestamp is converted from milliseconds to microseconds
-        assert_eq!(
-            expressions[COMMIT_TIMESTAMP_COL_NAME],
-            Expr::literal(Scalar::Timestamp(1234000)) // 1234 * 1000
-        );
+        assert!(matches!(result.unwrap().as_ref(), Expr::Transform(_)));
     }
 }

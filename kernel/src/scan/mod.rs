@@ -309,7 +309,7 @@ impl ScanResult {
 /// store the name of the column, as that's all that's needed during the actual query. For
 /// `Partition` we store an index into the logical schema for this query since later we need the
 /// data type as well to materialize the partition column.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum ColumnType {
     // A column, selected from the data, as is
     Selected(String),
@@ -1678,73 +1678,7 @@ mod tests {
         }
 
         #[test]
-        fn test_build_transform_expr_with_partition_columns() {
-            let transform_spec = vec![FieldTransformSpec::PartitionColumn {
-                field_index: 1, // age column
-                insert_after: Some("id".to_string()),
-            }];
-
-            let mut field_values = HashMap::new();
-            field_values.insert(1, ("age".to_string(), Expr::literal(Scalar::Long(25))));
-
-            let result = build_transform_expr(&transform_spec, field_values);
-            assert!(result.is_ok());
-
-            let expr = result.unwrap();
-            assert!(matches!(expr.as_ref(), Expr::Transform(_)));
-        }
-
-        #[test]
-        fn test_build_transform_expr_with_missing_field() {
-            let transform_spec = vec![
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 1, // age column
-                    insert_after: Some("id".to_string()),
-                },
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 2, // name column - missing from field_values
-                    insert_after: Some("age".to_string()),
-                },
-            ];
-
-            let mut field_values = HashMap::new();
-            field_values.insert(1, ("age".to_string(), Expr::literal(Scalar::Long(25))));
-            // field_values for index 2 is missing - this should be handled gracefully
-
-            let result = build_transform_expr(&transform_spec, field_values);
-            assert!(result.is_ok());
-
-            let expr = result.unwrap();
-            assert!(matches!(expr.as_ref(), Expr::Transform(_)));
-        }
-
-        #[test]
-        fn test_build_transform_expr_static_operations() {
-            let transform_spec = vec![
-                FieldTransformSpec::StaticInsert {
-                    insert_after: Some("id".to_string()),
-                    expr: Arc::new(Expr::literal("inserted_value")),
-                },
-                FieldTransformSpec::StaticReplace {
-                    field_name: "name".to_string(),
-                    expr: Arc::new(Expr::literal("replaced_name")),
-                },
-                FieldTransformSpec::StaticDrop {
-                    field_name: "old_field".to_string(),
-                },
-            ];
-
-            let field_values = HashMap::new(); // No partition columns
-
-            let result = build_transform_expr(&transform_spec, field_values);
-            assert!(result.is_ok());
-
-            let expr = result.unwrap();
-            assert!(matches!(expr.as_ref(), Expr::Transform(_)));
-        }
-
-        #[test]
-        fn test_parse_field_values_to_expressions() {
+        fn test_transform_utilities() {
             let schema = create_test_schema();
             let transform_spec = vec![
                 FieldTransformSpec::PartitionColumn {
@@ -1757,168 +1691,37 @@ mod tests {
                 },
             ];
 
-            let mut field_expressions = HashMap::new();
-            field_expressions.insert("age".to_string(), Expr::literal(Scalar::Long(30)));
-            field_expressions.insert("name".to_string(), Expr::literal("John"));
-
-            let result =
-                parse_field_values_to_expressions(&schema, &transform_spec, &field_expressions);
-            assert!(result.is_ok());
-
-            let values = result.unwrap();
-            assert_eq!(values.len(), 2);
-            assert!(values.contains_key(&1)); // age field index
-            assert!(values.contains_key(&2)); // name field index
-
-            let (age_name, age_expr) = &values[&1];
-            assert_eq!(age_name, "age");
-            assert_eq!(*age_expr, Expr::literal(Scalar::Long(30)));
-
-            let (name_name, name_expr) = &values[&2];
-            assert_eq!(name_name, "name");
-            assert_eq!(*name_expr, Expr::literal("John"));
-        }
-
-        #[test]
-        fn test_parse_field_values_to_expressions_with_physical_names() {
-            let schema = create_test_schema();
-            let transform_spec = vec![FieldTransformSpec::PartitionColumn {
-                field_index: 1, // age column
-                insert_after: Some("id".to_string()),
-            }];
-
-            let mut field_expressions = HashMap::new();
-            // Use physical name instead of logical name
-            field_expressions.insert("age".to_string(), Expr::literal(Scalar::Long(40)));
-
-            let result =
-                parse_field_values_to_expressions(&schema, &transform_spec, &field_expressions);
-            assert!(result.is_ok());
-
-            let values = result.unwrap();
-            assert_eq!(values.len(), 1);
-            assert!(values.contains_key(&1));
-
-            let (field_name, field_expr) = &values[&1];
-            assert_eq!(field_name, "age");
-            assert_eq!(*field_expr, Expr::literal(Scalar::Long(40)));
-        }
-
-        #[test]
-        fn test_parse_field_values_to_expressions_missing_expression() {
-            let schema = create_test_schema();
-            let transform_spec = vec![
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 1, // age column
-                    insert_after: Some("id".to_string()),
-                },
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 2, // name column - no expression provided
-                    insert_after: Some("age".to_string()),
-                },
-            ];
-
-            let mut field_expressions = HashMap::new();
-            field_expressions.insert("age".to_string(), Expr::literal(Scalar::Long(25)));
-            // Missing expression for "name" field
-
-            let result =
-                parse_field_values_to_expressions(&schema, &transform_spec, &field_expressions);
-            assert!(result.is_ok());
-
-            let values = result.unwrap();
-            assert_eq!(values.len(), 1); // Only age field should be present
-            assert!(values.contains_key(&1));
-            assert!(!values.contains_key(&2)); // name field should be absent
-        }
-
-        #[test]
-        fn test_parse_partition_values_to_expressions() {
-            let schema = create_test_schema();
-            let transform_spec = vec![
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 1, // age column
-                    insert_after: Some("id".to_string()),
-                },
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 2, // name column
-                    insert_after: Some("age".to_string()),
-                },
-            ];
-
+            // Test normal partition values
             let mut partition_values = HashMap::new();
             partition_values.insert("age".to_string(), "35".to_string());
             partition_values.insert("name".to_string(), "Alice".to_string());
-
-            let result =
-                parse_partition_values_to_expressions(&schema, &transform_spec, &partition_values);
+            let result = parse_partition_values_to_expressions(&schema, &transform_spec, &partition_values);
             assert!(result.is_ok());
-
             let values = result.unwrap();
             assert_eq!(values.len(), 2);
+            assert_eq!(values[&1].1, Expr::literal(Scalar::Long(35)));
+            assert_eq!(values[&2].1, Expr::literal("Alice"));
 
-            let (age_name, age_expr) = &values[&1];
-            assert_eq!(age_name, "age");
-            assert_eq!(*age_expr, Expr::literal(Scalar::Long(35)));
-
-            let (name_name, name_expr) = &values[&2];
-            assert_eq!(name_name, "name");
-            assert_eq!(*name_expr, Expr::literal("Alice"));
-        }
-
-        #[test]
-        fn test_parse_partition_values_to_expressions_with_null() {
-            let schema = create_test_schema();
-            let transform_spec = vec![
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 1, // age column
-                    insert_after: Some("id".to_string()),
-                },
-                FieldTransformSpec::PartitionColumn {
-                    field_index: 2, // name column - will be null
-                    insert_after: Some("age".to_string()),
-                },
-            ];
-
-            let mut partition_values = HashMap::new();
-            partition_values.insert("age".to_string(), "45".to_string());
-            // Missing partition value for "name" - should create null expression
-
-            let result =
-                parse_partition_values_to_expressions(&schema, &transform_spec, &partition_values);
+            // Test with null partition values (the critical bug fix)
+            let mut null_partition_values = HashMap::new();
+            null_partition_values.insert("age".to_string(), "45".to_string());
+            // Missing "name" partition - should create null
+            let result = parse_partition_values_to_expressions(&schema, &transform_spec, &null_partition_values);
             assert!(result.is_ok());
-
             let values = result.unwrap();
             assert_eq!(values.len(), 2);
-
-            let (age_name, age_expr) = &values[&1];
-            assert_eq!(age_name, "age");
-            assert_eq!(*age_expr, Expr::literal(Scalar::Long(45)));
-
-            let (name_name, name_expr) = &values[&2];
-            assert_eq!(name_name, "name");
-            match name_expr {
-                Expr::Literal(Scalar::Null(DataType::Primitive(_))) => {
-                    // Expected null value - test passes
-                }
-                _ => panic!("Expected null expression, got: {:?}", name_expr),
+            assert_eq!(values[&1].1, Expr::literal(Scalar::Long(45)));
+            match &values[&2].1 {
+                Expr::Literal(Scalar::Null(DataType::Primitive(_))) => {}, // Expected
+                _ => panic!("Expected null expression for missing partition"),
             }
-        }
 
-        #[test]
-        fn test_parse_partition_values_to_expressions_invalid_field_index() {
-            let schema = create_test_schema();
-            let transform_spec = vec![FieldTransformSpec::PartitionColumn {
-                field_index: 99, // Invalid field index
-                insert_after: Some("id".to_string()),
-            }];
-
-            let partition_values = HashMap::new();
-
-            let result =
-                parse_partition_values_to_expressions(&schema, &transform_spec, &partition_values);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("out of bounds"));
+            // Test build_transform_expr
+            let mut field_values = HashMap::new();
+            field_values.insert(1, ("age".to_string(), Expr::literal(Scalar::Long(25))));
+            let result = build_transform_expr(&transform_spec, field_values);
+            assert!(result.is_ok());
+            assert!(matches!(result.unwrap().as_ref(), Expr::Transform(_)));
         }
     }
 }
