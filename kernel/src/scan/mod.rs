@@ -310,7 +310,7 @@ impl ScanResult {
 /// `Partition` we store an index into the logical schema for this query since later we need the
 /// data type as well to materialize the partition column.
 #[derive(PartialEq, Debug)]
-pub enum ColumnType {
+pub(crate) enum ColumnType {
     // A column, selected from the data, as is
     Selected(String),
     // A partition column that needs to be added back in
