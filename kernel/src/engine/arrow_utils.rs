@@ -330,8 +330,8 @@ fn get_indices(
     fields: &ArrowFields,
     mask_indices: &mut Vec<usize>,
 ) -> DeltaResult<(usize, Vec<ReorderIndex>)> {
-    let mut found_fields = HashSet::with_capacity(requested_schema.fields.len());
-    let mut reorder_indices = Vec::with_capacity(requested_schema.fields.len());
+    let mut found_fields = HashSet::with_capacity(requested_schema.num_fields());
+    let mut reorder_indices = Vec::with_capacity(requested_schema.num_fields());
     let mut parquet_offset = start_parquet_offset;
     // for each field, get its position in the parquet (via enumerate), a reference to the arrow
     // field, and info about where it appears in the requested_schema, or None if the field is not
@@ -507,10 +507,17 @@ fn get_indices(
         }
     }
 
-    if found_fields.len() != requested_schema.fields.len() {
+    if found_fields.len() != requested_schema.num_fields() {
         // some fields are missing, but they might be nullable, need to insert them into the reorder_indices
         for (requested_position, field) in requested_schema.fields().enumerate() {
             if !found_fields.contains(field.name()) {
+                if let Some(metadata_spec) = field.get_metadata_column_spec() {
+                    // We don't support reading any metadata columns yet
+                    // TODO: Implement row index support for the Parquet reader
+                    return Err(Error::Generic(format!(
+                        "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
+                    )));
+                }
                 if field.nullable {
                     debug!("Inserting missing and nullable field: {}", field.name());
                     reorder_indices.push(ReorderIndex::missing(
@@ -582,11 +589,12 @@ fn match_parquet_fields<'k, 'p>(
             // Map the parquet ArrowField to the matching kernel KernelFieldInfo if present.
             let kernel_field_info =
                 kernel_schema
-                    .fields
-                    .get_full(field_name)
-                    .map(|(idx, _name, field)| KernelFieldInfo {
-                        parquet_index: idx,
-                        field,
+                    .field_with_index(field_name)
+                    .and_then(|(idx, field)| {
+                        (!field.is_metadata_column()).then_some(KernelFieldInfo {
+                            parquet_index: idx,
+                            field,
+                        })
                     });
 
             MatchedParquetField {
@@ -1531,6 +1539,41 @@ mod tests {
             ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, false)
                 .with_metadata(arrow_fid(2)),
         ]))
+    }
+
+    #[test]
+    fn test_match_parquet_fields_filters_metadata_columns() {
+        use crate::schema::MetadataColumnSpec;
+
+        let kernel_schema = StructType::new_unchecked([
+            StructField::not_null("regular_field", DataType::INTEGER),
+            StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+            StructField::nullable("another_field", DataType::STRING),
+        ]);
+
+        let parquet_fields: ArrowFields = vec![
+            ArrowField::new("regular_field", ArrowDataType::Int32, false),
+            ArrowField::new("row_index", ArrowDataType::Int64, false),
+            ArrowField::new("another_field", ArrowDataType::Utf8, true),
+        ]
+        .into();
+
+        let matched_fields: Vec<_> =
+            match_parquet_fields(&kernel_schema, &parquet_fields).collect();
+
+        assert_eq!(matched_fields.len(), 3);
+
+        // First field (regular_field) should have kernel_field_info
+        assert!(matched_fields[0].kernel_field_info.is_some());
+        assert_eq!(matched_fields[0].parquet_field.name(), "regular_field");
+
+        // Second field (row_index metadata column) should have None for kernel_field_info
+        assert!(matched_fields[1].kernel_field_info.is_none());
+        assert_eq!(matched_fields[1].parquet_field.name(), "row_index");
+
+        // Third field (another_field) should have kernel_field_info
+        assert!(matched_fields[2].kernel_field_info.is_some());
+        assert_eq!(matched_fields[2].parquet_field.name(), "another_field");
     }
 
     #[test]
