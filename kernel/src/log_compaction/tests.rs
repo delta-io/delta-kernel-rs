@@ -1,9 +1,43 @@
 use super::writer::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
 use super::COMPACTION_ACTIONS_SCHEMA;
+use crate::checkpoint::log_replay::CheckpointBatch;
+use crate::engine_data::FilteredEngineData;
 use crate::path::ParsedLogPath;
 use crate::{DeltaResult, EngineData, FileMeta, Version};
 use std::sync::Arc;
 use url::Url;
+
+// Helper to create a  LogCompactionDataIterator with mock data
+fn create_test_iterator<I>(
+    iter: I,
+    initial_actions_count: i64,
+    initial_add_actions_count: i64,
+) -> LogCompactionDataIterator
+where
+    I: Iterator<Item = DeltaResult<CheckpointBatch>> + Send + 'static,
+{
+    LogCompactionDataIterator {
+        compaction_batch_iterator: Box::new(iter),
+        actions_count: initial_actions_count,
+        add_actions_count: initial_add_actions_count,
+    }
+}
+
+// Helper to create a mock CheckpointBatch from EngineData
+fn create_mock_batch(
+    data: Box<dyn EngineData>,
+    actions_count: i64,
+    add_actions_count: i64,
+) -> DeltaResult<CheckpointBatch> {
+    Ok(CheckpointBatch {
+        filtered_data: FilteredEngineData {
+            data,
+            selection_vector: vec![true],
+        },
+        actions_count,
+        add_actions_count,
+    })
+}
 
 #[test]
 fn test_log_compaction_writer_creation() {
@@ -44,11 +78,7 @@ fn test_invalid_version_range() {
 
 #[test]
 fn test_log_compaction_data_iterator() {
-    let mut iterator = LogCompactionDataIterator {
-        batches: vec![].into_iter(),
-        total_actions: 0,
-        total_add_actions: 0,
-    };
+    let mut iterator = create_test_iterator(std::iter::empty(), 0, 0);
 
     // Test empty iterator
     assert!(iterator.next().is_none());
@@ -152,11 +182,7 @@ fn test_equal_version_range() {
 
 #[test]
 fn test_iterator_methods() {
-    let iterator = LogCompactionDataIterator {
-        batches: vec![].into_iter(),
-        total_actions: 100,
-        total_add_actions: 50,
-    };
+    let iterator = create_test_iterator(std::iter::empty(), 100, 50);
 
     assert_eq!(iterator.total_actions(), 100);
     assert_eq!(iterator.total_add_actions(), 50);
@@ -266,11 +292,12 @@ fn test_log_compaction_data_iterator_with_data() {
     let batch2: Box<dyn EngineData> = Box::new(MockEngineData { _value: 2 });
     let batch3: Box<dyn EngineData> = Box::new(MockEngineData { _value: 3 });
 
-    let iterator = LogCompactionDataIterator {
-        batches: vec![batch1, batch2, batch3].into_iter(),
-        total_actions: 100,
-        total_add_actions: 50,
-    };
+    let mock_batches = vec![
+        create_mock_batch(batch1, 30, 15),
+        create_mock_batch(batch2, 30, 15),
+        create_mock_batch(batch3, 40, 20),
+    ];
+    let iterator = create_test_iterator(mock_batches.into_iter(), 0, 0);
 
     // Verify we can iterate through all batches
     let mut count = 0;
@@ -320,16 +347,12 @@ fn test_compaction_actions_schema_access() {
 #[test]
 fn test_log_compaction_data_iterator_debug() {
     // Test Debug implementation for LogCompactionDataIterator
-    let iterator = LogCompactionDataIterator {
-        batches: vec![].into_iter(),
-        total_actions: 100,
-        total_add_actions: 50,
-    };
+    let iterator = create_test_iterator(std::iter::empty(), 100, 50);
 
     let debug_str = format!("{:?}", iterator);
     assert!(debug_str.contains("LogCompactionDataIterator"));
-    assert!(debug_str.contains("total_actions: 100"));
-    assert!(debug_str.contains("total_add_actions: 50"));
+    assert!(debug_str.contains("actions_count: 100"));
+    assert!(debug_str.contains("add_actions_count: 50"));
 }
 
 #[test]
@@ -348,11 +371,7 @@ fn test_finalize() {
     };
 
     // Create mock iterator
-    let iterator = LogCompactionDataIterator {
-        batches: vec![].into_iter(),
-        total_actions: 100,
-        total_add_actions: 50,
-    };
+    let iterator = create_test_iterator(std::iter::empty(), 100, 50);
 
     // Mock engine - we can't use real engine in first commit
     // but we can test that finalize accepts the parameters
@@ -396,11 +415,11 @@ fn test_compaction_data_iterator_consumption() {
     let batch1: Box<dyn EngineData> = Box::new(MockEngineData { _value: 1 });
     let batch2: Box<dyn EngineData> = Box::new(MockEngineData { _value: 2 });
 
-    let mut iterator = LogCompactionDataIterator {
-        batches: vec![batch1, batch2].into_iter(),
-        total_actions: 50,
-        total_add_actions: 25,
-    };
+    let mock_batches = vec![
+        create_mock_batch(batch1, 50, 25),
+        create_mock_batch(batch2, 0, 0),
+    ];
+    let mut iterator = create_test_iterator(mock_batches.into_iter(), 0, 0);
 
     // Consume first batch
     assert!(iterator.next().is_some());
@@ -731,11 +750,7 @@ fn test_log_compaction_writer_fields() {
 #[test]
 fn test_iterator_empty() {
     // Test behavior with empty iterator
-    let mut empty_iter = LogCompactionDataIterator {
-        batches: vec![].into_iter(),
-        total_actions: 0,
-        total_add_actions: 0,
-    };
+    let mut empty_iter = create_test_iterator(std::iter::empty(), 0, 0);
 
     assert_eq!(empty_iter.total_actions(), 0);
     assert_eq!(empty_iter.total_add_actions(), 0);
