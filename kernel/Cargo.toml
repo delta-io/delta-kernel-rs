@@ -69,7 +69,7 @@ comfy-table = { version = "~7.1", optional = true }
 # arrow 55
 [dependencies.arrow_55]
 package = "arrow"
-version = ">=55.0.0, <55.1.0"
+version = "=55.0.0"
 features = ["chrono-tz", "ffi", "json", "prettyprint"]
 optional = true
 [dependencies.parquet_55]
@@ -99,7 +99,7 @@ internal-api = []
 integration-test = ["hdfs-native-object-store/integration-test"]
 
 # The default versions for arrow/parquet/object_store
-arrow = ["arrow-56"] # latest arrow version
+arrow = ["arrow-55"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
 arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store", "comfy-table"]
