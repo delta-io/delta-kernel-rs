@@ -1,16 +1,22 @@
-use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
-use crate::schema::{ColumnName, DataType};
-use crate::{DeltaResult, Error};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use itertools::Itertools;
+use tracing::debug;
 
 use crate::arrow::array::cast::AsArray;
 use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
-use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, FieldRef};
-use tracing::debug;
-
-use std::collections::{HashMap, HashSet};
+use crate::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
+};
+use crate::engine::arrow_conversion::TryIntoArrow as _;
+use crate::engine_data::{EngineData, EngineList, EngineMap, GetData, RowVisitor};
+use crate::expressions::ArrayData;
+use crate::schema::{ColumnName, DataType, SchemaRef};
+use crate::{DeltaResult, Error};
 
 pub use crate::engine::arrow_utils::fix_nested_null_masks;
 
@@ -21,6 +27,14 @@ pub use crate::engine::arrow_utils::fix_nested_null_masks;
 /// example. When in doubt, call [`fix_nested_null_masks`] first.
 pub struct ArrowEngineData {
     data: RecordBatch,
+}
+
+/// Helper function to extract a RecordBatch from EngineData, ensuring it's ArrowEngineData
+pub(crate) fn extract_record_batch(engine_data: &dyn EngineData) -> DeltaResult<&RecordBatch> {
+    let Some(arrow_data) = engine_data.any_ref().downcast_ref::<ArrowEngineData>() else {
+        return Err(Error::engine_data_type("ArrowEngineData"));
+    };
+    Ok(arrow_data.record_batch())
 }
 
 /// unshredded variant arrow type: struct of two non-nullable binary fields 'metadata' and 'value'
@@ -199,6 +213,30 @@ impl EngineData for ArrowEngineData {
         }
         visitor.visit(self.len(), &getters)
     }
+
+    fn append_columns(
+        &self,
+        schema: SchemaRef,
+        columns: Vec<ArrayData>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        // Combine existing and new schema fields
+        let schema: ArrowSchema = schema.as_ref().try_into_arrow()?;
+        let mut combined_fields = self.data.schema().fields().to_vec();
+        combined_fields.extend_from_slice(schema.fields());
+        let combined_schema = Arc::new(ArrowSchema::new(combined_fields));
+
+        // Combine existing and new columns
+        let new_columns: Vec<ArrayRef> = columns
+            .into_iter()
+            .map(|array_data| array_data.to_arrow())
+            .try_collect()?;
+        let mut combined_columns = self.data.columns().to_vec();
+        combined_columns.extend(new_columns);
+
+        // Create a new ArrowEngineData with the combined schema and columns
+        let data = RecordBatch::try_new(combined_schema, combined_columns)?;
+        Ok(Box::new(ArrowEngineData { data }))
+    }
 }
 
 impl ArrowEngineData {
@@ -303,12 +341,22 @@ impl ArrowEngineData {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::actions::{get_log_schema, Metadata, Protocol};
-    use crate::arrow::array::StringArray;
+    use crate::arrow::array::types::Int32Type;
+    use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
     use crate::engine::sync::SyncEngine;
+    use crate::expressions::ArrayData;
+    use crate::schema::{ArrayType, DataType, StructField, StructType};
     use crate::table_features::{ReaderFeature, WriterFeature};
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use crate::{DeltaResult, Engine as _};
+    use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::{DeltaResult, Engine as _, EngineData as _};
+
+    use super::{extract_record_batch, ArrowEngineData};
 
     #[test]
     fn test_md_extract() -> DeltaResult<()> {
@@ -352,6 +400,328 @@ mod tests {
             protocol.writer_features(),
             Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_columns() -> DeltaResult<()> {
+        // Create initial ArrowEngineData with 2 rows and 2 columns
+        let initial_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+        let initial_batch = RecordBatch::try_new(
+            initial_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob")])),
+            ],
+        )?;
+        let arrow_data = ArrowEngineData::new(initial_batch);
+
+        // Create new columns as ArrayData
+        let new_columns = vec![
+            ArrayData::try_new(
+                ArrayType::new(DataType::INTEGER, true),
+                vec![Some(25), None],
+            )?,
+            ArrayData::try_new(ArrayType::new(DataType::BOOLEAN, false), vec![true, false])?,
+        ];
+
+        // Create schema for the new columns
+        let new_schema = Arc::new(StructType::new([
+            StructField::new("age", DataType::INTEGER, true),
+            StructField::new("active", DataType::BOOLEAN, false),
+        ]));
+
+        // Test the append_columns method
+        let arrow_data = arrow_data.append_columns(new_schema, new_columns)?;
+        let result_batch = extract_record_batch(arrow_data.as_ref())?;
+
+        // Verify the result
+        assert_eq!(result_batch.num_columns(), 4);
+        assert_eq!(result_batch.num_rows(), 2);
+
+        let schema = result_batch.schema();
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(2).name(), "age");
+        assert_eq!(schema.field(3).name(), "active");
+
+        assert_eq!(schema.field(0).data_type(), &ArrowDataType::Int32);
+        assert_eq!(schema.field(1).data_type(), &ArrowDataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &ArrowDataType::Int32);
+        assert_eq!(schema.field(3).data_type(), &ArrowDataType::Boolean);
+
+        let id_column = result_batch.column(0).as_primitive::<Int32Type>();
+        let name_column = result_batch.column(1).as_string::<i32>();
+        let age_column = result_batch.column(2).as_primitive::<Int32Type>();
+        let active_column = result_batch.column(3).as_boolean();
+
+        assert_eq!(id_column.values(), &[1, 2]);
+        assert_eq!(name_column.value(0), "Alice");
+        assert_eq!(name_column.value(1), "Bob");
+        assert_eq!(age_column.value(0), 25);
+        assert!(age_column.is_null(1));
+        assert!(active_column.value(0));
+        assert!(!active_column.value(1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_columns_row_mismatch() -> DeltaResult<()> {
+        // Create initial ArrowEngineData with 2 rows
+        let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let initial_batch =
+            RecordBatch::try_new(initial_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+        let arrow_data = super::ArrowEngineData::new(initial_batch);
+
+        // Create new column with wrong number of rows (3 instead of 2)
+        let new_columns = vec![ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, false),
+            vec![25, 30, 35],
+        )?];
+
+        let new_schema = Arc::new(StructType::new([StructField::new(
+            "age",
+            DataType::INTEGER,
+            true,
+        )]));
+
+        let result = arrow_data.append_columns(new_schema, new_columns);
+        assert_result_error_with_message(
+            result,
+            "all columns in a record batch must have the same length",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_columns_schema_field_count_mismatch() -> DeltaResult<()> {
+        let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let initial_batch =
+            RecordBatch::try_new(initial_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+        let arrow_data = ArrowEngineData::new(initial_batch);
+
+        // Schema has 2 fields but only 1 column provided
+        let new_columns = vec![ArrayData::try_new(
+            ArrayType::new(DataType::STRING, true),
+            vec![Some("Alice".to_string()), Some("Bob".to_string())],
+        )?];
+
+        let new_schema = Arc::new(StructType::new([
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("email", DataType::STRING, true), // Extra field in schema
+        ]));
+
+        let result = arrow_data.append_columns(new_schema, new_columns);
+        assert_result_error_with_message(
+            result,
+            "number of columns(2) must match number of fields(3)",
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_columns_empty_existing_data() -> DeltaResult<()> {
+        // Create empty ArrowEngineData with schema but no rows
+        let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let initial_batch = RecordBatch::try_new(
+            initial_schema,
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new()))],
+        )?;
+        let arrow_data = ArrowEngineData::new(initial_batch);
+
+        // Create empty new columns
+        let new_columns = vec![ArrayData::try_new(
+            ArrayType::new(DataType::STRING, true),
+            Vec::<Option<String>>::new(),
+        )?];
+        let new_schema = Arc::new(StructType::new([StructField::new(
+            "name",
+            DataType::STRING,
+            true,
+        )]));
+
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
+        let result_batch = extract_record_batch(result_data.as_ref())?;
+
+        assert_eq!(result_batch.num_columns(), 2);
+        assert_eq!(result_batch.num_rows(), 0);
+        assert_eq!(result_batch.schema().field(0).name(), "id");
+        assert_eq!(result_batch.schema().field(1).name(), "name");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_columns_empty_new_columns() -> DeltaResult<()> {
+        // Create ArrowEngineData with some data
+        let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let initial_batch =
+            RecordBatch::try_new(initial_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+        let arrow_data = ArrowEngineData::new(initial_batch);
+
+        // Create empty schema and columns
+        let new_columns = vec![];
+        let new_schema = Arc::new(StructType::new([]));
+
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
+        let result_batch = extract_record_batch(result_data.as_ref())?;
+
+        // Should be identical to original
+        assert_eq!(result_batch.num_columns(), 1);
+        assert_eq!(result_batch.num_rows(), 2);
+        assert_eq!(result_batch.schema().field(0).name(), "id");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_columns_with_nulls() -> DeltaResult<()> {
+        let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let initial_batch = RecordBatch::try_new(
+            initial_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let arrow_data = ArrowEngineData::new(initial_batch);
+
+        let new_columns = vec![
+            ArrayData::try_new(
+                ArrayType::new(DataType::STRING, true),
+                vec![Some("Alice".to_string()), None, Some("Charlie".to_string())],
+            )?,
+            ArrayData::try_new(
+                ArrayType::new(DataType::INTEGER, true),
+                vec![Some(25), Some(30), None],
+            )?,
+        ];
+
+        let new_schema = Arc::new(StructType::new([
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("age", DataType::INTEGER, true),
+        ]));
+
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
+        let result_batch = extract_record_batch(result_data.as_ref())?;
+
+        assert_eq!(result_batch.num_columns(), 3);
+        assert_eq!(result_batch.num_rows(), 3);
+
+        // Verify nullable columns work correctly
+        assert!(!result_batch.schema().field(0).is_nullable());
+        assert!(result_batch.schema().field(1).is_nullable());
+        assert!(result_batch.schema().field(2).is_nullable());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_columns_various_data_types() -> DeltaResult<()> {
+        let initial_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let initial_batch =
+            RecordBatch::try_new(initial_schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])?;
+        let arrow_data = ArrowEngineData::new(initial_batch);
+
+        let new_columns = vec![
+            ArrayData::try_new(
+                ArrayType::new(DataType::LONG, false),
+                vec![1000_i64, 2000_i64],
+            )?,
+            ArrayData::try_new(
+                ArrayType::new(DataType::DOUBLE, true),
+                vec![Some(3.87), Some(2.71)],
+            )?,
+            ArrayData::try_new(ArrayType::new(DataType::BOOLEAN, false), vec![true, false])?,
+        ];
+
+        let new_schema = Arc::new(StructType::new([
+            StructField::new("big_number", DataType::LONG, false),
+            StructField::new("pi", DataType::DOUBLE, true),
+            StructField::new("flag", DataType::BOOLEAN, false),
+        ]));
+
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
+        let result_batch = extract_record_batch(result_data.as_ref())?;
+
+        assert_eq!(result_batch.num_columns(), 4);
+        assert_eq!(result_batch.num_rows(), 2);
+
+        // Check data types
+        let schema = result_batch.schema();
+        assert_eq!(schema.field(0).data_type(), &ArrowDataType::Int32);
+        assert_eq!(schema.field(1).data_type(), &ArrowDataType::Int64);
+        assert_eq!(schema.field(2).data_type(), &ArrowDataType::Float64);
+        assert_eq!(schema.field(3).data_type(), &ArrowDataType::Boolean);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_append_single_column() -> DeltaResult<()> {
+        let initial_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+        let initial_batch = RecordBatch::try_new(
+            initial_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    Some("Alice"),
+                    Some("Bob"),
+                    Some("Charlie"),
+                ])),
+            ],
+        )?;
+        let arrow_data = ArrowEngineData::new(initial_batch);
+
+        // Append just one column
+        let new_columns = vec![ArrayData::try_new(
+            ArrayType::new(DataType::BOOLEAN, false),
+            vec![true, false, true],
+        )?];
+
+        let new_schema = Arc::new(StructType::new([StructField::new(
+            "active",
+            DataType::BOOLEAN,
+            false,
+        )]));
+
+        let result_data = arrow_data.append_columns(new_schema, new_columns)?;
+        let result_batch = extract_record_batch(result_data.as_ref())?;
+
+        assert_eq!(result_batch.num_columns(), 3);
+        assert_eq!(result_batch.num_rows(), 3);
+        assert_eq!(result_batch.schema().field(2).name(), "active");
+
         Ok(())
     }
 }
