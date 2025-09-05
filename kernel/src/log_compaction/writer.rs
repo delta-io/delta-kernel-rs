@@ -1,12 +1,13 @@
 use crate::listed_log_files::*;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
+use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
-use crate::checkpoint::log_replay::CheckpointLogReplayProcessor;
+use crate::checkpoint::log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
+use crate::engine_data::FilteredEngineData;
 use crate::log_replay::LogReplayProcessor;
 
 /// Utility function to determine if log compaction should be performed
@@ -128,40 +129,43 @@ impl LogCompactionWriter {
         // The processor handles reverse chronological processing internally
         let result_iter = processor.process_actions_iter(actions_iter);
 
-        // Collect processed batches into a vector for the iterator
-        let mut batches = Vec::new();
-        let mut total_actions = 0i64;
-        let mut total_add_actions = 0i64;
-
-        for batch_result in result_iter {
-            let batch = batch_result?;
-            // Track statistics
-            total_actions += batch.actions_count;
-            total_add_actions += batch.add_actions_count;
-            // Extract the data from the batch - pass the FilteredEngineData directly
-            batches.push(batch.filtered_data.data);
-        }
-
+        // Wrap the iterator in a LogCompactionDataIterator to track action counts lazily
         Ok(LogCompactionDataIterator {
-            batches: batches.into_iter(),
-            total_actions,
-            total_add_actions,
+            compaction_batch_iterator: Box::new(result_iter),
+            actions_count: 0,
+            add_actions_count: 0,
         })
     }
 
     /// Finalize the compaction after the data has been written
     ///
-    /// This method completes the compaction process and can perform any
-    /// necessary cleanup or validation.
+    /// # Important
+    /// This method **must** be called only after:
+    /// 1. The compaction data iterator has been fully exhausted
+    /// 2. All data has been successfully written to object storage
+    ///
+    /// # Parameters
+    /// - `engine`: Implementation of [`Engine`] apis.
+    /// - `metadata`: The metadata of the written compaction file
+    /// - `data_iterator`: The exhausted compaction data iterator
+    ///
+    /// # Returns: `Ok` if the compaction was successfully finalized
     #[allow(dead_code)]
     pub(crate) fn finalize(
         self,
         _engine: &dyn Engine,
         _metadata: &FileMeta,
-        _data_iterator: LogCompactionDataIterator,
+        mut data_iterator: LogCompactionDataIterator,
     ) -> DeltaResult<()> {
+        // Ensure the compaction data iterator is fully exhausted
+        if data_iterator.compaction_batch_iterator.next().is_some() {
+            return Err(Error::generic(
+                "The compaction data iterator must be fully consumed and written to storage before calling finalize"
+            ));
+        }
+
         // For now, just validate that the iterator was exhausted
-        // In the future, we might want to validate file metadata, etc.
+        // In the future, we might want to validate file metadata, write stats to a metadata file, etc.
         Ok(())
     }
 
@@ -226,40 +230,52 @@ impl LogCompactionWriter {
 /// to the compaction file. It follows a similar pattern to CheckpointDataIterator.
 #[allow(dead_code)]
 pub(crate) struct LogCompactionDataIterator {
-    pub(crate) batches: std::vec::IntoIter<Box<dyn EngineData>>,
-    /// Total number of actions in the compaction
-    pub(crate) total_actions: i64,
-    /// Total number of add actions in the compaction
-    pub(crate) total_add_actions: i64,
+    /// The nested iterator that yields compaction batches with action counts
+    pub(crate) compaction_batch_iterator:
+        Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
+    /// Running total of actions included in the compaction
+    pub(crate) actions_count: i64,
+    /// Running total of add actions included in the compaction
+    pub(crate) add_actions_count: i64,
 }
 
 impl LogCompactionDataIterator {
     /// Get the total number of actions in the compaction
     #[allow(dead_code)]
     pub(crate) fn total_actions(&self) -> i64 {
-        self.total_actions
+        self.actions_count
     }
 
     /// Get the total number of add actions in the compaction
     #[allow(dead_code)]
     pub(crate) fn total_add_actions(&self) -> i64 {
-        self.total_add_actions
+        self.add_actions_count
     }
 }
 
 impl std::fmt::Debug for LogCompactionDataIterator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogCompactionDataIterator")
-            .field("total_actions", &self.total_actions)
-            .field("total_add_actions", &self.total_add_actions)
+            .field("actions_count", &self.actions_count)
+            .field("add_actions_count", &self.add_actions_count)
             .finish()
     }
 }
 
 impl Iterator for LogCompactionDataIterator {
-    type Item = DeltaResult<Box<dyn EngineData>>;
+    type Item = DeltaResult<FilteredEngineData>;
 
+    /// Advances the iterator and returns the next value.
+    ///
+    /// This implementation transforms the `CheckpointBatch` items from the nested iterator into
+    /// [`FilteredEngineData`] items for the engine to write, while accumulating action counts from
+    /// each batch. The [`LogCompactionDataIterator`] is passed back to the kernel on call to
+    /// [`LogCompactionWriter::finalize`] for counts to be read.
     fn next(&mut self) -> Option<Self::Item> {
-        self.batches.next().map(Ok)
+        Some(self.compaction_batch_iterator.next()?.map(|batch| {
+            self.actions_count += batch.actions_count;
+            self.add_actions_count += batch.add_actions_count;
+            batch.filtered_data
+        }))
     }
 }
