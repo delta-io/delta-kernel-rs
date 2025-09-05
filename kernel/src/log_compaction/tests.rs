@@ -2,7 +2,9 @@ use super::writer::{should_compact, LogCompactionDataIterator, LogCompactionWrit
 use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::checkpoint::log_replay::CheckpointBatch;
 use crate::engine_data::FilteredEngineData;
+use crate::expressions::ArrayData;
 use crate::path::ParsedLogPath;
+use crate::schema::SchemaRef;
 use crate::{DeltaResult, EngineData, FileMeta, Version};
 use std::sync::Arc;
 use url::Url;
@@ -282,6 +284,15 @@ impl EngineData for MockEngineData {
 
     fn len(&self) -> usize {
         1
+    }
+
+    fn append_columns(
+        &self,
+        _schema: SchemaRef,
+        _columns: Vec<ArrayData>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        // For testing purposes, just return a new MockEngineData with the same value
+        Ok(Box::new(MockEngineData { _value: self._value }))
     }
 }
 
