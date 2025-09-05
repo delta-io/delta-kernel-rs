@@ -12,7 +12,7 @@
 //! # let engine = DefaultEngine::new_local();
 //! let url = delta_kernel::try_parse_uri(path)?;
 //! // Get the table changes (change data feed) between version 0 and 1
-//! let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
+//! let table_changes = TableChanges::try_new(url, vec![], engine.as_ref(), 0, Some(1))?;
 //!
 //! // Optionally specify a schema and predicate to apply to the table changes scan
 //! let schema = table_changes
@@ -38,13 +38,13 @@ use url::Url;
 
 use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
-use crate::path::AsUrl;
+use crate::path::{AsUrl, ParsedLogPath};
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::table_features::{ColumnMappingMode, ReaderFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, LogPath, Version};
 
 mod log_replay;
 mod physical_to_logical;
@@ -102,7 +102,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  # let engine = DefaultEngine::new_local();
 ///  # let path = "./tests/data/table-with-cdf";
 ///  let url = delta_kernel::try_parse_uri(path).unwrap();
-///  let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
+///  let table_changes = TableChanges::try_new(url, vec![], engine.as_ref(), 0, Some(1))?;
 ///  # Ok::<(), Error>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
@@ -135,14 +135,19 @@ impl TableChanges {
     ///   defaults to the newest table version.
     pub fn try_new(
         table_root: Url,
+        log_tail: Vec<LogPath>,
         engine: &dyn Engine,
         start_version: Version,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let log_root = table_root.join("_delta_log/")?;
+        let parsed_log_tail: Vec<ParsedLogPath> =
+            log_tail.clone().into_iter().map(|p| p.into()).collect();
+
         let log_segment = LogSegment::for_table_changes(
             engine.storage_handler().as_ref(),
             log_root,
+            parsed_log_tail,
             start_version,
             end_version,
         )?;
@@ -155,7 +160,8 @@ impl TableChanges {
                 .at_version(start_version)
                 .build(engine)?,
         );
-        let end_snapshot = Snapshot::try_new_from(start_snapshot.clone(), engine, end_version)?;
+        let end_snapshot =
+            Snapshot::try_new_from(start_snapshot.clone(), log_tail, engine, end_version)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
@@ -293,6 +299,7 @@ mod tests {
         for (start_version, end_version) in valid_ranges {
             let table_changes = TableChanges::try_new(
                 url.clone(),
+                vec![],
                 engine.as_ref(),
                 start_version,
                 end_version.into(),
@@ -306,6 +313,7 @@ mod tests {
         for (start_version, end_version) in invalid_ranges {
             let res = TableChanges::try_new(
                 url.clone(),
+                vec![],
                 engine.as_ref(),
                 start_version,
                 end_version.into(),
@@ -321,7 +329,7 @@ mod tests {
         let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }} }";
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
+        let table_changes_res = TableChanges::try_new(url, vec![], engine.as_ref(), 3, Some(4));
         assert!(matches!(table_changes_res, Err(Error::Generic(msg)) if msg == expected_msg));
     }
 
@@ -338,7 +346,7 @@ mod tests {
         .chain(CDF_FIELDS.clone());
 
         let table_changes =
-            TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).unwrap();
+            TableChanges::try_new(url.clone(), vec![], engine.as_ref(), 0, 0.into()).unwrap();
         assert_equal(expected_schema, table_changes.schema().fields().cloned());
     }
 }

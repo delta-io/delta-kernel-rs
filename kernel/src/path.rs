@@ -8,6 +8,16 @@ use delta_kernel_derive::internal_api;
 use url::Url;
 use uuid::Uuid;
 
+/// DOCS FIXME!
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPath(ParsedLogPath);
+
+impl Into<ParsedLogPath> for LogPath {
+    fn into(self) -> ParsedLogPath {
+        self.0
+    }
+}
+
 /// How many characters a version tag has
 const VERSION_LEN: usize = 20;
 

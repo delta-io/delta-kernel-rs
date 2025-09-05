@@ -144,33 +144,42 @@ impl LogSegment {
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-        Self::for_snapshot_impl(storage, log_root, checkpoint_hint, time_travel_version)
+        Self::for_snapshot_impl(
+            storage,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+        )
     }
 
     // factored out for testing
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let listed_files = match (checkpoint_hint, time_travel_version) {
             (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None)?
+                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
             }
             (Some(cp), Some(end_version)) if cp.version <= end_version => {
                 ListedLogFiles::list_with_checkpoint_hint(
                     &cp,
                     storage,
                     &log_root,
+                    log_tail,
                     Some(end_version),
                 )?
             }
-            _ => ListedLogFiles::list(storage, &log_root, None, time_travel_version)?,
+            _ => ListedLogFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version)
@@ -184,6 +193,7 @@ impl LogSegment {
     pub(crate) fn for_table_changes(
         storage: &dyn StorageHandler,
         log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
         start_version: Version,
         end_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
@@ -197,8 +207,13 @@ impl LogSegment {
         }
 
         // TODO: compactions?
-        let listed_files =
-            ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
+        let listed_files = ListedLogFiles::list_commits(
+            storage,
+            &log_root,
+            log_tail,
+            Some(start_version),
+            end_version,
+        )?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`ListedLogFiles::list_commits`] also checks that there are no gaps between commits.
@@ -226,6 +241,7 @@ impl LogSegment {
     pub(crate) fn for_timestamp_conversion(
         storage: &dyn StorageHandler,
         log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
         end_version: Version,
         limit: Option<NonZero<usize>>,
     ) -> DeltaResult<Self> {
@@ -241,8 +257,13 @@ impl LogSegment {
 
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
-        let mut listed_commits =
-            ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
+        let mut listed_commits = ListedLogFiles::list_commits(
+            storage,
+            &log_root,
+            log_tail,
+            start_from,
+            Some(end_version),
+        )?;
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = &mut listed_commits.ascending_commit_files;
