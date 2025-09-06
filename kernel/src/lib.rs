@@ -84,6 +84,7 @@ use url::Url;
 
 use self::schema::{DataType, SchemaRef};
 
+mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod engine_data;

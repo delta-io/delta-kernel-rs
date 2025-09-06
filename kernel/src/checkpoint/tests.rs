@@ -1,10 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
-use super::DEFAULT_RETENTION_SECS;
+use crate::action_reconciliation::{
+    deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
+};
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{ArrayRef, StructArray};
 use crate::arrow::datatypes::{DataType, Schema};
-use crate::checkpoint::{create_last_checkpoint_data, deleted_file_retention_timestamp_with_time};
+use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
 use crate::utils::test_utils::Action;
