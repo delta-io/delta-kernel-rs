@@ -49,7 +49,7 @@ impl FileActionKey {
 ///
 /// TODO: Modify deduplication to track only file paths instead of (path, dv_unique_id).
 /// More info here: https://github.com/delta-io/delta-kernel-rs/issues/701
-pub(crate) struct FileActionDeduplicator<'seen> {
+pub struct FileActionDeduplicator<'seen> {
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log for deduplication. This is a mutable reference to the set
     /// of seen file keys that persists across multiple log batches.
