@@ -242,9 +242,6 @@ impl ListedLogFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
-        // on config at some point
-
         // TODO: plumb through a log_tail provided by our caller
         let log_tail = vec![];
         let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
