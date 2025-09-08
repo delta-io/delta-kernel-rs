@@ -121,9 +121,9 @@ mod tests {
     #[test]
     fn test_deleted_file_retention_timestamp_with_time() -> DeltaResult<()> {
         // Test with default retention (7 days)
-        let reference_time = Duration::from_secs(1_000_000_000); // Some reference time
+        let reference_time = Duration::from_secs(1_000_000_000);
         let result = deleted_file_retention_timestamp_with_time(None, reference_time)?;
-        let expected = 1_000_000_000_000 - (7 * 24 * 60 * 60 * 1000); // 7 days in milliseconds
+        let expected = 1_000_000_000_000 - (7 * 24 * 60 * 60 * 1000);
         assert_eq!(result, expected);
 
         // Test with custom retention (1 day)
@@ -153,5 +153,135 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Retention duration exceeds i64 millisecond range"));
+    }
+
+    #[test]
+    fn test_deleted_file_retention_timestamp_with_large_now_time() {
+        // Test with very large current time that would overflow i64 milliseconds
+        let reference_time = Duration::from_secs(u64::MAX);
+        let retention = Duration::from_secs(1);
+        let result = deleted_file_retention_timestamp_with_time(Some(retention), reference_time);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Current timestamp exceeds i64 millisecond range"));
+    }
+
+    #[test]
+    fn test_calculate_transaction_expiration_timestamp() -> DeltaResult<()> {
+        // No set_transaction_retention_duration
+        let properties = TableProperties::default();
+        let result = calculate_transaction_expiration_timestamp(&properties)?;
+        assert_eq!(result, None);
+
+        // Test with set_transaction_retention_duration
+        let mut properties = TableProperties::default();
+        properties.set_transaction_retention_duration = Some(Duration::from_secs(3600)); // 1 hour
+        let result = calculate_transaction_expiration_timestamp(&properties)?;
+        assert!(result.is_some());
+
+        // The result should be current time minus 1 hour (approximately)
+        // We can't test exact value due to timing, but we can verify it's reasonable
+        let timestamp = result.unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let one_hour_ms = 3600 * 1000;
+
+        // Should be within a reasonable range (allowing for test execution time)
+        assert!(timestamp < now_ms);
+        assert!(timestamp > now_ms - one_hour_ms - 1000); // Allow 1 second buffer
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_calculate_transaction_expiration_timestamp_edge_cases() {
+        // Test with very large retention duration that would overflow
+        let mut properties = TableProperties::default();
+        properties.set_transaction_retention_duration = Some(Duration::from_secs(u64::MAX));
+        let result = calculate_transaction_expiration_timestamp(&properties);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Retention duration exceeds i64 millisecond range"));
+    }
+
+    // Mock implementation of RetentionCalculator for testing trait methods
+    struct MockRetentionCalculator {
+        properties: TableProperties,
+    }
+
+    impl MockRetentionCalculator {
+        fn new(properties: TableProperties) -> Self {
+            Self { properties }
+        }
+    }
+
+    impl RetentionCalculator for MockRetentionCalculator {
+        fn table_properties(&self) -> &TableProperties {
+            &self.properties
+        }
+    }
+
+    #[test]
+    fn test_retention_calculator_trait_deleted_file_retention_timestamp() -> DeltaResult<()> {
+        // Test with default retention
+        let properties = TableProperties::default();
+        let calculator = MockRetentionCalculator::new(properties);
+        let result = calculator.deleted_file_retention_timestamp()?;
+
+        // Should be current time minus 7 days (approximately)
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
+
+        assert!(result < now_ms);
+        assert!(result > now_ms - seven_days_ms - 1000); // Allow a small 1 second buffer
+
+        // Test with custom retention
+        let mut properties = TableProperties::default();
+        properties.deleted_file_retention_duration = Some(Duration::from_secs(1800)); // 30 minutes
+        let calculator = MockRetentionCalculator::new(properties);
+        let result = calculator.deleted_file_retention_timestamp()?;
+
+        let thirty_minutes_ms = 30 * 60 * 1000;
+        assert!(result < now_ms);
+        assert!(result > now_ms - thirty_minutes_ms - 1000); // Allow 1 second buffer
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_retention_calculator_trait_get_transaction_expiration_timestamp() -> DeltaResult<()> {
+        // Test with no transaction retention
+        let properties = TableProperties::default();
+        let calculator = MockRetentionCalculator::new(properties);
+        let result = calculator.get_transaction_expiration_timestamp()?;
+        assert_eq!(result, None);
+
+        // Test with transaction retention
+        let mut properties = TableProperties::default();
+        properties.set_transaction_retention_duration = Some(Duration::from_secs(7200)); // 2 hours
+        let calculator = MockRetentionCalculator::new(properties);
+        let result = calculator.get_transaction_expiration_timestamp()?;
+        assert!(result.is_some());
+
+        let timestamp = result.unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let two_hours_ms = 2 * 60 * 60 * 1000;
+
+        assert!(timestamp < now_ms);
+        assert!(timestamp > now_ms - two_hours_ms - 1000); // Allow 1 second buffer
+
+        Ok(())
     }
 }
