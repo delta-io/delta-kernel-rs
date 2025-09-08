@@ -157,9 +157,17 @@ mod tests {
 
     use std::sync::Arc;
 
+    const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
     use super::*;
 
     use tempfile::tempdir;
+
+    fn check_txn_id_exists(commit_info: &serde_json::Value) {
+        commit_info["txnId"]
+            .as_str()
+            .expect("txnId should be present in commitInfo");
+    }
 
     fn create_arrow_ffi_from_json(
         schema: ArrowSchema,
@@ -341,9 +349,12 @@ mod tests {
                 .into_iter::<serde_json::Value>()
                 .try_collect()?;
 
-            // set timestamps to 0 and paths to known string values for comparison
-            // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+            check_txn_id_exists(&parsed_commits[0]["commitInfo"]);
+
+            // set timestamps to 0, paths and txn_id to known string values for comparison
+            // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
             set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+            set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
             set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
             set_json_value(&mut parsed_commits[1], "add.size", json!(0))?;
 
@@ -355,6 +366,7 @@ mod tests {
                         "operation": "UNKNOWN",
                         "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                         "operationParameters": {},
+                        "txnId": ZERO_UUID
                     }
                 }),
                 json!({
