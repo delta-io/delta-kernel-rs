@@ -176,8 +176,10 @@ mod tests {
         assert_eq!(result, None);
 
         // Test with set_transaction_retention_duration
-        let mut properties = TableProperties::default();
-        properties.set_transaction_retention_duration = Some(Duration::from_secs(3600)); // 1 hour
+        let properties = TableProperties {
+            set_transaction_retention_duration: Some(Duration::from_secs(3600)), // 1 hour
+            ..Default::default()
+        };
         let result = calculate_transaction_expiration_timestamp(&properties)?;
         assert!(result.is_some());
 
@@ -200,8 +202,10 @@ mod tests {
     #[test]
     fn test_calculate_transaction_expiration_timestamp_edge_cases() {
         // Test with very large retention duration that would overflow
-        let mut properties = TableProperties::default();
-        properties.set_transaction_retention_duration = Some(Duration::from_secs(u64::MAX));
+        let properties = TableProperties {
+            set_transaction_retention_duration: Some(Duration::from_secs(u64::MAX)),
+            ..Default::default()
+        };
         let result = calculate_transaction_expiration_timestamp(&properties);
         assert!(result.is_err());
         assert!(result
@@ -245,8 +249,10 @@ mod tests {
         assert!(result > now_ms - seven_days_ms - 1000); // Allow a small 1 second buffer
 
         // Test with custom retention
-        let mut properties = TableProperties::default();
-        properties.deleted_file_retention_duration = Some(Duration::from_secs(1800)); // 30 minutes
+        let properties = TableProperties {
+            deleted_file_retention_duration: Some(Duration::from_secs(1800)), // 30 minutes
+            ..Default::default()
+        };
         let calculator = MockRetentionCalculator::new(properties);
         let result = calculator.deleted_file_retention_timestamp()?;
 
@@ -266,8 +272,10 @@ mod tests {
         assert_eq!(result, None);
 
         // Test with transaction retention
-        let mut properties = TableProperties::default();
-        properties.set_transaction_retention_duration = Some(Duration::from_secs(7200)); // 2 hours
+        let properties = TableProperties {
+            set_transaction_retention_duration: Some(Duration::from_secs(7200)), // 2 hours
+            ..Default::default()
+        };
         let calculator = MockRetentionCalculator::new(properties);
         let result = calculator.get_transaction_expiration_timestamp()?;
         assert!(result.is_some());
