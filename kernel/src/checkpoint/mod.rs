@@ -83,7 +83,7 @@
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
@@ -96,7 +96,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::Snapshot;
-use crate::utils::calculate_transaction_expiration_timestamp;
+use crate::utils::{calculate_transaction_expiration_timestamp, current_time_duration};
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
@@ -403,12 +403,7 @@ impl CheckpointWriter {
             .table_properties()
             .deleted_file_retention_duration;
 
-        deleted_file_retention_timestamp_with_time(
-            retention_duration,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to calculate system time: {e}")))?,
-        )
+        deleted_file_retention_timestamp_with_time(retention_duration, current_time_duration()?)
     }
 }
 
