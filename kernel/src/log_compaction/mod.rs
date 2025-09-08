@@ -13,7 +13,8 @@
 //!
 //! The log compaction API follows a similar pattern to the checkpoint API:
 //!
-//! 1. Create a [`LogCompactionWriter`] using [`Snapshot::compact_log`]
+//! 1. Create a [`LogCompactionWriter`] using [`Snapshot::compact_log`] to compact the log
+//!    from a given start_version to end_version
 //! 2. Get the compaction path from [`LogCompactionWriter::compaction_path`]
 //! 3. Get the compaction data from [`LogCompactionWriter::compaction_data`]
 //! 4. Write the data to the path in object storage (engine-specific)
@@ -23,7 +24,6 @@
 //! ```ignore
 //! # use std::sync::Arc;
 //! # use delta_kernel::log_compaction::{LogCompactionDataIterator, LogCompactionWriter};
-//! # use delta_kernel::engine::sync::SyncEngine;
 //! # use delta_kernel::{Engine, Snapshot, DeltaResult, Error, FileMeta};
 //! # use url::Url;
 //!
@@ -34,8 +34,7 @@
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
-//! # fn example() -> DeltaResult<()> {
-//! let engine = SyncEngine::new();
+//! let engine: &dyn Engine = todo!(); /* create engine instance */
 //!
 //! // Create a snapshot for the table
 //! let snapshot = Arc::new(Snapshot::try_from_uri("./path/to/table", &engine, None)?);
@@ -50,7 +49,6 @@
 //! // Write the compaction data to object storage
 //! let _metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
 //! # Ok(())
-//! # }
 //! ```
 //!
 //! ## When to Use Log Compaction

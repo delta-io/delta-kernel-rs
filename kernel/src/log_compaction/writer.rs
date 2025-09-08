@@ -85,7 +85,17 @@ impl LogCompactionWriter {
         let commit_files = self.list_commit_files(engine)?;
 
         // Validate that we have the expected number of commit files
-        let expected_count = (self.end_version - self.start_version + 1) as usize;
+        let expected_count: usize = self
+            .end_version
+            .checked_sub(self.start_version)
+            .and_then(|diff| diff.checked_add(1))
+            .and_then(|count| count.try_into().ok())
+            .ok_or_else(|| {
+                Error::generic(format!(
+                    "Invalid version range: cannot compute expected file count for range [{}, {}]",
+                    self.start_version, self.end_version
+                ))
+            })?;
         if commit_files.len() != expected_count {
             // Provide detailed information about missing versions
             let found_versions: Vec<Version> = commit_files.iter().map(|f| f.version).collect();
