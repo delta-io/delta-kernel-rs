@@ -137,38 +137,6 @@ impl LogCompactionWriter {
         })
     }
 
-    /// Finalize the compaction after the data has been written
-    ///
-    /// # Important
-    /// This method **must** be called only after:
-    /// 1. The compaction data iterator has been fully exhausted
-    /// 2. All data has been successfully written to object storage
-    ///
-    /// # Parameters
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `metadata`: The metadata of the written compaction file
-    /// - `data_iterator`: The exhausted compaction data iterator
-    ///
-    /// # Returns: `Ok` if the compaction was successfully finalized
-    #[allow(dead_code)]
-    pub(crate) fn finalize(
-        self,
-        _engine: &dyn Engine,
-        _metadata: &FileMeta,
-        mut data_iterator: LogCompactionDataIterator,
-    ) -> DeltaResult<()> {
-        // Ensure the compaction data iterator is fully exhausted
-        if data_iterator.compaction_batch_iterator.next().is_some() {
-            return Err(Error::generic(
-                "The compaction data iterator must be fully consumed and written to storage before calling finalize"
-            ));
-        }
-
-        // For now, just validate that the iterator was exhausted
-        // In the future, we might want to validate file metadata, write stats to a metadata file, etc.
-        Ok(())
-    }
-
     /// List commit files in the specified version range
     fn list_commit_files(&self, engine: &dyn Engine) -> DeltaResult<Vec<ParsedLogPath<FileMeta>>> {
         let log_root = self.table_root.join("_delta_log/")?;
@@ -269,8 +237,7 @@ impl Iterator for LogCompactionDataIterator {
     ///
     /// This implementation transforms the `CheckpointBatch` items from the nested iterator into
     /// [`FilteredEngineData`] items for the engine to write, while accumulating action counts from
-    /// each batch. The [`LogCompactionDataIterator`] is passed back to the kernel on call to
-    /// [`LogCompactionWriter::finalize`] for counts to be read.
+    /// each batch.
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.compaction_batch_iterator.next()?.map(|batch| {
             self.actions_count += batch.actions_count;

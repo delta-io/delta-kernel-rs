@@ -6,7 +6,6 @@ use crate::expressions::ArrayData;
 use crate::path::ParsedLogPath;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, EngineData, FileMeta, Version};
-use std::sync::Arc;
 use url::Url;
 
 // Helper to create a  LogCompactionDataIterator with mock data
@@ -366,48 +365,6 @@ fn test_log_compaction_data_iterator_debug() {
     assert!(debug_str.contains("LogCompactionDataIterator"));
     assert!(debug_str.contains("actions_count: 100"));
     assert!(debug_str.contains("add_actions_count: 50"));
-}
-
-#[test]
-fn test_finalize() {
-    // Test finalize method with actual parameters
-    let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 1, 5, 1000).unwrap();
-
-    // Create mock metadata
-    let metadata = FileMeta {
-        location: table_root
-            .join("_delta_log/00000000000000000001.00000000000000000005.compacted.json")
-            .unwrap(),
-        last_modified: 1234567890,
-        size: 5000,
-    };
-
-    // Create mock iterator
-    let iterator = create_test_iterator(std::iter::empty(), 100, 50);
-
-    // Mock engine - we can't use real engine in first commit
-    // but we can test that finalize accepts the parameters
-    // The actual finalize just returns Ok(()) for now
-    struct MockEngine;
-    impl crate::Engine for MockEngine {
-        fn evaluation_handler(&self) -> Arc<dyn crate::EvaluationHandler> {
-            unimplemented!()
-        }
-        fn storage_handler(&self) -> Arc<dyn crate::StorageHandler> {
-            unimplemented!()
-        }
-        fn parquet_handler(&self) -> Arc<dyn crate::ParquetHandler> {
-            unimplemented!()
-        }
-        fn json_handler(&self) -> Arc<dyn crate::JsonHandler> {
-            unimplemented!()
-        }
-    }
-
-    let engine = MockEngine;
-    let result = writer.finalize(&engine, &metadata, iterator);
-    assert!(result.is_ok());
 }
 
 #[test]

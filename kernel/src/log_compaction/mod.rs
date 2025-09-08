@@ -17,8 +17,6 @@
 //! 2. Get the compaction path from [`LogCompactionWriter::compaction_path`]
 //! 3. Get the compaction data from [`LogCompactionWriter::compaction_data`]
 //! 4. Write the data to the path in object storage (engine-specific)
-//! 5. Collect metadata ([`FileMeta`]) from the write operation
-//! 6. Pass the metadata and exhausted data iterator to [`LogCompactionWriter::finalize`]
 //!
 //! ## Example
 //!
@@ -50,12 +48,7 @@
 //! let compaction_data = writer.compaction_data(&engine)?;
 //!
 //! // Write the compaction data to object storage
-//! let metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
-//!
-//! // Important: all data must be written before finalizing the compacted log
-//!
-//! // Finalize the compaction by passing metadata and exhausted data iterator
-//! writer.finalize(&engine, &metadata, final_data)?;
+//! let _metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
 //! # Ok(())
 //! # }
 //! ```
