@@ -2,7 +2,7 @@
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
@@ -104,12 +104,7 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties
         .set_transaction_retention_duration
         .map(|duration| -> DeltaResult<i64> {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to get current time: {e}")))?;
-
-            let now_ms = i64::try_from(now.as_millis())
-                .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
+            let now_ms = current_time_ms()?;
 
             let expiration_ms = i64::try_from(duration.as_millis())
                 .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
@@ -119,6 +114,19 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
         .transpose()
 }
 
+/// Returns the current time as a Duration since Unix epoch.
+pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
+}
+
+/// Returns the current time in milliseconds since Unix epoch.
+pub(crate) fn current_time_ms() -> DeltaResult<i64> {
+    let duration = current_time_duration()?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
+}
 // Extension trait for Cow<'_, T>
 pub(crate) trait CowExt<T: ToOwned + ?Sized> {
     /// The owned type that corresopnds to Self
