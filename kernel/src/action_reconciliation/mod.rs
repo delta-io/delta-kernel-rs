@@ -1,7 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::snapshot::Snapshot;
-use crate::utils::calculate_transaction_expiration_timestamp;
+use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
 
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -16,8 +15,8 @@ pub(crate) const DEFAULT_RETENTION_SECS: u64 =
 /// Provides common functionality for calculating file retention timestamps
 /// and transaction expiration timestamps.
 pub(crate) trait RetentionCalculator {
-    /// Get the snapshot reference for accessing table properties
-    fn snapshot(&self) -> &Snapshot;
+    /// Get the table properties for accessing retention durations
+    fn table_properties(&self) -> &TableProperties;
 
     /// Determines the minimum timestamp before which deleted files
     /// are eligible for permanent removal during VACUUM operations. It is used
@@ -34,10 +33,7 @@ pub(crate) trait RetentionCalculator {
     ///
     /// # Note: The default retention period is 7 days, matching delta-spark's behavior.
     fn deleted_file_retention_timestamp(&self) -> DeltaResult<i64> {
-        let retention_duration = self
-            .snapshot()
-            .table_properties()
-            .deleted_file_retention_duration;
+        let retention_duration = self.table_properties().deleted_file_retention_duration;
 
         deleted_file_retention_timestamp_with_time(
             retention_duration,
@@ -61,7 +57,7 @@ pub(crate) trait RetentionCalculator {
     /// Returns an error if the current system time cannot be obtained or if the retention
     /// duration exceeds the maximum representable value for i64.
     fn get_transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
-        calculate_transaction_expiration_timestamp(self.snapshot().table_properties())
+        calculate_transaction_expiration_timestamp(self.table_properties())
     }
 }
 
@@ -92,6 +88,29 @@ pub(crate) fn deleted_file_retention_timestamp_with_time(
 
     // Simple subtraction - will produce negative values if retention > now
     Ok(now_ms - retention_ms)
+}
+
+/// Calculates the transaction expiration timestamp based on table properties.
+/// Returns None if set_transaction_retention_duration is not set.
+pub(crate) fn calculate_transaction_expiration_timestamp(
+    table_properties: &TableProperties,
+) -> DeltaResult<Option<i64>> {
+    table_properties
+        .set_transaction_retention_duration
+        .map(|duration| -> DeltaResult<i64> {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| Error::generic(format!("Failed to get current time: {e}")))?;
+
+            let now_ms = i64::try_from(now.as_millis())
+                .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
+
+            let expiration_ms = i64::try_from(duration.as_millis())
+                .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
+
+            Ok(now_ms - expiration_ms)
+        })
+        .transpose()
 }
 
 #[cfg(test)]

@@ -96,6 +96,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::Snapshot;
+use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
@@ -200,7 +201,11 @@ pub struct CheckpointWriter {
 }
 
 impl RetentionCalculator for CheckpointWriter {
+<<<<<<< HEAD
     fn table_properties(&self) -> &crate::table_properties::TableProperties {
+=======
+    fn table_properties(&self) -> &TableProperties {
+>>>>>>> 1127ce9 (Incorporate PR feedback from Zach)
         self.snapshot.table_properties()
     }
 }

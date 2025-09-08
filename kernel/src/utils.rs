@@ -1,12 +1,9 @@
 //! Various utility functions/macros used throughout the kernel
+use crate::{DeltaResult, Error};
+use delta_kernel_derive::internal_api;
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
 
 use url::Url;
 
@@ -96,37 +93,6 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
     }
 }
 
-/// Calculates the transaction expiration timestamp based on table properties.
-/// Returns None if set_transaction_retention_duration is not set.
-pub(crate) fn calculate_transaction_expiration_timestamp(
-    table_properties: &TableProperties,
-) -> DeltaResult<Option<i64>> {
-    table_properties
-        .set_transaction_retention_duration
-        .map(|duration| -> DeltaResult<i64> {
-            let now_ms = current_time_ms()?;
-
-            let expiration_ms = i64::try_from(duration.as_millis())
-                .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
-
-            Ok(now_ms - expiration_ms)
-        })
-        .transpose()
-}
-
-/// Returns the current time as a Duration since Unix epoch.
-pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
-}
-
-/// Returns the current time in milliseconds since Unix epoch.
-pub(crate) fn current_time_ms() -> DeltaResult<i64> {
-    let duration = current_time_duration()?;
-    i64::try_from(duration.as_millis())
-        .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
-}
 // Extension trait for Cow<'_, T>
 pub(crate) trait CowExt<T: ToOwned + ?Sized> {
     /// The owned type that corresopnds to Self
