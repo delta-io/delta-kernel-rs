@@ -242,16 +242,13 @@ impl ListedLogFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // We expect 10 commit files per checkpoint, so start with that size. We could adjust this based
-        // on config at some point
-
         // TODO: plumb through a log_tail provided by our caller
         let log_tail = vec![];
         let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
         log_files.process_results(|iter| {
-            let mut ascending_commit_files = Vec::with_capacity(10);
-            let mut ascending_compaction_files = Vec::with_capacity(2);
+            let mut ascending_commit_files = Vec::new();
+            let mut ascending_compaction_files = Vec::new();
             let mut checkpoint_parts = vec![];
             let mut latest_crc_file: Option<ParsedLogPath> = None;
 
