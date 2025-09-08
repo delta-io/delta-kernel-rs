@@ -175,6 +175,12 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
         Ok(Box::new(receiver.into_iter()))
     }
+
+    fn write_file(&self, url: Url, payload: Bytes) -> DeltaResult<()> {
+        let _ = url;
+        let _ = payload;
+        todo!();
+    }
 }
 
 #[cfg(test)]

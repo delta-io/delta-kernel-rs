@@ -10,6 +10,8 @@ use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::{MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
+use roaring::RoaringTreemap;
+use crate::engine_data::FilteredEngineData;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version,
 };
@@ -68,6 +70,7 @@ pub struct Transaction {
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
     is_data_change: bool,
+    enable_deletion_vectors: bool,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -110,6 +113,7 @@ impl Transaction {
             set_transactions: vec![],
             commit_timestamp,
             is_data_change: true,
+            enable_deletion_vectors: false,
         })
     }
 
@@ -202,6 +206,13 @@ impl Transaction {
         self
     }
 
+    /// Enable the writing of deletion vectors. This must be set before creating a scan builder to read data
+    /// files.
+    pub  fn with_enable_deletion_vectors(mut self) -> Self{
+        self.enable_deletion_vectors = true;
+        self
+    }
+
     /// Include a SetTransaction (app_id and version) action for this transaction (with an optional
     /// `last_updated` timestamp).
     /// Note that each app_id can only appear once per transaction. That is, multiple app_ids with
@@ -264,12 +275,75 @@ impl Transaction {
     /// granularity.
     ///
     /// The metadata passed in here is expected to be taken from the output of a scan of the
-    /// table (i.e. using [`scan_builder`]).
+    /// table.
     /// The expected schema for `remove_metadata` is given by [`crate::scan::scan_row_schema`].
     pub fn remove_files(&mut self, remove_metadata: Box<dyn EngineData>) {
         // Avoid warnings until implementation
         drop(remove_metadata);
         todo!("implement remove files method")
+    }
+
+    //
+    // Writes a new deletion vector file that will be used in the transaction.
+    //
+    // The returned EngineData must be passed to [`update_deletion_vectors`]
+    // to record the deletion vectors in metadata. After this has been added to the
+    // transaction, writers can cleanup orphaned files from the tranaction by accessing
+    // them via [`new_files_written`].
+    //
+    // * new_deleted_rows - The collection of new deletion vectors to apply to the files. Each
+    // element corresponds a non-filtered row in file_metadata.
+    //
+    // * existing_deleted_rows - The collection of existing deletion vectors corresponding to the
+    // present row in FilteredEngineMetadata. If there was no existing deletion Vector, None should
+    // be set at the corresponding element
+    //
+    // * file_metadata - A FilteredEngineData with the same schema as that produced by the
+    // scan produced by calling [`scan_builder`].
+    //
+    // TODO: consider returning Url here as well?
+    pub fn write_deletion_vectors(self, new_deleted_rows : Vec<roaring::RoaringTreemap>, existing_deleted_rows : Vec<Option<RoaringTreemap>>,
+            file_metadata : FilteredEngineData) -> DeltaResult<Box<dyn EngineData>> {
+        // Pseudo-code:
+        //
+        // bytes_to_write: Bytes = 1b
+        // lengths : Vec<(i64)>
+        // current_offset = 0
+        // for (new, existing, metadata) : zip(new_deleted_rows, existing_deleted_rows, file_metadata) {
+        //   // optional validate
+        //   assert (size(new.intersect(existing)) == 0)
+        //
+        //   final = new.merge(existing)
+        //   final_dv_payload : Bytes = wrap_dv_with_metadata(final)
+        //   lengths.push_back(size(final_dv_payload))
+        //   bytes_to_write.append(final_dv_payload)
+        //   dv_url = construct_new_dv_url
+        //   updated_dv_metadata = update_engine_dv_data(dv_url, lenghts, file_metadata)
+        //   file_system.write(dv_url,bytes_to_write)
+        //   updated_dv_metadata
+        // }
+        let _ =new_deleted_rows.as_chunks::<1000>();
+        let _ = existing_deleted_rows.as_chunks::<1000>();
+        let _ = file_metadata.selection_vector[0];
+        todo!()
+    }
+
+    // Adds or updates deletion vectors for a file.
+    //
+    // Calling this method adds deletion vector files to the list
+    // returned by [`new_files_written`].
+    //
+    // * dv_metadata - A EngineData produced via [`write_deletion_vectors`].
+    pub fn update_deletion_vectors(dv_metadata : Box<dyn EngineData>) -> () {
+        drop(dv_metadata);
+        todo!()
+    }
+
+    // Returns a collection of files written as part of this transaction that need
+    // to be cleaned up if the transaction fails. File are registered here when
+    // [`update_deletion_vectors`] is called.
+    pub fn new_files_written(self) -> Vec<Url>{
+        todo!()
     }
 }
 

@@ -522,6 +522,10 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    // Writes the given bytes to the given URL.  Overwrites the object
+    // if there is already one stored at the given location.
+    fn write_file(&self, url: Url, payload : Bytes ) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
