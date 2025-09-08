@@ -1,28 +1,9 @@
 //! The [`LiteralExpressionTransform`] is a [`SchemaTransform`] that transforms a [`Schema`] and an
 //! ordered list of leaf values (scalars) into an [`Expression`] with a literal value for each leaf.
 
-use std::borrow::Cow;
-use std::ops::Deref as _;
-
-use tracing::debug;
-
 use crate::expressions::{Expression, Scalar};
-use crate::schema::{
-    ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
-};
-
-/// [`SchemaTransform`] that will transform a [`Schema`] and an ordered list of leaf values
-/// (Scalars) into an Expression with a [`Literal`] expr for each leaf.
-#[derive(Debug)]
-pub(crate) struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
-    /// Leaf values to insert in schema order.
-    scalars: T,
-    /// A stack of built Expressions. After visiting children, we pop them off to
-    /// build the parent container, then push the parent back on.
-    stack: Vec<Expression>,
-    /// Since schema transforms are infallible we keep track of errors here
-    error: Result<(), Error>,
-}
+use crate::schema::{ArrayType, DataType, MapType, PrimitiveType, StructField, StructType};
+use crate::DeltaResult;
 
 /// Any error for [`LiteralExpressionTransform`]
 #[derive(thiserror::Error, Debug)]
@@ -48,97 +29,71 @@ pub enum Error {
     Unsupported(String),
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct LiteralExpressionTransform<'a, T: Iterator<Item = &'a Scalar>> {
+    /// Leaf values to insert in schema order.
+    scalars: T,
+}
+
 impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
     pub(crate) fn new(scalars: impl IntoIterator<IntoIter = I>) -> Self {
         Self {
             scalars: scalars.into_iter(),
-            stack: Vec::new(),
-            error: Ok(()),
         }
     }
 
-    /// return the Expression we just built (or propagate Error). the top of `stack` should be our
-    /// final Expression
-    pub(crate) fn try_into_expr(mut self) -> Result<Expression, Error> {
-        self.error?;
+    /// Bind the visitor to a StructType and produce an Expression
+    pub(crate) fn bind(&mut self, struct_type: &StructType) -> DeltaResult<Expression> {
+        use crate::schema::visitor::visit_struct;
+        let result = visit_struct(struct_type, self)?;
 
-        if let Some(s) = self.scalars.next() {
-            return Err(Error::ExcessScalars(s.clone()));
+        // Check for excess scalars after visiting
+        if let Some(scalar) = self.scalars.next() {
+            return Err(Error::ExcessScalars(scalar.clone()).into());
         }
 
-        self.stack.pop().ok_or(Error::EmptyStack)
+        Ok(result)
     }
 
-    fn set_error(&mut self, error: Error) {
-        // Only set when the error not yet set
-        if let Err(ref existing_error) = self.error {
-            debug!("Trying to overwrite an existing error: {existing_error:?} with {error:?}");
-        } else {
-            self.error = Err(error);
-        }
-    }
-}
-
-// All leaf types (primitive, array, map) share the same "shape" of transformation logic
-macro_rules! transform_leaf {
-    ($self:ident, $type_variant:path, $type:ident) => {{
-        // first always check error to terminate early if possible
-        $self.error.as_ref().ok()?;
-
-        let Some(scalar) = $self.scalars.next() else {
-            $self.set_error(Error::InsufficientScalars);
-            return None;
+    fn visit_leaf(&mut self, schema_type: &DataType) -> DeltaResult<Expression> {
+        let Some(scalar) = self.scalars.next() else {
+            return Err(Error::InsufficientScalars.into());
         };
 
-        // NOTE: Grab a reference here so code below can leverage the blanket impl<T> Deref for &T
-        let $type_variant(ref scalar_type) = scalar.data_type() else {
-            $self.set_error(Error::Schema(format!(
-                "Mismatched scalar type while creating Expression: expected {}({:?}), got {:?}",
-                stringify!($type_variant),
-                $type,
-                scalar.data_type()
-            )));
-            return None;
-        };
-
-        // NOTE: &T and &Box<T> both deref to &T
-        if scalar_type.deref() != $type {
-            $self.set_error(Error::Schema(format!(
+        if schema_type.clone() != scalar.data_type() {
+            return Err(Error::Schema(format!(
                 "Mismatched scalar type while creating Expression: expected {:?}, got {:?}",
-                $type, scalar_type
-            )));
-            return None;
-        }
+                schema_type,
+                scalar.data_type()
+            ))
+            .into());
+        };
 
-        $self.stack.push(Expression::Literal(scalar.clone()));
-        None
-    }};
+        Ok(Expression::Literal(scalar.clone()))
+    }
 }
 
-impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressionTransform<'a, T> {
-    fn transform_primitive(
-        &mut self,
-        prim_type: &'a PrimitiveType,
-    ) -> Option<Cow<'a, PrimitiveType>> {
-        transform_leaf!(self, DataType::Primitive, prim_type)
+impl<'a, I: Iterator<Item = &'a Scalar>> delta_kernel::schema::visitor::SchemaVisitor
+    for LiteralExpressionTransform<'a, I>
+{
+    type T = Expression;
+
+    fn field(&mut self, field: &StructField, value: Self::T) -> DeltaResult<Self::T> {
+        match &field.data_type {
+            DataType::Struct(_) => Ok(value),
+            DataType::Primitive(_) => self.visit_leaf(&field.data_type),
+            DataType::Array(_) => self.visit_leaf(&field.data_type),
+            DataType::Map(_) => self.visit_leaf(&field.data_type),
+            DataType::Variant(_) => self.visit_leaf(&field.data_type),
+        }
     }
 
-    fn transform_struct(&mut self, struct_type: &'a StructType) -> Option<Cow<'a, StructType>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-
-        // Only consume newly-added entries (if any). There could be fewer than expected if
-        // the recursion encountered an error.
-        let mark = self.stack.len();
-        self.recurse_into_struct(struct_type)?;
-        let field_exprs = self.stack.split_off(mark);
-
+    fn r#struct(
+        &mut self,
+        struct_type: &StructType,
+        field_exprs: Vec<Self::T>,
+    ) -> DeltaResult<Self::T> {
         let fields = struct_type.fields();
-        if field_exprs.len() != fields.len() {
-            self.set_error(Error::InsufficientScalars);
-            return None;
-        }
-
         let mut found_non_nullable_null = false;
         let mut all_null = true;
         for (field, expr) in fields.zip(&field_exprs) {
@@ -154,36 +109,42 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         let struct_expr = if found_non_nullable_null {
             if !all_null {
                 // we found a non_nullable NULL, but other siblings are non-null: error
-                self.set_error(Error::Schema(
+                return Err(Error::Schema(
                     "NULL value for non-nullable struct field with non-NULL siblings".to_string(),
-                ));
-                return None;
+                )
+                .into());
             }
             Expression::null_literal(struct_type.clone().into())
         } else {
             Expression::struct_from(field_exprs)
         };
 
-        self.stack.push(struct_expr);
-        None
+        Ok(struct_expr)
     }
 
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        // first always check error to terminate early if possible
-        self.error.as_ref().ok()?;
-
-        self.recurse_into_struct_field(field);
-        Some(Cow::Borrowed(field))
+    fn list(&mut self, _list: &ArrayType, _value: Self::T) -> DeltaResult<Self::T> {
+        // Everything is handled on the field level
+        Ok(Expression::Unknown("Should not happen".to_string()))
     }
 
-    // arrays treated as leaves
-    fn transform_array(&mut self, array_type: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
-        transform_leaf!(self, DataType::Array, array_type)
+    fn map(
+        &mut self,
+        _map: &MapType,
+        _key_value: Self::T,
+        _value: Self::T,
+    ) -> DeltaResult<Self::T> {
+        // Everything is handled on the field level
+        Ok(Expression::Unknown("Should not happen".to_string()))
     }
 
-    // maps treated as leaves
-    fn transform_map(&mut self, map_type: &'a MapType) -> Option<Cow<'a, MapType>> {
-        transform_leaf!(self, DataType::Map, map_type)
+    fn primitive(&mut self, _p: &PrimitiveType) -> DeltaResult<Self::T> {
+        // Everything is handled on the field level
+        Ok(Expression::Unknown("Should not happen".to_string()))
+    }
+
+    fn variant(&mut self, _struct: &StructType) -> DeltaResult<Self::T> {
+        // Everything is handled on the field level
+        Ok(Expression::Unknown("Should not happen".to_string()))
     }
 }
 
@@ -208,18 +169,15 @@ mod tests {
         schema: SchemaRef,
         expected: Result<Expr, ()>,
     ) {
-        let mut schema_transform = LiteralExpressionTransform::new(values);
-        let datatype = schema.into();
-        let _transformed = schema_transform.transform(&datatype);
+        let actual = LiteralExpressionTransform::new(values).bind(&schema);
         match expected {
             Ok(expected_expr) => {
-                let actual_expr = schema_transform.try_into_expr().unwrap();
                 // TODO: we can't compare NULLs so we convert with .to_string to workaround
-                // see: https://github.com/delta-io/delta-kernel-rs/pull/677
-                assert_eq!(expected_expr.to_string(), actual_expr.to_string());
+                // see: https://github.com/delta-io/delta-kernel-rs/pull/1267
+                assert_eq!(expected_expr.to_string(), actual.unwrap().to_string());
             }
             Err(()) => {
-                assert!(schema_transform.try_into_expr().is_err());
+                assert!(actual.is_err());
             }
         }
     }
