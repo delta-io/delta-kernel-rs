@@ -36,7 +36,8 @@
 //!
 //! # fn example(engine: &dyn Engine) -> DeltaResult<()> {
 //! // Create a snapshot for the table
-//! let snapshot = Arc::new(Snapshot::try_from_uri("./path/to/table", engine, None)?);
+//! let table_root = url::Url::parse("file:///path/to/table")?;
+//! let snapshot = Arc::new(Snapshot::builder(table_root).build(engine)?);
 //!
 //! // Create a log compaction writer for versions 10-20
 //! let mut writer = snapshot.compact_log(10, 20)?;
@@ -46,13 +47,7 @@
 //! let compaction_data = writer.compaction_data(engine)?;
 //!
 //! // Write the compaction data to object storage
-//! let metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
-//!
-//! // Get fresh data iterator for finalization
-//! let final_data = writer.compaction_data(engine)?;
-//!
-//! // Finalize the compaction
-//! writer.finalize(engine, &metadata, final_data)?;
+//! let _metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -63,6 +58,9 @@
 //! - You have many small commit files that slow down log replay
 //! - You want to reduce the number of files without creating a full checkpoint
 //! - You need to optimize specific version ranges that are frequently accessed
+//!
+//! The [`should_compact`] utility function can help determine when compaction is appropriate
+//! based on version intervals.
 //!
 //! Please see <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#log-compaction-files>
 //! for more details
@@ -86,7 +84,7 @@ use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 
 mod writer;
 
-pub use writer::{LogCompactionDataIterator, LogCompactionWriter};
+pub use writer::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
 
 #[cfg(test)]
 mod tests;
