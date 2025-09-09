@@ -47,7 +47,7 @@ fn test_log_compaction_writer_creation() {
     let end_version = 20;
     let retention_millis = 7 * 24 * 60 * 60 * 1000; // 7 days
 
-    let writer = LogCompactionWriter::new(
+    let writer = LogCompactionWriter::try_new(
         table_root.clone(),
         start_version,
         end_version,
@@ -68,7 +68,7 @@ fn test_invalid_version_range() {
     let end_version = 10; // Invalid: start > end
     let retention_millis = 7 * 24 * 60 * 60 * 1000;
 
-    let result = LogCompactionWriter::new(table_root, start_version, end_version, retention_millis);
+    let result = LogCompactionWriter::try_new(table_root, start_version, end_version, retention_millis);
 
     assert!(result.is_err());
     assert!(result
@@ -148,7 +148,7 @@ fn test_compaction_path_formats() {
 
     for (start, end, expected_filename) in test_cases {
         let writer =
-            LogCompactionWriter::new(table_root.clone(), start, end, retention_millis).unwrap();
+            LogCompactionWriter::try_new(table_root.clone(), start, end, retention_millis).unwrap();
 
         let path = writer.compaction_path().unwrap();
         assert!(
@@ -166,7 +166,7 @@ fn test_equal_version_range() {
     let table_root = Url::parse("memory:///test-table").unwrap();
     let retention_millis = 7 * 24 * 60 * 60 * 1000;
 
-    let writer = LogCompactionWriter::new(
+    let writer = LogCompactionWriter::try_new(
         table_root.clone(),
         5,
         5, // Same version for start and end
@@ -198,7 +198,7 @@ fn test_large_version_numbers() {
     let start_version = 999999;
     let end_version = 1000000;
 
-    let writer = LogCompactionWriter::new(
+    let writer = LogCompactionWriter::try_new(
         table_root.clone(),
         start_version,
         end_version,
@@ -217,7 +217,7 @@ fn test_list_commit_files_empty() {
     // We don't actually call list_commit_files since it would require
     // a real filesystem or mock engine
     let table_root = Url::parse("memory:///test-empty-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 0, 5, 0).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 0, 5, 0).unwrap();
 
     // Just verify the writer was created successfully
     assert!(writer.compaction_path().is_ok());
@@ -227,7 +227,7 @@ fn test_list_commit_files_empty() {
 fn test_create_log_segment_empty() {
     // Test create_log_segment with empty commit files
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 0, 5, 0).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 0, 5, 0).unwrap();
 
     let commit_files = vec![];
     let result = writer.create_log_segment(commit_files);
@@ -244,7 +244,7 @@ fn test_create_log_segment_empty() {
 fn test_create_log_segment_with_files() {
     // Test create_log_segment with actual commit files
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 1, 3, 0).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 1, 3, 0).unwrap();
 
     // Create mock commit files
     let mut commit_files = vec![];
@@ -324,7 +324,7 @@ fn test_log_compaction_data_iterator_with_data() {
 fn test_compaction_writer() {
     // Additional test to ensure all public methods are covered
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 5, 10, 1000).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 5, 10, 1000).unwrap();
 
     // Test compaction_path returns expected format
     let path = writer.compaction_path().unwrap();
@@ -333,7 +333,7 @@ fn test_compaction_writer() {
         .contains("00000000000000000005.00000000000000000010.compacted.json"));
 
     // Create another writer to test validation
-    let writer2 = LogCompactionWriter::new(table_root.clone(), 0, 0, 0).unwrap();
+    let writer2 = LogCompactionWriter::try_new(table_root.clone(), 0, 0, 0).unwrap();
     let path2 = writer2.compaction_path().unwrap();
     assert!(path2
         .to_string()
@@ -371,7 +371,7 @@ fn test_log_compaction_data_iterator_debug() {
 fn test_writer_debug_impl() {
     // Test Debug implementation for LogCompactionWriter
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 5, 10, 1000).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 5, 10, 1000).unwrap();
 
     let debug_str = format!("{:?}", writer);
     assert!(debug_str.contains("LogCompactionWriter"));
@@ -485,7 +485,7 @@ fn test_parsed_log_path_filtering() {
 fn test_writer_getters() {
     // Test that all getter methods work correctly
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(
+    let writer = LogCompactionWriter::try_new(
         table_root.clone(),
         42,
         100,
@@ -504,7 +504,7 @@ fn test_writer_getters() {
 fn test_zero_versions() {
     // Test with version 0 which is valid
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 0, 0, 0);
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 0, 0, 0);
     assert!(writer.is_ok());
 
     let writer = writer.unwrap();
@@ -520,7 +520,7 @@ fn test_very_large_retention_millis() {
     let table_root = Url::parse("memory:///test-table").unwrap();
     let retention_millis = i64::MAX;
 
-    let writer = LogCompactionWriter::new(table_root.clone(), 1, 10, retention_millis);
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 1, 10, retention_millis);
 
     assert!(writer.is_ok());
     let writer = writer.unwrap();
@@ -533,7 +533,7 @@ fn test_negative_retention_millis() {
     let table_root = Url::parse("memory:///test-table").unwrap();
     let retention_millis = -1;
 
-    let writer = LogCompactionWriter::new(table_root.clone(), 1, 10, retention_millis);
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 1, 10, retention_millis);
 
     assert!(writer.is_ok());
 }
@@ -544,7 +544,7 @@ fn test_multiple_version_ranges() {
     let table_root = Url::parse("memory:///test-table").unwrap();
 
     // Single version range
-    let single = LogCompactionWriter::new(table_root.clone(), 5, 5, 0).unwrap();
+    let single = LogCompactionWriter::try_new(table_root.clone(), 5, 5, 0).unwrap();
     assert!(single
         .compaction_path()
         .unwrap()
@@ -552,7 +552,7 @@ fn test_multiple_version_ranges() {
         .contains("00000000000000000005.00000000000000000005"));
 
     // Small range
-    let small = LogCompactionWriter::new(table_root.clone(), 0, 9, 0).unwrap();
+    let small = LogCompactionWriter::try_new(table_root.clone(), 0, 9, 0).unwrap();
     assert!(small
         .compaction_path()
         .unwrap()
@@ -560,7 +560,7 @@ fn test_multiple_version_ranges() {
         .contains("00000000000000000000.00000000000000000009"));
 
     // Large range
-    let large = LogCompactionWriter::new(table_root.clone(), 100, 999, 0).unwrap();
+    let large = LogCompactionWriter::try_new(table_root.clone(), 100, 999, 0).unwrap();
     assert!(large
         .compaction_path()
         .unwrap()
@@ -568,7 +568,7 @@ fn test_multiple_version_ranges() {
         .contains("00000000000000000100.00000000000000000999"));
 
     // Very large version numbers
-    let huge = LogCompactionWriter::new(table_root.clone(), 1000000, 1000010, 0).unwrap();
+    let huge = LogCompactionWriter::try_new(table_root.clone(), 1000000, 1000010, 0).unwrap();
     assert!(huge
         .compaction_path()
         .unwrap()
@@ -582,7 +582,7 @@ fn test_boundary_conditions() {
 
     // Test with maximum safe version number
     let max_safe = (i64::MAX / 2) as Version;
-    let writer = LogCompactionWriter::new(table_root.clone(), max_safe - 10, max_safe, 0);
+    let writer = LogCompactionWriter::try_new(table_root.clone(), max_safe - 10, max_safe, 0);
     assert!(writer.is_ok());
 }
 
@@ -590,17 +590,17 @@ fn test_boundary_conditions() {
 fn test_path_validation() {
     // Test various URL schemes
     let memory_url = Url::parse("memory:///test").unwrap();
-    let writer1 = LogCompactionWriter::new(memory_url, 0, 5, 0);
+    let writer1 = LogCompactionWriter::try_new(memory_url, 0, 5, 0);
     assert!(writer1.is_ok());
 
     // Test with file URL
     let file_url = Url::parse("file:///tmp/test").unwrap();
-    let writer2 = LogCompactionWriter::new(file_url, 0, 5, 0);
+    let writer2 = LogCompactionWriter::try_new(file_url, 0, 5, 0);
     assert!(writer2.is_ok());
 
     // Test path component construction
     let http_url = Url::parse("http://example.com/delta").unwrap();
-    let writer3 = LogCompactionWriter::new(http_url, 0, 5, 0);
+    let writer3 = LogCompactionWriter::try_new(http_url, 0, 5, 0);
     assert!(writer3.is_ok());
 }
 
@@ -609,7 +609,7 @@ fn test_create_log_segment_various_sizes() {
     let table_root = Url::parse("memory:///test-table").unwrap();
 
     // Test with single file
-    let writer = LogCompactionWriter::new(table_root.clone(), 10, 10, 0).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 10, 10, 0).unwrap();
     let single_file = vec![ParsedLogPath::try_from(FileMeta {
         location: table_root
             .join("_delta_log/00000000000000000010.json")
@@ -623,7 +623,7 @@ fn test_create_log_segment_various_sizes() {
     assert!(result.is_ok());
 
     // Test with many files
-    let writer2 = LogCompactionWriter::new(table_root.clone(), 0, 99, 0).unwrap();
+    let writer2 = LogCompactionWriter::try_new(table_root.clone(), 0, 99, 0).unwrap();
     let mut many_files = vec![];
     for i in 0..100 {
         let location = table_root
@@ -646,7 +646,7 @@ fn test_create_log_segment_various_sizes() {
 fn test_create_log_segment_sorting() {
     // Test that create_log_segment properly sorts commit files
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 1, 5, 0).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 1, 5, 0).unwrap();
 
     // Create commit files in reverse order
     let mut commit_files = vec![];
@@ -709,7 +709,7 @@ fn test_compaction_actions_schema_fields() {
 fn test_log_compaction_writer_fields() {
     // Test that we can access internal fields through Debug
     let table_root = Url::parse("memory:///test-table").unwrap();
-    let writer = LogCompactionWriter::new(table_root.clone(), 123, 456, 7890).unwrap();
+    let writer = LogCompactionWriter::try_new(table_root.clone(), 123, 456, 7890).unwrap();
 
     let debug_str = format!("{:?}", writer);
     assert!(debug_str.contains("123"));
@@ -770,7 +770,7 @@ fn test_retention_timestamp_edge_cases() {
     let table_root = Url::parse("memory:///test-table").unwrap();
 
     // Test with 0 retention
-    let zero_retention = LogCompactionWriter::new(table_root.clone(), 1, 5, 0).unwrap();
+    let zero_retention = LogCompactionWriter::try_new(table_root.clone(), 1, 5, 0).unwrap();
     assert!(zero_retention.compaction_path().is_ok());
 
     // Test with common retention periods
@@ -780,7 +780,7 @@ fn test_retention_timestamp_edge_cases() {
     let month_millis = 30 * day_millis;
 
     for retention in [hour_millis, day_millis, week_millis, month_millis] {
-        let writer = LogCompactionWriter::new(table_root.clone(), 1, 5, retention).unwrap();
+        let writer = LogCompactionWriter::try_new(table_root.clone(), 1, 5, retention).unwrap();
         assert!(writer.compaction_path().is_ok());
     }
 }
@@ -799,7 +799,7 @@ fn test_version_range_calculations() {
     ];
 
     for (start, end, expected_count) in test_cases {
-        let writer = LogCompactionWriter::new(table_root.clone(), start, end, 0).unwrap();
+        let writer = LogCompactionWriter::try_new(table_root.clone(), start, end, 0).unwrap();
         let actual_count = (end - start + 1) as usize;
         assert_eq!(
             actual_count, expected_count,
@@ -822,7 +822,7 @@ fn test_url_joining() {
 
     for url_str in test_urls {
         let url = Url::parse(url_str).unwrap();
-        let writer = LogCompactionWriter::new(url, 0, 10, 0).unwrap();
+        let writer = LogCompactionWriter::try_new(url, 0, 10, 0).unwrap();
         let path = writer.compaction_path().unwrap();
         assert!(path.to_string().contains("_delta_log"));
         assert!(path.to_string().contains(".compacted.json"));

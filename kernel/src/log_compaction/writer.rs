@@ -39,7 +39,7 @@ pub(crate) struct LogCompactionWriter {
 
 impl LogCompactionWriter {
     #[allow(dead_code)]
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         table_root: Url,
         start_version: Version,
         end_version: Version,
