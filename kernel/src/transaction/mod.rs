@@ -83,6 +83,40 @@ impl std::fmt::Debug for Transaction {
     }
 }
 
+
+/// A trait for building leaf files when the transaction is doing doing an adaptive
+/// metadata commit.
+/// Expected usage:
+///    1.  Create a leaf builder.
+///    2.  Call add_files methods populate the leaf's metadata.
+///    3.  Call write_leaf method and pass the returned EngineData to [`Transaction::add_leaf`].
+pub trait DataFileLeafBuilder {
+    /// Same as [`Transaction::add_files`] but adds file to the leaf instead of the root.
+    fn add_files(&mut self, add_metadata: Box<dyn EngineData>);
+
+
+    // TODO: APIs for moving files to the leaf (need to define a scan over actions on the transaction with schema and then use it here).
+
+    /// Writes the leaf manifest to object storage.  The return EngineData should
+    /// be be passed to [`Transaction::add_leaf`]. After this call the builder is reset
+    /// to its initial state and may be used again.
+    fn write_leaf(&mut self) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+/// Analogue of DataFileLeafBuilderTrait for deletion vectors.
+pub trait DeletionVectorLeafBuilder {
+    /// Same as [`Transaction::update_deletion_vectors`] but updates deletion vectors in a leaf file instead of the root.
+    /// That is, the old DV is marked as deleted in the corresponding manifest DV and the new one is added to the leaf.
+    fn update_deletion_vectors(&mut self, dv_metadata: Box<dyn EngineData>);
+
+// TODO: APIs for moving files to the leaf (need to define a scan over actions on the transaction with schema and then use ).
+
+    /// Writes the leaf manifest to object storage.  The return EngineData should
+    /// be be passed to [`Transaction::add_leaf`]. After this call the builder is reset
+    /// to its initial state and may be used again.
+    fn write_leaf(&mut self) -> DeltaResult<Box<dyn EngineData>>;
+}
+
 impl Transaction {
     /// Create a new transaction from a snapshot. The snapshot will be used to read the current
     /// state of the table (e.g. to read the current version).
@@ -119,6 +153,8 @@ impl Transaction {
 
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
     /// will include the failed transaction in case of a conflict so the user can retry.
+    /// 
+    /// If in batch mode, any incremental actions will be added to the tree root.
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
         // step 0: if there are txn(app_id, version) actions being committed, ensure that every
         // `app_id` is unique and create a row of `EngineData` for it.
@@ -191,6 +227,20 @@ impl Transaction {
     pub fn with_is_data_change(mut self, is_data_change: bool) -> Self {
         self.is_data_change = is_data_change;
         self
+    }
+
+    /// Set whether the transaction should use batch commit mode (commit directly to the metadata tree).
+    /// When not set, the transaction writes incremental commits to the log. 
+    /// 
+    /// Any incremental actions accumulated since the last batch commit will automatically 
+    /// be added to the tree root on commit.
+    /// 
+    /// Requires preview feature preview-adaptive-metadata-tree be turned on for the table. 
+    /// TODO: add the feature option.
+    /// TODO: Add option to replay incremental actions and add them to leaves.
+    pub fn with_batch_commit(mut self) -> Self {
+        self.commit_timestamp = 0;
+        todo!()
     }
 
     /// Set the operation that this transaction is performing. This string will be persisted in the
@@ -339,9 +389,26 @@ impl Transaction {
         todo!()
     }
 
+    /// Returns a builder for deletion vector leaves. [`with_batch_commit`] must be called before this method.
+    pub fn new_deletion_vector_leaf_builder(self) -> Box<dyn DeletionVectorLeafBuilder> {
+        todo!()
+    }
+
+    /// Returns a builder for data file leaves. [`with_batch_commit`] must be called before this method.
+    pub fn new_data_file_leaf_builder(self) -> Box<dyn DataFileLeafBuilder> {
+        todo!()
+    }
+
+    /// Adds the given leaf metadata to the transaction (See [`DataFileLeafBuilder`] and [`DeletionVectorLeafBuilder`] for more details).
+    /// [`with_batch_commit`] must be called before this method.
+    pub fn add_leaf(self, leaf_metadata: Box<dyn EngineData>) -> () {
+        leaf_metadata.any_ref();
+        todo!()
+    }
+
     // Returns a collection of files written as part of this transaction that need
     // to be cleaned up if the transaction fails. File are registered here when
-    // [`update_deletion_vectors`] is called.
+    // [`update_deletion_vectors`] or [`add_leaf`] are called.
     pub fn new_files_written(self) -> Vec<Url>{
         todo!()
     }
