@@ -18,7 +18,7 @@
 //!    from a given start_version to end_version
 //! 2. Get the compaction path from [`LogCompactionWriter::compaction_path`]
 //! 3. Get the compaction data from [`LogCompactionWriter::compaction_data`]
-//! 4. Write the data to the path in object storage (engine-specific)
+//! 4. Write the data to the path in cloud storage (engine-specific)
 //!
 //! ## Example
 //!
@@ -30,8 +30,7 @@
 //!
 //! // Engine-specific function to write compaction data
 //! fn write_compaction_file(path: Url, data: LogCompactionDataIterator) -> DeltaResult<FileMeta> {
-//!     // In a real implementation, this would write the data to object storage
-//!     // and return the file metadata
+//!     // In a real implementation, this would write the data to cloud storage
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
@@ -47,7 +46,7 @@
 //! let compaction_path = writer.compaction_path()?;
 //! let compaction_data = writer.compaction_data(engine)?;
 //!
-//! // Write the compaction data to object storage
+//! // Write the compaction data to cloud storage
 //! let _metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;
 //! # Ok(())
 //! # }
