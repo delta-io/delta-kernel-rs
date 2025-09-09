@@ -236,6 +236,10 @@ impl TableChangesScan {
     /// to read and process all the data for the query. Each [`ScanResult`] in the resultant iterator
     /// encapsulates the raw data and an optional boolean vector built from the deletion vector if it
     /// was present. See the documentation for [`ScanResult`] for more details.
+    #[deprecated(
+        since = "0.15.3",
+        note = "execute is a good example, but is too naive and will be removed in the near future"
+    )]
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
