@@ -1,4 +1,5 @@
 //! # Log Compaction
+//!
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
 //! by reducing the number of individual log files that need to be processed during
@@ -8,14 +9,15 @@
 //!
 //! Log compaction creates files with the naming pattern `{start_version}.{end_version}.compacted.json`
 //! that contain the reconciled actions from all commit files in the specified version range.
+//! Only commit/compaction files that intersect with [start_version, end_version] are processed.
 //! This is similar to checkpoints but operates on a subset of versions rather than the entire table.
 //!
 //! ## Usage
 //!
 //! The log compaction API follows a similar pattern to the checkpoint API:
 //!
-//! 1. Create a [`LogCompactionWriter`] using [`Snapshot::compact_log`] to compact the log
-//!    from a given start_version to end_version
+//! 1. Create a [`LogCompactionWriter`] using [`crate::Snapshot::compact_log`] to compact the log
+//!    from a given start_version to end_version (inclusive)
 //! 2. Get the compaction path from [`LogCompactionWriter::compaction_path`]
 //! 3. Get the compaction data from [`LogCompactionWriter::compaction_data`]
 //! 4. Write the data to the path in cloud storage (engine-specific)
@@ -55,9 +57,9 @@
 //! ## When to Use Log Compaction
 //!
 //! Log compaction is beneficial when:
-//! - You have many small commit files that slow down log replay
-//! - You want to reduce the number of files without creating a full checkpoint
-//! - You need to optimize specific version ranges that are frequently accessed
+//! - Table has many small commit files that slow down log replay
+//! - Reduce the number of files without creating a full checkpoint
+//! - Optimize specific version ranges that are frequently accessed
 //!
 //! The [`should_compact`] utility function can help determine when compaction is appropriate
 //! based on version intervals.

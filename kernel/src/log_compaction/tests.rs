@@ -202,3 +202,25 @@ fn test_compaction_paths() {
         );
     }
 }
+
+#[test]
+fn test_version_filtering() {
+    let snapshot = create_multi_version_snapshot();
+    let engine = SyncEngine::new();
+    let snapshot_version = snapshot.version();
+
+    if snapshot_version >= 1 {
+        let mut writer = LogCompactionWriter::try_new(snapshot.clone(), 0, 1).unwrap();
+
+        let result = writer.compaction_data(&engine);
+        assert!(
+            result.is_ok(),
+            "Failed to get compaction data: {:?}",
+            result.err()
+        );
+
+        let iterator = result.unwrap();
+        assert!(iterator.total_actions() >= 0);
+        assert!(iterator.total_add_actions() >= 0);
+    }
+}

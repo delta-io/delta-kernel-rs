@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::action_reconciliation::RetentionCalculator;
+use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::table_properties::TableProperties;
@@ -24,10 +25,8 @@ pub fn should_compact(commit_version: Version, compaction_interval: Version) -> 
 
 /// Writer for log compaction files
 ///
-/// This writer provides an API similar to [`CheckpointWriter`] for creating
-/// log compaction files that aggregate actions from multiple commit files.
-///
-/// [`CheckpointWriter`]: crate::checkpoint::CheckpointWriter
+/// This writer provides an API for creating log compaction files that aggregate actions
+/// from multiple commit files.
 #[derive(Debug)]
 pub struct LogCompactionWriter {
     /// Reference to the snapshot of the table being compacted
@@ -74,10 +73,9 @@ impl LogCompactionWriter {
 
     /// Get an iterator over the compaction data to be written
     ///
-    /// This method performs action reconciliation similar to checkpoint creation,
-    /// but specifically for the version range specified in the constructor.
-    /// It reuses the CheckpointLogReplayProcessor to ensure consistent reconciliation
-    /// logic with checkpoint creation.
+    /// Performs action reconciliation for the version range specified in the constructor.
+    /// It creates a LogSegment that only includes commits in the specified version range,
+    /// and performs action reconciliation.
     pub fn compaction_data(
         &mut self,
         engine: &dyn Engine,
@@ -91,13 +89,21 @@ impl LogCompactionWriter {
             )));
         }
 
-        // Read actions from the snapshot's log segment
-        // Filter to only include commits in our specified version range
-        let actions_iter = self.snapshot.log_segment().read_actions(
+        // Create a log segment specifically for the compaction range
+        // This ensures we only process commits in [start_version, end_version]
+        let compaction_log_segment = LogSegment::for_table_changes(
+            engine.storage_handler().as_ref(),
+            self.snapshot.log_segment().log_root.clone(),
+            self.start_version,
+            Some(self.end_version),
+        )?;
+
+        // Read actions from the version-filtered log segment
+        let actions_iter = compaction_log_segment.read_actions(
             engine,
             COMPACTION_ACTIONS_SCHEMA.clone(),
             COMPACTION_ACTIONS_SCHEMA.clone(),
-            None, // No predicate - we want all actions
+            None, // No predicate - we want all actions in the version range
         )?;
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
@@ -122,10 +128,8 @@ impl LogCompactionWriter {
     }
 }
 
-/// Iterator over log compaction data
-///
-/// This iterator provides the reconciled actions that should be written
-/// to the compaction file. It follows a similar pattern to CheckpointDataIterator.
+/// Iterator over log compaction data. Provides the reconciled actions that should be written
+/// to the compaction file.
 pub struct LogCompactionDataIterator {
     /// The nested iterator that yields compaction batches with action counts
     pub(crate) compaction_batch_iterator:
@@ -161,10 +165,6 @@ impl Iterator for LogCompactionDataIterator {
     type Item = DeltaResult<FilteredEngineData>;
 
     /// Advances the iterator and returns the next value.
-    ///
-    /// This implementation transforms the `CheckpointBatch` items from the nested iterator into
-    /// [`FilteredEngineData`] items for the engine to write, while accumulating action counts from
-    /// each batch.
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.compaction_batch_iterator.next()?.map(|batch| {
             self.actions_count += batch.actions_count;
