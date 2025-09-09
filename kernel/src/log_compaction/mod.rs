@@ -1,3 +1,4 @@
+//! # Log Compaction
 //! This module provides an API for writing log compaction files that aggregate
 //! multiple commit JSON files into single compacted files. This improves performance
 //! by reducing the number of individual log files that need to be processed during
@@ -70,9 +71,6 @@
 //! - **Checkpoints**: Aggregate the entire table state up to a specific version
 //! - **Log Compaction**: Aggregates only a specific range of commit files
 //! - Both use similar action reconciliation logic but serve different use cases
-//!
-//! [`Snapshot::compact_log`]: crate::Snapshot::compact_log
-//! [`FileMeta`]: crate::FileMeta
 
 use std::sync::{Arc, LazyLock};
 
@@ -88,11 +86,9 @@ pub use writer::{should_compact, LogCompactionDataIterator, LogCompactionWriter}
 
 #[cfg(test)]
 mod tests;
-/// Schema for extracting relevant actions from log files for compaction
-///
-/// This aligns with the checkpoint schema used for reading and writing compacted files.
+
+/// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
-#[allow(dead_code)]
 static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new([
         StructField::nullable(ADD_NAME, Add::to_schema()),

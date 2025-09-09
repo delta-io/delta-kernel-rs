@@ -249,7 +249,6 @@ impl ParsedLogPath<Url> {
     }
 
     /// Create a new ParsedLogPath<Url> for a log compaction file
-    #[allow(dead_code)]
     pub(crate) fn new_log_compaction(
         table_root: &Url,
         start_version: Version,
