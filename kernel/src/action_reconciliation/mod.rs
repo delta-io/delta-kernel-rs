@@ -1,3 +1,13 @@
+//! # This module implements APIs related to action reconciliation.
+//! Please see the [Delta Lake Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#action-reconciliation)
+//! for more details about action reconciliation.
+//!
+//! ## Retention and Cleanup
+//!
+//! This module provides utilities for calculating retention timestamps used during action reconciliation:
+//!
+//! - **Deleted File Retention**: Determines when `remove` actions can be excluded from checkpoints
+//! - **Transaction Retention**: Calculates when expired transactions can be cleaned up
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::table_properties::TableProperties;
