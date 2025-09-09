@@ -1,4 +1,5 @@
-//! # This module implements APIs related to action reconciliation.
+//! # Action Reconciliation
+//! This module implements APIs related to action reconciliation.
 //! Please see the [Delta Lake Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#action-reconciliation)
 //! for more details about action reconciliation.
 //!
@@ -41,7 +42,7 @@ pub(crate) trait RetentionCalculator {
     /// The cutoff timestamp in milliseconds since epoch, matching the remove action's
     /// `deletion_timestamp` field format for comparison.
     ///
-    /// # Note: The default retention period is 7 days, matching delta-spark's behavior.
+    /// Note: The default retention period is 7 days, matching delta-spark's behavior.
     fn deleted_file_retention_timestamp(&self) -> DeltaResult<i64> {
         let retention_duration = self.table_properties().deleted_file_retention_duration;
 
