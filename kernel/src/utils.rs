@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::Url;
 
-use delta_kernel_derive::internal_api;
 use crate::{DeltaResult, Error};
+use delta_kernel_derive::internal_api;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
