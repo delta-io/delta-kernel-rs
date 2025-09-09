@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
@@ -15,7 +16,6 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
-use crate::utils::calculate_transaction_expiration_timestamp;
 use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
 
