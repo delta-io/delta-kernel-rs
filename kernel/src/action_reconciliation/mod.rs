@@ -7,8 +7,8 @@
 //! This module provides utilities for calculating retention timestamps used during action reconciliation:
 //!
 //! - **Deleted File Retention**: Determines when `remove` actions can be excluded from checkpoints
-//! - **Transaction Retention**: Calculates when expired transactions can be cleaned up
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+//! - **Transaction Retention**: Calculates when expired app ids can be cleaned up
+use std::time::Duration;
 
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
@@ -47,9 +47,7 @@ pub(crate) trait RetentionCalculator {
 
         deleted_file_retention_timestamp_with_time(
             retention_duration,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to calculate system time: {e}")))?,
+            crate::utils::current_time_duration()?,
         )
     }
 
@@ -108,12 +106,7 @@ pub(crate) fn calculate_transaction_expiration_timestamp(
     table_properties
         .set_transaction_retention_duration
         .map(|duration| -> DeltaResult<i64> {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to get current time: {e}")))?;
-
-            let now_ms = i64::try_from(now.as_millis())
-                .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
+            let now_ms = crate::utils::current_time_ms()?;
 
             let expiration_ms = i64::try_from(duration.as_millis())
                 .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
@@ -196,10 +189,7 @@ mod tests {
         // The result should be current time minus 1 hour (approximately)
         // We can't test exact value due to timing, but we can verify it's reasonable
         let timestamp = result.unwrap();
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now_ms = crate::utils::current_time_ms().unwrap();
         let one_hour_ms = 3600 * 1000;
 
         // Should be within a reasonable range (allowing for test execution time)
@@ -249,10 +239,7 @@ mod tests {
         let result = calculator.deleted_file_retention_timestamp()?;
 
         // Should be current time minus 7 days (approximately)
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now_ms = crate::utils::current_time_ms().unwrap();
         let seven_days_ms = 7 * 24 * 60 * 60 * 1000;
 
         assert!(result < now_ms);
@@ -291,10 +278,7 @@ mod tests {
         assert!(result.is_some());
 
         let timestamp = result.unwrap();
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now_ms = crate::utils::current_time_ms().unwrap();
         let two_hours_ms = 2 * 60 * 60 * 1000;
 
         assert!(timestamp < now_ms);

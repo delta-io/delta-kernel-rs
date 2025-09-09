@@ -201,11 +201,7 @@ pub struct CheckpointWriter {
 }
 
 impl RetentionCalculator for CheckpointWriter {
-<<<<<<< HEAD
-    fn table_properties(&self) -> &crate::table_properties::TableProperties {
-=======
     fn table_properties(&self) -> &TableProperties {
->>>>>>> 1127ce9 (Incorporate PR feedback from Zach)
         self.snapshot.table_properties()
     }
 }
