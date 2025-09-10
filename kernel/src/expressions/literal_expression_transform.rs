@@ -148,6 +148,50 @@ impl<'a, I: Iterator<Item = &'a Scalar>> delta_kernel::schema::visitor::SchemaVi
     }
 }
 
+struct StructFieldIterator {
+    stack: Vec<StructType>,
+    pos: Vec<usize>,
+}
+
+impl StructFieldIterator {
+    fn new(root: StructType) -> Self {
+        StructFieldIterator {
+            stack: vec![root],
+            pos: vec![0],
+        }
+    }
+}
+
+impl Iterator for StructFieldIterator {
+    type Item = StructField;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(level) = self.stack.last().cloned() {
+            let current_position = *self.pos.last().unwrap();
+
+            if current_position < level.fields_len() {
+                let field = level.by_index(current_position).clone();
+
+                // Increment position for next iteration
+                *self.pos.last_mut().unwrap() += 1;
+
+                // If this field is a nested struct, push it onto the stack
+                if let DataType::Struct(nested_struct) = &field.data_type {
+                    self.stack.push(nested_struct.as_ref().clone());
+                    self.pos.push(0);
+                }
+
+                return Some(field);
+            } else {
+                // Current level exhausted, pop it
+                self.stack.pop();
+                self.pos.pop();
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +545,255 @@ mod tests {
             (N, b) -> Error,
             (a, N) -> Error,
             (N, N) -> Null,
+        }
+    }
+
+    #[cfg(test)]
+    mod struct_field_iterator_tests {
+        use super::*;
+        use crate::DataType as DeltaDataTypes;
+
+        #[test]
+        fn test_simple_flat_struct() {
+            let schema = StructType::new([
+                StructField::nullable("field1", DeltaDataTypes::INTEGER),
+                StructField::not_null("field2", DeltaDataTypes::STRING),
+                StructField::nullable("field3", DeltaDataTypes::BOOLEAN),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0].name(), "field1");
+            assert_eq!(fields[0].data_type(), &DeltaDataTypes::INTEGER);
+            assert_eq!(fields[1].name(), "field2");
+            assert_eq!(fields[1].data_type(), &DeltaDataTypes::STRING);
+            assert_eq!(fields[2].name(), "field3");
+            assert_eq!(fields[2].data_type(), &DeltaDataTypes::BOOLEAN);
+        }
+
+        #[test]
+        fn test_nested_struct() {
+            let inner_struct = StructType::new([
+                StructField::nullable("inner1", DeltaDataTypes::INTEGER),
+                StructField::nullable("inner2", DeltaDataTypes::STRING),
+            ]);
+
+            let schema = StructType::new([
+                StructField::nullable("outer1", DeltaDataTypes::INTEGER),
+                StructField::nullable("nested", inner_struct.clone()),
+                StructField::nullable("outer2", DeltaDataTypes::STRING),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            // Should get: outer1, nested, inner1, inner2, outer2
+            assert_eq!(fields.len(), 5);
+            assert_eq!(fields[0].name(), "outer1");
+            assert_eq!(fields[0].data_type(), &DeltaDataTypes::INTEGER);
+            assert_eq!(fields[1].name(), "nested");
+            assert!(matches!(fields[1].data_type(), DataType::Struct(_)));
+            assert_eq!(fields[2].name(), "inner1");
+            assert_eq!(fields[2].data_type(), &DeltaDataTypes::INTEGER);
+            assert_eq!(fields[3].name(), "inner2");
+            assert_eq!(fields[3].data_type(), &DeltaDataTypes::STRING);
+            assert_eq!(fields[4].name(), "outer2");
+            assert_eq!(fields[4].data_type(), &DeltaDataTypes::STRING);
+        }
+
+        #[test]
+        fn test_deeply_nested_structs() {
+            let level2 = StructType::new([StructField::nullable(
+                "level2_field",
+                DeltaDataTypes::INTEGER,
+            )]);
+
+            let level1 = StructType::new([
+                StructField::nullable("level1_field", DeltaDataTypes::STRING),
+                StructField::nullable("level2", level2),
+            ]);
+
+            let schema = StructType::new([
+                StructField::nullable("root_field", DeltaDataTypes::BOOLEAN),
+                StructField::nullable("level1", level1),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            // Should get: root_field, level1, level1_field, level2, level2_field
+            assert_eq!(fields.len(), 5);
+            assert_eq!(fields[0].name(), "root_field");
+            assert_eq!(fields[1].name(), "level1");
+            assert_eq!(fields[2].name(), "level1_field");
+            assert_eq!(fields[3].name(), "level2");
+            assert_eq!(fields[4].name(), "level2_field");
+        }
+
+        #[test]
+        fn test_struct_with_array_types() {
+            let array_type = ArrayType::new(DeltaDataTypes::INTEGER, true);
+            let schema = StructType::new([
+                StructField::nullable("before_array", DeltaDataTypes::STRING),
+                StructField::nullable(
+                    "array_field",
+                    DeltaDataTypes::Array(Box::new(array_type.clone())),
+                ),
+                StructField::nullable("after_array", DeltaDataTypes::BOOLEAN),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0].name(), "before_array");
+            assert_eq!(fields[0].data_type(), &DeltaDataTypes::STRING);
+            assert_eq!(fields[1].name(), "array_field");
+            assert!(matches!(fields[1].data_type(), DataType::Array(_)));
+            assert_eq!(fields[2].name(), "after_array");
+            assert_eq!(fields[2].data_type(), &DeltaDataTypes::BOOLEAN);
+        }
+
+        #[test]
+        fn test_struct_with_map_types() {
+            let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, false);
+            let schema = StructType::new([
+                StructField::nullable("before_map", DeltaDataTypes::STRING),
+                StructField::nullable("map_field", DeltaDataTypes::Map(Box::new(map_type.clone()))),
+                StructField::nullable("after_map", DeltaDataTypes::BOOLEAN),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0].name(), "before_map");
+            assert_eq!(fields[0].data_type(), &DeltaDataTypes::STRING);
+            assert_eq!(fields[1].name(), "map_field");
+            assert!(matches!(fields[1].data_type(), DataType::Map(_)));
+            assert_eq!(fields[2].name(), "after_map");
+            assert_eq!(fields[2].data_type(), &DeltaDataTypes::BOOLEAN);
+        }
+
+        #[test]
+        fn test_complex_mixed_structure() {
+            // Create a complex structure with nested structs, arrays, and maps
+            let array_type = ArrayType::new(DeltaDataTypes::STRING, true);
+            let map_type = MapType::new(DeltaDataTypes::STRING, DeltaDataTypes::INTEGER, false);
+
+            let inner_struct = StructType::new([
+                StructField::nullable("inner_primitive", DeltaDataTypes::DOUBLE),
+                StructField::nullable(
+                    "inner_array",
+                    DeltaDataTypes::Array(Box::new(array_type.clone())),
+                ),
+            ]);
+
+            let schema = StructType::new([
+                StructField::nullable("root_string", DeltaDataTypes::STRING),
+                StructField::nullable("root_map", DeltaDataTypes::Map(Box::new(map_type.clone()))),
+                StructField::nullable("nested_struct", inner_struct),
+                StructField::nullable("root_array", DeltaDataTypes::Array(Box::new(array_type))),
+                StructField::nullable("root_int", DeltaDataTypes::INTEGER),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            // Should get: root_string, root_map, nested_struct, inner_primitive, inner_array, root_array, root_int
+            assert_eq!(fields.len(), 7);
+
+            let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(
+                field_names,
+                vec![
+                    "root_string",
+                    "root_map",
+                    "nested_struct",
+                    "inner_primitive",
+                    "inner_array",
+                    "root_array",
+                    "root_int"
+                ]
+            );
+
+            // Verify data types
+            assert_eq!(fields[0].data_type(), &DeltaDataTypes::STRING);
+            assert!(matches!(fields[1].data_type(), DataType::Map(_)));
+            assert!(matches!(fields[2].data_type(), DataType::Struct(_)));
+            assert_eq!(fields[3].data_type(), &DeltaDataTypes::DOUBLE);
+            assert!(matches!(fields[4].data_type(), DataType::Array(_)));
+            assert!(matches!(fields[5].data_type(), DataType::Array(_)));
+            assert_eq!(fields[6].data_type(), &DeltaDataTypes::INTEGER);
+        }
+
+        #[test]
+        fn test_empty_struct() {
+            let schema = StructType::new([]);
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+            assert_eq!(fields.len(), 0);
+        }
+
+        #[test]
+        fn test_struct_with_nested_empty_struct() {
+            let empty_struct = StructType::new([]);
+            let schema = StructType::new([
+                StructField::nullable("before_empty", DeltaDataTypes::STRING),
+                StructField::nullable("empty_nested", empty_struct),
+                StructField::nullable("after_empty", DeltaDataTypes::INTEGER),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            // Should get: before_empty, empty_nested, after_empty
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[0].name(), "before_empty");
+            assert_eq!(fields[1].name(), "empty_nested");
+            assert_eq!(fields[2].name(), "after_empty");
+        }
+
+        #[test]
+        fn test_multiple_sibling_nested_structs() {
+            let struct1 = StructType::new([StructField::nullable(
+                "struct1_field",
+                DeltaDataTypes::STRING,
+            )]);
+
+            let struct2 = StructType::new([
+                StructField::nullable("struct2_field1", DeltaDataTypes::INTEGER),
+                StructField::nullable("struct2_field2", DeltaDataTypes::BOOLEAN),
+            ]);
+
+            let schema = StructType::new([
+                StructField::nullable("root_field", DeltaDataTypes::DOUBLE),
+                StructField::nullable("first_nested", struct1),
+                StructField::nullable("second_nested", struct2),
+                StructField::nullable("final_field", DeltaDataTypes::STRING),
+            ]);
+
+            let iterator = StructFieldIterator::new(schema);
+            let fields: Vec<StructField> = iterator.collect();
+
+            // Should get: root_field, first_nested, struct1_field, second_nested, struct2_field1, struct2_field2, final_field
+            assert_eq!(fields.len(), 7);
+
+            let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+            assert_eq!(
+                field_names,
+                vec![
+                    "root_field",
+                    "first_nested",
+                    "struct1_field",
+                    "second_nested",
+                    "struct2_field1",
+                    "struct2_field2",
+                    "final_field"
+                ]
+            );
         }
     }
 }
