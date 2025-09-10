@@ -44,7 +44,7 @@ pub struct SnapshotBuilder {
 
 impl SnapshotBuilder {
     /// Set the table root URL. This is required when there is no existing snapshot hint (see
-    /// [from_snapshot]).
+    /// [Self::from_snapshot]).
     pub fn with_table_root(mut self, table_root: Url) -> Self {
         self.table_root = Some(table_root);
         self
@@ -121,7 +121,7 @@ impl SnapshotBuilder {
 
         let old_log_segment = &existing_snapshot.log_segment;
         let old_version = existing_snapshot.version();
-        let new_version = self.version.into();
+        let new_version = self.version;
         if let Some(new_version) = new_version {
             if new_version == old_version {
                 // Re-requesting the same version
@@ -356,10 +356,13 @@ mod tests {
         let engine = engine.as_ref();
         create_table(&store, &table_root)?;
 
-        let snapshot = SnapshotBuilder::default().with_table_root(table_root.clone()).build(engine)?;
+        let snapshot = SnapshotBuilder::default()
+            .with_table_root(table_root.clone())
+            .build(engine)?;
         assert_eq!(snapshot.version(), 1);
 
-        let snapshot = SnapshotBuilder::default().with_table_root(table_root.clone())
+        let snapshot = SnapshotBuilder::default()
+            .with_table_root(table_root.clone())
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
@@ -374,20 +377,23 @@ mod tests {
         create_table(&store, &table_root)?;
 
         // Create initial snapshot at version 0
-        let snapshot_v0 = SnapshotBuilder::default().with_table_root(table_root.clone())
+        let snapshot_v0 = SnapshotBuilder::default()
+            .with_table_root(table_root.clone())
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot_v0.version(), 0);
 
         // Create incremental snapshot to version 1
-        let snapshot_v1 = SnapshotBuilder::default().with_table_root(table_root.clone())
+        let snapshot_v1 = SnapshotBuilder::default()
+            .with_table_root(table_root.clone())
             .from_snapshot(snapshot_v0.clone())
             .at_version(1)
             .build(engine)?;
         assert_eq!(snapshot_v1.version(), 1);
 
         // Try to get the same version - should return the same Arc
-        let snapshot_v1_again = SnapshotBuilder::default().with_table_root(table_root.clone())
+        let snapshot_v1_again = SnapshotBuilder::default()
+            .with_table_root(table_root.clone())
             .from_snapshot(snapshot_v1.clone())
             .at_version(1)
             .build(engine)?;

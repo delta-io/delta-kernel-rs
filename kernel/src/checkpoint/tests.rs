@@ -72,7 +72,9 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder().with_table_root(table_root).build(&engine)?;
+    let snapshot = Snapshot::builder()
+        .with_table_root(table_root)
+        .build(&engine)?;
     let writer = snapshot.clone().checkpoint()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
@@ -295,7 +297,9 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder().with_table_root(table_root).build(&engine)?;
+    let snapshot = Snapshot::builder()
+        .with_table_root(table_root)
+        .build(&engine)?;
     let writer = snapshot.clone().checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.
@@ -363,7 +367,10 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
 
     let table_root = Url::parse("memory:///")?;
     // Specify version 0 for checkpoint
-    let snapshot = Snapshot::builder().with_table_root(table_root).at_version(0).build(&engine)?;
+    let snapshot = Snapshot::builder()
+        .with_table_root(table_root)
+        .at_version(0)
+        .build(&engine)?;
     let writer = snapshot.clone().checkpoint()?;
 
     // Verify the checkpoint file path is the specified version.
@@ -411,7 +418,10 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder().with_table_root(table_root).at_version(0).build(&engine)?;
+    let snapshot = Snapshot::builder()
+        .with_table_root(table_root)
+        .at_version(0)
+        .build(&engine)?;
     let writer = snapshot.clone().checkpoint()?;
     let data_iter = writer.checkpoint_data(&engine)?;
 
@@ -465,7 +475,9 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder().with_table_root(table_root).build(&engine)?;
+    let snapshot = Snapshot::builder()
+        .with_table_root(table_root)
+        .build(&engine)?;
     let writer = snapshot.clone().checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.

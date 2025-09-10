@@ -50,7 +50,10 @@ fn test_replay_for_metadata() {
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
     let engine = SyncEngine::new();
 
-    let snapshot = Snapshot::builder().with_table_root(url).build(&engine).unwrap();
+    let snapshot = Snapshot::builder()
+        .with_table_root(url)
+        .build(&engine)
+        .unwrap();
     let data: Vec<_> = snapshot
         .log_segment()
         .replay_for_metadata(&engine)
