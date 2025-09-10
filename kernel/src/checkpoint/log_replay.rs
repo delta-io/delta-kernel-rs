@@ -940,6 +940,30 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_add_then_remove_same_file_keep_tombstone() -> DeltaResult<()> {
+        // - Commit 1: adds file1
+        // - Commit 2: removes file1
+        let commit1 = vec![
+            r#"{"add":{"path":"file1","partitionValues":{},"size":100,"modificationTime":100,"dataChange":true}}"#,
+        ];
+        let commit2 = vec![
+            r#"{"remove":{"path":"file1","deletionTimestamp":200,"dataChange":true,"partitionValues":{}}}"#,
+        ];
+        // actions are in reverse order (newest first)
+        let input_batches = vec![create_batch(commit2)?, create_batch(commit1)?];
+        let (results, actions_count, add_actions) = run_checkpoint_test(input_batches)?;
+
+        // should have 1 batch
+        assert_eq!(results.len(), 1);
+        // first batch (remove): should be included
+        assert_eq!(results[0].selection_vector, vec![true],);
+        // second batch (add) should have been filtered out entirely (SV is [false])
+        assert_eq!(actions_count, 1); // one remove
+        assert_eq!(add_actions, 0); // no adds
+        Ok(())
+    }
+
     // ERROR COVERAGE TESTS - These tests specifically target error paths to improve code coverage
 
     // Test-only mock utilities module to avoid coverage noise
