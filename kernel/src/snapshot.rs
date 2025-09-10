@@ -264,7 +264,7 @@ impl Snapshot {
     /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
     ///
     /// See the [`crate::log_compaction`] module documentation for more details.
-    pub fn compact_log(
+    pub fn get_log_compaction_writer(
         self: Arc<Self>,
         start_version: Version,
         end_version: Version,
@@ -1014,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_log() {
+    fn test_get_log_compaction_writer() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1023,15 +1023,15 @@ mod tests {
         let snapshot = Arc::new(Snapshot::builder(url).build(&engine).unwrap());
 
         // Test creating a log compaction writer
-        let writer = snapshot.clone().compact_log(0, 1).unwrap();
-        let path = writer.compaction_path().unwrap();
+        let writer = snapshot.clone().get_log_compaction_writer(0, 1).unwrap();
+        let path = writer.compaction_path();
 
         // Verify the path format is correct
         let expected_filename = "00000000000000000000.00000000000000000001.compacted.json";
         assert!(path.to_string().ends_with(expected_filename));
 
         // Test invalid version range
-        let result = snapshot.compact_log(2, 1);
+        let result = snapshot.get_log_compaction_writer(2, 1);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

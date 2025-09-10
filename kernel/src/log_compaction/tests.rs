@@ -32,7 +32,7 @@ fn test_log_compaction_writer_creation() {
     let writer = LogCompactionWriter::try_new(snapshot, start_version, end_version).unwrap();
 
     // Verify compaction path
-    let path = writer.compaction_path().unwrap();
+    let path = writer.compaction_path();
     let expected_filename = "00000000000000000000.00000000000000000001.compacted.json";
     assert!(path.to_string().ends_with(expected_filename));
 }
@@ -87,7 +87,7 @@ fn test_equal_version_range() {
     let snapshot = create_mock_snapshot();
     let writer = LogCompactionWriter::try_new(snapshot, 5, 5).unwrap();
 
-    let path = writer.compaction_path().unwrap();
+    let path = writer.compaction_path();
     let expected_filename = "00000000000000000005.00000000000000000005.compacted.json";
     assert!(path.to_string().ends_with(expected_filename));
 }
@@ -193,7 +193,7 @@ fn test_compaction_paths() {
 
     for (start, end, expected_suffix) in test_cases {
         let writer = LogCompactionWriter::try_new(snapshot.clone(), start, end).unwrap();
-        let path = writer.compaction_path().unwrap();
+        let path = writer.compaction_path();
         assert!(
             path.to_string().ends_with(expected_suffix),
             "Path {} doesn't end with {}",

@@ -33,6 +33,8 @@ pub struct LogCompactionWriter {
     snapshot: Arc<Snapshot>,
     start_version: Version,
     end_version: Version,
+    /// Cached compaction file path
+    compaction_path: Url,
 }
 
 impl RetentionCalculator for LogCompactionWriter {
@@ -54,21 +56,21 @@ impl LogCompactionWriter {
             )));
         }
 
+        // Compute the compaction path once during construction
+        let compaction_path =
+            ParsedLogPath::new_log_compaction(snapshot.table_root(), start_version, end_version)?;
+
         Ok(Self {
             snapshot,
             start_version,
             end_version,
+            compaction_path: compaction_path.location,
         })
     }
 
     /// Get the path where the compaction file will be written
-    pub fn compaction_path(&self) -> DeltaResult<Url> {
-        let compaction_path = ParsedLogPath::new_log_compaction(
-            self.snapshot.table_root(),
-            self.start_version,
-            self.end_version,
-        )?;
-        Ok(compaction_path.location)
+    pub fn compaction_path(&self) -> &Url {
+        &self.compaction_path
     }
 
     /// Get an iterator over the compaction data to be written
