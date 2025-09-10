@@ -1,7 +1,7 @@
 //! Builder for creating [`Snapshot`] instances.
 
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, Snapshot, Version};
+use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use url::Url;
 
@@ -23,17 +23,18 @@ use url::Url;
 /// # Ok(())
 /// # }
 /// ```
+#[derive(Debug, Default)]
 pub struct SnapshotBuilder {
-    table_root: Url,
+    table_root: Option<Url>,
     version: Option<Version>,
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new(table_root: Url) -> Self {
-        Self {
-            table_root,
-            version: None,
-        }
+    /// Set the table root URL for the [`Snapshot`].
+    // to include after next PR: This is required unless a snapshot hint is provided.
+    pub fn with_table_root(mut self, table_root: Url) -> Self {
+        self.table_root = Some(table_root);
+        self
     }
 
     /// Set the target version of the [`Snapshot`]. When omitted, the Snapshot is created at the
@@ -49,12 +50,15 @@ impl SnapshotBuilder {
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<Snapshot> {
+        let table_root = self
+            .table_root
+            .ok_or_else(|| Error::generic("table_root must be specified to build a Snapshot"))?;
         let log_segment = LogSegment::for_snapshot(
             engine.storage_handler().as_ref(),
-            self.table_root.join("_delta_log/")?,
+            table_root.join("_delta_log/")?,
             self.version,
         )?;
-        Snapshot::try_new_from_log_segment(self.table_root, log_segment, engine)
+        Snapshot::try_new_from_log_segment(table_root, log_segment, engine)
     }
 }
 

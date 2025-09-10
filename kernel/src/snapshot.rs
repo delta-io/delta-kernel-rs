@@ -53,9 +53,9 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    /// Create a new [`SnapshotBuilder`] to build a [`Snapshot`] for a given table root.
-    pub fn builder(table_root: Url) -> SnapshotBuilder {
-        SnapshotBuilder::new(table_root)
+    /// Create a new [`SnapshotBuilder`] to build a [`Snapshot`].
+    pub fn builder() -> SnapshotBuilder {
+        SnapshotBuilder::default()
     }
 
     #[internal_api]
