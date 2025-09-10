@@ -168,7 +168,7 @@ async fn latest_snapshot_test(
     url: Url,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder(url).build(&engine)?;
+    let snapshot = Snapshot::builder().with_table_root(url).build(&engine)?;
     let scan = snapshot.into_scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
@@ -271,7 +271,10 @@ async fn canonicalized_paths_test(
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // assert latest version is 1 and there are no files in the snapshot (add is removed)
-    let snapshot = Snapshot::builder(table_root).build(&engine).unwrap();
+    let snapshot = Snapshot::builder()
+        .with_table_root(table_root)
+        .build(&engine)
+        .unwrap();
     assert_eq!(snapshot.version(), 1);
     let scan = snapshot
         .into_scan_builder()
@@ -287,7 +290,10 @@ async fn checkpoint_test(
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder(table_root).build(&engine).unwrap();
+    let snapshot = Snapshot::builder()
+        .with_table_root(table_root)
+        .build(&engine)
+        .unwrap();
     let version = snapshot.version();
     let scan = snapshot
         .into_scan_builder()

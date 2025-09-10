@@ -391,7 +391,11 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder(url).at_version(1).build(&engine).unwrap();
+        let snapshot = Snapshot::builder()
+            .with_table_root(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -409,7 +413,10 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder()
+            .with_table_root(url)
+            .build(&engine)
+            .unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -449,7 +456,8 @@ mod tests {
 
         let engine = SyncEngine::new();
         let old_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
+            Snapshot::builder()
+                .with_table_root(url.clone())
                 .at_version(1)
                 .build(&engine)
                 .unwrap(),
@@ -479,12 +487,14 @@ mod tests {
             let url = Url::parse("memory:///")?;
             let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
             let base_snapshot = Arc::new(
-                Snapshot::builder(url.clone())
+                Snapshot::builder()
+                    .with_table_root(url.clone())
                     .at_version(0)
                     .build(&engine)?,
             );
             let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-            let expected = Snapshot::builder(url.clone())
+            let expected = Snapshot::builder()
+                .with_table_root(url.clone())
                 .at_version(1)
                 .build(&engine)?;
             assert_eq!(snapshot, expected.into());
@@ -532,12 +542,14 @@ mod tests {
             Arc::new(TokioBackgroundExecutor::new()),
         );
         let base_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
+            Snapshot::builder()
+                .with_table_root(url.clone())
                 .at_version(0)
                 .build(&engine)?,
         );
         let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, None)?;
-        let expected = Snapshot::builder(url.clone())
+        let expected = Snapshot::builder()
+            .with_table_root(url.clone())
             .at_version(0)
             .build(&engine)?;
         assert_eq!(snapshot, expected.into());
@@ -607,7 +619,8 @@ mod tests {
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
         let base_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
+            Snapshot::builder()
+                .with_table_root(url.clone())
                 .at_version(0)
                 .build(&engine)?,
         );
@@ -718,14 +731,16 @@ mod tests {
 
         // base snapshot is at version 0
         let base_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
+            Snapshot::builder()
+                .with_table_root(url.clone())
                 .at_version(0)
                 .build(&engine)?,
         );
 
         // first test: no new crc
         let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::builder(url.clone())
+        let expected = Snapshot::builder()
+            .with_table_root(url.clone())
             .at_version(1)
             .build(&engine)?;
         assert_eq!(snapshot, expected.into());
@@ -752,7 +767,8 @@ mod tests {
         });
         store.put(&path, crc.to_string().into()).await?;
         let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::builder(url.clone())
+        let expected = Snapshot::builder()
+            .with_table_root(url.clone())
             .at_version(1)
             .build(&engine)?;
         assert_eq!(snapshot, expected.into());
@@ -865,7 +881,10 @@ mod tests {
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder(location).build(&engine).unwrap();
+        let snapshot = Snapshot::builder()
+            .with_table_root(location)
+            .build(&engine)
+            .unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
         assert_eq!(
@@ -972,7 +991,11 @@ mod tests {
         .join("\n");
         add_commit(store.as_ref(), 1, commit).await.unwrap();
 
-        let snapshot = Arc::new(Snapshot::builder(url.clone()).build(&engine)?);
+        let snapshot = Arc::new(
+            Snapshot::builder()
+                .with_table_root(url.clone())
+                .build(&engine)?,
+        );
 
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(

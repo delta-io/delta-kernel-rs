@@ -113,7 +113,10 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder()
+            .with_table_root(url)
+            .build(&engine)
+            .unwrap();
         let log_segment = snapshot.log_segment();
 
         (
@@ -163,7 +166,10 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder()
+            .with_table_root(url)
+            .build(&engine)
+            .unwrap();
         let log_segment = snapshot.log_segment();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
@@ -180,7 +186,10 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder()
+            .with_table_root(url)
+            .build(&engine)
+            .unwrap();
         let log_segment = snapshot.log_segment();
 
         // Test with no retention (should get all transactions)

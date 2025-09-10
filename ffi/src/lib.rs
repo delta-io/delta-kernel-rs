@@ -601,7 +601,7 @@ fn snapshot_impl(
     extern_engine: &dyn ExternEngine,
     version: Option<Version>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
-    let builder = Snapshot::builder(url?);
+    let builder = Snapshot::builder().with_table_root(url?);
     let builder = if let Some(v) = version {
         // TODO: should we include a `with_version_opt` method for the builder?
         builder.at_version(v)

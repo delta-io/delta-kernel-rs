@@ -16,7 +16,7 @@ use url::Url;
 /// let table_root = Url::parse("file:///path/to/table")?;
 ///
 /// // Build a snapshot
-/// let snapshot = Snapshot::builder(table_root.clone())
+/// let snapshot = Snapshot::builder().with_table_root(table_root.clone())
 ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
 ///     .build(engine)?;
 ///
@@ -161,10 +161,13 @@ mod tests {
         let engine = engine.as_ref();
         create_table(&store, &table_root)?;
 
-        let snapshot = SnapshotBuilder::new(table_root.clone()).build(engine)?;
+        let snapshot = SnapshotBuilder::default()
+            .with_table_root(table_root.clone())
+            .build(engine)?;
         assert_eq!(snapshot.version(), 1);
 
-        let snapshot = SnapshotBuilder::new(table_root.clone())
+        let snapshot = SnapshotBuilder::default()
+            .with_table_root(table_root.clone())
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);

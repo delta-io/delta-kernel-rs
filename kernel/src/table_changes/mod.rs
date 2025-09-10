@@ -151,7 +151,8 @@ impl TableChanges {
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
         let start_snapshot = Arc::new(
-            Snapshot::builder(table_root.as_url().clone())
+            Snapshot::builder()
+                .with_table_root(table_root.as_url().clone())
                 .at_version(start_version)
                 .build(engine)?,
         );
