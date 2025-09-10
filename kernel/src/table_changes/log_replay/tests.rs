@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 fn get_schema() -> StructType {
-    StructType::new([
+    StructType::new_unchecked([
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("value", DataType::STRING),
     ])
@@ -214,7 +214,7 @@ async fn incompatible_schemas_fail() {
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long`, `value: string` and `year: int` (nullable).
-    let schema = StructType::new([
+    let schema = StructType::new_unchecked([
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
         StructField::nullable("year", DataType::INTEGER),
@@ -223,7 +223,7 @@ async fn incompatible_schemas_fail() {
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields: `id: long` and `value: string`.
-    let schema = StructType::new([
+    let schema = StructType::new_unchecked([
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
@@ -233,11 +233,11 @@ async fn incompatible_schemas_fail() {
     //
     // The CDF schema has fields: `id: long` and `value: string`.
     // This commit has schema with fields: `id: int` and `value: string`.
-    let cdf_schema = StructType::new([
+    let cdf_schema = StructType::new_unchecked([
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
-    let commit_schema = StructType::new([
+    let commit_schema = StructType::new_unchecked([
         StructField::nullable("id", DataType::INTEGER),
         StructField::nullable("value", DataType::STRING),
     ]);
@@ -247,7 +247,7 @@ async fn incompatible_schemas_fail() {
     //
     // The CDF schema has fields: nullable `id`  and nullable `value`.
     // This commit has schema with fields: non-nullable `id` and nullable `value`.
-    let schema = StructType::new([
+    let schema = StructType::new_unchecked([
         StructField::not_null("id", DataType::LONG),
         StructField::nullable("value", DataType::STRING),
     ]);
@@ -255,7 +255,7 @@ async fn incompatible_schemas_fail() {
 
     // The CDF schema has fields: `id: int` and `value: string`.
     // This commit has schema with fields:`id: string` and `value: string`.
-    let schema = StructType::new([
+    let schema = StructType::new_unchecked([
         StructField::nullable("id", DataType::STRING),
         StructField::nullable("value", DataType::STRING),
     ]);

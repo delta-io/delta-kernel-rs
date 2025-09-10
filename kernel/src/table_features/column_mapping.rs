@@ -305,7 +305,7 @@ mod tests {
             create_annotations(outer_id, outer_name)
         );
         println!("{schema}");
-        StructType::new([serde_json::from_str(&schema).unwrap()])
+        StructType::new_unchecked([serde_json::from_str(&schema).unwrap()])
     }
 
     #[test]

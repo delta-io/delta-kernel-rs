@@ -229,10 +229,10 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::new(vec![
+        let schema = Arc::new(StructType::try_new(vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("string", DataType::STRING),
-        ]));
+        ])?);
 
         // Create a temporary local directory for use during this test
         let tmp_test_dir = tempdir()?;
