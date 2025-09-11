@@ -81,7 +81,7 @@ pub(crate) fn get_cdf_transform_expr(
                 ..
             } = field_transform
             {
-                Some(insert_after)
+                insert_after.clone()
             } else {
                 None
             }
@@ -112,11 +112,11 @@ pub(crate) fn get_cdf_transform_expr(
                 if let Some((_, field_value)) = field_values.remove(field_index) {
                     let field_value = Arc::new(field_value);
                     let actual_insert_after = if use_change_type_insert_after {
-                        change_type_insert_after.unwrap()
+                        change_type_insert_after.clone()
                     } else {
-                        insert_after
+                        insert_after.clone()
                     };
-                    transform.with_inserted_field(actual_insert_after.clone(), field_value)
+                    transform.with_inserted_field(actual_insert_after, field_value)
                 } else {
                     transform
                 }
@@ -130,14 +130,14 @@ pub(crate) fn get_cdf_transform_expr(
                     && !matches!(col_type, crate::scan::CdfCol::ChangeType(_));
 
                 let actual_insert_after = if should_use_change_type_insert_after {
-                    change_type_insert_after.unwrap()
+                    change_type_insert_after.clone()
                 } else {
-                    insert_after
+                    insert_after.clone()
                 };
 
                 if let Some((_, field_value)) = field_values.remove(field_index) {
                     let field_value = Arc::new(field_value);
-                    transform.with_inserted_field(actual_insert_after.clone(), field_value)
+                    transform.with_inserted_field(actual_insert_after, field_value)
                 } else {
                     transform
                 }

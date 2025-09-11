@@ -47,10 +47,10 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
-pub mod physical_to_logical;
+mod physical_to_logical;
 mod resolve_dvs;
 pub mod scan;
-pub mod scan_file;
+mod scan_file;
 
 static CHANGE_TYPE_COL_NAME: &str = "_change_type";
 static COMMIT_VERSION_COL_NAME: &str = "_commit_version";

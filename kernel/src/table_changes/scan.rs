@@ -308,7 +308,7 @@ fn read_scan_file(
 
     // Create transform expression using partition values and CDF metadata
     let physical_to_logical_expr = super::physical_to_logical::get_cdf_transform_expr(
-        &transform_spec,
+        transform_spec,
         &scan_file.partition_values,
         logical_schema.as_ref(),
         &scan_file,

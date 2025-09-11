@@ -346,7 +346,6 @@ pub fn get_transform_for_row(
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// [`TransformSpec`].
-#[derive(Debug, Clone)]
 pub(crate) enum FieldTransformSpec {
     /// Insert the given expression after the named input column (None = prepend instead)
     // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
