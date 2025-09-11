@@ -1349,7 +1349,7 @@ mod tests {
             r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
-        // Unkown writer features should cause an error
+        // Unknown writer features should cause an error
         let protocol = Protocol::try_new(
             3,
             7,

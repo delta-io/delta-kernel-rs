@@ -7,9 +7,8 @@ use url::Url;
 
 use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_txn_schema,
+    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
-use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::ParsedLogPath;
@@ -23,7 +22,7 @@ use crate::{
 };
 
 /// Type alias for an iterator of [`EngineData`] results.
-type EngineDataIterator<'a> =
+type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The minimal (i.e., mandatory) fields in an add action.
@@ -75,6 +74,7 @@ pub fn add_files_schema() -> &'static SchemaRef {
 }
 
 // NOTE: The following two methods are a workaround for the fact that we do not have a proper SchemaBuilder yet.
+// See https://github.com/delta-io/delta-kernel-rs/issues/1284
 /// Extend a schema with a statistics column and return a new SchemaRef.
 ///
 /// The stats column is of type string as required by the spec.
@@ -169,7 +169,7 @@ impl Transaction {
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
     /// will include the failed transaction in case of a conflict so the user can retry.
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
-        // Step 1: Check for duplicate app_ids and generate set transactions
+        // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
         // TODO(zach): we currently do this in two passes - can we do it in one and still keep refs
@@ -316,7 +316,7 @@ impl Transaction {
         add_files_metadata: I,
         input_schema: SchemaRef,
         output_schema: SchemaRef,
-    ) -> EngineDataIterator<'a>
+    ) -> EngineDataResultIterator<'a>
     where
         I: Iterator<Item = DeltaResult<T>> + Send + 'a,
         T: Deref<Target = dyn EngineData> + Send + 'a,
@@ -346,7 +346,7 @@ impl Transaction {
         &'a self,
         engine: &dyn Engine,
         commit_version: u64,
-    ) -> DeltaResult<EngineDataIterator<'a>> {
+    ) -> DeltaResult<EngineDataResultIterator<'a>> {
         // Return early if we have nothing to add
         if self.add_files_metadata.is_empty() {
             return Ok(Box::new(iter::empty()));
@@ -368,9 +368,9 @@ impl Transaction {
         }
 
         // Generate a domain metadata action based on the final high water mark
-        let domain_metadata = RowTrackingDomainMetadata::create_domain_metadata(
+        let domain_metadata = DomainMetadata::try_from(RowTrackingDomainMetadata::new(
             row_tracking_visitor.row_id_high_water_mark,
-        )?;
+        ))?;
         let domain_metadata_action =
             domain_metadata.into_engine_data(get_log_domain_metadata_schema().clone(), engine);
 

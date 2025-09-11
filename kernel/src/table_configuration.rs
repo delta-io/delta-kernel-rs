@@ -368,7 +368,6 @@ impl TableConfiguration {
     /// To support this feature the table must:
     /// - Have a min_writer_version of 7.
     /// - Have the [`WriterFeature::RowTracking`] writer feature.
-    #[allow(unused)]
     pub(crate) fn is_row_tracking_supported(&self) -> bool {
         self.protocol().min_writer_version() == 7
             && self
@@ -381,7 +380,6 @@ impl TableConfiguration {
     /// In order to enable row tracking the table must:
     /// - Support row tracking (see [`Self::is_row_tracking_supported`]).
     /// - Have the `delta.enableRowTracking` table property set to `true`.
-    #[allow(unused)]
     pub(crate) fn is_row_tracking_enabled(&self) -> bool {
         self.is_row_tracking_supported()
             && self.table_properties().enable_row_tracking.unwrap_or(false)
@@ -393,7 +391,6 @@ impl TableConfiguration {
     /// Note that:
     /// - Row tracking can be _supported_ and _suspended_ at the same time.
     /// - Row tracking cannot be _enabled_ while _suspended_.
-    #[allow(unused)]
     pub(crate) fn is_row_tracking_suspended(&self) -> bool {
         self.table_properties()
             .row_tracking_suspended
@@ -408,7 +405,6 @@ impl TableConfiguration {
     ///
     /// Note: We ignore [`is_row_tracking_enabled`] at this point because Kernel does not
     /// preserve row IDs and row commit versions yet.
-    #[allow(unused)]
     pub(crate) fn should_write_row_tracking(&self) -> bool {
         self.is_row_tracking_supported() && !self.is_row_tracking_suspended()
     }

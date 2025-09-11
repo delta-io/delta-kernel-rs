@@ -89,7 +89,6 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
-pub mod row_tracking;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -98,6 +97,8 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
+
+mod row_tracking;
 
 mod arrow_compat;
 #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
