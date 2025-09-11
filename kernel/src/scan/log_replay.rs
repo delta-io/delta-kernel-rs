@@ -152,7 +152,10 @@ impl AddRemoveDedupVisitor<'_> {
                 }
                 FieldTransformSpec::StaticInsert { .. }
                 | FieldTransformSpec::StaticReplace { .. }
-                | FieldTransformSpec::StaticDrop { .. } => None,
+                | FieldTransformSpec::StaticDrop { .. }
+                | FieldTransformSpec::CdfChangeType { .. }
+                | FieldTransformSpec::CdfCommitVersion { .. }
+                | FieldTransformSpec::CdfCommitTimestamp { .. } => None,
             })
             .try_collect()
     }
@@ -191,6 +194,10 @@ impl AddRemoveDedupVisitor<'_> {
 
                     let partition_value = Arc::new(partition_value.into());
                     transform.with_inserted_field(insert_after.clone(), partition_value)
+                }
+                CdfChangeType { .. } | CdfCommitVersion { .. } | CdfCommitTimestamp { .. } => {
+                    // CDF fields are handled elsewhere, not in regular scan transform
+                    transform
                 }
             }
         }

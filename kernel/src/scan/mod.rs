@@ -315,6 +315,19 @@ pub(crate) enum ColumnType {
     Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
+    // CDF-specific _change_type metadata column - may exist in physical data (CDC files) or be generated (Add/Remove files)
+    CdfChangeType {
+        physical_name: String,
+        logical_idx: usize,
+    },
+    // CDF-specific _commit_version metadata column - always generated (never in physical data)
+    CdfCommitVersion {
+        logical_idx: usize,
+    },
+    // CDF-specific _commit_timestamp metadata column - always generated (never in physical data)
+    CdfCommitTimestamp {
+        logical_idx: usize,
+    },
 }
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
@@ -333,6 +346,7 @@ pub fn get_transform_for_row(
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
 /// [`TransformSpec`].
+#[derive(Debug, Clone)]
 pub(crate) enum FieldTransformSpec {
     /// Insert the given expression after the named input column (None = prepend instead)
     // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
@@ -355,10 +369,28 @@ pub(crate) enum FieldTransformSpec {
     // they should not appear in the query's output.
     #[allow(unused)]
     StaticDrop { field_name: String },
-    /// Inserts a partition column after the named input column. The partition column is identified
-    /// by its field index in the logical table schema (the column is not present in the physical
-    /// read schema). Its value varies from file to file and is obtained from file metadata.
+    /// Inserts a partition column after the named input column.
+    /// Partition columns are identified by field index, with values from file metadata.
+    /// These columns are not present in physical data and must be generated per file.
     PartitionColumn {
+        field_index: usize,
+        insert_after: Option<String>,
+    },
+    /// Inserts a CDF-specific _change_type metadata column after the named input column.
+    /// May exist in physical data (CDC files) or be generated (Add/Remove files).
+    CdfChangeType {
+        field_index: usize,
+        insert_after: Option<String>,
+    },
+    /// Inserts a CDF-specific _commit_version metadata column after the named input column.
+    /// Always generated (never exists in physical data).
+    CdfCommitVersion {
+        field_index: usize,
+        insert_after: Option<String>,
+    },
+    /// Inserts a CDF-specific _commit_timestamp metadata column after the named input column.
+    /// Always generated (never exists in physical data).
+    CdfCommitTimestamp {
         field_index: usize,
         insert_after: Option<String>,
     },
@@ -477,7 +509,7 @@ impl Scan {
     /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
     /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
     /// from input to output unchanged and in the same relative order.
-    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
+    pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
         let mut transform_spec = TransformSpec::new();
         let mut last_physical_field: Option<&str> = None;
 
@@ -489,6 +521,28 @@ impl Scan {
                 }
                 ColumnType::Partition(logical_idx) => {
                     transform_spec.push(FieldTransformSpec::PartitionColumn {
+                        insert_after: last_physical_field.map(String::from),
+                        field_index: *logical_idx,
+                    });
+                }
+                ColumnType::CdfChangeType {
+                    physical_name,
+                    logical_idx,
+                } => {
+                    transform_spec.push(FieldTransformSpec::CdfChangeType {
+                        insert_after: last_physical_field.map(String::from),
+                        field_index: *logical_idx,
+                    });
+                    last_physical_field = Some(physical_name);
+                }
+                ColumnType::CdfCommitVersion { logical_idx } => {
+                    transform_spec.push(FieldTransformSpec::CdfCommitVersion {
+                        insert_after: last_physical_field.map(String::from),
+                        field_index: *logical_idx,
+                    });
+                }
+                ColumnType::CdfCommitTimestamp { logical_idx } => {
+                    transform_spec.push(FieldTransformSpec::CdfCommitTimestamp {
                         insert_after: last_physical_field.map(String::from),
                         field_index: *logical_idx,
                     });
@@ -1058,6 +1112,9 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
+    use crate::table_changes::physical_to_logical::{
+        build_transform_expr, parse_partition_value, parse_partition_values_to_expressions,
+    };
     use crate::Snapshot;
 
     use super::*;
@@ -1534,5 +1591,67 @@ mod tests {
             vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
         );
         Ok(())
+    }
+
+    use super::*;
+    use crate::expressions::{Expression as Expr, Scalar};
+    use crate::schema::{DataType, StructField, StructType};
+    use std::collections::HashMap;
+
+    fn create_test_schema() -> StructType {
+        StructType::new([
+            StructField::nullable("id", DataType::STRING),
+            StructField::not_null("age", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+        ])
+    }
+
+    #[test]
+    fn test_transform_utilities() {
+        let schema = create_test_schema();
+        let transform_spec = vec![
+            FieldTransformSpec::PartitionColumn {
+                field_index: 1, // age column
+                insert_after: Some("id".to_string()),
+            },
+            FieldTransformSpec::PartitionColumn {
+                field_index: 2, // name column
+                insert_after: Some("age".to_string()),
+            },
+        ];
+
+        // Test normal partition values
+        let mut partition_values = HashMap::new();
+        partition_values.insert("age".to_string(), "35".to_string());
+        partition_values.insert("name".to_string(), "Alice".to_string());
+        let result =
+            parse_partition_values_to_expressions(&schema, &transform_spec, &partition_values);
+        assert!(result.is_ok());
+        let values = result.unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[&1].1, Expr::literal(Scalar::Long(35)));
+        assert_eq!(values[&2].1, Expr::literal("Alice"));
+
+        // Test with null partition values (the critical bug fix)
+        let mut null_partition_values = HashMap::new();
+        null_partition_values.insert("age".to_string(), "45".to_string());
+        // Missing "name" partition - should create null
+        let result =
+            parse_partition_values_to_expressions(&schema, &transform_spec, &null_partition_values);
+        assert!(result.is_ok());
+        let values = result.unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[&1].1, Expr::literal(Scalar::Long(45)));
+        match &values[&2].1 {
+            Expr::Literal(Scalar::Null(DataType::Primitive(_))) => {} // Expected
+            _ => panic!("Expected null expression for missing partition"),
+        }
+
+        // Test build_transform_expr
+        let mut field_values = HashMap::new();
+        field_values.insert(1, ("age".to_string(), Expr::literal(Scalar::Long(25))));
+        let result = build_transform_expr(&transform_spec, field_values);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap().as_ref(), Expr::Transform(_)));
     }
 }
