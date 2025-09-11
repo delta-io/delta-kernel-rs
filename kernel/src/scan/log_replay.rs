@@ -2,8 +2,6 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
-
 use super::data_skipping::DataSkippingFilter;
 use super::{ScanMetadata, TransformSpec};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -122,44 +120,6 @@ impl AddRemoveDedupVisitor<'_> {
         }
     }
 
-    fn parse_partition_value(
-        &self,
-        field_idx: usize,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<(usize, (String, Scalar))> {
-        let field = self.logical_schema.fields.get_index(field_idx);
-        let Some((_, field)) = field else {
-            return Err(Error::InternalError(format!(
-                "out of bounds partition column field index {field_idx}"
-            )));
-        };
-        let name = field.physical_name();
-        let partition_value =
-            super::parse_partition_value(partition_values.get(name), field.data_type())?;
-        Ok((field_idx, (name.to_string(), partition_value)))
-    }
-
-    fn parse_partition_values(
-        &self,
-        transform_spec: &TransformSpec,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
-        transform_spec
-            .iter()
-            .filter_map(|field_transform| match field_transform {
-                FieldTransformSpec::PartitionColumn { field_index, .. } => {
-                    Some(self.parse_partition_value(*field_index, partition_values))
-                }
-                FieldTransformSpec::StaticInsert { .. }
-                | FieldTransformSpec::StaticReplace { .. }
-                | FieldTransformSpec::StaticDrop { .. }
-                | FieldTransformSpec::CdfChangeType { .. }
-                | FieldTransformSpec::CdfCommitVersion { .. }
-                | FieldTransformSpec::CdfCommitTimestamp { .. } => None,
-            })
-            .try_collect()
-    }
-
     /// Compute an expression that will transform from physical to logical for a given Add file action
     ///
     /// An empty `transform_spec` is valid and represents the case where only column mapping is needed
@@ -195,7 +155,7 @@ impl AddRemoveDedupVisitor<'_> {
                     let partition_value = Arc::new(partition_value.into());
                     transform.with_inserted_field(insert_after.clone(), partition_value)
                 }
-                CdfChangeType { .. } | CdfCommitVersion { .. } | CdfCommitTimestamp { .. } => {
+                Cdf { .. } => {
                     // CDF fields are handled elsewhere, not in regular scan transform
                     transform
                 }
@@ -251,7 +211,11 @@ impl AddRemoveDedupVisitor<'_> {
             Some(transform) if is_add => {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values = self.parse_partition_values(transform, &partition_values)?;
+                let partition_values = super::parse_partition_values_to_scalars(
+                    &self.logical_schema,
+                    transform,
+                    &partition_values,
+                )?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }

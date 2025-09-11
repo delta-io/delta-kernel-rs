@@ -4,10 +4,31 @@ use std::sync::Arc;
 use crate::expressions::{Expression, ExpressionRef};
 use crate::scan::FieldTransformSpec;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::{DeltaResult, Error};
+use crate::DeltaResult;
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, REMOVE_CHANGE_TYPE};
+
+/// Parse partition values for the given transform spec and convert them to expressions.
+/// This uses the core partition parsing function from the scan module and converts Scalars to Expressions.
+pub(crate) fn parse_partition_values_to_expressions(
+    logical_schema: &StructType,
+    transform_spec: &[FieldTransformSpec],
+    partition_values: &HashMap<String, String>,
+) -> DeltaResult<HashMap<usize, (String, Expression)>> {
+    // Use the core partition parsing function from scan module
+    let scalars = crate::scan::parse_partition_values_to_scalars(
+        logical_schema,
+        transform_spec,
+        partition_values,
+    )?;
+
+    // Convert Scalars to Expressions
+    Ok(scalars
+        .into_iter()
+        .map(|(field_idx, (name, scalar))| (field_idx, (name, scalar.into())))
+        .collect())
+}
 
 /// Gets the physical schema that will be used to read data in the `scan_file` path.
 pub(crate) fn scan_file_physical_schema(
@@ -31,130 +52,120 @@ pub(crate) fn get_cdf_transform_expr(
     logical_schema: &StructType,
     scan_file: &CdfScanFile,
 ) -> DeltaResult<ExpressionRef> {
-    // Create CDF constant value map
-    // Convert partition values to expressions using proper data type conversion
+    // Build all field values in one pass
     let mut field_values =
         parse_partition_values_to_expressions(logical_schema, transform_spec, partition_values)?;
 
-    // Add CDF constants directly to the indexed field values map
+    // Add CDF constants
     for field_transform in transform_spec {
-        match field_transform {
-            FieldTransformSpec::CdfChangeType { field_index, .. } => {
-                // For Add/Remove files, inject a constant _change_type value; for CDC, it's in the data.
-                if let Some((_, field)) = logical_schema.fields.get_index(*field_index) {
-                    let expr = match scan_file.scan_type {
-                        CdfScanFileType::Add => Some(Expression::literal(ADD_CHANGE_TYPE)),
-                        CdfScanFileType::Remove => Some(Expression::literal(REMOVE_CHANGE_TYPE)),
-                        CdfScanFileType::Cdc => None,
-                    };
-                    if let Some(expression) = expr {
-                        field_values.insert(*field_index, (field.name().to_string(), expression));
-                    }
+        if let FieldTransformSpec::Cdf {
+            col_type,
+            field_index,
+            ..
+        } = field_transform
+        {
+            if let Some((_, field)) = logical_schema.fields.get_index(*field_index) {
+                if let Some(expr) = create_cdf_expression(col_type, scan_file) {
+                    field_values.insert(*field_index, (field.name().to_string(), expr));
                 }
             }
-            FieldTransformSpec::CdfCommitVersion { field_index, .. } => {
-                if let Some((_, field)) = logical_schema.fields.get_index(*field_index) {
-                    field_values.insert(
-                        *field_index,
-                        (
-                            field.name().to_string(),
-                            Expression::literal(scan_file.commit_version),
-                        ),
-                    );
-                }
-            }
-            FieldTransformSpec::CdfCommitTimestamp { field_index, .. } => {
-                if let (Ok(timestamp), Some((_, field))) = (
-                    crate::expressions::Scalar::timestamp_from_millis(scan_file.commit_timestamp),
-                    logical_schema.fields.get_index(*field_index),
-                ) {
-                    field_values.insert(
-                        *field_index,
-                        (field.name().to_string(), Expression::literal(timestamp)),
-                    );
-                }
-            }
-            _ => continue,
         }
     }
 
-    // For Add/Remove files, adjust insert_after for fields that should come after _change_type
-    //
-    // Problem: When _change_type is generated (not physical), other generated columns like
-    // _commit_version and _commit_timestamp that reference _change_type in their insert_after
-    // will fail because _change_type doesn't exist in the physical schema yet.
-    //
-    // Solution: For Add/Remove files, we adjust the insert_after of these columns to match
-    // the insert_after of _change_type itself, so they all get inserted after the same
-    // physical column.
-    //
-    // Example:
-    // - Physical schema: [id, name]
-    // - _change_type wants to insert after "name"
-    // - _commit_version wants to insert after "_change_type" (fails!)
-    // - After adjustment: _commit_version also inserts after "name"
-    // - Result: [id, name, _change_type, _commit_version] ✅
-    let modified_transform_spec = if scan_file.scan_type != CdfScanFileType::Cdc {
-        adjust_insert_after_for_generated_change_type(transform_spec)
-    } else {
-        transform_spec.to_vec()
-    };
-
-    build_cdf_transform_expr(&modified_transform_spec, field_values)
-}
-
-/// Adjusts insert_after for fields that should come after _change_type when _change_type is generated
-///
-/// This function fixes the column ordering issue where generated columns try to insert after
-/// another generated column (_change_type) that doesn't exist in the physical schema yet.
-///
-/// It works by:
-/// 1. Finding the insert_after value of the _change_type column (which points to a physical column)
-/// 2. Updating all other generated columns (_commit_version, _commit_timestamp, partition columns)
-///    to use the same insert_after value as _change_type
-///
-/// This ensures all generated columns are inserted after the same physical column, maintaining
-/// the correct order: [physical_cols..., _change_type, _commit_version, _commit_timestamp, ...]
-fn adjust_insert_after_for_generated_change_type(
-    transform_spec: &[FieldTransformSpec],
-) -> Vec<FieldTransformSpec> {
-    // Find the insert_after value for _change_type
-    let change_type_insert_after = transform_spec
-        .iter()
-        .find_map(|field_transform| {
-            if let FieldTransformSpec::CdfChangeType { insert_after, .. } = field_transform {
+    // Find the _change_type insert_after for Add/Remove files
+    let change_type_insert_after = if scan_file.scan_type != CdfScanFileType::Cdc {
+        transform_spec.iter().find_map(|field_transform| {
+            if let FieldTransformSpec::Cdf {
+                col_type: crate::scan::CdfCol::ChangeType(_),
+                insert_after,
+                ..
+            } = field_transform
+            {
                 Some(insert_after)
             } else {
                 None
             }
         })
-        .expect("CdfChangeType should always be present in transform spec");
+    } else {
+        None
+    };
 
-    // Update fields that should come after _change_type to use the same insert_after
-    transform_spec
-        .iter()
-        .map(|field_transform| match field_transform {
-            FieldTransformSpec::CdfCommitVersion { field_index, .. } => {
-                FieldTransformSpec::CdfCommitVersion {
-                    field_index: *field_index,
-                    insert_after: change_type_insert_after.clone(),
+    // Build the transform expression
+    let mut transform = crate::expressions::Transform::new_top_level();
+    let use_change_type_insert_after =
+        scan_file.scan_type != CdfScanFileType::Cdc && change_type_insert_after.is_some();
+
+    for field_transform in transform_spec {
+        use FieldTransformSpec::*;
+        transform = match field_transform {
+            StaticInsert { insert_after, expr } => {
+                transform.with_inserted_field(insert_after.clone(), expr.clone())
+            }
+            StaticReplace { field_name, expr } => {
+                transform.with_replaced_field(field_name.clone(), expr.clone())
+            }
+            StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
+            PartitionColumn {
+                field_index,
+                insert_after,
+            } => {
+                if let Some((_, field_value)) = field_values.remove(field_index) {
+                    let field_value = Arc::new(field_value);
+                    let actual_insert_after = if use_change_type_insert_after {
+                        change_type_insert_after.unwrap()
+                    } else {
+                        insert_after
+                    };
+                    transform.with_inserted_field(actual_insert_after.clone(), field_value)
+                } else {
+                    transform
                 }
             }
-            FieldTransformSpec::CdfCommitTimestamp { field_index, .. } => {
-                FieldTransformSpec::CdfCommitTimestamp {
-                    field_index: *field_index,
-                    insert_after: change_type_insert_after.clone(),
+            Cdf {
+                col_type,
+                field_index,
+                insert_after,
+            } => {
+                let should_use_change_type_insert_after = use_change_type_insert_after
+                    && !matches!(col_type, crate::scan::CdfCol::ChangeType(_));
+
+                let actual_insert_after = if should_use_change_type_insert_after {
+                    change_type_insert_after.unwrap()
+                } else {
+                    insert_after
+                };
+
+                if let Some((_, field_value)) = field_values.remove(field_index) {
+                    let field_value = Arc::new(field_value);
+                    transform.with_inserted_field(actual_insert_after.clone(), field_value)
+                } else {
+                    transform
                 }
             }
-            FieldTransformSpec::PartitionColumn { field_index, .. } => {
-                FieldTransformSpec::PartitionColumn {
-                    field_index: *field_index,
-                    insert_after: change_type_insert_after.clone(),
-                }
-            }
-            _ => field_transform.clone(),
-        })
-        .collect()
+        }
+    }
+
+    Ok(Arc::new(Expression::Transform(transform)))
+}
+
+/// Creates the appropriate expression for a CDF column type
+fn create_cdf_expression(
+    col_type: &crate::scan::CdfCol,
+    scan_file: &CdfScanFile,
+) -> Option<Expression> {
+    match col_type {
+        crate::scan::CdfCol::ChangeType(_) => match scan_file.scan_type {
+            CdfScanFileType::Add => Some(Expression::literal(ADD_CHANGE_TYPE)),
+            CdfScanFileType::Remove => Some(Expression::literal(REMOVE_CHANGE_TYPE)),
+            CdfScanFileType::Cdc => None, // Comes from physical data
+        },
+        crate::scan::CdfCol::CommitVersion => Some(Expression::literal(scan_file.commit_version)),
+        crate::scan::CdfCol::CommitTimestamp => {
+            crate::expressions::Scalar::timestamp_from_millis(scan_file.commit_timestamp)
+                .ok()
+                .map(Expression::literal)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -201,8 +212,8 @@ mod tests {
         let all_fields = vec![
             ColumnType::Selected("id".to_string()),
             ColumnType::Partition(1), // age column
-            ColumnType::CdfChangeType {
-                physical_name: CHANGE_TYPE_COL_NAME.to_string(),
+            ColumnType::Cdf {
+                col_type: crate::scan::CdfCol::ChangeType(CHANGE_TYPE_COL_NAME.to_string()),
                 logical_idx: 2,
             },
         ];
@@ -238,8 +249,8 @@ mod tests {
         let add_scan_file = create_test_scan_file(CdfScanFileType::Add);
         let all_fields = vec![
             ColumnType::Selected("id".to_string()),
-            ColumnType::CdfChangeType {
-                physical_name: CHANGE_TYPE_COL_NAME.to_string(),
+            ColumnType::Cdf {
+                col_type: crate::scan::CdfCol::ChangeType(CHANGE_TYPE_COL_NAME.to_string()),
                 logical_idx: 2,
             },
         ];
@@ -283,115 +294,4 @@ mod tests {
             "Should generate _change_type for Remove file without it in physical schema"
         );
     }
-}
-
-/// Build a transform expression from field transform specifications and field values.
-pub(crate) fn build_cdf_transform_expr(
-    transform_spec: &[FieldTransformSpec],
-    mut field_values: HashMap<usize, (String, Expression)>,
-) -> DeltaResult<ExpressionRef> {
-    let mut transform = crate::expressions::Transform::new();
-
-    for field_transform in transform_spec {
-        use FieldTransformSpec::*;
-        transform = match field_transform {
-            StaticInsert { insert_after, expr } => {
-                transform.with_inserted_field(insert_after.clone(), expr.clone())
-            }
-            StaticReplace { field_name, expr } => {
-                transform.with_replaced_field(field_name.clone(), expr.clone())
-            }
-            StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
-            PartitionColumn {
-                field_index,
-                insert_after,
-            } => {
-                if let Some((_, field_value)) = field_values.remove(field_index) {
-                    let field_value = Arc::new(field_value);
-                    transform.with_inserted_field(insert_after.clone(), field_value)
-                } else {
-                    // Missing field value - skip this transform step.
-                    // This can happen when a metadata column isn't applicable to this file type.
-                    transform
-                }
-            }
-            CdfChangeType {
-                field_index,
-                insert_after,
-            } => {
-                if let Some((_, field_value)) = field_values.remove(field_index) {
-                    let field_value = Arc::new(field_value);
-                    transform.with_inserted_field(insert_after.clone(), field_value)
-                } else {
-                    // Missing field value - skip this transform step
-                    transform
-                }
-            }
-            CdfCommitVersion {
-                field_index,
-                insert_after,
-            } => {
-                // _commit_version is always generated (never in physical data)
-                if let Some((_, field_value)) = field_values.remove(field_index) {
-                    let field_value = Arc::new(field_value);
-                    transform.with_inserted_field(insert_after.clone(), field_value)
-                } else {
-                    // Missing field value - skip this transform step.
-                    transform
-                }
-            }
-            CdfCommitTimestamp {
-                field_index,
-                insert_after,
-            } => {
-                // _commit_timestamp is always generated (never in physical data)
-                if let Some((_, field_value)) = field_values.remove(field_index) {
-                    let field_value = Arc::new(field_value);
-                    transform.with_inserted_field(insert_after.clone(), field_value)
-                } else {
-                    // Missing field value - skip this transform step.
-                    transform
-                }
-            }
-        }
-    }
-
-    Ok(Arc::new(Expression::Transform(transform)))
-}
-
-/// Parse partition values for the given transform spec and convert them to expressions.
-fn parse_partition_values_to_expressions(
-    logical_schema: &StructType,
-    transform_spec: &[FieldTransformSpec],
-    partition_values: &HashMap<String, String>,
-) -> DeltaResult<HashMap<usize, (String, Expression)>> {
-    let mut result = HashMap::new();
-
-    // Process all partition columns in the transform spec
-    for field_transform in transform_spec {
-        let field_index = match field_transform {
-            FieldTransformSpec::PartitionColumn { field_index, .. } => *field_index,
-            _ => continue,
-        };
-
-        let field = logical_schema.fields.get_index(field_index);
-        let Some((_, field)) = field else {
-            return Err(Error::InternalError(format!(
-                "out of bounds field index {field_index}"
-            )));
-        };
-        let physical_name = field.physical_name();
-
-        // Convert string partition value to expression
-        let partition_value = crate::scan::parse_partition_value(
-            partition_values.get(physical_name),
-            field.data_type(),
-        )?;
-        result.insert(
-            field_index,
-            (field.name().to_string(), partition_value.into()),
-        );
-    }
-
-    Ok(result)
 }

@@ -127,8 +127,6 @@ fn evaluate_transform_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    println!("evaluate_transform_expression: {transform:#?}");
-
     let mut used_field_transforms = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.

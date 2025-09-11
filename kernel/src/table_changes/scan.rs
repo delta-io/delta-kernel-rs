@@ -133,36 +133,46 @@ impl TableChangesScanBuilder {
             .fields()
             .enumerate()
             .map(|(index, logical_field)| -> DeltaResult<_> {
-                if self
-                    .table_changes
-                    .partition_columns()
-                    .contains(logical_field.name())
-                {
-                    // Store the index into the schema for this field. When we turn it into an
-                    // expression in the inner loop, we will index into the schema and get the name and
-                    // data type, which we need to properly materialize the column.
-                    Ok(ColumnType::Partition(index))
-                } else if logical_field.name() == super::CHANGE_TYPE_COL_NAME {
-                    // CDF _change_type column - may exist in physical data (CDC files) or be generated (Add/Remove files)
-                    Ok(ColumnType::CdfChangeType {
-                        physical_name: logical_field.name().to_string(),
-                        logical_idx: index,
-                    })
-                } else if logical_field.name() == super::COMMIT_VERSION_COL_NAME {
-                    // CDF _commit_version column - always generated (never in physical data)
-                    Ok(ColumnType::CdfCommitVersion { logical_idx: index })
-                } else if logical_field.name() == super::COMMIT_TIMESTAMP_COL_NAME {
-                    // CDF _commit_timestamp column - always generated (never in physical data)
-                    Ok(ColumnType::CdfCommitTimestamp { logical_idx: index })
-                } else {
-                    // Add to read schema, store field so we can build a `Column` expression later
-                    // if needed (i.e. if we have partition columns)
-                    let physical_field = logical_field
-                        .make_physical(self.table_changes.end_snapshot.column_mapping_mode());
-                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                    let physical_name = physical_field.name.clone();
-                    read_fields.push(physical_field);
-                    Ok(ColumnType::Selected(physical_name))
+                match logical_field.name() {
+                    name if self.table_changes.partition_columns().contains(name) => {
+                        // Store the index into the schema for this field. When we turn it into an
+                        // expression in the inner loop, we will index into the schema and get the name and
+                        // data type, which we need to properly materialize the column.
+                        Ok(ColumnType::Partition(index))
+                    }
+                    name if name == super::CHANGE_TYPE_COL_NAME => {
+                        // CDF _change_type column - may exist in physical data (CDC files) or be generated (Add/Remove files)
+                        Ok(ColumnType::Cdf {
+                            col_type: crate::scan::CdfCol::ChangeType(
+                                logical_field.name().to_string(),
+                            ),
+                            logical_idx: index,
+                        })
+                    }
+                    name if name == super::COMMIT_VERSION_COL_NAME => {
+                        // CDF _commit_version column - always generated (never in physical data)
+                        Ok(ColumnType::Cdf {
+                            col_type: crate::scan::CdfCol::CommitVersion,
+                            logical_idx: index,
+                        })
+                    }
+                    name if name == super::COMMIT_TIMESTAMP_COL_NAME => {
+                        // CDF _commit_timestamp column - always generated (never in physical data)
+                        Ok(ColumnType::Cdf {
+                            col_type: crate::scan::CdfCol::CommitTimestamp,
+                            logical_idx: index,
+                        })
+                    }
+                    _ => {
+                        // Add to read schema, store field so we can build a `Column` expression later
+                        // if needed (i.e. if we have partition columns)
+                        let physical_field = logical_field
+                            .make_physical(self.table_changes.end_snapshot.column_mapping_mode());
+                        debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                        let physical_name = physical_field.name.clone();
+                        read_fields.push(physical_field);
+                        Ok(ColumnType::Selected(physical_name))
+                    }
                 }
             })
             .try_collect()?;
@@ -253,8 +263,6 @@ impl TableChangesScan {
 
         // TODO: Pipe through the transform spec from the scan metadata when scan metadata is wired up
         let transform_spec = Scan::get_transform_spec(&all_fields);
-
-        println!("transform_spec: {transform_spec:#?}");
 
         let result = scan_files
             .map(move |scan_file| {
@@ -398,12 +406,18 @@ mod tests {
             vec![
                 ColumnType::Selected("part".to_string()),
                 ColumnType::Selected("id".to_string()),
-                ColumnType::CdfChangeType {
-                    physical_name: "_change_type".to_string(),
+                ColumnType::Cdf {
+                    col_type: crate::scan::CdfCol::ChangeType("_change_type".to_string()),
                     logical_idx: 2,
                 },
-                ColumnType::CdfCommitVersion { logical_idx: 3 },
-                ColumnType::CdfCommitTimestamp { logical_idx: 4 },
+                ColumnType::Cdf {
+                    col_type: crate::scan::CdfCol::CommitVersion,
+                    logical_idx: 3,
+                },
+                ColumnType::Cdf {
+                    col_type: crate::scan::CdfCol::CommitTimestamp,
+                    logical_idx: 4,
+                },
             ]
             .into()
         );
@@ -434,7 +448,10 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::CdfCommitVersion { logical_idx: 1 },
+                ColumnType::Cdf {
+                    col_type: crate::scan::CdfCol::CommitVersion,
+                    logical_idx: 1,
+                },
             ]
             .into()
         );

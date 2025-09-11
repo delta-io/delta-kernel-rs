@@ -34,6 +34,14 @@ use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
+
+/// CDF column types for metadata columns
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CdfCol {
+    ChangeType(String),
+    CommitVersion,
+    CommitTimestamp,
+}
 pub mod log_replay;
 pub mod state;
 
@@ -315,17 +323,9 @@ pub(crate) enum ColumnType {
     Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
-    // CDF-specific _change_type metadata column - may exist in physical data (CDC files) or be generated (Add/Remove files)
-    CdfChangeType {
-        physical_name: String,
-        logical_idx: usize,
-    },
-    // CDF-specific _commit_version metadata column - always generated (never in physical data)
-    CdfCommitVersion {
-        logical_idx: usize,
-    },
-    // CDF-specific _commit_timestamp metadata column - always generated (never in physical data)
-    CdfCommitTimestamp {
+    // CDF-specific metadata column - may exist in physical data (CDC files) or be generated (Add/Remove files)
+    Cdf {
+        col_type: CdfCol,
         logical_idx: usize,
     },
 }
@@ -376,21 +376,10 @@ pub(crate) enum FieldTransformSpec {
         field_index: usize,
         insert_after: Option<String>,
     },
-    /// Inserts a CDF-specific _change_type metadata column after the named input column.
+    /// Inserts a CDF-specific metadata column after the named input column.
     /// May exist in physical data (CDC files) or be generated (Add/Remove files).
-    CdfChangeType {
-        field_index: usize,
-        insert_after: Option<String>,
-    },
-    /// Inserts a CDF-specific _commit_version metadata column after the named input column.
-    /// Always generated (never exists in physical data).
-    CdfCommitVersion {
-        field_index: usize,
-        insert_after: Option<String>,
-    },
-    /// Inserts a CDF-specific _commit_timestamp metadata column after the named input column.
-    /// Always generated (never exists in physical data).
-    CdfCommitTimestamp {
+    Cdf {
+        col_type: CdfCol,
         field_index: usize,
         insert_after: Option<String>,
     },
@@ -525,27 +514,18 @@ impl Scan {
                         field_index: *logical_idx,
                     });
                 }
-                ColumnType::CdfChangeType {
-                    physical_name,
+                ColumnType::Cdf {
+                    col_type,
                     logical_idx,
                 } => {
-                    transform_spec.push(FieldTransformSpec::CdfChangeType {
+                    transform_spec.push(FieldTransformSpec::Cdf {
+                        col_type: col_type.clone(),
                         insert_after: last_physical_field.map(String::from),
                         field_index: *logical_idx,
                     });
-                    last_physical_field = Some(physical_name);
-                }
-                ColumnType::CdfCommitVersion { logical_idx } => {
-                    transform_spec.push(FieldTransformSpec::CdfCommitVersion {
-                        insert_after: last_physical_field.map(String::from),
-                        field_index: *logical_idx,
-                    });
-                }
-                ColumnType::CdfCommitTimestamp { logical_idx } => {
-                    transform_spec.push(FieldTransformSpec::CdfCommitTimestamp {
-                        insert_after: last_physical_field.map(String::from),
-                        field_index: *logical_idx,
-                    });
+                    if let CdfCol::ChangeType(physical_name) = col_type {
+                        last_physical_field = Some(physical_name);
+                    }
                 }
             }
         }
@@ -904,6 +884,39 @@ pub(crate) fn parse_partition_value(
     }
 }
 
+/// Parse partition values for the given transform spec and convert them to scalars.
+/// This is the core partition parsing function used by both regular scans and CDF scans.
+pub(crate) fn parse_partition_values_to_scalars(
+    logical_schema: &StructType,
+    transform_spec: &[FieldTransformSpec],
+    partition_values: &HashMap<String, String>,
+) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
+    let mut result = HashMap::new();
+
+    // Process all partition columns in the transform spec
+    for field_transform in transform_spec {
+        let field_index = match field_transform {
+            FieldTransformSpec::PartitionColumn { field_index, .. } => *field_index,
+            _ => continue,
+        };
+
+        let field = logical_schema.fields.get_index(field_index);
+        let Some((_, field)) = field else {
+            return Err(Error::InternalError(format!(
+                "out of bounds field index {field_index}"
+            )));
+        };
+        let physical_name = field.physical_name();
+
+        // Convert string partition value to scalar
+        let partition_value =
+            parse_partition_value(partition_values.get(physical_name), field.data_type())?;
+        result.insert(field_index, (field.name().to_string(), partition_value));
+    }
+
+    Ok(result)
+}
+
 /// All the state needed to process a scan.
 struct StateInfo {
     /// All fields referenced by the query.
@@ -1112,9 +1125,6 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
-    use crate::table_changes::physical_to_logical::{
-        build_transform_expr, parse_partition_value, parse_partition_values_to_expressions,
-    };
     use crate::Snapshot;
 
     use super::*;
@@ -1591,67 +1601,5 @@ mod tests {
             vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
         );
         Ok(())
-    }
-
-    use super::*;
-    use crate::expressions::{Expression as Expr, Scalar};
-    use crate::schema::{DataType, StructField, StructType};
-    use std::collections::HashMap;
-
-    fn create_test_schema() -> StructType {
-        StructType::new([
-            StructField::nullable("id", DataType::STRING),
-            StructField::not_null("age", DataType::LONG),
-            StructField::nullable("name", DataType::STRING),
-        ])
-    }
-
-    #[test]
-    fn test_transform_utilities() {
-        let schema = create_test_schema();
-        let transform_spec = vec![
-            FieldTransformSpec::PartitionColumn {
-                field_index: 1, // age column
-                insert_after: Some("id".to_string()),
-            },
-            FieldTransformSpec::PartitionColumn {
-                field_index: 2, // name column
-                insert_after: Some("age".to_string()),
-            },
-        ];
-
-        // Test normal partition values
-        let mut partition_values = HashMap::new();
-        partition_values.insert("age".to_string(), "35".to_string());
-        partition_values.insert("name".to_string(), "Alice".to_string());
-        let result =
-            parse_partition_values_to_expressions(&schema, &transform_spec, &partition_values);
-        assert!(result.is_ok());
-        let values = result.unwrap();
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[&1].1, Expr::literal(Scalar::Long(35)));
-        assert_eq!(values[&2].1, Expr::literal("Alice"));
-
-        // Test with null partition values (the critical bug fix)
-        let mut null_partition_values = HashMap::new();
-        null_partition_values.insert("age".to_string(), "45".to_string());
-        // Missing "name" partition - should create null
-        let result =
-            parse_partition_values_to_expressions(&schema, &transform_spec, &null_partition_values);
-        assert!(result.is_ok());
-        let values = result.unwrap();
-        assert_eq!(values.len(), 2);
-        assert_eq!(values[&1].1, Expr::literal(Scalar::Long(45)));
-        match &values[&2].1 {
-            Expr::Literal(Scalar::Null(DataType::Primitive(_))) => {} // Expected
-            _ => panic!("Expected null expression for missing partition"),
-        }
-
-        // Test build_transform_expr
-        let mut field_values = HashMap::new();
-        field_values.insert(1, ("age".to_string(), Expr::literal(Scalar::Long(25))));
-        let result = build_transform_expr(&transform_spec, field_values);
-        assert!(result.is_ok());
-        assert!(matches!(result.unwrap().as_ref(), Expr::Transform(_)));
     }
 }
