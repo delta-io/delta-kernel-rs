@@ -401,7 +401,10 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder(url).at_version(1).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -419,7 +422,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -458,21 +461,24 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let old_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
-                .at_version(1)
-                .build(&engine)
-                .unwrap(),
-        );
+        let old_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
         // 1. new version < existing version: error
-        let snapshot_res = Snapshot::try_new_from(old_snapshot.clone(), &engine, Some(0));
+        let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
+            .at_version(0)
+            .build(&engine);
         assert!(matches!(
             snapshot_res,
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
         // 2. new version == existing version
-        let snapshot = Snapshot::try_new_from(old_snapshot.clone(), &engine, Some(1)).unwrap();
+        let snapshot = Snapshot::builder_from(old_snapshot.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
         let expected = old_snapshot.clone();
         assert_eq!(snapshot, expected);
 
@@ -488,16 +494,16 @@ mod tests {
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
             let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-            let base_snapshot = Arc::new(
-                Snapshot::builder(url.clone())
-                    .at_version(0)
-                    .build(&engine)?,
-            );
-            let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-            let expected = Snapshot::builder(url.clone())
+            let base_snapshot = Snapshot::builder_for(url.clone())
+                .at_version(0)
+                .build(&engine)?;
+            let snapshot = Snapshot::builder_from(base_snapshot.clone())
                 .at_version(1)
                 .build(&engine)?;
-            assert_eq!(snapshot, expected.into());
+            let expected = Snapshot::builder_for(url.clone())
+                .at_version(1)
+                .build(&engine)?;
+            assert_eq!(snapshot, expected);
             Ok(())
         }
 
@@ -541,19 +547,17 @@ mod tests {
             Arc::new(store.fork()),
             Arc::new(TokioBackgroundExecutor::new()),
         );
-        let base_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
-                .at_version(0)
-                .build(&engine)?,
-        );
-        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, None)?;
-        let expected = Snapshot::builder(url.clone())
+        let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
-        assert_eq!(snapshot, expected.into());
+        let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine)?;
+        let expected = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
+        assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
         assert!(matches!(
-            Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1)),
+            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is newer than the latest version 0"
         ));
 
@@ -616,13 +620,11 @@ mod tests {
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
-        let base_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
-                .at_version(0)
-                .build(&engine)?,
-        );
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
         assert!(matches!(
-            Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(2)),
+            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
             Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
@@ -727,18 +729,18 @@ mod tests {
         store.put(&path, crc.to_string().into()).await?;
 
         // base snapshot is at version 0
-        let base_snapshot = Arc::new(
-            Snapshot::builder(url.clone())
-                .at_version(0)
-                .build(&engine)?,
-        );
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
 
         // first test: no new crc
-        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::builder(url.clone())
+        let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
-        assert_eq!(snapshot, expected.into());
+        let expected = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+        assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
                 .log_segment
@@ -761,11 +763,13 @@ mod tests {
             "protocol": protocol(1, 2),
         });
         store.put(&path, crc.to_string().into()).await?;
-        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::builder(url.clone())
+        let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
             .build(&engine)?;
-        assert_eq!(snapshot, expected.into());
+        let expected = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+        assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
                 .log_segment
@@ -875,7 +879,7 @@ mod tests {
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder(location).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(location).build(&engine).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
         assert_eq!(
@@ -982,7 +986,7 @@ mod tests {
         .join("\n");
         add_commit(store.as_ref(), 1, commit).await.unwrap();
 
-        let snapshot = Arc::new(Snapshot::builder(url.clone()).build(&engine)?);
+        let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(

@@ -18,7 +18,7 @@ use url::Url;
 /// let table_root = Url::parse("file:///path/to/table")?;
 ///
 /// // Build a snapshot
-/// let snapshot = Snapshot::builder(table_root.clone())
+/// let snapshot = Snapshot::builder_for(table_root.clone())
 ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
 ///     .build(engine)?;
 ///
