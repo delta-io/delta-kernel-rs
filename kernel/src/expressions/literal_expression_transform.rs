@@ -149,15 +149,16 @@ impl<'a, I: Iterator<Item = &'a Scalar>> delta_kernel::schema::visitor::SchemaVi
 }
 
 struct StructFieldIterator {
-    stack: Vec<StructType>,
-    pos: Vec<usize>,
+    // Stack of (struct_type, current_position, deferred_struct_field)
+    // deferred_struct_field is the struct field that contains this struct_type
+    // and should be returned after all children are processed
+    stack: Vec<(StructType, usize, Option<StructField>)>,
 }
 
 impl StructFieldIterator {
     fn new(root: StructType) -> Self {
         StructFieldIterator {
-            stack: vec![root],
-            pos: vec![0],
+            stack: vec![(root, 0, None)],
         }
     }
 }
@@ -166,28 +167,34 @@ impl Iterator for StructFieldIterator {
     type Item = StructField;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(level) = self.stack.last().cloned() {
-            let current_position = *self.pos.last().unwrap();
+        while !self.stack.is_empty() {
+            let (struct_type, current_pos, deferred_field) = self.stack.last().unwrap().clone();
 
-            if current_position < level.fields_len() {
-                let field = level.by_index(current_position).clone();
+            if current_pos < struct_type.fields_len() {
+                // Get the current field and increment position
+                let field = struct_type.by_index(current_pos).clone();
+                self.stack.last_mut().unwrap().1 += 1;
 
-                // Increment position for next iteration
-                *self.pos.last_mut().unwrap() += 1;
-
-                // If this field is a nested struct, push it onto the stack
+                // Check if this field is a nested struct
                 if let DataType::Struct(nested_struct) = &field.data_type {
-                    self.stack.push(nested_struct.as_ref().clone());
-                    self.pos.push(0);
+                    // Push the nested struct onto the stack with the current field as deferred
+                    self.stack.push((nested_struct.as_ref().clone(), 0, Some(field)));
+                    // Continue to process the nested struct first
+                } else {
+                    // Non-struct field: return it immediately
+                    return Some(field);
                 }
-
-                return Some(field);
             } else {
-                // Current level exhausted, pop it
+                // Current level exhausted - pop it and return any deferred field
                 self.stack.pop();
-                self.pos.pop();
+                if let Some(deferred) = deferred_field {
+                    // This was a struct field that we deferred - return it now
+                    return Some(deferred);
+                }
+                // No deferred field, continue with parent level
             }
         }
+
         None
     }
 }
@@ -589,16 +596,16 @@ mod tests {
             let iterator = StructFieldIterator::new(schema);
             let fields: Vec<StructField> = iterator.collect();
 
-            // Should get: outer1, nested, inner1, inner2, outer2
+            // Post-order traversal: outer1, inner1, inner2, nested, outer2
             assert_eq!(fields.len(), 5);
             assert_eq!(fields[0].name(), "outer1");
             assert_eq!(fields[0].data_type(), &DeltaDataTypes::INTEGER);
-            assert_eq!(fields[1].name(), "nested");
-            assert!(matches!(fields[1].data_type(), DataType::Struct(_)));
-            assert_eq!(fields[2].name(), "inner1");
-            assert_eq!(fields[2].data_type(), &DeltaDataTypes::INTEGER);
-            assert_eq!(fields[3].name(), "inner2");
-            assert_eq!(fields[3].data_type(), &DeltaDataTypes::STRING);
+            assert_eq!(fields[1].name(), "inner1");
+            assert_eq!(fields[1].data_type(), &DeltaDataTypes::INTEGER);
+            assert_eq!(fields[2].name(), "inner2");
+            assert_eq!(fields[2].data_type(), &DeltaDataTypes::STRING);
+            assert_eq!(fields[3].name(), "nested");
+            assert!(matches!(fields[3].data_type(), DataType::Struct(_)));
             assert_eq!(fields[4].name(), "outer2");
             assert_eq!(fields[4].data_type(), &DeltaDataTypes::STRING);
         }
@@ -623,13 +630,13 @@ mod tests {
             let iterator = StructFieldIterator::new(schema);
             let fields: Vec<StructField> = iterator.collect();
 
-            // Should get: root_field, level1, level1_field, level2, level2_field
+            // Post-order traversal: root_field, level1_field, level2_field, level2, level1
             assert_eq!(fields.len(), 5);
             assert_eq!(fields[0].name(), "root_field");
-            assert_eq!(fields[1].name(), "level1");
-            assert_eq!(fields[2].name(), "level1_field");
+            assert_eq!(fields[1].name(), "level1_field");
+            assert_eq!(fields[2].name(), "level2_field");
             assert_eq!(fields[3].name(), "level2");
-            assert_eq!(fields[4].name(), "level2_field");
+            assert_eq!(fields[4].name(), "level1");
         }
 
         #[test]
@@ -702,7 +709,7 @@ mod tests {
             let iterator = StructFieldIterator::new(schema);
             let fields: Vec<StructField> = iterator.collect();
 
-            // Should get: root_string, root_map, nested_struct, inner_primitive, inner_array, root_array, root_int
+            // Post-order traversal: root_string, root_map, inner_primitive, inner_array, nested_struct, root_array, root_int
             assert_eq!(fields.len(), 7);
 
             let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
@@ -711,9 +718,9 @@ mod tests {
                 vec![
                     "root_string",
                     "root_map",
-                    "nested_struct",
                     "inner_primitive",
-                    "inner_array",
+                    "inner_array", 
+                    "nested_struct",
                     "root_array",
                     "root_int"
                 ]
@@ -722,9 +729,9 @@ mod tests {
             // Verify data types
             assert_eq!(fields[0].data_type(), &DeltaDataTypes::STRING);
             assert!(matches!(fields[1].data_type(), DataType::Map(_)));
-            assert!(matches!(fields[2].data_type(), DataType::Struct(_)));
-            assert_eq!(fields[3].data_type(), &DeltaDataTypes::DOUBLE);
-            assert!(matches!(fields[4].data_type(), DataType::Array(_)));
+            assert_eq!(fields[2].data_type(), &DeltaDataTypes::DOUBLE);
+            assert!(matches!(fields[3].data_type(), DataType::Array(_)));
+            assert!(matches!(fields[4].data_type(), DataType::Struct(_)));
             assert!(matches!(fields[5].data_type(), DataType::Array(_)));
             assert_eq!(fields[6].data_type(), &DeltaDataTypes::INTEGER);
         }
@@ -778,7 +785,7 @@ mod tests {
             let iterator = StructFieldIterator::new(schema);
             let fields: Vec<StructField> = iterator.collect();
 
-            // Should get: root_field, first_nested, struct1_field, second_nested, struct2_field1, struct2_field2, final_field
+            // Post-order traversal: root_field, struct1_field, first_nested, struct2_field1, struct2_field2, second_nested, final_field
             assert_eq!(fields.len(), 7);
 
             let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
@@ -786,11 +793,11 @@ mod tests {
                 field_names,
                 vec![
                     "root_field",
-                    "first_nested",
                     "struct1_field",
-                    "second_nested",
+                    "first_nested",
                     "struct2_field1",
                     "struct2_field2",
+                    "second_nested",
                     "final_field"
                 ]
             );
