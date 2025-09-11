@@ -25,6 +25,8 @@ pub use builder::SnapshotBuilder;
 use tracing::debug;
 use url::Url;
 
+pub type SnapshotRef = Arc<Snapshot>;
+
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
@@ -53,22 +55,15 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    /// Create a new [`SnapshotBuilder`] to build a [`Snapshot`] for a given table root.
-    pub fn builder(table_root: Url) -> SnapshotBuilder {
+    /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
+    /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
+    /// using
+    pub fn builder_for(table_root: Url) -> SnapshotBuilder {
         SnapshotBuilder::new(table_root)
     }
 
-    #[internal_api]
-    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
-        Self {
-            log_segment,
-            table_configuration,
-        }
-    }
-
-    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
-    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
-    /// snapshot to a later version.
+    /// Create a new [`SnapshotBuilder`] to incrementally update a [`Snapshot`] to a more recent
+    /// version.
     ///
     /// We implement a simple heuristic:
     /// 1. if the new version == existing version, just return the existing snapshot
@@ -86,7 +81,22 @@ impl Snapshot {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
     ///   version of the table.
-    pub fn try_new_from(
+    pub fn builder_from(existing_snapshot: Arc<Snapshot>) -> SnapshotBuilder {
+        SnapshotBuilder::new_from(existing_snapshot)
+    }
+
+    #[internal_api]
+    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        Self {
+            log_segment,
+            table_configuration,
+        }
+    }
+
+    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
+    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
+    /// snapshot to a later version.
+    fn try_new_from(
         existing_snapshot: Arc<Snapshot>,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
