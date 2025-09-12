@@ -57,7 +57,7 @@ async fn write_data_to_table(
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
     let write_context = Arc::new(txn.get_write_context());
@@ -66,7 +66,7 @@ async fn write_data_to_table(
         let write_context = write_context.clone();
         tokio::task::spawn(async move {
             engine
-                .write_parquet(&data, write_context.as_ref(), HashMap::new(), true)
+                .write_parquet(&data, write_context.as_ref(), HashMap::new())
                 .await
         })
     });
@@ -639,8 +639,14 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
-    let mut txn1 = snapshot1.transaction()?.with_engine_info("transaction 1");
-    let mut txn2 = snapshot2.transaction()?.with_engine_info("transaction 2");
+    let mut txn1 = snapshot1
+        .transaction()?
+        .with_engine_info("transaction 1")
+        .with_data_change(true);
+    let mut txn2 = snapshot2
+        .transaction()?
+        .with_engine_info("transaction 2")
+        .with_data_change(true);
 
     // Prepare data for both transactions
     let data1 = RecordBatch::try_new(
@@ -661,7 +667,6 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
             &ArrowEngineData::new(data1),
             write_context1.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
 
@@ -670,7 +675,6 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
             &ArrowEngineData::new(data2),
             write_context2.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
 

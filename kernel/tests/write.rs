@@ -148,7 +148,7 @@ async fn write_data_and_check_result_and_stats(
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -171,7 +171,6 @@ async fn write_data_and_check_result_and_stats(
                     data.as_ref().unwrap(),
                     write_context.as_ref(),
                     HashMap::new(),
-                    true,
                 )
                 .await
         })
@@ -435,7 +434,10 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let mut txn = snapshot.transaction()?.with_engine_info("default engine");
+        let mut txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine")
+            .with_data_change(true);
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -463,7 +465,6 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                             data.as_ref().unwrap(),
                             write_context.as_ref(),
                             HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
-                            true,
                         )
                         .await
                 })
@@ -602,7 +603,6 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
                         data.as_ref().unwrap(),
                         write_context.as_ref(),
                         HashMap::new(),
-                        true,
                     )
                     .await
             })
@@ -780,7 +780,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?.with_engine_info("default engine");
+    let mut txn = snapshot
+        .transaction()?
+        .with_engine_info("default engine")
+        .with_data_change(true);
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -807,7 +810,6 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
             &ArrowEngineData::new(data.clone()),
             write_context.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
 
@@ -915,7 +917,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1014,7 +1016,6 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
-            true,
         )
         .await?;
 
@@ -1125,7 +1126,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1186,7 +1187,6 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
-            true,
         )
         .await?;
 

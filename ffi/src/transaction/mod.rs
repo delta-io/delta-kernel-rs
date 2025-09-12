@@ -94,6 +94,23 @@ pub unsafe extern "C" fn add_files(
     txn.add_files(write_metadata);
 }
 
+///
+/// Mark the transaction as having data changes or not (these are recorded at the file level).
+///
+/// When set here writers should not provide a data_change column in EngineData.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION and commit info
+#[no_mangle]
+pub unsafe extern "C" fn with_data_change(
+    txn: Handle<ExclusiveTransaction>,
+    data_change: bool,
+) -> Handle<ExclusiveTransaction> {
+    let txn = unsafe { txn.into_inner() };
+    Box::new(txn.with_data_change(data_change)).into()
+}
+
 /// Attempt to commit a transaction to the table. Returns version number if successful.
 /// Returns error if the commit fails.
 ///
@@ -136,11 +153,11 @@ mod tests {
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-    use delta_kernel::transaction::add_files_schema;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
@@ -194,25 +211,25 @@ mod tests {
     fn create_file_metadata(
         path: &str,
         num_rows: i64,
+        metadata_schema: ArrowSchema,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        let schema: ArrowSchema = add_files_schema().as_ref().try_into_arrow()?;
-
         let current_time: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": {{"numRecords": {num_rows}}}}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "stats": {{"numRecords": {num_rows}}}}}"#,
         );
 
-        create_arrow_ffi_from_json(schema, file_metadata.as_str())
+        create_arrow_ffi_from_json(metadata_schema, file_metadata.as_str())
     }
 
     fn write_parquet_file(
         delta_path: &str,
         file_path: &str,
         batch: &RecordBatch,
+        metadata_schema: ArrowSchema,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
         // WriterProperties can be used to set Parquet file options
         let props = WriterProperties::builder().build();
@@ -226,7 +243,7 @@ mod tests {
         // writer must be closed to write footer
         let res = writer.close().unwrap();
 
-        create_file_metadata(file_path, res.num_rows)
+        create_file_metadata(file_path, res.num_rows, metadata_schema)
     }
 
     #[tokio::test]
@@ -257,9 +274,10 @@ mod tests {
             let engine = get_default_engine(table_path_str);
 
             // Start the transaction
-            let txn = ok_or_panic(unsafe {
+            let mut txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
+            unsafe { txn = with_data_change(txn.shallow_copy(), true) };
 
             // Add engine info
             let engine_info = "default_engine";
@@ -314,7 +332,19 @@ mod tests {
             ])
             .unwrap();
 
-            let file_info = write_parquet_file(table_path_str, "my_file.parquet", &batch)?;
+            let file_info = write_parquet_file(
+                table_path_str,
+                "my_file.parquet",
+                &batch,
+                unsafe {
+                    txn_with_engine_info
+                        .shallow_copy()
+                        .as_ref()
+                        .add_files_schema()
+                }
+                .as_ref()
+                .try_into_arrow()?,
+            )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(
