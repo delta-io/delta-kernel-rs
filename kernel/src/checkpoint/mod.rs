@@ -83,8 +83,8 @@
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
+use crate::action_reconciliation::RetentionCalculator;
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
     METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME, SIDECAR_NAME,
@@ -96,7 +96,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::Snapshot;
-use crate::utils::{calculate_transaction_expiration_timestamp, current_time_duration};
+use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
@@ -105,13 +105,6 @@ use url::Url;
 mod log_replay;
 #[cfg(test)]
 mod tests;
-
-const SECONDS_PER_MINUTE: u64 = 60;
-const MINUTES_PER_HOUR: u64 = 60;
-const HOURS_PER_DAY: u64 = 24;
-/// The default retention period for deleted files in seconds.
-/// This is set to 7 days, which is the default in delta-spark.
-const DEFAULT_RETENTION_SECS: u64 = 7 * HOURS_PER_DAY * MINUTES_PER_HOUR * SECONDS_PER_MINUTE;
 
 /// Schema of the `_last_checkpoint` file
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
@@ -207,6 +200,12 @@ pub struct CheckpointWriter {
     version: i64,
 }
 
+impl RetentionCalculator for CheckpointWriter {
+    fn table_properties(&self) -> &TableProperties {
+        self.snapshot.table_properties()
+    }
+}
+
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: Arc<Snapshot>) -> DeltaResult<Self> {
@@ -219,10 +218,6 @@ impl CheckpointWriter {
         })?;
 
         Ok(Self { snapshot, version })
-    }
-
-    fn get_transaction_expiration_timestamp(&self) -> DeltaResult<Option<i64>> {
-        calculate_transaction_expiration_timestamp(self.snapshot.table_properties())
     }
     /// Returns the URL where the checkpoint file should be written.
     ///
@@ -382,58 +377,6 @@ impl CheckpointWriter {
             add_actions_count: 0,
         })
     }
-
-    /// This function determines the minimum timestamp before which deleted files
-    /// are eligible for permanent removal during VACUUM operations. It is used
-    /// during checkpointing to decide whether to include `remove` actions.
-    ///
-    /// If a deleted file's timestamp is older than this threshold (based on the
-    /// table's `deleted_file_retention_duration`), the corresponding `remove` action
-    /// is included in the checkpoint, allowing VACUUM operations to later identify
-    /// and clean up those files.
-    ///
-    /// # Returns:
-    /// The cutoff timestamp in milliseconds since epoch, matching the remove action's
-    /// `deletion_timestamp` field format for comparison.
-    ///
-    /// # Note: The default retention period is 7 days, matching delta-spark's behavior.
-    fn deleted_file_retention_timestamp(&self) -> DeltaResult<i64> {
-        let retention_duration = self
-            .snapshot
-            .table_properties()
-            .deleted_file_retention_duration;
-
-        deleted_file_retention_timestamp_with_time(retention_duration, current_time_duration()?)
-    }
-}
-
-/// Calculates the timestamp threshold for deleted file retention based on the provided duration.
-/// This is factored out to allow testing with an injectable time and duration parameter.
-///
-/// # Parameters
-/// - `retention_duration`: The duration to retain deleted files. The table property
-///   `deleted_file_retention_duration` is passed here. If `None`, defaults to 7 days.
-/// - `now_duration`: The current time as a [`Duration`]. This allows for testing with
-///   a specific time instead of using `SystemTime::now()`.
-///
-/// # Returns: The timestamp in milliseconds since epoch
-fn deleted_file_retention_timestamp_with_time(
-    retention_duration: Option<Duration>,
-    now_duration: Duration,
-) -> DeltaResult<i64> {
-    // Use provided retention duration or default (7 days)
-    let retention_duration =
-        retention_duration.unwrap_or_else(|| Duration::from_secs(DEFAULT_RETENTION_SECS));
-
-    // Convert to milliseconds for remove action deletion_timestamp comparison
-    let now_ms = i64::try_from(now_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Current timestamp exceeds i64 millisecond range"))?;
-
-    let retention_ms = i64::try_from(retention_duration.as_millis())
-        .map_err(|_| Error::checkpoint_write("Retention duration exceeds i64 millisecond range"))?;
-
-    // Simple subtraction - will produce negative values if retention > now
-    Ok(now_ms - retention_ms)
 }
 
 /// Creates the data for the _last_checkpoint file containing checkpoint
