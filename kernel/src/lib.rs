@@ -99,6 +99,8 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 
+mod row_tracking;
+
 mod arrow_compat;
 #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
 pub use arrow_compat::*;

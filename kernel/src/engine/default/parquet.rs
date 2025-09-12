@@ -5,7 +5,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::datatypes::{DataType, Field};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -24,6 +25,7 @@ use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requeste
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
+use crate::transaction::add_files_schema;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -55,7 +57,10 @@ impl DataFileMetadata {
         }
     }
 
-    // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
+    /// Convert DataFileMetadata into a record batch which matches the schema returned by
+    /// [`add_files_schema`].
+    ///
+    /// [`add_files_schema`]: crate::transaction::add_files_schema
     fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
@@ -70,8 +75,6 @@ impl DataFileMetadata {
                 },
             num_records,
         } = self;
-        let add_files_schema = crate::transaction::add_files_schema();
-
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
         let key_builder = StringBuilder::new();
@@ -95,17 +98,22 @@ impl DataFileMetadata {
         let size = Arc::new(Int64Array::from(vec![size]));
         let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let num_records = Arc::new(Int64Array::from(vec![*num_records as i64]));
+        let stats = Arc::new(StructArray::try_new_with_length(
+            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
+            None,
+            1,
+        )?);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(add_files_schema.as_ref().try_into_arrow()?),
+            Arc::new(add_files_schema().as_ref().try_into_arrow()?),
             vec![
                 path,
                 partitions,
                 size,
                 modification_time,
                 data_change,
-                num_records,
+                stats,
             ],
         )?)))
     }
@@ -502,6 +510,14 @@ mod tests {
         partition_values_builder.values().append_value("a");
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
+        let stats_struct = StructArray::try_new_with_length(
+            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![num_records as i64]))],
+            None,
+            1,
+        )
+        .unwrap();
+
         let expected = RecordBatch::try_new(
             schema,
             vec![
@@ -510,7 +526,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
                 Arc::new(BooleanArray::from(vec![data_change])),
-                Arc::new(Int64Array::from(vec![num_records as i64])),
+                Arc::new(stats_struct),
             ],
         )
         .unwrap();

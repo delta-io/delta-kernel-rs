@@ -179,6 +179,13 @@ impl TableConfiguration {
             ));
         }
 
+        // Fail if row tracking is both enabled and suspended
+        if self.is_row_tracking_enabled() && self.is_row_tracking_suspended() {
+            return Err(Error::unsupported(
+                "Row tracking cannot be both enabled and suspended",
+            ));
+        }
+
         Ok(())
     }
 
@@ -341,6 +348,65 @@ impl TableConfiguration {
                 "Enablement version and timestamp are not present.",
             )),
         }
+    }
+
+    /// Returns `true` if the table supports writing domain metadata.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7.
+    /// - Have the [`WriterFeature::DomainMetadata`] writer feature.
+    #[allow(unused)]
+    pub(crate) fn is_domain_metadata_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::DomainMetadata)
+    }
+
+    /// Returns `true` if the table supports writing row tracking metadata.
+    ///
+    /// To support this feature the table must:
+    /// - Have a min_writer_version of 7.
+    /// - Have the [`WriterFeature::RowTracking`] writer feature.
+    pub(crate) fn is_row_tracking_supported(&self) -> bool {
+        self.protocol().min_writer_version() == 7
+            && self
+                .protocol()
+                .has_writer_feature(&WriterFeature::RowTracking)
+    }
+
+    /// Returns `true` if row tracking is enabled for this table.
+    ///
+    /// In order to enable row tracking the table must:
+    /// - Support row tracking (see [`Self::is_row_tracking_supported`]).
+    /// - Have the `delta.enableRowTracking` table property set to `true`.
+    pub(crate) fn is_row_tracking_enabled(&self) -> bool {
+        self.is_row_tracking_supported()
+            && self.table_properties().enable_row_tracking.unwrap_or(false)
+    }
+
+    /// Returns `true` if row tracking is suspended for this table.
+    ///
+    /// Row tracking is suspended when the `delta.rowTrackingSuspended` table property is set to `true`.
+    /// Note that:
+    /// - Row tracking can be _supported_ and _suspended_ at the same time.
+    /// - Row tracking cannot be _enabled_ while _suspended_.
+    pub(crate) fn is_row_tracking_suspended(&self) -> bool {
+        self.table_properties()
+            .row_tracking_suspended
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` if row tracking information should be written for this table.
+    ///
+    /// Row tracking information should be written when:
+    /// - Row tracking is supported
+    /// - Row tracking is not suspended
+    ///
+    /// Note: We ignore [`is_row_tracking_enabled`] at this point because Kernel does not
+    /// preserve row IDs and row commit versions yet.
+    pub(crate) fn should_write_row_tracking(&self) -> bool {
+        self.is_row_tracking_supported() && !self.is_row_tracking_suspended()
     }
 }
 
