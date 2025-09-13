@@ -20,7 +20,7 @@
 //!
 //! - [`ActionReconciliationVisitor`]: Implements [`RowVisitor`] to examine each action in a batch and
 //!   determine if it should be included. It maintains state for deduplication across multiple actions
-//! in a batch and efficiently handles all filtering rules.
+//!   in a batch and efficiently handles all filtering rules.
 //!
 //! - [`ActionReconciliationProcessor`]: Implements the [`LogReplayProcessor`] trait and orchestrates
 //!   the overall process. For each batch of log actions, it:
