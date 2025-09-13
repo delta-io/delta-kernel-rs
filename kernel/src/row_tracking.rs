@@ -70,7 +70,8 @@ impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
 
 /// A row visitor that iterates over preliminary [`Add`] actions as returned by the engine and
 /// computes a base row ID for each action.
-/// It expects to visit engine data conforming to the schema returned by a passed in schema.
+/// It expects to visit engine data with a nested field `stats.numRecords which is 
+/// part of a Delta add action.
 ///
 /// This visitor is only required for the row tracking write path. The read path will be completely
 /// implemented via expressions.

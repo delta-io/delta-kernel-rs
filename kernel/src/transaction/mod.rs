@@ -380,10 +380,10 @@ impl Transaction {
                 "stats",
                 Expression::unary(ToJson, Expression::column(["stats"])).into(),
             );
-            if self.data_change.is_some() {
+            if let Some(data_change) = self.data_change {
                 transform = transform.with_inserted_field(
                     Some("modificationTime"),
-                    Expression::literal(self.data_change.unwrap()).into(),
+                    Expression::literal(data_change).into(),
                 );
             }
             let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
