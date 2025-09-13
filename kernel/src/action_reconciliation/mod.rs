@@ -4,6 +4,12 @@
 //! Please see the [Delta Lake Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#action-reconciliation)
 //! for more details about action reconciliation.
 //!
+//! ## Log Replay for Action Reconciliation
+//!
+//! The [`log_replay`] module provides specialized log replay functionality for action reconciliation,
+//! including checkpoint creation. It processes log files in reverse chronological order and selects
+//! the appropriate actions to include based on deduplication and retention rules.
+//!
 //! ## Retention and Cleanup
 //!
 //! This module provides utilities for calculating retention timestamps used during action reconciliation:
@@ -14,6 +20,8 @@ use std::time::Duration;
 
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error};
+
+pub(crate) mod log_replay;
 
 const SECONDS_PER_MINUTE: u64 = 60;
 const MINUTES_PER_HOUR: u64 = 60;
