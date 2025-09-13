@@ -80,11 +80,12 @@ mod tests {
     #[test]
     fn test_ok_or_panic_with_error() {
         // Create a test error
+        let message = "Test error message";
         let error_ptr = allocate_err(
             KernelError::GenericError,
             KernelStringSlice {
-                ptr: "Test error message".as_ptr() as *const i8,
-                len: "Test error message".len(),
+                ptr: message.as_ptr() as *const i8,
+                len: message.len(),
             },
         );
         let result = ExternResult::<i32>::Err(error_ptr);
@@ -100,8 +101,6 @@ mod tests {
         let panic_message = panic_result.unwrap_err();
         let panic_str = if let Some(s) = panic_message.downcast_ref::<String>() {
             s.clone()
-        } else if let Some(s) = panic_message.downcast_ref::<&str>() {
-            s.to_string()
         } else {
             "Unknown panic type".to_string()
         };
@@ -117,7 +116,7 @@ mod tests {
             panic_str
         );
         assert!(
-            panic_str.contains("Test error message"),
+            panic_str.contains(message),
             "Panic message should contain error message 'Test error message', got: {}",
             panic_str
         );
