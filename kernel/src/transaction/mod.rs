@@ -39,7 +39,7 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
 });
 
 /// Returns a reference to the mandatory fields in an add action.
-/// 
+///
 /// Note this does not include "dataChange" which is a required field but
 /// but should be set on the transactoin level. Getting the full schema
 /// can be done with [`Transaction::add_files_schema`].
@@ -70,7 +70,7 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
         .iter()
         .position(|f| f.name() == "modificationTime")
         .unwrap_or(len);
-    fields.insert(insert_position, &DATA_CHANGE_COLUMN);
+    fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
     Arc::new(StructType::new(fields.into_iter().cloned()))
 });
 
@@ -81,7 +81,7 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
 /// The stats column is of type string as required by the spec.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
+pub(crate) fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
     let fields = schema
         .fields()
         .cloned()
@@ -218,7 +218,7 @@ impl Transaction {
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
                 self.add_files_schema().clone(),
-                as_log_add_schema(with_stats_col(mandatory_add_file_schema()))
+                with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
             )
         };
 
@@ -376,25 +376,23 @@ impl Transaction {
 
         Box::new(add_files_metadata.map(move |add_files_batch| {
             // Convert stats to a JSON string and nest the add action in a top-level struct
-            let mut adds_expr = vec![Expression::transform(
-                Transform::new_top_level().with_replaced_field(
-                    "stats",
-                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                ),
-            )];
-            if let Some(transaction_data_change) = self.data_change {
-                adds_expr.push(Expression::transform(Transform::new_top_level().with_replaced_field(
-                    "dataChange",
-                    Expression::literal(transaction_data_change).into(),
-                )));
-            }
-            let adds_expr = Expression::struct_from(adds_expr);
-            let adds_evaluator = evaluation_handler.new_expression_evaluator(
-                input_schema.clone(),
-                Arc::new(adds_expr),
-                output_schema.clone().into(),
+            let mut transform = Transform::new_top_level().with_replaced_field(
+                "stats",
+                Expression::unary(ToJson, Expression::column(["stats"])).into(),
             );
-            adds_evaluator.evaluate(add_files_batch?.deref())
+            if self.data_change.is_some() {
+                transform = transform.with_inserted_field(
+                    Some("modificationTime"),
+                    Expression::literal(self.data_change.unwrap()).into(),
+                );
+            }
+            let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
+            let update_evaluator = evaluation_handler.new_expression_evaluator(
+                input_schema.clone(),
+                expr,
+                as_log_add_schema(output_schema.clone()).into(),
+            );
+            update_evaluator.evaluate(add_files_batch?.deref())
         }))
     }
 
@@ -454,9 +452,7 @@ impl Transaction {
             engine,
             extended_add_files_metadata,
             with_row_tracking_cols(self.add_files_schema()),
-            as_log_add_schema(with_row_tracking_cols(&with_stats_col(
-                mandatory_add_file_schema(),
-            ))),
+            with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
         );
 
         // Return a chained iterator with add and domain metadata actions
@@ -574,7 +570,10 @@ mod tests {
             ),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable(
+                "stats",
+                DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
+            ),
         ]);
         assert_eq!(*schema, expected.into());
         Ok(())

@@ -88,7 +88,6 @@ impl RowTrackingVisitor {
     /// Default value for an absent high water mark
     const DEFAULT_HIGH_WATER_MARK: i64 = -1;
 
-    
     pub(crate) fn new(row_id_high_water_mark: Option<i64>) -> Self {
         // A table might not have a row ID high water mark yet, so we model the input as an Option<i64>
         Self {
@@ -100,8 +99,13 @@ impl RowTrackingVisitor {
 
 impl RowVisitor for RowTrackingVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES : LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| (vec![ColumnName::new(["numRecords"])], vec![DataType::LONG]).into());
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![ColumnName::new(["stats", "numRecords"])],
+                vec![DataType::LONG],
+            )
+                .into()
+        });
         NAMES_AND_TYPES.as_ref()
     }
 
@@ -120,14 +124,12 @@ impl RowVisitor for RowTrackingVisitor {
 
         let mut current_hwm = self.row_id_high_water_mark;
         for i in 0..row_count {
-            let num_records: i64 = getters[0]
-                .get_opt(i, "numRecords")?
-                .ok_or_else(|| {
-                    Error::InternalError(
-                        "numRecords must be present in Add actions when row tracking is enabled."
-                            .to_string(),
-                    )
-                })?;
+            let num_records: i64 = getters[0].get_opt(i, "numRecords")?.ok_or_else(|| {
+                Error::InternalError(
+                    "numRecords must be present in Add actions when row tracking is enabled."
+                        .to_string(),
+                )
+            })?;
             self.base_row_ids.push(current_hwm + 1);
             current_hwm += num_records;
         }
@@ -164,12 +166,9 @@ mod tests {
         }
     }
 
-    fn create_getters<'a>(
-        num_records_mock: &'a MockGetData,
-    ) -> Vec<&'a dyn GetData<'a>> {
+    fn create_getters<'a>(num_records_mock: &'a MockGetData) -> Vec<&'a dyn GetData<'a>> {
         vec![num_records_mock]
     }
-
 
     #[test]
     fn test_visit_basic_functionality() -> DeltaResult<()> {
@@ -268,7 +267,7 @@ mod tests {
         let visitor = RowTrackingVisitor::new(Some(0));
         let (names, types) = visitor.selected_column_names_and_types();
 
-        assert_eq!(names, (vec![ColumnName::new(["numRecords"])]));
+        assert_eq!(names, (vec![ColumnName::new(["stats", "numRecords"])]));
         assert_eq!(types, vec![DataType::LONG]);
     }
 

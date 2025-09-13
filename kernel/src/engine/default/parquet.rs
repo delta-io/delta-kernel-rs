@@ -25,7 +25,6 @@ use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requeste
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
-use crate::transaction::mandatory_add_file_schema;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -104,14 +103,12 @@ impl DataFileMetadata {
         )?);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(mandatory_add_file_schema().as_ref().try_into_arrow()?),
-            vec![
-                path,
-                partitions,
-                size,
-                modification_time,
-                stats,
-            ],
+            Arc::new(
+                crate::transaction::BASE_ADD_FILES_SCHEMA
+                    .as_ref()
+                    .try_into_arrow()?,
+            ),
+            vec![path, partitions, size, modification_time, stats],
         )?)))
     }
 }

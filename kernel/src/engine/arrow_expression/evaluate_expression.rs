@@ -180,9 +180,19 @@ fn evaluate_transform_expression(
     // Verify that the lengths match before attempting to zip them below.
     if output_cols.len() != output_schema.fields_len() {
         return Err(Error::generic(format!(
-            "Expression count ({}) doesn't match output schema field count ({})",
+            "Expression count ({}) doesn't match output schema field count ({}) ({}) ({})",
             output_cols.len(),
-            output_schema.fields_len()
+            output_schema.fields_len(),
+            output_schema
+                .fields()
+                .into_iter()
+                .map(|f| f.name())
+                .join(", "),
+            source_data
+                .schema_fields()
+                .into_iter()
+                .map(|f| f.name())
+                .join(", "),
         )));
     }
 
