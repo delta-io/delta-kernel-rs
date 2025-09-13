@@ -130,13 +130,15 @@ mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
-    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
+    use delta_kernel::transaction::add_files_schema;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
@@ -157,9 +159,17 @@ mod tests {
 
     use std::sync::Arc;
 
+    const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
     use super::*;
 
     use tempfile::tempdir;
+
+    fn check_txn_id_exists(commit_info: &serde_json::Value) {
+        commit_info["txnId"]
+            .as_str()
+            .expect("txnId should be present in commitInfo");
+    }
 
     fn create_arrow_ffi_from_json(
         schema: ArrowSchema,
@@ -183,30 +193,7 @@ mod tests {
         path: &str,
         num_rows: i64,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        let schema = ArrowSchema::new(vec![
-            Field::new("path", ArrowDataType::Utf8, false),
-            Field::new(
-                "partitionValues",
-                ArrowDataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        ArrowDataType::Struct(
-                            vec![
-                                Field::new("key", ArrowDataType::Utf8, false),
-                                Field::new("value", ArrowDataType::Utf8, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                false,
-            ),
-            Field::new("size", ArrowDataType::Int64, false),
-            Field::new("modificationTime", ArrowDataType::Int64, false),
-            Field::new("dataChange", ArrowDataType::Boolean, false),
-        ]);
+        let schema: ArrowSchema = add_files_schema().as_ref().try_into_arrow()?;
 
         let current_time: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -214,7 +201,7 @@ mod tests {
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": {{"numRecords": {num_rows}}}}}"#,
         );
 
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
@@ -340,9 +327,12 @@ mod tests {
                 .into_iter::<serde_json::Value>()
                 .try_collect()?;
 
-            // set timestamps to 0 and paths to known string values for comparison
-            // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+            check_txn_id_exists(&parsed_commits[0]["commitInfo"]);
+
+            // set timestamps to 0, paths and txn_id to known string values for comparison
+            // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
             set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+            set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
             set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
             set_json_value(&mut parsed_commits[1], "add.size", json!(0))?;
 
@@ -354,6 +344,7 @@ mod tests {
                         "operation": "UNKNOWN",
                         "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                         "operationParameters": {},
+                        "txnId": ZERO_UUID
                     }
                 }),
                 json!({
@@ -362,7 +353,8 @@ mod tests {
                         "partitionValues": {},
                         "size": 0,
                         "modificationTime": 0,
-                        "dataChange": true
+                        "dataChange": true,
+                        "stats": "{\"numRecords\":5}"
                     }
                 }),
             ];

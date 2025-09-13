@@ -84,6 +84,7 @@ use url::Url;
 
 use self::schema::{DataType, SchemaRef};
 
+mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod engine_data;
@@ -97,6 +98,8 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
+
+mod row_tracking;
 
 mod arrow_compat;
 #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
