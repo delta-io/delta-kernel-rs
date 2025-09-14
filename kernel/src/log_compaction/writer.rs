@@ -44,7 +44,7 @@ impl RetentionCalculator for LogCompactionWriter {
 }
 
 impl LogCompactionWriter {
-    pub fn try_new(
+    pub(crate) fn try_new(
         snapshot: Arc<Snapshot>,
         start_version: Version,
         end_version: Version,
@@ -75,9 +75,7 @@ impl LogCompactionWriter {
 
     /// Get an iterator over the compaction data to be written
     ///
-    /// Performs action reconciliation for the version range specified in the constructor.
-    /// It creates a LogSegment that only includes commits in the specified version range,
-    /// and performs action reconciliation.
+    /// Performs action reconciliation for the version range specified in the constructor
     pub fn compaction_data(
         &mut self,
         engine: &dyn Engine,
@@ -122,11 +120,7 @@ impl LogCompactionWriter {
         let result_iter = processor.process_actions_iter(actions_iter);
 
         // Wrap the iterator in a LogCompactionDataIterator to track action counts lazily
-        Ok(LogCompactionDataIterator {
-            compaction_batch_iterator: Box::new(result_iter),
-            actions_count: 0,
-            add_actions_count: 0,
-        })
+        Ok(LogCompactionDataIterator::new(Box::new(result_iter)))
     }
 }
 
@@ -143,13 +137,26 @@ pub struct LogCompactionDataIterator {
 }
 
 impl LogCompactionDataIterator {
+    /// Create a new LogCompactionDataIterator with counters initialized to 0
+    pub(crate) fn new(
+        compaction_batch_iterator: Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
+    ) -> Self {
+        Self {
+            compaction_batch_iterator,
+            actions_count: 0,
+            add_actions_count: 0,
+        }
+    }
+
     /// Get the total number of actions in the compaction
-    pub fn total_actions(&self) -> i64 {
+    #[allow(dead_code)]
+    pub(crate) fn total_actions(&self) -> i64 {
         self.actions_count
     }
 
     /// Get the total number of add actions in the compaction
-    pub fn total_add_actions(&self) -> i64 {
+    #[allow(dead_code)]
+    pub(crate) fn total_add_actions(&self) -> i64 {
         self.add_actions_count
     }
 }

@@ -26,27 +26,26 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use delta_kernel::log_compaction::{LogCompactionDataIterator, LogCompactionWriter};
+//! # use delta_kernel::{LogCompactionDataIterator, LogCompactionWriter};
 //! # use delta_kernel::{Engine, Snapshot, DeltaResult, Error, FileMeta};
 //! # use url::Url;
 //!
 //! // Engine-specific function to write compaction data
-//! fn write_compaction_file(path: Url, data: LogCompactionDataIterator) -> DeltaResult<FileMeta> {
+//! fn write_compaction_file(path: &Url, data: LogCompactionDataIterator) -> DeltaResult<FileMeta> {
 //!     // In a real implementation, this would write the data to cloud storage
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
 //!
 //! # fn example(engine: &dyn Engine) -> DeltaResult<()> {
 //! // Create a snapshot for the table
-//! let table_root = url::Url::parse("file:///path/to/table")?;
+//! let table_root = Url::parse("file:///path/to/table")?;
 //! let snapshot = Arc::new(Snapshot::builder(table_root).build(engine)?);
 //!
 //! // Create a log compaction writer for versions 10-20
 //! let mut writer = snapshot.get_log_compaction_writer(10, 20)?;
 //!
-//! // Get the compaction path and data
-//! let compaction_path = writer.compaction_path().clone();
 //! let compaction_data = writer.compaction_data(engine)?;
+//! let compaction_path = writer.compaction_path();
 //!
 //! // Write the compaction data to cloud storage
 //! let _metadata: FileMeta = write_compaction_file(compaction_path, compaction_data)?;

@@ -9,7 +9,6 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::listed_log_files::ListedLogFiles;
-use crate::log_compaction::LogCompactionWriter;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -17,6 +16,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
+use crate::LogCompactionWriter;
 use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
 
@@ -262,8 +262,6 @@ impl Snapshot {
     ///
     /// # Returns
     /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
-    ///
-    /// See the [`crate::log_compaction`] module documentation for more details.
     pub fn get_log_compaction_writer(
         self: Arc<Self>,
         start_version: Version,
