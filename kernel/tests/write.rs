@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use delta_kernel::Error as KernelError;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
+use uuid::Uuid;
 
 use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
@@ -35,6 +36,15 @@ use test_utils::{create_table, engine_store_setup, setup_test_tables, test_read}
 mod common;
 use url::Url;
 
+fn validate_txn_id(commit_info: &serde_json::Value) {
+    let txn_id = commit_info["txnId"]
+        .as_str()
+        .expect("txnId should be present in commitInfo");
+    Uuid::parse_str(txn_id).expect("txnId should be valid UUID format");
+}
+
+const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -50,7 +60,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // create a transaction
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // commit!
@@ -63,11 +73,11 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
         let mut parsed_commit: serde_json::Value = serde_json::from_slice(&commit1.bytes().await?)?;
-        *parsed_commit
-            .get_mut("commitInfo")
-            .unwrap()
-            .get_mut("timestamp")
-            .unwrap() = serde_json::Value::Number(0.into());
+
+        validate_txn_id(&parsed_commit["commitInfo"]);
+
+        set_json_value(&mut parsed_commit, "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commit, "commitInfo.txnId", json!(ZERO_UUID))?;
 
         let expected_commit = json!({
             "commitInfo": {
@@ -76,6 +86,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
                 "engineInfo": "default engine",
+                "txnId": ZERO_UUID,
             }
         });
 
@@ -132,7 +143,7 @@ async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), engine.as_ref(), None)?);
+    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(engine.as_ref())?);
     let mut txn = snapshot.transaction()?;
 
     // create two new arrow record batches to append
@@ -202,7 +213,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         txn.commit(&engine)?;
@@ -217,9 +228,12 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        // set timestamps to 0 and paths to known string values for comparison
-        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
+
+        // set timestamps to 0, paths and txn_id to known string values for comparison
+        // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
 
         let expected_commit = vec![json!({
             "commitInfo": {
@@ -228,6 +242,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
                 "engineInfo": "default engine",
+                "txnId": ZERO_UUID
             }
         })];
 
@@ -270,10 +285,13 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
         // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
         // before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
+        // check that the txn_id is valid before we clear it for comparison
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
 
-        // set timestamps to 0 and paths to known string values for comparison
-        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        // set timestamps to 0, paths and txn_id to known string values for comparison
+        // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
         set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -286,6 +304,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
+                    "txnId": ZERO_UUID
                 }
             }),
             json!({
@@ -294,7 +313,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "partitionValues": {},
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
             json!({
@@ -303,7 +323,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "partitionValues": {},
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
         ];
@@ -376,7 +397,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
         let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -435,10 +456,13 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         // check that the timestamps in commit_info and add actions are within 10s of SystemTime::now()
         // before we clear them for comparison
         check_action_timestamps(parsed_commits.iter())?;
+        // check that the txn_id is valid before we clear it for comparison
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
 
-        // set timestamps to 0 and paths to known string values for comparison
-        // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+        // set timestamps to 0, paths and txn_id to known string values for comparison
+        // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
         set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
         set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
         set_json_value(&mut parsed_commits[1], "add.path", json!("first.parquet"))?;
         set_json_value(&mut parsed_commits[2], "add.modificationTime", json!(0))?;
@@ -452,6 +476,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
+                    "txnId": ZERO_UUID
                 }
             }),
             json!({
@@ -462,7 +487,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
             json!({
@@ -473,7 +499,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true
+                    "dataChange": true,
+                    "stats": "{\"numRecords\":3}"
                 }
             }),
         ];
@@ -513,7 +540,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -571,7 +598,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // can't have duplicate app_id in same transaction
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
         assert!(matches!(
             snapshot
                 .transaction()?
@@ -581,7 +608,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
 
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
         let txn = snapshot
             .transaction()?
             .with_engine_info("default engine")
@@ -591,7 +618,11 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         // commit!
         txn.commit(&engine)?;
 
-        let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, Some(1))?);
+        let snapshot = Arc::new(
+            Snapshot::builder(table_url.clone())
+                .at_version(1)
+                .build(&engine)?,
+        );
         assert_eq!(
             snapshot.clone().get_app_id_version("app_id1", &engine)?,
             Some(1)
@@ -612,11 +643,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .into_iter::<serde_json::Value>()
             .try_collect()?;
 
-        *parsed_commits[0]
-            .get_mut("commitInfo")
-            .unwrap()
-            .get_mut("timestamp")
-            .unwrap() = serde_json::Value::Number(0.into());
+        set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0)).unwrap();
 
         let time_ms: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -655,6 +682,10 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         assert!((last_updated.as_i64().unwrap() - time_ms).abs() < 10_000);
         *last_updated = serde_json::Value::Number(2.into());
 
+        validate_txn_id(&parsed_commits[0]["commitInfo"]);
+
+        set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
+
         let expected_commit = vec![
             json!({
                 "commitInfo": {
@@ -663,6 +694,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
+                    "txnId": ZERO_UUID
                 }
             }),
             json!({
@@ -704,13 +736,12 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         schema.clone(),
         &[],
         true,
-        true, // enable "timestamp without timezone" feature
-        false,
-        false,
+        vec!["timestampNtz"],
+        vec!["timestampNtz"],
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
     let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
@@ -827,19 +858,24 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let (store, engine, table_location) =
         engine_store_setup("test_table_variant", Some(&tmp_test_dir_url));
 
+    // We can add shredding features as well as we are allowed to write unshredded variants
+    // into shredded tables and shredded reads are explicitly blocked in the default
+    // engine's parquet reader.
+    // TODO: (#1124) we don't actually support column mapping writes yet, but have some
+    // tests that do column mapping on writes. For now omit the writer feature to let tests
+    // run, but after actual support this should be enabled.
     let table_url = create_table(
         store.clone(),
         table_location,
         table_schema.clone(),
         &[],
         true,
-        false,
-        true, // enable "variantType" feature
-        true, // enable "columnMapping" feature
+        vec!["variantType", "variantShredding-preview", "columnMapping"],
+        vec!["variantType", "variantShredding-preview"],
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
     let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1043,13 +1079,12 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         table_schema.clone(),
         &[],
         true,
-        false,
-        true,  // enable "variantType" feature
-        false, // enable "columnMapping" feature
+        vec!["variantType", "variantShredding-preview"],
+        vec!["variantType", "variantShredding-preview"],
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, None)?);
+    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
     let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant

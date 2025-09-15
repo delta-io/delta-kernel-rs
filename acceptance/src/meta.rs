@@ -103,12 +103,13 @@ impl TestCaseInfo {
         let engine = engine.as_ref();
         let (latest, versions) = self.versions().await?;
 
-        let snapshot = Snapshot::try_new(self.table_root()?, engine, None)?;
+        let snapshot = Snapshot::builder(self.table_root()?).build(engine)?;
         self.assert_snapshot_meta(&latest, &snapshot)?;
 
         for table_version in versions {
-            let snapshot =
-                Snapshot::try_new(self.table_root()?, engine, Some(table_version.version))?;
+            let snapshot = Snapshot::builder(self.table_root()?)
+                .at_version(table_version.version)
+                .build(engine)?;
             self.assert_snapshot_meta(&table_version, &snapshot)?;
         }
 

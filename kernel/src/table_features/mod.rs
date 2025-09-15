@@ -37,6 +37,12 @@ mod timestamp_ntz;
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum ReaderFeature {
+    /// CatalogManaged tables:
+    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
+    CatalogManaged,
+    #[strum(serialize = "catalogOwned-preview")]
+    #[serde(rename = "catalogOwned-preview")]
+    CatalogOwnedPreview,
     /// Mapping of one column to another
     ColumnMapping,
     /// Deletion vectors for merge, update, delete
@@ -90,6 +96,12 @@ pub(crate) enum ReaderFeature {
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum WriterFeature {
+    /// CatalogManaged tables:
+    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
+    CatalogManaged,
+    #[strum(serialize = "catalogOwned-preview")]
+    #[serde(rename = "catalogOwned-preview")]
+    CatalogOwnedPreview,
     /// Append Only Tables
     AppendOnly,
     /// Table invariants
@@ -188,6 +200,10 @@ impl WriterFeature {
 
 pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = LazyLock::new(|| {
     vec![
+        #[cfg(feature = "catalog-managed")]
+        ReaderFeature::CatalogManaged,
+        #[cfg(feature = "catalog-managed")]
+        ReaderFeature::CatalogOwnedPreview,
         ReaderFeature::ColumnMapping,
         ReaderFeature::DeletionVectors,
         ReaderFeature::TimestampWithoutTimezone,
@@ -206,14 +222,19 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
     ]
 });
 
-// note: we 'support' Invariants, but only insofar as we check that they are not present.
-// we support writing to tables that have Invariants enabled but not used. similarly, we only
-// support DeletionVectors in that we never write them (no DML).
+/// The writer features have the following limitations:
+/// - We 'support' Invariants only insofar as we check that they are not present.
+/// - We support writing to tables that have Invariants enabled but not used.
+/// - We only support DeletionVectors in that we never write them (no DML).
+/// - We support writing to existing tables with row tracking, but we don't support creating
+///   tables with row tracking yet.
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = LazyLock::new(|| {
     vec![
         WriterFeature::AppendOnly,
         WriterFeature::DeletionVectors,
+        WriterFeature::DomainMetadata,
         WriterFeature::Invariants,
+        WriterFeature::RowTracking,
         WriterFeature::TimestampWithoutTimezone,
         WriterFeature::VariantType,
         WriterFeature::VariantTypePreview,
@@ -262,6 +283,8 @@ mod tests {
     #[test]
     fn test_roundtrip_reader_features() {
         let cases = [
+            (ReaderFeature::CatalogManaged, "catalogManaged"),
+            (ReaderFeature::CatalogOwnedPreview, "catalogOwned-preview"),
             (ReaderFeature::ColumnMapping, "columnMapping"),
             (ReaderFeature::DeletionVectors, "deletionVectors"),
             (ReaderFeature::TimestampWithoutTimezone, "timestampNtz"),
@@ -297,6 +320,8 @@ mod tests {
     fn test_roundtrip_writer_features() {
         let cases = [
             (WriterFeature::AppendOnly, "appendOnly"),
+            (WriterFeature::CatalogManaged, "catalogManaged"),
+            (WriterFeature::CatalogOwnedPreview, "catalogOwned-preview"),
             (WriterFeature::Invariants, "invariants"),
             (WriterFeature::CheckConstraints, "checkConstraints"),
             (WriterFeature::ChangeDataFeed, "changeDataFeed"),

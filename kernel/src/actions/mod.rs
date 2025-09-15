@@ -67,13 +67,6 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
-static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
-        ADD_NAME,
-        Add::to_schema(),
-    )]))
-});
-
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new([
         StructField::nullable(ADD_NAME, Add::to_schema()),
@@ -87,6 +80,13 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
     ]))
+});
+
+static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        ADD_NAME,
+        Add::to_schema(),
+    )]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -130,6 +130,14 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+/// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
+///
+/// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
+/// schema in a top-level "add" struct.
+pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
+    Arc::new(StructType::new([StructField::nullable(ADD_NAME, schema)]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -289,42 +297,20 @@ impl IntoEngineData for Metadata {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let id = Scalar::from(self.id);
-        let name = Scalar::from(self.name);
-        let description = Scalar::from(self.description);
         // For format, we need to provide individual scalars for provider and options
-        let format_provider = Scalar::from(self.format.provider);
-        let format_options = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            self.format.options,
-        )
-        .map(Scalar::Map)?;
-        let schema_string = Scalar::from(self.schema_string);
-        let partition_columns = Scalar::Array(ArrayData::try_new(
-            ArrayType::new(DataType::STRING, false),
-            self.partition_columns,
-        )?);
-        let created_time = Scalar::from(self.created_time);
-        let configuration = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            self.configuration,
-        )
-        .map(Scalar::Map)?;
-
         let values = [
-            id,
-            name,
-            description,
-            format_provider,
-            format_options,
-            schema_string,
-            partition_columns,
-            created_time,
-            configuration,
+            self.id.into(),
+            self.name.into(),
+            self.description.into(),
+            self.format.provider.into(),
+            self.format.options.try_into()?,
+            self.schema_string.into(),
+            self.partition_columns.try_into()?,
+            self.created_time.into(),
+            self.configuration.try_into()?,
         ];
 
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -483,7 +469,18 @@ impl Protocol {
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
-                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
+                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)?;
+
+                // ensure that there is no illegal combination of features
+                if writer_features.contains(&WriterFeature::RowTracking)
+                    && !writer_features.contains(&WriterFeature::DomainMetadata)
+                {
+                    Err(Error::invalid_protocol(
+                        "rowTracking feature requires domainMetadata to also be enabled",
+                    ))
+                } else {
+                    Ok(())
+                }
             }
             Some(_) => {
                 // there are features, but we're not on 7, so the protocol is actually broken
@@ -533,21 +530,14 @@ impl IntoEngineData for Protocol {
             }
         }
 
-        let min_reader_version = Scalar::from(self.min_reader_version);
-        let min_writer_version = Scalar::from(self.min_writer_version);
-
-        let reader_features = features_to_scalar(self.reader_features)?;
-        let writer_features = features_to_scalar(self.writer_features)?;
-
         let values = [
-            min_reader_version,
-            min_writer_version,
-            reader_features,
-            writer_features,
+            self.min_reader_version.into(),
+            self.min_writer_version.into(),
+            features_to_scalar(self.reader_features)?,
+            features_to_scalar(self.writer_features)?,
         ];
 
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -613,8 +603,7 @@ pub(crate) struct CommitInfo {
     pub(crate) kernel_version: Option<String>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
-    /// A unique transaction identified for this commit. When the `catalogManaged` table feature is
-    /// enabled (not yet implemented), this field will be required. Otherwise, it is optional.
+    /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
 }
 
@@ -631,7 +620,7 @@ impl CommitInfo {
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
-            txn_id: None,
+            txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
     }
 }
@@ -643,32 +632,17 @@ impl IntoEngineData for CommitInfo {
         schema: SchemaRef,
         engine: &dyn Engine,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let timestamp = Scalar::from(self.timestamp);
-        let in_commit_timestamp = Scalar::from(self.in_commit_timestamp);
-        let operation = Scalar::from(self.operation);
-
-        let operation_parameters = MapData::try_new(
-            MapType::new(DataType::STRING, DataType::STRING, false),
-            self.operation_parameters.unwrap_or_default(),
-        )
-        .map(Scalar::Map)?;
-
-        let kernel_version = Scalar::from(self.kernel_version);
-        let engine_info = Scalar::from(self.engine_info);
-        let txn_id = Scalar::from(self.txn_id);
-
         let values = [
-            timestamp,
-            in_commit_timestamp,
-            operation,
-            operation_parameters,
-            kernel_version,
-            engine_info,
-            txn_id,
+            self.timestamp.into(),
+            self.in_commit_timestamp.into(),
+            self.operation.into(),
+            self.operation_parameters.unwrap_or_default().try_into()?,
+            self.kernel_version.into(),
+            self.engine_info.into(),
+            self.txn_id.into(),
         ];
 
-        let evaluator = engine.evaluation_handler();
-        evaluator.create_one(schema, &values)
+        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -719,7 +693,7 @@ pub(crate) struct Add {
 
     /// Default generated Row ID of the first row in the file. The default generated Row IDs
     /// of the other rows in the file can be reconstructed by adding the physical index of the
-    /// row within the file to the base Row ID
+    /// row within the file to the base Row ID.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub base_row_id: Option<i64>,
 
@@ -918,7 +892,7 @@ pub(crate) struct CheckpointMetadata {
 /// Note that the `delta.*` domain is reserved for internal use.
 ///
 /// [DomainMetadata]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#domain-metadata
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 pub(crate) struct DomainMetadata {
     domain: String,
@@ -927,6 +901,17 @@ pub(crate) struct DomainMetadata {
 }
 
 impl DomainMetadata {
+    /// Create a new DomainMetadata action.
+    // TODO: Discuss if we should remove `removed` from this method and introduce a dedicated
+    // method for removed domain metadata.
+    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
+        DomainMetadata {
+            domain,
+            configuration,
+            removed,
+        }
+    }
+
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
@@ -938,17 +923,16 @@ impl DomainMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::ListBuilder;
-    use crate::arrow::json::ReaderBuilder;
     use crate::{
-        arrow::array::{
-            Array, Int32Array, Int64Array, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-            StructArray,
+        arrow::{
+            array::{
+                Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+                MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+            },
+            datatypes::{DataType as ArrowDataType, Field, Schema},
+            json::ReaderBuilder,
         },
-        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
-        arrow::record_batch::RecordBatch,
-        engine::arrow_data::ArrowEngineData,
-        engine::arrow_expression::ArrowEvaluationHandler,
+        engine::{arrow_data::ArrowEngineData, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
         utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
@@ -980,6 +964,25 @@ mod tests {
         fn storage_handler(&self) -> Arc<dyn StorageHandler> {
             unimplemented!()
         }
+    }
+
+    fn create_string_map_builder(
+        nullable_values: bool,
+    ) -> MapBuilder<StringBuilder, StringBuilder> {
+        MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "key_value".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            StringBuilder::new(),
+            StringBuilder::new(),
+        )
+        .with_values_field(Field::new(
+            "value".to_string(),
+            ArrowDataType::Utf8,
+            nullable_values,
+        ))
     }
 
     #[test]
@@ -1324,22 +1327,58 @@ mod tests {
             Some(vec![
                 WriterFeature::AppendOnly,
                 WriterFeature::DeletionVectors,
+                WriterFeature::DomainMetadata,
                 WriterFeature::Invariants,
+                WriterFeature::RowTracking,
             ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
 
+        // Verify that unsupported writer features are rejected
+        // NOTE: Unsupported reader features should not cause an error here
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
-            Some([WriterFeature::RowTracking]),
+            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
+            Some([WriterFeature::IdentityColumns]),
         )
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "rowTracking". Supported WriterFeatures: "appendOnly", "deletionVectors", "invariants", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+        );
+
+        // Unknown writer features should cause an error
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
+            Some([WriterFeature::Unknown("unsupported writer".to_string())]),
+        )
+        .unwrap();
+        assert_result_error_with_message(
+            protocol.ensure_write_supported(),
+            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+        );
+    }
+
+    #[test]
+    fn test_illegal_writer_feature_combination() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                // No domain metadata even though that is required
+                WriterFeature::RowTracking,
+            ]),
+        )
+        .unwrap();
+
+        assert_result_error_with_message(
+            protocol.ensure_write_supported(),
+            "rowTracking feature requires domainMetadata to also be enabled",
         );
     }
 
@@ -1389,7 +1428,7 @@ mod tests {
         let engine_data =
             set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
 
-        let record_batch: crate::arrow::array::RecordBatch = engine_data
+        let record_batch: RecordBatch = engine_data
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -1420,26 +1459,18 @@ mod tests {
         let engine = ExprEngine::new();
 
         let commit_info = CommitInfo::new(0, None, None);
+        let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
 
-        let record_batch: crate::arrow::array::RecordBatch = engine_data
+        let record_batch: RecordBatch = engine_data
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
             .unwrap()
             .into();
 
-        let mut map_builder = MapBuilder::new(
-            Some(MapFieldNames {
-                entry: "key_value".to_string(),
-                key: "key".to_string(),
-                value: "value".to_string(),
-            }),
-            StringBuilder::new(),
-            StringBuilder::new(),
-        )
-        .with_values_field(Field::new("value".to_string(), ArrowDataType::Utf8, false));
+        let mut map_builder = create_string_map_builder(false);
         map_builder.append(true).unwrap();
         let operation_parameters = Arc::new(map_builder.finish());
 
@@ -1452,7 +1483,40 @@ mod tests {
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
-                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(StringArray::from(vec![commit_info_txn_id])),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(record_batch, expected);
+    }
+
+    #[test]
+    fn test_domain_metadata_into_engine_data() {
+        let engine = ExprEngine::new();
+
+        let domain_metadata = DomainMetadata {
+            domain: "my.domain".to_string(),
+            configuration: "config_value".to_string(),
+            removed: false,
+        };
+
+        let engine_data =
+            domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
+
+        let record_batch: RecordBatch = engine_data
+            .unwrap()
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
+
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["my.domain"])),
+                Arc::new(StringArray::from(vec!["config_value"])),
+                Arc::new(BooleanArray::from(vec![false])),
             ],
         )
         .unwrap();
@@ -1820,14 +1884,14 @@ mod tests {
         let reader_features_col = record_batch
             .column(2)
             .as_any()
-            .downcast_ref::<crate::arrow::array::ListArray>()
+            .downcast_ref::<ListArray>()
             .unwrap();
         assert_eq!(reader_features_col.len(), 1);
         assert_eq!(reader_features_col.value(0).len(), 0); // empty list
         let writer_features_col = record_batch
             .column(3)
             .as_any()
-            .downcast_ref::<crate::arrow::array::ListArray>()
+            .downcast_ref::<ListArray>()
             .unwrap();
         assert_eq!(writer_features_col.len(), 1);
         assert_eq!(writer_features_col.value(0).len(), 0); // empty list

@@ -684,7 +684,7 @@ mod tests {
     use crate::arrow::array::StringArray;
 
     use crate::engine::sync::SyncEngine;
-    use crate::expressions::{column_expr, Expression};
+    use crate::expressions::{column_expr_ref, Expression};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::utils::test_utils::{action_batch, parse_json_batch};
     use crate::Engine;
@@ -1079,13 +1079,15 @@ mod tests {
 
     fn transform_batch(batch: Box<dyn EngineData>) -> Box<dyn EngineData> {
         let engine = SyncEngine::new();
+        let expression =
+            Expression::Struct(vec![Arc::new(Expression::Struct(vec![column_expr_ref!(
+                "commitInfo.inCommitTimestamp"
+            )]))]);
         engine
             .evaluation_handler()
             .new_expression_evaluator(
                 get_log_schema().clone(),
-                Expression::Struct(vec![Expression::Struct(vec![column_expr!(
-                    "commitInfo.inCommitTimestamp"
-                )])]),
+                expression.into(),
                 InCommitTimestampVisitor::schema().into(),
             )
             .evaluate(batch.as_ref())
