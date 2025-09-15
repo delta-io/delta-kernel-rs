@@ -71,8 +71,10 @@ impl EnsureDataTypes {
             }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
+            | (&DataType::STRING, ArrowDataType::LargeUtf8)
             | (&DataType::STRING, ArrowDataType::Utf8)
             | (&DataType::STRING, ArrowDataType::Utf8View)
+            | (&DataType::BINARY, ArrowDataType::LargeBinary)
             | (&DataType::BINARY, ArrowDataType::BinaryView)
             | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
             (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
@@ -549,6 +551,18 @@ mod tests {
                 true
             )
             .unwrap(),
+            DataTypeCompat::Identical
+        );
+    }
+
+    #[test]
+    fn ensure_large_strings_and_binary() {
+        assert_eq!(
+            ensure_data_types(&DataType::STRING, &ArrowDataType::LargeUtf8, true).unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(&DataType::BINARY, &ArrowDataType::LargeBinary, true).unwrap(),
             DataTypeCompat::Identical
         );
     }
