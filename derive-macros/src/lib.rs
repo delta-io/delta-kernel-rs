@@ -3,7 +3,7 @@ use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
+    Data, DataStruct, DeriveInput, Error, Fields, Item, Lit, Meta, PathArguments, Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -38,7 +38,7 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
 /// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
 /// mark the value field as nullable, but those mappings will be dropped when converting to an
 /// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-#[proc_macro_derive(ToSchema, attributes(allow_null_container_values))]
+#[proc_macro_derive(ToSchema, attributes(allow_null_container_values, field_id))]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
@@ -107,6 +107,23 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                 _ => false,
             }
         });
+        let _field_id: Option<i64> = field.attrs.iter().find_map(|attr| {
+            match &attr.meta {
+                Meta::NameValue(nv) if nv.path.get_ident().is_some_and(|ident| ident == "field_id") =>
+                    match &nv.value {
+                        syn::Expr::Lit(expr_lit) => {
+                            match &expr_lit.lit {
+                                Lit::Int(lit_int) => {
+                                    lit_int.base10_parse().ok()
+                                }
+                                _ => None
+                            }
+                        }
+                        _ => None
+                    }
+                _ => None,
+            }
+        });
 
         match field.ty {
             Type::Path(ref type_path) => {
@@ -118,7 +135,9 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                         _ => Error::new(segment.arguments.span(), "Can only handle <> type path args").to_compile_error()
                     }
                 });
-                if have_schema_null {
+
+                // First, determine which base function to call based on schema_null setting
+                let base_call = if have_schema_null {
                     if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
                         if last_ident != "HashMap" {
                            return Error::new(
@@ -127,9 +146,15 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                             ).to_compile_error()
                         }
                     }
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name))}
+                    quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name)) }
                 } else {
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name))}
+                    quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name)) }
+                };
+
+                // Then, add field-id metadata if present
+                match _field_id {
+                    Some(id) => quote_spanned! { field.span() => #base_call.add_metadata([("parquet.field.id", #id)]) },
+                    None => base_call
                 }
             }
             _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty)).to_compile_error()

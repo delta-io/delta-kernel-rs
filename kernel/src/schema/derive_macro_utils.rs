@@ -116,3 +116,35 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
         StructField::not_null(name, T::to_nullable_container_type())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use delta_kernel_derive::ToSchema;
+
+    #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+    pub(crate) struct TestFieldId {
+        #[field_id = 123]
+        pub(crate) some_field: Option<String>,
+    }
+
+    #[test]
+    fn test_field_id_schema() {
+        let schema = TestFieldId::to_schema();
+        let fields: Vec<_> = schema.fields().collect();
+
+        // Check that someField (first field) has parquet field id metadata
+        let some_field = fields[0];
+        assert_eq!(some_field.name(), "someField");
+        assert!(some_field.is_nullable());
+
+        let metadata = some_field.metadata();
+        assert!(metadata.contains_key("parquet.field.id"));
+        // MetadataValue stores i64, so we can compare directly
+        if let crate::schema::MetadataValue::Number(n) = metadata.get("parquet.field.id").unwrap() {
+            assert_eq!(*n, 123);
+        } else {
+            panic!("Expected number parquet.field.id");
+        }
+    }
+}
