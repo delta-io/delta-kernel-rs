@@ -86,6 +86,7 @@ mod tests {
 
     #[cfg(feature = "default-engine-base")]
     #[tokio::test]
+    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         // Create a temporary local directory for use during this test
         let tmp_test_dir = tempdir()?;
