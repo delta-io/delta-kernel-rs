@@ -247,6 +247,22 @@ impl ParsedLogPath<Url> {
         }
         Ok(path)
     }
+
+    /// Create a new ParsedLogPath<Url> for a log compaction file
+    pub(crate) fn new_log_compaction(
+        table_root: &Url,
+        start_version: Version,
+        end_version: Version,
+    ) -> DeltaResult<Self> {
+        let filename = format!("{start_version:020}.{end_version:020}.compacted.json");
+        let path = Self::create_path(table_root, filename)?;
+        if !matches!(path.file_type, LogPathFileType::CompactedCommit { .. }) {
+            return Err(Error::internal_error(
+                "ParsedLogPath::new_log_compaction created a non-compaction path",
+            ));
+        }
+        Ok(path)
+    }
 }
 
 #[cfg(test)]

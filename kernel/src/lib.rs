@@ -90,6 +90,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+mod log_compaction;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -146,6 +147,7 @@ pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
+pub use log_compaction::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
 pub use snapshot::Snapshot;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;

@@ -1,4 +1,5 @@
 //! # Action Reconciliation
+//!
 //! This module implements APIs related to action reconciliation.
 //! Please see the [Delta Lake Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#action-reconciliation)
 //! for more details about action reconciliation.
