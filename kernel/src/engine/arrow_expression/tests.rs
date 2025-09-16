@@ -1,9 +1,8 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, AsArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    StructArray,
+    create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
+    ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -1108,77 +1107,4 @@ fn test_to_json_with_nested_struct() {
         json_array.value(1),
         r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
     );
-}
-
-#[test]
-#[ignore]
-fn benchmark_to_json_performance() {
-    use std::time::Instant;
-
-    // Create a large test struct array for performance testing
-    fn create_large_test_struct_array(num_rows: usize) -> StructArray {
-        let mut id_builder = Int32Builder::with_capacity(num_rows);
-        let mut name_builder = StringBuilder::with_capacity(num_rows, num_rows * 20);
-        let mut score_builder = crate::arrow::array::Float64Builder::with_capacity(num_rows);
-        let mut active_builder = crate::arrow::array::BooleanBuilder::with_capacity(num_rows);
-
-        for i in 0..num_rows {
-            id_builder.append_value(i as i32);
-            name_builder.append_value(format!("user_{i}"));
-            score_builder.append_value((i as f64) * 0.1 + 100.0);
-            active_builder.append_value(i % 3 != 0);
-        }
-
-        let fields = Fields::from(vec![
-            Arc::new(Field::new("id", DataType::Int32, false)),
-            Arc::new(Field::new("name", DataType::Utf8, false)),
-            Arc::new(Field::new("score", DataType::Float64, false)),
-            Arc::new(Field::new("active", DataType::Boolean, false)),
-        ]);
-
-        let arrays: Vec<ArrayRef> = vec![
-            Arc::new(id_builder.finish()),
-            Arc::new(name_builder.finish()),
-            Arc::new(score_builder.finish()),
-            Arc::new(active_builder.finish()),
-        ];
-
-        StructArray::new(fields, arrays, None)
-    }
-
-    // Test with different sizes to measure performance characteristics
-    let test_sizes = [100, 1000, 5000, 100000];
-    for &size in &test_sizes {
-        let large_struct = create_large_test_struct_array(size);
-
-        let start = Instant::now();
-        let result = to_json(&large_struct).unwrap();
-        let duration = start.elapsed();
-
-        println!(
-            "to_json processed {} rows in {:?} ({:.2} μs/row)",
-            size,
-            duration,
-            duration.as_micros() as f64 / size as f64
-        );
-
-        // Verify correctness
-        assert_eq!(result.len(), size);
-        let string_array = result.as_string::<i32>();
-
-        // Check a few sample results
-        if size > 0 {
-            let first_json = string_array.value(0);
-            assert!(first_json.contains("\"id\":0"));
-            assert!(first_json.contains("\"name\":\"user_0\""));
-            assert!(first_json.contains("\"score\":100"));
-            assert!(first_json.contains("\"active\":false"));
-        }
-
-        if size > 1 {
-            let second_json = string_array.value(1);
-            assert!(second_json.contains("\"id\":1"));
-            assert!(second_json.contains("\"name\":\"user_1\""));
-        }
-    }
 }
