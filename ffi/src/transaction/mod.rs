@@ -95,6 +95,23 @@ pub unsafe extern "C" fn add_files(
     txn.add_files(write_metadata);
 }
 
+///
+/// Mark the transaction as having data changes or not (these are recorded at the file level).
+///
+/// When set here writers should not provide a data_change column in EngineData.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION and commit info
+#[no_mangle]
+pub unsafe extern "C" fn with_data_change(
+    txn: Handle<ExclusiveTransaction>,
+    data_change: bool,
+) -> Handle<ExclusiveTransaction> {
+    let txn = unsafe { txn.into_inner() };
+    Box::new(txn.with_data_change(data_change)).into()
+}
+
 /// Attempt to commit a transaction to the table. Returns version number if successful.
 /// Returns error if the commit fails.
 ///
@@ -130,15 +147,14 @@ mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
-    use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-    use delta_kernel::transaction::add_files_schema;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
@@ -192,16 +208,58 @@ mod tests {
     fn create_file_metadata(
         path: &str,
         num_rows: i64,
+        exclude_data_change: bool,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        let schema: ArrowSchema = add_files_schema().as_ref().try_into_arrow()?;
-
+        // Explicitly define the schema here which duplicates Transaction::add_files_schema, to demonstrate
+        // engines can still specify data change explicitly (i.e. preserve backwards compatibility for
+        // non-default engines).
+        let mut schema_fields = vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new(
+                "partitionValues",
+                ArrowDataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        ArrowDataType::Struct(
+                            vec![
+                                Field::new("key", ArrowDataType::Utf8, false),
+                                Field::new("value", ArrowDataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                false,
+            ),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new("modificationTime", ArrowDataType::Int64, false),
+        ];
+        if !exclude_data_change {
+            schema_fields.push(Field::new("dataChange", ArrowDataType::Boolean, false));
+        }
+        schema_fields.push(Field::new(
+            "stats",
+            ArrowDataType::Struct(
+                vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
+            ),
+            false,
+        ));
+        let schema = ArrowSchema::new(schema_fields);
         let current_time: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
 
+        let data_change_value = if exclude_data_change {
+            ""
+        } else {
+            "\"dataChange\": true, "
+        };
+
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": {{"numRecords": {num_rows}}}}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, {data_change_value} "stats": {{"numRecords": {num_rows}}}}}"#,
         );
 
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
@@ -211,6 +269,7 @@ mod tests {
         delta_path: &str,
         file_path: &str,
         batch: &RecordBatch,
+        exclude_data_change: bool,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
         // WriterProperties can be used to set Parquet file options
         let props = WriterProperties::builder().build();
@@ -224,12 +283,24 @@ mod tests {
         // writer must be closed to write footer
         let res = writer.close().unwrap();
 
-        create_file_metadata(file_path, res.num_rows)
+        create_file_metadata(file_path, res.num_rows, exclude_data_change)
     }
 
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
-    async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_basic_append_with_data_change() -> Result<(), Box<dyn std::error::Error>> {
+        test_basic_append(true).await
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
+    async fn test_basic_append_without_data_change() -> Result<(), Box<dyn std::error::Error>> {
+        test_basic_append(false).await
+    }
+
+    async fn test_basic_append(
+        set_data_change_on_txn: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let schema = Arc::new(StructType::new(vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("string", DataType::STRING),
@@ -255,9 +326,12 @@ mod tests {
             let engine = get_default_engine(table_path_str);
 
             // Start the transaction
-            let txn = ok_or_panic(unsafe {
+            let mut txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
+            if set_data_change_on_txn {
+                unsafe { txn = with_data_change(txn.shallow_copy(), true) };
+            }
 
             // Add engine info
             let engine_info = "default_engine";
@@ -306,7 +380,12 @@ mod tests {
             ])
             .unwrap();
 
-            let file_info = write_parquet_file(table_path_str, "my_file.parquet", &batch)?;
+            let file_info = write_parquet_file(
+                table_path_str,
+                "my_file.parquet",
+                &batch,
+                /*exclude_data_change */ set_data_change_on_txn,
+            )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(file_info.array, &file_info.schema, engine.shallow_copy())

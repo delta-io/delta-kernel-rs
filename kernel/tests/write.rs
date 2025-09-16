@@ -144,7 +144,7 @@ async fn write_data_and_check_result_and_stats(
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(engine.as_ref())?);
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -167,7 +167,6 @@ async fn write_data_and_check_result_and_stats(
                     data.as_ref().unwrap(),
                     write_context.as_ref(),
                     HashMap::new(),
-                    true,
                 )
                 .await
         })
@@ -344,6 +343,85 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn test_append_no_data_change() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )]));
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        // write data out by spawning async tasks to simulate executors
+        let engine = Arc::new(engine);
+        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(engine.as_ref())?);
+        let mut txn = snapshot.transaction()?.with_data_change(false);
+
+        // create two new arrow record batches to append
+        let append_data: DeltaResult<Box<ArrowEngineData>> = {
+            let data = RecordBatch::try_new(
+                Arc::new(schema.as_ref().try_into_arrow()?),
+                vec![Arc::new(Int32Array::from([1, 2, 3].to_vec()))],
+            )?;
+            Ok(Box::new(ArrowEngineData::new(data)))
+        };
+
+        let add_files_metadata = engine
+            .write_parquet(
+                append_data.as_ref().unwrap(),
+                &txn.get_write_context(),
+                HashMap::new(),
+            )
+            .await?;
+        // do a second write because get_and_check_all_parquet_sizes expects 2 files
+        engine
+            .write_parquet(
+                append_data.as_ref().unwrap(),
+                &txn.get_write_context(),
+                HashMap::new(),
+            )
+            .await?;
+
+        txn.add_files(add_files_metadata);
+        txn.commit(engine.as_ref())?;
+
+        let commit1 = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let parsed_commits: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        let size =
+            get_and_check_all_parquet_sizes(store.clone(), format!("/{table_name}/").as_str())
+                .await;
+
+        let expected_add_file_action = json!({
+            "add": {
+                "path": "first.parquet",
+                "partitionValues": {},
+                "size": size,
+                "modificationTime": 0,
+                "dataChange": false,
+                "stats": "{\"numRecords\":3}"
+            }
+        });
+
+        assert_eq!(
+            parsed_commits[1]["dataChange"],
+            expected_add_file_action["dataChange"]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
@@ -398,7 +476,10 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
         let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
-        let mut txn = snapshot.transaction()?.with_engine_info("default engine");
+        let mut txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine")
+            .with_data_change(true);
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -426,7 +507,6 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                             data.as_ref().unwrap(),
                             write_context.as_ref(),
                             HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
-                            true,
                         )
                         .await
                 })
@@ -565,7 +645,6 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
                         data.as_ref().unwrap(),
                         write_context.as_ref(),
                         HashMap::new(),
-                        true,
                     )
                     .await
             })
@@ -742,7 +821,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
-    let mut txn = snapshot.transaction()?.with_engine_info("default engine");
+    let mut txn = snapshot
+        .transaction()?
+        .with_engine_info("default engine")
+        .with_data_change(true);
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -769,7 +851,6 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
             &ArrowEngineData::new(data.clone()),
             write_context.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
 
@@ -876,7 +957,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -975,7 +1056,6 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
-            true,
         )
         .await?;
 
@@ -1085,7 +1165,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .await?;
 
     let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1146,7 +1226,6 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
-            true,
         )
         .await?;
 
