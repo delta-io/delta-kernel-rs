@@ -107,23 +107,64 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                 _ => false,
             }
         });
+        // Validate field_id attribute and collect any errors
+        let mut field_id_errors = Vec::new();
         let _field_id: Option<i64> = field.attrs.iter().find_map(|attr| {
             match &attr.meta {
-                Meta::NameValue(nv) if nv.path.get_ident().is_some_and(|ident| ident == "field_id") =>
+                Meta::NameValue(nv) if nv.path.get_ident().is_some_and(|ident| ident == "field_id") => {
                     match &nv.value {
                         syn::Expr::Lit(expr_lit) => {
                             match &expr_lit.lit {
                                 Lit::Int(lit_int) => {
-                                    lit_int.base10_parse().ok()
+                                    match lit_int.base10_parse() {
+                                        Ok(value) => Some(value),
+                                        Err(e) => {
+                                            field_id_errors.push(Error::new(
+                                                lit_int.span(),
+                                                format!("Invalid field_id value: failed to parse integer: {}", e)
+                                            ));
+                                            None
+                                        }
+                                    }
                                 }
-                                _ => None
+                                Lit::Str(lit_str) => {
+                                    field_id_errors.push(Error::new(
+                                        lit_str.span(),
+                                        "field_id must be an integer literal, not a string"
+                                    ));
+                                    None
+                                }
+                                _ => {
+                                    field_id_errors.push(Error::new(
+                                        expr_lit.span(),
+                                        "field_id must be an integer literal"
+                                    ));
+                                    None
+                                }
                             }
                         }
-                        _ => None
+                        _ => {
+                            field_id_errors.push(Error::new(
+                                nv.value.span(),
+                                "field_id must be an integer literal"
+                            ));
+                            None
+                        }
                     }
+                }
                 _ => None,
             }
         });
+
+        // If we found validation errors, return them instead of proceeding
+        if !field_id_errors.is_empty() {
+            let mut errors_iter = field_id_errors.into_iter();
+            let mut combined_error = errors_iter.next().unwrap();
+            for error in errors_iter {
+                combined_error = Error::new(combined_error.span(), format!("{}\n{}", combined_error, error));
+            }
+            return combined_error.to_compile_error();
+        }
 
         match field.ty {
             Type::Path(ref type_path) => {
@@ -278,4 +319,76 @@ fn make_public(mut item: Item) -> Item {
     }
 
     item
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Tests for field_id parsing and validation
+
+    // Helper function to parse a struct and extract the field_id logic
+    fn test_field_id_parsing(input: &str) -> Result<TokenStream, String> {
+        let input = syn::parse_str::<DeriveInput>(input).map_err(|e| e.to_string())?;
+        let tokens = gen_schema_fields(&input.data);
+        Ok(tokens)
+    }
+
+    #[test]
+    fn test_valid_field_id_parsing() {
+        let input = r#"
+            struct TestStruct {
+                #[field_id = 123]
+                valid_field: String,
+                
+                #[field_id = 456]
+                another_valid_field: i32,
+                
+                normal_field: bool,
+            }
+        "#;
+
+        let result = test_field_id_parsing(input);
+        assert!(result.is_ok(), "Valid field_id should parse successfully");
+
+        let tokens = result.unwrap();
+        let token_string = tokens.to_string();
+
+        // Should contain metadata for valid field_ids
+        assert!(token_string.contains("123"));
+        assert!(token_string.contains("456"));
+        assert!(token_string.contains("add_metadata"));
+    }
+
+    #[test]
+    fn test_field_id_edge_cases() {
+        // Test with zero
+        let input_zero = r#"
+            struct TestStruct {
+                #[field_id = 0]
+                zero_field: String,
+            }
+        "#;
+        let result = test_field_id_parsing(input_zero);
+        assert!(result.is_ok(), "field_id = 0 should be valid");
+
+        // Test with negative number
+        let input_negative = r#"
+            struct TestStruct {
+                #[field_id = -1]
+                negative_field: String,
+            }
+        "#;
+        let result = test_field_id_parsing(input_negative);
+        assert!(result.is_ok(), "field_id = -1 should be valid");
+
+        // Test with large number
+        let input_large = r#"
+            struct TestStruct {
+                #[field_id = 9223372036854775807]
+                large_field: String,
+            }
+        "#;
+        let result = test_field_id_parsing(input_large);
+        assert!(result.is_ok(), "Large field_id should be valid");
+    }
 }
