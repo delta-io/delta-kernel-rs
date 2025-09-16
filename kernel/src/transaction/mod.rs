@@ -127,6 +127,7 @@ pub struct Transaction {
     // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
+    domain_metadatas: Vec<DomainMetadata>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -163,6 +164,7 @@ impl Transaction {
             add_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
+            domain_metadatas: vec![],
         })
     }
 
@@ -217,12 +219,19 @@ impl Transaction {
             )
         };
 
+        let domain_metadata_actions = Self::generate_domain_metadata_actions(
+            engine,
+            &self.domain_metadatas,
+            &self.read_snapshot,
+        )?;
+
         // Step 4: Commit the actions as a JSON file to the Delta log
         let commit_path =
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
         let actions = iter::once(commit_info_action)
             .chain(set_transaction_actions)
-            .chain(add_actions);
+            .chain(add_actions)
+            .chain(domain_metadata_actions);
 
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
@@ -268,6 +277,56 @@ impl Transaction {
         let set_transaction = SetTransaction::new(app_id, version, Some(self.commit_timestamp));
         self.set_transactions.push(set_transaction);
         self
+    }
+
+    /// Set domain metadata to be written to the Delta log.
+    /// Note that each domain can only appear once per transaction. That is, multiple configurations
+    /// of the same domain are disallowed in a single transaction, as well as setting and removing
+    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
+    /// fail (that is, we don't eagerly check domain validity here).
+    pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
+        self.domain_metadatas
+            .push(DomainMetadata::new(domain, configuration));
+        self
+    }
+
+    /// Generate domain metadata actions with validation.
+    fn generate_domain_metadata_actions<'a>(
+        engine: &'a dyn Engine,
+        domain_metadatas: &'a [DomainMetadata],
+        read_snapshot: &Snapshot,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
+        // if there are domain metadata actions, the table must support it
+        if !domain_metadatas.is_empty()
+            && !read_snapshot
+                .table_configuration()
+                .is_domain_metadata_supported()
+        {
+            return Err(Error::unsupported(
+                "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"
+            ));
+        }
+
+        // cannot have multiple actions for the same domain in a txn
+        let mut domains = HashSet::new();
+        for domain_metadata in domain_metadatas {
+            if domain_metadata.is_internal() {
+                return Err(Error::Generic(
+                    "Users cannot modify system controlled metadata domains".to_string(),
+                ));
+            }
+            if !domains.insert(domain_metadata.domain()) {
+                return Err(Error::Generic(format!(
+                    "Metadata for domain {} already specified in this transaction",
+                    domain_metadata.domain()
+                )));
+            }
+        }
+
+        Ok(domain_metadatas
+            .iter()
+            .cloned()
+            .map(move |dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
