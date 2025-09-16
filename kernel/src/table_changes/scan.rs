@@ -134,34 +134,21 @@ impl TableChangesScanBuilder {
             .enumerate()
             .map(|(index, logical_field)| -> DeltaResult<_> {
                 match logical_field.name() {
+                    name if name == super::COMMIT_VERSION_COL_NAME => {
+                        Ok(ColumnType::Cdf(crate::scan::CdfCol::CommitVersion, index))
+                    }
+                    name if name == super::COMMIT_TIMESTAMP_COL_NAME => {
+                        Ok(ColumnType::Cdf(crate::scan::CdfCol::CommitTimestamp, index))
+                    }
+                    name if name == super::CHANGE_TYPE_COL_NAME => Ok(ColumnType::Cdf(
+                        crate::scan::CdfCol::ChangeType(logical_field.name().to_string()),
+                        index,
+                    )),
                     name if self.table_changes.partition_columns().contains(name) => {
                         // Store the index into the schema for this field. When we turn it into an
                         // expression in the inner loop, we will index into the schema and get the name and
                         // data type, which we need to properly materialize the column.
                         Ok(ColumnType::Partition(index))
-                    }
-                    name if name == super::CHANGE_TYPE_COL_NAME => {
-                        // CDF _change_type column - may exist in physical data (CDC files) or be generated (Add/Remove files)
-                        Ok(ColumnType::Cdf {
-                            col_type: crate::scan::CdfCol::ChangeType(
-                                logical_field.name().to_string(),
-                            ),
-                            logical_idx: index,
-                        })
-                    }
-                    name if name == super::COMMIT_VERSION_COL_NAME => {
-                        // CDF _commit_version column - always generated (never in physical data)
-                        Ok(ColumnType::Cdf {
-                            col_type: crate::scan::CdfCol::CommitVersion,
-                            logical_idx: index,
-                        })
-                    }
-                    name if name == super::COMMIT_TIMESTAMP_COL_NAME => {
-                        // CDF _commit_timestamp column - always generated (never in physical data)
-                        Ok(ColumnType::Cdf {
-                            col_type: crate::scan::CdfCol::CommitTimestamp,
-                            logical_idx: index,
-                        })
                     }
                     _ => {
                         // Add to read schema, store field so we can build a `Column` expression later
@@ -261,7 +248,6 @@ impl TableChangesScan {
         let physical_predicate = self.physical_predicate();
         let dv_engine_ref = engine.clone();
 
-        // TODO: Pipe through the transform spec from the scan metadata when scan metadata is wired up
         let transform_spec = Scan::get_transform_spec(&all_fields);
 
         let result = scan_files
@@ -406,18 +392,12 @@ mod tests {
             vec![
                 ColumnType::Selected("part".to_string()),
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Cdf {
-                    col_type: crate::scan::CdfCol::ChangeType("_change_type".to_string()),
-                    logical_idx: 2,
-                },
-                ColumnType::Cdf {
-                    col_type: crate::scan::CdfCol::CommitVersion,
-                    logical_idx: 3,
-                },
-                ColumnType::Cdf {
-                    col_type: crate::scan::CdfCol::CommitTimestamp,
-                    logical_idx: 4,
-                },
+                ColumnType::Cdf(
+                    crate::scan::CdfCol::ChangeType("_change_type".to_string()),
+                    2,
+                ),
+                ColumnType::Cdf(crate::scan::CdfCol::CommitVersion, 3,),
+                ColumnType::Cdf(crate::scan::CdfCol::CommitTimestamp, 4,),
             ]
             .into()
         );
@@ -448,10 +428,7 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Cdf {
-                    col_type: crate::scan::CdfCol::CommitVersion,
-                    logical_idx: 1,
-                },
+                ColumnType::Cdf(crate::scan::CdfCol::CommitVersion, 1,),
             ]
             .into()
         );

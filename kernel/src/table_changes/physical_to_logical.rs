@@ -52,48 +52,52 @@ pub(crate) fn get_cdf_transform_expr(
     logical_schema: &StructType,
     scan_file: &CdfScanFile,
 ) -> DeltaResult<ExpressionRef> {
-    // Build all field values in one pass
-    let mut field_values =
+    // Build partition values separately
+    let partition_field_values =
         parse_partition_values_to_expressions(logical_schema, transform_spec, partition_values)?;
 
-    // Add CDF constants
+    // Build CDF field values separately and note which field we need to add the `_change_type` column after
+    let mut cdf_field_values = HashMap::new();
+    let mut change_type_insert_after = None;
     for field_transform in transform_spec {
         if let FieldTransformSpec::Cdf {
             col_type,
             field_index,
-            ..
+            insert_after,
         } = field_transform
         {
-            if let Some((_, field)) = logical_schema.fields.get_index(*field_index) {
-                if let Some(expr) = create_cdf_expression(col_type, scan_file) {
-                    field_values.insert(*field_index, (field.name().to_string(), expr));
-                }
+            let (_, field) = logical_schema
+                .fields
+                .get_index(*field_index)
+                .ok_or_else(|| {
+                    crate::Error::InternalError(format!("out of bounds field index {field_index}"))
+                })?;
+
+            // If the CDF expression is not None, insert it into the cdf_field_values map
+            // If it is None, it means the CDF column should come from physical data
+            if let Some(expr) = create_cdf_expression(col_type, scan_file) {
+                cdf_field_values.insert(*field_index, (field.name().to_string(), expr));
+            }
+
+            // Set change_type_insert_after for non-CDC scans to redirect columns that target the change type
+            //
+            // Example: In test_column_ordering_with_change_type:
+            // - ChangeType CDF has insert_after = "name" (where it should go)
+            // - CommitVersion CDF has insert_after = "_change_type" (wants to go after change type)
+            // - We set change_type_insert_after = "name" so CommitVersion gets redirected to "name"
+            // - Result: Both ChangeType and CommitVersion go after "name" in correct order
+            //
+            // For CDC scans: change_type column exists in physical data, so no redirection needed
+            if scan_file.scan_type != CdfScanFileType::Cdc
+                && matches!(col_type, crate::scan::CdfCol::ChangeType(_))
+            {
+                change_type_insert_after = insert_after.clone();
             }
         }
     }
 
-    // Find the _change_type insert_after for Add/Remove files
-    let change_type_insert_after = if scan_file.scan_type != CdfScanFileType::Cdc {
-        transform_spec.iter().find_map(|field_transform| {
-            if let FieldTransformSpec::Cdf {
-                col_type: crate::scan::CdfCol::ChangeType(_),
-                insert_after,
-                ..
-            } = field_transform
-            {
-                insert_after.clone()
-            } else {
-                None
-            }
-        })
-    } else {
-        None
-    };
-
     // Build the transform expression
     let mut transform = crate::expressions::Transform::new_top_level();
-    let use_change_type_insert_after =
-        scan_file.scan_type != CdfScanFileType::Cdc && change_type_insert_after.is_some();
 
     for field_transform in transform_spec {
         use FieldTransformSpec::*;
@@ -109,36 +113,35 @@ pub(crate) fn get_cdf_transform_expr(
                 field_index,
                 insert_after,
             } => {
-                if let Some((_, field_value)) = field_values.remove(field_index) {
-                    let field_value = Arc::new(field_value);
-                    let actual_insert_after = if use_change_type_insert_after {
-                        change_type_insert_after.clone()
-                    } else {
-                        insert_after.clone()
-                    };
+                if let Some((_, field_value)) = partition_field_values.get(field_index) {
+                    let field_value = Arc::new(field_value.clone());
+                    let actual_insert_after = resolve_insert_after_with_change_type_redirection(
+                        insert_after.clone(),
+                        change_type_insert_after.clone(),
+                    );
                     transform.with_inserted_field(actual_insert_after, field_value)
                 } else {
-                    transform
+                    return Err(crate::Error::InternalError(format!(
+                        "Missing field value for partition column at index {field_index}"
+                    )));
                 }
             }
             Cdf {
-                col_type,
                 field_index,
                 insert_after,
+                col_type: _,
             } => {
-                let should_use_change_type_insert_after = use_change_type_insert_after
-                    && !matches!(col_type, crate::scan::CdfCol::ChangeType(_));
+                let actual_insert_after = resolve_insert_after_with_change_type_redirection(
+                    insert_after.clone(),
+                    change_type_insert_after.clone(),
+                );
 
-                let actual_insert_after = if should_use_change_type_insert_after {
-                    change_type_insert_after.clone()
-                } else {
-                    insert_after.clone()
-                };
-
-                if let Some((_, field_value)) = field_values.remove(field_index) {
-                    let field_value = Arc::new(field_value);
+                if let Some((_, field_value)) = cdf_field_values.get(field_index) {
+                    let field_value = Arc::new(field_value.clone());
                     transform.with_inserted_field(actual_insert_after, field_value)
                 } else {
+                    // CDF field was not generated, meaning it should come from physical data
+                    // (e.g., ChangeType column in CDC files)
                     transform
                 }
             }
@@ -146,6 +149,29 @@ pub(crate) fn get_cdf_transform_expr(
     }
 
     Ok(Arc::new(Expression::Transform(transform)))
+}
+
+/// Resolves the correct insert_after field for a column, applying change_type redirection when needed.
+///
+/// When a column wants to insert after "_change_type" but the change type column itself
+/// needs to be redirected (e.g., from "_change_type" to "name"), this function handles
+/// the redirection so the column goes to the correct location.
+///
+/// Example: CommitVersion wants to go after "_change_type", but "_change_type" goes after "name"
+/// → CommitVersion gets redirected to go after "name" instead
+fn resolve_insert_after_with_change_type_redirection(
+    insert_after: Option<String>,
+    change_type_insert_after: Option<String>,
+) -> Option<String> {
+    if insert_after
+        .as_ref()
+        .map(|field| field == CHANGE_TYPE_COL_NAME)
+        .unwrap_or(false)
+    {
+        change_type_insert_after.or(insert_after)
+    } else {
+        insert_after
+    }
 }
 
 /// Creates the appropriate expression for a CDF column type
@@ -187,7 +213,10 @@ mod tests {
             path: "fake_path".to_string(),
             dv_info: Default::default(),
             remove_dv: None,
-            partition_values: HashMap::from([("age".to_string(), "20".to_string())]),
+            partition_values: HashMap::from([
+                ("age".to_string(), "20".to_string()),
+                ("score".to_string(), "100".to_string()),
+            ]),
             commit_version: 42,
             commit_timestamp: 1234,
         }
@@ -195,11 +224,13 @@ mod tests {
 
     fn create_test_logical_schema() -> StructType {
         StructType::new([
-            StructField::nullable("id", DataType::STRING),
-            StructField::not_null("age", DataType::LONG),
-            StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),
-            StructField::not_null(COMMIT_VERSION_COL_NAME, DataType::LONG),
-            StructField::not_null(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP),
+            StructField::nullable("id", DataType::STRING), // index 0
+            StructField::not_null("age", DataType::LONG),  // index 1
+            StructField::nullable("name", DataType::STRING), // index 2
+            StructField::not_null("score", DataType::LONG), // index 3
+            StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING), // index 4
+            StructField::not_null(COMMIT_VERSION_COL_NAME, DataType::LONG), // index 5
+            StructField::not_null(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP), // index 6
         ])
     }
 
@@ -212,10 +243,10 @@ mod tests {
         let all_fields = vec![
             ColumnType::Selected("id".to_string()),
             ColumnType::Partition(1), // age column
-            ColumnType::Cdf {
-                col_type: crate::scan::CdfCol::ChangeType(CHANGE_TYPE_COL_NAME.to_string()),
-                logical_idx: 2,
-            },
+            ColumnType::Cdf(
+                crate::scan::CdfCol::ChangeType(CHANGE_TYPE_COL_NAME.to_string()),
+                4, // updated index for new schema
+            ),
         ];
         let transform_spec = Scan::get_transform_spec(&all_fields);
         let result = get_cdf_transform_expr(
@@ -241,6 +272,82 @@ mod tests {
     }
 
     #[test]
+    fn test_column_ordering_with_change_type() {
+        let logical_schema = create_test_logical_schema();
+        let scan_file = create_test_scan_file(CdfScanFileType::Add);
+
+        // Create a scenario: physical col A, partition col B, physical col C, partition col D, cdf col E
+        // This tests that change_type_insert_after doesn't mess up the ordering of other columns
+        let all_fields = vec![
+            ColumnType::Selected("id".to_string()), // physical col A (index 0)
+            ColumnType::Partition(1), // partition col B (age, index 1) - should insert after "id"
+            ColumnType::Selected("name".to_string()), // physical col C (index 2)
+            ColumnType::Partition(3), // partition col D (score, index 3) - should insert after "name"
+            ColumnType::Cdf(
+                crate::scan::CdfCol::ChangeType(CHANGE_TYPE_COL_NAME.to_string()),
+                4, // CDF col E (index 4) - sets change_type_insert_after
+            ),
+            ColumnType::Cdf(
+                crate::scan::CdfCol::CommitVersion,
+                5, // CDF col F (index 5) - should NOT use change_type_insert_after for partition col D
+            ),
+        ];
+
+        let transform_spec = Scan::get_transform_spec(&all_fields);
+
+        // This should not panic or produce wrong ordering
+        let result = get_cdf_transform_expr(
+            &transform_spec,
+            &scan_file.partition_values,
+            &logical_schema,
+            &scan_file,
+        );
+
+        // Extract the transform and check the actual column ordering
+        let transform_expr = result.unwrap();
+        if let crate::expressions::Expression::Transform(transform) = transform_expr.as_ref() {
+            // CORRECT BEHAVIOR: Check that columns are inserted in their proper locations
+
+            println!("transform: {:?}", transform);
+
+            // The "age" partition column should be inserted after "id"
+            let id_transform = transform.field_transforms.get("id");
+            assert!(
+                id_transform.is_some(),
+                "Age partition should be inserted after 'id'"
+            );
+            let id_exprs = &id_transform.unwrap().exprs;
+            assert_eq!(
+                id_exprs.len(),
+                1,
+                "Should have exactly 1 expression after 'id' (age partition)"
+            );
+
+            // The "score" partition and "_change_type" CDF should be inserted after "name"
+            let name_transform = transform.field_transforms.get("name");
+            assert!(
+                name_transform.is_some(),
+                "Score partition and ChangeType CDF should be after 'name'"
+            );
+            let name_exprs = &name_transform.unwrap().exprs;
+            assert_eq!(
+                name_exprs.len(),
+                3,
+                "Should have exactly 3 expressions after 'name' (score partition + ChangeType CDF + CommitVersion CDF)"
+            );
+
+            // Verify no other unexpected transform locations
+            assert_eq!(
+                transform.field_transforms.len(),
+                2,
+                "Should have transforms for exactly 2 fields: id, name"
+            );
+        } else {
+            panic!("Expected Transform expression");
+        }
+    }
+
+    #[test]
     fn test_dynamic_metadata_physical_schema_check() {
         let logical_schema = create_test_logical_schema();
 
@@ -249,10 +356,10 @@ mod tests {
         let add_scan_file = create_test_scan_file(CdfScanFileType::Add);
         let all_fields = vec![
             ColumnType::Selected("id".to_string()),
-            ColumnType::Cdf {
-                col_type: crate::scan::CdfCol::ChangeType(CHANGE_TYPE_COL_NAME.to_string()),
-                logical_idx: 2,
-            },
+            ColumnType::Cdf(
+                crate::scan::CdfCol::ChangeType(CHANGE_TYPE_COL_NAME.to_string()),
+                4, // updated index for new schema
+            ),
         ];
         let transform_spec = Scan::get_transform_spec(&all_fields);
 

@@ -34,14 +34,6 @@ use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
-
-/// CDF column types for metadata columns
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum CdfCol {
-    ChangeType(String),
-    CommitVersion,
-    CommitTimestamp,
-}
 pub mod log_replay;
 pub mod state;
 
@@ -313,21 +305,26 @@ impl ScanResult {
     }
 }
 
+/// CDF column types for metadata columns
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CdfCol {
+    ChangeType(String),
+    CommitVersion,
+    CommitTimestamp,
+}
+
 /// Scan uses this to set up what kinds of top-level columns it is scanning. For `Selected` we just
 /// store the name of the column, as that's all that's needed during the actual query. For
 /// `Partition` we store an index into the logical schema for this query since later we need the
 /// data type as well to materialize the partition column.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub(crate) enum ColumnType {
     // A column, selected from the data, as is
     Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
     // CDF-specific metadata column - may exist in physical data (CDC files) or be generated (Add/Remove files)
-    Cdf {
-        col_type: CdfCol,
-        logical_idx: usize,
-    },
+    Cdf(CdfCol, usize),
 }
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
@@ -513,10 +510,7 @@ impl Scan {
                         field_index: *logical_idx,
                     });
                 }
-                ColumnType::Cdf {
-                    col_type,
-                    logical_idx,
-                } => {
+                ColumnType::Cdf(col_type, logical_idx) => {
                     transform_spec.push(FieldTransformSpec::Cdf {
                         col_type: col_type.clone(),
                         insert_after: last_physical_field.map(String::from),
