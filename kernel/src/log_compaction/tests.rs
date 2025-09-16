@@ -12,7 +12,7 @@ fn create_mock_snapshot() -> Arc<Snapshot> {
     .unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
-    Arc::new(Snapshot::builder(url).build(&engine).unwrap())
+    Snapshot::builder_for(url).build(&engine).unwrap()
 }
 
 fn create_multi_version_snapshot() -> Arc<Snapshot> {
@@ -20,7 +20,7 @@ fn create_multi_version_snapshot() -> Arc<Snapshot> {
         std::fs::canonicalize(std::path::PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
-    Arc::new(Snapshot::builder(url).build(&engine).unwrap())
+    Snapshot::builder_for(url).build(&engine).unwrap()
 }
 
 #[test]

@@ -1032,7 +1032,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Arc::new(Snapshot::builder(url).build(&engine).unwrap());
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
         // Test creating a log compaction writer
         let writer = snapshot.clone().get_log_compaction_writer(0, 1).unwrap();
