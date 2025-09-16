@@ -156,7 +156,7 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
                     }
                 }
             }
-            Commit | StagedCommit(_) | CompactedCommit { .. } | Crc | Unknown => {}
+            Commit | StagedCommit | CompactedCommit { .. } | Crc | Unknown => {}
         }
     }
     checkpoints
@@ -261,7 +261,7 @@ impl ListedLogFiles {
                 for file in files {
                     use LogPathFileType::*;
                     match file.file_type {
-                        Commit | StagedCommit(_) => ascending_commit_files.push(file),
+                        Commit | StagedCommit => ascending_commit_files.push(file),
                         CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
                             ascending_compaction_files.push(file);
                         }
@@ -633,16 +633,8 @@ mod list_log_files_with_log_tail_tests {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
-            (
-                2,
-                LogPathFileType::StagedCommit("uuid1".to_string()),
-                CommitSource::Filesystem,
-            ),
-            (
-                2,
-                LogPathFileType::StagedCommit("uuid2".to_string()),
-                CommitSource::Filesystem,
-            ),
+            (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+            (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
         let (storage, log_root) = create_storage(log_files);

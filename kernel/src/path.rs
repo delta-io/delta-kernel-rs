@@ -22,7 +22,7 @@ const UUID_PART_LEN: usize = 36;
 pub(crate) enum LogPathFileType {
     Commit,
     /// Staged commits are commits with UUID filenames, stored in _delta_log/_staged_commits dir.
-    StagedCommit(String),
+    StagedCommit,
     SinglePartCheckpoint,
     #[allow(unused)]
     UuidCheckpoint(String),
@@ -127,8 +127,8 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["json"] => LogPathFileType::Commit,
             [uuid, "json"] if subdir == Some("_staged_commits") => {
                 // staged commits like _delta_log/_staged_commits/00000000000000000000.{uuid}.json
-                match parse_path_part(uuid, UUID_PART_LEN, url) {
-                    Ok(uuid) => LogPathFileType::StagedCommit(uuid),
+                match parse_path_part::<String>(uuid, UUID_PART_LEN, url) {
+                    Ok(_uuid) => LogPathFileType::StagedCommit,
                     Err(_) => LogPathFileType::Unknown,
                 }
             }
@@ -172,7 +172,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     pub(crate) fn is_commit(&self) -> bool {
         matches!(
             self.file_type,
-            LogPathFileType::Commit | LogPathFileType::StagedCommit(_)
+            LogPathFileType::Commit | LogPathFileType::StagedCommit
         )
     }
 
@@ -719,10 +719,7 @@ mod tests {
         );
         assert_eq!(log_path.extension, "json");
         assert_eq!(log_path.version, 10);
-        assert!(matches!(
-            log_path.file_type,
-            LogPathFileType::StagedCommit(ref u) if u == "3a0d65cd-4056-49b8-937b-95f9e3ee90e5",
-        ));
+        assert!(matches!(log_path.file_type, LogPathFileType::StagedCommit));
         assert!(log_path.is_commit());
         assert!(!log_path.is_checkpoint());
         assert!(!log_path.is_unknown());
