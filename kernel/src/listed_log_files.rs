@@ -31,6 +31,7 @@ use url::Url;
 /// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
 ///
 /// NOTE: the `ascending_commit_files` _may_ contain gaps.
+/// NOTE: the `ascending_commit_files` includes both regular commits and staged commits.
 #[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
@@ -155,7 +156,7 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
                     }
                 }
             }
-            Commit | CompactedCommit { .. } | Crc | Unknown => {}
+            Commit | StagedCommit(_) | CompactedCommit { .. } | Crc | Unknown => {}
         }
     }
     checkpoints
@@ -260,7 +261,7 @@ impl ListedLogFiles {
                 for file in files {
                     use LogPathFileType::*;
                     match file.file_type {
-                        Commit => ascending_commit_files.push(file),
+                        Commit | StagedCommit(_) => ascending_commit_files.push(file),
                         CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
                             ascending_compaction_files.push(file);
                         }
@@ -620,5 +621,39 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[0], CommitSource::Catalog);
         assert_source(&result[1], CommitSource::Catalog);
         assert_source(&result[2], CommitSource::Catalog);
+    }
+
+    #[test]
+    fn test_listing_omits_staged_commits() {
+        // note that in the presence of staged commits, we CANNOT trust listing to determine which
+        // to include in our listing/log segment. This is up to the catalog. (e.g. version
+        // 5.uuid1.json and 5.uuid2.json can both exist and only catalog can say which is the 'real'
+        // version 5).
+
+        let log_files = vec![
+            (0, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (
+                2,
+                LogPathFileType::StagedCommit("uuid1".to_string()),
+                CommitSource::Filesystem,
+            ),
+            (
+                2,
+                LogPathFileType::StagedCommit("uuid2".to_string()),
+                CommitSource::Filesystem,
+            ),
+        ];
+
+        let (storage, log_root) = create_storage(log_files);
+        let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], None, None)
+            .unwrap()
+            .try_collect()
+            .unwrap();
+
+        // we must only see two regular commits
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].version, 0);
+        assert_eq!(result[1].version, 1);
     }
 }
