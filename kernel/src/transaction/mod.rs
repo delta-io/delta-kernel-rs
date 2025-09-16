@@ -202,30 +202,20 @@ impl Transaction {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        // Step 3: Generate add actions with or without row tracking metadata
+        // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let commit_version = self.read_snapshot.version() + 1;
-        let add_actions = if self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking()
-        {
-            self.generate_adds_with_row_tracking(engine, commit_version)?
-        } else {
-            self.generate_adds(
-                engine,
-                self.add_files_metadata.iter().map(|a| Ok(a.deref())),
-                add_files_schema().clone(),
-                as_log_add_schema(with_stats_col(mandatory_add_file_schema())),
-            )
-        };
+        let (add_actions, row_tracking_high_watermark) =
+            self.generate_adds(engine, commit_version)?;
 
+        // Step 4: Generate all domain metadata actions (user and system domains)
         let domain_metadata_actions = Self::generate_domain_metadata_actions(
             engine,
             &self.domain_metadatas,
             &self.read_snapshot,
+            row_tracking_high_watermark,
         )?;
 
-        // Step 4: Commit the actions as a JSON file to the Delta log
+        // Step 5: Commit the actions as a JSON file to the Delta log
         let commit_path =
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
         let actions = iter::once(commit_info_action)
@@ -290,11 +280,12 @@ impl Transaction {
         self
     }
 
-    /// Generate domain metadata actions with validation.
+    /// Generate domain metadata actions with validation. Handle both user and system domains.
     fn generate_domain_metadata_actions<'a>(
         engine: &'a dyn Engine,
         domain_metadatas: &'a [DomainMetadata],
         read_snapshot: &Snapshot,
+        row_tracking_high_watermark: Option<i64>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
         // if there are domain metadata actions, the table must support it
         if !domain_metadatas.is_empty()
@@ -323,10 +314,16 @@ impl Transaction {
             }
         }
 
+        let system_domains = row_tracking_high_watermark
+            .map(|hwm| DomainMetadata::try_from(RowTrackingDomainMetadata::new(hwm)))
+            .transpose()?
+            .into_iter();
+
         Ok(domain_metadatas
             .iter()
             .cloned()
-            .map(move |dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
+            .chain(system_domains)
+            .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -368,21 +365,93 @@ impl Transaction {
         self.add_files_metadata.push(add_metadata);
     }
 
+    /// Generate add actions, handling row tracking internally if needed
+    fn generate_adds<'a>(
+        &'a self,
+        engine: &dyn Engine,
+        commit_version: u64,
+    ) -> DeltaResult<(EngineDataResultIterator<'a>, Option<i64>)> {
+        if self.add_files_metadata.is_empty() {
+            return Ok((Box::new(iter::empty()), None));
+        }
+
+        let commit_version = i64::try_from(commit_version)
+            .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
+
+        let needs_row_tracking = self
+            .read_snapshot
+            .table_configuration()
+            .should_write_row_tracking();
+
+        if needs_row_tracking {
+            let row_id_high_water_mark =
+                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+            let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
+            let mut base_row_id_batches = Vec::with_capacity(self.add_files_metadata.len());
+
+            // Visit all files to collect row tracking info
+            for add_files_batch in &self.add_files_metadata {
+                row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
+                base_row_id_batches.push(row_tracking_visitor.base_row_ids.clone());
+            }
+
+            // Create extended add files with row tracking columns
+            let extended_add_files = self.add_files_metadata.iter().zip(base_row_id_batches).map(
+                move |(add_files_batch, base_row_ids)| {
+                    let commit_versions = vec![commit_version; base_row_ids.len()];
+                    let base_row_ids_array =
+                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
+                    let commit_versions_array =
+                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
+
+                    add_files_batch.append_columns(
+                        with_row_tracking_cols(&Arc::new(StructType::new(vec![]))),
+                        vec![base_row_ids_array, commit_versions_array],
+                    )
+                },
+            );
+
+            let add_actions = self.create_add_actions(
+                engine,
+                extended_add_files,
+                with_row_tracking_cols(add_files_schema()),
+                as_log_add_schema(with_row_tracking_cols(&with_stats_col(
+                    mandatory_add_file_schema(),
+                ))),
+            );
+
+            Ok((
+                Box::new(add_actions),
+                Some(row_tracking_visitor.row_id_high_water_mark),
+            ))
+        } else {
+            // Simple case without row tracking
+            let add_actions = self.create_add_actions(
+                engine,
+                self.add_files_metadata.iter().map(|a| Ok(a.deref())),
+                add_files_schema().clone(),
+                as_log_add_schema(with_stats_col(mandatory_add_file_schema())),
+            );
+
+            Ok((Box::new(add_actions), None))
+        }
+    }
+
     /// Convert file metadata provided by the engine into protocol-compliant add actions.
-    fn generate_adds<'a, I, T>(
+    fn create_add_actions<'a, I, T>(
         &'a self,
         engine: &dyn Engine,
         add_files_metadata: I,
         input_schema: SchemaRef,
         output_schema: SchemaRef,
-    ) -> EngineDataResultIterator<'a>
+    ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
     where
         I: Iterator<Item = DeltaResult<T>> + Send + 'a,
         T: Deref<Target = dyn EngineData> + Send + 'a,
     {
         let evaluation_handler = engine.evaluation_handler();
 
-        Box::new(add_files_metadata.map(move |add_files_batch| {
+        add_files_metadata.map(move |add_files_batch| {
             // Convert stats to a JSON string and nest the add action in a top-level struct
             let adds_expr = Expression::struct_from([Expression::transform(
                 Transform::new_top_level().with_replaced_field(
@@ -396,74 +465,7 @@ impl Transaction {
                 output_schema.clone().into(),
             );
             adds_evaluator.evaluate(add_files_batch?.deref())
-        }))
-    }
-
-    /// Extend file metadata provided by the engine with row tracking information and convert them into
-    /// protocol-compliant add actions.
-    fn generate_adds_with_row_tracking<'a>(
-        &'a self,
-        engine: &dyn Engine,
-        commit_version: u64,
-    ) -> DeltaResult<EngineDataResultIterator<'a>> {
-        // Return early if we have nothing to add
-        if self.add_files_metadata.is_empty() {
-            return Ok(Box::new(iter::empty()));
-        }
-
-        // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
-        let row_id_high_water_mark =
-            RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-
-        // Create a row tracking visitor and visit all files to collect row tracking information
-        let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
-        let mut base_row_id_batches = Vec::with_capacity(self.add_files_metadata.len());
-
-        // We visit all files with the row visitor before creating the add action iterator
-        // because we need to know the final row ID high water mark to create the domain metadata action
-        for add_files_batch in &self.add_files_metadata {
-            row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
-            base_row_id_batches.push(row_tracking_visitor.base_row_ids.clone());
-        }
-
-        // Generate a domain metadata action based on the final high water mark
-        let domain_metadata = DomainMetadata::try_from(RowTrackingDomainMetadata::new(
-            row_tracking_visitor.row_id_high_water_mark,
-        ))?;
-        let domain_metadata_action =
-            domain_metadata.into_engine_data(get_log_domain_metadata_schema().clone(), engine);
-
-        // Create an iterator that pairs each add action with its row tracking metadata
-        let extended_add_files_metadata =
-            self.add_files_metadata.iter().zip(base_row_id_batches).map(
-                move |(add_files_batch, base_row_ids)| {
-                    let commit_versions = vec![commit_version as i64; base_row_ids.len()];
-                    let base_row_ids =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
-                    let row_commit_versions =
-                        ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
-
-                    add_files_batch.append_columns(
-                        with_row_tracking_cols(&Arc::new(StructType::new(vec![]))),
-                        vec![base_row_ids, row_commit_versions],
-                    )
-                },
-            );
-
-        // Generate add actions including row tracking metadata
-        let add_actions = self.generate_adds(
-            engine,
-            extended_add_files_metadata,
-            with_row_tracking_cols(add_files_schema()),
-            as_log_add_schema(with_row_tracking_cols(&with_stats_col(
-                mandatory_add_file_schema(),
-            ))),
-        );
-
-        // Return a chained iterator with add and domain metadata actions
-        Ok(Box::new(
-            add_actions.chain(iter::once(domain_metadata_action)),
-        ))
+        })
     }
 }
 
