@@ -190,7 +190,7 @@ impl CheckpointLogReplayProcessor {
 ///
 /// The resulting filtered set of actions are the actions which should be written to a
 /// checkpoint for a corresponding version.
-pub(crate) struct CheckpointVisitor<'seen> {
+pub struct CheckpointVisitor<'seen> {
     // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
     // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
     // This set has O(M) memory usage where M = number of file actions with unique (path, dvId) pairs
