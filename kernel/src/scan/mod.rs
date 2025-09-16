@@ -1256,8 +1256,8 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files = get_files_for_scan(scan, &engine).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -1273,8 +1273,8 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder(url).build(engine.as_ref()).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<ScanResult> = scan.execute(engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
@@ -1289,9 +1289,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder(url).build(engine.as_ref()).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let version = snapshot.version();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()
@@ -1323,11 +1323,11 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder(url.clone())
+        let snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(engine.as_ref())
             .unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()
@@ -1347,11 +1347,11 @@ mod tests {
             .into_iter()
             .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
             .collect();
-        let snapshot = Snapshot::builder(url)
+        let snapshot = Snapshot::builder_for(url)
             .at_version(1)
             .build(engine.as_ref())
             .unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let new_files: Vec<_> = scan
             .scan_metadata_from(engine.as_ref(), 0, files, None)
             .unwrap()
@@ -1419,8 +1419,8 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let data: Vec<_> = scan
             .replay_for_scan_metadata(&engine)
             .unwrap()
@@ -1439,7 +1439,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Arc::new(Snapshot::builder(url).build(engine.as_ref()).unwrap());
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
         // No predicate pushdown attempted, so the one data file should be returned.
         //
@@ -1482,7 +1482,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Arc::new(Snapshot::builder(url).build(engine.as_ref()).unwrap());
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
         // Predicate over a logically valid but physically missing column. No data files should be
         // returned because the column is inferred to be all-null.
@@ -1517,8 +1517,8 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder(url).build(&engine).unwrap();
-        let scan = snapshot.into_scan_builder().build()?;
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let scan = snapshot.scan_builder().build()?;
         let files = get_files_for_scan(scan, &engine)?;
         // test case:
         //

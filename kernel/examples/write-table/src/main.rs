@@ -79,7 +79,7 @@ async fn try_main() -> DeltaResult<()> {
     )?;
 
     // Create or get the table
-    let snapshot = Arc::new(create_or_get_base_snapshot(&url, &engine, &cli.schema).await?);
+    let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
 
     // Create sample data based on the schema
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
@@ -123,9 +123,9 @@ async fn create_or_get_base_snapshot(
     url: &Url,
     engine: &dyn Engine,
     schema_str: &str,
-) -> DeltaResult<Snapshot> {
+) -> DeltaResult<Arc<Snapshot>> {
     // Check if table already exists
-    match Snapshot::builder(url.clone()).build(engine) {
+    match Snapshot::builder_for(url.clone()).build(engine) {
         Ok(snapshot) => {
             println!("✓ Found existing table at version {}", snapshot.version());
             Ok(snapshot)
@@ -135,7 +135,7 @@ async fn create_or_get_base_snapshot(
             println!("Creating new Delta table...");
             let schema = parse_schema(schema_str)?;
             create_table(url, &schema).await?;
-            Snapshot::builder(url.clone()).build(engine)
+            Snapshot::builder_for(url.clone()).build(engine)
         }
     }
 }
@@ -294,8 +294,8 @@ async fn read_and_display_data(
     table_url: &Url,
     engine: DefaultEngine<TokioBackgroundExecutor>,
 ) -> DeltaResult<()> {
-    let snapshot = Snapshot::builder(table_url.clone()).build(&engine)?;
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let scan = snapshot.scan_builder().build()?;
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?

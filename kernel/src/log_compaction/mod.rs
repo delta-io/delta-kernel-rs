@@ -39,7 +39,7 @@
 //! # fn example(engine: &dyn Engine) -> DeltaResult<()> {
 //! // Create a snapshot for the table
 //! let table_root = Url::parse("file:///path/to/table")?;
-//! let snapshot = Arc::new(Snapshot::builder(table_root).build(engine)?);
+//! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
 //!
 //! // Create a log compaction writer for versions 10-20
 //! let mut writer = snapshot.get_log_compaction_writer(10, 20)?;

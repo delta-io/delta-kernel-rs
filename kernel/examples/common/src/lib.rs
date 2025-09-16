@@ -62,7 +62,7 @@ pub fn get_engine(
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed
 /// engine. Parameters of the scan are controlled by the specified `ScanArgs`
-pub fn get_scan(snapshot: Snapshot, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
+pub fn get_scan(snapshot: Arc<Snapshot>, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
     if args.schema_only {
         println!("{:#?}", snapshot.schema());
         return Ok(None);
@@ -86,7 +86,7 @@ pub fn get_scan(snapshot: Snapshot, args: &ScanArgs) -> DeltaResult<Option<Scan>
         .transpose()?;
     Ok(Some(
         snapshot
-            .into_scan_builder()
+            .scan_builder()
             .with_schema_opt(read_schema_opt)
             .build()?,
     ))
