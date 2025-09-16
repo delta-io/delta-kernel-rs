@@ -357,12 +357,16 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
             || checkpoint_read_schema.contains(REMOVE_NAME);
-        require!(
-            !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
-            Error::invalid_checkpoint(
-                "If the checkpoint read schema contains file actions, it must contain the sidecar column"
-            )
-        );
+
+        // Only validate sidecar requirement if we actually have checkpoint files
+        if !self.checkpoint_parts.is_empty() {
+            require!(
+                !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
+                Error::invalid_checkpoint(
+                    "If the checkpoint read schema contains file actions, it must contain the sidecar column"
+                )
+            );
+        }
 
         let checkpoint_file_meta: Vec<_> = self
             .checkpoint_parts
