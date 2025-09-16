@@ -125,7 +125,10 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
     pub(crate) struct TestFieldId {
         #[field_id = 123]
-        pub(crate) some_field: Option<String>,
+        pub(crate) valid_id: Option<String>,
+
+        #[field_id = "abc"]
+        pub(crate) invalid_id: Option<String>,
     }
 
     #[test]
@@ -133,18 +136,20 @@ mod tests {
         let schema = TestFieldId::to_schema();
         let fields: Vec<_> = schema.fields().collect();
 
-        // Check that someField (first field) has parquet field id metadata
-        let some_field = fields[0];
-        assert_eq!(some_field.name(), "someField");
-        assert!(some_field.is_nullable());
+        let field_valid_id = fields[0];
+        assert_eq!(field_valid_id.name(), "validId");
 
-        let metadata = some_field.metadata();
+        let metadata = field_valid_id.metadata();
         assert!(metadata.contains_key("parquet.field.id"));
-        // MetadataValue stores i64, so we can compare directly
+
         if let crate::schema::MetadataValue::Number(n) = metadata.get("parquet.field.id").unwrap() {
             assert_eq!(*n, 123);
         } else {
             panic!("Expected number parquet.field.id");
         }
+
+        let field_invalid_id = fields[1];
+        assert_eq!(field_invalid_id.name(), "invalidId");
+        assert!(!field_invalid_id.metadata().contains_key("parquet.field.id"));
     }
 }
