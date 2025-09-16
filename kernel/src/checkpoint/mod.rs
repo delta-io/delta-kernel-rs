@@ -47,7 +47,7 @@
 //!
 //! // Create a snapshot for the table at the version you want to checkpoint
 //! let url = delta_kernel::try_parse_uri("./tests/data/app-txn-no-checkpoint")?;
-//! let snapshot = Arc::new(Snapshot::builder(url).build(engine)?);
+//! let snapshot = Snapshot::builder_for(url).build(engine)?;
 //!
 //! // Create a checkpoint writer from the snapshot
 //! let mut writer = snapshot.checkpoint()?;
@@ -102,7 +102,7 @@ use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
 use url::Url;
 
-mod log_replay;
+pub(crate) mod log_replay;
 #[cfg(test)]
 mod tests;
 
