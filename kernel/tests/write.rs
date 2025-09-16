@@ -60,7 +60,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // create a transaction
-        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // commit!
@@ -143,7 +143,7 @@ async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(engine.as_ref())?);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
     let mut txn = snapshot.transaction()?;
 
     // create two new arrow record batches to append
@@ -213,7 +213,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
-        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         txn.commit(&engine)?;
@@ -397,7 +397,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
-        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -540,7 +540,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
-        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // create two new arrow record batches to append
@@ -598,7 +598,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema, &[], None, "test_table").await?
     {
         // can't have duplicate app_id in same transaction
-        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
             snapshot
                 .transaction()?
@@ -608,7 +608,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             Err(KernelError::Generic(msg)) if msg == "app_id app_id1 already exists in transaction"
         ));
 
-        let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
             .transaction()?
             .with_engine_info("default engine")
@@ -618,11 +618,9 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         // commit!
         txn.commit(&engine)?;
 
-        let snapshot = Arc::new(
-            Snapshot::builder(table_url.clone())
-                .at_version(1)
-                .build(&engine)?,
-        );
+        let snapshot = Snapshot::builder_for(table_url.clone())
+            .at_version(1)
+            .build(&engine)?;
         assert_eq!(
             snapshot.clone().get_app_id_version("app_id1", &engine)?,
             Some(1)
@@ -631,7 +629,10 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             snapshot.clone().get_app_id_version("app_id2", &engine)?,
             Some(2)
         );
-        assert_eq!(snapshot.get_app_id_version("app_id3", &engine)?, None);
+        assert_eq!(
+            snapshot.clone().get_app_id_version("app_id3", &engine)?,
+            None
+        );
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -741,7 +742,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
@@ -875,7 +876,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
@@ -1084,7 +1085,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let mut txn = snapshot.transaction()?;
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant

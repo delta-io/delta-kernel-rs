@@ -150,12 +150,15 @@ impl TableChanges {
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
-        let start_snapshot = Arc::new(
-            Snapshot::builder(table_root.as_url().clone())
-                .at_version(start_version)
+        let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
+            .at_version(start_version)
+            .build(engine)?;
+        let end_snapshot = match end_version {
+            Some(version) => Snapshot::builder_from(start_snapshot.clone())
+                .at_version(version)
                 .build(engine)?,
-        );
-        let end_snapshot = Snapshot::try_new_from(start_snapshot.clone(), engine, end_version)?;
+            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+        };
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
