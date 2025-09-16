@@ -1,7 +1,9 @@
 //! Builder for creating [`Snapshot`] instances.
+use std::sync::Arc;
 
 use crate::log_segment::LogSegment;
-use crate::{DeltaResult, Engine, Snapshot, Version};
+use crate::snapshot::SnapshotRef;
+use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use url::Url;
 
@@ -16,22 +18,37 @@ use url::Url;
 /// let table_root = Url::parse("file:///path/to/table")?;
 ///
 /// // Build a snapshot
-/// let snapshot = Snapshot::builder(table_root.clone())
+/// let snapshot = Snapshot::builder_for(table_root.clone())
 ///     .at_version(5) // Optional: specify a time-travel version (default is latest version)
 ///     .build(engine)?;
 ///
 /// # Ok(())
 /// # }
 /// ```
+//
+// Note the SnapshotBuilder must have either a table_root or an existing_snapshot (but not both).
+// We enforce this in the constructors. We could improve this in the future with different
+// types/add type state.
+#[derive(Debug)]
 pub struct SnapshotBuilder {
-    table_root: Url,
+    table_root: Option<Url>,
+    existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
 }
 
 impl SnapshotBuilder {
     pub(crate) fn new(table_root: Url) -> Self {
         Self {
-            table_root,
+            table_root: Some(table_root),
+            existing_snapshot: None,
+            version: None,
+        }
+    }
+
+    pub(crate) fn new_from(existing_snapshot: Arc<Snapshot>) -> Self {
+        Self {
+            table_root: None,
+            existing_snapshot: Some(existing_snapshot),
             version: None,
         }
     }
@@ -43,18 +60,29 @@ impl SnapshotBuilder {
         self
     }
 
-    /// Create a new [`Snapshot`] instance.
+    /// Create a new [`Snapshot`]. This returns a [`SnapshotRef`] (`Arc<Snapshot>`), perhaps
+    /// returning a reference to an existing snapshot if the request to build a new snapshot
+    /// matches the version of an existing snapshot.
     ///
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<Snapshot> {
-        let log_segment = LogSegment::for_snapshot(
-            engine.storage_handler().as_ref(),
-            self.table_root.join("_delta_log/")?,
-            self.version,
-        )?;
-        Snapshot::try_new_from_log_segment(self.table_root, log_segment, engine)
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<Arc<Snapshot>> {
+        if let Some(table_root) = self.table_root {
+            let log_segment = LogSegment::for_snapshot(
+                engine.storage_handler().as_ref(),
+                table_root.join("_delta_log/")?,
+                self.version,
+            )?;
+            Ok(Snapshot::try_new_from_log_segment(table_root, log_segment, engine)?.into())
+        } else {
+            let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
+                Error::internal_error(
+                    "SnapshotBuilder should have either table_root or existing_snapshot",
+                )
+            })?;
+            Snapshot::try_new_from(existing_snapshot, engine, self.version)
+        }
     }
 }
 

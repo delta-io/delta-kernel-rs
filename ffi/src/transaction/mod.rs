@@ -9,7 +9,6 @@ use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
-use std::sync::Arc;
 
 /// A handle representing an exclusive transaction on a Delta table. (Similar to a Box<_>)
 ///
@@ -38,7 +37,7 @@ fn transaction_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let snapshot = Arc::new(Snapshot::builder(url?).build(extern_engine.engine().as_ref())?);
+    let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
     let transaction = snapshot.transaction();
     Ok(Box::new(transaction?).into())
 }
@@ -130,13 +129,15 @@ mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
-    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
+    use delta_kernel::transaction::add_files_schema;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
@@ -191,31 +192,7 @@ mod tests {
         path: &str,
         num_rows: i64,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        let schema = ArrowSchema::new(vec![
-            Field::new("path", ArrowDataType::Utf8, false),
-            Field::new(
-                "partitionValues",
-                ArrowDataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        ArrowDataType::Struct(
-                            vec![
-                                Field::new("key", ArrowDataType::Utf8, false),
-                                Field::new("value", ArrowDataType::Utf8, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                false,
-            ),
-            Field::new("size", ArrowDataType::Int64, false),
-            Field::new("modificationTime", ArrowDataType::Int64, false),
-            Field::new("dataChange", ArrowDataType::Boolean, false),
-            Field::new("numRecords", ArrowDataType::Int64, true),
-        ]);
+        let schema: ArrowSchema = add_files_schema().as_ref().try_into_arrow()?;
 
         let current_time: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -223,7 +200,7 @@ mod tests {
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "numRecords": {num_rows}}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": {{"numRecords": {num_rows}}}}}"#,
         );
 
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
