@@ -156,7 +156,8 @@ impl AddRemoveDedupVisitor<'_> {
                     transform.with_inserted_field(insert_after.clone(), partition_value)
                 }
                 Cdf { .. } => {
-                    // CDF fields are handled elsewhere, not in regular scan transform
+                    // CDF fields are handled by get_cdf_transform_expr() in table_changes::physical_to_logical
+                    // This regular scan transform only handles partition columns and static transforms
                     transform
                 }
             }
