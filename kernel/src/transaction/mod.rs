@@ -285,7 +285,7 @@ impl Transaction {
         engine: &'a dyn Engine,
         domain_metadatas: &'a [DomainMetadata],
         read_snapshot: &Snapshot,
-        row_tracking_high_watermark: Option<i64>,
+        row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
         // if there are domain metadata actions, the table must support it
         if !domain_metadatas.is_empty()
@@ -315,7 +315,7 @@ impl Transaction {
         }
 
         let system_domains = row_tracking_high_watermark
-            .map(|hwm| DomainMetadata::try_from(RowTrackingDomainMetadata::new(hwm)))
+            .map(DomainMetadata::try_from)
             .transpose()?
             .into_iter();
 
@@ -370,7 +370,39 @@ impl Transaction {
         &'a self,
         engine: &dyn Engine,
         commit_version: u64,
-    ) -> DeltaResult<(EngineDataResultIterator<'a>, Option<i64>)> {
+    ) -> DeltaResult<(
+        EngineDataResultIterator<'a>,
+        Option<RowTrackingDomainMetadata>,
+    )> {
+        fn build_add_actions<'a, I, T>(
+            engine: &dyn Engine,
+            add_files_metadata: I,
+            input_schema: SchemaRef,
+            output_schema: SchemaRef,
+        ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
+        where
+            I: Iterator<Item = DeltaResult<T>> + Send + 'a,
+            T: Deref<Target = dyn EngineData> + Send + 'a,
+        {
+            let evaluation_handler = engine.evaluation_handler();
+
+            add_files_metadata.map(move |add_files_batch| {
+                // Convert stats to a JSON string and nest the add action in a top-level struct
+                let adds_expr = Expression::struct_from([Expression::transform(
+                    Transform::new_top_level().with_replaced_field(
+                        "stats",
+                        Expression::unary(ToJson, Expression::column(["stats"])).into(),
+                    ),
+                )]);
+                let adds_evaluator = evaluation_handler.new_expression_evaluator(
+                    input_schema.clone(),
+                    Arc::new(adds_expr),
+                    output_schema.clone().into(),
+                );
+                adds_evaluator.evaluate(add_files_batch?.deref())
+            })
+        }
+
         if self.add_files_metadata.is_empty() {
             return Ok((Box::new(iter::empty()), None));
         }
@@ -411,7 +443,7 @@ impl Transaction {
                 },
             );
 
-            let add_actions = self.create_add_actions(
+            let add_actions = build_add_actions(
                 engine,
                 extended_add_files,
                 with_row_tracking_cols(add_files_schema()),
@@ -420,13 +452,13 @@ impl Transaction {
                 ))),
             );
 
-            Ok((
-                Box::new(add_actions),
-                Some(row_tracking_visitor.row_id_high_water_mark),
-            ))
+            let row_tracking_domain_metadata =
+                RowTrackingDomainMetadata::new(row_tracking_visitor.row_id_high_water_mark);
+
+            Ok((Box::new(add_actions), Some(row_tracking_domain_metadata)))
         } else {
             // Simple case without row tracking
-            let add_actions = self.create_add_actions(
+            let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
                 add_files_schema().clone(),
@@ -435,37 +467,6 @@ impl Transaction {
 
             Ok((Box::new(add_actions), None))
         }
-    }
-
-    /// Convert file metadata provided by the engine into protocol-compliant add actions.
-    fn create_add_actions<'a, I, T>(
-        &'a self,
-        engine: &dyn Engine,
-        add_files_metadata: I,
-        input_schema: SchemaRef,
-        output_schema: SchemaRef,
-    ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
-    where
-        I: Iterator<Item = DeltaResult<T>> + Send + 'a,
-        T: Deref<Target = dyn EngineData> + Send + 'a,
-    {
-        let evaluation_handler = engine.evaluation_handler();
-
-        add_files_metadata.map(move |add_files_batch| {
-            // Convert stats to a JSON string and nest the add action in a top-level struct
-            let adds_expr = Expression::struct_from([Expression::transform(
-                Transform::new_top_level().with_replaced_field(
-                    "stats",
-                    Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                ),
-            )]);
-            let adds_evaluator = evaluation_handler.new_expression_evaluator(
-                input_schema.clone(),
-                Arc::new(adds_expr),
-                output_schema.clone().into(),
-            );
-            adds_evaluator.evaluate(add_files_batch?.deref())
-        })
     }
 }
 

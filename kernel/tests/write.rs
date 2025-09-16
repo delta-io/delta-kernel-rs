@@ -31,7 +31,10 @@ use tempfile::tempdir;
 
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
-use test_utils::{create_table, engine_store_setup, setup_test_tables, test_read};
+use test_utils::{
+    assert_result_error_with_message, create_table, engine_store_setup, setup_test_tables,
+    test_read,
+};
 
 mod common;
 use url::Url;
@@ -1283,24 +1286,24 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
 
     // System domain rejection
     let txn = snapshot.clone().transaction()?;
-    let err = txn
+    let res = txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
-        .commit(&engine)
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("Users cannot modify system controlled metadata domains"));
+        .commit(&engine);
+    assert_result_error_with_message(
+        res,
+        "Users cannot modify system controlled metadata domains",
+    );
 
     // Duplicate domain rejection
     let txn2 = snapshot.clone().transaction()?;
-    let err = txn2
+    let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
-        .commit(&engine)
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("Metadata for domain app.config already specified in this transaction"));
+        .commit(&engine);
+    assert_result_error_with_message(
+        res,
+        "Metadata for domain app.config already specified in this transaction",
+    );
 
     Ok(())
 }
@@ -1331,14 +1334,12 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
     .await?;
 
     let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
-    let result = snapshot
+    let res = snapshot
         .transaction()?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
 
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(err.to_string().contains("Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"));
+    assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
 
     Ok(())
 }
