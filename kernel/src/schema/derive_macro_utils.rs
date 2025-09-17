@@ -142,10 +142,9 @@ mod tests {
         let metadata = field_valid_id.metadata();
         assert!(metadata.contains_key("parquet.field.id"));
 
-        if let crate::schema::MetadataValue::Number(n) = metadata.get("parquet.field.id").unwrap() {
-            assert_eq!(*n, 123);
-        } else {
-            panic!("Expected number parquet.field.id");
+        match metadata.get("parquet.field.id") {
+            Some(crate::schema::MetadataValue::Number(n)) => assert_eq!(*n, 123),
+            _ => panic!("Expected number parquet.field.id"),
         }
 
         // Test field without field_id

@@ -1,7 +1,7 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
-use syn::{parse_macro_input, Attribute, Field};
 use syn::spanned::Spanned;
+use syn::{parse_macro_input, Attribute, Field};
 use syn::{
     Data, DataStruct, DeriveInput, Error, Fields, Item, Lit, Meta, PathArguments, Type, Visibility,
 };
@@ -89,20 +89,34 @@ fn field_id_error(span: Span, message: &str) -> Error {
 
 fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
     for attr in field_attributes {
-        let Meta::NameValue(nv) = &attr.meta else { continue };
-        let Some(ident) = nv.path.get_ident() else { continue };
-        if ident != "field_id" { continue }
+        let Meta::NameValue(nv) = &attr.meta else {
+            continue;
+        };
+        let Some(ident) = nv.path.get_ident() else {
+            continue;
+        };
+        if ident != "field_id" {
+            continue;
+        }
 
         return match &nv.value {
             syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
-                Lit::Int(lit_int) => lit_int
-                    .base10_parse()
-                    .map(Some)
-                    .map_err(|e| field_id_error(lit_int.span(), &format!("failed to parse integer: {}", e))),
-                Lit::Str(lit_str) => Err(field_id_error(lit_str.span(), "must be an integer literal, not a string")),
-                _ => Err(field_id_error(expr_lit.span(), "must be an integer literal")),
+                Lit::Int(lit_int) => lit_int.base10_parse().map(Some).map_err(|e| {
+                    field_id_error(lit_int.span(), &format!("failed to parse integer: {}", e))
+                }),
+                Lit::Str(lit_str) => Err(field_id_error(
+                    lit_str.span(),
+                    "must be an integer literal, not a string",
+                )),
+                _ => Err(field_id_error(
+                    expr_lit.span(),
+                    "must be an integer literal",
+                )),
             },
-            _ => Err(field_id_error(nv.value.span(), "must be an integer literal")),
+            _ => Err(field_id_error(
+                nv.value.span(),
+                "must be an integer literal",
+            )),
         };
     }
     Ok(None)
@@ -114,7 +128,9 @@ fn gen_schema_field(field: &Field) -> TokenStream {
     let have_schema_null = field.attrs.iter().any(|attr| {
         // check if we have allow_null_container_values attr
         match &attr.meta {
-            Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "allow_null_container_values"),
+            Meta::Path(path) => path
+                .get_ident()
+                .is_some_and(|ident| ident == "allow_null_container_values"),
             _ => false,
         }
     });
@@ -125,8 +141,14 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                 let segment_ident = &segment.ident;
                 match &segment.arguments {
                     PathArguments::None => quote! { #segment_ident :: },
-                    PathArguments::AngleBracketed(angle_args) => quote! { #segment_ident::#angle_args :: },
-                    _ => Error::new(segment.arguments.span(), "Can only handle <> type path args").to_compile_error()
+                    PathArguments::AngleBracketed(angle_args) => {
+                        quote! { #segment_ident::#angle_args :: }
+                    }
+                    _ => Error::new(
+                        segment.arguments.span(),
+                        "Can only handle <> type path args",
+                    )
+                    .to_compile_error(),
                 }
             });
 
@@ -137,7 +159,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
                         return Error::new(
                             last_ident.span(),
                             format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
-                        ).to_compile_error()
+                        ).to_compile_error();
                     }
                 }
                 quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name)) }
@@ -147,12 +169,15 @@ fn gen_schema_field(field: &Field) -> TokenStream {
 
             // Then, add field-id metadata if present
             match get_field_id(&field.attrs) {
-                Ok(Some(id)) => quote_spanned! { field.span() => #base_call.add_metadata([("parquet.field.id", #id)]) },
+                Ok(Some(id)) => {
+                    quote_spanned! { field.span() => #base_call.add_metadata([("parquet.field.id", #id)]) }
+                }
                 Ok(None) => quote_spanned! { field.span() => #base_call },
-                Err(err) =>  err.to_compile_error(),
+                Err(err) => err.to_compile_error(),
             }
         }
-        _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty)).to_compile_error()
+        _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty))
+            .to_compile_error(),
     }
 }
 
@@ -364,4 +389,3 @@ mod tests {
         assert!(result.is_ok(), "Large field_id should be valid");
     }
 }
-
