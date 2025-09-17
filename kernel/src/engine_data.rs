@@ -22,6 +22,20 @@ pub struct FilteredEngineData {
     pub selection_vector: Vec<bool>,
 }
 
+impl FilteredEngineData {
+    /// Creates a new `FilteredEngineData` with all rows selected.
+    ///
+    /// This is a convenience method for the common case where you want to wrap
+    /// `EngineData` in `FilteredEngineData` without any filtering.
+    pub fn with_all_rows_selected(data: Box<dyn EngineData>) -> Self {
+        let len = data.len();
+        Self {
+            data,
+            selection_vector: vec![true; len],
+        }
+    }
+}
+
 impl HasSelectionVector for FilteredEngineData {
     /// Returns true if any row in the selection vector is marked as selected
     fn has_selected_rows(&self) -> bool {
