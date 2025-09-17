@@ -213,7 +213,7 @@ impl AddRemoveDedupVisitor<'_> {
                     insert_after,
                 } => {
                     if physical_schema.contains(column_name) {
-                        // Return the transform unchanged
+                        // Simply reorder what's in the physical data
                         transform
                             .with_dropped_field(column_name)
                             .with_inserted_field(
@@ -221,9 +221,9 @@ impl AddRemoveDedupVisitor<'_> {
                                 Expression::column([column_name.to_string()]).into(),
                             )
                     } else {
+                        // Otherwise, treat this as a metadata-derived column
                         let Some((_, partition_value)) = partition_values.remove(field_index)
                         else {
-                            println!("Physical schema: {:?}", physical_schema);
                             return Err(Error::InternalError(format!(
                                 "missing dynamic column for field index {field_index}, column name: {column_name}"
                             )));
