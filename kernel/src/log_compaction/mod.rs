@@ -75,8 +75,9 @@
 use std::sync::{Arc, LazyLock};
 
 use crate::actions::{
-    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, ADD_NAME,
+    Add, DomainMetadata, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME,
     DOMAIN_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+    SIDECAR_NAME,
 };
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 
@@ -97,5 +98,6 @@ static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
     ]))
 });

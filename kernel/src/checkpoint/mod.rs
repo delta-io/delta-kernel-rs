@@ -84,6 +84,9 @@
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock};
 
+use crate::action_reconciliation::log_replay::{
+    ActionReconciliationBatch, ActionReconciliationProcessor,
+};
 use crate::action_reconciliation::RetentionCalculator;
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
@@ -98,11 +101,9 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _}
 use crate::snapshot::Snapshot;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
-use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
 use url::Url;
 
-pub(crate) mod log_replay;
 #[cfg(test)]
 mod tests;
 
@@ -153,7 +154,8 @@ static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
 /// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 pub struct CheckpointDataIterator {
     /// The nested iterator that yields checkpoint batches with action counts
-    checkpoint_batch_iterator: Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
+    checkpoint_batch_iterator:
+        Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
     /// Running total of actions included in the checkpoint
     actions_count: i64,
     /// Running total of add actions included in the checkpoint
@@ -165,7 +167,7 @@ impl Iterator for CheckpointDataIterator {
 
     /// Advances the iterator and returns the next value.
     ///
-    /// This implementation transforms the `CheckpointBatch` items from the nested iterator into
+    /// This implementation transforms the `ActionReconciliationBatch` items from the nested iterator into
     /// [`FilteredEngineData`] items for the engine to write, while accumulating action counts from
     /// each batch. The [`CheckpointDataIterator`] is passed back to the kernel on call to
     /// [`CheckpointWriter::finalize`] for counts to be read and written to the `_last_checkpoint` file
@@ -267,7 +269,7 @@ impl CheckpointWriter {
         )?;
 
         // Create iterator over actions for checkpoint data
-        let checkpoint_data = CheckpointLogReplayProcessor::new(
+        let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
         )
@@ -354,13 +356,13 @@ impl CheckpointWriter {
     /// include the additional metadata field `tags` when map support is added.
     ///
     /// # Returns:
-    /// A [`CheckpointBatch`] batch including the single-row [`EngineData`] batch along with
+    /// A [`ActionReconciliationBatch`] batch including the single-row [`EngineData`] batch along with
     /// an accompanying selection vector with a single `true` value, indicating the action in
     /// batch should be included in the checkpoint.
     fn create_checkpoint_metadata_batch(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<CheckpointBatch> {
+    ) -> DeltaResult<ActionReconciliationBatch> {
         let checkpoint_metadata_batch = engine.evaluation_handler().create_one(
             CHECKPOINT_METADATA_ACTION_SCHEMA.clone(),
             &[Scalar::from(self.version)],
@@ -371,7 +373,7 @@ impl CheckpointWriter {
             selection_vector: vec![true], // Include the action in the checkpoint
         };
 
-        Ok(CheckpointBatch {
+        Ok(ActionReconciliationBatch {
             filtered_data,
             actions_count: 1,
             add_actions_count: 0,
