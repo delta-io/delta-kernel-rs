@@ -2783,6 +2783,77 @@ mod tests {
     }
 
     #[test]
+    fn test_to_json_bytes_filters_data() -> DeltaResult<()> {
+        // Create test data with 4 rows
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                "row0", "row1", "row2", "row3",
+            ]))],
+        )?;
+
+        // Helper function to create EngineData from the same record batch
+        let create_engine_data =
+            || -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch.clone())) };
+
+        // Test case 1: All rows selected (should include all 4 rows)
+        let all_selected = FilteredEngineData {
+            data: create_engine_data(),
+            selection_vector: vec![true, true, true, true],
+        };
+        let json_all = to_json_bytes(Box::new(std::iter::once(Ok(all_selected))))?;
+        assert_eq!(
+            json_all,
+            "{\"value\":\"row0\"}\n{\"value\":\"row1\"}\n{\"value\":\"row2\"}\n{\"value\":\"row3\"}\n".as_bytes()
+        );
+
+        // Test case 2: Only first and last rows selected (should include only 2 rows)
+        let partial_selected = FilteredEngineData {
+            data: create_engine_data(),
+            selection_vector: vec![true, false, false, true],
+        };
+        let json_partial = to_json_bytes(Box::new(std::iter::once(Ok(partial_selected))))?;
+        assert_eq!(
+            json_partial,
+            "{\"value\":\"row0\"}\n{\"value\":\"row3\"}\n".as_bytes()
+        );
+
+        // Test case 3: Only middle rows selected (should include only 2 rows)
+        let middle_selected = FilteredEngineData {
+            data: create_engine_data(),
+            selection_vector: vec![false, true, true, false],
+        };
+        let json_middle = to_json_bytes(Box::new(std::iter::once(Ok(middle_selected))))?;
+        assert_eq!(
+            json_middle,
+            "{\"value\":\"row1\"}\n{\"value\":\"row2\"}\n".as_bytes()
+        );
+
+        // Test case 4: No rows selected (should produce empty output)
+        let none_selected = FilteredEngineData {
+            data: create_engine_data(),
+            selection_vector: vec![false, false, false, false],
+        };
+        let json_none = to_json_bytes(Box::new(std::iter::once(Ok(none_selected))))?;
+        assert_eq!(json_none, "".as_bytes());
+
+        // Test case 5: Only one row selected (should include only 1 row)
+        let one_selected = FilteredEngineData {
+            data: create_engine_data(),
+            selection_vector: vec![false, true, false, false],
+        };
+        let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
+        assert_eq!(json_one, "{\"value\":\"row1\"}\n".as_bytes());
+
+        Ok(())
+    }
+
+    #[test]
     fn test_arrow_broken_nested_null_masks() {
         use crate::arrow::datatypes::{DataType, Field, Schema};
         use crate::engine::arrow_utils::fix_nested_null_masks;
