@@ -14,7 +14,7 @@ use crate::{
     utils::require,
     DeltaResult, EngineData, Error,
 };
-use crate::engine_data::FilteredEngineData,
+use crate::engine_data::FilteredEngineData;
 
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray, MapArray,
