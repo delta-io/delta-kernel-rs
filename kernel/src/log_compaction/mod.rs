@@ -10,6 +10,7 @@
 //! Log compaction creates files with the naming pattern `{start_version}.{end_version}.compacted.json`
 //! that contain the reconciled actions from all commit files in the specified version range.
 //! Only commit/compaction files that intersect with [start_version, end_version] are processed.
+//! Note that `end_version` must be greater than `start_version` (equal versions are not allowed).
 //! This is similar to checkpoints but operates on a subset of versions rather than the entire table.
 //!
 //! ## Usage
