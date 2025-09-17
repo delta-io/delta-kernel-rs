@@ -1291,7 +1291,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
         .commit(&engine);
     assert_result_error_with_message(
         res,
-        "Users cannot modify system controlled metadata domains",
+        "Cannot modify domains that start with 'delta.' as those are system controlled",
     );
 
     // Duplicate domain rejection

@@ -303,7 +303,8 @@ impl Transaction {
         for domain_metadata in domain_metadatas {
             if domain_metadata.is_internal() {
                 return Err(Error::Generic(
-                    "Users cannot modify system controlled metadata domains".to_string(),
+                    "Cannot modify domains that start with 'delta.' as those are system controlled"
+                        .to_string(),
                 ));
             }
             if !domains.insert(domain_metadata.domain()) {
