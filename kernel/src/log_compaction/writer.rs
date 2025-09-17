@@ -1,18 +1,17 @@
 use std::sync::Arc;
 
+use url::Url;
+
+use super::COMPACTION_ACTIONS_SCHEMA;
 use crate::action_reconciliation::RetentionCalculator;
+use crate::checkpoint::log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
+use crate::engine_data::FilteredEngineData;
+use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
 use crate::snapshot::Snapshot;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, Error, Version};
-
-use url::Url;
-
-use super::COMPACTION_ACTIONS_SCHEMA;
-use crate::checkpoint::log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
-use crate::engine_data::FilteredEngineData;
-use crate::log_replay::LogReplayProcessor;
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -149,12 +148,14 @@ impl LogCompactionDataIterator {
     }
 
     /// Get the total number of actions in the compaction
+    /// We don't use it currently, leaving it on as a useful observabilty feature.
     #[allow(dead_code)]
     pub(crate) fn total_actions(&self) -> i64 {
         self.actions_count
     }
 
     /// Get the total number of add actions in the compaction
+    /// We don't use it currently, leaving it on as a useful observabilty feature.
     #[allow(dead_code)]
     pub(crate) fn total_add_actions(&self) -> i64 {
         self.add_actions_count
