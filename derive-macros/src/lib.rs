@@ -88,26 +88,25 @@ fn field_id_error(span: Span, message: &str) -> Error {
 }
 
 fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
-    for attr in field_attributes {
-        let Meta::NameValue(nv) = &attr.meta else {
-            continue;
-        };
-        let Some(ident) = nv.path.get_ident() else {
-            continue;
-        };
-        if ident != "field_id" {
-            continue;
-        }
-
-        return match &nv.value {
+    field_attributes
+        .iter()
+        .filter_map(|attr| {
+            // Extract NameValue meta with field_id identifier
+            if let Meta::NameValue(nv) = &attr.meta {
+                nv.path
+                    .get_ident()
+                    .filter(|&ident| ident == "field_id")
+                    .map(|_| nv)
+            } else {
+                None
+            }
+        })
+        .next() // Get the first field_id attribute
+        .map(|nv| match &nv.value {
             syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
-                Lit::Int(lit_int) => lit_int.base10_parse().map(Some).map_err(|e| {
+                Lit::Int(lit_int) => lit_int.base10_parse().map_err(|e| {
                     field_id_error(lit_int.span(), &format!("failed to parse integer: {}", e))
                 }),
-                Lit::Str(lit_str) => Err(field_id_error(
-                    lit_str.span(),
-                    "must be an integer literal, not a string",
-                )),
                 _ => Err(field_id_error(
                     expr_lit.span(),
                     "must be an integer literal",
@@ -117,9 +116,8 @@ fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
                 nv.value.span(),
                 "must be an integer literal",
             )),
-        };
-    }
-    Ok(None)
+        })
+        .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
 }
 
 fn gen_schema_field(field: &Field) -> TokenStream {
