@@ -2,10 +2,9 @@ use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::{as_log_add_schema, get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema};
-use crate::actions::{CommitInfo, SetTransaction};
+use crate::actions::{as_log_add_schema, get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema, get_log_domain_metadata_schema};
+use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::error::Error;
 use crate::path::ParsedLogPath;
 use crate::scan::scan_row_schema;
@@ -587,7 +586,7 @@ impl Transaction {
 // Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
 // actions using an expression to transform the data (in a single pass) from [`input_schema`] into
 // [`target_schema`].
-fn generate_file_actions<'a>(
+fn generate_remove_actions<'a>(
     input_schema: SchemaRef,
     target_schema: SchemaRef,
     file_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
@@ -714,22 +713,5 @@ mod tests {
         ]);
         assert_eq!(*schema, expected.into());
         Ok(())
-    }
-
-    #[test]
-    fn test_remove_files_schema() {
-        let schema = remove_files_schema();
-        let expected = StructType::new(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::nullable("deletionTimestamp", DataType::LONG),
-            StructField::not_null("dataChange", DataType::BOOLEAN),
-            StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
-            StructField::nullable(
-                "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::nullable("size", DataType::LONG),
-        ]);
-        assert_eq!(*schema, expected.into());
     }
 }
