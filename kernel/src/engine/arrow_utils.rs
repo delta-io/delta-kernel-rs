@@ -480,9 +480,7 @@ fn get_indices(
                         &requested_field.data_type,
                         field.data_type(),
                         false,
-                    )
-                    .expect("Failed horrendously")
-                    {
+                    )? {
                         DataTypeCompat::Identical => {
                             reorder_indices.push(ReorderIndex::identity(index))
                         }
