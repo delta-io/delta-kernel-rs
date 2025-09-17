@@ -329,3 +329,73 @@ pub trait EngineData: AsAny {
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use crate::engine::arrow_data::ArrowEngineData;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_with_all_rows_selected_empty_data() {
+        // Test with empty data
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(Vec::<String>::new()))]).unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+        
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        
+        assert_eq!(filtered_data.selection_vector.len(), 0);
+        assert!(filtered_data.selection_vector.is_empty());
+        assert_eq!(filtered_data.data.len(), 0);
+    }
+
+    #[test]
+    fn test_with_all_rows_selected_single_row() {
+        // Test with single row
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["single_row"]))],
+        ).unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+        
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        
+        assert_eq!(filtered_data.selection_vector.len(), 1);
+        assert_eq!(filtered_data.selection_vector, vec![true]);
+        assert_eq!(filtered_data.data.len(), 1);
+    }
+
+    #[test]
+    fn test_with_all_rows_selected_multiple_rows() {
+        // Test with multiple rows
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["row1", "row2", "row3", "row4"]))],
+        ).unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+        
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        
+        assert_eq!(filtered_data.selection_vector.len(), 4);
+        assert_eq!(filtered_data.selection_vector, vec![true, true, true, true]);
+        assert_eq!(filtered_data.data.len(), 4);
+    }
+    
+}
