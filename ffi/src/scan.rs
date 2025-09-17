@@ -275,13 +275,27 @@ pub struct Stats {
     pub num_records: u64,
 }
 
+/// Contains information that can be used to get a selection vector. If `has_vector` is false, that
+/// indicates there is no selection vector to consider. It is always possible to get a vector out of
+/// a `DvInfo`, but if `has_vector` is false it will just be an empty vector (indicating all
+/// selected). Without this there's no way for a connector using ffi to know if a &DvInfo actually
+/// has a vector in it. We have has_vector() on the rust side, but this isn't exposed via ffi. So
+/// this just wraps the &DvInfo in another struct which includes a boolean that says if there is a
+/// dv to consider or not.  This allows engines to ignore dv info if there isn't any without needing
+/// to make another ffi call at all.
+#[repr(C)]
+pub struct CDvInfo<'a> {
+    info: &'a DvInfo,
+    has_vector: bool,
+}
+
 /// This callback will be invoked for each valid file that needs to be read for a scan.
 ///
 /// The arguments to the callback are:
 /// * `context`: a `void*` context this can be anything that engine needs to pass through to each call
 /// * `path`: a `KernelStringSlice` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
-/// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
+/// * `dv_info`: a [`CDvInfo`] struct, which allows getting the selection vector for this file
 /// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
 ///   convert it to the correct logical format. If this is `NULL`, no transform is needed.
 /// * `partition_values`: [DEPRECATED] a `HashMap<String, String>` which are partition values
@@ -290,7 +304,7 @@ type CScanCallback = extern "C" fn(
     path: KernelStringSlice,
     size: i64,
     stats: Option<&Stats>,
-    dv_info: &DvInfo,
+    dv_info: &CDvInfo,
     transform: Option<&Expression>,
     partition_map: &CStringMap,
 );
@@ -430,12 +444,16 @@ fn rust_callback(
     let stats = kernel_stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
+    let cdv_info = CDvInfo {
+        info: &dv_info,
+        has_vector: dv_info.has_vector(),
+    };
     (context.callback)(
         context.engine_context,
         kernel_string_slice!(path),
         size,
         stats.as_ref(),
-        &dv_info,
+        &cdv_info,
         transform.as_ref(),
         &partition_map,
     );
