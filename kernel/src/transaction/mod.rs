@@ -226,9 +226,8 @@ impl Transaction {
             .chain(add_actions);
 
         // Convert EngineData to FilteredEngineData with all rows selected
-        let filtered_actions = actions.map(|action_result| {
-            action_result.map(FilteredEngineData::with_all_rows_selected)
-        });
+        let filtered_actions = actions
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
 
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
