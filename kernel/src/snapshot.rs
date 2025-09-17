@@ -272,7 +272,7 @@ impl Snapshot {
     ///
     /// # Returns
     /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
-    pub fn get_log_compaction_writer(
+    pub fn log_compaction_writer(
         self: Arc<Self>,
         start_version: Version,
         end_version: Version,
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_log_compaction_writer() {
+    fn test_log_compaction_writer() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -1035,7 +1035,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
         // Test creating a log compaction writer
-        let writer = snapshot.clone().get_log_compaction_writer(0, 1).unwrap();
+        let writer = snapshot.clone().log_compaction_writer(0, 1).unwrap();
         let path = writer.compaction_path();
 
         // Verify the path format is correct
@@ -1043,7 +1043,7 @@ mod tests {
         assert!(path.to_string().ends_with(expected_filename));
 
         // Test invalid version range
-        let result = snapshot.get_log_compaction_writer(2, 1);
+        let result = snapshot.log_compaction_writer(2, 1);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
