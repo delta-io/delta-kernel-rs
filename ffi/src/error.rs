@@ -11,8 +11,9 @@ use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 // ArrowError,
 // #endif
 
-// and C will _NOT_ count that, so `EngineDataTypeError` will end up as `2`, and everything is
-// confused.  By manually specifying the values we avoid this issue.
+// and C will _NOT_ count that if `DEFINE_DEFAULT_ENGINE_BASE` isn't defined, so
+// `EngineDataTypeError` will end up as `2`, and everything is confused.  By manually specifying the
+// values we avoid this issue.
 
 #[repr(C)]
 #[derive(Debug, PartialEq)]
