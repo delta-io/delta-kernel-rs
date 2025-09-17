@@ -1,5 +1,6 @@
 //! Functionality to create and execute table changes scans over the data in the delta table
 
+use std::ops::Not;
 use std::sync::Arc;
 
 use itertools::Itertools;
@@ -7,15 +8,23 @@ use tracing::debug;
 use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
-use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
-use crate::schema::{SchemaRef, StructType};
+use crate::scan::{
+    get_transform_for_row, parse_partition_value, ColumnType, PhysicalPredicate, ScanResult,
+    TransformSpec,
+};
+use crate::schema::{SchemaRef, StructField, StructType};
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
-use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
+use super::physical_to_logical::{
+    get_cdf_columns, physical_to_logical_expr, scan_file_physical_schema,
+};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
-use super::{TableChanges, CDF_FIELDS};
+use super::{
+    TableChanges, CDF_FIELDS, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME,
+    COMMIT_VERSION_COL_NAME,
+};
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -130,6 +139,10 @@ impl TableChangesScanBuilder {
         //
         //   Both the partition columns and CDF generated columns will be filled in by evaluating an
         //   expression when transforming physical data to the logical representation.
+        let is_metadata_derived_cdf = |logical_field: &StructField| {
+            logical_field.name() == COMMIT_TIMESTAMP_COL_NAME
+                || logical_field.name() == COMMIT_VERSION_COL_NAME
+        };
         let all_fields = logical_schema
             .fields()
             .enumerate()
@@ -138,19 +151,21 @@ impl TableChangesScanBuilder {
                     .table_changes
                     .partition_columns()
                     .contains(logical_field.name())
+                    || is_metadata_derived_cdf(logical_field)
                 {
                     // Store the index into the schema for this field. When we turn it into an
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
-                    Ok(ColumnType::Partition(index))
-                } else if CDF_FIELDS
-                    .iter()
-                    .any(|field| field.name() == logical_field.name())
-                {
+                    let is_partition = is_metadata_derived_cdf(logical_field).not();
+                    Ok(ColumnType::Partition(index, is_partition))
+                } else if logical_field.name() == CHANGE_TYPE_COL_NAME {
                     // CDF Columns are generated, so they do not have a column mapping. These will
                     // be processed separately and used to build an expression when transforming physical
-                    // data to logical.
-                    Ok(ColumnType::Selected(logical_field.name().to_string()))
+                    // data to logical
+                    Ok(ColumnType::Dynamic {
+                        column_name: logical_field.name().to_string(),
+                        field_index: index,
+                    })
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
@@ -247,6 +262,7 @@ impl TableChangesScan {
         let all_fields = self.all_fields.clone();
         let physical_predicate = self.physical_predicate();
         let dv_engine_ref = engine.clone();
+        let transform = crate::scan::Scan::get_transform_spec(all_fields.as_slice());
 
         let result = scan_files
             .map(move |scan_file| {
@@ -260,7 +276,7 @@ impl TableChangesScan {
                     self.table_root(),
                     self.logical_schema(),
                     self.physical_schema(),
-                    &all_fields,
+                    &transform,
                     physical_predicate.clone(),
                 )
             }) // Iterator-Result-Iterator-Result
@@ -279,7 +295,7 @@ fn read_scan_file(
     table_root: &Url,
     logical_schema: &SchemaRef,
     physical_schema: &SchemaRef,
-    all_fields: &[ColumnType],
+    transform_spec: &TransformSpec,
     _physical_predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
@@ -287,12 +303,37 @@ fn read_scan_file(
         mut selection_vector,
     } = resolved_scan_file;
 
-    let physical_to_logical_expr =
-        physical_to_logical_expr(&scan_file, logical_schema.as_ref(), all_fields)?;
+    let mut parsed_partition_values =
+        crate::scan::log_replay::AddRemoveDedupVisitor::parse_partition_values(
+            logical_schema,
+            transform_spec,
+            &scan_file.partition_values,
+        )?;
+
+    parsed_partition_values.extend(get_cdf_columns(logical_schema, &scan_file)?.into_iter());
+
+    println!(
+        "Getting physical to logical expr for file of type: {:?}",
+        scan_file.scan_type
+    );
+
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
+    let physical_to_logical_expr =
+        crate::scan::log_replay::AddRemoveDedupVisitor::get_transform_expr(
+            transform_spec,
+            parsed_partition_values,
+            physical_schema.as_ref(),
+        )?;
+    println!("physical to logical expr: {physical_to_logical_expr:?}");
+    // let physical_to_logical_expr = physical_to_logical_expr(
+    //     &scan_file,
+    //     logical_schema.as_ref(),
+    //     physical_schema.as_ref(),
+    //     all_fields,
+    // )?;
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
-        Arc::new(physical_to_logical_expr),
+        physical_to_logical_expr,
         logical_schema.clone().into(),
     );
     // Determine if the scan file was derived from a deletion vector pair
@@ -312,8 +353,11 @@ fn read_scan_file(
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
+        println!("evaluating batch");
         // to transform the physical data into the correct logical form
         let logical = phys_to_logical_eval.evaluate(batch.as_ref());
+
+        println!("completed transformation");
         let len = logical.as_ref().map_or(0, |res| res.len());
         // need to split the dv_mask. what's left in dv_mask covers this result, and rest
         // will cover the following results. we `take()` out of `selection_vector` to avoid

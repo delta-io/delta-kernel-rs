@@ -116,8 +116,10 @@ impl EnsureDataTypes {
                 let mut found_fields = 0;
                 // ensure that for the fields that we found, the types match
                 for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
-                    self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
-                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+                    self.ensure_nullability_and_metadata(kernel_field, arrow_field)
+                        .expect("failed to do field: {kernel_field:?}");
+                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())
+                        .expect("failed to do field: {kernel_field:?}");
                     found_fields += 1;
                 }
 

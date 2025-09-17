@@ -314,11 +314,16 @@ pub(crate) enum ColumnType {
     // A column, selected from the data, as is
     Selected(String),
     // A partition column that needs to be added back in
-    Partition(usize),
+    Partition(usize, bool),
+
+    Dynamic {
+        column_name: String,
+        field_index: usize,
+    },
 }
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
-type TransformSpec = Vec<FieldTransformSpec>;
+pub type TransformSpec = Vec<FieldTransformSpec>;
 
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
@@ -358,7 +363,16 @@ pub(crate) enum FieldTransformSpec {
     /// Inserts a partition column after the named input column. The partition column is identified
     /// by its field index in the logical table schema (the column is not present in the physical
     /// read schema). Its value varies from file to file and is obtained from file metadata.
-    PartitionColumn {
+    MetadataDerivedColumn {
+        is_partition: bool,
+        field_index: usize,
+        insert_after: Option<String>,
+    },
+
+    // Inserts a column based on whether it exists in the physical schema. If not physically present, pull from
+    // partition values
+    DynamicColumn {
+        column_name: String,
         field_index: usize,
         insert_after: Option<String>,
     },
@@ -477,7 +491,7 @@ impl Scan {
     /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
     /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
     /// from input to output unchanged and in the same relative order.
-    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
+    pub fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
         let mut transform_spec = TransformSpec::new();
         let mut last_physical_field: Option<&str> = None;
 
@@ -487,12 +501,21 @@ impl Scan {
                     // Track physical field for calculating partition value insertion points.
                     last_physical_field = Some(physical_name);
                 }
-                ColumnType::Partition(logical_idx) => {
-                    transform_spec.push(FieldTransformSpec::PartitionColumn {
+                ColumnType::Partition(logical_idx, is_partition) => {
+                    transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
+                        is_partition: *is_partition,
                         insert_after: last_physical_field.map(String::from),
                         field_index: *logical_idx,
                     });
                 }
+                ColumnType::Dynamic {
+                    column_name,
+                    field_index,
+                } => transform_spec.push(FieldTransformSpec::DynamicColumn {
+                    column_name: column_name.to_string(),
+                    field_index: *field_index,
+                    insert_after: last_physical_field.map(String::from),
+                }),
             }
         }
 
@@ -678,6 +701,7 @@ impl Scan {
             engine,
             action_batch_iter,
             self.logical_schema.clone(),
+            self.physical_schema.clone(),
             static_transform,
             physical_predicate,
         );
@@ -881,7 +905,7 @@ impl StateInfo {
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
                     have_partition_cols = true;
-                    Ok(ColumnType::Partition(index))
+                    Ok(ColumnType::Partition(index, true))
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
@@ -1030,6 +1054,7 @@ pub(crate) mod test_utils {
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            logical_schema.clone(),
             logical_schema,
             transform_spec,
             None,
