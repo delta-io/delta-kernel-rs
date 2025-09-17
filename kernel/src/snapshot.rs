@@ -60,7 +60,7 @@ impl Snapshot {
     /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
     /// using
     pub fn builder_for(table_root: Url) -> SnapshotBuilder {
-        SnapshotBuilder::new(table_root)
+        SnapshotBuilder::new_for(table_root)
     }
 
     /// Create a new [`SnapshotBuilder`] to incrementally update a [`Snapshot`] to a more recent

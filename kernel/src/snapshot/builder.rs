@@ -37,7 +37,7 @@ pub struct SnapshotBuilder {
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new(table_root: Url) -> Self {
+    pub(crate) fn new_for(table_root: Url) -> Self {
         Self {
             table_root: Some(table_root),
             existing_snapshot: None,
@@ -185,10 +185,10 @@ mod tests {
         let engine = engine.as_ref();
         create_table(&store, &table_root)?;
 
-        let snapshot = SnapshotBuilder::new(table_root.clone()).build(engine)?;
+        let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
         assert_eq!(snapshot.version(), 1);
 
-        let snapshot = SnapshotBuilder::new(table_root.clone())
+        let snapshot = SnapshotBuilder::new_for(table_root.clone())
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
