@@ -42,6 +42,15 @@ pub(crate) enum LogPathFileType {
     Unknown,
 }
 
+/// A ParsedLogPath is a well-understood path to a file in the _delta_log directory.
+///
+/// Note this includes things like checkpoints and commits (containing current table state), but
+/// also files used for various optimizations like CRC, compaction, etc.
+///
+/// Every parsed log path has a version. And additionally, we implement a 'should_list' method
+/// which controls whether or not we include this file in our listing. For example, when we list
+/// the _delta_log we may see _staged_commits/00000000000000000000.{uuid}.json, but we MUST NOT
+/// include those in listing, as only the catalog can tell us which are valid commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
@@ -166,6 +175,19 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             version,
             file_type,
         }))
+    }
+
+    pub(crate) fn should_list(&self) -> bool {
+        match self.file_type {
+            LogPathFileType::Commit
+            | LogPathFileType::SinglePartCheckpoint
+            | LogPathFileType::UuidCheckpoint(_)
+            | LogPathFileType::MultiPartCheckpoint { .. }
+            | LogPathFileType::CompactedCommit { .. }
+            | LogPathFileType::Crc
+            | LogPathFileType::Unknown => true,
+            LogPathFileType::StagedCommit => false,
+        }
     }
 
     #[internal_api]
@@ -749,4 +771,7 @@ mod tests {
         assert!(!log_path.is_checkpoint());
         assert!(log_path.is_unknown());
     }
+
+    #[test]
+    fn test_should_list() {}
 }
