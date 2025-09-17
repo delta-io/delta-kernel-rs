@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use delta_kernel::engine::to_json_bytes;
+use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
 use test_utils::{create_table, engine_store_setup};
@@ -118,7 +119,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     // bu this is intentional, as most engines would be implementing something similar
     let compaction_data_iter = compacted_data_batches
         .into_iter()
-        .map(|batch| Ok(batch.data));
+        .map(|batch| Ok(FilteredEngineData::with_all_rows_selected(batch.data)));
     let json_bytes = to_json_bytes(compaction_data_iter)?;
     let final_content = String::from_utf8(json_bytes)?;
 
