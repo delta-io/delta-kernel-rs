@@ -1,4 +1,4 @@
-error: field_id must be an integer literal
+error: field_id error: must be an integer literal
   --> tests/field_id_validation/float_literal.rs:12:18
    |
 12 |     #[field_id = 123.45]  // Should be integer, not float

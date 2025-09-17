@@ -1,4 +1,4 @@
-error: field_id must be an integer literal, not a string
+error: field_id error: must be an integer literal, not a string
   --> tests/field_id_validation/string_literal.rs:12:18
    |
 12 |     #[field_id = "123"]  // Should be integer, not string

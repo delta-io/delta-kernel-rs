@@ -1,4 +1,4 @@
-error: field_id must be an integer literal
+error: field_id error: must be an integer literal
   --> tests/field_id_validation/boolean_literal.rs:12:18
    |
 12 |     #[field_id = true]  // Should be integer, not boolean
