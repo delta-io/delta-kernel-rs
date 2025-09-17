@@ -1,3 +1,9 @@
+error: field_id error: must be an integer literal
+  --> tests/field_id_validation/boolean_literal.rs:12:18
+   |
+12 |     #[field_id = true]  // Should be integer, not boolean
+   |                  ^^^^
+
 error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
   --> tests/field_id_validation/boolean_literal.rs:10:10
    |

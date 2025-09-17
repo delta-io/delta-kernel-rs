@@ -102,20 +102,17 @@ fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
             }
         })
         .next() // Get the first field_id attribute
-        .map(|nv| match &nv.value {
-            syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
-                Lit::Int(lit_int) => lit_int.base10_parse().map_err(|e| {
+        .map(|nv| {
+            let span = nv.value.span();
+            match &nv.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: Lit::Int(lit_int),
+                    ..
+                }) => lit_int.base10_parse().map_err(|e| {
                     field_id_error(lit_int.span(), &format!("failed to parse integer: {}", e))
                 }),
-                _ => Err(field_id_error(
-                    expr_lit.span(),
-                    "must be an integer literal",
-                )),
-            },
-            _ => Err(field_id_error(
-                nv.value.span(),
-                "must be an integer literal",
-            )),
+                _ => Err(field_id_error(span, "must be an integer literal")),
+            }
         })
         .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
 }
