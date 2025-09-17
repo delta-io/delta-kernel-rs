@@ -3,15 +3,19 @@ use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::{as_log_add_schema, get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema, get_log_domain_metadata_schema};
+use crate::actions::{as_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema, get_log_domain_metadata_schema};
 use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
+use crate::arrow::array::BooleanArray;
+use crate::arrow::compute::filter_record_batch;
+use crate::engine::arrow_data::{ArrowEngineData, extract_record_batch};
+use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::path::ParsedLogPath;
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType,MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version,
+    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, RowVisitor, Version
 };
 
 use url::Url;
@@ -118,7 +122,7 @@ pub struct Transaction {
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
-    remove_files_metadata: Vec<Box<dyn EngineData>>,
+    remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -205,10 +209,6 @@ impl Transaction {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        // Step 3: Generate add actions with or without row tracking metadata
-
-        let commit_info_action = commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
-               
         // step two: set new commit version (current_version + 1) and path to write
         let commit_version = self.read_snapshot.version() + 1;
         let add_actions = if self
@@ -226,10 +226,10 @@ impl Transaction {
             )
         };
         let remove_actions = generate_remove_actions(
-            engine,
-            self.remove_files_metadata.iter().map(|a| Ok(a.deref())),
             scan_row_schema().clone(),
             get_log_remove_schema().clone(),
+            self.remove_files_metadata.iter(),
+            engine,
         );
 
         // Step 4: Commit the actions as a JSON file to the Delta log
@@ -476,11 +476,14 @@ impl Transaction {
     /// delete data (at file-level granularity) from the table. Note that this API can be called
     /// multiple times to remove multiple batches.
     ///
-    /// The expected schema for `remove_metadata` is given by [`remove_files_schema`].
-    pub fn remove_files(&mut self, remove_metadata: Box<dyn EngineData>) {
+    /// the expected schema for `remove_metadata` is given by [`scan_row_schema`] it, is expected
+    /// this will be the result of passing [`FilteredEngineData`] returned from a scan
+    /// with rows modified for removal.
+    pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
         self.remove_files_metadata.push(remove_metadata);
     }
 }
+
 
 // Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
 // actions using an expression to transform the data (in a single pass) from [`input_schema`] into
@@ -488,7 +491,7 @@ impl Transaction {
 fn generate_remove_actions<'a>(
     input_schema: SchemaRef,
     target_schema: SchemaRef,
-    file_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
+    file_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
     engine: &dyn Engine,
 ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
     let evaluation_handler = engine.evaluation_handler();
@@ -503,7 +506,13 @@ fn generate_remove_actions<'a>(
             Arc::new(file_action_expr),
             target_schema.clone().into(),
         );
-        file_action_eval.evaluate(file_metadata_batch)
+        // Extract the underlying data and apply the selection vector to get only selected rows
+        let batch = extract_record_batch(&*file_metadata_batch.data)?;
+        let filtered_batch = filter_record_batch(batch, &BooleanArray::from(file_metadata_batch.selection_vector.clone()))
+            .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
+        let filtered_engine_data = Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>;
+        
+        file_action_eval.evaluate(&*filtered_engine_data)
     })
 }
 
