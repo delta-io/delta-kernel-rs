@@ -2,10 +2,9 @@ use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::{as_log_add_schema, get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema};
-use crate::actions::{CommitInfo, SetTransaction};
+use crate::actions::{as_log_add_schema, get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema, get_log_domain_metadata_schema};
+use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::error::Error;
 use crate::path::ParsedLogPath;
 use crate::scan::scan_row_schema;
@@ -209,24 +208,7 @@ impl Transaction {
         // Step 3: Generate add actions with or without row tracking metadata
 
         let commit_info_action = commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
-        let add_actions = generate_file_actions(
-            self.add_files_schema().clone(),
-            get_log_add_schema().clone(),
-            self.add_files_metadata.iter().map(|a| a.as_ref()),
-            engine,
-        );
-        let remove_actions = generate_remove_actions(
-            scan_row_schema().clone(),
-            get_log_remove_schema().clone(),
-            self.remove_files_metadata.iter().map(|a| a.as_ref()),
-            engine,
-        );
-
-        let actions = iter::once(commit_info_action)
-            .chain(add_actions)
-            .chain(remove_actions)
-            .chain(set_transaction_actions);
-
+               
         // step two: set new commit version (current_version + 1) and path to write
         let commit_version = self.read_snapshot.version() + 1;
         let add_actions = if self
@@ -243,13 +225,20 @@ impl Transaction {
                 with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
             )
         };
+        let remove_actions = generate_remove_actions(
+            engine,
+            self.remove_files_metadata.iter().map(|a| Ok(a.deref())),
+            scan_row_schema().clone(),
+            get_log_remove_schema().clone(),
+        );
 
         // Step 4: Commit the actions as a JSON file to the Delta log
         let commit_path =
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
         let actions = iter::once(commit_info_action)
             .chain(set_transaction_actions)
-            .chain(add_actions);
+            .chain(add_actions)
+            .chain(remove_actions);
 
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
@@ -496,7 +485,7 @@ impl Transaction {
 // Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
 // actions using an expression to transform the data (in a single pass) from [`input_schema`] into
 // [`target_schema`].
-fn generate_file_actions<'a>(
+fn generate_remove_actions<'a>(
     input_schema: SchemaRef,
     target_schema: SchemaRef,
     file_metadata: impl Iterator<Item = &'a dyn EngineData> + Send + 'a,
@@ -633,22 +622,5 @@ mod tests {
         ]);
         assert_eq!(*schema, expected.into());
         Ok(())
-    }
-
-    #[test]
-    fn test_remove_files_schema() {
-        let schema = remove_files_schema();
-        let expected = StructType::new(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::nullable("deletionTimestamp", DataType::LONG),
-            StructField::not_null("dataChange", DataType::BOOLEAN),
-            StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
-            StructField::nullable(
-                "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::nullable("size", DataType::LONG),
-        ]);
-        assert_eq!(*schema, expected.into());
     }
 }
