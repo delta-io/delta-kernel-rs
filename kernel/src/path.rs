@@ -773,5 +773,41 @@ mod tests {
     }
 
     #[test]
-    fn test_should_list() {}
+    fn test_should_list() {
+        let mut path = ParsedLogPath {
+            location: table_log_dir_url(),
+            filename: "".to_string(),
+            extension: "".to_string(),
+            version: 0,
+            file_type: LogPathFileType::Commit,
+        };
+
+        for (file_type, should_list) in [
+            (LogPathFileType::Commit, true),
+            (LogPathFileType::StagedCommit, false),
+            (LogPathFileType::SinglePartCheckpoint, true),
+            (
+                LogPathFileType::UuidCheckpoint("some-uuid".to_string()),
+                true,
+            ),
+            (
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 1,
+                    num_parts: 2,
+                },
+                true,
+            ),
+            (LogPathFileType::CompactedCommit { hi: 10 }, true),
+            (LogPathFileType::Crc, true),
+            (LogPathFileType::Unknown, true),
+        ] {
+            path.file_type = file_type;
+            assert_eq!(
+                path.should_list(),
+                should_list,
+                "file_type: {:?}",
+                path.file_type
+            );
+        }
+    }
 }
