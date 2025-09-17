@@ -842,6 +842,26 @@ pub trait DataSkippingPredicateEvaluator {
         inverted: bool,
     ) -> Option<Self::Output> {
         let max = self.get_max_stat(col, &val.data_type())?;
+
+        // Delta Lake min/max stats are stored with millisecond precision (truncated, not rounded up), so we can't use direct comparison.
+        // For max stats comparison, we adjust timestamp values by subtracting 999 microseconds from the value to ensure
+        // that comparisons against max stats are correct. Any rows that pass this filter will be re-evaluated later for exact matches.
+        // See:
+        // - https://github.com/delta-io/delta-kernel-rs/pull/1003
+        if matches!(val, Scalar::Timestamp(_) | Scalar::TimestampNtz(_)) {
+            match ord {
+                Ordering::Greater | Ordering::Less => {
+                    let max_ts_adjusted = timestamp_subtract(val, 999);
+                    tracing::debug!(
+                        "Adjusted timestamp value for col {col} for max stat comparison from {val:?} to {max_ts_adjusted:?}"
+                    );
+                    return self.eval_partial_cmp(ord, max, &max_ts_adjusted, inverted);
+                }
+                // Equality comparison can't be applied as max stats is truncated to milliseconds, so actual microsecond value is unknown.
+                Ordering::Equal => return None,
+            }
+        }
+
         self.eval_partial_cmp(ord, max, val, inverted)
     }
 
@@ -984,5 +1004,14 @@ impl<T: DataSkippingPredicateEvaluator + ?Sized> KernelPredicateEvaluator for T 
         inverted: bool,
     ) -> Option<Self::Output> {
         self.finish_eval_pred_junction(op, preds, inverted)
+    }
+}
+
+/// Adjust timestamp value by subtracting the given interval in microseconds.
+fn timestamp_subtract(val: &Scalar, interval_micros: i64) -> Scalar {
+    match val {
+        Scalar::Timestamp(ts) => Scalar::Timestamp(*ts - interval_micros),
+        Scalar::TimestampNtz(ts) => Scalar::TimestampNtz(*ts - interval_micros),
+        _ => val.clone(),
     }
 }
