@@ -278,7 +278,11 @@ pub struct Stats {
 /// Contains information that can be used to get a selection vector. If `has_vector` is false, that
 /// indicates there is no selection vector to consider. It is always possible to get a vector out of
 /// a `DvInfo`, but if `has_vector` is false it will just be an empty vector (indicating all
-/// selected).
+/// selected). Without this there's no way for a connector using ffi to know if a &DvInfo actually
+/// has a vector in it. We have has_vector() on the rust side, but this isn't exposed via ffi. So
+/// this just wraps the &DvInfo in another struct which includes a boolean that says if there is a
+/// dv to consider or not.  This allows engines to ignore dv info if there isn't any without needing
+/// to make another ffi call at all.
 #[repr(C)]
 pub struct CDvInfo<'a> {
     info: &'a DvInfo,
