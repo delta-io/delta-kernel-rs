@@ -222,7 +222,7 @@ impl Transaction {
 
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions.map(|action_result| {
-            action_result.map(|action| FilteredEngineData::with_all_rows_selected(action))
+            action_result.map(FilteredEngineData::with_all_rows_selected)
         });
 
         let json_handler = engine.json_handler();

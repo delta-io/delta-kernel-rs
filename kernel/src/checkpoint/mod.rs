@@ -336,7 +336,7 @@ impl CheckpointWriter {
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
-        let filtered_data = data.map(|data| FilteredEngineData::with_all_rows_selected(data));
+        let filtered_data = data.map(FilteredEngineData::with_all_rows_selected);
         engine.json_handler().write_json_file(
             &last_checkpoint_path,
             Box::new(std::iter::once(filtered_data)),
