@@ -69,6 +69,9 @@ pub(crate) enum ReaderFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    #[strum(serialize = "metadataTree-preview")]
+    #[serde(rename = "metadataTree-preview")]
+    MetadataTreePreview,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -155,6 +158,9 @@ pub(crate) enum WriterFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+    #[strum(serialize = "metadataTree-experimental")]
+    #[serde(rename = "metadataTree-experimental")]
+    MetadataTreeExperimental,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -219,6 +225,7 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
         // `STRUCT<metadata: BINARY, value: BINARY>` representation if parquet readers of
         // third-party engines support it.
         ReaderFeature::VariantShreddingPreview,
+        ReaderFeature::MetadataTreePreview,
     ]
 });
 
@@ -239,6 +246,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::VariantType,
         WriterFeature::VariantTypePreview,
         WriterFeature::VariantShreddingPreview,
+        ReaderFeature::MetadataTreeExperimental,
     ]
 });
 
