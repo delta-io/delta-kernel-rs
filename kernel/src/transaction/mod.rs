@@ -4,11 +4,12 @@ use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::actions::{get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema};
+use crate::actions::{as_log_add_schema, get_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema};
 use crate::actions::{CommitInfo, SetTransaction};
 use crate::error::Error;
 use crate::path::ParsedLogPath;
-use crate::schema::{MapType, SchemaRef, StructField, StructType};
+use crate::scan::scan_row_schema;
+use crate::schema::{ArrayType,MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::Snapshot;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, Version,
@@ -22,16 +23,12 @@ use crate::actions::{
 };
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
+
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
-use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
-use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version,
-};
 
 /// Type alias for an iterator of [`EngineData`] results.
 type EngineDataResultIterator<'a> =
@@ -109,16 +106,6 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
         StructField::nullable("defaultRowCommitVersion", DataType::LONG),
     ]);
     Arc::new(StructType::new_unchecked(fields))
-}
-
-/// This function specifies the schema for the remove_files metadata.
-/// Concretely, it is the expected schema for engine data passed to [`remove_files`].
-///
-/// Each row represents metadata about a file to be removed from the table.
-///
-/// [`remove_files`]: crate::transaction::Transaction::remove_files
-pub fn remove_files_schema() -> &'static SchemaRef {
-    &REMOVE_FILES_SCHEMA
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -231,9 +218,9 @@ impl Transaction {
 
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
 
-        let commit_info_action = commit_info.into_engine_data(commit_info_schema, engine);
+        let commit_info_action = commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
         let add_actions = generate_file_actions(
-            add_files_schema().clone(),
+            self.add_files_schema().clone(),
             get_log_add_schema().clone(),
             self.add_files_metadata.iter().map(|a| a.as_ref()),
             engine,
@@ -256,7 +243,7 @@ impl Transaction {
             .chain(domain_metadata_actions);
 
         let remove_actions = generate_remove_actions(
-            remove_files_schema().clone(),
+            scan_row_schema().clone(),
             get_log_remove_schema().clone(),
             self.remove_files_metadata.iter().map(|a| a.as_ref()),
             engine,
