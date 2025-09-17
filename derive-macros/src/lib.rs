@@ -90,18 +90,11 @@ fn field_id_error(span: Span, message: &str) -> Error {
 fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
     field_attributes
         .iter()
-        .filter_map(|attr| {
-            // Extract NameValue meta with field_id identifier
-            if let Meta::NameValue(nv) = &attr.meta {
-                nv.path
-                    .get_ident()
-                    .filter(|&ident| ident == "field_id")
-                    .map(|_| nv)
-            } else {
-                None
-            }
+        .filter_map(|attr| match &attr.meta {
+            Meta::NameValue(nv) => Some(nv),
+            _ => None,
         })
-        .next() // Get the first field_id attribute
+        .find(|nv| matches!(nv.path.get_ident(), Some(ident) if ident == "field_id"))
         .map(|nv| {
             let span = nv.value.span();
             match &nv.value {
