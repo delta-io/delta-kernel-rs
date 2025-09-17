@@ -277,6 +277,20 @@ impl Transaction {
         self
     }
 
+    /// Remove domain metadata from the Delta log.
+    /// This creates a tombstone to logically delete the specified domain. We don't check
+    /// if the domain metadata exists in the log, the remove action is simply a tombstone record.
+    /// Note that each domain can only appear once per transaction. That is, multiple operations
+    /// on the same domain are disallowed in a single transaction, as well as setting and removing
+    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
+    /// fail (that is, we don't eagerly check domain validity here).
+    /// Removing metadata for multiple distinct domains is allowed.
+    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+        self.domain_metadatas
+            .push(DomainMetadata::remove(domain.clone()));
+        self
+    }
+
     /// Generate domain metadata actions with validation. Handle both user and system domains.
     fn generate_domain_metadata_actions<'a>(
         &'a self,
