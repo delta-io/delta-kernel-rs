@@ -1,66 +1,34 @@
 //! The `KernelSchemaVisitor` defines a visitor system to allow engines to build kernel-native
 //! representations of schemas for projection pushdown during scans.
-//!
+//! 
 //! The model is ID based. When the engine wants to create a schema element, it calls the appropriate
-//! visitor function which returns an `id` ([`usize`]). This ID can be passed to other visitor
-//! functions to reference that element when building complex types.
-//!
-//! Every schema element created belongs to one of two categories: Fields (named elements with
-//! nullability) or DataTypes (anonymous type information for use in complex types).
-//!  1. **Fields** are created by `visit_schema_*` functions and represent named schema columns
-//!  2. **DataTypes** are created by `create_*_type` functions and represent type information for
-//!     use as array elements, map keys/values, or struct field types
-//!  3. **Complex types** (arrays, maps, structs) reference other elements by their IDs
-//!  4. **Final schema** is built by combining field IDs into a complete table schema, which is
-//!     represented as a `DataType::Struct`
-//!
-//! Note: IDs are consumed when used - each element takes ownership of its referenced child elements.
-//!
-//! ## Construction Pattern
-//!
-//! Building a schema requires creating elements in dependency order: referenced elements must be
-//! created before the elements that reference them.
-//!
-//! ```ignore
-//! // Create simple fields directly
-//! let name_field = visit_schema_string(state, "name", false, allocator);
-//!
-//! // Create DataTypes for use in complex types
-//! let double_type = create_double_type(state, allocator);
-//! let string_key_type = create_string_type(state, allocator);
-//! let string_val_type = create_string_type(state, allocator);
-//!
-//! // Create complex fields that reference the DataTypes
-//! let scores_field = visit_schema_array(state, "scores", double_type, false, false, allocator);
-//! let metadata_field = visit_schema_map(state, "metadata", string_key_type, string_val_type, false, false, allocator);
-//!
-//! // Build final schema from field IDs
-//! let field_ids = [name_field, scores_field, metadata_field];
-//! let schema_id = build_kernel_schema(state, field_ids.as_ptr(), 3, allocator);
-//! ```
-//!
-//! ## Element Types
-//!
-//! The visitor manages two types of schema elements:
-//! - **Field**: Complete named field with type and nullability (for table columns)
-//! - **DataType**: Type information only (for array elements, map keys/values, nested structs)
-//!
-//! Top-level schemas are represented as `DataType::Struct(StructType)`.
-//!
-//! TODO: Add support for metadata on schema fields. Currently metadata is ignored,
-//! but Delta fields can have typed metadata (String, Number, Boolean, JSON).
-//! The FFI interface needs to be extended to support these types.
-
+//! visitor function which constructs the analgous kernel schema element and returns an `id` (`usize`).
+//! That ID is passed to other visitor functions to reference that element when building complex types.
+//! 
+//! Every schema element belongs to one of two categories. Fields (named elements with nullability)
+//! or DataTypes (anonymous type information for use in complex types).
+//! 1. **Fields** are created by `visit_schema_*` functions and represent named schema columns.
+//! 2. **DataTypes** are created by `visit_*_type` functions and represent type information for use
+//!    as array elements, map keys/values, or struct field type.
+//! 3. **Complex types** (arrays, maps, structs) reference other elements by their IDs
+//! 4. The final schema is built by combining the fields IDs of the top-level schema, and is represented
+//!     as a DataType::Struct.
+//! 
+//! Note: IDs are consumed when used. Each element takes ownership of its referenced child elements.
+//! 
+//! Building a schema requires creating elements in dependency order. Referenced elements must be constructed
+//! before the elements that reference them. In other words, children must be created before parents.
 
 use crate::{AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet, TryFromStringSlice};
 use delta_kernel::schema::{
     ArrayType, DataType, DecimalType, MapType, PrimitiveType, StructField, StructType,
 };
-use delta_kernel::DeltaResult;
+use delta_kernel::{DeltaResult, Error};
 
-/// Element types that can be built during schema construction
-///
-/// Note: Top-level schemas are represented as `DataType::Struct(StructType)`
+/// The different types of schema elements.
+/// 1. **Field** is a complete field (name + type + nullability)
+/// 2. **DataType** is a data type (primitive, array, map, struct, etc.)
+/// The final schema is represented as a DataType::Struct.
 pub(crate) enum SchemaElement {
     /// A complete field (name + type + nullability)
     Field(StructField),
@@ -103,8 +71,8 @@ fn unwrap_data_type(state: &mut KernelSchemaVisitorState, type_id: usize) -> Opt
     }
 }
 
-/// Extract the final schema from the visitor state
-/// The schema must be stored as DataType::Struct - no coercion is performed
+/// Extract the final schema from the visitor state.
+/// The schema must be stored as DataType::Struct. No coercion is performed.
 pub fn unwrap_kernel_schema(
     state: &mut KernelSchemaVisitorState,
     schema_id: usize,
@@ -220,42 +188,6 @@ pub unsafe extern "C" fn visit_schema_integer(
         .into_extern_result(&allocate_error)
 }
 
-/// Visit a boolean field. Boolean fields store true/false values.
-///
-/// # Safety
-///
-/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
-#[no_mangle]
-pub unsafe extern "C" fn visit_schema_boolean(
-    state: &mut KernelSchemaVisitorState,
-    name: KernelStringSlice,
-    nullable: bool,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_schema_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable)
-        .into_extern_result(&allocate_error)
-}
-
-/// Visit a double field. Double fields store 64-bit floating point numbers.
-///
-/// # Safety
-///
-/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-/// and `allocate_error` function pointer.
-#[no_mangle]
-pub unsafe extern "C" fn visit_schema_double(
-    state: &mut KernelSchemaVisitorState,
-    name: KernelStringSlice,
-    nullable: bool,
-    allocate_error: AllocateErrorFn,
-) -> ExternResult<usize> {
-    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_schema_primitive_impl(state, name_str, PrimitiveType::Double, nullable)
-        .into_extern_result(&allocate_error)
-}
-
 /// Visit a short field. Short fields store 16-bit signed integers.
 ///
 /// # Safety
@@ -307,6 +239,42 @@ pub unsafe extern "C" fn visit_schema_float(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
     visit_schema_primitive_impl(state, name_str, PrimitiveType::Float, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a double field. Double fields store 64-bit floating point numbers.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_schema_double(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_schema_primitive_impl(state, name_str, PrimitiveType::Double, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a boolean field. Boolean fields store true/false values.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_schema_boolean(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_schema_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable)
         .into_extern_result(&allocate_error)
 }
 
@@ -413,7 +381,7 @@ fn visit_schema_decimal_impl(
     let name_str = name?.to_string();
 
     let decimal_type = DecimalType::try_new(precision, scale)
-        .map_err(|e| delta_kernel::Error::generic(format!("Invalid decimal type precision/scale: {}", e)))?;
+        .map_err(|e| Error::generic(format!("Invalid decimal type precision/scale: {}", e)))?;
     let field = StructField::new(name_str, DataType::Primitive(PrimitiveType::Decimal(decimal_type)), nullable);
 
     Ok(wrap_field(state, field))
@@ -460,7 +428,7 @@ fn visit_schema_struct_impl(
         if let Some(field) = unwrap_field(state, field_id) {
             field_vec.push(field);
         } else {
-            return Err(delta_kernel::Error::generic(format!("Invalid field ID {} in struct", field_id)));
+            return Err(Error::generic(format!("Invalid field ID {} in struct", field_id)));
         }
     }
 
@@ -472,12 +440,12 @@ fn visit_schema_struct_impl(
 
 /// Visit an array field. Array fields store ordered sequences of elements of the same type.
 ///
-/// The `element_type_id` must reference a DataType created by a previous `create_*_type` call.
+/// The `element_type_id` must reference a DataType created by a previous `visit_*_type` call.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `element_type_id` from
-/// previous `create_*_type` call, and `allocate_error` function pointer.
+/// previous `visit_*_type` call, and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_schema_array(
     state: &mut KernelSchemaVisitorState,
@@ -502,7 +470,7 @@ fn visit_schema_array_impl(
     let name_str = name?.to_string();
 
     let element_type = unwrap_data_type(state, element_type_id)
-        .ok_or_else(|| delta_kernel::Error::generic(format!("Invalid element type ID {} for array", element_type_id)))?;
+        .ok_or_else(|| Error::generic(format!("Invalid element type ID {} for array", element_type_id)))?;
 
     let array_type = ArrayType::new(element_type, contains_null);
     let field = StructField::new(name_str, array_type, nullable);
@@ -512,12 +480,12 @@ fn visit_schema_array_impl(
 
 /// Visit a map field. Map fields store key-value pairs where all keys have the same type and all values have the same type.
 ///
-/// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `create_*_type` calls.
+/// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `visit_*_type` calls.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and `value_type_id`
-/// from previous `create_*_type` calls, and `allocate_error` function pointer.
+/// from previous `visit_*_type` calls, and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_schema_map(
     state: &mut KernelSchemaVisitorState,
@@ -544,10 +512,10 @@ fn visit_schema_map_impl(
     let name_str = name?.to_string();
 
     let key_type = unwrap_data_type(state, key_type_id)
-        .ok_or_else(|| delta_kernel::Error::generic(format!("Invalid key type ID {} for map", key_type_id)))?;
+        .ok_or_else(|| Error::generic(format!("Invalid key type ID {} for map", key_type_id)))?;
 
     let value_type = unwrap_data_type(state, value_type_id)
-        .ok_or_else(|| delta_kernel::Error::generic(format!("Invalid value type ID {} for map", value_type_id)))?;
+        .ok_or_else(|| Error::generic(format!("Invalid value type ID {} for map", value_type_id)))?;
 
     let map_type = MapType::new(key_type, value_type, value_contains_null);
     let field = StructField::new(name_str, map_type, nullable);
@@ -587,7 +555,7 @@ fn visit_schema_variant_impl(
     // Extract the struct type for the variant
     let variant_struct = match state.elements.take(variant_struct_id) {
         Some(SchemaElement::DataType(DataType::Struct(s))) => *s,
-        _ => return Err(delta_kernel::Error::generic(format!("Invalid variant struct ID {} - must be DataType::Struct", variant_struct_id))),
+        _ => return Err(Error::generic(format!("Invalid variant struct ID {} - must be DataType::Struct", variant_struct_id))),
     };
 
     let field = StructField::new(name_str, DataType::Variant(Box::new(variant_struct)), nullable);
@@ -631,7 +599,7 @@ fn build_kernel_schema_impl(
         if let Some(field) = unwrap_field(state, field_id) {
             field_vec.push(field);
         } else {
-            return Err(delta_kernel::Error::generic(format!("Invalid field ID {} in schema", field_id)));
+            return Err(Error::generic(format!("Invalid field ID {} in schema", field_id)));
         }
     }
 
@@ -644,8 +612,8 @@ fn build_kernel_schema_impl(
 // Helper Functions for Type-Only Building (No Field Names)
 // =============================================================================
 
-/// Generic helper to create DataType objects for use in complex types
-fn create_primitive_data_type_impl(
+/// Generic helper to visit DataType objects for use in complex types
+fn visit_primitive_data_type_impl(
     state: &mut KernelSchemaVisitorState,
     primitive_type: PrimitiveType,
 ) -> DeltaResult<usize> {
@@ -667,7 +635,7 @@ fn create_primitive_data_type_impl(
 //             allocate_error: AllocateErrorFn,
 //         ) -> ExternResult<usize> {
 //             unsafe {
-//                 create_primitive_data_type_impl(state, $primitive_type)
+//                 visit_primitive_data_type_impl(state, $primitive_type)
 //                     .into_extern_result(&allocate_error)
 //             }
 //         }
@@ -675,176 +643,176 @@ fn create_primitive_data_type_impl(
 // }
 //
 // Then generate all type creation functions:
-// generate_type_creator!(create_string_type, PrimitiveType::String, "Create a string DataType for use as array elements, map keys, or map values.");
-// generate_type_creator!(create_double_type, PrimitiveType::Double, "Create a double DataType for 64-bit floating point numbers in complex types.");
+// generate_type_creator!(visit_string_type, PrimitiveType::String, "Create a string DataType for use as array elements, map keys, or map values.");
+// generate_type_creator!(visit_double_type, PrimitiveType::Double, "Create a double DataType for 64-bit floating point numbers in complex types.");
 // ... etc for all primitive types
 //
 // However, we use explicit functions below for better generated documentation.
 */
 
-/// Create a string DataType for use as array elements, map keys, or map values.
+/// Visit a string DataType for use as array elements, map keys, or map values.
 #[no_mangle]
-pub extern "C" fn create_string_type(
+pub extern "C" fn visit_string_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::String)
+        visit_primitive_data_type_impl(state, PrimitiveType::String)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a long DataType for 64-bit integers in complex types.
+/// Visit a long DataType for 64-bit integers in complex types.
 #[no_mangle]
-pub extern "C" fn create_long_type(
+pub extern "C" fn visit_long_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Long)
+        visit_primitive_data_type_impl(state, PrimitiveType::Long)
             .into_extern_result(&allocate_error)
     }
 }
 
 /// Create an integer DataType for 32-bit integers in complex types.
 #[no_mangle]
-pub extern "C" fn create_integer_type(
+pub extern "C" fn visit_integer_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Integer)
+        visit_primitive_data_type_impl(state, PrimitiveType::Integer)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a short DataType for 16-bit integers in complex types.
+/// Visit a short DataType for 16-bit integers in complex types.
 #[no_mangle]
-pub extern "C" fn create_short_type(
+pub extern "C" fn visit_short_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Short)
+        visit_primitive_data_type_impl(state, PrimitiveType::Short)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a byte DataType for 8-bit integers in complex types.
+/// Visit a byte DataType for 8-bit integers in complex types.
 #[no_mangle]
-pub extern "C" fn create_byte_type(
+pub extern "C" fn visit_byte_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Byte)
+        visit_primitive_data_type_impl(state, PrimitiveType::Byte)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a float DataType for 32-bit floating point numbers in complex types.
+/// Visit a float DataType for 32-bit floating point numbers in complex types.
 #[no_mangle]
-pub extern "C" fn create_float_type(
+pub extern "C" fn visit_float_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Float)
+        visit_primitive_data_type_impl(state, PrimitiveType::Float)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a double DataType for 64-bit floating point numbers in complex types.
+/// Visit a double DataType for 64-bit floating point numbers in complex types.
 #[no_mangle]
-pub extern "C" fn create_double_type(
+pub extern "C" fn visit_double_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Double)
+        visit_primitive_data_type_impl(state, PrimitiveType::Double)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a boolean DataType for true/false values in complex types.
+/// Visit a boolean DataType for true/false values in complex types.
 #[no_mangle]
-pub extern "C" fn create_boolean_type(
+pub extern "C" fn visit_boolean_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Boolean)
+        visit_primitive_data_type_impl(state, PrimitiveType::Boolean)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a binary DataType for byte arrays in complex types.
+/// Visit a binary DataType for byte arrays in complex types.
 #[no_mangle]
-pub extern "C" fn create_binary_type(
+pub extern "C" fn visit_binary_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Binary)
+        visit_primitive_data_type_impl(state, PrimitiveType::Binary)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a date DataType for calendar dates in complex types.
+/// Visit a date DataType for calendar dates in complex types.
 #[no_mangle]
-pub extern "C" fn create_date_type(
+pub extern "C" fn visit_date_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Date)
+        visit_primitive_data_type_impl(state, PrimitiveType::Date)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a timestamp DataType with microsecond precision in UTC for complex types.
+/// Visit a timestamp DataType with microsecond precision in UTC for complex types.
 #[no_mangle]
-pub extern "C" fn create_timestamp_type(
+pub extern "C" fn visit_timestamp_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::Timestamp)
+        visit_primitive_data_type_impl(state, PrimitiveType::Timestamp)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a timestamp_ntz DataType without timezone information for complex types.
+/// Visit a timestamp_ntz DataType without timezone information for complex types.
 #[no_mangle]
-pub extern "C" fn create_timestamp_ntz_type(
+pub extern "C" fn visit_timestamp_ntz_type(
     state: &mut KernelSchemaVisitorState,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        create_primitive_data_type_impl(state, PrimitiveType::TimestampNtz)
+        visit_primitive_data_type_impl(state, PrimitiveType::TimestampNtz)
             .into_extern_result(&allocate_error)
     }
 }
 
-/// Create a decimal DataType with specified precision and scale for use in complex types.
+/// Visit a decimal DataType with specified precision and scale for use in complex types.
 #[no_mangle]
-pub extern "C" fn create_decimal_type(
+pub extern "C" fn visit_decimal_type(
     state: &mut KernelSchemaVisitorState,
     precision: u8,
     scale: u8,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
-    unsafe { create_decimal_type_impl(state, precision, scale)
+    unsafe { visit_decimal_type_impl(state, precision, scale)
         .into_extern_result(&allocate_error) }
 }
 
-fn create_decimal_type_impl(
+fn visit_decimal_type_impl(
     state: &mut KernelSchemaVisitorState,
     precision: u8,
     scale: u8,
 ) -> DeltaResult<usize> {
     let decimal_type = DecimalType::try_new(precision, scale)
-        .map_err(|e| delta_kernel::Error::generic(format!("Invalid decimal type precision/scale: {}", e)))?;
+        .map_err(|e| Error::generic(format!("Invalid decimal type precision/scale: {}", e)))?;
     let data_type = DataType::Primitive(PrimitiveType::Decimal(decimal_type));
     Ok(wrap_data_type(state, data_type))
 }
