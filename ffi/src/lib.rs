@@ -43,6 +43,7 @@ pub mod expressions;
 pub mod ffi_tracing;
 pub mod scan;
 pub mod schema;
+pub mod schema_visitor;
 
 #[cfg(test)]
 mod ffi_test_utils;
