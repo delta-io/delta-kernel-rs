@@ -191,9 +191,29 @@ impl Transaction {
             .into_iter()
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
-        // Step 2: Construct commit info and initialize the action iterator
+        // Step 2: Construct commit info with ICT if enabled
+        let in_commit_timestamp = if self
+            .read_snapshot
+            .table_configuration()
+            .is_in_commit_timestamps_enabled()
+        {
+            // Generate ICT timestamp based on previous commit
+            let last_commit_timestamp = if self.read_snapshot.version() == 0 {
+                None
+            } else {
+                Some(self.read_snapshot.get_timestamp(engine)?)
+            };
+            Some(generate_ict_timestamp(
+                self.commit_timestamp,
+                last_commit_timestamp,
+            ))
+        } else {
+            None
+        };
+
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
+            in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
         );
@@ -478,6 +498,23 @@ pub enum CommitResult {
     Conflict(Transaction, Version),
 }
 
+/// Generate an In-Commit Timestamp (ICT) following the protocol requirement.
+///
+/// The protocol requires the timestamp to be "the larger of two values":
+/// - The time at which the writer attempted the commit (current_time)
+/// - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
+///
+/// Returns the next monotonic timestamp that should be used for this commit
+pub(crate) fn generate_ict_timestamp(current_time: i64, last_commit_timestamp: Option<i64>) -> i64 {
+    if let Some(last_ts) = last_commit_timestamp {
+        // Protocol requirement: "One millisecond later than the previous commit's inCommitTimestamp"
+        current_time.max(last_ts + 1)
+    } else {
+        // Protocol requirement: "The time at which the writer attempted the commit"
+        current_time
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,5 +543,31 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+    }
+
+    #[test]
+    fn test_generate_ict_timestamp_first_commit() {
+        let current_time = 1000;
+        // First commit with no previous timestamp should use current time
+        let result = generate_ict_timestamp(current_time, None);
+        assert_eq!(result, current_time);
+    }
+
+    #[test]
+    fn test_generate_ict_timestamp_monotonic_increase() {
+        let current_time = 1000;
+        let last_commit_time = 1500;
+        // Should be one millisecond later than last commit timestamp
+        let result = generate_ict_timestamp(current_time, Some(last_commit_time));
+        assert_eq!(result, last_commit_time + 1);
+    }
+
+    #[test]
+    fn test_generate_ict_timestamp_current_time_larger() {
+        let current_time = 2000;
+        let last_commit_time = 1500;
+        // Should use current time when it's larger than last_commit_time + 1
+        let result = generate_ict_timestamp(current_time, Some(last_commit_time));
+        assert_eq!(result, current_time);
     }
 }
