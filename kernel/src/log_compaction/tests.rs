@@ -1,9 +1,9 @@
-use super::COMPACTION_ACTIONS_SCHEMA;
-use super::{should_compact, LogCompactionWriter};
+use std::sync::Arc;
+
+use super::{should_compact, LogCompactionWriter, COMPACTION_ACTIONS_SCHEMA};
 use crate::action_reconciliation::RetentionCalculator;
 use crate::engine::sync::SyncEngine;
 use crate::snapshot::Snapshot;
-use std::sync::Arc;
 
 fn create_mock_snapshot() -> Arc<Snapshot> {
     let path = std::fs::canonicalize(std::path::PathBuf::from(

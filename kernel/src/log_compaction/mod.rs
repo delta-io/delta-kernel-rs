@@ -16,7 +16,7 @@
 //!
 //! The log compaction API follows a similar pattern to the checkpoint API:
 //!
-//! 1. Create a [`LogCompactionWriter`] using [`crate::Snapshot::get_log_compaction_writer`] to compact the log
+//! 1. Create a [`LogCompactionWriter`] using [`crate::Snapshot::log_compaction_writer`] to compact the log
 //!    from a given start_version to end_version (inclusive)
 //! 2. Get the compaction path from [`LogCompactionWriter::compaction_path`]
 //! 3. Get the compaction data from [`LogCompactionWriter::compaction_data`]
@@ -42,7 +42,7 @@
 //! let snapshot = Snapshot::builder_for(table_root).build(engine)?;
 //!
 //! // Create a log compaction writer for versions 10-20
-//! let mut writer = snapshot.get_log_compaction_writer(10, 20)?;
+//! let mut writer = snapshot.log_compaction_writer(10, 20)?;
 //!
 //! let compaction_data = writer.compaction_data(engine)?;
 //! let compaction_path = writer.compaction_path();
