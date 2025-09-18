@@ -51,6 +51,20 @@ fn test_invalid_version_range() {
 }
 
 #[test]
+fn test_equal_version_range_invalid() {
+    let start_version = 5;
+    let end_version = 5; // Invalid: start == end (must be start < end)
+
+    let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid version range"));
+}
+
+#[test]
 fn test_should_compact() {
     assert!(should_compact(9, 10));
     assert!(!should_compact(5, 10));
@@ -82,19 +96,9 @@ fn test_writer_debug_impl() {
 }
 
 #[test]
-fn test_equal_version_range() {
-    let snapshot = create_mock_snapshot();
-    let writer = LogCompactionWriter::try_new(snapshot, 5, 5).unwrap();
-
-    let path = writer.compaction_path();
-    let expected_filename = "00000000000000000005.00000000000000000005.compacted.json";
-    assert!(path.to_string().ends_with(expected_filename));
-}
-
-#[test]
 fn test_compaction_data() {
     let snapshot = create_mock_snapshot();
-    let mut writer = LogCompactionWriter::try_new(snapshot, 0, 0).unwrap();
+    let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
     let engine = SyncEngine::new();
 
     let result = writer.compaction_data(&engine);
