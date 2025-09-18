@@ -14,7 +14,7 @@
 //! as a DataType::Struct.
 //!
 //! Note: Schemas are structs but can also contain struct fields. Use `visit_struct_type` for both the root
-//! schema and anonymous struct types, and `visit_schema_struct` for named struct fields.
+//! schema and anonymous struct types, and `visit_field_struct` for named struct fields.
 //!
 //! IDs are consumed when used. Each element takes ownership of its referenced child elements.
 //!
@@ -104,7 +104,7 @@ fn unwrap_data_type(state: &mut KernelSchemaVisitorState, type_id: usize) -> Opt
 // =============================================================================
 
 /// Generic helper to create primitive fields
-fn visit_schema_primitive_impl(
+fn visit_field_primitive_impl(
     state: &mut KernelSchemaVisitorState,
     name: DeltaResult<&str>,
     primitive_type: PrimitiveType,
@@ -133,7 +133,7 @@ macro_rules! generate_primitive_schema_visitors {
                 allocate_error: AllocateErrorFn,
             ) -> ExternResult<usize> {
                 let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-                visit_schema_primitive_impl(state, name_str, $primitive_type, nullable)
+                visit_field_primitive_impl(state, name_str, $primitive_type, nullable)
                     .into_extern_result(&allocate_error)
             }
         )*
@@ -141,18 +141,18 @@ macro_rules! generate_primitive_schema_visitors {
 }
 
 generate_primitive_schema_visitors! {
-    (visit_schema_string, PrimitiveType::String, "Visit a string field. Strings in Delta Lake can hold arbitrary UTF-8 text data."),
-    (visit_schema_long, PrimitiveType::Long, "Visit a long field. Long fields store 64-bit signed integers."),
-    (visit_schema_integer, PrimitiveType::Integer, "Visit an integer field. Integer fields store 32-bit signed integers."),
-    (visit_schema_short, PrimitiveType::Short, "Visit a short field. Short fields store 16-bit signed integers."),
-    (visit_schema_byte, PrimitiveType::Byte, "Visit a byte field. Byte fields store 8-bit signed integers."),
-    (visit_schema_float, PrimitiveType::Float, "Visit a float field. Float fields store 32-bit floating point numbers."),
-    (visit_schema_double, PrimitiveType::Double, "Visit a double field. Double fields store 64-bit floating point numbers."),
-    (visit_schema_boolean, PrimitiveType::Boolean, "Visit a boolean field. Boolean fields store true/false values."),
-    (visit_schema_binary, PrimitiveType::Binary, "Visit a binary field. Binary fields store arbitrary byte arrays."),
-    (visit_schema_date, PrimitiveType::Date, "Visit a date field. Date fields store calendar dates without time information."),
-    (visit_schema_timestamp, PrimitiveType::Timestamp, "Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC."),
-    (visit_schema_timestamp_ntz, PrimitiveType::TimestampNtz, "Visit a timestamp_ntz field. Similar to timestamp but without timezone information."),
+    (visit_field_string, PrimitiveType::String, "Visit a string field. Strings in Delta Lake can hold arbitrary UTF-8 text data."),
+    (visit_field_long, PrimitiveType::Long, "Visit a long field. Long fields store 64-bit signed integers."),
+    (visit_field_integer, PrimitiveType::Integer, "Visit an integer field. Integer fields store 32-bit signed integers."),
+    (visit_field_short, PrimitiveType::Short, "Visit a short field. Short fields store 16-bit signed integers."),
+    (visit_field_byte, PrimitiveType::Byte, "Visit a byte field. Byte fields store 8-bit signed integers."),
+    (visit_field_float, PrimitiveType::Float, "Visit a float field. Float fields store 32-bit floating point numbers."),
+    (visit_field_double, PrimitiveType::Double, "Visit a double field. Double fields store 64-bit floating point numbers."),
+    (visit_field_boolean, PrimitiveType::Boolean, "Visit a boolean field. Boolean fields store true/false values."),
+    (visit_field_binary, PrimitiveType::Binary, "Visit a binary field. Binary fields store arbitrary byte arrays."),
+    (visit_field_date, PrimitiveType::Date, "Visit a date field. Date fields store calendar dates without time information."),
+    (visit_field_timestamp, PrimitiveType::Timestamp, "Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC."),
+    (visit_field_timestamp_ntz, PrimitiveType::TimestampNtz, "Visit a timestamp_ntz field. Similar to timestamp but without timezone information."),
 }
 
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified precision and scale.
@@ -162,7 +162,7 @@ generate_primitive_schema_visitors! {
 /// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
 /// and `allocate_error` function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn visit_schema_decimal(
+pub unsafe extern "C" fn visit_field_decimal(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     precision: u8,
@@ -172,11 +172,11 @@ pub unsafe extern "C" fn visit_schema_decimal(
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
 
-    visit_schema_decimal_impl(state, name_str, precision, scale, nullable)
+    visit_field_decimal_impl(state, name_str, precision, scale, nullable)
         .into_extern_result(&allocate_error)
 }
 
-fn visit_schema_decimal_impl(
+fn visit_field_decimal_impl(
     state: &mut KernelSchemaVisitorState,
     name: DeltaResult<&str>,
     precision: u8,
@@ -201,16 +201,16 @@ fn visit_schema_decimal_impl(
 /// Visit a struct field. Struct fields contain nested fields organized as ordered key-value pairs.
 ///
 /// Note: This creates a named struct field (e.g. `address: struct<street, city>`), different from the
-/// `visit_struct_type` which creates anonymous struct DataTypes.
+/// `visit_data_type_struct` which creates anonymous struct DataTypes.
 ///
-/// The `field_ids` array must contain IDs from previous `visit_schema_*` field creation calls.
+/// The `field_ids` array must contain IDs from previous `visit_field_*` field creation calls.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `field_ids` array pointing
 /// to valid field IDs previously returned by this visitor, and `allocate_error` function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn visit_schema_struct(
+pub unsafe extern "C" fn visit_field_struct(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     field_ids: *const usize,
@@ -221,7 +221,7 @@ pub unsafe extern "C" fn visit_schema_struct(
     let name_str: Result<&str, Error> = unsafe { TryFromStringSlice::try_from_slice(&name) };
     let field_ids = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
 
-    visit_schema_struct_impl(state, name_str, field_ids, nullable)
+    visit_field_struct_impl(state, name_str, field_ids, nullable)
         .into_extern_result(&allocate_error)
 }
 
@@ -242,7 +242,7 @@ fn create_struct_data_type(
     Ok(DataType::Struct(Box::new(struct_type)))
 }
 
-fn visit_schema_struct_impl(
+fn visit_field_struct_impl(
     state: &mut KernelSchemaVisitorState,
     name: DeltaResult<&str>,
     field_ids: &[usize],
@@ -256,14 +256,14 @@ fn visit_schema_struct_impl(
 
 /// Visit an array field. Array fields store ordered sequences of elements of the same type.
 ///
-/// The `element_type_id` must reference a DataType created by a previous `visit_*_type` call.
+/// The `element_type_id` must reference a DataType created by a previous `visit_data_type_*` call.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `element_type_id` from
-/// previous `visit_*_type` call, and `allocate_error` function pointer.
+/// previous `visit_data_type_*` call, and `allocate_error` function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn visit_schema_array(
+pub unsafe extern "C" fn visit_field_array(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     element_type_id: usize,
@@ -272,7 +272,7 @@ pub unsafe extern "C" fn visit_schema_array(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_schema_array_impl(state, name_str, element_type_id, contains_null, nullable)
+    visit_field_array_impl(state, name_str, element_type_id, contains_null, nullable)
         .into_extern_result(&allocate_error)
 }
 
@@ -292,7 +292,7 @@ fn create_array_data_type(
     Ok(DataType::Array(Box::new(array_type)))
 }
 
-fn visit_schema_array_impl(
+fn visit_field_array_impl(
     state: &mut KernelSchemaVisitorState,
     name: DeltaResult<&str>,
     element_type_id: usize,
@@ -307,14 +307,14 @@ fn visit_schema_array_impl(
 
 /// Visit a map field. Map fields store key-value pairs where all keys have the same type and all values have the same type.
 ///
-/// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `visit_*_type` calls.
+/// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `visit_data_type_*` calls.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `name` slice, `key_type_id` and `value_type_id`
-/// from previous `visit_*_type` calls, and `allocate_error` function pointer.
+/// from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn visit_schema_map(
+pub unsafe extern "C" fn visit_field_map(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     key_type_id: usize,
@@ -324,7 +324,7 @@ pub unsafe extern "C" fn visit_schema_map(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_schema_map_impl(
+    visit_field_map_impl(
         state,
         name_str,
         key_type_id,
@@ -352,7 +352,7 @@ fn create_map_data_type(
     Ok(DataType::Map(Box::new(map_type)))
 }
 
-fn visit_schema_map_impl(
+fn visit_field_map_impl(
     state: &mut KernelSchemaVisitorState,
     name: DeltaResult<&str>,
     key_type_id: usize,
@@ -372,10 +372,10 @@ fn visit_schema_map_impl(
 /// # Safety
 ///
 /// Caller must ensure:
-/// - All base parameters are valid as per visit_schema_string
+/// - All base parameters are valid as per visit_field_string
 /// - `variant_struct_id` is a valid struct type ID from a previous visitor call
 #[no_mangle]
-pub unsafe extern "C" fn visit_schema_variant(
+pub unsafe extern "C" fn visit_field_variant(
     state: &mut KernelSchemaVisitorState,
     name: KernelStringSlice,
     variant_struct_id: usize,
@@ -383,11 +383,11 @@ pub unsafe extern "C" fn visit_schema_variant(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_schema_variant_impl(state, name_str, variant_struct_id, nullable)
+    visit_field_variant_impl(state, name_str, variant_struct_id, nullable)
         .into_extern_result(&allocate_error)
 }
 
-fn visit_schema_variant_impl(
+fn visit_field_variant_impl(
     state: &mut KernelSchemaVisitorState,
     name: DeltaResult<&str>,
     variant_struct_id: usize,
@@ -451,18 +451,18 @@ macro_rules! generate_primitive_type_visitors {
 
 // Generate all primitive DataType visitor functions (except decimal which has different signature)
 generate_primitive_type_visitors! {
-    (visit_string_type, PrimitiveType::String, "Create a string DataType for text data in complex types."),
-    (visit_long_type, PrimitiveType::Long, "Create a long DataType for 64-bit integers in complex types."),
-    (visit_integer_type, PrimitiveType::Integer, "Create an integer DataType for 32-bit integers in complex types."),
-    (visit_short_type, PrimitiveType::Short, "Create a short DataType for 16-bit integers in complex types."),
-    (visit_byte_type, PrimitiveType::Byte, "Create a byte DataType for 8-bit integers in complex types."),
-    (visit_float_type, PrimitiveType::Float, "Create a float DataType for 32-bit floating point numbers in complex types."),
-    (visit_double_type, PrimitiveType::Double, "Create a double DataType for 64-bit floating point numbers in complex types."),
-    (visit_boolean_type, PrimitiveType::Boolean, "Create a boolean DataType for true/false values in complex types."),
-    (visit_binary_type, PrimitiveType::Binary, "Create a binary DataType for byte arrays in complex types."),
-    (visit_date_type, PrimitiveType::Date, "Create a date DataType for calendar dates in complex types."),
-    (visit_timestamp_type, PrimitiveType::Timestamp, "Create a timestamp DataType for timestamps with timezone in complex types."),
-    (visit_timestamp_ntz_type, PrimitiveType::TimestampNtz, "Create a timestamp_ntz DataType for timestamps without timezone in complex types."),
+    (visit_data_type_string, PrimitiveType::String, "Create a string DataType for text data in complex types."),
+    (visit_data_type_long, PrimitiveType::Long, "Create a long DataType for 64-bit integers in complex types."),
+    (visit_data_type_integer, PrimitiveType::Integer, "Create an integer DataType for 32-bit integers in complex types."),
+    (visit_data_type_short, PrimitiveType::Short, "Create a short DataType for 16-bit integers in complex types."),
+    (visit_data_type_byte, PrimitiveType::Byte, "Create a byte DataType for 8-bit integers in complex types."),
+    (visit_data_type_float, PrimitiveType::Float, "Create a float DataType for 32-bit floating point numbers in complex types."),
+    (visit_data_type_double, PrimitiveType::Double, "Create a double DataType for 64-bit floating point numbers in complex types."),
+    (visit_data_type_boolean, PrimitiveType::Boolean, "Create a boolean DataType for true/false values in complex types."),
+    (visit_data_type_binary, PrimitiveType::Binary, "Create a binary DataType for byte arrays in complex types."),
+    (visit_data_type_date, PrimitiveType::Date, "Create a date DataType for calendar dates in complex types."),
+    (visit_data_type_timestamp, PrimitiveType::Timestamp, "Create a timestamp DataType for timestamps with timezone in complex types."),
+    (visit_data_type_timestamp_ntz, PrimitiveType::TimestampNtz, "Create a timestamp_ntz DataType for timestamps without timezone in complex types."),
 }
 
 // =============================================================================
@@ -476,18 +476,18 @@ generate_primitive_type_visitors! {
 /// Caller is responsible for providing a valid `state`, `precision` and `scale`,
 /// and `allocate_error` function pointer.
 #[no_mangle]
-pub extern "C" fn visit_decimal_data_type(
+pub extern "C" fn visit_data_type_decimal(
     state: &mut KernelSchemaVisitorState,
     precision: u8,
     scale: u8,
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     unsafe {
-        visit_decimal_data_type_impl(state, precision, scale).into_extern_result(&allocate_error)
+        visit_data_type_decimal_impl(state, precision, scale).into_extern_result(&allocate_error)
     }
 }
 
-fn visit_decimal_data_type_impl(
+fn visit_data_type_decimal_impl(
     state: &mut KernelSchemaVisitorState,
     precision: u8,
     scale: u8,
@@ -503,16 +503,16 @@ fn visit_decimal_data_type_impl(
 /// map values, or nested within other structs.
 ///
 /// Note: This is also the final step for building the root schema. Create all your
-/// top-level fields with `visit_schema_*` functions, then call this function with
+/// top-level fields with `visit_field_*` functions, then call this function with
 /// those field IDs to build the root schema struct.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `field_ids` array pointing
-/// to valid field IDs previously returned by `visit_schema_*` calls, and
+/// to valid field IDs previously returned by `visit_field_*` calls, and
 /// `allocate_error` function pointer.
 #[no_mangle]
-pub unsafe extern "C" fn visit_struct_data_type(
+pub unsafe extern "C" fn visit_data_type_struct(
     state: &mut KernelSchemaVisitorState,
     field_ids: *const usize,
     field_count: usize,
@@ -528,14 +528,14 @@ pub unsafe extern "C" fn visit_struct_data_type(
 /// This creates an anonymous array type that can be used as struct field types,
 /// map values, or nested within other arrays.
 ///
-/// The `element_type_id` must reference a DataType created by a previous `visit_*_type` call.
+/// The `element_type_id` must reference a DataType created by a previous `visit_data_type_*` call.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `element_type_id` from
-/// previous `visit_*_type` call, and `allocate_error` function pointer.
+/// previous `visit_data_type_*` call, and `allocate_error` function pointer.
 #[no_mangle]
-pub extern "C" fn visit_array_data_type(
+pub extern "C" fn visit_data_type_array(
     state: &mut KernelSchemaVisitorState,
     element_type_id: usize,
     contains_null: bool,
@@ -552,14 +552,14 @@ pub extern "C" fn visit_array_data_type(
 /// This creates an anonymous map type that can be used as struct field types,
 /// array elements, or nested within other maps.
 ///
-/// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `visit_*_type` calls.
+/// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `visit_data_type_*` calls.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `key_type_id` and `value_type_id`
-/// from previous `visit_*_type` calls, and `allocate_error` function pointer.
+/// from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
 #[no_mangle]
-pub extern "C" fn visit_map_data_type(
+pub extern "C" fn visit_data_type_map(
     state: &mut KernelSchemaVisitorState,
     key_type_id: usize,
     value_type_id: usize,
@@ -577,14 +577,14 @@ pub extern "C" fn visit_map_data_type(
 /// This creates an anonymous variant type that can be used as struct field types,
 /// array elements, or map values.
 ///
-/// The `struct_type_id` must reference a struct DataType created by a previous `visit_struct_type` call.
+/// The `struct_type_id` must reference a struct DataType created by a previous `visit_data_type_struct` call.
 ///
 /// # Safety
 ///
 /// Caller is responsible for providing valid `state`, `struct_type_id` from
-/// previous `visit_struct_type` call, and `allocate_error` function pointer.
+/// previous `visit_data_type_struct` call, and `allocate_error` function pointer.
 #[no_mangle]
-pub extern "C" fn visit_variant_data_type(
+pub extern "C" fn visit_data_type_variant(
     state: &mut KernelSchemaVisitorState,
     struct_type_id: usize,
     allocate_error: AllocateErrorFn,
@@ -648,7 +648,7 @@ mod tests {
 
         // Create all primitive fields
         let col_string = ok_or_panic(unsafe {
-            visit_schema_string(
+            visit_field_string(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_string"),
                 false,
@@ -656,7 +656,7 @@ mod tests {
             )
         });
         let col_long = ok_or_panic(unsafe {
-            visit_schema_long(
+            visit_field_long(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_long"),
                 false,
@@ -664,7 +664,7 @@ mod tests {
             )
         });
         let col_int = ok_or_panic(unsafe {
-            visit_schema_integer(
+            visit_field_integer(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_int"),
                 false,
@@ -672,7 +672,7 @@ mod tests {
             )
         });
         let col_short = ok_or_panic(unsafe {
-            visit_schema_short(
+            visit_field_short(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_short"),
                 false,
@@ -680,7 +680,7 @@ mod tests {
             )
         });
         let col_byte = ok_or_panic(unsafe {
-            visit_schema_byte(
+            visit_field_byte(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_byte"),
                 false,
@@ -688,7 +688,7 @@ mod tests {
             )
         });
         let col_double = ok_or_panic(unsafe {
-            visit_schema_double(
+            visit_field_double(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_double"),
                 false,
@@ -696,7 +696,7 @@ mod tests {
             )
         });
         let col_float = ok_or_panic(unsafe {
-            visit_schema_float(
+            visit_field_float(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_float"),
                 false,
@@ -704,7 +704,7 @@ mod tests {
             )
         });
         let col_boolean = ok_or_panic(unsafe {
-            visit_schema_boolean(
+            visit_field_boolean(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_boolean"),
                 false,
@@ -712,7 +712,7 @@ mod tests {
             )
         });
         let col_binary = ok_or_panic(unsafe {
-            visit_schema_binary(
+            visit_field_binary(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_binary"),
                 false,
@@ -720,7 +720,7 @@ mod tests {
             )
         });
         let col_date = ok_or_panic(unsafe {
-            visit_schema_date(
+            visit_field_date(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_date"),
                 false,
@@ -728,7 +728,7 @@ mod tests {
             )
         });
         let col_timestamp = ok_or_panic(unsafe {
-            visit_schema_timestamp(
+            visit_field_timestamp(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_timestamp"),
                 false,
@@ -736,7 +736,7 @@ mod tests {
             )
         });
         let col_timestamp_ntz = ok_or_panic(unsafe {
-            visit_schema_timestamp_ntz(
+            visit_field_timestamp_ntz(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_timestamp_ntz"),
                 false,
@@ -744,7 +744,7 @@ mod tests {
             )
         });
         let col_decimal = ok_or_panic(unsafe {
-            visit_schema_decimal(
+            visit_field_decimal(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_decimal"),
                 10,
@@ -755,9 +755,10 @@ mod tests {
         });
 
         // Create array<string>
-        let string_element_type = ok_or_panic(visit_string_type(&mut state, test_allocate_error));
+        let string_element_type =
+            ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
         let col_array = ok_or_panic(unsafe {
-            visit_schema_array(
+            visit_field_array(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_array"),
                 string_element_type,
@@ -768,10 +769,10 @@ mod tests {
         });
 
         // Create map<string, long>
-        let map_key_type = ok_or_panic(visit_string_type(&mut state, test_allocate_error));
-        let map_value_type = ok_or_panic(visit_long_type(&mut state, test_allocate_error));
+        let map_key_type = ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
+        let map_value_type = ok_or_panic(visit_data_type_long(&mut state, test_allocate_error));
         let col_map = ok_or_panic(unsafe {
-            visit_schema_map(
+            visit_field_map(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_map"),
                 map_key_type,
@@ -784,7 +785,7 @@ mod tests {
 
         // Create struct<inner_name: string>
         let struct_inner_field = ok_or_panic(unsafe {
-            visit_schema_string(
+            visit_field_string(
                 &mut state,
                 KernelStringSlice::new_unsafe("inner_name"),
                 false,
@@ -792,7 +793,7 @@ mod tests {
             )
         });
         let col_struct = ok_or_panic(unsafe {
-            visit_schema_struct(
+            visit_field_struct(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_struct"),
                 &struct_inner_field,
@@ -804,7 +805,7 @@ mod tests {
 
         // Create variant<metadata: binary, value: binary>
         let variant_inner_field1 = ok_or_panic(unsafe {
-            visit_schema_binary(
+            visit_field_binary(
                 &mut state,
                 KernelStringSlice::new_unsafe("metadata"),
                 false,
@@ -812,7 +813,7 @@ mod tests {
             )
         });
         let variant_inner_field2 = ok_or_panic(unsafe {
-            visit_schema_binary(
+            visit_field_binary(
                 &mut state,
                 KernelStringSlice::new_unsafe("value"),
                 false,
@@ -821,7 +822,7 @@ mod tests {
         });
         let variant_inner_fields = vec![variant_inner_field1, variant_inner_field2];
         let variant_struct_type = ok_or_panic(unsafe {
-            visit_struct_data_type(
+            visit_data_type_struct(
                 &mut state,
                 variant_inner_fields.as_ptr(),
                 2,
@@ -829,7 +830,7 @@ mod tests {
             )
         });
         let col_variant = ok_or_panic(unsafe {
-            visit_schema_variant(
+            visit_field_variant(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_variant"),
                 variant_struct_type,
@@ -859,7 +860,7 @@ mod tests {
             col_variant,
         ];
         let schema_id = ok_or_panic(unsafe {
-            visit_struct_data_type(
+            visit_data_type_struct(
                 &mut state,
                 all_columns.as_ptr(),
                 all_columns.len(),
@@ -993,11 +994,11 @@ mod tests {
         // Build from deepest level outward
 
         // 6b: double for final map values
-        let double_type = ok_or_panic(visit_double_type(&mut state, test_allocate_error));
+        let double_type = ok_or_panic(visit_data_type_double(&mut state, test_allocate_error));
 
         // 6a: Complex key for final map: struct<coord: double>
         let coord_field = ok_or_panic(unsafe {
-            visit_schema_double(
+            visit_field_double(
                 &mut state,
                 KernelStringSlice::new_unsafe("coord"),
                 false,
@@ -1005,11 +1006,11 @@ mod tests {
             )
         });
         let coord_struct_type = ok_or_panic(unsafe {
-            visit_struct_data_type(&mut state, &coord_field, 1, test_allocate_error)
+            visit_data_type_struct(&mut state, &coord_field, 1, test_allocate_error)
         });
 
         // 6: map<struct<coord: double>, double>
-        let final_map_type = ok_or_panic(visit_map_data_type(
+        let final_map_type = ok_or_panic(visit_data_type_map(
             &mut state,
             coord_struct_type,
             double_type,
@@ -1019,7 +1020,7 @@ mod tests {
 
         // 4c: struct<final_array: array<map<struct<coord: double>, double>>>
         let final_array_field = ok_or_panic(unsafe {
-            visit_schema_array(
+            visit_field_array(
                 &mut state,
                 KernelStringSlice::new_unsafe("final_array"),
                 final_map_type, // Pass the map type as the array element type
@@ -1033,7 +1034,7 @@ mod tests {
 
         // 4a: deep_maps field - create key and value types fresh for this field
         let variant_key_metadata_field = ok_or_panic(unsafe {
-            visit_schema_binary(
+            visit_field_binary(
                 &mut state,
                 KernelStringSlice::new_unsafe("metadata"),
                 false,
@@ -1041,7 +1042,7 @@ mod tests {
             )
         });
         let variant_key_value_field = ok_or_panic(unsafe {
-            visit_schema_binary(
+            visit_field_binary(
                 &mut state,
                 KernelStringSlice::new_unsafe("value"),
                 false,
@@ -1050,26 +1051,26 @@ mod tests {
         });
         let variant_key_fields = vec![variant_key_metadata_field, variant_key_value_field];
         let variant_key_struct_type = ok_or_panic(unsafe {
-            visit_struct_data_type(
+            visit_data_type_struct(
                 &mut state,
                 variant_key_fields.as_ptr(),
                 variant_key_fields.len(),
                 test_allocate_error,
             )
         });
-        let variant_key_type = ok_or_panic(visit_variant_data_type(
+        let variant_key_type = ok_or_panic(visit_data_type_variant(
             &mut state,
             variant_key_struct_type,
             test_allocate_error,
         ));
 
-        let decimal_type = ok_or_panic(visit_decimal_data_type(
+        let decimal_type = ok_or_panic(visit_data_type_decimal(
             &mut state,
             10,
             2,
             test_allocate_error,
         ));
-        let decimal_array_type = ok_or_panic(visit_array_data_type(
+        let decimal_array_type = ok_or_panic(visit_data_type_array(
             &mut state,
             decimal_type,
             true,
@@ -1077,7 +1078,7 @@ mod tests {
         ));
 
         let deep_maps_field = ok_or_panic(unsafe {
-            visit_schema_map(
+            visit_field_map(
                 &mut state,
                 KernelStringSlice::new_unsafe("deep_maps"),
                 variant_key_type,
@@ -1089,7 +1090,7 @@ mod tests {
         });
         // 4b: Create fresh variant struct for variant_data field
         let variant_data_metadata_field = ok_or_panic(unsafe {
-            visit_schema_binary(
+            visit_field_binary(
                 &mut state,
                 KernelStringSlice::new_unsafe("metadata"),
                 false,
@@ -1097,7 +1098,7 @@ mod tests {
             )
         });
         let variant_data_value_field = ok_or_panic(unsafe {
-            visit_schema_binary(
+            visit_field_binary(
                 &mut state,
                 KernelStringSlice::new_unsafe("value"),
                 false,
@@ -1106,7 +1107,7 @@ mod tests {
         });
         let variant_data_fields = vec![variant_data_metadata_field, variant_data_value_field];
         let variant_data_struct_type = ok_or_panic(unsafe {
-            visit_struct_data_type(
+            visit_data_type_struct(
                 &mut state,
                 variant_data_fields.as_ptr(),
                 variant_data_fields.len(),
@@ -1115,7 +1116,7 @@ mod tests {
         });
 
         let variant_data_field = ok_or_panic(unsafe {
-            visit_schema_variant(
+            visit_field_variant(
                 &mut state,
                 KernelStringSlice::new_unsafe("variant_data"),
                 variant_data_struct_type,
@@ -1124,7 +1125,7 @@ mod tests {
             )
         });
         let nested_struct_field = ok_or_panic(unsafe {
-            visit_schema_struct(
+            visit_field_struct(
                 &mut state,
                 KernelStringSlice::new_unsafe("nested_struct"),
                 [final_array_field].as_ptr(),
@@ -1136,7 +1137,7 @@ mod tests {
 
         let inner_struct_fields = vec![deep_maps_field, variant_data_field, nested_struct_field];
         let inner_struct_type = ok_or_panic(unsafe {
-            visit_struct_data_type(
+            visit_data_type_struct(
                 &mut state,
                 inner_struct_fields.as_ptr(),
                 inner_struct_fields.len(),
@@ -1146,7 +1147,7 @@ mod tests {
 
         // 2b: struct field for inner_arrays: array<struct<deep_maps: ..., variant_data: ..., nested_struct: ...>>
         let inner_arrays_field = ok_or_panic(unsafe {
-            visit_schema_array(
+            visit_field_array(
                 &mut state,
                 KernelStringSlice::new_unsafe("inner_arrays"),
                 inner_struct_type, // Pass the struct type as the array element type
@@ -1156,12 +1157,12 @@ mod tests {
             )
         });
         let middle_struct_type = ok_or_panic(unsafe {
-            visit_struct_data_type(&mut state, &inner_arrays_field, 1, test_allocate_error)
+            visit_data_type_struct(&mut state, &inner_arrays_field, 1, test_allocate_error)
         });
 
         // 2a: Complex key for outer map: struct<key_id: long>
         let key_id_field = ok_or_panic(unsafe {
-            visit_schema_long(
+            visit_field_long(
                 &mut state,
                 KernelStringSlice::new_unsafe("key_id"),
                 false,
@@ -1169,11 +1170,11 @@ mod tests {
             )
         });
         let outer_map_key_type = ok_or_panic(unsafe {
-            visit_struct_data_type(&mut state, &key_id_field, 1, test_allocate_error)
+            visit_data_type_struct(&mut state, &key_id_field, 1, test_allocate_error)
         });
 
         // 2: map<struct<key_id: long>, struct<inner_arrays: ...>>
-        let outer_map_type = ok_or_panic(visit_map_data_type(
+        let outer_map_type = ok_or_panic(visit_data_type_map(
             &mut state,
             outer_map_key_type,
             middle_struct_type,
@@ -1183,7 +1184,7 @@ mod tests {
 
         // Final column: col_nested: array<map<struct<key_id: long>, struct<...>>>
         let col_nested = ok_or_panic(unsafe {
-            visit_schema_array(
+            visit_field_array(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_nested"),
                 outer_map_type, // Pass the map type directly as the array element type
@@ -1195,7 +1196,7 @@ mod tests {
 
         // Build final schema
         let schema_id = ok_or_panic(unsafe {
-            visit_struct_data_type(&mut state, &col_nested, 1, test_allocate_error)
+            visit_data_type_struct(&mut state, &col_nested, 1, test_allocate_error)
         });
 
         // Verify the deeply nested structure step by step
@@ -1382,7 +1383,7 @@ mod tests {
 
         // Required string field
         let col_required_string = ok_or_panic(unsafe {
-            visit_schema_string(
+            visit_field_string(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_required_string"),
                 false,
@@ -1392,7 +1393,7 @@ mod tests {
 
         // Nullable string field
         let col_nullable_string = ok_or_panic(unsafe {
-            visit_schema_string(
+            visit_field_string(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_nullable_string"),
                 true,
@@ -1402,9 +1403,9 @@ mod tests {
 
         // Nullable array with non-null elements: array<string> NULL (elements NOT NULL)
         let string_type_for_nullable_array =
-            ok_or_panic(visit_string_type(&mut state, test_allocate_error));
+            ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
         let col_nullable_array_non_null_elements = ok_or_panic(unsafe {
-            visit_schema_array(
+            visit_field_array(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_nullable_array_non_null_elements"),
                 string_type_for_nullable_array,
@@ -1416,9 +1417,9 @@ mod tests {
 
         // Non-null array with nullable elements: array<string> NOT NULL (elements NULL)
         let string_type_for_non_null_array =
-            ok_or_panic(visit_string_type(&mut state, test_allocate_error));
+            ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
         let col_non_null_array_nullable_elements = ok_or_panic(unsafe {
-            visit_schema_array(
+            visit_field_array(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_non_null_array_nullable_elements"),
                 string_type_for_non_null_array,
@@ -1430,11 +1431,11 @@ mod tests {
 
         // Nullable map with nullable values: map<string, integer> NULL (values NULL)
         let string_key_type_nullable_map =
-            ok_or_panic(visit_string_type(&mut state, test_allocate_error));
+            ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
         let integer_value_type_nullable_map =
-            ok_or_panic(visit_integer_type(&mut state, test_allocate_error));
+            ok_or_panic(visit_data_type_integer(&mut state, test_allocate_error));
         let col_nullable_map_nullable_values = ok_or_panic(unsafe {
-            visit_schema_map(
+            visit_field_map(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_nullable_map_nullable_values"),
                 string_key_type_nullable_map,
@@ -1447,11 +1448,11 @@ mod tests {
 
         // Non-null map with non-null values: map<string, integer> NOT NULL (values NOT NULL)
         let string_key_type_non_null_map =
-            ok_or_panic(visit_string_type(&mut state, test_allocate_error));
+            ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
         let integer_value_type_non_null_map =
-            ok_or_panic(visit_integer_type(&mut state, test_allocate_error));
+            ok_or_panic(visit_data_type_integer(&mut state, test_allocate_error));
         let col_non_null_map_non_null_values = ok_or_panic(unsafe {
-            visit_schema_map(
+            visit_field_map(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_non_null_map_non_null_values"),
                 string_key_type_non_null_map,
@@ -1464,7 +1465,7 @@ mod tests {
 
         // Nullable struct: struct<inner: string> NULL
         let struct_inner_field_nullable_struct = ok_or_panic(unsafe {
-            visit_schema_string(
+            visit_field_string(
                 &mut state,
                 KernelStringSlice::new_unsafe("inner"),
                 false,
@@ -1472,7 +1473,7 @@ mod tests {
             )
         });
         let col_nullable_struct = ok_or_panic(unsafe {
-            visit_schema_struct(
+            visit_field_struct(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_nullable_struct"),
                 &struct_inner_field_nullable_struct,
@@ -1484,7 +1485,7 @@ mod tests {
 
         // Non-null struct with nullable field: struct<inner: string NULL> NOT NULL
         let struct_nullable_inner_field = ok_or_panic(unsafe {
-            visit_schema_string(
+            visit_field_string(
                 &mut state,
                 KernelStringSlice::new_unsafe("inner"),
                 true, // inner field is nullable
@@ -1492,7 +1493,7 @@ mod tests {
             )
         });
         let col_non_null_struct_nullable_field = ok_or_panic(unsafe {
-            visit_schema_struct(
+            visit_field_struct(
                 &mut state,
                 KernelStringSlice::new_unsafe("col_non_null_struct_nullable_field"),
                 &struct_nullable_inner_field,
@@ -1514,7 +1515,7 @@ mod tests {
             col_non_null_struct_nullable_field,
         ];
         let schema_id = ok_or_panic(unsafe {
-            visit_struct_data_type(
+            visit_data_type_struct(
                 &mut state,
                 all_columns.as_ptr(),
                 all_columns.len(),
