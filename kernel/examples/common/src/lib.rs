@@ -8,7 +8,7 @@ use delta_kernel::{
     engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
     scan::Scan,
     schema::Schema,
-    DeltaResult, Snapshot,
+    DeltaResult, SnapshotRef,
 };
 
 use url::Url;
@@ -62,7 +62,7 @@ pub fn get_engine(
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed
 /// engine. Parameters of the scan are controlled by the specified `ScanArgs`
-pub fn get_scan(snapshot: Arc<Snapshot>, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
+pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
     if args.schema_only {
         println!("{:#?}", snapshot.schema());
         return Ok(None);

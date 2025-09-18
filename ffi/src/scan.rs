@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::DvInfo;
 use delta_kernel::scan::{Scan, ScanMetadata};
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -103,7 +103,7 @@ pub unsafe extern "C" fn scan(
 }
 
 fn scan_impl(
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     predicate: Option<&mut EnginePredicate>,
 ) -> DeltaResult<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();

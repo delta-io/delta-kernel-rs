@@ -6,7 +6,7 @@
 //! # use test_utils::DefaultEngineExtension;
 //! # use delta_kernel::engine::default::DefaultEngine;
 //! # use delta_kernel::expressions::{column_expr, Scalar};
-//! # use delta_kernel::{Predicate, Snapshot, Error, Engine};
+//! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, Error, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
 //! # let path = "./tests/data/table-with-cdf";
 //! # let engine = DefaultEngine::new_local();
@@ -40,7 +40,7 @@ use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::{ColumnMappingMode, ReaderFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -97,7 +97,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  ```rust
 ///  # use delta_kernel::engine::default::DefaultEngine;
 ///  # use test_utils::DefaultEngineExtension;
-///  # use delta_kernel::{Snapshot, Error};
+///  # use delta_kernel::{SnapshotRef, Error};
 ///  # use delta_kernel::table_changes::TableChanges;
 ///  # let engine = DefaultEngine::new_local();
 ///  # let path = "./tests/data/table-with-cdf";
@@ -112,7 +112,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 pub struct TableChanges {
     pub(crate) log_segment: LogSegment,
     table_root: Url,
-    end_snapshot: Arc<Snapshot>,
+    end_snapshot: SnapshotRef,
     start_version: Version,
     schema: Schema,
 }

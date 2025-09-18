@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
@@ -11,9 +9,9 @@ use crate::engine_data::FilteredEngineData;
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::snapshot::Snapshot;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
+
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
 pub fn should_compact(commit_version: Version, compaction_interval: Version) -> bool {
@@ -30,7 +28,7 @@ pub fn should_compact(commit_version: Version, compaction_interval: Version) -> 
 #[derive(Debug)]
 pub struct LogCompactionWriter {
     /// Reference to the snapshot of the table being compacted
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     start_version: Version,
     end_version: Version,
     /// Cached compaction file path
@@ -45,7 +43,7 @@ impl RetentionCalculator for LogCompactionWriter {
 
 impl LogCompactionWriter {
     pub(crate) fn try_new(
-        snapshot: Arc<Snapshot>,
+        snapshot: SnapshotRef,
         start_version: Version,
         end_version: Version,
     ) -> DeltaResult<Self> {
