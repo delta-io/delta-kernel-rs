@@ -204,7 +204,7 @@ impl Transaction {
 
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let commit_version = self.read_snapshot.version() + 1;
-        let (add_actions, row_tracking_high_watermark) =
+        let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
 
         // Step 4: Generate all domain metadata actions (user and system domains)
@@ -212,7 +212,7 @@ impl Transaction {
             engine,
             &self.domain_metadatas,
             &self.read_snapshot,
-            row_tracking_high_watermark,
+            row_tracking_domain_metadata,
         )?;
 
         // Step 5: Commit the actions as a JSON file to the Delta log
@@ -272,7 +272,7 @@ impl Transaction {
     /// Set domain metadata to be written to the Delta log.
     /// Note that each domain can only appear once per transaction. That is, multiple configurations
     /// of the same domain are disallowed in a single transaction, as well as setting and removing
-    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
+    /// the same domain in a single transaction. If a duplicate domain is included, the commit will
     /// fail (that is, we don't eagerly check domain validity here).
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
         self.domain_metadatas
