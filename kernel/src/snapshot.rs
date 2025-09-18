@@ -1271,4 +1271,122 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_get_timestamp_edge_cases() -> DeltaResult<()> {
+        // Test various edge cases in snapshot timestamp retrieval
+        let url = Url::parse("memory:///")?;
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Test 1: ICT caching - create table with ICT enabled
+        let commit_data = [
+            json!({
+                "protocol": {
+                    "minReaderVersion": 3,
+                    "minWriterVersion": 7,
+                    "readerFeatures": [],
+                    "writerFeatures": ["inCommitTimestamp"]
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id": "test_id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {
+                        "delta.enableInCommitTimestamps": "true",
+                        "delta.inCommitTimestampEnablementVersion": "0",
+                        "delta.inCommitTimestampEnablementTimestamp": "1612345678"
+                    },
+                    "createdTime": 1677811175819u64
+                }
+            })
+        ];
+        commit(store.as_ref(), 0, commit_data.to_vec()).await;
+
+        // Create commit with ICT
+        let commit1 = [json!({
+            "commitInfo": {
+                "timestamp": 1234567890,
+                "inCommitTimestamp": 9876543210i64,
+                "operation": "WRITE",
+                "engineInfo": "test"
+            }
+        })];
+        commit(store.as_ref(), 1, commit1.to_vec()).await;
+
+        let snapshot = Snapshot::builder_for(url.clone()).at_version(1).build(&engine)?;
+
+        // Test cached timestamp path - first call computes, second uses cache
+        let timestamp1 = snapshot.get_timestamp(&engine)?;
+        let timestamp2 = snapshot.get_timestamp(&engine)?;
+        assert_eq!(timestamp1, 9876543210);
+        assert_eq!(timestamp2, timestamp1);
+
+        // Test 2: Version predating ICT enablement - fallback to file modification time
+        let url2 = Url::parse("memory:///table2")?;
+        let commit_data2 = [
+            json!({
+                "protocol": {
+                    "minReaderVersion": 3,
+                    "minWriterVersion": 7,
+                    "readerFeatures": [],
+                    "writerFeatures": ["inCommitTimestamp"]
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id": "test_id2",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {
+                        "delta.enableInCommitTimestamps": "true",
+                        "delta.inCommitTimestampEnablementVersion": "5", // Enablement after version 1
+                        "delta.inCommitTimestampEnablementTimestamp": "1612345678"
+                    },
+                    "createdTime": 1677811175819u64
+                }
+            })
+        ];
+        commit(store.as_ref(), 0, commit_data2.to_vec()).await;
+
+        // Create commit that predates ICT enablement (no inCommitTimestamp)
+        let commit_predates = [json!({
+            "commitInfo": {
+                "timestamp": 1234567890,
+                "operation": "WRITE",
+                "engineInfo": "test"
+            }
+        })];
+        commit(store.as_ref(), 1, commit_predates.to_vec()).await;
+
+        let snapshot_predates = Snapshot::builder_for(url2).at_version(1).build(&engine)?;
+        let timestamp_predates = snapshot_predates.get_timestamp(&engine)?;
+        assert!(timestamp_predates > 0); // Should fallback to file modification time
+
+        // Test 3: Missing ICT when it should be present - should error
+        let url3 = Url::parse("memory:///table3")?;
+        commit(store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
+
+        // Create commit without ICT despite being enabled (corrupt case)
+        let commit_missing_ict = [json!({
+            "commitInfo": {
+                "timestamp": 1234567890,
+                "operation": "WRITE",
+                "engineInfo": "test"
+                // Missing inCommitTimestamp despite ICT being enabled
+            }
+        })];
+        commit(store.as_ref(), 1, commit_missing_ict.to_vec()).await;
+
+        let snapshot_missing = Snapshot::builder_for(url3).at_version(1).build(&engine)?;
+        let result = snapshot_missing.get_timestamp(&engine);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No inCommitTimestamp found"));
+
+        Ok(())
+    }
 }
