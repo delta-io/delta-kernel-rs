@@ -45,8 +45,10 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     )
     .await?;
 
-    // Commit 1: Add a file
+    // Commit 1: Add two files
     let commit1_content = r#"{"add":{"path":"part-00000-file1.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":10,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 1},\"maxValues\":{\"id\":10}}"}}
+{"add":{"path":"part-00001-file2.parquet","partitionValues":{},"size":2048,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":20,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 11},\"maxValues\":{\"id\":30}}"}}
+{"commitInfo":{"timestamp":1587968586000,"operation":"WRITE","operationParameters":{"mode":"Append"},"isBlindAppend":true}}
 "#;
     println!("Commit1: {}", commit1_content);
     store
@@ -56,15 +58,16 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
         )
         .await?;
 
-    // Commit 2: Remove the file with a recent deletionTimestamp
+    // Commit 2: Remove only the first file with a recent deletionTimestamp, keep the second file
     let current_timestamp_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
     let commit2_content = format!(
         r#"{{"remove":{{"path":"part-00000-file1.parquet","partitionValues":{{}},"size":1024,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{}}}}}
+{{"commitInfo":{{"timestamp":{},"operation":"DELETE","operationParameters":{{"predicate":"id <= 10"}},"isBlindAppend":false}}}}
 "#,
-        current_timestamp_millis
+        current_timestamp_millis, current_timestamp_millis
     );
     println!("Commit2: {}", commit2_content);
     store
@@ -91,9 +94,16 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let mut batch_count = 0;
     let mut compacted_data_batches = Vec::new();
 
-    // Log compaction should produce reconciled actions from the version range
-    // Protocol + metadata from table creation, and remove action should be included
-    // since it has a recent deletionTimestamp (non-expired tombstone)
+    // Log compaction should produce reconciled actions from the version range:
+    // - Protocol + metadata from table creation
+    // - Add action for file1 (first/newest add for this file path)
+    // - Add action for file2 (first/newest add for this file path)
+    // - Remove action for file1 (first/newest remove for this file path, non-expired tombstone)
+    // - CommitInfo actions should be excluded from compaction
+    // 
+    // Note: Actions are processed in reverse chronological order (newest to oldest).
+    // The reconciliation keeps the first (newest) occurrence of each action type
+    // for each unique file path, so both add and remove actions for file1 are kept.
     for batch_result in compaction_data.by_ref() {
         let batch = batch_result?;
         compacted_data_batches.push(batch);
@@ -139,10 +149,13 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
         "Compacted file should not be empty"
     );
 
-    // Check for protocol, metadata, and remove actions
+    // Check for expected actions
     let has_protocol = compacted_lines.iter().any(|line| line.contains("protocol"));
     let has_metadata = compacted_lines.iter().any(|line| line.contains("metaData"));
     let has_remove = compacted_lines.iter().any(|line| line.contains("remove"));
+    let has_add_file1 = compacted_lines.iter().any(|line| line.contains("part-00000-file1.parquet") && line.contains("add"));
+    let has_add_file2 = compacted_lines.iter().any(|line| line.contains("part-00001-file2.parquet") && line.contains("add"));
+    let has_commit_info = compacted_lines.iter().any(|line| line.contains("commitInfo"));
 
     assert!(
         has_protocol,
@@ -155,6 +168,18 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     assert!(
         has_remove,
         "Compacted file should contain remove action (non-expired tombstone)"
+    );
+    assert!(
+        has_add_file1,
+        "Compacted file should contain add action for file1 (first/newest add action for this file path)"
+    );
+    assert!(
+        has_add_file2,
+        "Compacted file should contain add action for file2 (it was not removed)"
+    );
+    assert!(
+        !has_commit_info,
+        "Compacted file should NOT contain commitInfo actions (they should be excluded)"
     );
 
     // Verify the remove action has the current timestamp
