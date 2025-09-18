@@ -44,18 +44,13 @@ impl LogPath {
         size: FileSize,
     ) -> DeltaResult<LogPath> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
-
-        // require table_root ends with '/'
-        require!(
-            table_root.path().ends_with('/'),
-            Error::generic("table root must be a directory-like URL ending with '/'")
-        );
-        let location = table_root
-            .join("_delta_log/")?
-            .join("_staged_commits/")?
-            .join(filename)?;
+        let mut commit_path = table_root.clone();
+        commit_path
+            .path_segments_mut()
+            .map_err(|()| Error::invalid_table_location(table_root))?
+            .extend(&["_delta_log", "_staged_commits", filename]);
         let file_meta = FileMeta {
-            location,
+            location: commit_path,
             last_modified,
             size,
         };
