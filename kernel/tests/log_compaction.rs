@@ -100,7 +100,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     // - Add action for file2 (first/newest add for this file path)
     // - Remove action for file1 (first/newest remove for this file path, non-expired tombstone)
     // - CommitInfo actions should be excluded from compaction
-    // 
+    //
     // Note: Actions are processed in reverse chronological order (newest to oldest).
     // The reconciliation keeps the first (newest) occurrence of each action type
     // for each unique file path, so both add and remove actions for file1 are kept.
@@ -153,9 +153,15 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let has_protocol = compacted_lines.iter().any(|line| line.contains("protocol"));
     let has_metadata = compacted_lines.iter().any(|line| line.contains("metaData"));
     let has_remove = compacted_lines.iter().any(|line| line.contains("remove"));
-    let has_add_file1 = compacted_lines.iter().any(|line| line.contains("part-00000-file1.parquet") && line.contains("add"));
-    let has_add_file2 = compacted_lines.iter().any(|line| line.contains("part-00001-file2.parquet") && line.contains("add"));
-    let has_commit_info = compacted_lines.iter().any(|line| line.contains("commitInfo"));
+    let has_add_file1 = compacted_lines
+        .iter()
+        .any(|line| line.contains("part-00000-file1.parquet") && line.contains("add"));
+    let has_add_file2 = compacted_lines
+        .iter()
+        .any(|line| line.contains("part-00001-file2.parquet") && line.contains("add"));
+    let has_commit_info = compacted_lines
+        .iter()
+        .any(|line| line.contains("commitInfo"));
 
     assert!(
         has_protocol,
