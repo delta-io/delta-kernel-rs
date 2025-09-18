@@ -649,7 +649,7 @@ mod tests {
 
         // Test 1: Empty transform (identity) - should be exactly equal to input
         let transform = Transform::new_top_level();
-        let output_schema = StructType::new(vec![
+        let output_schema = StructType::new_unchecked(vec![
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
             StructField::new("c", DataType::INTEGER, false),
@@ -675,7 +675,7 @@ mod tests {
         let nested_batch = create_nested_test_batch();
         let transform_nested = Transform::new_nested(["nested"]);
 
-        let nested_output_schema = StructType::new(vec![
+        let nested_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::INTEGER, false),
         ]);
@@ -723,7 +723,7 @@ mod tests {
             .with_inserted_field(Some("c"), column_expr_ref!("a"))
             .with_inserted_field(Some("c"), Expr::literal(99).into());
 
-        let output_schema = StructType::new(vec![
+        let output_schema = StructType::new_unchecked(vec![
             StructField::new("pre1", DataType::INTEGER, false), // prepend 1
             StructField::new("pre2", DataType::INTEGER, false), // prepend 2
             StructField::new("pre3", DataType::INTEGER, false), // prepend 3 (column c)
@@ -770,7 +770,7 @@ mod tests {
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
         let transform_copy = Transform::new_nested(["nested"]);
 
-        let copy_output_schema = StructType::new(vec![
+        let copy_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::INTEGER, false),
         ]);
@@ -804,7 +804,7 @@ mod tests {
             .with_replaced_field("x".to_string(), Expr::literal(777).into())
             .with_inserted_field(Some("y"), Expr::literal(555).into());
 
-        let modify_output_schema = StructType::new(vec![
+        let modify_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
             StructField::new("y", DataType::INTEGER, false), // passed through
             StructField::new("new_field", DataType::INTEGER, false), // inserted after y
@@ -842,7 +842,8 @@ mod tests {
         // Test unused replacement keys
         let transform =
             Transform::new_top_level().with_replaced_field("missing", Expr::literal(1).into());
-        let output_schema = StructType::new(vec![StructField::new("a", DataType::INTEGER, false)]);
+        let output_schema =
+            StructType::new_unchecked(vec![StructField::new("a", DataType::INTEGER, false)]);
 
         let expr = Expr::Transform(transform);
         let result = evaluate_expression(
@@ -874,7 +875,7 @@ mod tests {
         // Test column count mismatch
         let transform3 = Transform::new_top_level().with_dropped_field("a");
 
-        let wrong_output_schema = StructType::new(vec![
+        let wrong_output_schema = StructType::new_unchecked(vec![
             StructField::new("a", DataType::INTEGER, false), // expects a field that was dropped
             StructField::new("b", DataType::INTEGER, false),
             StructField::new("c", DataType::INTEGER, false),

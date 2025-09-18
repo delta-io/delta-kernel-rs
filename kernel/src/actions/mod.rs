@@ -68,7 +68,7 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([
+    Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
@@ -83,28 +83,28 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         ADD_NAME,
         Add::to_schema(),
     )]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         COMMIT_INFO_NAME,
         CommitInfo::to_schema(),
     )]))
 });
 
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         SET_TRANSACTION_NAME,
         SetTransaction::to_schema(),
     )]))
 });
 
 static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         DOMAIN_METADATA_NAME,
         DomainMetadata::to_schema(),
     )]))
@@ -137,7 +137,9 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
 /// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
 /// schema in a top-level "add" struct.
 pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
-    Arc::new(StructType::new([StructField::nullable(ADD_NAME, schema)]))
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME, schema,
+    )]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -991,15 +993,15 @@ mod tests {
             .project(&[METADATA_NAME])
             .expect("Couldn't get metaData field");
 
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "metaData",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("id", DataType::STRING),
                 StructField::nullable("name", DataType::STRING),
                 StructField::nullable("description", DataType::STRING),
                 StructField::not_null(
                     "format",
-                    StructType::new([
+                    StructType::new_unchecked([
                         StructField::not_null("provider", DataType::STRING),
                         StructField::not_null(
                             "options",
@@ -1025,9 +1027,9 @@ mod tests {
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "add",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
                     "partitionValues",
@@ -1067,7 +1069,7 @@ mod tests {
     fn deletion_vector_field() -> StructField {
         StructField::nullable(
             "deletionVector",
-            DataType::struct_type([
+            DataType::struct_type_unchecked([
                 StructField::not_null("storageType", DataType::STRING),
                 StructField::not_null("pathOrInlineDv", DataType::STRING),
                 StructField::nullable("offset", DataType::INTEGER),
@@ -1082,9 +1084,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "remove",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::nullable("deletionTimestamp", DataType::LONG),
                 StructField::not_null("dataChange", DataType::BOOLEAN),
@@ -1105,9 +1107,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[CDC_NAME])
             .expect("Couldn't get cdc field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "cdc",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
                     "partitionValues",
@@ -1126,9 +1128,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[SIDECAR_NAME])
             .expect("Couldn't get sidecar field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "sidecar",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null("sizeInBytes", DataType::LONG),
                 StructField::not_null("modificationTime", DataType::LONG),
@@ -1143,9 +1145,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[CHECKPOINT_METADATA_NAME])
             .expect("Couldn't get checkpointMetadata field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "checkpointMetadata",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("version", DataType::LONG),
                 tags_field(),
             ]),
@@ -1159,9 +1161,9 @@ mod tests {
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "txn",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("appId", DataType::STRING),
                 StructField::not_null("version", DataType::LONG),
                 StructField::nullable("lastUpdated", DataType::LONG),
@@ -1176,9 +1178,9 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
-        let expected = Arc::new(StructType::new(vec![StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "commitInfo",
-            StructType::new(vec![
+            StructType::new_unchecked(vec![
                 StructField::nullable("timestamp", DataType::LONG),
                 StructField::nullable("inCommitTimestamp", DataType::LONG),
                 StructField::nullable("operation", DataType::STRING),
@@ -1199,9 +1201,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[DOMAIN_METADATA_NAME])
             .expect("Couldn't get domainMetadata field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "domainMetadata",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("domain", DataType::STRING),
                 StructField::not_null("configuration", DataType::STRING),
                 StructField::not_null("removed", DataType::BOOLEAN),
@@ -1526,7 +1528,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1551,7 +1553,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1561,7 +1563,7 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1648,7 +1650,7 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1699,7 +1701,7 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),

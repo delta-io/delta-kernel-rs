@@ -225,11 +225,9 @@ mod tests {
     #[test]
     fn test_new_expression_evaluator() {
         let engine = get_default_engine("memory:///doesntmatter/foo");
-        let in_schema = Arc::new(StructType::new(vec![StructField::new(
-            "a",
-            DataType::LONG,
-            true,
-        )]));
+        let in_schema = Arc::new(
+            StructType::try_new(vec![StructField::new("a", DataType::LONG, true)]).unwrap(),
+        );
         let expr = Expression::literal(1);
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();

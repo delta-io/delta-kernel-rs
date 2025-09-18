@@ -233,7 +233,7 @@ mod apply_schema_validation_tests {
     }
 
     fn create_target_schema_2_fields() -> StructType {
-        StructType::new([
+        StructType::new_unchecked([
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
         ])

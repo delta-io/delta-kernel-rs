@@ -173,7 +173,7 @@ impl TableChangesScanBuilder {
             logical_schema,
             physical_predicate,
             all_fields: Arc::new(all_fields),
-            physical_schema: StructType::new(read_fields).into(),
+            physical_schema: StructType::try_new(read_fields)?.into(),
         })
     }
 }
@@ -422,7 +422,7 @@ mod tests {
         );
         assert_eq!(
             scan.logical_schema,
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::not_null("_commit_version", DataType::LONG),
             ])
@@ -432,7 +432,7 @@ mod tests {
             scan.physical_predicate,
             PhysicalPredicate::Some(
                 predicate,
-                StructType::new([StructField::nullable("id", DataType::INTEGER),]).into()
+                StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER),]).into()
             )
         );
     }

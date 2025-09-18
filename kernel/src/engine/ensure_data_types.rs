@@ -452,10 +452,10 @@ mod tests {
 
     #[test]
     fn ensure_struct() {
-        let schema = DataType::struct_type([StructField::nullable(
+        let schema = DataType::struct_type_unchecked([StructField::nullable(
             "a",
             ArrayType::new(
-                DataType::struct_type([
+                DataType::struct_type_unchecked([
                     StructField::nullable("w", DataType::LONG),
                     StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
                     StructField::nullable(
@@ -464,7 +464,7 @@ mod tests {
                     ),
                     StructField::nullable(
                         "z",
-                        DataType::struct_type([
+                        DataType::struct_type_unchecked([
                             StructField::nullable("n", DataType::LONG),
                             StructField::nullable("m", DataType::STRING),
                         ]),
@@ -476,7 +476,7 @@ mod tests {
         let arrow_struct = ArrowDataType::try_from_kernel(&schema).unwrap();
         assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
 
-        let kernel_simple = DataType::struct_type([
+        let kernel_simple = DataType::struct_type_unchecked([
             StructField::nullable("w", DataType::LONG),
             StructField::nullable("x", DataType::LONG),
         ]);

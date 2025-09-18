@@ -701,7 +701,7 @@ mod tests {
                 )),
             );
             let handler = handler.with_buffer_size(*buffer_size);
-            let physical_schema = Arc::new(Schema::new(vec![StructField::nullable(
+            let physical_schema = Arc::new(Schema::new_unchecked(vec![StructField::nullable(
                 "val",
                 DeltaDataType::INTEGER,
             )]));

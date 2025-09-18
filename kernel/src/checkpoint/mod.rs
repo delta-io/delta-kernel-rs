@@ -113,7 +113,7 @@ mod tests;
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
 /// field, which is only known at runtime.
 static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([
+    StructType::new_unchecked([
         StructField::not_null("version", DataType::LONG),
         StructField::not_null("size", DataType::LONG),
         StructField::nullable("parts", DataType::LONG),
@@ -125,7 +125,7 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 /// Schema for extracting relevant actions from log files for checkpoint creation
 static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([
+    Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
@@ -139,9 +139,9 @@ static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 // We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
 // we're not supporting yet due to the lack of map support TODO(#880).
 static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         CHECKPOINT_METADATA_NAME,
-        DataType::struct_type([StructField::not_null("version", DataType::LONG)]),
+        DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
     )]))
 });
 

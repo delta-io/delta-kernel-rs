@@ -51,12 +51,12 @@ mod tests {
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {
-        let schema_with_timestamp_ntz = StructType::new([
+        let schema_with_timestamp_ntz = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("ts", DataType::Primitive(PrimitiveType::TimestampNtz), true),
         ]);
 
-        let schema_without_timestamp_ntz = StructType::new([
+        let schema_without_timestamp_ntz = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("name", DataType::STRING, true),
         ]);
@@ -105,11 +105,11 @@ mod tests {
         assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
 
         // Nested schema with TIMESTAMP_NTZ
-        let nested_schema_with_timestamp_ntz = StructType::new([
+        let nested_schema_with_timestamp_ntz = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new([StructField::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
                     "inner_ts",
                     DataType::Primitive(PrimitiveType::TimestampNtz),
                     true,

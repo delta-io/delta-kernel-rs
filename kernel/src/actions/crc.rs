@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_file_size_histogram_schema() {
         let schema = FileSizeHistogram::to_schema();
-        let expected = StructType::new([
+        let expected = StructType::new_unchecked([
             StructField::not_null("sortedBinBoundaries", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("fileCounts", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("totalBytes", ArrayType::new(DataType::LONG, false)),
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn test_deleted_record_counts_histogram_schema() {
         let schema = DeletedRecordCountsHistogram::to_schema();
-        let expected = StructType::new([StructField::not_null(
+        let expected = StructType::new_unchecked([StructField::not_null(
             "deletedRecordCounts",
             ArrayType::new(DataType::LONG, false),
         )]);
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn test_crc_schema() {
         let schema = Crc::to_schema();
-        let expected = StructType::new([
+        let expected = StructType::new_unchecked([
             StructField::nullable("txnId", DataType::STRING),
             StructField::not_null("tableSizeBytes", DataType::LONG),
             StructField::not_null("numFiles", DataType::LONG),

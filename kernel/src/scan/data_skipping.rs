@@ -116,7 +116,7 @@ impl DataSkippingFilter {
         let nullcount_schema = NullCountStatsTransform
             .transform_struct(&stats_schema)?
             .into_owned();
-        let stats_schema = Arc::new(StructType::new([
+        let stats_schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", nullcount_schema),
             StructField::nullable("minValues", stats_schema.clone()),

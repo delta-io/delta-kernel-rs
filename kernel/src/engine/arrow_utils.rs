@@ -387,7 +387,7 @@ fn get_indices(
                     // we just want to transparently recurse into lists, need to transform the kernel
                     // list data type into a schema
                     if let DataType::Array(array_type) = requested_field.data_type() {
-                        let requested_schema = StructType::new([StructField::new(
+                        let requested_schema = StructType::new_unchecked([StructField::new(
                             list_field.name().clone(), // so we find it in the inner call
                             array_type.element_type.clone(),
                             array_type.contains_null,
@@ -1111,7 +1111,7 @@ mod tests {
     #[test]
     fn simple_mask_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
@@ -1188,7 +1188,7 @@ mod tests {
             ArrowField::new("v", ArrowDataType::Int16, true)
         }
         // Top level variant
-        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
             "v",
             DataType::unshredded_variant(),
         )]));
@@ -1214,9 +1214,9 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Struct of Variant
-        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
             "struct_v",
-            StructType::new([StructField::nullable("v", DataType::unshredded_variant())]),
+            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]),
         )]));
         let unshredded_parquet_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "struct_v",
@@ -1235,7 +1235,7 @@ mod tests {
         assert!(matches!(result_shredded,
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
         // Array of Variant
-        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
             "array_v",
             ArrayType::new(DataType::unshredded_variant(), true),
         )]));
@@ -1257,7 +1257,7 @@ mod tests {
             Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 
         // Map of Variant
-        let requested_schema = Arc::new(StructType::new([StructField::nullable(
+        let requested_schema = Arc::new(StructType::new_unchecked([StructField::nullable(
             "map_v",
             MapType::new(DataType::STRING, DataType::unshredded_variant(), true),
         )]));
@@ -1288,7 +1288,7 @@ mod tests {
     #[test]
     fn ensure_data_types_fails_correctly() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::INTEGER)
@@ -1308,7 +1308,7 @@ mod tests {
                 "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
             );
 
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
@@ -1331,7 +1331,7 @@ mod tests {
     #[test]
     fn mask_with_map() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([StructField::not_null(
+            let requested_schema = StructType::new_unchecked([StructField::not_null(
                 logical_name(0),
                 MapType::new(DataType::INTEGER, DataType::STRING, false),
             )
@@ -1361,7 +1361,7 @@ mod tests {
     #[test]
     fn simple_reorder_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
@@ -1395,7 +1395,7 @@ mod tests {
     #[test]
     fn simple_nullable_field_missing() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::nullable(logical_name(1), DataType::STRING)
@@ -1436,7 +1436,7 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_only() {
-        let requested_schema = StructType::new([
+        let requested_schema = StructType::new_unchecked([
             StructField::not_null("i_logical", DataType::INTEGER)
                 .with_metadata(kernel_fid_and_name(1, "i_physical")),
             StructField::nullable("s_logical", DataType::STRING)
@@ -1474,7 +1474,7 @@ mod tests {
 
     #[test]
     fn get_requested_indices_by_id_falls_back_to_name() {
-        let requested_schema = StructType::new([
+        let requested_schema = StructType::new_unchecked([
             StructField::not_null("i_logical", DataType::INTEGER)
                 .with_metadata(kernel_fid_and_name(1, "i_physical")),
             StructField::nullable("s_logical", DataType::STRING)
@@ -1536,12 +1536,12 @@ mod tests {
     #[test]
     fn nested_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(3),
-                    StructType::new([
+                    StructType::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
                             .with_metadata(column_mapping_metadata(4)),
                         StructField::not_null(logical_name(5), DataType::STRING)
@@ -1573,10 +1573,10 @@ mod tests {
     #[test]
     fn nested_indices_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(
                     logical_name(3),
-                    StructType::new([
+                    StructType::new_unchecked([
                         StructField::not_null(logical_name(5), DataType::STRING)
                             .with_metadata(column_mapping_metadata(5)),
                         StructField::not_null(logical_name(4), DataType::INTEGER)
@@ -1611,13 +1611,16 @@ mod tests {
     #[test]
     fn nested_indices_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(3),
-                    StructType::new([StructField::not_null(logical_name(4), DataType::INTEGER)
-                        .with_metadata(column_mapping_metadata(4))]),
+                    StructType::new_unchecked([StructField::not_null(
+                        logical_name(4),
+                        DataType::INTEGER,
+                    )
+                    .with_metadata(column_mapping_metadata(4))]),
                 )
                 .with_metadata(column_mapping_metadata(3)),
                 StructField::not_null(logical_name(2), DataType::INTEGER)
@@ -1642,7 +1645,7 @@ mod tests {
     #[test]
     fn simple_list_mask() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(logical_name(2), ArrayType::new(DataType::INTEGER, false))
@@ -1684,7 +1687,7 @@ mod tests {
     #[test]
     fn list_skip_earlier_element() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([StructField::not_null(
+            let requested_schema = StructType::new_unchecked([StructField::not_null(
                 logical_name(1),
                 ArrayType::new(DataType::INTEGER, false),
             )
@@ -1716,13 +1719,13 @@ mod tests {
     #[test]
     fn nested_indices_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(0), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(0)),
                 StructField::not_null(
                     logical_name(1),
                     ArrayType::new(
-                        StructType::new([
+                        StructType::new_unchecked([
                             StructField::not_null(logical_name(3), DataType::INTEGER)
                                 .with_metadata(column_mapping_metadata(3)),
                             StructField::not_null(logical_name(4), DataType::STRING)
@@ -1781,7 +1784,7 @@ mod tests {
     #[test]
     fn nested_indices_unselected_list() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(logical_name(3), DataType::INTEGER)
@@ -1825,13 +1828,13 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new([StructField::not_null(
+                        StructType::new_unchecked([StructField::not_null(
                             logical_name(4),
                             DataType::INTEGER,
                         )
@@ -1886,13 +1889,13 @@ mod tests {
     #[test]
     fn nested_indices_list_mask_inner_reorder() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
                     ArrayType::new(
-                        StructType::new([
+                        StructType::new_unchecked([
                             StructField::not_null(logical_name(6), DataType::STRING)
                                 .with_metadata(column_mapping_metadata(6)),
                             StructField::not_null(logical_name(5), DataType::INTEGER)
@@ -1953,12 +1956,12 @@ mod tests {
     #[test]
     fn skipped_struct() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::not_null(logical_name(1), DataType::INTEGER)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::not_null(
                     logical_name(2),
-                    StructType::new([
+                    StructType::new_unchecked([
                         StructField::not_null(logical_name(4), DataType::INTEGER)
                             .with_metadata(column_mapping_metadata(4)),
                         StructField::not_null(logical_name(5), DataType::STRING)
@@ -2023,16 +2026,16 @@ mod tests {
 
     #[test]
     fn reorder_map_with_structs() {
-        let requested_schema = Arc::new(StructType::new([
+        let requested_schema = Arc::new(StructType::new_unchecked([
             StructField::not_null("i", DataType::INTEGER),
             StructField::not_null(
                 "map",
                 MapType::new(
-                    StructType::new([
+                    StructType::new_unchecked([
                         StructField::not_null("k1", DataType::STRING),
                         StructField::not_null("k2", DataType::STRING),
                     ]),
-                    StructType::new([
+                    StructType::new_unchecked([
                         StructField::not_null("v2", DataType::STRING),
                         StructField::not_null("v1", DataType::STRING),
                     ]),
@@ -2297,7 +2300,7 @@ mod tests {
     #[test]
     fn no_matches() {
         column_mapping_cases().into_iter().for_each(|mode| {
-            let requested_schema = StructType::new([
+            let requested_schema = StructType::new_unchecked([
                 StructField::nullable(logical_name(1), DataType::STRING)
                     .with_metadata(column_mapping_metadata(1)),
                 StructField::nullable(logical_name(2), DataType::INTEGER)
@@ -2340,7 +2343,7 @@ mod tests {
 
     #[test]
     fn empty_requested_schema() {
-        let requested_schema = Arc::new(StructType::new([]));
+        let requested_schema = Arc::new(StructType::new_unchecked([]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("i", ArrowDataType::Int32, false),
             ArrowField::new("s", ArrowDataType::Utf8, true),

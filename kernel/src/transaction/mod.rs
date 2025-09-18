@@ -27,7 +27,7 @@ type EngineDataResultIterator<'a> =
 
 /// The minimal (i.e., mandatory) fields in an add action.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new(vec![
+    Arc::new(StructType::new_unchecked(vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null(
             "partitionValues",
@@ -48,10 +48,10 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
-        DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
+        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
     );
 
-    Arc::new(StructType::new(
+    Arc::new(StructType::new_unchecked(
         mandatory_add_file_schema().fields().cloned().chain([stats]),
     ))
 });
@@ -85,7 +85,7 @@ fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
         .fields()
         .cloned()
         .chain([StructField::nullable("stats", DataType::STRING)]);
-    Arc::new(StructType::new(fields))
+    Arc::new(StructType::new_unchecked(fields))
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
@@ -96,7 +96,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
         StructField::nullable("baseRowId", DataType::LONG),
         StructField::nullable("defaultRowCommitVersion", DataType::LONG),
     ]);
-    Arc::new(StructType::new(fields))
+    Arc::new(StructType::new_unchecked(fields))
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -385,7 +385,7 @@ impl Transaction {
                         ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
                     add_files_batch.append_columns(
-                        with_row_tracking_cols(&Arc::new(StructType::new(vec![]))),
+                        with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
                         vec![base_row_ids, row_commit_versions],
                     )
                 },
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn test_add_files_schema() {
         let schema = add_files_schema();
-        let expected = StructType::new(vec![
+        let expected = StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
                 "partitionValues",
@@ -492,7 +492,10 @@ mod tests {
             StructField::not_null("dataChange", DataType::BOOLEAN),
             StructField::nullable(
                 "stats",
-                DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
+                DataType::struct_type_unchecked(vec![StructField::nullable(
+                    "numRecords",
+                    DataType::LONG,
+                )]),
             ),
         ]);
         assert_eq!(*schema, expected.into());

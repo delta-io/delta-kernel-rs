@@ -372,16 +372,48 @@ pub struct StructType {
 }
 
 impl StructType {
-    pub fn new(fields: impl IntoIterator<Item = StructField>) -> Self {
+    /// Creates a new [`StructType`] from the given fields.
+    ///
+    /// Returns an error if:
+    /// - the schema contains duplicate field names
+    pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        let mut field_map = IndexMap::new();
+
+        // Validate duplicates during insertion
+        for field in fields {
+            // Check for duplicate field names
+            if let Some(dup) = field_map.insert(field.name.clone(), field) {
+                return Err(Error::schema(format!("Duplicate field name: {}", dup.name)));
+            }
+        }
+
+        Ok(Self {
+            type_name: "struct".into(),
+            fields: field_map,
+        })
+    }
+
+    /// Creates a new [`StructType`] from a fallible iterator of fields.
+    ///
+    /// This constructor collects all fields from the iterator, returning the first error
+    /// encountered, or a new [`StructType`] if all fields are successfully collected and validated.
+    pub fn try_from_results<E: Into<Error>>(
+        fields: impl IntoIterator<Item = Result<StructField, E>>,
+    ) -> DeltaResult<Self> {
+        let fields: Vec<_> = fields.into_iter().try_collect().map_err(Into::into)?;
+        Self::try_new(fields)
+    }
+
+    /// Creates a new [`StructType`] from the given fields without validating them.
+    ///
+    /// This should only be used when you are sure that the fields are valid.
+    /// Refer to [`StructType::try_new`] for more details on the validation checks.
+    #[internal_api]
+    pub(crate) fn new_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
         Self {
             type_name: "struct".into(),
             fields: fields.into_iter().map(|f| (f.name.clone(), f)).collect(),
         }
-    }
-
-    pub fn try_new<E>(fields: impl IntoIterator<Item = Result<StructField, E>>) -> Result<Self, E> {
-        let fields: Vec<_> = fields.into_iter().try_collect()?;
-        Ok(Self::new(fields))
     }
 
     /// Get a [`StructType`] containing [`StructField`]s of the given names. The order of fields in
@@ -394,7 +426,7 @@ impl StructType {
                 .cloned()
                 .ok_or_else(|| Error::missing_column(name.as_ref()))
         });
-        Self::try_new(fields)
+        Self::try_from_results(fields)
     }
 
     /// Get a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
@@ -457,7 +489,7 @@ impl StructType {
         let fields = self
             .fields()
             .map(|field| field.make_physical(column_mapping_mode));
-        Self::new(fields)
+        Self::new_unchecked(fields)
     }
 }
 
@@ -492,18 +524,20 @@ impl<'a> IntoIterator for &'a StructType {
 /// # Examples
 ///
 /// ```
+/// # use delta_kernel::Error;
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
 ///     StructField::new("name", DataType::STRING, false),
 ///     StructField::new("age", DataType::INTEGER, true),
 /// ];
-/// let struct_type = StructType::new(fields);
+/// let struct_type = StructType::try_new(fields)?;
 ///
 /// // Consume the struct_type and iterate over owned fields
 /// for field in struct_type {
 ///     println!("Field: {} ({})", field.name(), field.data_type());
 /// }
+/// # Ok::<(), Error>(())
 /// ```
 ///
 /// [`IndexMap`]: indexmap::IndexMap
@@ -563,13 +597,14 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// # Examples
 ///
 /// ```
+/// # use delta_kernel::Error;
 /// use delta_kernel::schema::{StructType, StructField, DataType};
 ///
 /// let fields = vec![
 ///     StructField::new("name", DataType::STRING, false),
 ///     StructField::new("age", DataType::INTEGER, true),
 /// ];
-/// let struct_type = StructType::new(fields);
+/// let struct_type = StructType::try_new(fields)?;
 ///
 /// // Iterate over field references without consuming the struct_type
 /// for field in &struct_type {
@@ -583,6 +618,7 @@ impl DoubleEndedIterator for StructFieldIntoIter {
 /// for field in struct_type.fields() {
 ///     println!("Field type: {}", field.data_type());
 /// }
+/// # Ok::<(), Error>(())
 /// ```
 ///
 /// [`StructType::fields()`]: StructType::fields
@@ -783,7 +819,7 @@ impl MapType {
 
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
-        StructType::new([
+        StructType::new_unchecked([
             StructField::not_null(key_name, self.key_type.clone()),
             StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
         ])
@@ -1028,30 +1064,35 @@ impl DataType {
     }
 
     /// Create a new struct type with the given fields.
-    pub fn struct_type(fields: impl IntoIterator<Item = StructField>) -> Self {
-        StructType::new(fields).into()
+    pub fn try_struct_type(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Ok(StructType::try_new(fields)?.into())
     }
 
     /// Create a new struct type from a fallible iterator of fields.
-    pub fn try_struct_type<E>(
+    pub fn try_struct_type_from_results<E: Into<Error>>(
         fields: impl IntoIterator<Item = Result<StructField, E>>,
-    ) -> Result<Self, E> {
-        Ok(StructType::try_new(fields)?.into())
+    ) -> DeltaResult<Self> {
+        StructType::try_from_results(fields).map(Self::from)
+    }
+
+    /// Create a new struct type with the given fields without validating them.
+    pub(crate) fn struct_type_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
+        StructType::new_unchecked(fields).into()
     }
 
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
     /// binary fields: `metadata` and `value`.
     pub fn unshredded_variant() -> Self {
-        DataType::variant_type([
+        DataType::Variant(Box::new(StructType::new_unchecked([
             StructField::not_null("metadata", DataType::BINARY),
             StructField::not_null("value", DataType::BINARY),
-        ])
+        ])))
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
     /// should prefer using [`DataType::unshredded_variant`].
-    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> Self {
-        DataType::Variant(Box::new(StructType::new(fields)))
+    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Ok(DataType::Variant(Box::new(StructType::try_new(fields)?)))
     }
 
     /// Attempt to convert this data type to a [`PrimitiveType`]. Returns `None` if this is a
@@ -1216,7 +1257,7 @@ pub trait SchemaTransform<'a> {
             None
         } else if num_borrowed < stype.fields.len() {
             // At least one field was changed or filtered out, so make a new struct
-            Some(Owned(StructType::new(
+            Some(Owned(StructType::new_unchecked(
                 fields.into_iter().map(|f| f.into_owned()),
             )))
         } else {
@@ -1672,11 +1713,11 @@ mod tests {
 
     #[test]
     fn test_depth_checker() {
-        let schema = DataType::struct_type([
+        let schema = DataType::try_struct_type([
             StructField::nullable(
                 "a",
                 ArrayType::new(
-                    DataType::struct_type([
+                    DataType::try_struct_type([
                         StructField::nullable("w", DataType::LONG),
                         StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
                         StructField::nullable(
@@ -1685,18 +1726,20 @@ mod tests {
                         ),
                         StructField::nullable(
                             "z",
-                            DataType::struct_type([
+                            DataType::try_struct_type([
                                 StructField::nullable("n", DataType::LONG),
                                 StructField::nullable("m", DataType::STRING),
-                            ]),
+                            ])
+                            .unwrap(),
                         ),
-                    ]),
+                    ])
+                    .unwrap(),
                     true,
                 ),
             ),
             StructField::nullable(
                 "b",
-                DataType::struct_type([
+                DataType::try_struct_type([
                     StructField::nullable("o", ArrayType::new(DataType::LONG, true)),
                     StructField::nullable(
                         "p",
@@ -1704,32 +1747,37 @@ mod tests {
                     ),
                     StructField::nullable(
                         "q",
-                        DataType::struct_type([
+                        DataType::try_struct_type([
                             StructField::nullable(
                                 "s",
-                                DataType::struct_type([
+                                DataType::try_struct_type([
                                     StructField::nullable("u", DataType::LONG),
                                     StructField::nullable("v", DataType::LONG),
-                                ]),
+                                ])
+                                .unwrap(),
                             ),
                             StructField::nullable("t", DataType::LONG),
-                        ]),
+                        ])
+                        .unwrap(),
                     ),
                     StructField::nullable("r", DataType::LONG),
-                ]),
+                ])
+                .unwrap(),
             ),
             StructField::nullable(
                 "c",
                 MapType::new(
                     DataType::LONG,
-                    DataType::struct_type([
+                    DataType::try_struct_type([
                         StructField::nullable("f", DataType::LONG),
                         StructField::nullable("g", DataType::STRING),
-                    ]),
+                    ])
+                    .unwrap(),
                     true,
                 ),
             ),
-        ]);
+        ])
+        .unwrap();
 
         // Similar to SchemaDepthChecker::check, but also returns call count
         let check_with_call_count =
@@ -1777,16 +1825,16 @@ mod tests {
 
     #[test]
     fn test_fields_len() {
-        let schema = StructType::new([]);
+        let schema = StructType::new_unchecked([]);
         assert!(schema.fields_len() == 0);
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG),
             StructField::nullable("c", DataType::LONG),
             StructField::nullable("d", DataType::LONG),
         ]);
         assert_eq!(schema.fields_len(), 4);
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("b", DataType::LONG),
             StructField::not_null("b", DataType::LONG),
             StructField::nullable("c", DataType::LONG),
@@ -1798,7 +1846,7 @@ mod tests {
     #[test]
     fn test_has_invariants() {
         // Schema with no invariants
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
         ]);
@@ -1811,23 +1859,25 @@ mod tests {
             MetadataValue::String("c > 0".to_string()),
         );
 
-        let schema = StructType::new([StructField::nullable("a", DataType::STRING), field]);
+        let schema =
+            StructType::new_unchecked([StructField::nullable("a", DataType::STRING), field]);
         assert!(InvariantChecker::has_invariants(&schema));
 
         // Schema with nested invariant in a struct
         let nested_field = StructField::nullable(
             "nested_c",
-            DataType::struct_type([{
+            DataType::try_struct_type([{
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
                     ColumnMetadataKey::Invariants.as_ref().to_string(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
-            }]),
+            }])
+            .unwrap(),
         );
 
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             nested_field,
@@ -1838,19 +1888,20 @@ mod tests {
         let array_field = StructField::nullable(
             "array_field",
             ArrayType::new(
-                DataType::struct_type([{
+                DataType::try_struct_type([{
                     let mut field = StructField::nullable("d", DataType::INTEGER);
                     field.metadata.insert(
                         ColumnMetadataKey::Invariants.as_ref().to_string(),
                         MetadataValue::String("d > 0".to_string()),
                     );
                     field
-                }]),
+                }])
+                .unwrap(),
                 true,
             ),
         );
 
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             array_field,
@@ -1862,19 +1913,20 @@ mod tests {
             "map_field",
             MapType::new(
                 DataType::STRING,
-                DataType::struct_type([{
+                DataType::try_struct_type([{
                     let mut field = StructField::nullable("d", DataType::INTEGER);
                     field.metadata.insert(
                         ColumnMetadataKey::Invariants.as_ref().to_string(),
                         MetadataValue::String("d > 0".to_string()),
                     );
                     field
-                }]),
+                }])
+                .unwrap(),
                 true,
             ),
         );
 
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             map_field,
@@ -1889,7 +1941,7 @@ mod tests {
             StructField::new("field2", DataType::INTEGER, false),
             StructField::new("field3", DataType::BOOLEAN, true),
         ];
-        let struct_type = StructType::new(fields.clone());
+        let struct_type = StructType::new_unchecked(fields.clone());
 
         // Test fields() method returns reference iterator
         let field_names: Vec<_> = struct_type.fields().map(|f| f.name()).collect();
@@ -1905,7 +1957,7 @@ mod tests {
             StructField::new("a", DataType::STRING, true),
             StructField::new("b", DataType::INTEGER, false),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test owned iteration (consumes the struct)
         let mut field_names = Vec::new();
@@ -1922,7 +1974,7 @@ mod tests {
             StructField::new("y", DataType::FLOAT, false),
             StructField::new("z", DataType::LONG, true),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test reference iteration (does not consume the struct)
         let mut field_names = Vec::new();
@@ -1945,17 +1997,17 @@ mod tests {
         ];
 
         // Test ExactSizeIterator for reference iterator
-        let struct_type = StructType::new(fields.clone());
+        let struct_type = StructType::new_unchecked(fields.clone());
         let ref_iter = struct_type.fields();
         assert_eq!(ref_iter.len(), 4);
 
         // Test ExactSizeIterator for &StructType into_iter
-        let struct_type = StructType::new(fields.clone());
+        let struct_type = StructType::new_unchecked(fields.clone());
         let into_ref_iter = (&struct_type).into_iter();
         assert_eq!(into_ref_iter.len(), 4);
 
         // Test ExactSizeIterator for StructType into_iter (consuming)
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
         let into_owned_iter = struct_type.into_iter();
         assert_eq!(into_owned_iter.len(), 4);
     }
@@ -1965,7 +2017,7 @@ mod tests {
         let field_with_metadata = StructField::new("test_field", DataType::STRING, true)
             .with_metadata([("key1", MetadataValue::String("value1".to_string()))]);
 
-        let struct_type = StructType::new([field_with_metadata]);
+        let struct_type = StructType::new_unchecked([field_with_metadata]);
 
         // Test that metadata is preserved through iteration
         for field in &struct_type {
@@ -1988,7 +2040,7 @@ mod tests {
 
     #[test]
     fn test_empty_struct_type_iterator() {
-        let struct_type = StructType::new(std::iter::empty::<StructField>());
+        let struct_type = StructType::new_unchecked(std::iter::empty::<StructField>());
 
         // Test all iterator methods with empty struct
         assert_eq!(struct_type.fields().count(), 0);
@@ -2003,7 +2055,7 @@ mod tests {
             StructField::new("apple", DataType::INTEGER, false),
             StructField::new("banana", DataType::BOOLEAN, true),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // IndexMap should preserve insertion order
         let field_names: Vec<_> = struct_type.fields().map(|f| f.name()).collect();
@@ -2024,7 +2076,7 @@ mod tests {
             StructField::new("field1", DataType::STRING, true),
             StructField::new("field2", DataType::INTEGER, false),
         ];
-        let struct_type = StructType::new(original_fields.clone());
+        let struct_type = StructType::new_unchecked(original_fields.clone());
 
         // Test collecting from reference iterator
         let collected_refs: Vec<&StructField> = struct_type.fields().collect();
@@ -2047,7 +2099,7 @@ mod tests {
             StructField::new("nullable_bool", DataType::BOOLEAN, true),
             StructField::new("required_long", DataType::LONG, false),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test filter - find nullable fields
         let nullable_count = struct_type.fields().filter(|f| f.is_nullable()).count();
@@ -2081,7 +2133,7 @@ mod tests {
             StructField::new("third", DataType::BOOLEAN, true),
             StructField::new("fourth", DataType::LONG, false),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test iterating from both ends using reference iterator
         let mut iter = struct_type.fields();
@@ -2106,7 +2158,7 @@ mod tests {
             StructField::new("beta", DataType::INTEGER, false),
             StructField::new("gamma", DataType::BOOLEAN, true),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test iterating from both ends using owned iterator
         let mut iter = struct_type.into_iter();
@@ -2132,7 +2184,7 @@ mod tests {
             StructField::new("two", DataType::INTEGER, false),
             StructField::new("three", DataType::BOOLEAN, true),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test collecting in reverse order using DoubleEndedIterator
         let reversed_names: Vec<_> = struct_type.fields().rev().map(|f| f.name()).collect();
@@ -2149,7 +2201,7 @@ mod tests {
             StructField::new("y", DataType::FLOAT, false),
             StructField::new("z", DataType::LONG, true),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test DoubleEndedIterator with &StructType into_iter
         let mut iter = (&struct_type).into_iter();
@@ -2170,7 +2222,7 @@ mod tests {
             StructField::new("test1", DataType::STRING, true),
             StructField::new("test2", DataType::INTEGER, false),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Verify that reference iterator implements FusedIterator
         let mut iter = struct_type.fields();
@@ -2192,7 +2244,7 @@ mod tests {
             StructField::new("item1", DataType::STRING, true),
             StructField::new("item2", DataType::INTEGER, false),
         ];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Verify that owned iterator implements FusedIterator
         let mut iter = struct_type.into_iter();
@@ -2211,7 +2263,7 @@ mod tests {
     #[test]
     fn test_fused_iterator_with_into_iter_ref() {
         let fields = vec![StructField::new("field_a", DataType::BOOLEAN, true)];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Verify that &StructType into_iter implements FusedIterator
         let mut iter = (&struct_type).into_iter();
@@ -2227,7 +2279,7 @@ mod tests {
 
     #[test]
     fn test_fused_double_ended_iterator_empty() {
-        let struct_type = StructType::new(std::iter::empty::<StructField>());
+        let struct_type = StructType::new_unchecked(std::iter::empty::<StructField>());
 
         // Test both forward and backward iteration on empty iterator
         let mut iter = struct_type.fields();
@@ -2244,7 +2296,7 @@ mod tests {
     #[test]
     fn test_double_ended_iterator_single_element() {
         let fields = vec![StructField::new("single", DataType::STRING, true)];
-        let struct_type = StructType::new(fields);
+        let struct_type = StructType::new_unchecked(fields);
 
         // Test DoubleEndedIterator with single element
         let mut iter = struct_type.fields();
@@ -2255,7 +2307,8 @@ mod tests {
         assert!(iter.next_back().is_none());
 
         // Test getting single element from next_back()
-        let struct_type = StructType::new([StructField::new("single2", DataType::INTEGER, false)]);
+        let struct_type =
+            StructType::new_unchecked([StructField::new("single2", DataType::INTEGER, false)]);
         let mut iter = struct_type.into_iter();
 
         assert_eq!(iter.next_back().unwrap().name, "single2");
