@@ -9,7 +9,6 @@ use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
-use std::sync::Arc;
 
 /// A handle representing an exclusive transaction on a Delta table. (Similar to a Box<_>)
 ///
@@ -38,7 +37,7 @@ fn transaction_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let snapshot = Arc::new(Snapshot::builder(url?).build(extern_engine.engine().as_ref())?);
+    let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
     let transaction = snapshot.transaction();
     Ok(Box::new(transaction?).into())
 }

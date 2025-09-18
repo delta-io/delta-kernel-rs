@@ -1,11 +1,12 @@
-//! The [`CheckpointLogReplayProcessor`] implements specialized log replay logic for creating
-//! checkpoint files. It processes log files in reverse chronological order (newest to oldest)
-//! and selects the set of actions to include in a checkpoint for a specific version.
+//! The [`ActionReconciliationProcessor`] implements specialized log replay logic for performing
+//! action reconciliation. It processes log files in reverse chronological order (newest to oldest)
+//! and selects the set of actions to be included.
 //!
-//! ## Actions Included for Checkpointing
+//! Uses cases include checkpointing and log compaction.
 //!
-//! For checkpoint creation, this processor applies several filtering and deduplication
-//! steps to each batch of log actions:
+//! ## Actions Included
+//!
+//! This processor applies several filtering and deduplication steps to each batch of log actions:
 //!
 //! 1. **Protocol and Metadata**: Retains exactly one of each - keeping only the latest protocol
 //!    and metadata actions.
@@ -17,19 +18,18 @@
 //!
 //! ## Architecture
 //!
-//! - [`CheckpointVisitor`]: Implements [`RowVisitor`] to examine each action in a batch and
-//!   determine if it should be included in the checkpoint. It maintains state for deduplication
-//!   across multiple actions in a batch and efficiently handles all filtering rules.
+//! - [`ActionReconciliationVisitor`]: Implements [`RowVisitor`] to examine each action in a batch and
+//!   determine if it should be included. It maintains state for deduplication across multiple actions
+//!   in a batch and efficiently handles all filtering rules.
 //!
-//! - [`CheckpointLogReplayProcessor`]: Implements the [`LogReplayProcessor`] trait and orchestrates
+//! - [`ActionReconciliationProcessor`]: Implements the [`LogReplayProcessor`] trait and orchestrates
 //!   the overall process. For each batch of log actions, it:
 //!   1. Creates a visitor with the current deduplication state
 //!   2. Applies the visitor to filter actions in the batch
 //!   3. Tracks state for deduplication across batches
-//!   4. Produces a [`CheckpointBatch`] result which includes both the filtered data and counts of
-//!      actions selected for the checkpoint file
+//!   4. Produces a [`ActionReconciliationBatch`] result which includes both the filtered data and counts of
+//!      actions selected
 //!
-//! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
@@ -42,11 +42,9 @@ use crate::{DeltaResult, Error};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// The [`CheckpointLogReplayProcessor`] is an implementation of the [`LogReplayProcessor`]
-/// trait that filters log segment actions for inclusion in a V1 spec checkpoint file. This
-/// processor is leveraged when creating a single-file V2 checkpoint as the V2 spec schema is
-/// a superset of the V1 spec schema, with the addition of a [`CheckpointMetadata`] action.
-pub(crate) struct CheckpointLogReplayProcessor {
+/// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
+/// trait that filters log segment actions.
+pub(crate) struct ActionReconciliationProcessor {
     /// Tracks file actions that have been seen during log replay to avoid duplicates.
     /// Contains (data file path, dv_unique_id) pairs as `FileActionKey` instances.
     seen_file_keys: HashSet<FileActionKey>,
@@ -62,33 +60,33 @@ pub(crate) struct CheckpointLogReplayProcessor {
     txn_expiration_timestamp: Option<i64>,
 }
 
-/// This struct is the output of the [`CheckpointLogReplayProcessor`].
+/// This struct is the output of the [`ActionReconciliationProcessor`].
 ///
-/// It contains the filtered batch of actions to be included in the checkpoint,
-/// along with statistics about the number of actions filtered for inclusion.
-pub(crate) struct CheckpointBatch {
-    /// The filtered batch of actions to be included in the checkpoint.
+/// It contains the filtered batch of actions to be included, along with statistics about the
+/// number of actions filtered for inclusion.
+pub(crate) struct ActionReconciliationBatch {
+    /// The filtered batch of actions.
     pub(crate) filtered_data: FilteredEngineData,
-    /// The number of actions in the batch filtered for inclusion in the checkpoint.
+    /// The number of actions in the batch.
     pub(crate) actions_count: i64,
-    /// The number of add actions in the batch filtered for inclusion in the checkpoint.
+    /// The number of add actions in the batch.
     pub(crate) add_actions_count: i64,
 }
 
-impl HasSelectionVector for CheckpointBatch {
+impl HasSelectionVector for ActionReconciliationBatch {
     fn has_selected_rows(&self) -> bool {
         self.filtered_data.has_selected_rows()
     }
 }
 
-impl LogReplayProcessor for CheckpointLogReplayProcessor {
-    type Output = CheckpointBatch;
+impl LogReplayProcessor for ActionReconciliationProcessor {
+    type Output = ActionReconciliationBatch;
 
     /// Processes a batch of actions read from the log during reverse chronological replay
-    /// and returns a [`CheckpointBatch`], which contains the filtered actions to be
-    /// included in the checkpoint file, along with statistics about the included actions.
+    /// and returns a [`ActionReconciliationBatch`], which contains the filtered actions,
+    /// along with statistics about the included actions.
     ///
-    /// This method delegates the filtering logic to the [`CheckpointVisitor`], which implements
+    /// This method delegates the filtering logic to the [`ActionReconciliationVisitor`], which implements
     /// the deduplication rules described in the module documentation. The method tracks
     /// statistics about processed actions (total count, add actions count) and maintains
     /// state for cross-batch deduplication.
@@ -99,8 +97,8 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
         } = actions_batch;
         let selection_vector = vec![true; actions.len()];
 
-        // Create the checkpoint visitor to process actions and update selection vector
-        let mut visitor = CheckpointVisitor::new(
+        // Create the action reconciliation visitor to process actions and update selection vector
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut self.seen_file_keys,
             is_log_batch,
             selection_vector,
@@ -121,20 +119,20 @@ impl LogReplayProcessor for CheckpointLogReplayProcessor {
             selection_vector: visitor.selection_vector,
         };
 
-        Ok(CheckpointBatch {
+        Ok(ActionReconciliationBatch {
             filtered_data,
             actions_count: visitor.actions_count,
             add_actions_count: visitor.add_actions_count,
         })
     }
 
-    /// We never do data skipping for checkpoint log replay (entire table state is always reproduced)
+    /// We never do data skipping for action reconciliation log replay (entire table state is always reproduced)
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
         None
     }
 }
 
-impl CheckpointLogReplayProcessor {
+impl ActionReconciliationProcessor {
     pub(crate) fn new(
         minimum_file_retention_timestamp: i64,
         txn_expiration_timestamp: Option<i64>,
@@ -150,11 +148,11 @@ impl CheckpointLogReplayProcessor {
     }
 }
 
-/// A visitor that filters actions for inclusion in a V1 spec checkpoint file.
+/// A visitor that filters actions,
 ///
 /// This visitor processes actions in newest-to-oldest order (as they appear in log
 /// replay) and applies deduplication logic for both file and non-file actions to
-/// produce the actions to include in a checkpoint.
+/// produce the actions.
 ///
 /// # File Action Filtering Rules:
 ///   Kept Actions:
@@ -188,9 +186,8 @@ impl CheckpointLogReplayProcessor {
 /// - N = number of txn actions with unique appIds
 /// - M = number of file actions with unique (path, dvId) pairs
 ///
-/// The resulting filtered set of actions are the actions which should be written to a
-/// checkpoint for a corresponding version.
-pub(crate) struct CheckpointVisitor<'seen> {
+/// The resulting filtered set of actions are the reconciled actions.
+pub(crate) struct ActionReconciliationVisitor<'seen> {
     // Deduplicates file actions (applies logic to filter Adds with corresponding Removes,
     // and keep unexpired Removes). This deduplicator builds a set of seen file actions.
     // This set has O(M) memory usage where M = number of file actions with unique (path, dvId) pairs
@@ -217,7 +214,7 @@ pub(crate) struct CheckpointVisitor<'seen> {
 }
 
 #[allow(unused)]
-impl CheckpointVisitor<'_> {
+impl ActionReconciliationVisitor<'_> {
     // These index positions correspond to the order of columns defined in
     // `selected_column_names_and_types()`
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
@@ -241,8 +238,8 @@ impl CheckpointVisitor<'_> {
         seen_metadata: bool,
         seen_txns: &'seen mut HashSet<String>,
         txn_expiration_timestamp: Option<i64>,
-    ) -> CheckpointVisitor<'seen> {
-        CheckpointVisitor {
+    ) -> ActionReconciliationVisitor<'seen> {
+        ActionReconciliationVisitor {
             deduplicator: FileActionDeduplicator::new(
                 seen_file_keys,
                 is_log_batch,
@@ -262,7 +259,7 @@ impl CheckpointVisitor<'_> {
         }
     }
 
-    /// Determines if a remove action tombstone has expired and should be excluded from the checkpoint.
+    /// Determines if a remove action tombstone has expired and should be excluded.
     ///
     /// A remove action includes a deletion_timestamp indicating when the deletion occurred. Physical
     /// files are deleted lazily after a user-defined expiration time. Remove actions are kept to allow
@@ -276,16 +273,16 @@ impl CheckpointVisitor<'_> {
         // Ideally this should never be zero, but we are following the same behavior as Delta
         // Spark and the Java Kernel.
         // Note: When remove.deletion_timestamp is not present (defaulting to 0), the remove action
-        // will be excluded from the checkpoint file as it will be treated as expired.
+        // will be excluded as it will be treated as expired.
         let deletion_timestamp = getter.get_opt(i, "remove.deletionTimestamp")?;
         let deletion_timestamp = deletion_timestamp.unwrap_or(0i64);
 
         Ok(deletion_timestamp <= self.minimum_file_retention_timestamp)
     }
 
-    /// Processes a potential file action to determine if it should be included in the checkpoint.
+    /// Processes a potential file action to determine if it should be included.
     ///
-    /// Returns `Ok(Some(true))` if the row contains a valid file action to be included in the checkpoint.
+    /// Returns `Ok(Some(true))` if the row contains a valid file action to be included.
     /// Returns `Ok(Some(false))` if the row contains a file action but it's suppressed (duplicate/expired).
     /// Returns `Ok(None)` if the row doesn't contain a file action (continue checking other action types).
     /// Returns `Err(...)` if there was an error processing the action.
@@ -316,7 +313,7 @@ impl CheckpointVisitor<'_> {
         Ok(Some(is_valid))
     }
 
-    /// Processes a potential protocol action to determine if it should be included in the checkpoint.
+    /// Processes a potential protocol action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid protocol action.
     /// Returns `Ok(Some(false))` if the row contains a protocol action but it's suppressed (duplicate).
@@ -336,7 +333,7 @@ impl CheckpointVisitor<'_> {
         Ok(result)
     }
 
-    /// Processes a potential metadata action to determine if it should be included in the checkpoint.
+    /// Processes a potential metadata action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid metadata action.
     /// Returns `Ok(Some(false))` if the row contains a metadata action but it's suppressed (duplicate).
@@ -356,7 +353,7 @@ impl CheckpointVisitor<'_> {
         Ok(result)
     }
 
-    /// Processes a potential txn action to determine if it should be included in the checkpoint.
+    /// Processes a potential txn action to determine if it should be included.
     ///
     /// Returns `Ok(Some(true))` if the row contains a valid txn action.
     /// Returns `Ok(Some(false))` if the row contains a txn action but it's suppressed (duplicate/expired).
@@ -377,7 +374,7 @@ impl CheckpointVisitor<'_> {
             if let Some(last_updated) = getter[12].get_opt(i, "txn.lastUpdated")? {
                 let last_updated: i64 = last_updated;
                 if last_updated <= retention_ts {
-                    // Transaction is old, exclude it from checkpoint
+                    // Transaction is old, exclude it
                     return Ok(Some(false));
                 }
             }
@@ -389,7 +386,7 @@ impl CheckpointVisitor<'_> {
         Ok(Some(self.seen_txns.insert(app_id.to_string())))
     }
 
-    /// Determines if a row in the batch should be included in the checkpoint.
+    /// Determines if a row in the batch should be included.
     ///
     /// This method checks each action type in sequence, short-circuiting when:
     /// - A valid action is found (`Some(true)`)
@@ -401,7 +398,7 @@ impl CheckpointVisitor<'_> {
     /// 2. Txn actions
     /// 3. Protocol & Metadata actions (least frequent)
     ///
-    /// Returns `Ok(true)` if the row should be included in the checkpoint.
+    /// Returns `Ok(true)` if the row should be included.
     /// Returns `Ok(false)` if the row should be skipped.
     /// Returns `Err(...)` if any validation or extraction failed.
     pub(crate) fn is_valid_action<'a>(
@@ -429,7 +426,7 @@ impl CheckpointVisitor<'_> {
     }
 }
 
-impl RowVisitor for CheckpointVisitor<'_> {
+impl RowVisitor for ActionReconciliationVisitor<'_> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // The data columns visited must be in the following order:
         // 1. ADD
@@ -497,12 +494,12 @@ mod tests {
         Ok(ActionsBatch::new(actions, true))
     }
 
-    /// Helper function which applies the [`CheckpointLogReplayProcessor`] to a set of
+    /// Helper function which applies the [`ActionReconciliationProcessor`] to a set of
     /// input batches and returns the results.
-    fn run_checkpoint_test(
+    fn run_action_reconciliation_test(
         input_batches: Vec<ActionsBatch>,
     ) -> DeltaResult<(Vec<FilteredEngineData>, i64, i64)> {
-        let processed_batches: Vec<_> = CheckpointLogReplayProcessor::new(0, None)
+        let processed_batches: Vec<_> = ActionReconciliationProcessor::new(0, None)
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
         let total_count: i64 = processed_batches.iter().map(|b| b.actions_count).sum();
@@ -515,11 +512,11 @@ mod tests {
         Ok((filtered_data, total_count, add_count))
     }
     #[test]
-    fn test_checkpoint_visitor() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor() -> DeltaResult<()> {
         let data = action_batch();
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
-        let mut visitor = CheckpointVisitor::new(
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut seen_file_keys,
             true,
             vec![true; 9],
@@ -561,7 +558,8 @@ mod tests {
     /// - Remove actions with deletionTimestamp > minimumFileRetentionTimestamp (should be included)
     /// - Remove actions with missing deletionTimestamp (defaults to 0, should be excluded)
     #[test]
-    fn test_checkpoint_visitor_boundary_cases_for_tombstone_expiration() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_boundary_cases_for_tombstone_expiration(
+    ) -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             r#"{"remove":{"path":"exactly_at_threshold","deletionTimestamp":100,"dataChange":true,"partitionValues":{}}}"#,
             r#"{"remove":{"path":"one_below_threshold","deletionTimestamp":99,"dataChange":true,"partitionValues":{}}}"#,
@@ -574,7 +572,7 @@ mod tests {
 
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
-        let mut visitor = CheckpointVisitor::new(
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut seen_file_keys,
             true,
             vec![true; 4],
@@ -596,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_visitor_file_actions_in_checkpoint_batch() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_file_actions_in_batch() -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
         ]
@@ -605,9 +603,9 @@ mod tests {
 
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
-        let mut visitor = CheckpointVisitor::new(
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut seen_file_keys,
-            false, // is_log_batch = false (checkpoint batch)
+            false, // is_log_batch = false (batch)
             vec![true; 1],
             0,
             false,
@@ -622,15 +620,15 @@ mod tests {
         assert_eq!(visitor.selection_vector, expected);
         assert_eq!(visitor.actions_count, 1);
         assert_eq!(visitor.add_actions_count, 1);
-        // The action should NOT be added to the seen_file_keys set as it's a checkpoint batch
-        // and actions in checkpoint batches do not conflict with each other.
+        // The action should NOT be added to the seen_file_keys set as it's a reconciled batch
+        // and actions in reconciled batches do not conflict with each other.
         // This is a key difference from log batches, where actions can conflict.
         assert!(seen_file_keys.is_empty());
         Ok(())
     }
 
     #[test]
-    fn test_checkpoint_visitor_file_actions_with_deletion_vectors() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_file_actions_with_deletion_vectors() -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             // Add action for file1 with deletion vector
             r#"{"add":{"path":"file1","partitionValues":{},"size":635,"modificationTime":100,"dataChange":true,"deletionVector":{"storageType":"ONE","pathOrInlineDv":"dv1","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
@@ -644,7 +642,7 @@ mod tests {
 
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
-        let mut visitor = CheckpointVisitor::new(
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut seen_file_keys,
             true,
             vec![true; 3],
@@ -666,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_visitor_already_seen_non_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_already_seen_non_file_actions() -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#,
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
@@ -679,12 +677,12 @@ mod tests {
         let mut seen_txns = HashSet::new();
         seen_txns.insert("app1".to_string());
 
-        let mut visitor = CheckpointVisitor::new(
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut seen_file_keys,
             true,
             vec![true; 3],
             0,
-            true,           // The visior has already seen a protocol action
+            true,           // The visitor has already seen a protocol action
             true,           // The visitor has already seen a metadata action
             &mut seen_txns, // Pre-populated transaction
             None,
@@ -701,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_visitor_duplicate_non_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_duplicate_non_file_actions() -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#,
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":123456789}}"#, // Duplicate txn
@@ -717,7 +715,7 @@ mod tests {
 
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
-        let mut visitor = CheckpointVisitor::new(
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut seen_file_keys,
             true, // is_log_batch
             vec![true; 7],
@@ -742,7 +740,7 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// non-file actions (metadata, protocol, txn) across multiple batches.
     #[test]
-    fn test_checkpoint_actions_iter_non_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_non_file_actions() -> DeltaResult<()> {
         // Batch 1: protocol, metadata, and txn actions
         let batch1 = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -768,7 +766,7 @@ mod tests {
             create_batch(batch2)?,
             create_batch(batch3)?,
         ];
-        let (results, actions_count, add_actions) = run_checkpoint_test(input_batches)?;
+        let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
 
         // Verify results
         assert_eq!(results.len(), 2, "Expected two batches in results");
@@ -783,7 +781,7 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) across multiple batches.
     #[test]
-    fn test_checkpoint_actions_iter_file_actions() -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_file_actions() -> DeltaResult<()> {
         // Batch 1: add action (file1) - new, should be included
         let batch1 = vec![
             r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#,
@@ -807,7 +805,7 @@ mod tests {
             create_batch(batch2)?,
             create_batch(batch3)?,
         ];
-        let (results, actions_count, add_actions) = run_checkpoint_test(input_batches)?;
+        let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
 
         // Verify results
         assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no selected actions
@@ -822,7 +820,8 @@ mod tests {
     /// This test ensures that the processor correctly deduplicates and filters
     /// file actions (add, remove) with deletion vectors across multiple batches.
     #[test]
-    fn test_checkpoint_actions_iter_file_actions_with_deletion_vectors() -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_file_actions_with_deletion_vectors(
+    ) -> DeltaResult<()> {
         // Batch 1: add actions with deletion vectors
         let batch1 = vec![
             // (file1, DV_ONE) New, should be included
@@ -842,7 +841,7 @@ mod tests {
         ];
 
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
-        let (results, actions_count, add_actions) = run_checkpoint_test(input_batches)?;
+        let (results, actions_count, add_actions) = run_action_reconciliation_test(input_batches)?;
 
         // Verify results
         assert_eq!(results.len(), 2);
@@ -855,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_visitor_txn_retention() -> DeltaResult<()> {
+    fn test_action_reconciliation_visitor_txn_retention() -> DeltaResult<()> {
         let json_strings: StringArray = vec![
             // Transaction with old timestamp (should be filtered)
             r#"{"txn":{"appId":"app1","version":1,"lastUpdated":100}}"#,
@@ -871,7 +870,7 @@ mod tests {
 
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
-        let mut visitor = CheckpointVisitor::new(
+        let mut visitor = ActionReconciliationVisitor::new(
             &mut seen_file_keys,
             true,
             vec![true; 4],
@@ -897,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_actions_iter_with_txn_retention() -> DeltaResult<()> {
+    fn test_action_reconciliation_actions_iter_with_txn_retention() -> DeltaResult<()> {
         // Test that transaction retention works across multiple batches
         let batch1 = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
@@ -918,7 +917,7 @@ mod tests {
         let input_batches = vec![create_batch(batch1)?, create_batch(batch2)?];
 
         // Create processor with txn expiration timestamp
-        let processor = CheckpointLogReplayProcessor::new(0, Some(1000));
+        let processor = ActionReconciliationProcessor::new(0, Some(1000));
         let results: Vec<_> = processor
             .process_actions_iter(input_batches.into_iter().map(Ok))
             .try_collect()?;
@@ -1020,13 +1019,13 @@ mod tests {
 
     use test_mocks::*;
 
-    /// Helper function to create a standard checkpoint visitor for error testing
+    /// Helper function to create a standard action reconciliation visitor for error testing
     fn create_test_visitor<'a>(
         seen_file_keys: &'a mut HashSet<FileActionKey>,
         seen_txns: &'a mut HashSet<String>,
         txn_expiration_timestamp: Option<i64>,
-    ) -> CheckpointVisitor<'a> {
-        CheckpointVisitor::new(
+    ) -> ActionReconciliationVisitor<'a> {
+        ActionReconciliationVisitor::new(
             seen_file_keys,
             true,
             vec![true; 1],
@@ -1056,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_visitor_validation_and_type_errors() {
+    fn test_action_reconciliation_visitor_validation_and_type_errors() {
         // Test 1: Wrong getter count validation
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
@@ -1100,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_visitor_complex_field_errors() {
+    fn test_action_reconciliation_visitor_complex_field_errors() {
         // Test txn.lastUpdated with retention enabled
         let mut seen_file_keys = HashSet::new();
         let mut seen_txns = HashSet::new();
@@ -1149,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_processor_error_propagation() -> DeltaResult<()> {
+    fn test_action_reconciliation_processor_error_propagation() -> DeltaResult<()> {
         // Test that errors from the visitor are properly propagated by the processor
         let json_strings: StringArray = vec![
             // This will create valid data that parses correctly
@@ -1161,14 +1160,14 @@ mod tests {
         // Create a processor and try to process the batch
         // We can't easily trigger an error in the normal flow since parse_json_batch creates valid data
         // But this test ensures the error propagation path exists and is tested
-        let mut processor = CheckpointLogReplayProcessor::new(0, None);
+        let mut processor = ActionReconciliationProcessor::new(0, None);
         let result = processor.process_actions_batch(batch);
 
         // This should succeed - the test mainly verifies that the error propagation paths compile
         assert!(result.is_ok());
-        let checkpoint_batch = result.unwrap();
-        assert_eq!(checkpoint_batch.actions_count, 1);
-        assert_eq!(checkpoint_batch.add_actions_count, 1);
+        let action_reconciliation_batch = result.unwrap();
+        assert_eq!(action_reconciliation_batch.actions_count, 1);
+        assert_eq!(action_reconciliation_batch.add_actions_count, 1);
 
         Ok(())
     }
