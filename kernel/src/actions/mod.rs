@@ -926,14 +926,12 @@ impl DomainMetadata {
 mod tests {
     use super::*;
     use crate::{
-        arrow::{
-            array::{
-                Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-                MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
-            },
-            datatypes::{DataType as ArrowDataType, Field, Schema},
-            json::ReaderBuilder,
+        arrow::array::{
+            Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+            MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
         },
+        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
+        arrow::json::ReaderBuilder,
         engine::{arrow_data::ArrowEngineData, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
         utils::test_utils::assert_result_error_with_message,
