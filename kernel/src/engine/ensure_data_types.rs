@@ -110,7 +110,7 @@ impl EnsureDataTypes {
                 // build a list of kernel fields that matches the order of the arrow fields
                 let mapped_fields = arrow_fields
                     .iter()
-                    .filter_map(|f| kernel_fields.fields.get(f.name()));
+                    .filter_map(|f| kernel_fields.field(f.name()));
 
                 // keep track of how many fields we matched up
                 let mut found_fields = 0;
@@ -122,12 +122,11 @@ impl EnsureDataTypes {
                 }
 
                 // require that we found the number of fields that we requested.
-                require!(kernel_fields.fields.len() == found_fields, {
+                require!(kernel_fields.num_fields() == found_fields, {
                     let arrow_field_map: HashSet<&String> =
                         HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
                     let missing_field_names = kernel_fields
-                        .fields
-                        .keys()
+                        .field_names()
                         .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
                         .take(5)
                         .join(", ");
