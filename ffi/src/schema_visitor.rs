@@ -833,9 +833,9 @@ mod tests {
     }
 
     #[test]
-    fn test_flat_schema_all_types() {
+    fn test_schema_all_types() {
         let mut state = KernelSchemaVisitorState::default();
-
+        
         // Schema: struct<
         //   f_string: string,
         //   f_long: long,
@@ -856,7 +856,6 @@ mod tests {
         //   f_variant: variant<variant_field: string>
         // >
 
-        // Build all primitive fields using variables for the macro
         let f_string_name = "f_string".to_string();
         let f_long_name = "f_long".to_string();
         let f_int_name = "f_int".to_string();
@@ -870,68 +869,58 @@ mod tests {
         let f_timestamp_name = "f_timestamp".to_string();
         let f_timestamp_ntz_name = "f_timestamp_ntz".to_string();
         let f_decimal_name = "f_decimal".to_string();
-
-        let f_string = unsafe { visit_schema_string(&mut state, kernel_string_slice!(f_string_name), false, test_allocate_error) };
-        let f_long = unsafe { visit_schema_long(&mut state, kernel_string_slice!(f_long_name), false, test_allocate_error) };
-        let f_int = unsafe { visit_schema_integer(&mut state, kernel_string_slice!(f_int_name), false, test_allocate_error) };
-        let f_short = unsafe { visit_schema_short(&mut state, kernel_string_slice!(f_short_name), false, test_allocate_error) };
-        let f_byte = unsafe { visit_schema_byte(&mut state, kernel_string_slice!(f_byte_name), false, test_allocate_error) };
-        let f_double = unsafe { visit_schema_double(&mut state, kernel_string_slice!(f_double_name), false, test_allocate_error) };
-        let f_float = unsafe { visit_schema_float(&mut state, kernel_string_slice!(f_float_name), false, test_allocate_error) };
-        let f_boolean = unsafe { visit_schema_boolean(&mut state, kernel_string_slice!(f_boolean_name), false, test_allocate_error) };
-        let f_binary = unsafe { visit_schema_binary(&mut state, kernel_string_slice!(f_binary_name), false, test_allocate_error) };
-        let f_date = unsafe { visit_schema_date(&mut state, kernel_string_slice!(f_date_name), false, test_allocate_error) };
-        let f_timestamp = unsafe { visit_schema_timestamp(&mut state, kernel_string_slice!(f_timestamp_name), false, test_allocate_error) };
-        let f_timestamp_ntz = unsafe { visit_schema_timestamp_ntz(&mut state, kernel_string_slice!(f_timestamp_ntz_name), false, test_allocate_error) };
-        let f_decimal = unsafe { visit_schema_decimal(&mut state, kernel_string_slice!(f_decimal_name), 10, 2, false, test_allocate_error) };
-
-        // Build complex types with primitive elements
-        let string_type_id = ok_or_panic(visit_string_type(&mut state, test_allocate_error));
         let f_array_name = "f_array".to_string();
-        let f_array = unsafe { visit_schema_array(&mut state, kernel_string_slice!(f_array_name), string_type_id, false, false, test_allocate_error) };
-
-        let string_type_id2 = ok_or_panic(visit_string_type(&mut state, test_allocate_error));
-        let long_type_id = ok_or_panic(visit_long_type(&mut state, test_allocate_error));
         let f_map_name = "f_map".to_string();
-        let f_map = unsafe { visit_schema_map(&mut state, kernel_string_slice!(f_map_name), string_type_id2, long_type_id, false, false, test_allocate_error) };
-
-        let inner_name = "inner".to_string();
-        let inner_field = unsafe { visit_schema_string(&mut state, kernel_string_slice!(inner_name), false, test_allocate_error) };
-        let inner_field_id = ok_or_panic(inner_field);
         let f_struct_name = "f_struct".to_string();
-        let f_struct = unsafe { visit_schema_struct(&mut state, kernel_string_slice!(f_struct_name), &inner_field_id, 1, false, test_allocate_error) };
-
-        // Build variant type: variant<variant_field: string>
-        // First build the inner field for the variant struct
-        let variant_inner_name = "variant_field".to_string();
-        let variant_inner_field = unsafe { visit_schema_string(&mut state, kernel_string_slice!(variant_inner_name), false, test_allocate_error) };
-        let variant_inner_field_id = ok_or_panic(variant_inner_field);
-
-        // Manually create the struct DataType for variant (not a field)
-        let variant_field = unwrap_field(&mut state, variant_inner_field_id).expect("Variant field should exist");
-        let variant_struct_type = StructType::new(vec![variant_field]);
-        let variant_struct_data_type = DataType::Struct(Box::new(variant_struct_type));
-        let variant_struct_type_id = wrap_data_type(&mut state, variant_struct_data_type);
-
         let f_variant_name = "f_variant".to_string();
-        let f_variant = unsafe { visit_schema_variant(&mut state, kernel_string_slice!(f_variant_name), variant_struct_type_id, false, test_allocate_error) };
 
-        // Collect all field IDs
+        // create primitive fields
+        // immediately unwrap the results
+        let f_string = ok_or_panic(unsafe { visit_schema_string(&mut state, kernel_string_slice!(f_string_name), false, test_allocate_error) });
+        let f_long = ok_or_panic(unsafe { visit_schema_long(&mut state, kernel_string_slice!(f_long_name), false, test_allocate_error) });
+        let f_int = ok_or_panic(unsafe { visit_schema_integer(&mut state, kernel_string_slice!(f_int_name), false, test_allocate_error) });
+        let f_short = ok_or_panic(unsafe { visit_schema_short(&mut state, kernel_string_slice!(f_short_name), false, test_allocate_error) });
+        let f_byte = ok_or_panic(unsafe { visit_schema_byte(&mut state, kernel_string_slice!(f_byte_name), false, test_allocate_error) });
+        let f_double = ok_or_panic(unsafe { visit_schema_double(&mut state, kernel_string_slice!(f_double_name), false, test_allocate_error) });
+        let f_float = ok_or_panic(unsafe { visit_schema_float(&mut state, kernel_string_slice!(f_float_name), false, test_allocate_error) });
+        let f_boolean = ok_or_panic(unsafe { visit_schema_boolean(&mut state, kernel_string_slice!(f_boolean_name), false, test_allocate_error) });
+        let f_binary = ok_or_panic(unsafe { visit_schema_binary(&mut state, kernel_string_slice!(f_binary_name), false, test_allocate_error) });
+        let f_date = ok_or_panic(unsafe { visit_schema_date(&mut state, kernel_string_slice!(f_date_name), false, test_allocate_error) });
+        let f_timestamp = ok_or_panic(unsafe { visit_schema_timestamp(&mut state, kernel_string_slice!(f_timestamp_name), false, test_allocate_error) });
+        let f_timestamp_ntz = ok_or_panic(unsafe { visit_schema_timestamp_ntz(&mut state, kernel_string_slice!(f_timestamp_ntz_name), false, test_allocate_error) });
+        let f_decimal = ok_or_panic(unsafe { visit_schema_decimal(&mut state, kernel_string_slice!(f_decimal_name), 10, 2, false, test_allocate_error) });
+
+        // create array<string>
+        let string_type_id = ok_or_panic(visit_string_type(&mut state, test_allocate_error));
+        let f_array = ok_or_panic(unsafe { visit_schema_array(&mut state, kernel_string_slice!(f_array_name), string_type_id, false, false, test_allocate_error) });
+
+        // create map<string, long>
+        let string_type_id = ok_or_panic(visit_string_type(&mut state, test_allocate_error));
+        let long_type_id = ok_or_panic(visit_long_type(&mut state, test_allocate_error));
+        let f_map = ok_or_panic(unsafe { visit_schema_map(&mut state, kernel_string_slice!(f_map_name), string_type_id, long_type_id, false, false, test_allocate_error) });
+
+        // create struct<inner: string>
+        let inner_name = "inner".to_string();
+        let inner_field = ok_or_panic(unsafe { visit_schema_string(&mut state, kernel_string_slice!(inner_name), false, test_allocate_error) });
+        let f_struct = ok_or_panic(unsafe { visit_schema_struct(&mut state, kernel_string_slice!(f_struct_name), &inner_field, 1, false, test_allocate_error) });
+
+        // create variant
+        let variant_inner_name = "variant_field".to_string();
+        let variant_inner_field = ok_or_panic(unsafe { visit_schema_string(&mut state, kernel_string_slice!(variant_inner_name), false, test_allocate_error) });
+        let variant_struct_name = "variant_struct".to_string();
+        let variant_struct_type_id = ok_or_panic(unsafe { visit_schema_struct(&mut state, kernel_string_slice!(variant_struct_name), &variant_inner_field, 1, false, test_allocate_error) });
+        let f_variant = ok_or_panic(unsafe { visit_schema_variant(&mut state, kernel_string_slice!(f_variant_name), variant_struct_type_id, false, test_allocate_error) });
+
+        // create the final schema
         let field_ids = vec![
-            ok_or_panic(f_string), ok_or_panic(f_long), ok_or_panic(f_int), ok_or_panic(f_short),
-            ok_or_panic(f_byte), ok_or_panic(f_double), ok_or_panic(f_float), ok_or_panic(f_boolean),
-            ok_or_panic(f_binary), ok_or_panic(f_date), ok_or_panic(f_timestamp), ok_or_panic(f_timestamp_ntz),
-            ok_or_panic(f_decimal), ok_or_panic(f_array), ok_or_panic(f_map), ok_or_panic(f_struct), ok_or_panic(f_variant)
+            f_string, f_long, f_int, f_short, f_byte, f_double, f_float, f_boolean, f_binary, f_date, f_timestamp, f_timestamp_ntz, f_decimal, f_array, f_map, f_struct, f_variant
         ];
-
-        // Build final schema
         let schema_id = ok_or_panic(unsafe { build_kernel_schema(&mut state, field_ids.as_ptr(), field_ids.len(), test_allocate_error) });
         let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
-
         assert_eq!(fields.len(), 17);
 
-        // Validate all primitive fields systematically
+        // validate the constructed schema
         let primitive_field_expectations = [
             ("f_string", PrimitiveType::String),
             ("f_long", PrimitiveType::Long),
@@ -949,65 +938,66 @@ mod tests {
 
         for (i, (expected_name, expected_primitive)) in primitive_field_expectations.iter().enumerate() {
             assert_eq!(fields[i].name(), *expected_name, "Field at index {} has wrong name", i);
-            if let DataType::Primitive(actual_primitive) = fields[i].data_type() {
-                assert_eq!(actual_primitive, expected_primitive, "Field {} has wrong primitive type", expected_name);
-            } else {
-                panic!("Field {} is not a primitive type", expected_name);
-            }
+            assert_eq!(fields[i].data_type(), &DataType::Primitive(*expected_primitive), "Field {} has wrong primitive type", expected_name);
             assert!(!fields[i].is_nullable(), "Field {} should not be nullable", expected_name);
         }
 
-        // Validate decimal field separately (has parameters)
+        // validate the decimal field
         assert_eq!(fields[12].name(), "f_decimal");
-        if let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[12].data_type() {
-            assert_eq!(decimal_type.precision(), 10);
-            assert_eq!(decimal_type.scale(), 2);
-        } else {
-            panic!("Expected decimal type for f_decimal");
-        }
-        // Validate array type
+        let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[12].data_type() else {
+            panic!("Field f_decimal is not a decimal type");
+        };
+        assert_eq!(decimal_type.precision(), 10);
+        assert_eq!(decimal_type.scale(), 2);
+
+        // validate array field: f_array: array<string>
         assert_eq!(fields[13].name(), "f_array");
-        if let DataType::Array(array_type) = fields[13].data_type() {
-            assert!(matches!(array_type.element_type(), DataType::Primitive(PrimitiveType::String)));
-            assert!(!array_type.contains_null());
-        } else {
-            panic!("Expected array type for f_array");
-        }
+        let DataType::Array(array_type) = fields[13].data_type() else {
+            panic!("Field f_array is not an array type");
+        };
+        assert_eq!(array_type.element_type(), &DataType::Primitive(PrimitiveType::String));
+        assert!(!array_type.contains_null());
+        assert!(!fields[13].is_nullable());
 
-        // Validate map type
+        // validate map field: f_map: map<string, long>
         assert_eq!(fields[14].name(), "f_map");
-        if let DataType::Map(map_type) = fields[14].data_type() {
-            assert!(matches!(map_type.key_type(), DataType::Primitive(PrimitiveType::String)));
-            assert!(matches!(map_type.value_type(), DataType::Primitive(PrimitiveType::Long)));
-            assert!(!map_type.value_contains_null());
-        } else {
-            panic!("Expected map type for f_map");
-        }
+        let DataType::Map(map_type) = fields[14].data_type() else {
+            panic!("Field f_map is not a map type");
+        };
+        assert_eq!(map_type.key_type(), &DataType::Primitive(PrimitiveType::String));
+        assert_eq!(map_type.value_type(), &DataType::Primitive(PrimitiveType::Long));
+        assert!(!map_type.value_contains_null());
+        assert!(!fields[14].is_nullable());
 
-        // Validate struct type
+        // validate struct field: f_struct: struct<inner: string>
         assert_eq!(fields[15].name(), "f_struct");
-        if let DataType::Struct(struct_type) = fields[15].data_type() {
-            let inner_fields: Vec<_> = struct_type.fields().collect();
-            assert_eq!(inner_fields.len(), 1);
-            assert_eq!(inner_fields[0].name(), "inner");
-            assert!(matches!(inner_fields[0].data_type(), DataType::Primitive(PrimitiveType::String)));
-        } else {
-            panic!("Expected struct type for f_struct");
-        }
+        let DataType::Struct(struct_type) = fields[15].data_type() else {
+            panic!("Field f_struct is not a struct type");
+        };
+        let struct_fields: Vec<_> = struct_type.fields().collect();
+        assert_eq!(struct_fields.len(), 1);
+        assert_eq!(struct_fields[0].name(), "inner");
+        assert_eq!(struct_fields[0].data_type(), &DataType::Primitive(PrimitiveType::String));
+        assert!(!struct_fields[0].is_nullable());
+        assert!(!fields[15].is_nullable());
 
-        // Validate variant type
+        // validate variant field: f_variant: variant<variant_field: string>
         assert_eq!(fields[16].name(), "f_variant");
-        if let DataType::Variant(_) = fields[16].data_type() {
-            // Variant type validated successfully
-        } else {
-            panic!("Expected variant type for f_variant");
-        }
+        let DataType::Variant(variant_struct) = fields[16].data_type() else {
+            panic!("Field f_variant is not a variant type");
+        };
+        let variant_fields: Vec<_> = variant_struct.fields().collect();
+        assert_eq!(variant_fields.len(), 1);
+        assert_eq!(variant_fields[0].name(), "variant_field");
+        assert_eq!(variant_fields[0].data_type(), &DataType::Primitive(PrimitiveType::String));
+        assert!(!variant_fields[0].is_nullable());
+        assert!(!fields[16].is_nullable());
+
     }
 
     #[test]
     fn test_deeply_nested_schema() {
         // Test: Complex nesting like array<struct<city: string, scores: map<string, long>>>
-        // Why: Validates post-order construction with multiple levels of nesting and ID management
         let mut state = KernelSchemaVisitorState::default();
 
         // Build from innermost types outward (post-order):
@@ -1035,28 +1025,25 @@ mod tests {
         assert_eq!(fields[0].name(), "location");
 
         // Validate the nested structure
-        if let DataType::Struct(struct_type) = fields[0].data_type() {
-            let nested_fields: Vec<_> = struct_type.fields().collect();
-            assert_eq!(nested_fields.len(), 2);
-            assert_eq!(nested_fields[0].name(), "city");
-            assert!(matches!(nested_fields[0].data_type(), DataType::Primitive(PrimitiveType::String)));
-
-            assert_eq!(nested_fields[1].name(), "scores");
-            if let DataType::Map(map_type) = nested_fields[1].data_type() {
-                assert!(matches!(map_type.key_type(), DataType::Primitive(PrimitiveType::String)));
-                assert!(matches!(map_type.value_type(), DataType::Primitive(PrimitiveType::Long)));
-            } else {
-                panic!("Expected map type for scores field");
-            }
-        } else {
+        let DataType::Struct(struct_type) = fields[0].data_type() else {
             panic!("Expected struct type for location field");
-        }
+        };
+        let nested_fields: Vec<_> = struct_type.fields().collect();
+        assert_eq!(nested_fields.len(), 2);
+        assert_eq!(nested_fields[0].name(), "city");
+        assert_eq!(nested_fields[0].data_type(), &DataType::Primitive(PrimitiveType::String));
+
+        assert_eq!(nested_fields[1].name(), "scores");
+        let DataType::Map(map_type) = nested_fields[1].data_type() else {
+            panic!("Expected map type for scores field");
+        };
+        assert_eq!(map_type.key_type(), &DataType::Primitive(PrimitiveType::String));
+        assert_eq!(map_type.value_type(), &DataType::Primitive(PrimitiveType::Long));
     }
 
     #[test]
     fn test_nullability_variations() {
         // Test: Different nullability combinations to ensure nullable flags work correctly
-        // Why: Validates that nullability is preserved through the FFI boundary
         let mut state = KernelSchemaVisitorState::default();
 
         let nullable_name = "nullable".to_string();
@@ -1085,8 +1072,9 @@ mod tests {
 
         assert_eq!(fields[2].name(), "tags");
         assert!(fields[2].is_nullable()); // Field itself is nullable
-        if let DataType::Array(array_type) = fields[2].data_type() {
-            assert!(!array_type.contains_null()); // But elements are not nullable
-        }
+        let DataType::Array(array_type) = fields[2].data_type() else {
+            panic!("Expected array type for tags field");
+        };
+        assert!(!array_type.contains_null()); // But elements are not nullable
     }
 }
