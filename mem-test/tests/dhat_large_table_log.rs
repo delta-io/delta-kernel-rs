@@ -1,4 +1,6 @@
 //! This tests our memory usage for reading tables with large/many log files.
+//!
+//! run with `cargo test -p mem-test dhat_large_table_log -- --ignored --nocapture`
 
 use std::fs::{create_dir_all, File};
 use std::io::Write;
@@ -7,9 +9,8 @@ use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::object_store::local::LocalFileSystem;
-
-use delta_kernel::Table;
+use delta_kernel::Snapshot;
+use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
 use tracing::info;
@@ -95,6 +96,7 @@ fn generate_delta_log(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[ignore = "mem-test - run manually"]
 #[test]
 fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
@@ -108,20 +110,18 @@ fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
 
     let _profiler = dhat::Profiler::builder().testing().build();
     let store = Arc::new(LocalFileSystem::new());
-    let url = "file:///".to_owned() + table_path.to_str().unwrap();
-    let url = Url::parse(&url).unwrap();
+    let url = Url::from_directory_path(table_path).unwrap();
     let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-    let table = Table::try_from_uri(&url).expect("Failed to create Delta Table");
-    let snapshot = table
-        .snapshot(&engine, None)
+    let snapshot = Snapshot::builder_for(url)
+        .build(&engine)
         .expect("Failed to get latest snapshot");
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after PM replay: {:?}", stats);
+    println!("Heap stats after PM replay:\n{:?}", stats);
 
     let scan = snapshot
-        .into_scan_builder()
+        .scan_builder()
         .build()
         .expect("Failed to build scan");
     let scan_metadata = scan
@@ -129,13 +129,10 @@ fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to get scan metadata");
     for res in scan_metadata {
         let _scan_metadata = res.expect("Failed to read scan metadata");
-        // scan_metadata.visit_scan_files((), |_, file, _, _, _, _, _| {
-        //     // do something
-        // })?;
     }
 
     let stats = dhat::HeapStats::get();
-    println!("Heap stats after Scan replay: {:?}", stats);
+    println!("Heap stats after Scan replay:\n{:?}", stats);
 
     Ok(())
 }
