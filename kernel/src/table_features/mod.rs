@@ -304,7 +304,10 @@ mod tests {
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (ReaderFeature::VariantType, "variantType"),
             (ReaderFeature::VariantTypePreview, "variantType-preview"),
-            (ReaderFeature::MetadataTreeExperimental, "metadataTree-experimental"),
+            (
+                ReaderFeature::MetadataTreeExperimental,
+                "metadataTree-experimental",
+            ),
             (
                 ReaderFeature::VariantShreddingPreview,
                 "variantShredding-preview",
@@ -353,7 +356,10 @@ mod tests {
             (WriterFeature::ClusteredTable, "clustering"),
             (WriterFeature::VariantType, "variantType"),
             (WriterFeature::VariantTypePreview, "variantType-preview"),
-            (WriterFeature::MetadataTreeExperimental, "metadataTree-experimental"),
+            (
+                WriterFeature::MetadataTreeExperimental,
+                "metadataTree-experimental",
+            ),
             (
                 WriterFeature::VariantShreddingPreview,
                 "variantShredding-preview",
