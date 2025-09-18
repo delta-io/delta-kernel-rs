@@ -176,7 +176,7 @@ impl TryFrom<Format> for Scalar {
         )
         .map(Scalar::Map)?;
         Ok(Scalar::Struct(StructData::try_new(
-            Format::to_schema().fields().cloned().collect(),
+            Format::to_schema().into_fields().collect(),
             vec![provider, options],
         )?))
     }
@@ -190,6 +190,7 @@ impl TryFrom<Format> for Scalar {
 )]
 #[internal_api]
 pub(crate) struct Metadata {
+    // TODO: Make the struct fields private to force using the try_new function.
     /// Unique identifier for this table
     pub(crate) id: String,
     /// User-provided identifier for this table
@@ -219,6 +220,16 @@ impl Metadata {
         created_time: i64,
         configuration: HashMap<String, String>,
     ) -> DeltaResult<Self> {
+        // Validate that the schema does not contain metadata columns
+        // Note: We don't have to look for nested metadata columns because that is already validated
+        // when creating a StructType.
+        if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
+            return Err(Error::Schema(format!(
+                "Table schema must not contain metadata columns. Found metadata column: '{}'",
+                metadata_field.name
+            )));
+        }
+
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,

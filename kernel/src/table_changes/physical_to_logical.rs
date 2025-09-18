@@ -43,8 +43,8 @@ pub(crate) fn physical_to_logical_expr(
         .iter()
         .map(|field| match field {
             ColumnType::Partition(field_idx) => {
-                let field = logical_schema.fields.get_index(*field_idx);
-                let Some((_, field)) = field else {
+                let field = logical_schema.field_at_index(*field_idx);
+                let Some(field) = field else {
                     return Err(Error::generic(
                         "logical schema did not contain expected field, can't transform data",
                     ));

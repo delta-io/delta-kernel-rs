@@ -872,7 +872,9 @@ impl StateInfo {
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
         let mut have_partition_cols = false;
-        let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
+        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
+        let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
+
         // Loop over all selected fields and note if they are columns that will be read from the
         // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
         // be filled in by evaluating an expression ([`ColumnType::Partition`])
@@ -881,6 +883,13 @@ impl StateInfo {
             .enumerate()
             .map(|(index, logical_field)| -> DeltaResult<_> {
                 if partition_columns.contains(logical_field.name()) {
+                    if logical_field.is_metadata_column() {
+                        return Err(Error::Schema(format!(
+                            "Metadata column names must not match partition columns: {}",
+                            logical_field.name()
+                        )));
+                    }
+
                     // Store the index into the schema for this field. When we turn it into an
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
@@ -893,10 +902,26 @@ impl StateInfo {
                     debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                     let physical_name = physical_field.name.clone();
                     read_fields.push(physical_field);
+
+                    if !logical_field.is_metadata_column() {
+                        read_field_names.insert(physical_name.clone());
+                    }
+
                     Ok(ColumnType::Selected(physical_name))
                 }
             })
             .try_collect()?;
+
+        // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
+        for metadata_column in logical_schema.metadata_columns() {
+            if read_field_names.contains(metadata_column.name()) {
+                return Err(Error::Schema(format!(
+                    "Metadata column names must not match physical columns: {}",
+                    metadata_column.name()
+                )));
+            }
+        }
+
         Ok(StateInfo {
             all_fields,
             read_fields,

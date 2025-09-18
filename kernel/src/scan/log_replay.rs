@@ -127,8 +127,8 @@ impl AddRemoveDedupVisitor<'_> {
         field_idx: usize,
         partition_values: &HashMap<String, String>,
     ) -> DeltaResult<(usize, (String, Scalar))> {
-        let field = self.logical_schema.fields.get_index(field_idx);
-        let Some((_, field)) = field else {
+        let field = self.logical_schema.field_at_index(field_idx);
+        let Some(field) = field else {
             return Err(Error::InternalError(format!(
                 "out of bounds partition column field index {field_idx}"
             )));
