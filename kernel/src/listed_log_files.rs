@@ -41,17 +41,24 @@ pub(crate) struct ListedLogFiles {
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
-/// taking into account the `log_tail` which was (ostentibly) returned from the catalog. Note
-/// that the `log_tail` must strictly adhere to being a 'tail' - that is, it is a contiguous
+/// taking into account the `log_tail` which was (ostentibly) returned from the catalog. If there
+/// are fewer files than requested (e.g. `end_version` is past the end of the log), the iterator
+/// will simply end before reaching `end_version`.
+///
+/// Note that the `log_tail` must strictly adhere to being a 'tail' - that is, it is a contiguous
 /// cover of versions `X..=Y` where `Y` is the latest version of the table. If it overlaps with
 /// commits listed from the filesystem, the `log_tail` will take precedence.
 ///
-/// Each [`ParsedLogPath`] the iterator returns may be a commit or a checkpoint. If `start_version`
-/// is not specified, the listing will begin from version number 0. If `end_version` is not
-/// specified, files up to the most recent version will be included.
+/// If `start_version` is not specified, the listing will begin from version number 0. If
+/// `end_version` is not specified, files up to the most recent version will be included.
 ///
 /// Note: this may call [`StorageHandler::list_from`] to get the list of log files unless the
 /// provided log_tail covers the entire requested range.
+///
+/// Note: at a high level we are doing two things:
+/// 1. list from the storage handler and filter based on [`ParsedLogPath::should_list`] (to prevent
+///    listing staged commits)
+/// 2. add the log_tail from the catalog
 fn list_log_files(
     storage: &dyn StorageHandler,
     log_root: &Url,
@@ -223,12 +230,9 @@ impl ListedLogFiles {
     ) -> DeltaResult<Self> {
         // TODO: plumb through a log_tail provided by our caller
         let log_tail = vec![];
-        // NOTE: we don't expect to ever get back staged commits from listing. We only get the
-        // normal commits from listing then (in the future) will merge with staged commits provided
-        // by the catalog in log_tail.
         let listed_commits =
             list_log_files(storage, log_root, log_tail, start_version, end_version)?
-                .filter_ok(|log_file| matches!(log_file.file_type, LogPathFileType::Commit))
+                .filter_ok(|log_file| log_file.is_commit())
                 .try_collect()?;
         ListedLogFiles::try_new(listed_commits, vec![], vec![], None)
     }
@@ -262,12 +266,7 @@ impl ListedLogFiles {
                 for file in files {
                     use LogPathFileType::*;
                     match file.file_type {
-                        Commit => ascending_commit_files.push(file),
-                        StagedCommit => {
-                            return Err(Error::internal_error(
-                                "Staged commit found in log listing.",
-                            ))
-                        }
+                        Commit | StagedCommit => ascending_commit_files.push(file),
                         CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
                             ascending_compaction_files.push(file);
                         }
@@ -647,7 +646,7 @@ mod list_log_files_with_log_tail_tests {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
-            (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
+            (1, LogPathFileType::StagedCommit, CommitSource::Filesystem),
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
@@ -661,6 +660,8 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].version, 0);
         assert_eq!(result[1].version, 1);
+        assert_source(&result[0], CommitSource::Filesystem);
+        assert_source(&result[1], CommitSource::Filesystem);
     }
 
     #[test]
