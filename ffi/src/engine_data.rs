@@ -14,6 +14,7 @@ use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
 use std::ffi::c_void;
 
+#[cfg(feature = "default-engine-base")]
 use crate::error::AllocateErrorFn;
 use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
