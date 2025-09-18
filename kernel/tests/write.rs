@@ -1207,7 +1207,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     let txn = snapshot.transaction()?;
 
@@ -1253,7 +1253,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
         }
     }
 
-    let final_snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+    let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let domain1_config = final_snapshot.get_domain_metadata(domain1, &engine)?;
     assert_eq!(domain1_config, Some(config1.to_string()));
     let domain2_config = final_snapshot.get_domain_metadata(domain2, &engine)?;
@@ -1283,7 +1283,7 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     // System domain rejection
     let txn = snapshot.clone().transaction()?;
@@ -1334,7 +1334,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
     )
     .await?;
 
-    let snapshot = Arc::new(Snapshot::builder(table_url.clone()).build(&engine)?);
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = snapshot
         .transaction()?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
