@@ -82,6 +82,8 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
+use crate::path::ParsedLogPath;
+
 use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
@@ -176,6 +178,32 @@ pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 /// An iterator of data read from specified files
 pub type FileDataReadResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+
+/// A path to a valid delta log file. You can parse a given `FileMeta` into a `LogPath` using
+/// [`LogPath::try_new`].
+///
+/// Today, a `LogPath` is a file in the `_delta_log` directory of a Delta table; in the future,
+/// this will expand to support providing inline data in the log path itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogPath(ParsedLogPath);
+
+impl From<LogPath> for ParsedLogPath {
+    fn from(p: LogPath) -> Self {
+        p.0
+    }
+}
+
+impl LogPath {
+    /// Attempt to create a `LogPath` from `FileMeta`. This returns an error if the path isn't a
+    /// valid log path.
+    pub fn try_new(file_meta: FileMeta) -> DeltaResult<Self> {
+        // TODO: we should avoid the clone
+        let parsed = ParsedLogPath::try_from(file_meta.clone())?
+            .ok_or_else(|| Error::invalid_log_path(file_meta.location))?;
+
+        Ok(Self(parsed))
+    }
+}
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
