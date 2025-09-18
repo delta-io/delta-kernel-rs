@@ -23,7 +23,7 @@ pub(crate) enum LogPathFileType {
     Commit,
     SinglePartCheckpoint,
     #[allow(unused)]
-    UuidCheckpoint(String),
+    UuidCheckpoint,
     // NOTE: Delta spec doesn't actually say, but checkpoint part numbers are effectively 31-bit
     // unsigned integers: Negative values are never allowed, but Java integer types are always
     // signed. Approximate that as u32 here.
@@ -124,8 +124,8 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["crc"] => LogPathFileType::Crc,
             ["checkpoint", "parquet"] => LogPathFileType::SinglePartCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] => {
-                let uuid = parse_path_part(uuid, UUID_PART_LEN, url)?;
-                LogPathFileType::UuidCheckpoint(uuid)
+                parse_path_part::<String>(uuid, UUID_PART_LEN, url)?;
+                LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] => {
                 let hi = parse_path_part(hi, VERSION_LEN, url)?;
@@ -168,7 +168,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             self.file_type,
             LogPathFileType::SinglePartCheckpoint
                 | LogPathFileType::MultiPartCheckpoint { .. }
-                | LogPathFileType::UuidCheckpoint(_)
+                | LogPathFileType::UuidCheckpoint
         )
     }
 
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(log_path.version, 2);
         assert!(matches!(
             log_path.file_type,
-            LogPathFileType::UuidCheckpoint(ref u) if u == "3a0d65cd-4056-49b8-937b-95f9e3ee90e5",
+            LogPathFileType::UuidCheckpoint
         ));
         assert!(!log_path.is_commit());
         assert!(log_path.is_checkpoint());
@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(log_path.version, 2);
         assert!(matches!(
             log_path.file_type,
-            LogPathFileType::UuidCheckpoint(ref u) if u == "3a0d65cd-4056-49b8-937b-95f9e3ee90e5",
+            LogPathFileType::UuidCheckpoint
         ));
         assert!(!log_path.is_commit());
         assert!(log_path.is_checkpoint());
@@ -660,11 +660,10 @@ mod tests {
         assert_eq!(log_path.version, 10);
         assert!(log_path.is_checkpoint());
         assert_eq!(log_path.extension, "parquet");
-        if let LogPathFileType::UuidCheckpoint(uuid) = &log_path.file_type {
-            assert_eq!(uuid.len(), UUID_PART_LEN);
-        } else {
-            panic!("Expected UuidCheckpoint file type");
-        }
+        assert!(
+            matches!(log_path.file_type, LogPathFileType::UuidCheckpoint),
+            "Expected UuidCheckpoint file type"
+        );
 
         let filename = log_path.filename.to_string();
         let filename_parts: Vec<&str> = filename.split('.').collect();
