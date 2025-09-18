@@ -907,8 +907,13 @@ mod tests {
         // create variant
         let variant_inner_name = "variant_field".to_string();
         let variant_inner_field = ok_or_panic(unsafe { visit_schema_string(&mut state, kernel_string_slice!(variant_inner_name), false, test_allocate_error) });
-        let variant_struct_name = "variant_struct".to_string();
-        let variant_struct_type_id = ok_or_panic(unsafe { visit_schema_struct(&mut state, kernel_string_slice!(variant_struct_name), &variant_inner_field, 1, false, test_allocate_error) });
+
+        // For variant, we need to manually create a DataType::Struct (not a named field)
+        let variant_field = unwrap_field(&mut state, variant_inner_field).expect("Variant field should exist");
+        let variant_struct_type = StructType::new(vec![variant_field]);
+        let variant_struct_data_type = DataType::Struct(Box::new(variant_struct_type));
+        let variant_struct_type_id = wrap_data_type(&mut state, variant_struct_data_type);
+
         let f_variant = ok_or_panic(unsafe { visit_schema_variant(&mut state, kernel_string_slice!(f_variant_name), variant_struct_type_id, false, test_allocate_error) });
 
         // create the final schema
@@ -938,7 +943,7 @@ mod tests {
 
         for (i, (expected_name, expected_primitive)) in primitive_field_expectations.iter().enumerate() {
             assert_eq!(fields[i].name(), *expected_name, "Field at index {} has wrong name", i);
-            assert_eq!(fields[i].data_type(), &DataType::Primitive(*expected_primitive), "Field {} has wrong primitive type", expected_name);
+            assert_eq!(fields[i].data_type(), &DataType::Primitive(expected_primitive.clone()), "Field {} has wrong primitive type", expected_name);
             assert!(!fields[i].is_nullable(), "Field {} should not be nullable", expected_name);
         }
 
