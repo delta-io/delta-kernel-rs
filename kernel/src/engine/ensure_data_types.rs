@@ -271,7 +271,7 @@ mod tests {
     use crate::engine::arrow_conversion::TryFromKernel as _;
     use crate::engine::arrow_data::unshredded_variant_arrow_type;
     use crate::schema::{ArrayType, DataType, MapType, StructField};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
 

@@ -18,8 +18,8 @@ use crate::kernel_predicates::{
     IndirectDataSkippingPredicateEvaluator,
 };
 use crate::schema::{ArrayType, DataType as KernelDataType, MapType, StructField, StructType};
-use crate::utils::test_utils::assert_result_error_with_message;
 use crate::EvaluationHandlerExtension as _;
+use test_utils::assert_result_error_with_message;
 
 use super::*;
 

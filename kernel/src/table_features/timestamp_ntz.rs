@@ -47,7 +47,7 @@ mod tests {
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::table_features::{ReaderFeature, WriterFeature};
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use test_utils::assert_result_error_with_message;
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {

@@ -759,8 +759,8 @@ mod tests {
     use std::f32::consts::PI;
 
     use crate::expressions::{column_expr, BinaryPredicateOp};
-    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::{Expression as Expr, Predicate as Pred};
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
 

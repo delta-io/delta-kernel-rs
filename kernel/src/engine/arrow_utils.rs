@@ -977,7 +977,7 @@ mod tests {
         ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
     };
     use crate::table_features::ColumnMappingMode;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
 

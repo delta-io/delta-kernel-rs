@@ -64,7 +64,6 @@ impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
         Ok(DomainMetadata::new(
             RowTrackingDomainMetadata::ROW_TRACKING_DOMAIN_NAME.to_string(),
             serde_json::to_string(&metadata)?,
-            false,
         ))
     }
 }
@@ -146,7 +145,7 @@ impl RowVisitor for RowTrackingVisitor {
 mod tests {
     use super::*;
     use crate::engine_data::GetData;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use test_utils::assert_result_error_with_message;
 
     /// Mock GetData implementation for testing
     struct MockGetData {

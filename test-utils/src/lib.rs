@@ -426,3 +426,17 @@ pub fn set_json_value(
     *v = new_value;
     Ok(())
 }
+
+// TODO: allow tests to pass in context (issue#1133)
+pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+    match res {
+        Ok(_) => panic!("Expected error, but got Ok result"),
+        Err(error) => {
+            let error_str = error.to_string();
+            assert!(
+                error_str.contains(message),
+                "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
+            );
+        }
+    }
+}
