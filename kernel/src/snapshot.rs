@@ -1302,7 +1302,7 @@ mod tests {
                     },
                     "createdTime": 1677811175819u64
                 }
-            })
+            }),
         ];
         commit(store.as_ref(), 0, commit_data.to_vec()).await;
 
@@ -1317,7 +1317,9 @@ mod tests {
         })];
         commit(store.as_ref(), 1, commit1.to_vec()).await;
 
-        let snapshot = Snapshot::builder_for(url.clone()).at_version(1).build(&engine)?;
+        let snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
 
         // Test cached timestamp path - first call computes, second uses cache
         let timestamp1 = snapshot.get_timestamp(&engine)?;
@@ -1349,7 +1351,7 @@ mod tests {
                     },
                     "createdTime": 1677811175819u64
                 }
-            })
+            }),
         ];
         commit(store.as_ref(), 0, commit_data2.to_vec()).await;
 
@@ -1385,7 +1387,10 @@ mod tests {
         let snapshot_missing = Snapshot::builder_for(url3).at_version(1).build(&engine)?;
         let result = snapshot_missing.get_timestamp(&engine);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No inCommitTimestamp found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No inCommitTimestamp found"));
 
         Ok(())
     }
