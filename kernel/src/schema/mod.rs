@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -412,7 +413,9 @@ impl StructType {
         self.fields.get_index_of(name.as_ref())
     }
 
-    pub fn fields(&self) -> impl ExactSizeIterator<Item = &StructField> {
+    pub fn fields(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &StructField> + DoubleEndedIterator + FusedIterator {
         self.fields.values()
     }
 
@@ -455,6 +458,163 @@ impl StructType {
             .fields()
             .map(|field| field.make_physical(column_mapping_mode));
         Self::new(fields)
+    }
+}
+
+impl IntoIterator for StructType {
+    type Item = StructField;
+    type IntoIter = StructFieldIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        StructFieldIntoIter {
+            inner: self.fields.into_values(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a StructType {
+    type Item = &'a StructField;
+    type IntoIter = StructFieldRefIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        StructFieldRefIter {
+            inner: self.fields.values(),
+        }
+    }
+}
+
+/// An iterator that yields owned [`StructField`]s from a [`StructType`].
+///
+/// This iterator is returned by the [`IntoIterator`] implementation for [`StructType`] and
+/// consumes the original struct. It yields each field in the order they were defined in the
+/// schema, preserving the insertion order maintained by the underlying [`IndexMap`].
+///
+/// # Examples
+///
+/// ```
+/// use delta_kernel::schema::{StructType, StructField, DataType};
+///
+/// let fields = vec![
+///     StructField::new("name", DataType::STRING, false),
+///     StructField::new("age", DataType::INTEGER, true),
+/// ];
+/// let struct_type = StructType::new(fields);
+///
+/// // Consume the struct_type and iterate over owned fields
+/// for field in struct_type {
+///     println!("Field: {} ({})", field.name(), field.data_type());
+/// }
+/// ```
+///
+/// [`IndexMap`]: indexmap::IndexMap
+#[derive(Debug)]
+pub struct StructFieldIntoIter {
+    inner: indexmap::map::IntoValues<String, StructField>,
+}
+
+impl Iterator for StructFieldIntoIter {
+    type Item = StructField;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+
+    fn count(self) -> usize {
+        self.inner.count()
+    }
+
+    fn last(self) -> Option<Self::Item> {
+        self.inner.last()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n)
+    }
+}
+
+impl ExactSizeIterator for StructFieldIntoIter {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl FusedIterator for StructFieldIntoIter {}
+
+impl DoubleEndedIterator for StructFieldIntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back()
+    }
+}
+
+/// An iterator that yields references to [`StructField`]s from a [`StructType`].
+///
+/// This iterator is returned by the [`IntoIterator`] implementation for `&StructType` and by
+/// the [`StructType::fields()`] method. Unlike [`StructFieldIntoIter`], this iterator does not
+/// consume the original struct and yields references to the fields. It preserves the insertion
+/// order maintained by the underlying [`IndexMap`].
+///
+/// This iterator implements [`Clone`], allowing you to create multiple independent iterators
+/// over the same set of fields.
+///
+/// # Examples
+///
+/// ```
+/// use delta_kernel::schema::{StructType, StructField, DataType};
+///
+/// let fields = vec![
+///     StructField::new("name", DataType::STRING, false),
+///     StructField::new("age", DataType::INTEGER, true),
+/// ];
+/// let struct_type = StructType::new(fields);
+///
+/// // Iterate over field references without consuming the struct_type
+/// for field in &struct_type {
+///     println!("Field: {} ({})", field.name(), field.data_type());
+/// }
+///
+/// // struct_type is still available for use
+/// assert_eq!(struct_type.field("name").unwrap().name(), "name");
+///
+/// // Or use the fields() method explicitly
+/// for field in struct_type.fields() {
+///     println!("Field type: {}", field.data_type());
+/// }
+/// ```
+///
+/// [`StructType::fields()`]: StructType::fields
+/// [`IndexMap`]: indexmap::IndexMap
+#[derive(Debug, Clone)]
+pub struct StructFieldRefIter<'a> {
+    inner: indexmap::map::Values<'a, String, StructField>,
+}
+
+impl<'a> Iterator for StructFieldRefIter<'a> {
+    type Item = &'a StructField;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a> ExactSizeIterator for StructFieldRefIter<'a> {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<'a> FusedIterator for StructFieldRefIter<'a> {}
+
+impl<'a> DoubleEndedIterator for StructFieldRefIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back()
     }
 }
 
@@ -1720,5 +1880,386 @@ mod tests {
             map_field,
         ]);
         assert!(InvariantChecker::has_invariants(&schema));
+    }
+
+    #[test]
+    fn test_struct_type_iterator_basic() {
+        let fields = vec![
+            StructField::new("field1", DataType::STRING, true),
+            StructField::new("field2", DataType::INTEGER, false),
+            StructField::new("field3", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new(fields.clone());
+
+        // Test fields() method returns reference iterator
+        let field_names: Vec<_> = struct_type.fields().map(|f| f.name()).collect();
+        assert_eq!(field_names, vec!["field1", "field2", "field3"]);
+
+        // Test that we can still access the struct_type after using fields()
+        assert_eq!(struct_type.field("field1").unwrap().name, "field1");
+    }
+
+    #[test]
+    fn test_struct_type_into_iterator_owned() {
+        let fields = vec![
+            StructField::new("a", DataType::STRING, true),
+            StructField::new("b", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Test owned iteration (consumes the struct)
+        let mut field_names = Vec::new();
+        for field in struct_type {
+            field_names.push(field.name);
+        }
+        assert_eq!(field_names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_struct_type_into_iterator_references() {
+        let fields = vec![
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new("y", DataType::FLOAT, false),
+            StructField::new("z", DataType::LONG, true),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Test reference iteration (does not consume the struct)
+        let mut field_names = Vec::new();
+        for field in &struct_type {
+            field_names.push(field.name().clone());
+        }
+        assert_eq!(field_names, vec!["x", "y", "z"]);
+
+        // Should still be able to use struct_type after iteration
+        assert_eq!(struct_type.field("x").unwrap().name, "x");
+    }
+
+    #[test]
+    fn test_iterator_exact_size() {
+        let fields = vec![
+            StructField::new("field1", DataType::STRING, true),
+            StructField::new("field2", DataType::INTEGER, false),
+            StructField::new("field3", DataType::BOOLEAN, true),
+            StructField::new("field4", DataType::DATE, true),
+        ];
+
+        // Test ExactSizeIterator for reference iterator
+        let struct_type = StructType::new(fields.clone());
+        let ref_iter = struct_type.fields();
+        assert_eq!(ref_iter.len(), 4);
+
+        // Test ExactSizeIterator for &StructType into_iter
+        let struct_type = StructType::new(fields.clone());
+        let into_ref_iter = (&struct_type).into_iter();
+        assert_eq!(into_ref_iter.len(), 4);
+
+        // Test ExactSizeIterator for StructType into_iter (consuming)
+        let struct_type = StructType::new(fields);
+        let into_owned_iter = struct_type.into_iter();
+        assert_eq!(into_owned_iter.len(), 4);
+    }
+
+    #[test]
+    fn test_iterator_with_metadata() {
+        let field_with_metadata = StructField::new("test_field", DataType::STRING, true)
+            .with_metadata([("key1", MetadataValue::String("value1".to_string()))]);
+
+        let struct_type = StructType::new([field_with_metadata]);
+
+        // Test that metadata is preserved through iteration
+        for field in &struct_type {
+            assert_eq!(field.metadata().len(), 1);
+            assert_eq!(
+                field.metadata().get("key1"),
+                Some(&MetadataValue::String("value1".to_string()))
+            );
+        }
+
+        // Test consuming iterator preserves metadata
+        for field in struct_type {
+            assert_eq!(field.metadata().len(), 1);
+            assert_eq!(
+                field.metadata().get("key1"),
+                Some(&MetadataValue::String("value1".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_struct_type_iterator() {
+        let struct_type = StructType::new(std::iter::empty::<StructField>());
+
+        // Test all iterator methods with empty struct
+        assert_eq!(struct_type.fields().count(), 0);
+        assert_eq!((&struct_type).into_iter().count(), 0);
+        assert_eq!(struct_type.into_iter().count(), 0);
+    }
+
+    #[test]
+    fn test_iterator_order_preservation() {
+        let fields = vec![
+            StructField::new("zebra", DataType::STRING, true),
+            StructField::new("apple", DataType::INTEGER, false),
+            StructField::new("banana", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // IndexMap should preserve insertion order
+        let field_names: Vec<_> = struct_type.fields().map(|f| f.name()).collect();
+        assert_eq!(field_names, vec!["zebra", "apple", "banana"]);
+
+        // Order should be the same across different iterator methods
+        let ref_names: Vec<_> = (&struct_type).into_iter().map(|f| f.name()).collect();
+        assert_eq!(ref_names, vec!["zebra", "apple", "banana"]);
+
+        // Test consuming iterator maintains order too
+        let owned_names: Vec<_> = struct_type.into_iter().map(|f| f.name).collect();
+        assert_eq!(owned_names, vec!["zebra", "apple", "banana"]);
+    }
+
+    #[test]
+    fn test_iterator_collect() {
+        let original_fields = vec![
+            StructField::new("field1", DataType::STRING, true),
+            StructField::new("field2", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new(original_fields.clone());
+
+        // Test collecting from reference iterator
+        let collected_refs: Vec<&StructField> = struct_type.fields().collect();
+        assert_eq!(collected_refs.len(), 2);
+        assert_eq!(collected_refs[0].name, "field1");
+        assert_eq!(collected_refs[1].name, "field2");
+
+        // Test collecting from consuming iterator
+        let collected_owned: Vec<StructField> = struct_type.into_iter().collect();
+        assert_eq!(collected_owned.len(), 2);
+        assert_eq!(collected_owned[0].name, "field1");
+        assert_eq!(collected_owned[1].name, "field2");
+    }
+
+    #[test]
+    fn test_iterator_functional_methods() {
+        let fields = vec![
+            StructField::new("nullable_string", DataType::STRING, true),
+            StructField::new("required_int", DataType::INTEGER, false),
+            StructField::new("nullable_bool", DataType::BOOLEAN, true),
+            StructField::new("required_long", DataType::LONG, false),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Test filter - find nullable fields
+        let nullable_count = struct_type.fields().filter(|f| f.is_nullable()).count();
+        assert_eq!(nullable_count, 2);
+
+        // Test map and filter chain
+        let required_field_names: Vec<_> = struct_type
+            .fields()
+            .filter(|f| !f.is_nullable())
+            .map(|f| f.name())
+            .collect();
+        assert_eq!(required_field_names, vec!["required_int", "required_long"]);
+
+        // Test enumerate
+        for (index, field) in struct_type.fields().enumerate() {
+            match index {
+                0 => assert_eq!(field.name, "nullable_string"),
+                1 => assert_eq!(field.name, "required_int"),
+                2 => assert_eq!(field.name, "nullable_bool"),
+                3 => assert_eq!(field.name, "required_long"),
+                _ => panic!("Unexpected field index: {}", index),
+            }
+        }
+    }
+
+    #[test]
+    fn test_double_ended_iterator_ref() {
+        let fields = vec![
+            StructField::new("first", DataType::STRING, true),
+            StructField::new("second", DataType::INTEGER, false),
+            StructField::new("third", DataType::BOOLEAN, true),
+            StructField::new("fourth", DataType::LONG, false),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Test iterating from both ends using reference iterator
+        let mut iter = struct_type.fields();
+
+        // Forward iteration
+        assert_eq!(iter.next().unwrap().name, "first");
+        assert_eq!(iter.next().unwrap().name, "second");
+
+        // Backward iteration
+        assert_eq!(iter.next_back().unwrap().name, "fourth");
+        assert_eq!(iter.next_back().unwrap().name, "third");
+
+        // Should be exhausted
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_double_ended_iterator_owned() {
+        let fields = vec![
+            StructField::new("alpha", DataType::STRING, true),
+            StructField::new("beta", DataType::INTEGER, false),
+            StructField::new("gamma", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Test iterating from both ends using owned iterator
+        let mut iter = struct_type.into_iter();
+
+        // Backward iteration first
+        assert_eq!(iter.next_back().unwrap().name, "gamma");
+
+        // Forward iteration
+        assert_eq!(iter.next().unwrap().name, "alpha");
+
+        // Backward iteration again
+        assert_eq!(iter.next_back().unwrap().name, "beta");
+
+        // Should be exhausted
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_double_ended_iterator_collect_reverse() {
+        let fields = vec![
+            StructField::new("one", DataType::STRING, true),
+            StructField::new("two", DataType::INTEGER, false),
+            StructField::new("three", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Test collecting in reverse order using DoubleEndedIterator
+        let reversed_names: Vec<_> = struct_type.fields().rev().map(|f| f.name()).collect();
+        assert_eq!(reversed_names, vec!["three", "two", "one"]);
+
+        // Test that we can still use the original struct
+        assert_eq!(struct_type.field("two").unwrap().name, "two");
+    }
+
+    #[test]
+    fn test_double_ended_iterator_with_into_iter_ref() {
+        let fields = vec![
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new("y", DataType::FLOAT, false),
+            StructField::new("z", DataType::LONG, true),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Test DoubleEndedIterator with &StructType into_iter
+        let mut iter = (&struct_type).into_iter();
+
+        // Mix forward and backward iteration
+        assert_eq!(iter.next().unwrap().name, "x");
+        assert_eq!(iter.next_back().unwrap().name, "z");
+        assert_eq!(iter.next().unwrap().name, "y");
+
+        // Should be exhausted
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_fused_iterator_ref() {
+        let fields = vec![
+            StructField::new("test1", DataType::STRING, true),
+            StructField::new("test2", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Verify that reference iterator implements FusedIterator
+        let mut iter = struct_type.fields();
+
+        // Exhaust the iterator
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
+        // FusedIterator guarantees that calling next() after exhaustion always returns None
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_fused_iterator_owned() {
+        let fields = vec![
+            StructField::new("item1", DataType::STRING, true),
+            StructField::new("item2", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new(fields);
+
+        // Verify that owned iterator implements FusedIterator
+        let mut iter = struct_type.into_iter();
+
+        // Exhaust the iterator
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
+        // FusedIterator guarantees that calling next() after exhaustion always returns None
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_fused_iterator_with_into_iter_ref() {
+        let fields = vec![StructField::new("field_a", DataType::BOOLEAN, true)];
+        let struct_type = StructType::new(fields);
+
+        // Verify that &StructType into_iter implements FusedIterator
+        let mut iter = (&struct_type).into_iter();
+
+        // Exhaust the iterator
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
+        // FusedIterator guarantees that calling next() after exhaustion always returns None
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_fused_double_ended_iterator_empty() {
+        let struct_type = StructType::new(std::iter::empty::<StructField>());
+
+        // Test both forward and backward iteration on empty iterator
+        let mut iter = struct_type.fields();
+
+        // Empty iterator should return None immediately
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+
+        // FusedIterator guarantees continued None after exhaustion
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_double_ended_iterator_single_element() {
+        let fields = vec![StructField::new("single", DataType::STRING, true)];
+        let struct_type = StructType::new(fields);
+
+        // Test DoubleEndedIterator with single element
+        let mut iter = struct_type.fields();
+
+        // Should get the single element from next()
+        assert_eq!(iter.next().unwrap().name, "single");
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+
+        // Test getting single element from next_back()
+        let struct_type = StructType::new([StructField::new("single2", DataType::INTEGER, false)]);
+        let mut iter = struct_type.into_iter();
+
+        assert_eq!(iter.next_back().unwrap().name, "single2");
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
     }
 }
