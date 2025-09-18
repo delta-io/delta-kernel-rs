@@ -348,10 +348,10 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
