@@ -1225,10 +1225,10 @@ async fn test_ict_first_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number' with ICT enabled
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let tmp_dir = TempDir::new()?;
     let tmp_test_dir_url = Url::from_file_path(&tmp_dir).unwrap();
