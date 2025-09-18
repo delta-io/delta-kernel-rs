@@ -13,7 +13,7 @@ use crate::transforms::ColumnType;
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
-use super::physical_to_logical::{physical_to_logical_expr, scan_file_physical_schema};
+use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{TableChanges, CDF_FIELDS};
@@ -144,14 +144,18 @@ impl TableChangesScanBuilder {
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
                     Ok(ColumnType::Partition(index))
+                } else if logical_field.name() == "_change_type" {
+                    // _change_type is dynamic - physical in CDC files, computed in Add/Remove files
+                    Ok(ColumnType::Dynamic {
+                        logical_index: index,
+                        physical_name: "_change_type".to_string(),
+                    })
                 } else if CDF_FIELDS
                     .iter()
                     .any(|field| field.name() == logical_field.name())
                 {
-                    // CDF Columns are generated, so they do not have a column mapping. These will
-                    // be processed separately and used to build an expression when transforming physical
-                    // data to logical.
-                    Ok(ColumnType::Selected(logical_field.name().to_string()))
+                    // Other CDF metadata columns (_commit_version, _commit_timestamp) are always computed
+                    Ok(ColumnType::Partition(index))
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
@@ -246,8 +250,11 @@ impl TableChangesScan {
 
         let table_root = self.table_changes.table_root().clone();
         let all_fields = self.all_fields.clone();
-        let physical_predicate = self.physical_predicate();
+        let _physical_predicate = self.physical_predicate();
         let dv_engine_ref = engine.clone();
+
+        // Generate transform_spec once and pass it to read_scan_file
+        let transform_spec = crate::transforms::get_transform_spec(&all_fields);
 
         let result = scan_files
             .map(move |scan_file| {
@@ -261,8 +268,8 @@ impl TableChangesScan {
                     self.table_root(),
                     self.logical_schema(),
                     self.physical_schema(),
-                    &all_fields,
-                    physical_predicate.clone(),
+                    &transform_spec,
+                    _physical_predicate.clone(),
                 )
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
@@ -280,7 +287,7 @@ fn read_scan_file(
     table_root: &Url,
     logical_schema: &SchemaRef,
     physical_schema: &SchemaRef,
-    all_fields: &[ColumnType],
+    transform_spec: &crate::transforms::TransformSpec,
     _physical_predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
@@ -288,12 +295,14 @@ fn read_scan_file(
         mut selection_vector,
     } = resolved_scan_file;
 
-    let physical_to_logical_expr =
-        physical_to_logical_expr(&scan_file, logical_schema.as_ref(), all_fields)?;
+    // Use the unified transform system instead of physical_to_logical workaround
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
+    let transform_expr =
+        get_cdf_transform_expr(transform_spec, &scan_file, logical_schema, &physical_schema)?;
+
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
-        Arc::new(physical_to_logical_expr),
+        transform_expr,
         logical_schema.clone().into(),
     );
     // Determine if the scan file was derived from a deletion vector pair
@@ -385,9 +394,12 @@ mod tests {
             vec![
                 ColumnType::Selected("part".to_string()),
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Selected("_change_type".to_string()),
-                ColumnType::Selected("_commit_version".to_string()),
-                ColumnType::Selected("_commit_timestamp".to_string()),
+                ColumnType::Dynamic {
+                    logical_index: 2,
+                    physical_name: "_change_type".to_string(),
+                },
+                ColumnType::Partition(3), // _commit_version
+                ColumnType::Partition(4), // _commit_timestamp
             ]
             .into()
         );
@@ -418,7 +430,7 @@ mod tests {
             scan.all_fields,
             vec![
                 ColumnType::Selected("id".to_string()),
-                ColumnType::Selected("_commit_version".to_string()),
+                ColumnType::Partition(1), // _commit_version
             ]
             .into()
         );

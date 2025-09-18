@@ -605,6 +605,7 @@ impl Scan {
             engine,
             action_batch_iter,
             self.logical_schema.clone(),
+            self.physical_schema.clone(),
             static_transform,
             physical_predicate,
         );
@@ -970,6 +971,7 @@ pub(crate) mod test_utils {
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            logical_schema.clone(),
             logical_schema,
             transform_spec,
             None,

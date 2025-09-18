@@ -55,8 +55,6 @@ mod scan_file;
 static CHANGE_TYPE_COL_NAME: &str = "_change_type";
 static COMMIT_VERSION_COL_NAME: &str = "_commit_version";
 static COMMIT_TIMESTAMP_COL_NAME: &str = "_commit_timestamp";
-static ADD_CHANGE_TYPE: &str = "insert";
-static REMOVE_CHANGE_TYPE: &str = "delete";
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
     [
         StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),

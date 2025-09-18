@@ -1,69 +1,67 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use itertools::Itertools;
 
 use crate::expressions::Scalar;
-use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
-use crate::transforms::ColumnType;
-use crate::{DeltaResult, Error, Expression};
+use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::transforms::{get_transform_expr, parse_partition_values};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
-use super::{
-    ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
-    REMOVE_CHANGE_TYPE,
-};
+use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
 
-/// Returns a map from change data feed column name to an expression that generates the row data.
-fn get_cdf_columns(scan_file: &CdfScanFile) -> DeltaResult<HashMap<&str, Expression>> {
-    let timestamp = Scalar::timestamp_from_millis(scan_file.commit_timestamp)?;
-    let version = scan_file.commit_version;
-    let change_type: Expression = match scan_file.scan_type {
-        CdfScanFileType::Cdc => Expression::column([CHANGE_TYPE_COL_NAME]),
-        CdfScanFileType::Add => Expression::literal(ADD_CHANGE_TYPE),
-        CdfScanFileType::Remove => Expression::literal(REMOVE_CHANGE_TYPE),
-    };
-    let expressions = [
-        (CHANGE_TYPE_COL_NAME, change_type),
-        (COMMIT_VERSION_COL_NAME, Expression::literal(version)),
-        (COMMIT_TIMESTAMP_COL_NAME, timestamp.into()),
-    ];
-    Ok(expressions.into_iter().collect())
-}
+// CDF change type constants
+const ADD_CHANGE_TYPE: &str = "insert";
+const REMOVE_CHANGE_TYPE: &str = "delete";
 
-/// Generates the expression used to convert physical data from the `scan_file` path into logical
-/// data matching the `logical_schema`
-pub(crate) fn physical_to_logical_expr(
+/// Gets CDF metadata columns from the logical schema and scan file.
+///
+/// This function directly looks up CDF columns in the schema and generates their values
+/// based on the scan file metadata.
+pub(crate) fn get_cdf_columns(
+    logical_schema: &SchemaRef,
     scan_file: &CdfScanFile,
-    logical_schema: &StructType,
-    all_fields: &[ColumnType],
-) -> DeltaResult<Expression> {
-    let mut cdf_columns = get_cdf_columns(scan_file)?;
-    let all_fields = all_fields
-        .iter()
-        .map(|field| match field {
-            ColumnType::Partition(field_idx) => {
-                let field = logical_schema.field_at_index(*field_idx);
-                let Some(field) = field else {
-                    return Err(Error::generic(
-                        "logical schema did not contain expected field, can't transform data",
-                    ));
-                };
-                let name = field.physical_name();
-                let raw_value = scan_file.partition_values.get(name);
-                let value_expression =
-                    crate::transforms::parse_partition_value_raw(raw_value, field.data_type())?;
-                Ok(value_expression.into())
-            }
-            ColumnType::Selected(field_name) => {
-                // Remove to take ownership
-                let generated_column = cdf_columns.remove(field_name.as_str());
-                Ok(generated_column.unwrap_or_else(|| ColumnName::new([field_name]).into()))
-            }
-        })
-        .map(|expr| expr.map(Arc::new))
-        .try_collect()?;
-    Ok(Expression::Struct(all_fields))
+) -> crate::DeltaResult<HashMap<usize, (String, Scalar)>> {
+    let mut out = HashMap::new();
+
+    // Handle _change_type
+    let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
+    match (change_type_field, &scan_file.scan_type) {
+        (Some((idx, field)), CdfScanFileType::Add) => {
+            let val = (
+                field.name().to_string(),
+                Scalar::String(ADD_CHANGE_TYPE.to_string()),
+            );
+            out.insert(idx, val);
+        }
+        (Some((idx, field)), CdfScanFileType::Remove) => {
+            let val = (
+                field.name().to_string(),
+                Scalar::String(REMOVE_CHANGE_TYPE.to_string()),
+            );
+            out.insert(idx, val);
+        }
+        (Some(_), CdfScanFileType::Cdc) | (None, _) => { /* Do nothing */ }
+    }
+
+    // Handle _commit_timestamp
+    let timestamp_field = logical_schema.field_with_index(COMMIT_TIMESTAMP_COL_NAME);
+    if let Some((idx, field)) = timestamp_field {
+        let val = (
+            field.name().to_string(),
+            Scalar::timestamp_from_millis(scan_file.commit_timestamp)?,
+        );
+        out.insert(idx, val);
+    }
+
+    // Handle _commit_version
+    let version_field = logical_schema.field_with_index(COMMIT_VERSION_COL_NAME);
+    if let Some((idx, field)) = version_field {
+        let val = (
+            field.name().to_string(),
+            Scalar::Long(scan_file.commit_version),
+        );
+        out.insert(idx, val);
+    }
+
+    Ok(out)
 }
 
 /// Gets the physical schema that will be used to read data in the `scan_file` path.
@@ -81,62 +79,59 @@ pub(crate) fn scan_file_physical_schema(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
+/// Prepares partition values for CDF columns and partition columns.
+///
+/// This function collects all partition values needed for the transform:
+/// - Partition values from the scan file
+/// - CDF metadata (_commit_version, _commit_timestamp)
+/// - _change_type value (for Dynamic column when not physical)
+///
+/// # Arguments
+/// * `scan_file` - The CDF scan file containing metadata
+/// * `logical_schema` - The logical schema to find field indices
+/// * `transform_spec` - The transform specification for parsing partition values
+///
+/// # Returns
+/// A HashMap mapping field indices to (name, value) pairs
+pub(crate) fn prepare_cdf_partition_values(
+    scan_file: &CdfScanFile,
+    logical_schema: &SchemaRef,
+    transform_spec: &crate::transforms::TransformSpec,
+) -> HashMap<usize, (String, Scalar)> {
+    let mut partition_values = HashMap::new();
 
-    use crate::expressions::{column_expr, Expression as Expr, Scalar};
-    use crate::schema::{DataType, StructField, StructType};
-    use crate::table_changes::physical_to_logical::physical_to_logical_expr;
-    use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
-    use crate::table_changes::{
-        ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
-        REMOVE_CHANGE_TYPE,
-    };
-    use crate::transforms::ColumnType;
-
-    #[test]
-    fn verify_physical_to_logical_expression() {
-        let test = |scan_type, expected_expr| {
-            let scan_file = CdfScanFile {
-                scan_type,
-                path: "fake_path".to_string(),
-                dv_info: Default::default(),
-                remove_dv: None,
-                partition_values: HashMap::from([("age".to_string(), "20".to_string())]),
-                commit_version: 42,
-                commit_timestamp: 1234,
-            };
-            let logical_schema = StructType::new_unchecked([
-                StructField::nullable("id", DataType::STRING),
-                StructField::not_null("age", DataType::LONG),
-                StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),
-                StructField::not_null(COMMIT_VERSION_COL_NAME, DataType::LONG),
-                StructField::not_null(COMMIT_TIMESTAMP_COL_NAME, DataType::TIMESTAMP),
-            ]);
-            let all_fields = vec![
-                ColumnType::Selected("id".to_string()),
-                ColumnType::Partition(1),
-                ColumnType::Selected(CHANGE_TYPE_COL_NAME.to_string()),
-                ColumnType::Selected(COMMIT_VERSION_COL_NAME.to_string()),
-                ColumnType::Selected(COMMIT_TIMESTAMP_COL_NAME.to_string()),
-            ];
-            let phys_to_logical_expr =
-                physical_to_logical_expr(&scan_file, &logical_schema, &all_fields).unwrap();
-            let expected_expr = Expr::struct_from([
-                column_expr!("id"),
-                Scalar::Long(20).into(),
-                expected_expr,
-                Expr::literal(42i64),
-                Scalar::Timestamp(1234000).into(), // Microsecond is 1000x millisecond
-            ]);
-
-            assert_eq!(phys_to_logical_expr, expected_expr)
-        };
-
-        let cdc_change_type = Expr::column([CHANGE_TYPE_COL_NAME]);
-        test(CdfScanFileType::Add, Expr::literal(ADD_CHANGE_TYPE));
-        test(CdfScanFileType::Remove, Expr::literal(REMOVE_CHANGE_TYPE));
-        test(CdfScanFileType::Cdc, cdc_change_type);
+    // Handle regular partition values using parse_partition_values
+    if let Ok(parsed_values) =
+        parse_partition_values(logical_schema, transform_spec, &scan_file.partition_values)
+    {
+        partition_values.extend(parsed_values);
     }
+
+    // Handle CDF metadata columns using the new get_cdf_columns approach
+    if let Ok(cdf_values) = get_cdf_columns(logical_schema, scan_file) {
+        partition_values.extend(cdf_values);
+    }
+
+    partition_values
+}
+
+/// Generates the transform expression for converting physical data to logical data.
+///
+/// # Arguments
+/// * `transform_spec` - The transform specification (generated once in execute)
+/// * `scan_file` - The CDF scan file containing metadata
+/// * `logical_schema` - The logical schema
+/// * `physical_schema` - The physical schema
+///
+/// # Returns
+/// The transform expression for data conversion
+pub(crate) fn get_cdf_transform_expr(
+    transform_spec: &crate::transforms::TransformSpec,
+    scan_file: &CdfScanFile,
+    logical_schema: &SchemaRef,
+    physical_schema: &SchemaRef,
+) -> crate::DeltaResult<std::sync::Arc<crate::expressions::Expression>> {
+    let partition_values = prepare_cdf_partition_values(scan_file, logical_schema, transform_spec);
+    let physical_schema = scan_file_physical_schema(scan_file, physical_schema.as_ref());
+    get_transform_expr(transform_spec, partition_values, physical_schema.as_ref())
 }
