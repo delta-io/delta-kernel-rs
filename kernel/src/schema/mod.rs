@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::ops::Index;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -24,6 +25,7 @@ pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
 pub(crate) mod variant_utils;
+pub(crate) mod visitor;
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;
@@ -410,6 +412,10 @@ impl StructType {
 
     pub fn index_of(&self, name: impl AsRef<str>) -> Option<usize> {
         self.fields.get_index_of(name.as_ref())
+    }
+
+    pub fn by_index(&self, pos: usize) -> &StructField {
+        self.fields.index(pos)
     }
 
     pub fn fields(&self) -> impl ExactSizeIterator<Item = &StructField> {

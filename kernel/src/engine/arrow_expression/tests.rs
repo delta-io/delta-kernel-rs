@@ -827,7 +827,7 @@ fn test_create_one_mismatching_scalar_types() {
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
         handler.create_one(schema, values),
-        "Schema error: Mismatched scalar type while creating Expression: expected Integer, got Long",
+        "Schema error: Mismatched scalar type while creating Expression: expected Primitive(Integer), got Primitive(Long)",
     );
 }
 
