@@ -120,7 +120,7 @@ impl TableChangesScanBuilder {
         let logical_schema = self
             .schema
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
-        let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
+        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
 
         // Loop over all selected fields. We produce the following:
         // - If the field is read from the parquet file then it is ([`ColumnType::Selected`]).

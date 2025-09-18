@@ -112,7 +112,7 @@ impl RowVisitor for RowTrackingVisitor {
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == add_files_schema().fields_len(),
+            getters.len() == add_files_schema().num_fields(),
             Error::generic(format!(
                 "Wrong number of RowTrackingVisitor getters: {}",
                 getters.len()
@@ -176,7 +176,7 @@ mod tests {
         let schema = add_files_schema();
         let mut getters: Vec<&'a dyn GetData<'a>> = Vec::new();
 
-        for i in 0..schema.fields_len() {
+        for i in 0..schema.num_fields() {
             if i == RowTrackingVisitor::NUM_RECORDS_FIELD_INDEX {
                 getters.push(num_records_mock);
             } else {
