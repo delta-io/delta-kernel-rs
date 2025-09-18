@@ -69,6 +69,7 @@ pub(crate) const CONTENT_ROOT_NAME: &str = "contentRoot";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
+// Full log schema for a commit file
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new([
         StructField::nullable(ADD_NAME, Add::to_schema()),
@@ -81,6 +82,7 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
         StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
+        StructField::nullable(CONTENT_ROOT_NAME, ContentRoot::to_schema()),
     ]))
 });
 
@@ -843,6 +845,21 @@ pub(crate) struct ContentRoot {
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
     pub(crate) path: String,
     pub(crate) size_in_bytes: i64,
+}
+
+impl IntoEngineData for ContentRoot {
+    fn into_engine_data(
+        self,
+        schema: SchemaRef,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        let values = [
+            self.path.into(),
+            self.size_in_bytes.into(),
+        ];
+
+        engine.evaluation_handler().create_one(schema, &values)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -2024,37 +2041,35 @@ mod tests {
     }
 
     #[test]
-    fn test_content_root_log_schema_serialization() {
-        // Test ContentRoot serialization in log schema format
+    fn test_content_root_into_engine_data() {
+        let engine = ExprEngine::new();
+
         let content_root = ContentRoot {
             path: "s3://bucket/table/data.parquet".to_string(),
             size_in_bytes: 1024,
         };
 
-        // Test JSON serialization in log format (wrapped in contentRoot field)
-        let log_entry = serde_json::json!({
-            "contentRoot": {
-                "path": content_root.path,
-                "sizeInBytes": content_root.size_in_bytes
-            }
-        });
+        let engine_data = content_root
+            .into_engine_data(ContentRoot::to_schema().into(), &engine)
+            .unwrap();
 
-        let json_str = serde_json::to_string(&log_entry).unwrap();
-        let expected_json =
-            r#"{"contentRoot":{"path":"s3://bucket/table/data.parquet","sizeInBytes":1024}}"#;
-        assert_eq!(json_str, expected_json);
+        let record_batch: RecordBatch = engine_data
+            .into_any()
+            .downcast::<ArrowEngineData>()
+            .unwrap()
+            .into();
 
-        // Test deserialization from log format
-        let parsed_entry: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        let content_root_field = parsed_entry.get("contentRoot").unwrap();
+        let expected = RecordBatch::try_new(
+            record_batch.schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["s3://bucket/table/data.parquet"])),
+                Arc::new(Int64Array::from(vec![1024])),
+            ],
+        )
+        .unwrap();
 
-        let deserialized_content_root: ContentRoot =
-            serde_json::from_value(content_root_field.clone()).unwrap();
-        assert_eq!(deserialized_content_root, content_root);
-
-        // Test round-trip serialization
-        let serialized_again = serde_json::to_string(&deserialized_content_root).unwrap();
-        let direct_serialization = serde_json::to_string(&content_root).unwrap();
-        assert_eq!(serialized_again, direct_serialization);
+        assert_eq!(record_batch, expected);
     }
+
+     
 }
