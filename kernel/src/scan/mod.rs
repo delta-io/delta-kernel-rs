@@ -27,7 +27,7 @@ use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     StructType,
 };
-use crate::snapshot::Snapshot;
+use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
@@ -48,7 +48,7 @@ static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
 }
@@ -64,7 +64,7 @@ impl std::fmt::Debug for ScanBuilder {
 
 impl ScanBuilder {
     /// Create a new [`ScanBuilder`] instance.
-    pub fn new(snapshot: impl Into<Arc<Snapshot>>) -> Self {
+    pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
         Self {
             snapshot: snapshot.into(),
             schema: None,
@@ -86,6 +86,8 @@ impl ScanBuilder {
 
     /// Optionally provide a [`SchemaRef`] for columns to select from the [`Snapshot`]. See
     /// [`ScanBuilder::with_schema`] for details. If `schema_opt` is `None` this is a no-op.
+    ///
+    /// [`Snapshot`]: crate::Snapshot
     pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
         match schema_opt {
             Some(schema) => self.with_schema(schema),
@@ -411,7 +413,7 @@ impl HasSelectionVector for ScanMetadata {
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     physical_predicate: PhysicalPredicate,
@@ -440,7 +442,9 @@ impl Scan {
     }
 
     /// Get a shared reference to the [`Snapshot`] of this scan.
-    pub fn snapshot(&self) -> &Arc<Snapshot> {
+    ///
+    /// [`Snapshot`]: crate::Snapshot
+    pub fn snapshot(&self) -> &SnapshotRef {
         &self.snapshot
     }
 
