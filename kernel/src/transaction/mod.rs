@@ -14,7 +14,7 @@ use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
-use crate::snapshot::Snapshot;
+use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -114,7 +114,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// txn.commit(&engine)?;
 /// ```
 pub struct Transaction {
-    read_snapshot: Arc<Snapshot>,
+    read_snapshot: SnapshotRef,
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -146,7 +146,7 @@ impl Transaction {
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
     /// a snapshot.
-    pub(crate) fn try_new(snapshot: impl Into<Arc<Snapshot>>) -> DeltaResult<Self> {
+    pub(crate) fn try_new(snapshot: impl Into<SnapshotRef>) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported

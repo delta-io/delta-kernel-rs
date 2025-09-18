@@ -82,7 +82,7 @@ impl Snapshot {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
     ///   version of the table.
-    pub fn builder_from(existing_snapshot: Arc<Snapshot>) -> SnapshotBuilder {
+    pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
         SnapshotBuilder::new_from(existing_snapshot)
     }
 
@@ -98,7 +98,7 @@ impl Snapshot {
     /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
     /// snapshot to a later version.
     fn try_new_from(
-        existing_snapshot: Arc<Snapshot>,
+        existing_snapshot: SnapshotRef,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<Arc<Self>> {
@@ -333,7 +333,7 @@ impl Snapshot {
         self.table_configuration.column_mapping_mode()
     }
 
-    /// Create a [`ScanBuilder`] for an `Arc<Snapshot>`.
+    /// Create a [`ScanBuilder`] for an `SnapshotRef`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
         ScanBuilder::new(self)
     }
@@ -343,7 +343,7 @@ impl Snapshot {
         ScanBuilder::new(self)
     }
 
-    /// Create a [`Transaction`] for this `Arc<Snapshot>`.
+    /// Create a [`Transaction`] for this `SnapshotRef`.
     pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
         Transaction::try_new(self)
     }
