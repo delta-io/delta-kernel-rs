@@ -1042,8 +1042,16 @@ mod tests {
         let expected_filename = "00000000000000000000.00000000000000000001.compacted.json";
         assert!(path.to_string().ends_with(expected_filename));
 
-        // Test invalid version range
-        let result = snapshot.log_compaction_writer(2, 1);
+        // Test invalid version range (start >= end)
+        let result = snapshot.clone().log_compaction_writer(2, 1);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid version range"));
+
+        // Test equal version range (also invalid)
+        let result = snapshot.log_compaction_writer(1, 1);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

@@ -47,10 +47,9 @@ impl LogCompactionWriter {
         start_version: Version,
         end_version: Version,
     ) -> DeltaResult<Self> {
-        if start_version > end_version {
+        if start_version >= end_version {
             return Err(Error::generic(format!(
-                "Invalid version range: start_version {} > end_version {}",
-                start_version, end_version
+                "Invalid version range: end_version {end_version} must be greater than start_version {start_version}"
             )));
         }
 
