@@ -64,6 +64,8 @@ pub(crate) const SIDECAR_NAME: &str = "sidecar";
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
+#[internal_api]
+pub(crate) const CONTENT_ROOT_NAME: &str = "contentRoot";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
@@ -110,6 +112,13 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+static LOG_CONTENT_ROOT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        CONTENT_ROOT_NAME,
+        ContentRoot::to_schema(),
+    )]))
+});
+
 #[internal_api]
 pub(crate) fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
@@ -130,6 +139,10 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+pub(crate) fn get_log_content_root_schema() -> &'static SchemaRef {
+    &LOG_CONTENT_ROOT_SCHEMA
 }
 
 /// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
@@ -814,18 +827,22 @@ pub(crate) struct Remove {
     pub(crate) delete_manifest_position: Option<i64>,
 }
 
+/// The ContentRoot action describes the root of the content metadata tree.
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[internal_api]
-#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
-/// The ContentRoot action describes the root of the content metadata tree.
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
 pub(crate) struct ContentRoot {
     /// A relative path to a data file from the root of the table or an absolute path to a file
     /// that should be added to the table. The path is a URI as specified by
     /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
     ///
     /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
-    path: String,
-    size_in_bytes: i64,
+    pub(crate) path: String,
+    pub(crate) size_in_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1989,5 +2006,20 @@ mod tests {
         // reader/writer features are null
         assert!(record_batch.column(2).is_null(0));
         assert!(record_batch.column(3).is_null(0));
+    }
+
+    #[test]
+    fn test_content_root_schema() {
+        let schema = get_log_content_root_schema();
+
+        let expected = StructType::new([StructField::nullable(
+            "contentRoot",
+            StructType::new([
+                StructField::not_null("path", DataType::STRING),
+                StructField::not_null("sizeInBytes", DataType::LONG),
+            ]),
+        )]);
+
+        assert_eq!(**schema, expected);
     }
 }
