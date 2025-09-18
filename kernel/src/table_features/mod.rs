@@ -71,7 +71,8 @@ pub(crate) enum ReaderFeature {
     VariantShreddingPreview,
     #[strum(serialize = "metadataTree-preview")]
     #[serde(rename = "metadataTree-preview")]
-    MetadataTreePreview,
+    // Allow reading from the metadata tree format.
+    MetadataTreeExperimental,
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
@@ -160,6 +161,7 @@ pub(crate) enum WriterFeature {
     VariantShreddingPreview,
     #[strum(serialize = "metadataTree-experimental")]
     #[serde(rename = "metadataTree-experimental")]
+    // Allow writing to the metadata tree format.
     MetadataTreeExperimental,
     #[serde(untagged)]
     #[strum(default)]
@@ -225,7 +227,7 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
         // `STRUCT<metadata: BINARY, value: BINARY>` representation if parquet readers of
         // third-party engines support it.
         ReaderFeature::VariantShreddingPreview,
-        ReaderFeature::MetadataTreePreview,
+        ReaderFeature::MetadataTreeExperimental,
     ]
 });
 
@@ -246,7 +248,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::VariantType,
         WriterFeature::VariantTypePreview,
         WriterFeature::VariantShreddingPreview,
-        ReaderFeature::MetadataTreeExperimental,
+        WriterFeature::MetadataTreeExperimental,
     ]
 });
 
@@ -302,6 +304,7 @@ mod tests {
             (ReaderFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (ReaderFeature::VariantType, "variantType"),
             (ReaderFeature::VariantTypePreview, "variantType-preview"),
+            (ReaderFeature::MetadataTreeExperimental, "metadataTree-experimental"),
             (
                 ReaderFeature::VariantShreddingPreview,
                 "variantShredding-preview",
@@ -350,6 +353,7 @@ mod tests {
             (WriterFeature::ClusteredTable, "clustering"),
             (WriterFeature::VariantType, "variantType"),
             (WriterFeature::VariantTypePreview, "variantType-preview"),
+            (WriterFeature::MetadataTreeExperimental, "metadataTree-experimental"),
             (
                 WriterFeature::VariantShreddingPreview,
                 "variantShredding-preview",
