@@ -1,11 +1,10 @@
-use std::sync::Arc;
-
 use super::{should_compact, LogCompactionWriter, COMPACTION_ACTIONS_SCHEMA};
 use crate::action_reconciliation::RetentionCalculator;
 use crate::engine::sync::SyncEngine;
 use crate::snapshot::Snapshot;
+use crate::SnapshotRef;
 
-fn create_mock_snapshot() -> Arc<Snapshot> {
+fn create_mock_snapshot() -> SnapshotRef {
     let path = std::fs::canonicalize(std::path::PathBuf::from(
         "./tests/data/table-with-dv-small/",
     ))
@@ -15,7 +14,7 @@ fn create_mock_snapshot() -> Arc<Snapshot> {
     Snapshot::builder_for(url).build(&engine).unwrap()
 }
 
-fn create_multi_version_snapshot() -> Arc<Snapshot> {
+fn create_multi_version_snapshot() -> SnapshotRef {
     let path =
         std::fs::canonicalize(std::path::PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();

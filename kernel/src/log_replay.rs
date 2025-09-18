@@ -246,10 +246,13 @@ impl ActionsBatch {
 ///   Note that scans do not expose `Remove` actions. Data skipping may be applied when a predicate is
 ///   provided.
 ///
-/// - [`CheckpointLogReplayProcessor`]: Used for writing checkpoints, this processor filters and selects
-///   actions from log batches for inclusion in V1 spec checkpoint files. Unlike scans, checkpoint
-///   processing includes additional actions, such as `Remove`, `Metadata`, and `Protocol`, required to
-///   fully reconstruct table state. Data skipping is not applied during checkpoint processing.
+/// - [`ActionReconciliationProcessor`]: Used for action reconciliation (including checkpoint writing),
+///   this processor filters and selects actions from log batches for inclusion in V1 spec checkpoint files.
+///   Unlike scans, action reconciliation processing includes additional actions, such as `Remove`, `Metadata`,
+///   and `Protocol`, required to fully reconstruct table state. Data skipping is not applied during action
+///   reconciliation processing.
+///
+/// [`ActionReconciliationProcessor`]: crate::action_reconciliation::log_replay::ActionReconciliationProcessor
 ///
 /// # Action Iterator Input
 ///

@@ -1,17 +1,16 @@
-use std::sync::Arc;
-
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
+use crate::action_reconciliation::log_replay::{
+    ActionReconciliationBatch, ActionReconciliationProcessor,
+};
 use crate::action_reconciliation::RetentionCalculator;
-use crate::checkpoint::log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 use crate::engine_data::FilteredEngineData;
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
-use crate::snapshot::Snapshot;
 use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, SnapshotRef, Version};
 
 /// Determine if log compaction should be performed based on the commit version and
 /// compaction interval.
@@ -29,7 +28,7 @@ pub fn should_compact(commit_version: Version, compaction_interval: Version) -> 
 #[derive(Debug)]
 pub struct LogCompactionWriter {
     /// Reference to the snapshot of the table being compacted
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     start_version: Version,
     end_version: Version,
     /// Cached compaction file path
@@ -44,7 +43,7 @@ impl RetentionCalculator for LogCompactionWriter {
 
 impl LogCompactionWriter {
     pub(crate) fn try_new(
-        snapshot: Arc<Snapshot>,
+        snapshot: SnapshotRef,
         start_version: Version,
         end_version: Version,
     ) -> DeltaResult<Self> {
@@ -107,9 +106,9 @@ impl LogCompactionWriter {
 
         let min_file_retention_timestamp_millis = self.deleted_file_retention_timestamp()?;
 
-        // Create checkpoint log replay processor for compaction
+        // Create action reconciliation processor for compaction
         // This reuses the same reconciliation logic as checkpoints
-        let processor = CheckpointLogReplayProcessor::new(
+        let processor = ActionReconciliationProcessor::new(
             min_file_retention_timestamp_millis,
             self.get_transaction_expiration_timestamp()?,
         );
@@ -128,7 +127,7 @@ impl LogCompactionWriter {
 pub struct LogCompactionDataIterator {
     /// The nested iterator that yields compaction batches with action counts
     pub(crate) compaction_batch_iterator:
-        Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
+        Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
     /// Running total of actions included in the compaction
     pub(crate) actions_count: i64,
     /// Running total of add actions included in the compaction
@@ -138,7 +137,9 @@ pub struct LogCompactionDataIterator {
 impl LogCompactionDataIterator {
     /// Create a new LogCompactionDataIterator with counters initialized to 0
     pub(crate) fn new(
-        compaction_batch_iterator: Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
+        compaction_batch_iterator: Box<
+            dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
+        >,
     ) -> Self {
         Self {
             compaction_batch_iterator,
