@@ -181,6 +181,7 @@ pub trait KernelPredicateEvaluator {
             | Expr::Transform(_)
             | Expr::Unary(_)
             | Expr::Binary(_)
+            | Expr::Variadic(_)
             | Expr::Unknown(_) => None,
         }
     }
@@ -206,6 +207,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Transform(_)
                 | Expr::Unary(_)
                 | Expr::Binary(_)
+                | Expr::Variadic(_)
                 | Expr::Opaque(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
@@ -624,6 +626,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 };
                 op_fn(&self.eval_expr(left)?, &self.eval_expr(right)?)
             }
+            Expr::Variadic(_) => None, // TODO
             Expr::Opaque(OpaqueExpression { op, exprs }) => op
                 .eval_expr_scalar(&|expr| self.eval_expr(expr), exprs)
                 .inspect_err(|err| {
