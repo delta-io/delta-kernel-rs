@@ -73,7 +73,8 @@ pub(crate) fn scan_file_physical_schema(
     if scan_file.scan_type == CdfScanFileType::Cdc {
         let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
         let fields = physical_schema.fields().cloned().chain(Some(change_type));
-        StructType::new(fields).into()
+        // NOTE: We don't validate the fields again because CHANGE_TYPE_COL_NAME should never be used anywhere else
+        StructType::new_unchecked(fields).into()
     } else {
         physical_schema.clone().into()
     }
@@ -105,7 +106,7 @@ mod tests {
                 commit_version: 42,
                 commit_timestamp: 1234,
             };
-            let logical_schema = StructType::new([
+            let logical_schema = StructType::new_unchecked([
                 StructField::nullable("id", DataType::STRING),
                 StructField::not_null("age", DataType::LONG),
                 StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),
