@@ -307,16 +307,26 @@ impl ScanResult {
     }
 }
 
+/// CDF column types for metadata columns
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CdfCol {
+    ChangeType(String),
+    CommitVersion,
+    CommitTimestamp,
+}
+
 /// Scan uses this to set up what kinds of top-level columns it is scanning. For `Selected` we just
 /// store the name of the column, as that's all that's needed during the actual query. For
 /// `Partition` we store an index into the logical schema for this query since later we need the
 /// data type as well to materialize the partition column.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub(crate) enum ColumnType {
     // A column, selected from the data, as is
     Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
+    // CDF-specific metadata column - may exist in physical data (CDC files) or be generated (Add/Remove files)
+    Cdf(CdfCol, usize),
 }
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
@@ -357,10 +367,17 @@ pub(crate) enum FieldTransformSpec {
     // they should not appear in the query's output.
     #[allow(unused)]
     StaticDrop { field_name: String },
-    /// Inserts a partition column after the named input column. The partition column is identified
-    /// by its field index in the logical table schema (the column is not present in the physical
-    /// read schema). Its value varies from file to file and is obtained from file metadata.
+    /// Inserts a partition column after the named input column.
+    /// Partition columns are identified by field index, with values from file metadata.
+    /// These columns are not present in physical data and must be generated per file.
     PartitionColumn {
+        field_index: usize,
+        insert_after: Option<String>,
+    },
+    /// Inserts a CDF-specific metadata column after the named input column.
+    /// May exist in physical data (CDC files) or be generated (Add/Remove files).
+    Cdf {
+        col_type: CdfCol,
         field_index: usize,
         insert_after: Option<String>,
     },
@@ -481,7 +498,7 @@ impl Scan {
     /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
     /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
     /// from input to output unchanged and in the same relative order.
-    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
+    pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
         let mut transform_spec = TransformSpec::new();
         let mut last_physical_field: Option<&str> = None;
 
@@ -496,6 +513,16 @@ impl Scan {
                         insert_after: last_physical_field.map(String::from),
                         field_index: *logical_idx,
                     });
+                }
+                ColumnType::Cdf(col_type, logical_idx) => {
+                    transform_spec.push(FieldTransformSpec::Cdf {
+                        col_type: col_type.clone(),
+                        insert_after: last_physical_field.map(String::from),
+                        field_index: *logical_idx,
+                    });
+                    if let CdfCol::ChangeType(physical_name) = col_type {
+                        last_physical_field = Some(physical_name);
+                    }
                 }
             }
         }
@@ -852,6 +879,39 @@ pub(crate) fn parse_partition_value(
         ))),
         _ => Ok(Scalar::Null(data_type.clone())),
     }
+}
+
+/// Parse partition values for the given transform spec and convert them to scalars.
+/// This is the core partition parsing function used by both regular scans and CDF scans.
+pub(crate) fn parse_partition_values_to_scalars(
+    logical_schema: &StructType,
+    transform_spec: &[FieldTransformSpec],
+    partition_values: &HashMap<String, String>,
+) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
+    let mut result = HashMap::new();
+
+    // Process all partition columns in the transform spec
+    for field_transform in transform_spec {
+        let field_index = match field_transform {
+            FieldTransformSpec::PartitionColumn { field_index, .. } => *field_index,
+            _ => continue,
+        };
+
+        let field = logical_schema.fields.get_index(field_index);
+        let Some((_, field)) = field else {
+            return Err(Error::InternalError(format!(
+                "out of bounds field index {field_index}"
+            )));
+        };
+        let physical_name = field.physical_name();
+
+        // Convert string partition value to scalar
+        let partition_value =
+            parse_partition_value(partition_values.get(physical_name), field.data_type())?;
+        result.insert(field_index, (field.name().to_string(), partition_value));
+    }
+
+    Ok(result)
 }
 
 /// All the state needed to process a scan.
