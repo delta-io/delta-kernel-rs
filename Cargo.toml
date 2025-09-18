@@ -7,7 +7,8 @@ members = [
     "kernel/examples/*",
     "test-utils",
     "feature-tests",
-    "uc-client", # WIP: this is an experimental UC client for catalog-managed table work
+    "uc-client",  # WIP: this is an experimental UC client for catalog-managed table work
+    "uc-catalog", # WIP: this is an experimental UC catalog implementation
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
