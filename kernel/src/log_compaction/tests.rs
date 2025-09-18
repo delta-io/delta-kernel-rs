@@ -1,11 +1,10 @@
-use std::sync::Arc;
-
 use super::{should_compact, LogCompactionWriter, COMPACTION_ACTIONS_SCHEMA};
 use crate::action_reconciliation::RetentionCalculator;
 use crate::engine::sync::SyncEngine;
 use crate::snapshot::Snapshot;
+use crate::SnapshotRef;
 
-fn create_mock_snapshot() -> Arc<Snapshot> {
+fn create_mock_snapshot() -> SnapshotRef {
     let path = std::fs::canonicalize(std::path::PathBuf::from(
         "./tests/data/table-with-dv-small/",
     ))
@@ -15,7 +14,7 @@ fn create_mock_snapshot() -> Arc<Snapshot> {
     Snapshot::builder_for(url).build(&engine).unwrap()
 }
 
-fn create_multi_version_snapshot() -> Arc<Snapshot> {
+fn create_multi_version_snapshot() -> SnapshotRef {
     let path =
         std::fs::canonicalize(std::path::PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
@@ -41,6 +40,20 @@ fn test_log_compaction_writer_creation() {
 fn test_invalid_version_range() {
     let start_version = 20;
     let end_version = 10; // Invalid: start > end
+
+    let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
+
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid version range"));
+}
+
+#[test]
+fn test_equal_version_range_invalid() {
+    let start_version = 5;
+    let end_version = 5; // Invalid: start == end (must be start < end)
 
     let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
 
@@ -83,19 +96,9 @@ fn test_writer_debug_impl() {
 }
 
 #[test]
-fn test_equal_version_range() {
-    let snapshot = create_mock_snapshot();
-    let writer = LogCompactionWriter::try_new(snapshot, 5, 5).unwrap();
-
-    let path = writer.compaction_path();
-    let expected_filename = "00000000000000000005.00000000000000000005.compacted.json";
-    assert!(path.to_string().ends_with(expected_filename));
-}
-
-#[test]
 fn test_compaction_data() {
     let snapshot = create_mock_snapshot();
-    let mut writer = LogCompactionWriter::try_new(snapshot, 0, 0).unwrap();
+    let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
     let engine = SyncEngine::new();
 
     let result = writer.compaction_data(&engine);
