@@ -1,6 +1,4 @@
 //! Builder for creating [`Snapshot`] instances.
-use std::sync::Arc;
-
 use crate::log_segment::LogSegment;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
@@ -37,7 +35,7 @@ pub struct SnapshotBuilder {
 }
 
 impl SnapshotBuilder {
-    pub(crate) fn new(table_root: Url) -> Self {
+    pub(crate) fn new_for(table_root: Url) -> Self {
         Self {
             table_root: Some(table_root),
             existing_snapshot: None,
@@ -45,7 +43,7 @@ impl SnapshotBuilder {
         }
     }
 
-    pub(crate) fn new_from(existing_snapshot: Arc<Snapshot>) -> Self {
+    pub(crate) fn new_from(existing_snapshot: SnapshotRef) -> Self {
         Self {
             table_root: None,
             existing_snapshot: Some(existing_snapshot),
@@ -67,7 +65,7 @@ impl SnapshotBuilder {
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<Arc<Snapshot>> {
+    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
         if let Some(table_root) = self.table_root {
             let log_segment = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
@@ -185,10 +183,10 @@ mod tests {
         let engine = engine.as_ref();
         create_table(&store, &table_root)?;
 
-        let snapshot = SnapshotBuilder::new(table_root.clone()).build(engine)?;
+        let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
         assert_eq!(snapshot.version(), 1);
 
-        let snapshot = SnapshotBuilder::new(table_root.clone())
+        let snapshot = SnapshotBuilder::new_for(table_root.clone())
             .at_version(0)
             .build(engine)?;
         assert_eq!(snapshot.version(), 0);
