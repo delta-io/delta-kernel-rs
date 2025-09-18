@@ -6,8 +6,8 @@ use itertools::Itertools;
 
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, NullBufferBuilder, RecordBatch, StringArray,
-    StructArray,
+    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
+    NullBufferBuilder, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
@@ -20,6 +20,7 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
@@ -29,7 +30,7 @@ use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
     Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp,
+    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, StructType};
 
@@ -210,6 +211,7 @@ pub fn evaluate_expression(
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
+    use VariadicExpressionOp::*;
     match (expression, result_type) {
         (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
         (Column(name), _) => extract_column(batch, name),
@@ -254,6 +256,19 @@ pub fn evaluate_expression(
             };
 
             Ok(eval(&left_arr, &right_arr)?)
+        }
+        (
+            Variadic(VariadicExpression {
+                op: Coalesce,
+                exprs,
+            }),
+            result_type,
+        ) => {
+            let arrays: Vec<ArrayRef> = exprs
+                .iter()
+                .map(|expr| evaluate_expression(expr, batch, None))
+                .try_collect()?;
+            Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -477,15 +492,97 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
     }
 }
 
+/// Coalesce multiple arrays into one by selecting the first non-null value from each row.
+///
+/// This function implements SQL COALESCE semantics: for each row, it iterates through
+/// the input arrays from left to right and returns the first non-null value found. If all values
+/// are null for a given row, the result will be null for that row.
+///
+/// # Parameters
+/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the same data type.
+/// - `result_type`: Optional expected result type. If provided, must match the arrays' data type.
+///
+/// # Returns
+/// An `ArrayRef` containing the coalesced values with the same number of rows as the input arrays.
+///
+/// # Errors
+/// This function returns an `ArrowError` in the following cases:
+/// - **Empty input**: The default engine currently does not support empty COALESCE statements.
+/// - **Mismatched row counts**: Not all arrays have the same number of rows.
+/// - **Mismatched data types**: Not all arrays have exactly the same data type.
+/// - **Invalid result type**: If `result_type` is provided but doesn't match the arrays' data type.
+pub fn coalesce_arrays(
+    arrays: &[ArrayRef],
+    result_type: Option<&DataType>,
+) -> Result<ArrayRef, ArrowError> {
+    let Some((first, rest)) = arrays.split_first() else {
+        return Err(ArrowError::InvalidArgumentError(
+            "The default engine currently does not support empty COALESCE statements".into(),
+        ));
+    };
+
+    // Validate against the expected output type, if provided
+    if let Some(result_type) = result_type {
+        let result_type = result_type.try_into_arrow()?;
+        if first.data_type() != &result_type {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Requested result type {result_type:?} does not match arrays' data type {:?}",
+                first.data_type()
+            )));
+        }
+    }
+
+    // Early exit for single array case
+    if rest.is_empty() {
+        return Ok(first.clone());
+    }
+
+    // Verify all arrays have the same length and data type
+    for (i, arr) in rest.iter().enumerate() {
+        if arr.len() != first.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Array at index {} has length {}, expected {}",
+                i + 1,
+                arr.len(),
+                first.len()
+            )));
+        }
+        if arr.data_type() != first.data_type() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Array at index {} has type {:?}, but expected {:?}",
+                i + 1,
+                arr.data_type(),
+                first.data_type()
+            )));
+        }
+    }
+
+    // Collect ArrayData for MutableArrayData
+    let array_data: Vec<ArrayData> = arrays.iter().map(|arr| arr.to_data()).collect();
+
+    // Build result
+    let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, first.len());
+    for row in 0..first.len() {
+        // Find first non-null value for this row
+        match arrays.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
+            Some((array_idx, _)) => mutable.extend(array_idx, row, row + 1),
+            None => mutable.extend_nulls(1),
+        }
+    }
+
+    Ok(make_array(mutable.freeze()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int32Array, StructArray};
+    use crate::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{column_expr_ref, Expression as Expr, Transform};
     use crate::schema::{DataType, StructField, StructType};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -804,5 +901,118 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Data type is required"));
+    }
+
+    #[test]
+    fn test_coalesce_arrays_same_type() {
+        // Test with Int32 arrays
+        let arr1 = Int32Array::from(vec![Some(1), None, Some(3), None, None, Some(8), None]);
+        let arr2 = Int32Array::from(vec![None, Some(2), Some(4), None, Some(6), None, None]);
+        let arr3 = Int32Array::from(vec![None, None, None, Some(5), Some(7), Some(9), None]);
+
+        let result =
+            coalesce_arrays(&[Arc::new(arr1), Arc::new(arr2), Arc::new(arr3)], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result_array.len(), 7);
+        assert_eq!(result_array.value(0), 1); // From arr1
+        assert_eq!(result_array.value(1), 2); // From arr2
+        assert_eq!(result_array.value(2), 3); // From arr1
+        assert_eq!(result_array.value(3), 5); // From arr3
+        assert_eq!(result_array.value(4), 6); // From arr2
+        assert_eq!(result_array.value(5), 8); // From arr1
+        assert!(result_array.is_null(6));
+
+        // Test with String arrays
+        let str_arr1 = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
+        let str_arr2 = Arc::new(StringArray::from(vec![None, Some("b"), None]));
+
+        let str_result = coalesce_arrays(&[str_arr1, str_arr2], None).unwrap();
+        let str_result_array = str_result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(str_result_array.len(), 3);
+        assert_eq!(str_result_array.value(0), "a"); // From str_arr1
+        assert_eq!(str_result_array.value(1), "b"); // From str_arr2
+        assert_eq!(str_result_array.value(2), "c"); // From str_arr1
+    }
+
+    #[test]
+    fn test_coalesce_arrays_all_nulls() {
+        let arr1 = Arc::new(Int32Array::from(vec![None, None, None]));
+        let arr2 = Arc::new(Int32Array::from(vec![None, None, None]));
+
+        let result = coalesce_arrays(&[arr1, arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result_array.len(), 3);
+        assert!(result_array.is_null(0));
+        assert!(result_array.is_null(1));
+        assert!(result_array.is_null(2));
+    }
+
+    #[test]
+    fn test_coalesce_arrays_single_array() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let result = coalesce_arrays(std::slice::from_ref(&arr), None).unwrap();
+
+        // Should return the same array
+        assert_eq!(result.as_ref(), arr.as_ref());
+    }
+
+    #[test]
+    fn test_coalesce_arrays_type_mismatch_error() {
+        // Test Int32 vs Int64 - should fail
+        let int32_arr = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let int64_arr = Arc::new(Int64Array::from(vec![None, Some(2)]));
+
+        let result = coalesce_arrays(&[int32_arr, int64_arr], None);
+        assert_result_error_with_message(
+            result,
+            "Array at index 1 has type Int64, but expected Int32",
+        );
+
+        // Test Int32 vs String - should fail
+        let int_arr = Arc::new(Int32Array::from(vec![Some(1)]));
+        let str_arr = Arc::new(StringArray::from(vec![Some("hello")]));
+
+        let result2 = coalesce_arrays(&[int_arr, str_arr], None);
+        assert_result_error_with_message(
+            result2,
+            "Array at index 1 has type Utf8, but expected Int32",
+        );
+    }
+
+    #[test]
+    fn test_coalesce_arrays_length_mismatch_error() {
+        // Test arrays with different lengths - should fail
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), Some(2)]));
+        let arr2 = Arc::new(Int32Array::from(vec![Some(3), Some(4), Some(5)]));
+
+        let result = coalesce_arrays(&[arr1, arr2], None);
+        assert_result_error_with_message(result, "Array at index 1 has length 3, expected 2");
+    }
+
+    #[test]
+    fn test_coalesce_arrays_empty_input_error() {
+        // Test with empty arrays slice - should fail
+        let result = coalesce_arrays(&[], None);
+        assert_result_error_with_message(result, "empty COALESCE statements");
+    }
+
+    #[test]
+    fn test_coalesce_arrays_result_type_validation() {
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let arr2 = Arc::new(Int32Array::from(vec![None, Some(2)]));
+
+        // Test with matching result type - should succeed
+        let result = coalesce_arrays(&[arr1.clone(), arr2.clone()], Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Test with mismatched result type - should fail
+        let result2 = coalesce_arrays(&[arr1, arr2], Some(&DataType::STRING));
+        assert_result_error_with_message(
+            result2,
+            "Requested result type Utf8 does not match arrays' data type Int32",
+        );
     }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
     OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression,
-    UnaryPredicate,
+    UnaryPredicate, VariadicExpression,
 };
 use crate::utils::CowExt as _;
 
@@ -118,6 +118,15 @@ pub trait ExpressionTransform<'a> {
         self.recurse_into_pred_binary(pred)
     }
 
+    /// Called for each [`VariadicExpression`] encountered during the traversal. Implementations can
+    /// call [`Self::recurse_into_expr_variadic`] if they wish to recursively transform the children.
+    fn transform_expr_variadic(
+        &mut self,
+        expr: &'a VariadicExpression,
+    ) -> Option<Cow<'a, VariadicExpression>> {
+        self.recurse_into_expr_variadic(expr)
+    }
+
     /// Called for each [`JunctionPredicate`] encountered during the traversal. Implementations can
     /// call [`Self::recurse_into_pred_junction`] if they wish to recursively transform the children.
     fn transform_pred_junction(
@@ -167,6 +176,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Binary(b) => self
                 .transform_expr_binary(b)?
                 .map_owned_or_else(expr, Expression::Binary),
+            Expression::Variadic(v) => self
+                .transform_expr_variadic(v)?
+                .map_owned_or_else(expr, Expression::Variadic),
             Expression::Opaque(o) => self
                 .transform_expr_opaque(o)?
                 .map_owned_or_else(expr, Expression::Opaque),
@@ -287,6 +299,17 @@ pub trait ExpressionTransform<'a> {
         let right = self.transform_expr(&b.right)?;
         let f = |(left, right)| BinaryExpression::new(b.op, left, right);
         Some((left, right).map_owned_or_else(b, f))
+    }
+
+    /// Recursively transforms a variadic expression's children. Returns `None` if all children were
+    /// removed, `Some(Cow::Owned)` if at least one child was changed or removed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_variadic(
+        &mut self,
+        v: &'a VariadicExpression,
+    ) -> Option<Cow<'a, VariadicExpression>> {
+        let nested_result = recurse_into_children(&v.exprs, |e| self.transform_expr(e))?;
+        Some(nested_result.map_owned_or_else(v, |exprs| VariadicExpression::new(v.op, exprs)))
     }
 
     /// Recursively transforms a junction predicate's children. Returns `None` if all children were
@@ -493,6 +516,7 @@ impl<'a> ExpressionTransform<'a> for ExpressionDepthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
         column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
         Predicate as Pred, ScalarExpressionEvaluator,
@@ -553,6 +577,231 @@ mod tests {
         }
     }
 
+    struct NoopTransform;
+    impl ExpressionTransform<'_> for NoopTransform {}
+
+    #[test]
+    fn test_transform_expr_variadic_noop() {
+        // Test default no-op behavior - should return Cow::Borrowed
+        let variadic_expr = VariadicExpression::new(
+            Coalesce,
+            vec![Expr::literal(1), column_expr!("x"), Expr::literal("test")],
+        );
+
+        let mut transform = NoopTransform;
+        let result = transform.transform_expr_variadic(&variadic_expr);
+
+        assert!(matches!(result, Some(Cow::Borrowed(_))));
+        if let Some(Cow::Borrowed(result_expr)) = result {
+            assert_eq!(result_expr, &variadic_expr);
+        }
+    }
+
+    #[test]
+    fn test_transform_expr_variadic_empty_input() {
+        // Test edge case with empty children list
+        let variadic_expr = VariadicExpression::new(Coalesce, Vec::<Expr>::new());
+
+        let mut transform = NoopTransform;
+        let result = transform.transform_expr_variadic(&variadic_expr);
+
+        // Empty children list with no-op transform returns None because new_children.is_empty()
+        // This is the behavior of recurse_into_children when starting with empty slice
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_transform_expr_variadic_child_transformation() {
+        // Test transformation of child expressions - should return Cow::Owned
+        struct ColumnReplacer;
+        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
+            fn transform_expr_column(
+                &mut self,
+                name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                if name.len() == 1 && name[0] == "old_col" {
+                    Some(Cow::Owned(ColumnName::new(["new_col"])))
+                } else {
+                    Some(Cow::Borrowed(name))
+                }
+            }
+        }
+
+        let variadic_expr = VariadicExpression::new(
+            Coalesce,
+            vec![
+                Expr::literal(1),
+                column_expr!("old_col"),
+                column_expr!("unchanged_col"),
+                Expr::literal("test"),
+            ],
+        );
+
+        let mut transform = ColumnReplacer;
+        let result = transform.transform_expr_variadic(&variadic_expr);
+
+        assert!(matches!(result, Some(Cow::Owned(_))));
+        if let Some(Cow::Owned(result_expr)) = result {
+            assert_eq!(result_expr.op, Coalesce);
+            assert_eq!(result_expr.exprs.len(), 4);
+
+            // Check that the column was replaced
+            if let Expr::Column(col) = &result_expr.exprs[1] {
+                assert_eq!(col.len(), 1);
+                assert_eq!(col[0], "new_col");
+            } else {
+                panic!("Expected column expression");
+            }
+
+            // Check that other expressions are unchanged
+            assert_eq!(result_expr.exprs[0], Expr::literal(1));
+            if let Expr::Column(col) = &result_expr.exprs[2] {
+                assert_eq!(col.len(), 1);
+                assert_eq!(col[0], "unchanged_col");
+            } else {
+                panic!("Expected column expression");
+            }
+            assert_eq!(result_expr.exprs[3], Expr::literal("test"));
+        }
+    }
+
+    #[test]
+    fn test_transform_expr_variadic_child_removal() {
+        // Test removal of child expressions - should return Cow::Owned with fewer children
+        struct LiteralRemover;
+        impl<'a> ExpressionTransform<'a> for LiteralRemover {
+            fn transform_expr_literal(&mut self, _value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
+                None // Remove all literals
+            }
+        }
+
+        let variadic_expr = VariadicExpression::new(
+            Coalesce,
+            vec![
+                Expr::literal(1),
+                column_expr!("x"),
+                Expr::literal("test"),
+                column_expr!("y"),
+            ],
+        );
+
+        let mut transform = LiteralRemover;
+        let result = transform.transform_expr_variadic(&variadic_expr);
+
+        assert!(matches!(result, Some(Cow::Owned(_))));
+        if let Some(Cow::Owned(result_expr)) = result {
+            assert_eq!(result_expr.op, Coalesce);
+            assert_eq!(result_expr.exprs.len(), 2); // Only columns should remain
+
+            // Check that only columns remain
+            if let Expr::Column(col) = &result_expr.exprs[0] {
+                assert_eq!(col.len(), 1);
+                assert_eq!(col[0], "x");
+            } else {
+                panic!("Expected column expression");
+            }
+            if let Expr::Column(col) = &result_expr.exprs[1] {
+                assert_eq!(col.len(), 1);
+                assert_eq!(col[0], "y");
+            } else {
+                panic!("Expected column expression");
+            }
+        }
+    }
+
+    #[test]
+    fn test_transform_expr_variadic_all_children_removed() {
+        // Test edge case where all children are removed - should return None
+        struct RemoveAll;
+        impl<'a> ExpressionTransform<'a> for RemoveAll {
+            fn transform_expr_literal(&mut self, _value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
+                None
+            }
+            fn transform_expr_column(
+                &mut self,
+                _name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                None
+            }
+        }
+
+        let variadic_expr = VariadicExpression::new(
+            Coalesce,
+            vec![Expr::literal(1), column_expr!("x"), Expr::literal("test")],
+        );
+
+        let mut transform = RemoveAll;
+        let result = transform.transform_expr_variadic(&variadic_expr);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_transform_expr_variadic_mixed_transformations() {
+        // Test mixed scenario: some children transformed, some removed, some unchanged
+        struct MixedTransform;
+        impl<'a> ExpressionTransform<'a> for MixedTransform {
+            fn transform_expr_literal(&mut self, value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
+                match value {
+                    Scalar::Integer(1) => None,                 // Remove literal 1
+                    Scalar::String(s) if s == "remove" => None, // Remove "remove" string
+                    Scalar::Integer(n) => Some(Cow::Owned(Scalar::Integer(n * 2))), // Double other integers
+                    _ => Some(Cow::Borrowed(value)), // Keep others unchanged
+                }
+            }
+            fn transform_expr_column(
+                &mut self,
+                name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                if name.len() == 1 && name[0] == "transform_me" {
+                    Some(Cow::Owned(ColumnName::new(["transformed"])))
+                } else {
+                    Some(Cow::Borrowed(name))
+                }
+            }
+        }
+
+        let variadic_expr = VariadicExpression::new(
+            Coalesce,
+            vec![
+                Expr::literal(1),             // Will be removed
+                column_expr!("unchanged"),    // Will stay unchanged
+                Expr::literal(5),             // Will be transformed to 10
+                Expr::literal("remove"),      // Will be removed
+                column_expr!("transform_me"), // Will be transformed
+                Expr::literal("keep"),        // Will stay unchanged
+            ],
+        );
+
+        let mut transform = MixedTransform;
+        let result = transform.transform_expr_variadic(&variadic_expr);
+
+        assert!(matches!(result, Some(Cow::Owned(_))));
+        if let Some(Cow::Owned(result_expr)) = result {
+            assert_eq!(result_expr.op, Coalesce);
+            assert_eq!(result_expr.exprs.len(), 4); // 2 removed, 4 remaining
+
+            // Check remaining expressions in order
+            if let Expr::Column(col) = &result_expr.exprs[0] {
+                assert_eq!(col.len(), 1);
+                assert_eq!(col[0], "unchanged");
+            } else {
+                panic!("Expected unchanged column");
+            }
+
+            assert_eq!(result_expr.exprs[1], Expr::literal(10)); // 5 * 2
+
+            if let Expr::Column(col) = &result_expr.exprs[2] {
+                assert_eq!(col.len(), 1);
+                assert_eq!(col[0], "transformed");
+            } else {
+                panic!("Expected transformed column");
+            }
+
+            assert_eq!(result_expr.exprs[3], Expr::literal("keep"));
+        }
+    }
+
     #[test]
     fn test_depth_checker() {
         let pred = Pred::or_from([
@@ -590,10 +839,8 @@ mod tests {
         ]);
 
         // Verify the default/no-op transform, since we have this nice complex expression handy.
-        struct Noop;
-        impl super::ExpressionTransform<'_> for Noop {}
         assert!(matches!(
-            Noop.transform_pred(&pred),
+            NoopTransform.transform_pred(&pred),
             Some(std::borrow::Cow::Borrowed(_))
         ));
 
