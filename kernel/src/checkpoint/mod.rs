@@ -35,6 +35,7 @@
 //! # use delta_kernel::checkpoint::CheckpointWriter;
 //! # use delta_kernel::Engine;
 //! # use delta_kernel::Snapshot;
+//! # use delta_kernel::SnapshotRef;
 //! # use delta_kernel::DeltaResult;
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
@@ -79,6 +80,7 @@
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
+//! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
@@ -98,7 +100,7 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::snapshot::Snapshot;
+use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
@@ -194,7 +196,7 @@ impl Iterator for CheckpointDataIterator {
 /// See the [module-level documentation](self) for the complete checkpoint workflow
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
-    pub(crate) snapshot: Arc<Snapshot>,
+    pub(crate) snapshot: SnapshotRef,
 
     /// The version of the snapshot being checkpointed.
     /// Note: Although the version is stored as a u64 in the snapshot, it is stored as an i64
@@ -210,7 +212,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: Arc<Snapshot>) -> DeltaResult<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef) -> DeltaResult<Self> {
         let version = i64::try_from(snapshot.version()).map_err(|e| {
             Error::CheckpointWrite(format!(
                 "Failed to convert checkpoint version from u64 {} to i64: {}",
