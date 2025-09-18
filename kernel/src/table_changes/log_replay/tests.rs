@@ -11,9 +11,10 @@ use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_features::ReaderFeature;
-use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+use crate::utils::test_utils::{Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
+use test_utils::assert_result_error_with_message;
 
 use itertools::Itertools;
 use std::collections::HashMap;

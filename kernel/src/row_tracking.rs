@@ -145,7 +145,7 @@ impl RowVisitor for RowTrackingVisitor {
 mod tests {
     use super::*;
     use crate::engine_data::GetData;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use test_utils::assert_result_error_with_message;
 
     /// Mock GetData implementation for testing
     struct MockGetData {

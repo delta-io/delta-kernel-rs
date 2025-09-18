@@ -936,11 +936,10 @@ mod tests {
         },
         engine::{arrow_data::ArrowEngineData, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
-        utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
-
+    use test_utils::assert_result_error_with_message;
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);
 

@@ -427,6 +427,7 @@ pub fn set_json_value(
     Ok(())
 }
 
+// TODO: allow tests to pass in context (issue#1133)
 pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
     match res {
         Ok(_) => panic!("Expected error, but got Ok result"),

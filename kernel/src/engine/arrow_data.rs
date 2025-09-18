@@ -353,8 +353,9 @@ mod tests {
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
     use crate::table_features::{ReaderFeature, WriterFeature};
-    use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use crate::utils::test_utils::string_array_to_engine_data;
     use crate::{DeltaResult, Engine as _, EngineData as _};
+    use test_utils::assert_result_error_with_message;
 
     use super::{extract_record_batch, ArrowEngineData};
 

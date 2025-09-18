@@ -25,11 +25,12 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
 };
-use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
+use crate::utils::test_utils::{assert_batch_matches, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
 };
+use test_utils::assert_result_error_with_message;
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
 use super::*;

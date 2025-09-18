@@ -424,7 +424,7 @@ mod tests {
     use url::Url;
 
     use crate::utils::current_time_ms;
-    use crate::utils::test_utils::assert_result_error_with_message;
+    use test_utils::assert_result_error_with_message;
 
     use super::*;
 

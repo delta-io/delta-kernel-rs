@@ -419,8 +419,8 @@ mod test {
     use crate::actions::{Metadata, Protocol};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::table_properties::TableProperties;
-    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
+    use test_utils::assert_result_error_with_message;
 
     use super::TableConfiguration;
 
