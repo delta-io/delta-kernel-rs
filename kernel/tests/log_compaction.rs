@@ -25,10 +25,10 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let _ = tracing_subscriber::fmt::try_init();
 
     // Create a simple table schema: one int column named 'id'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "id",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     // Setup engine and storage - this creates a proper temporary table
     let (store, engine, table_location) = engine_store_setup("test_compaction_table", None);
