@@ -92,7 +92,7 @@ mod tests;
 /// Schema for extracting relevant actions from log files for compaction.
 /// CommitInfo is excluded as it's not needed in compaction files.
 static COMPACTION_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([
+    Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),

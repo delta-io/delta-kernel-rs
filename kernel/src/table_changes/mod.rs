@@ -188,13 +188,13 @@ impl TableChanges {
             )));
         }
 
-        let schema = StructType::new(
+        let schema = StructType::try_new(
             end_snapshot
                 .schema()
                 .fields()
                 .cloned()
                 .chain(CDF_FIELDS.clone()),
-        );
+        )?;
 
         Ok(TableChanges {
             table_root,
