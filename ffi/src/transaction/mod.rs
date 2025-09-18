@@ -314,7 +314,11 @@ mod tests {
             let file_info = write_parquet_file(table_path_str, "my_file.parquet", &batch)?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, engine.shallow_copy())
+                get_engine_data(
+                    file_info.array,
+                    &file_info.schema,
+                    crate::ffi_test_utils::allocate_err,
+                )
             });
 
             unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };

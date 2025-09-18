@@ -14,6 +14,7 @@ use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
 use std::ffi::c_void;
 
+use crate::error::AllocateErrorFn;
 use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
@@ -113,9 +114,9 @@ fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowF
 pub unsafe extern "C" fn get_engine_data(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-    engine: Handle<SharedExternEngine>,
+    allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    get_engine_data_impl(array, schema).into_extern_result(&engine.as_ref())
+    get_engine_data_impl(array, schema).into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "default-engine-base")]
