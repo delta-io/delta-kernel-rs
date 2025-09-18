@@ -69,8 +69,8 @@ pub(crate) enum ReaderFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
-    #[strum(serialize = "metadataTree-preview")]
-    #[serde(rename = "metadataTree-preview")]
+    #[strum(serialize = "metadataTree-experimental")]
+    #[serde(rename = "metadataTree-experimental")]
     // Allow reading from the metadata tree format.
     MetadataTreeExperimental,
     #[serde(untagged)]
