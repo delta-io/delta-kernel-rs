@@ -25,30 +25,31 @@ url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.14.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.15.2" }
 
 [build-dependencies]
-cbindgen = "0.28"
-libc = "0.2.171"
+cbindgen = "0.29"
+libc = "0.2.175"
 
 [dev-dependencies]
-rand = "0.8.5"
+rand = "0.9.2"
 serde = "1.0.219"
-serde_json = "1.0.140"
+serde_json = "1.0.142"
 test_utils = { path = "../test-utils" }
-tokio = { version = "1.44" }
+tokio = { version = "1.47" }
 trybuild = "1.0"
 tempfile = "3.20.0"
 itertools = "0.14.0"
+object_store = "0.12.3"
 
 [features]
-default = ["default-engine"]
-default-engine = ["delta_kernel/default-engine", "default-engine-base"]
+default = ["default-engine-rustls"]
+default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
 
-# This is an 'internal' feature flag which has all the shared bits from default-engine and
+# This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
-# default-engine or default-engine-rustls, so default-engine-base will not work by itself
+# default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
 default-engine-base = ["delta_kernel/default-engine-base", "delta_kernel/arrow"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]

@@ -7,12 +7,14 @@ members = [
     "kernel/examples/*",
     "test-utils",
     "feature-tests",
+    "uc-client", # WIP: this is an experimental UC client for catalog-managed table work
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
 # - read-table-changes
 # - read-table-multi-threaded
 # - read-table-single-threaded
+# - write-table
 resolver = "2"
 
 [workspace.package]
@@ -22,5 +24,5 @@ keywords = ["deltalake", "delta", "datalake"]
 license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
-rust-version = "1.82"
-version = "0.14.0"
+rust-version = "1.84"
+version = "0.15.2"

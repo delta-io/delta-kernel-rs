@@ -2,7 +2,6 @@
 //! ordered list of leaf values (scalars) into an [`Expression`] with a literal value for each leaf.
 
 use std::borrow::Cow;
-use std::mem;
 use std::ops::Deref as _;
 
 use tracing::debug;
@@ -71,8 +70,11 @@ impl<'a, I: Iterator<Item = &'a Scalar>> LiteralExpressionTransform<'a, I> {
     }
 
     fn set_error(&mut self, error: Error) {
-        if let Err(e) = mem::replace(&mut self.error, Err(error)) {
-            debug!("Overwriting error that was already set: {e}");
+        // Only set when the error not yet set
+        if let Err(ref existing_error) = self.error {
+            debug!("Trying to overwrite an existing error: {existing_error:?} with {error:?}");
+        } else {
+            self.error = Err(error);
         }
     }
 }
@@ -131,14 +133,14 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         self.recurse_into_struct(struct_type)?;
         let field_exprs = self.stack.split_off(mark);
 
-        if field_exprs.len() != struct_type.fields_len() {
+        let fields = struct_type.fields();
+        if field_exprs.len() != fields.len() {
             self.set_error(Error::InsufficientScalars);
             return None;
         }
 
         let mut found_non_nullable_null = false;
         let mut all_null = true;
-        let fields = struct_type.fields();
         for (field, expr) in fields.zip(&field_exprs) {
             if !matches!(expr, Expression::Literal(Scalar::Null(_))) {
                 all_null = false;
@@ -226,14 +228,14 @@ mod tests {
     fn test_create_one_top_level_null() {
         let values = &[Scalar::Null(DeltaDataTypes::INTEGER)];
 
-        let schema = Arc::new(StructType::new([StructField::not_null(
+        let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
         let expected = Expr::null_literal(schema.clone().into());
         assert_single_row_transform(values, schema, Ok(expected));
 
-        let schema = Arc::new(StructType::new([StructField::nullable(
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
@@ -244,7 +246,7 @@ mod tests {
     #[test]
     fn test_create_one_missing_values() {
         let values = &[1.into()];
-        let schema = Arc::new(StructType::new([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("col_1", DeltaDataTypes::INTEGER),
             StructField::nullable("col_2", DeltaDataTypes::INTEGER),
         ]));
@@ -254,7 +256,7 @@ mod tests {
     #[test]
     fn test_create_one_extra_values() {
         let values = &[1.into(), 2.into(), 3.into()];
-        let schema = Arc::new(StructType::new([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("col_1", DeltaDataTypes::INTEGER),
             StructField::nullable("col_2", DeltaDataTypes::INTEGER),
         ]));
@@ -264,7 +266,7 @@ mod tests {
     #[test]
     fn test_create_one_incorrect_schema() {
         let values = &["a".into()];
-        let schema = Arc::new(StructType::new([StructField::nullable(
+        let schema = Arc::new(StructType::new_unchecked([StructField::nullable(
             "col_1",
             DeltaDataTypes::INTEGER,
         )]));
@@ -275,17 +277,17 @@ mod tests {
     #[test]
     fn test_many_structs() {
         let values: &[Scalar] = &[1.into(), 2.into(), 3.into(), 4.into()];
-        let schema = Arc::new(StructType::new([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable(
                 "x",
-                DeltaDataTypes::struct_type([
+                DeltaDataTypes::struct_type_unchecked([
                     StructField::not_null("a", DeltaDataTypes::INTEGER),
                     StructField::nullable("b", DeltaDataTypes::INTEGER),
                 ]),
             ),
             StructField::nullable(
                 "y",
-                DeltaDataTypes::struct_type([
+                DeltaDataTypes::struct_type_unchecked([
                     StructField::not_null("c", DeltaDataTypes::INTEGER),
                     StructField::nullable("d", DeltaDataTypes::INTEGER),
                 ]),
@@ -308,7 +310,7 @@ mod tests {
             Scalar::Map(map_data.clone()),
             Scalar::Array(array_data.clone()),
         ];
-        let schema = Arc::new(StructType::new([
+        let schema = Arc::new(StructType::new_unchecked([
             StructField::nullable("map", DeltaDataTypes::Map(Box::new(map_type))),
             StructField::nullable("array", DeltaDataTypes::Array(Box::new(array_type))),
         ]));
@@ -349,10 +351,10 @@ mod tests {
         let field_b = StructField::new("b", DeltaDataTypes::INTEGER, test_schema.b_nullable);
         let field_x = StructField::new(
             "x",
-            StructType::new([field_a.clone(), field_b.clone()]),
+            StructType::new_unchecked([field_a.clone(), field_b.clone()]),
             test_schema.x_nullable,
         );
-        let schema = Arc::new(StructType::new([field_x.clone()]));
+        let schema = Arc::new(StructType::new_unchecked([field_x.clone()]));
 
         let expected_result = match expected {
             Expected::Noop => {

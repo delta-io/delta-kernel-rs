@@ -33,6 +33,10 @@ struct Cli {
     /// how many threads to read with (1 - 2048)
     #[arg(short, long, default_value_t = 2, value_parser = 1..=2048)]
     thread_count: i64,
+
+    /// run metadata-only
+    #[arg(short, long, default_value_t = false)]
+    metadata: bool,
 }
 
 fn main() -> ExitCode {
@@ -95,7 +99,7 @@ fn try_main() -> DeltaResult<()> {
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::try_new(url, &engine, None)?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
@@ -106,6 +110,14 @@ fn try_main() -> DeltaResult<()> {
     // this data directly, and can just call [`visit_scan_files`] to get pre-parsed data back from
     // the kernel.
     let scan_metadata = scan.scan_metadata(&engine)?;
+
+    if cli.metadata {
+        let (scan_metadata_batches, scan_metadata_rows) = scan_metadata
+            .map(|res| res.unwrap().scan_files.data.len())
+            .fold((0, 0), |(batches, rows), len| (batches + 1, rows + len));
+        println!("Scan metadata: {scan_metadata_batches} chunks, {scan_metadata_rows} files",);
+        return Ok(());
+    }
 
     // create the channels we'll use. record_batch_[t/r]x are used for the threads to send back the
     // processed RecordBatches to themain thread
@@ -215,7 +227,7 @@ fn do_work(
                 read_result,
                 &scan_state.physical_schema,
                 &scan_state.logical_schema,
-                &scan_file.transform,
+                scan_file.transform.clone(),
             )
             .unwrap();
 

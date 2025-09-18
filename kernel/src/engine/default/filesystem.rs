@@ -4,10 +4,9 @@ use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
 use itertools::Itertools;
+use object_store::path::Path;
+use object_store::{DynObjectStore, ObjectStore};
 use url::Url;
-
-use crate::object_store::path::Path;
-use crate::object_store::{DynObjectStore, ObjectStore};
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
@@ -92,14 +91,11 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     Ok(meta) => {
                         let mut location = url.clone();
                         location.set_path(&format!("/{}", meta.location.as_ref()));
-                        let meta_size = meta.size;
-                        #[cfg(not(feature = "arrow-55"))]
-                        let meta_size = meta_size.try_into().expect("convert file size to u64");
                         sender
                             .send(Ok(FileMeta {
                                 location,
                                 last_modified: meta.last_modified.timestamp_millis(),
-                                size: meta_size,
+                                size: meta.size,
                             }))
                             .ok();
                     }
@@ -160,14 +156,6 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                             // have to annotate type here or rustc can't figure it out
                             Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
                         } else if let Some(rng) = range {
-                            #[cfg(not(feature = "arrow-55"))]
-                            let rng = (rng
-                                .start
-                                .try_into()
-                                .map_err(|_| Error::generic("unable to convert usize to u64"))?)
-                                ..(rng.end.try_into().map_err(|_| {
-                                    Error::generic("unable to convert usize to u64")
-                                })?);
                             Ok(store.get_range(&path, rng).await?)
                         } else {
                             let result = store.get(&path).await?;
@@ -192,18 +180,18 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::{local::LocalFileSystem, ObjectStore};
+    use itertools::Itertools;
+    use object_store::memory::InMemory;
+    use object_store::{local::LocalFileSystem, ObjectStore};
 
     use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
+    use crate::utils::current_time_duration;
     use crate::Engine as _;
-
-    use itertools::Itertools;
 
     use super::*;
 
@@ -254,7 +242,7 @@ mod tests {
     async fn test_file_meta_is_correct() {
         let store = Arc::new(InMemory::new());
 
-        let begin_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let begin_time = current_time_duration().unwrap();
 
         let data = Bytes::from("kernel-data");
         let name = delta_path_for_version(1, "json");

@@ -9,11 +9,10 @@ clap = { version = "4.5", features = ["derive"] }
 common = { path = "../common" }
 delta_kernel = { path = "../../../kernel", features = [
   "arrow",
-  "default-engine",
+  "default-engine-rustls",
   "internal-api",
 ] }
 env_logger = "0.11.8"
-url = "2"
 
 # for cargo-release
 [package.metadata.release]

@@ -13,11 +13,11 @@ use crate::engine::default::DefaultEngine;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::log_segment::tests::{add_checkpoint_to_store, create_log_path};
 use crate::log_segment::{ListedLogFiles, LogPathFileType, LogSegment, ParsedLogPath};
-use crate::object_store::{memory::InMemory, path::Path, ObjectStore};
 use crate::table_features::{ReaderFeature, WriterFeature};
 use crate::utils::test_utils::{string_array_to_engine_data, Action};
 use crate::{DeltaResult, Error, FileMeta, JsonHandler};
 
+use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json;
 use url::Url;
 use uuid::Uuid;

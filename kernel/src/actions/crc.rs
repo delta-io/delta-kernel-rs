@@ -170,9 +170,6 @@ mod tests {
 
     use crate::arrow::array::StringArray;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore;
 
     use crate::actions::{Format, Metadata, Protocol};
     use crate::engine::default::DefaultEngine;
@@ -183,12 +180,16 @@ mod tests {
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::Engine;
 
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
+
     use url::Url;
 
     #[test]
     fn test_file_size_histogram_schema() {
         let schema = FileSizeHistogram::to_schema();
-        let expected = StructType::new([
+        let expected = StructType::new_unchecked([
             StructField::not_null("sortedBinBoundaries", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("fileCounts", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("totalBytes", ArrayType::new(DataType::LONG, false)),
@@ -199,7 +200,7 @@ mod tests {
     #[test]
     fn test_deleted_record_counts_histogram_schema() {
         let schema = DeletedRecordCountsHistogram::to_schema();
-        let expected = StructType::new([StructField::not_null(
+        let expected = StructType::new_unchecked([StructField::not_null(
             "deletedRecordCounts",
             ArrayType::new(DataType::LONG, false),
         )]);
@@ -209,7 +210,7 @@ mod tests {
     #[test]
     fn test_crc_schema() {
         let schema = Crc::to_schema();
-        let expected = StructType::new([
+        let expected = StructType::new_unchecked([
             StructField::nullable("txnId", DataType::STRING),
             StructField::not_null("tableSizeBytes", DataType::LONG),
             StructField::not_null("numFiles", DataType::LONG),

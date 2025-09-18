@@ -2,58 +2,71 @@ use delta_kernel::{DeltaResult, Error};
 
 use crate::{kernel_string_slice, ExternEngine, KernelStringSlice};
 
+// We explicitly assign integer values to the error codes here because C and Rust are inconsistent
+// about values for "typedefed" features. Rust reserves the numbers for them regardless, so
+// `EngineDataTypeError` will be `3` whether or not `default-engine-base` is on becasue `ArrowError`
+// _always_ is `2`. But in the C header we get:
+
+// #if defined(DEFINE_DEFAULT_ENGINE_BASE)
+// ArrowError,
+// #endif
+
+// and C will _NOT_ count that if `DEFINE_DEFAULT_ENGINE_BASE` isn't defined, so
+// `EngineDataTypeError` will end up as `2`, and everything is confused.  By manually specifying the
+// values we avoid this issue.
+
 #[repr(C)]
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
 pub enum KernelError {
-    UnknownError, // catch-all for unrecognized kernel Error types
-    FFIError,     // errors encountered in the code layer that supports FFI
+    UnknownError = 0, // catch-all for unrecognized kernel Error types
+    FFIError = 1,     // errors encountered in the code layer that supports FFI
     #[cfg(feature = "default-engine-base")]
-    ArrowError,
-    EngineDataTypeError,
-    ExtractError,
-    GenericError,
-    IOErrorError,
+    ArrowError = 2,
+    EngineDataTypeError = 3,
+    ExtractError = 4,
+    GenericError = 5,
+    IOErrorError = 6,
     #[cfg(feature = "default-engine-base")]
-    ParquetError,
+    ParquetError = 7,
     #[cfg(feature = "default-engine-base")]
-    ObjectStoreError,
+    ObjectStoreError = 8,
     #[cfg(feature = "default-engine-base")]
-    ObjectStorePathError,
+    ObjectStorePathError = 9,
     #[cfg(feature = "default-engine-base")]
-    ReqwestError,
-    FileNotFoundError,
-    MissingColumnError,
-    UnexpectedColumnTypeError,
-    MissingDataError,
-    MissingVersionError,
-    DeletionVectorError,
-    InvalidUrlError,
-    MalformedJsonError,
-    MissingMetadataError,
-    MissingProtocolError,
-    InvalidProtocolError,
-    MissingMetadataAndProtocolError,
-    ParseError,
-    JoinFailureError,
-    Utf8Error,
-    ParseIntError,
-    InvalidColumnMappingModeError,
-    InvalidTableLocationError,
-    InvalidDecimalError,
-    InvalidStructDataError,
-    InternalError,
-    InvalidExpression,
-    InvalidLogPath,
-    FileAlreadyExists,
-    UnsupportedError,
-    ParseIntervalError,
-    ChangeDataFeedUnsupported,
-    ChangeDataFeedIncompatibleSchema,
-    InvalidCheckpoint,
-    LiteralExpressionTransformError,
-    CheckpointWriteError,
-    SchemaError,
+    ReqwestError = 10,
+    FileNotFoundError = 11,
+    MissingColumnError = 12,
+    UnexpectedColumnTypeError = 13,
+    MissingDataError = 14,
+    MissingVersionError = 15,
+    DeletionVectorError = 16,
+    InvalidUrlError = 17,
+    MalformedJsonError = 18,
+    MissingMetadataError = 19,
+    MissingProtocolError = 20,
+    InvalidProtocolError = 21,
+    MissingMetadataAndProtocolError = 22,
+    ParseError = 23,
+    JoinFailureError = 24,
+    Utf8Error = 25,
+    ParseIntError = 26,
+    InvalidColumnMappingModeError = 27,
+    InvalidTableLocationError = 28,
+    InvalidDecimalError = 29,
+    InvalidStructDataError = 30,
+    InternalError = 31,
+    InvalidExpression = 32,
+    InvalidLogPath = 33,
+    FileAlreadyExists = 34,
+    UnsupportedError = 35,
+    ParseIntervalError = 36,
+    ChangeDataFeedUnsupported = 37,
+    ChangeDataFeedIncompatibleSchema = 38,
+    InvalidCheckpoint = 39,
+    LiteralExpressionTransformError = 40,
+    CheckpointWriteError = 41,
+    SchemaError = 42,
 }
 
 impl From<Error> for KernelError {

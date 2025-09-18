@@ -28,6 +28,24 @@ StructExpression
           Array
             Short(5)
             Short(0)
+  Transform
+    Column(foo.bar.baz)
+    Prepend
+      String(prepended)
+    Insert(a)
+      String(first)
+      Transform
+        Drop(gone)
+        Replace(stub)
+          String(replaced)
+        Insert(x)
+          Boolean(1)
+        Insert(y)
+          Boolean(0)
+      String(third)
+    Drop(dropme)
+    Replace(replaceme)
+      Integer(42)
   Array
     Short(5)
     Short(0)

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use itertools::Itertools;
 
@@ -42,8 +43,8 @@ pub(crate) fn physical_to_logical_expr(
         .iter()
         .map(|field| match field {
             ColumnType::Partition(field_idx) => {
-                let field = logical_schema.fields.get_index(*field_idx);
-                let Some((_, field)) = field else {
+                let field = logical_schema.field_at_index(*field_idx);
+                let Some(field) = field else {
                     return Err(Error::generic(
                         "logical schema did not contain expected field, can't transform data",
                     ));
@@ -59,6 +60,7 @@ pub(crate) fn physical_to_logical_expr(
                 Ok(generated_column.unwrap_or_else(|| ColumnName::new([field_name]).into()))
             }
         })
+        .map(|expr| expr.map(Arc::new))
         .try_collect()?;
     Ok(Expression::Struct(all_fields))
 }
@@ -71,7 +73,8 @@ pub(crate) fn scan_file_physical_schema(
     if scan_file.scan_type == CdfScanFileType::Cdc {
         let change_type = StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING);
         let fields = physical_schema.fields().cloned().chain(Some(change_type));
-        StructType::new(fields).into()
+        // NOTE: We don't validate the fields again because CHANGE_TYPE_COL_NAME should never be used anywhere else
+        StructType::new_unchecked(fields).into()
     } else {
         physical_schema.clone().into()
     }
@@ -103,7 +106,7 @@ mod tests {
                 commit_version: 42,
                 commit_timestamp: 1234,
             };
-            let logical_schema = StructType::new([
+            let logical_schema = StructType::new_unchecked([
                 StructField::nullable("id", DataType::STRING),
                 StructField::not_null("age", DataType::LONG),
                 StructField::not_null(CHANGE_TYPE_COL_NAME, DataType::STRING),

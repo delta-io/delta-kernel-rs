@@ -4,9 +4,8 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Snapshot};
 
 mod common;
-use common::load_test_data;
 
-use test_utils::DefaultEngineExtension;
+use test_utils::{load_test_data, DefaultEngineExtension};
 
 use itertools::Itertools;
 use test_utils::read_scan;
@@ -16,13 +15,10 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
     let test_path = test_dir.path().join(test_name.as_ref());
 
     let engine = DefaultEngine::new_local();
-    let snapshot = Snapshot::try_from_uri(
-        test_path.to_str().expect("table path to string"),
-        engine.as_ref(),
-        None,
-    )
-    .unwrap();
-    let scan = snapshot.into_scan_builder().build()?;
+    let url =
+        delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string")).unwrap();
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
 
     Ok(batches)

@@ -8,7 +8,7 @@ use delta_kernel::{
     engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
     scan::Scan,
     schema::Schema,
-    DeltaResult, Snapshot,
+    DeltaResult, SnapshotRef,
 };
 
 use url::Url;
@@ -62,7 +62,7 @@ pub fn get_engine(
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed
 /// engine. Parameters of the scan are controlled by the specified `ScanArgs`
-pub fn get_scan(snapshot: Snapshot, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
+pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Scan>> {
     if args.schema_only {
         println!("{:#?}", snapshot.schema());
         return Ok(None);
@@ -81,12 +81,12 @@ pub fn get_scan(snapshot: Snapshot, args: &ScanArgs) -> DeltaResult<Option<Scan>
                         "Table has no such column: {col}"
                     )))
             });
-            Schema::try_new(selected_fields).map(Arc::new)
+            Schema::try_from_results(selected_fields).map(Arc::new)
         })
         .transpose()?;
     Ok(Some(
         snapshot
-            .into_scan_builder()
+            .scan_builder()
             .with_schema_opt(read_schema_opt)
             .build()?,
     ))

@@ -16,17 +16,18 @@ use crate::actions::deletion_vector::{
 use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
-use crate::expressions::{ColumnName, Expression, ExpressionRef, Predicate, PredicateRef, Scalar};
+use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
+use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
-use crate::log_segment::{ListedLogFiles, LogSegment};
+use crate::log_segment::LogSegment;
 use crate::scan::state::{DvInfo, Stats};
 use crate::schema::ToSchema as _;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     StructType,
 };
-use crate::snapshot::Snapshot;
+use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
@@ -47,7 +48,7 @@ static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     schema: Option<SchemaRef>,
     predicate: Option<PredicateRef>,
 }
@@ -63,7 +64,7 @@ impl std::fmt::Debug for ScanBuilder {
 
 impl ScanBuilder {
     /// Create a new [`ScanBuilder`] instance.
-    pub fn new(snapshot: impl Into<Arc<Snapshot>>) -> Self {
+    pub fn new(snapshot: impl Into<SnapshotRef>) -> Self {
         Self {
             snapshot: snapshot.into(),
             schema: None,
@@ -85,6 +86,8 @@ impl ScanBuilder {
 
     /// Optionally provide a [`SchemaRef`] for columns to select from the [`Snapshot`]. See
     /// [`ScanBuilder::with_schema`] for details. If `schema_opt` is `None` this is a no-op.
+    ///
+    /// [`Snapshot`]: crate::Snapshot
     pub fn with_schema_opt(self, schema_opt: Option<SchemaRef>) -> Self {
         match schema_opt {
             Some(schema) => self.with_schema(schema),
@@ -126,7 +129,7 @@ impl ScanBuilder {
         Ok(Scan {
             snapshot: self.snapshot,
             logical_schema,
-            physical_schema: Arc::new(StructType::new(state_info.read_fields)),
+            physical_schema: Arc::new(StructType::try_new(state_info.read_fields)?),
             physical_predicate,
             all_fields: Arc::new(state_info.all_fields),
             have_partition_cols: state_info.have_partition_cols,
@@ -309,15 +312,15 @@ impl ScanResult {
 /// `Partition` we store an index into the logical schema for this query since later we need the
 /// data type as well to materialize the partition column.
 #[derive(PartialEq, Debug)]
-pub enum ColumnType {
+pub(crate) enum ColumnType {
     // A column, selected from the data, as is
     Selected(String),
     // A partition column that needs to be added back in
     Partition(usize),
 }
 
-/// A transform is ultimately a `Struct` expr. This holds the set of expressions that make that struct expr up
-type Transform = Vec<TransformExpr>;
+/// A list of field transforms that describes a transform expression to be created at scan time.
+type TransformSpec = Vec<FieldTransformSpec>;
 
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
@@ -331,10 +334,36 @@ pub fn get_transform_for_row(
 
 /// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
 /// things like partition columns need to filled in. This enum holds an expression that's part of a
-/// `Transform`.
-pub(crate) enum TransformExpr {
-    Static(Expression),
-    Partition(usize),
+/// [`TransformSpec`].
+pub(crate) enum FieldTransformSpec {
+    /// Insert the given expression after the named input column (None = prepend instead)
+    // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
+    // which would usually be expressed as a drop+insert pair of transforms.
+    #[allow(unused)]
+    StaticInsert {
+        insert_after: Option<String>,
+        expr: ExpressionRef,
+    },
+    /// Replace the named input column with an expression
+    // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
+    // to compute non-materialized row ids and row commit versions.
+    #[allow(unused)]
+    StaticReplace {
+        field_name: String,
+        expr: ExpressionRef,
+    },
+    /// Drops the named input column
+    // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
+    // they should not appear in the query's output.
+    #[allow(unused)]
+    StaticDrop { field_name: String },
+    /// Inserts a partition column after the named input column. The partition column is identified
+    /// by its field index in the logical table schema (the column is not present in the physical
+    /// read schema). Its value varies from file to file and is obtained from file metadata.
+    PartitionColumn {
+        field_index: usize,
+        insert_after: Option<String>,
+    },
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
@@ -384,7 +413,7 @@ impl HasSelectionVector for ScanMetadata {
 /// The result of building a scan over a table. This can be used to get the actual data from
 /// scanning the table.
 pub struct Scan {
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     physical_predicate: PhysicalPredicate,
@@ -413,7 +442,9 @@ impl Scan {
     }
 
     /// Get a shared reference to the [`Snapshot`] of this scan.
-    pub fn snapshot(&self) -> &Arc<Snapshot> {
+    ///
+    /// [`Snapshot`]: crate::Snapshot
+    pub fn snapshot(&self) -> &SnapshotRef {
         &self.snapshot
     }
 
@@ -434,7 +465,7 @@ impl Scan {
         &self.physical_schema
     }
 
-    /// Get the predicate [`Expression`] of the scan.
+    /// Get the predicate [`PredicateRef`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
         if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
             Some(predicate.clone())
@@ -443,19 +474,33 @@ impl Scan {
         }
     }
 
-    /// Convert the parts of the transform that can be computed statically into `Expression`s. For
-    /// parts that cannot be computed statically, include enough metadata so lower levels of
-    /// processing can create and fill in an expression.
-    fn get_static_transform(all_fields: &[ColumnType]) -> Transform {
-        all_fields
-            .iter()
-            .map(|field| match field {
-                ColumnType::Selected(col_name) => {
-                    TransformExpr::Static(ColumnName::new([col_name]).into())
+    /// Computes the transform spec for this scan. Static (query-level) transforms can already be
+    /// turned into expressions now, but file-level transforms like partition values can only be
+    /// described now; they are converted to expressions during the scan, using file metadata.
+    ///
+    /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
+    /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
+    /// from input to output unchanged and in the same relative order.
+    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
+        let mut transform_spec = TransformSpec::new();
+        let mut last_physical_field: Option<&str> = None;
+
+        for field in all_fields {
+            match field {
+                ColumnType::Selected(physical_name) => {
+                    // Track physical field for calculating partition value insertion points.
+                    last_physical_field = Some(physical_name);
                 }
-                ColumnType::Partition(idx) => TransformExpr::Partition(*idx),
-            })
-            .collect()
+                ColumnType::Partition(logical_idx) => {
+                    transform_spec.push(FieldTransformSpec::PartitionColumn {
+                        insert_after: last_physical_field.map(String::from),
+                        field_index: *logical_idx,
+                    });
+                }
+            }
+        }
+
+        transform_spec
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
@@ -536,9 +581,9 @@ impl Scan {
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-            DataType::struct_type(vec![StructField::nullable(
+            DataType::struct_type_unchecked(vec![StructField::nullable(
                 "add",
-                DataType::struct_type(vec![
+                DataType::struct_type_unchecked(vec![
                     StructField::not_null("path", DataType::STRING),
                     StructField::not_null("partitionValues", partition_values),
                     StructField::not_null("size", DataType::LONG),
@@ -622,11 +667,12 @@ impl Scan {
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         // Compute the static part of the transformation. This is `None` if no transformation is
-        // needed (currently just means no partition cols AND no column mapping but will be extended
-        // for other transforms as we support them)
+        // needed. We need transforms for:
+        // - Partition columns: Must be injected from partition values
+        // - Column mapping: Physical field names must be mapped to logical field names via output schema
         let static_transform = (self.have_partition_cols
             || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then(|| Arc::new(Scan::get_static_transform(&self.all_fields)));
+            .then(|| Arc::new(Scan::get_transform_spec(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
@@ -736,8 +782,7 @@ impl Scan {
                     None,
                 )?;
 
-                // Arc clones
-                let engine = engine.clone();
+                let engine = engine.clone(); // Arc clone
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
@@ -746,7 +791,7 @@ impl Scan {
                         read_result,
                         self.physical_schema(),
                         self.logical_schema(),
-                        &scan_file.transform,
+                        scan_file.transform.clone(), // Arc clone
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
                     // need to split the dv_mask. what's left in dv_mask covers this result, and rest
@@ -827,7 +872,9 @@ impl StateInfo {
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
         let mut have_partition_cols = false;
-        let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
+        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
+        let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
+
         // Loop over all selected fields and note if they are columns that will be read from the
         // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
         // be filled in by evaluating an expression ([`ColumnType::Partition`])
@@ -836,6 +883,13 @@ impl StateInfo {
             .enumerate()
             .map(|(index, logical_field)| -> DeltaResult<_> {
                 if partition_columns.contains(logical_field.name()) {
+                    if logical_field.is_metadata_column() {
+                        return Err(Error::Schema(format!(
+                            "Metadata column names must not match partition columns: {}",
+                            logical_field.name()
+                        )));
+                    }
+
                     // Store the index into the schema for this field. When we turn it into an
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
@@ -848,10 +902,26 @@ impl StateInfo {
                     debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                     let physical_name = physical_field.name.clone();
                     read_fields.push(physical_field);
+
+                    if !logical_field.is_metadata_column() {
+                        read_field_names.insert(physical_name.clone());
+                    }
+
                     Ok(ColumnType::Selected(physical_name))
                 }
             })
             .try_collect()?;
+
+        // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
+        for metadata_column in logical_schema.metadata_columns() {
+            if read_field_names.contains(metadata_column.name()) {
+                return Err(Error::Schema(format!(
+                    "Metadata column names must not match physical columns: {}",
+                    metadata_column.name()
+                )));
+            }
+        }
+
         Ok(StateInfo {
             all_fields,
             read_fields,
@@ -890,7 +960,7 @@ pub(crate) mod test_utils {
         JsonHandler,
     };
 
-    use super::{state::ScanCallback, Transform};
+    use super::{state::ScanCallback, TransformSpec};
 
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
@@ -977,20 +1047,20 @@ pub(crate) mod test_utils {
     pub(crate) fn run_with_validate_callback<T: Clone>(
         batch: Vec<Box<ArrowEngineData>>,
         logical_schema: Option<SchemaRef>,
-        transform: Option<Arc<Transform>>,
+        transform_spec: Option<Arc<TransformSpec>>,
         expected_sel_vec: &[bool],
         context: T,
         validate_callback: ScanCallback<T>,
     ) {
-        let logical_schema =
-            logical_schema.unwrap_or_else(|| Arc::new(crate::schema::StructType::new(vec![])));
+        let logical_schema = logical_schema
+            .unwrap_or_else(|| Arc::new(crate::schema::StructType::new_unchecked(vec![])));
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             logical_schema,
-            transform,
+            transform_spec,
             None,
         );
         let mut batch_count = 0;
@@ -1048,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_physical_predicate() {
-        let logical_schema = StructType::new(vec![
+        let logical_schema = StructType::new_unchecked(vec![
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1060,7 +1130,7 @@ mod tests {
             )]),
             StructField::nullable(
                 "nested",
-                StructType::new(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("x", DataType::LONG),
                     StructField::nullable("y", DataType::LONG).with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1070,7 +1140,7 @@ mod tests {
             ),
             StructField::nullable(
                 "mapped",
-                StructType::new(vec![StructField::nullable("n", DataType::LONG)
+                StructType::new_unchecked(vec![StructField::nullable("n", DataType::LONG)
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_n",
@@ -1092,18 +1162,22 @@ mod tests {
                 column_pred!("a"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("a").into(),
-                    StructType::new(vec![StructField::nullable("a", DataType::LONG)]).into(),
+                    StructType::new_unchecked(vec![StructField::nullable("a", DataType::LONG)])
+                        .into(),
                 )),
             ),
             (
                 column_pred!("b"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("phys_b").into(),
-                    StructType::new(vec![StructField::nullable("phys_b", DataType::LONG)
-                        .with_metadata([(
-                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                            "phys_b",
-                        )])])
+                    StructType::new_unchecked(vec![StructField::nullable(
+                        "phys_b",
+                        DataType::LONG,
+                    )
+                    .with_metadata([(
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                        "phys_b",
+                    )])])
                     .into(),
                 )),
             ),
@@ -1111,9 +1185,9 @@ mod tests {
                 column_pred!("nested.x"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("nested.x").into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "nested",
-                        StructType::new(vec![StructField::nullable("x", DataType::LONG)]),
+                        StructType::new_unchecked(vec![StructField::nullable("x", DataType::LONG)]),
                     )])
                     .into(),
                 )),
@@ -1122,13 +1196,16 @@ mod tests {
                 column_pred!("nested.y"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("nested.phys_y").into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "nested",
-                        StructType::new(vec![StructField::nullable("phys_y", DataType::LONG)
-                            .with_metadata([(
-                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                                "phys_y",
-                            )])]),
+                        StructType::new_unchecked(vec![StructField::nullable(
+                            "phys_y",
+                            DataType::LONG,
+                        )
+                        .with_metadata([(
+                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                            "phys_y",
+                        )])]),
                     )])
                     .into(),
                 )),
@@ -1137,13 +1214,16 @@ mod tests {
                 column_pred!("mapped.n"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("phys_mapped.phys_n").into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "phys_mapped",
-                        StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
-                            .with_metadata([(
-                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                                "phys_n",
-                            )])]),
+                        StructType::new_unchecked(vec![StructField::nullable(
+                            "phys_n",
+                            DataType::LONG,
+                        )
+                        .with_metadata([(
+                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                            "phys_n",
+                        )])]),
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1156,13 +1236,16 @@ mod tests {
                 Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
                 Some(PhysicalPredicate::Some(
                     Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "phys_mapped",
-                        StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
-                            .with_metadata([(
-                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                                "phys_n",
-                            )])]),
+                        StructType::new_unchecked(vec![StructField::nullable(
+                            "phys_n",
+                            DataType::LONG,
+                        )
+                        .with_metadata([(
+                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                            "phys_n",
+                        )])]),
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1215,8 +1298,8 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files = get_files_for_scan(scan, &engine).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(
@@ -1232,8 +1315,8 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::try_new(url, engine.as_ref(), None).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<ScanResult> = scan.execute(engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
@@ -1248,9 +1331,9 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::try_new(url, engine.as_ref(), None).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let version = snapshot.version();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()
@@ -1282,8 +1365,11 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::try_new(url.clone(), engine.as_ref(), Some(0)).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(engine.as_ref())
+            .unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<_> = scan
             .scan_metadata(engine.as_ref())
             .unwrap()
@@ -1303,8 +1389,11 @@ mod tests {
             .into_iter()
             .map(|b| Box::new(ArrowEngineData::from(b)) as Box<dyn EngineData>)
             .collect();
-        let snapshot = Snapshot::try_new(url, engine.as_ref(), Some(1)).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(engine.as_ref())
+            .unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let new_files: Vec<_> = scan
             .scan_metadata_from(engine.as_ref(), 0, files, None)
             .unwrap()
@@ -1372,8 +1461,8 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
-        let scan = snapshot.into_scan_builder().build().unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let scan = snapshot.scan_builder().build().unwrap();
         let data: Vec<_> = scan
             .replay_for_scan_metadata(&engine)
             .unwrap()
@@ -1392,7 +1481,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Arc::new(Snapshot::try_new(url, engine.as_ref(), None).unwrap());
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
         // No predicate pushdown attempted, so the one data file should be returned.
         //
@@ -1435,7 +1524,7 @@ mod tests {
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Arc::new(Snapshot::try_new(url, engine.as_ref(), None).unwrap());
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
 
         // Predicate over a logically valid but physically missing column. No data files should be
         // returned because the column is inferred to be all-null.
@@ -1470,8 +1559,8 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
-        let scan = snapshot.into_scan_builder().build()?;
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let scan = snapshot.scan_builder().build()?;
         let files = get_files_for_scan(scan, &engine)?;
         // test case:
         //

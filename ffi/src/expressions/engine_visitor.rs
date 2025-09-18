@@ -1,22 +1,25 @@
 //! Defines [`EngineExpressionVisitor`]. This is a visitor that can be used to convert the kernel's
 //! [`Expression`] or [`Predicate`] to an engine's native expression format.
-use std::ffi::c_void;
-
-use delta_kernel::expressions::{
-    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
-    Expression, JunctionPredicate, JunctionPredicateOp, MapData, OpaqueExpression,
-    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate, Scalar, StructData,
-    UnaryPredicate, UnaryPredicateOp,
-};
-
 use crate::expressions::{
     SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
 };
 use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
 
+use delta_kernel::expressions::{
+    ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
+    ColumnName, Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData,
+    OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate,
+    Scalar, StructData, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
+    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+};
+
+use std::ffi::c_void;
+
 type VisitLiteralFn<T> = extern "C" fn(data: *mut c_void, sibling_list_id: usize, value: T);
 type VisitUnaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitBinaryFn = extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitVariadicFn =
+    extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 
@@ -132,6 +135,9 @@ pub struct EngineExpressionVisitor {
     /// Visits a `is_null` expression belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_is_null: VisitUnaryFn,
+    /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
+    /// The sub-expression will be in a _one_ item list identified by `child_list_id`
+    pub visit_to_json: VisitUnaryFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_lt: VisitBinaryFn,
@@ -159,13 +165,59 @@ pub struct EngineExpressionVisitor {
     /// Visits the `Divide` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_divide: VisitBinaryFn,
+    /// Visits the `Coalesce` variadic operator belonging to the list identified by `sibling_list_id`.
+    /// The operands will be in a list identified by `child_list_id`
+    pub visit_coalesce: VisitVariadicFn,
     /// Visits the `column` belonging to the list identified by `sibling_list_id`.
     pub visit_column:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, name: KernelStringSlice),
-    /// Visits a `StructExpression` belonging to the list identified by `sibling_list_id`.
-    /// The sub-expressions of the `StructExpression` are in a list identified by `child_list_id`
+    /// Visits a `Struct` expression belonging to the list identified by `sibling_list_id`.
+    /// The sub-expressions (fields) of the struct are in a list identified by `child_list_id`
     pub visit_struct_expr:
         extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize),
+    /// Visits a `Transform` expression belonging to the list identified by `sibling_list_id`. The
+    /// `input_path_list_id` is a single-item list containing transform's input path as a column
+    /// reference (0 = no path). The `field_transform_list_id` identifies the list of field
+    /// transforms to apply (0 = identity transform). See also [`Self::visit_field_transform`].
+    pub visit_transform_expr: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        input_path_list_id: usize,
+        field_transform_list_id: usize,
+    ),
+    /// Visits one field transform of a `Transform` expression that owns the list identified by
+    /// `sibling_list_id`. Each field transform has a different insertion point (no duplicates).
+    ///
+    /// A field transform is modeled as the triple `(field_name, expr_list, is_replace)`, as
+    /// described by the truth table below. The `expr_list_id` identifies the list of expressions
+    /// the field transform should emit. The field name (if present) always references a field of
+    /// the input struct. Both the field name and the expression list are optional:
+    ///
+    /// |field_name? |expr_list? |is_replace? |meaning|
+    /// |-|-|-|-|
+    /// | NO  | NO  | *   | NO-OP (prepend an empty list of expressions to the output)
+    /// | NO  | YES | *   | Prepend a list of expressions to the output
+    /// | YES | NO  | NO  | NO-OP (insert an empty list of expressions after the named input field)
+    /// | YES | NO  | YES | Drop the named input field
+    /// | YES | YES | NO  | Insert a list of expressions after the named input field
+    /// | YES | YES | YES | Replace the named input field with a list of expressions
+    ///
+    /// NOTE: Treating list id 0 as an empty list yields a simplified truth table:
+    ///
+    /// |field_name? |is_replace? |meaning|
+    /// |-|-|-|
+    /// | NO  | *   | Prepend a (possibly empty) list of expressions to the output
+    /// | YES | NO  | Insert a (possibly empty)  list of expressions after the named input field
+    /// | YES | YES | Replace the named input field with a (possibly empty) list of expressions
+    ///
+    /// NOTE: The expressions of each field transform must be emitted in order at the insertion point.
+    pub visit_field_transform: extern "C" fn(
+        data: *mut c_void,
+        sibling_list_id: usize,
+        field_name: *const KernelStringSlice,
+        expr_list_id: usize,
+        is_replace: bool,
+    ),
     /// Visits the operator (`op`) and children (`child_list_id`) of an opaque expression belonging
     /// to the list identified by `sibling_list_id`.
     pub visit_opaque_expr: extern "C" fn(
@@ -321,9 +373,19 @@ fn visit_expression_struct_literal(
     )
 }
 
+fn visit_expression_column(
+    visitor: &mut EngineExpressionVisitor,
+    name: &ColumnName,
+    sibling_list_id: usize,
+) {
+    let name = name.to_string();
+    let name = kernel_string_slice!(name);
+    call!(visitor, visit_column, sibling_list_id, name);
+}
+
 fn visit_expression_struct(
     visitor: &mut EngineExpressionVisitor,
-    exprs: &[Expression],
+    exprs: &[ExpressionRef],
     sibling_list_id: usize,
 ) {
     let child_list_id = call!(visitor, make_field_list, exprs.len());
@@ -331,6 +393,73 @@ fn visit_expression_struct(
         visit_expression_impl(visitor, expr, child_list_id);
     }
     call!(visitor, visit_struct_expr, sibling_list_id, child_list_id)
+}
+
+fn visit_expression_transform(
+    visitor: &mut EngineExpressionVisitor,
+    transform: &Transform,
+    sibling_list_id: usize,
+) {
+    let Transform {
+        input_path,
+        field_transforms,
+        prepended_fields,
+    } = transform;
+
+    // Treat the input path like a column expression
+    let mut path_list_id = 0;
+    if let Some(ref column_name) = input_path {
+        path_list_id = call!(visitor, make_field_list, 1);
+        visit_expression_column(visitor, column_name, path_list_id);
+    };
+
+    // Emit one field transform for each named input field (ignoring no-ops), plus one more for the
+    // prepended field list (if any).
+    let prepended_count = if prepended_fields.is_empty() { 0 } else { 1 };
+    let field_transform_count = prepended_count + field_transforms.len();
+    let field_transform_list_id = call!(visitor, make_field_list, field_transform_count);
+
+    // Process the prepend first (if any)
+    if !prepended_fields.is_empty() {
+        let child_list_id = call!(visitor, make_field_list, prepended_fields.len());
+        for expr in prepended_fields {
+            visit_expression_impl(visitor, expr, child_list_id);
+        }
+        call!(
+            visitor,
+            visit_field_transform,
+            field_transform_list_id,
+            std::ptr::null(),
+            child_list_id,
+            false // doesn't matter, no field name
+        );
+    }
+
+    // Process each field transform in turn
+    for (field_name, field_transform) in field_transforms {
+        let child_list_id = call!(visitor, make_field_list, field_transform.exprs.len());
+        for expr in &field_transform.exprs {
+            visit_expression_impl(visitor, expr, child_list_id);
+        }
+
+        call!(
+            visitor,
+            visit_field_transform,
+            field_transform_list_id,
+            &kernel_string_slice!(field_name),
+            child_list_id,
+            field_transform.is_replace
+        );
+    }
+
+    // Attach the field transforms to the parent transform
+    call!(
+        visitor,
+        visit_transform_expr,
+        sibling_list_id,
+        path_list_id,
+        field_transform_list_id
+    );
 }
 
 fn visit_expression_opaque(
@@ -460,13 +589,20 @@ fn visit_expression_impl(
 ) {
     match expression {
         Expression::Literal(scalar) => visit_expression_scalar(visitor, scalar, sibling_list_id),
-        Expression::Column(name) => {
-            let name = name.to_string();
-            let name = kernel_string_slice!(name);
-            call!(visitor, visit_column, sibling_list_id, name);
-        }
+        Expression::Column(name) => visit_expression_column(visitor, name, sibling_list_id),
         Expression::Struct(exprs) => visit_expression_struct(visitor, exprs, sibling_list_id),
+        Expression::Transform(transform) => {
+            visit_expression_transform(visitor, transform, sibling_list_id)
+        }
         Expression::Predicate(pred) => visit_predicate_impl(visitor, pred, sibling_list_id),
+        Expression::Unary(UnaryExpression { op, expr }) => {
+            let child_list_id = call!(visitor, make_field_list, 1);
+            visit_expression_impl(visitor, expr, child_list_id);
+            let visit_fn = match op {
+                UnaryExpressionOp::ToJson => visitor.visit_to_json,
+            };
+            visit_fn(visitor.data, sibling_list_id, child_list_id);
+        }
         Expression::Binary(BinaryExpression { op, left, right }) => {
             let child_list_id = call!(visitor, make_field_list, 2);
             visit_expression_impl(visitor, left, child_list_id);
@@ -476,6 +612,16 @@ fn visit_expression_impl(
                 BinaryExpressionOp::Minus => visitor.visit_minus,
                 BinaryExpressionOp::Multiply => visitor.visit_multiply,
                 BinaryExpressionOp::Divide => visitor.visit_divide,
+            };
+            visit_fn(visitor.data, sibling_list_id, child_list_id);
+        }
+        Expression::Variadic(VariadicExpression { op, exprs }) => {
+            let child_list_id = call!(visitor, make_field_list, exprs.len());
+            for expr in exprs {
+                visit_expression_impl(visitor, expr, child_list_id);
+            }
+            let visit_fn = match op {
+                VariadicExpressionOp::Coalesce => visitor.visit_coalesce,
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }

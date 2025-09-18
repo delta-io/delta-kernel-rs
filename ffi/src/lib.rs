@@ -601,8 +601,15 @@ fn snapshot_impl(
     extern_engine: &dyn ExternEngine,
     version: Option<Version>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
-    let snapshot = Snapshot::try_new(url?, extern_engine.engine().as_ref(), version)?;
-    Ok(Arc::new(snapshot).into())
+    let builder = Snapshot::builder_for(url?);
+    let builder = if let Some(v) = version {
+        // TODO: should we include a `with_version_opt` method for the builder?
+        builder.at_version(v)
+    } else {
+        builder
+    };
+    let snapshot = builder.build(extern_engine.engine().as_ref())?;
+    Ok(snapshot.into())
 }
 
 /// # Safety
@@ -788,7 +795,7 @@ mod tests {
         recover_string,
     };
     use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-    use delta_kernel::object_store::memory::InMemory;
+    use object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
     #[no_mangle]

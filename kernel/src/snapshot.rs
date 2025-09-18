@@ -3,29 +3,30 @@
 
 use std::sync::Arc;
 
+use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
-use crate::log_segment::{self, ListedLogFiles, LogSegment};
+use crate::listed_log_files::ListedLogFiles;
+use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
-use crate::schema::{Schema, SchemaRef};
+use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
-use crate::utils::{calculate_transaction_expiration_timestamp, try_parse_uri};
-use crate::{DeltaResult, Engine, Error, StorageHandler, Version};
+use crate::LogCompactionWriter;
+use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
 
-use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+mod builder;
+pub use builder::SnapshotBuilder;
+
+use tracing::debug;
 use url::Url;
 
-/// Name of the _last_checkpoint file that provides metadata about the last checkpoint
-/// created for the table. This file is used as a hint for the engine to quickly locate
-/// the latest checkpoint without a full directory listing.
-pub(crate) const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
+pub type SnapshotRef = Arc<Snapshot>;
 
 // TODO expose methods for accessing the files of a table (with file pruning).
 /// In-memory representation of a specific snapshot of a Delta table. While a `DeltaTable` exists
@@ -55,60 +56,15 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    #[internal_api]
-    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
-        Self {
-            log_segment,
-            table_configuration,
-        }
+    /// Create a new [`SnapshotBuilder`] to build a new [`Snapshot`] for a given table root. If you
+    /// instead have an existing [`Snapshot`] you would like to do minimal work to update, consider
+    /// using
+    pub fn builder_for(table_root: Url) -> SnapshotBuilder {
+        SnapshotBuilder::new_for(table_root)
     }
 
-    /// Create a new [`Snapshot`] instance for the given version by parsing the given uri string.
-    ///
-    /// # Parameters
-    ///
-    /// - `table_root`: string-encoded URI pointing at the table root (where `_delta_log` folder is
-    ///   located)
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
-    ///   version of the table.
-    pub fn try_from_uri(
-        uri: impl AsRef<str>,
-        engine: &dyn Engine,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let url = try_parse_uri(uri)?;
-        Self::try_new(url, engine, version)
-    }
-
-    /// Create a new [`Snapshot`] instance for the given version.
-    ///
-    /// # Parameters
-    ///
-    /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
-    /// - `engine`: Implementation of [`Engine`] apis.
-    /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
-    ///   version of the table.
-    pub fn try_new(
-        table_root: Url,
-        engine: &dyn Engine,
-        version: Option<Version>,
-    ) -> DeltaResult<Self> {
-        let storage = engine.storage_handler();
-        let log_root = table_root.join("_delta_log/")?;
-
-        let checkpoint_hint = read_last_checkpoint(storage.as_ref(), &log_root)?;
-
-        let log_segment =
-            LogSegment::for_snapshot(storage.as_ref(), log_root, checkpoint_hint, version)?;
-
-        // try_new_from_log_segment will ensure the protocol is supported
-        Self::try_new_from_log_segment(table_root, log_segment, engine)
-    }
-
-    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
-    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
-    /// snapshot to a later version.
+    /// Create a new [`SnapshotBuilder`] to incrementally update a [`Snapshot`] to a more recent
+    /// version.
     ///
     /// We implement a simple heuristic:
     /// 1. if the new version == existing version, just return the existing snapshot
@@ -126,8 +82,23 @@ impl Snapshot {
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `version`: target version of the [`Snapshot`]. None will create a snapshot at the latest
     ///   version of the table.
-    pub fn try_new_from(
-        existing_snapshot: Arc<Snapshot>,
+    pub fn builder_from(existing_snapshot: SnapshotRef) -> SnapshotBuilder {
+        SnapshotBuilder::new_from(existing_snapshot)
+    }
+
+    #[internal_api]
+    pub(crate) fn new(log_segment: LogSegment, table_configuration: TableConfiguration) -> Self {
+        Self {
+            log_segment,
+            table_configuration,
+        }
+    }
+
+    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
+    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
+    /// snapshot to a later version.
+    fn try_new_from(
+        existing_snapshot: SnapshotRef,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<Arc<Self>> {
@@ -154,7 +125,7 @@ impl Snapshot {
         let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
 
         // Check for new commits (and CRC)
-        let new_listed_files = log_segment::list_log_files_with_version(
+        let new_listed_files = ListedLogFiles::list(
             storage.as_ref(),
             &log_root,
             Some(listing_start),
@@ -290,6 +261,25 @@ impl Snapshot {
         CheckpointWriter::try_new(self)
     }
 
+    /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
+    ///
+    /// Log compaction aggregates commit files in a version range into a single compacted file,
+    /// improving performance by reducing the number of files to process during log replay.
+    ///
+    /// # Parameters
+    /// - `start_version`: The first version to include in the compaction (inclusive)
+    /// - `end_version`: The last version to include in the compaction (inclusive)
+    ///
+    /// # Returns
+    /// A [`LogCompactionWriter`] that can be used to generate the compaction file.
+    pub fn log_compaction_writer(
+        self: Arc<Self>,
+        start_version: Version,
+        end_version: Version,
+    ) -> DeltaResult<LogCompactionWriter> {
+        LogCompactionWriter::try_new(self, start_version, end_version)
+    }
+
     /// Log segment this snapshot uses
     #[internal_api]
     pub(crate) fn log_segment(&self) -> &LogSegment {
@@ -305,7 +295,9 @@ impl Snapshot {
         self.table_configuration().version()
     }
 
-    /// Table [`type@Schema`] at this `Snapshot`s version.
+    /// Table [`Schema`] at this `Snapshot`s version.
+    ///
+    /// [`Schema`]: crate::schema::Schema
     pub fn schema(&self) -> SchemaRef {
         self.table_configuration.schema()
     }
@@ -341,7 +333,7 @@ impl Snapshot {
         self.table_configuration.column_mapping_mode()
     }
 
-    /// Create a [`ScanBuilder`] for an `Arc<Snapshot>`.
+    /// Create a [`ScanBuilder`] for an `SnapshotRef`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
         ScanBuilder::new(self)
     }
@@ -351,7 +343,7 @@ impl Snapshot {
         ScanBuilder::new(self)
     }
 
-    /// Create a [`Transaction`] for this `Arc<Snapshot>`.
+    /// Create a [`Transaction`] for this `SnapshotRef`.
     pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
         Transaction::try_new(self)
     }
@@ -395,54 +387,6 @@ impl Snapshot {
     }
 }
 
-// Note: Schema can not be derived because the checkpoint schema is only known at runtime.
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-#[internal_api]
-pub(crate) struct LastCheckpointHint {
-    /// The version of the table when the last checkpoint was made.
-    #[allow(unreachable_pub)] // used by acceptance tests (TODO make an fn accessor?)
-    pub version: Version,
-    /// The number of actions that are stored in the checkpoint.
-    pub(crate) size: i64,
-    /// The number of fragments if the last checkpoint was written in multiple parts.
-    pub(crate) parts: Option<usize>,
-    /// The number of bytes of the checkpoint.
-    pub(crate) size_in_bytes: Option<i64>,
-    /// The number of AddFile actions in the checkpoint.
-    pub(crate) num_of_add_files: Option<i64>,
-    /// The schema of the checkpoint file.
-    pub(crate) checkpoint_schema: Option<Schema>,
-    /// The checksum of the last checkpoint JSON.
-    pub(crate) checksum: Option<String>,
-}
-
-/// Try reading the `_last_checkpoint` file.
-///
-/// Note that we typically want to ignore a missing/invalid `_last_checkpoint` file without failing
-/// the read. Thus, the semantics of this function are to return `None` if the file is not found or
-/// is invalid JSON. Unexpected/unrecoverable errors are returned as `Err` case and are assumed to
-/// cause failure.
-// TODO(#1047): weird that we propagate FileNotFound as part of the iterator instead of top-level
-// result coming from storage.read_files
-fn read_last_checkpoint(
-    storage: &dyn StorageHandler,
-    log_root: &Url,
-) -> DeltaResult<Option<LastCheckpointHint>> {
-    let file_path = log_root.join(LAST_CHECKPOINT_FILE_NAME)?;
-    match storage.read_files(vec![(file_path, None)])?.next() {
-        Some(Ok(data)) => Ok(serde_json::from_slice(&data)
-            .inspect_err(|e| warn!("invalid _last_checkpoint JSON: {e}"))
-            .ok()),
-        Some(Err(Error::FileNotFound(_))) => Ok(None),
-        Some(Err(err)) => Err(err),
-        None => {
-            warn!("empty _last_checkpoint file");
-            Ok(None)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,10 +394,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use crate::object_store::local::LocalFileSystem;
-    use crate::object_store::memory::InMemory;
-    use crate::object_store::path::Path;
-    use crate::object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
     use serde_json::json;
 
     use crate::arrow::array::StringArray;
@@ -465,6 +409,7 @@ mod tests {
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
+    use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::path::ParsedLogPath;
     use crate::utils::test_utils::string_array_to_engine_data;
     use test_utils::{add_commit, delta_path_for_version};
@@ -476,7 +421,10 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::try_new(url, &engine, Some(1)).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -494,7 +442,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::try_new(url, &engine, None).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -533,16 +481,24 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let old_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(1)).unwrap());
+        let old_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
         // 1. new version < existing version: error
-        let snapshot_res = Snapshot::try_new_from(old_snapshot.clone(), &engine, Some(0));
+        let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
+            .at_version(0)
+            .build(&engine);
         assert!(matches!(
             snapshot_res,
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
         ));
 
         // 2. new version == existing version
-        let snapshot = Snapshot::try_new_from(old_snapshot.clone(), &engine, Some(1)).unwrap();
+        let snapshot = Snapshot::builder_from(old_snapshot.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
         let expected = old_snapshot.clone();
         assert_eq!(snapshot, expected);
 
@@ -558,10 +514,16 @@ mod tests {
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
             let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-            let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
-            let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-            let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
-            assert_eq!(snapshot, expected.into());
+            let base_snapshot = Snapshot::builder_for(url.clone())
+                .at_version(0)
+                .build(&engine)?;
+            let snapshot = Snapshot::builder_from(base_snapshot.clone())
+                .at_version(1)
+                .build(&engine)?;
+            let expected = Snapshot::builder_for(url.clone())
+                .at_version(1)
+                .build(&engine)?;
+            assert_eq!(snapshot, expected);
             Ok(())
         }
 
@@ -605,13 +567,17 @@ mod tests {
             Arc::new(store.fork()),
             Arc::new(TokioBackgroundExecutor::new()),
         );
-        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
-        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, None)?;
-        let expected = Snapshot::try_new(url.clone(), &engine, Some(0))?;
-        assert_eq!(snapshot, expected.into());
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
+        let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine)?;
+        let expected = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
+        assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
         assert!(matches!(
-            Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1)),
+            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is newer than the latest version 0"
         ));
 
@@ -674,9 +640,11 @@ mod tests {
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
-        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
         assert!(matches!(
-            Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(2)),
+            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
             Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
@@ -783,12 +751,18 @@ mod tests {
         store.put(&path, crc.to_string().into()).await?;
 
         // base snapshot is at version 0
-        let base_snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, Some(0))?);
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
 
         // first test: no new crc
-        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
-        assert_eq!(snapshot, expected.into());
+        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+            .at_version(1)
+            .build(&engine)?;
+        let expected = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+        assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
                 .log_segment
@@ -811,9 +785,13 @@ mod tests {
             "protocol": protocol_fields(1, 2),
         });
         store.put(&path, crc.to_string().into()).await?;
-        let snapshot = Snapshot::try_new_from(base_snapshot.clone(), &engine, Some(1))?;
-        let expected = Snapshot::try_new(url.clone(), &engine, Some(1))?;
-        assert_eq!(snapshot, expected.into());
+        let snapshot = Snapshot::builder_from(base_snapshot.clone())
+            .at_version(1)
+            .build(&engine)?;
+        let expected = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+        assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
                 .log_segment
@@ -839,7 +817,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
-        let cp = read_last_checkpoint(&storage, &url).unwrap();
+        let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
 
@@ -868,7 +846,7 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
@@ -899,9 +877,9 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let valid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = read_last_checkpoint(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         let expected = LastCheckpointHint {
             version: 1,
             size: 8,
@@ -923,7 +901,7 @@ mod tests {
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::try_new(location, &engine, None).unwrap();
+        let snapshot = Snapshot::builder_for(location).build(&engine).unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
         assert_eq!(
@@ -1030,7 +1008,7 @@ mod tests {
         .join("\n");
         add_commit(store.as_ref(), 1, commit).await.unwrap();
 
-        let snapshot = Arc::new(Snapshot::try_new(url.clone(), &engine, None)?);
+        let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
@@ -1047,5 +1025,39 @@ mod tests {
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
         Ok(())
+    }
+
+    #[test]
+    fn test_log_compaction_writer() {
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+
+        let engine = SyncEngine::new();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+
+        // Test creating a log compaction writer
+        let writer = snapshot.clone().log_compaction_writer(0, 1).unwrap();
+        let path = writer.compaction_path();
+
+        // Verify the path format is correct
+        let expected_filename = "00000000000000000000.00000000000000000001.compacted.json";
+        assert!(path.to_string().ends_with(expected_filename));
+
+        // Test invalid version range (start >= end)
+        let result = snapshot.clone().log_compaction_writer(2, 1);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid version range"));
+
+        // Test equal version range (also invalid)
+        let result = snapshot.log_compaction_writer(1, 1);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid version range"));
     }
 }
