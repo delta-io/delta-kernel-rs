@@ -704,6 +704,31 @@ pub(crate) struct Add {
     /// The name of the clustering implementation
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub clustering_provider: Option<String>,
+
+    /// The path to the data manifest this remove action is in.
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) data_manifest_path: Option<String>,
+
+    /// The index in the data manifest of this remove action
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) data_manifest_position: Option<i64>,
+
+    /// The path to the delete manifest the DV for this remove action is in.
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) delete_manifest_path: Option<i64>,
+
+    /// The index in the delete manifest of this remove actions deletion
+    /// vector.
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) delete_manifest_position: Option<i64>,
 }
 
 impl Add {
@@ -762,6 +787,45 @@ pub(crate) struct Remove {
     /// First commit version in which an add action with the same path was committed to the table.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) default_row_commit_version: Option<i64>,
+
+    /// The path to the data manifest this remove action is in.
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) data_manifest_path: Option<String>,
+
+    /// The index in the data manifest of this remove action
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) data_manifest_position: Option<i64>,
+
+    /// The path to the delete manifest the DV for this remove action is in.
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) delete_manifest_path: Option<i64>,
+
+    /// The index in the delete manifest of this remove actions deletion
+    /// vector.
+    ///
+    /// Only present in tables that have metadata tree enabled.
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub(crate) delete_manifest_position: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[internal_api]
+#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+/// The ContentRoot action describes the root of the content metadata tree.
+pub(crate) struct ContentRoot {
+    /// A relative path to a data file from the root of the table or an absolute path to a file
+    /// that should be added to the table. The path is a URI as specified by
+    /// [RFC 2396 URI Generic Syntax], which needs to be decoded to get the data file path.
+    ///
+    /// [RFC 2396 URI Generic Syntax]: https://www.ietf.org/rfc/rfc2396.txt
+    path: String,
+    size_in_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1045,6 +1109,10 @@ mod tests {
                 StructField::nullable("baseRowId", DataType::LONG),
                 StructField::nullable("defaultRowCommitVersion", DataType::LONG),
                 StructField::nullable("clusteringProvider", DataType::STRING),
+                StructField::nullable("dataManifestPath", DataType::STRING),
+                StructField::nullable("dataManifestPosition", DataType::LONG),
+                StructField::nullable("deleteManifestPath", DataType::LONG),
+                StructField::nullable("deleteManifestPosition", DataType::LONG),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1095,6 +1163,10 @@ mod tests {
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
                 StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                StructField::nullable("dataManifestPath", DataType::STRING),
+                StructField::nullable("dataManifestPosition", DataType::LONG),
+                StructField::nullable("deleteManifestPath", DataType::LONG),
+                StructField::nullable("deleteManifestPosition", DataType::LONG),
             ]),
         )]));
         assert_eq!(schema, expected);

@@ -105,7 +105,7 @@ impl AddVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Add> {
         require!(
-            getters.len() == 15,
+            getters.len() == 19,
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
@@ -139,6 +139,10 @@ impl AddVisitor {
             base_row_id,
             default_row_commit_version,
             clustering_provider,
+            data_manifest_path: None,
+            data_manifest_position: None,
+            delete_manifest_path: None,
+            delete_manifest_position: None,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
@@ -178,7 +182,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 14,
+            getters.len() == 18,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -214,6 +218,10 @@ impl RemoveVisitor {
             deletion_vector,
             base_row_id,
             default_row_commit_version,
+            data_manifest_path: None,
+            data_manifest_position: None,
+            delete_manifest_path: None,
+            delete_manifest_position: None,
         })
     }
     pub(crate) fn names_and_types() -> (&'static [ColumnName], &'static [DataType]) {
