@@ -3,8 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
+use delta_kernel::arrow::array::AsArray as _;
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
-use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
+use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
@@ -13,23 +15,23 @@ use delta_kernel::expressions::{
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::Scan;
-use delta_kernel::schema::{DataType, Schema};
+use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
+
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
-    record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray, TestAction, METADATA,
+    load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, to_arrow,
+    IntoArray, TestAction, METADATA,
 };
 use url::Url;
 
 mod common;
 
-use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use test_utils::{load_test_data, read_scan, to_arrow};
-
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
+const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
 
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -1349,4 +1351,184 @@ fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+}
+
+#[tokio::test]
+async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup up an in-memory table with different numbers of rows in each file
+    let batch1 = generate_batch(vec![
+        ("id", vec![1i32, 2, 3, 4, 5].into_array()),
+        ("value", vec!["a", "b", "c", "d", "e"].into_array()),
+    ])?;
+    let batch2 = generate_batch(vec![
+        ("id", vec![10i32, 20, 30].into_array()),
+        ("value", vec!["x", "y", "z"].into_array()),
+    ])?;
+    let batch3 = generate_batch(vec![
+        ("id", vec![100i32, 200, 300, 400].into_array()),
+        ("value", vec!["p", "q", "r", "s"].into_array()),
+    ])?;
+
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::Add(PARQUET_FILE2.to_string()),
+            TestAction::Add(PARQUET_FILE3.to_string()),
+        ]),
+    )
+    .await?;
+
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch1).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE2),
+            record_batch_to_bytes(&batch2).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE3),
+            record_batch_to_bytes(&batch3).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(
+        storage.clone(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
+
+    // Create a schema that includes a row index metadata column
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().with_schema(schema).build()?;
+
+    let mut file_count = 0;
+    let expected_row_counts = [5, 3, 4];
+    let stream = scan.execute(engine.clone())?;
+
+    for scan_result in stream {
+        let data = scan_result?.raw_data?;
+        let batch = into_record_batch(data);
+        file_count += 1;
+
+        // Verify the schema structure
+        assert_eq!(batch.num_columns(), 3, "Expected 3 columns in the batch");
+        assert_eq!(
+            batch.schema().field(0).name(),
+            "id",
+            "First column should be 'id'"
+        );
+        assert_eq!(
+            batch.schema().field(1).name(),
+            "row_index",
+            "Second column should be 'row_index'"
+        );
+        assert_eq!(
+            batch.schema().field(2).name(),
+            "value",
+            "Third column should be 'value'"
+        );
+
+        // Each file should have row indexes starting from 0 (file-local indexing)
+        let row_index_array = batch.column(1).as_primitive::<Int64Type>();
+        let expected_values: Vec<i64> = (0..batch.num_rows() as i64).collect();
+        assert_eq!(
+            row_index_array.values().to_vec(),
+            expected_values,
+            "Row index values incorrect for file {} (expected {} rows)",
+            file_count,
+            expected_row_counts[file_count - 1]
+        );
+    }
+
+    assert_eq!(file_count, 3, "Expected to scan 3 files");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::Error>> {
+    // Prepare an in-memory table with some data
+    let batch = generate_simple_batch()?;
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+        ]),
+    )
+    .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(
+        storage.clone(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
+
+    // Test that unsupported metadata columns fail with appropriate errors
+    let test_cases = [
+        ("row_id", MetadataColumnSpec::RowId, "RowId"),
+        (
+            "row_commit_version",
+            MetadataColumnSpec::RowCommitVersion,
+            "RowCommitVersion",
+        ),
+    ];
+    for (column_name, metadata_spec, error_text) in test_cases {
+        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let schema = Arc::new(StructType::try_new([
+            StructField::nullable("id", DataType::INTEGER),
+            StructField::create_metadata_column(column_name, metadata_spec),
+        ])?);
+        let scan = snapshot.scan_builder().with_schema(schema).build()?;
+        let stream = scan.execute(engine.clone())?;
+
+        let mut found_error = false;
+        for scan_result in stream {
+            match scan_result {
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if error_msg.contains(error_text) && error_msg.contains("not supported") {
+                        found_error = true;
+                        break;
+                    }
+                }
+                Ok(_) => {
+                    panic!(
+                        "Expected error for {} metadata column, but scan succeeded",
+                        error_text
+                    );
+                }
+            }
+        }
+        assert!(
+            found_error,
+            "Expected error about {} not being supported",
+            error_text
+        );
+    }
+
+    Ok(())
 }
