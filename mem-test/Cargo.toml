@@ -1,0 +1,25 @@
+[package]
+name = "mem-test"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# for cargo-release
+[package.metadata.release]
+release = false
+
+[dependencies]
+arrow = "56"
+delta_kernel = { path = "../kernel", features = ["arrow", "default-engine-rustls"] }
+dhat = "0.3"
+object_store = "0.12.3"
+rayon = "1.10"
+serde_json = "1"
+tempfile = "3"
+tracing = "0.1"
+url = "2"
