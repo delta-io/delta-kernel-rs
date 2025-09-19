@@ -99,6 +99,7 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
+pub mod transforms;
 
 mod row_tracking;
 
