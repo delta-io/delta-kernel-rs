@@ -15,6 +15,7 @@ use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, Log
 use crate::scan::{FieldTransformSpec, Scalar};
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -46,6 +47,7 @@ pub(crate) struct ScanLogReplayProcessor {
     add_transform: Arc<dyn ExpressionEvaluator>,
     logical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
+    column_mapping_mode: ColumnMappingMode,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -59,6 +61,7 @@ impl ScanLogReplayProcessor {
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
         logical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
+        column_mapping_mode: ColumnMappingMode,
     ) -> Self {
         Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
@@ -71,6 +74,7 @@ impl ScanLogReplayProcessor {
             seen_file_keys: Default::default(),
             logical_schema,
             transform_spec,
+            column_mapping_mode,
         }
     }
 }
@@ -85,6 +89,7 @@ struct AddRemoveDedupVisitor<'seen> {
     logical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     partition_filter: Option<PredicateRef>,
+    column_mapping_mode: ColumnMappingMode,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
@@ -103,6 +108,7 @@ impl AddRemoveDedupVisitor<'_> {
         logical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
         partition_filter: Option<PredicateRef>,
+        column_mapping_mode: ColumnMappingMode,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
         AddRemoveDedupVisitor {
@@ -118,6 +124,7 @@ impl AddRemoveDedupVisitor<'_> {
             logical_schema,
             transform_spec,
             partition_filter,
+            column_mapping_mode,
             row_transform_exprs: Vec::new(),
         }
     }
@@ -133,7 +140,7 @@ impl AddRemoveDedupVisitor<'_> {
                 "out of bounds partition column field index {field_idx}"
             )));
         };
-        let name = field.physical_name();
+        let name = field.physical_name(self.column_mapping_mode);
         let partition_value =
             super::parse_partition_value(partition_values.get(name), field.data_type())?;
         Ok((field_idx, (name.to_string(), partition_value)))
@@ -399,6 +406,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             self.logical_schema.clone(),
             self.transform_spec.clone(),
             self.partition_filter.clone(),
+            self.column_mapping_mode,
             is_log_batch,
         );
         visitor.visit_rows_of(actions.as_ref())?;
@@ -431,9 +439,16 @@ pub(crate) fn scan_action_iter(
     logical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    column_mapping_mode: ColumnMappingMode,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform_spec)
-        .process_actions_iter(action_iter)
+    ScanLogReplayProcessor::new(
+        engine,
+        physical_predicate,
+        logical_schema,
+        transform_spec,
+        column_mapping_mode,
+    )
+    .process_actions_iter(action_iter)
 }
 
 #[cfg(test)]
@@ -517,6 +532,7 @@ mod tests {
             logical_schema,
             None,
             None,
+            ColumnMappingMode::None,
         );
         for res in iter {
             let scan_metadata = res.unwrap();
@@ -546,6 +562,7 @@ mod tests {
             schema,
             static_transform,
             None,
+            ColumnMappingMode::None,
         );
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
