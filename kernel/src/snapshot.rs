@@ -1,7 +1,7 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::domain_metadata_configuration;
@@ -10,6 +10,7 @@ use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
+use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
@@ -33,11 +34,23 @@ pub type SnapshotRef = Arc<Snapshot>;
 /// throughout time, `Snapshot`s represent a view of a table at a specific point in time; they
 /// have a defined schema (which may change over time for any given table), specific version, and
 /// frozen log segment.
-#[derive(PartialEq, Eq)]
 pub struct Snapshot {
     log_segment: LogSegment,
     table_configuration: TableConfiguration,
+    /// Cached timestamp value to avoid re-reading commit files on repeated calls.
+    /// None means ICT is not available for this snapshot (ICT disabled or pre-enablement).
+    latest_in_commit_timestamp: OnceLock<Option<i64>>,
 }
+
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare only the logical content, ignoring cache
+        self.log_segment == other.log_segment
+            && self.table_configuration == other.table_configuration
+    }
+}
+
+impl Eq for Snapshot {}
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
@@ -91,6 +104,7 @@ impl Snapshot {
         Self {
             log_segment,
             table_configuration,
+            latest_in_commit_timestamp: OnceLock::new(),
         }
     }
 
@@ -250,6 +264,7 @@ impl Snapshot {
         Ok(Self {
             log_segment,
             table_configuration,
+            latest_in_commit_timestamp: OnceLock::new(),
         })
     }
 
@@ -385,6 +400,53 @@ impl Snapshot {
 
         domain_metadata_configuration(self.log_segment(), domain, engine)
     }
+
+    /// Get the In-Commit Timestamp of this snapshot.
+    ///
+    /// This method only works when In-Commit Timestamps (ICT) is enabled for the table.
+    /// It returns the inCommitTimestamp from the CommitInfo action of the commit that created this snapshot.
+    ///
+    /// Returns an error if ICT is not enabled for this table.
+    pub fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+        // Check if we have a cached value first
+        if let Some(cached_timestamp) = self.latest_in_commit_timestamp.get() {
+            return match *cached_timestamp {
+                Some(ict) => Ok(ict),
+                None => Err(Error::generic(
+                    "In-Commit Timestamps are not available for this snapshot",
+                )),
+            };
+        }
+
+        let enablement_info = self
+            .table_configuration()
+            .in_commit_timestamp_enablement()?;
+
+        let computed_timestamp = if let Some((enablement_version, _)) = enablement_info {
+            // ICT is enabled for the table
+            if self.version() < enablement_version {
+                // This snapshot predates ICT enablement
+                None
+            } else {
+                // This snapshot should have ICT, call utility on ParsedLogPath to do the rest of the work
+                let commit_path = ParsedLogPath::new_commit(self.table_root(), self.version())?;
+                commit_path.extract_in_commit_timestamp(engine)?
+            }
+        } else {
+            // ICT was never enabled for this table
+            None
+        };
+
+        // Cache the result
+        let _ = self.latest_in_commit_timestamp.set(computed_timestamp);
+
+        match computed_timestamp {
+            Some(ict) => Ok(ict),
+            None => Err(Error::generic(
+                "In-Commit Timestamps are not available for this snapshot",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +475,96 @@ mod tests {
     use crate::path::ParsedLogPath;
     use crate::utils::test_utils::string_array_to_engine_data;
     use test_utils::{add_commit, delta_path_for_version};
+
+    /// Helper function to create a commitInfo action with optional ICT
+    fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
+        let mut commit_info = json!({
+            "timestamp": timestamp,
+            "operation": "WRITE",
+        });
+
+        if let Some(ict_value) = ict {
+            commit_info["inCommitTimestamp"] = json!(ict_value);
+        }
+
+        json!({
+            "commitInfo": commit_info
+        })
+    }
+
+    fn create_protocol(ict_enabled: bool, min_reader_version: Option<u32>) -> serde_json::Value {
+        let reader_version = min_reader_version.unwrap_or(1);
+
+        if ict_enabled {
+            let mut protocol = json!({
+                "protocol": {
+                    "minReaderVersion": reader_version,
+                    "minWriterVersion": 7,
+                    "writerFeatures": ["inCommitTimestamp"]
+                }
+            });
+
+            // Only include readerFeatures if minReaderVersion >= 3
+            if reader_version >= 3 {
+                protocol["protocol"]["readerFeatures"] = json!([]);
+            }
+
+            protocol
+        } else {
+            json!({
+                "protocol": {
+                    "minReaderVersion": reader_version,
+                    "minWriterVersion": 2
+                }
+            })
+        }
+    }
+
+    fn create_metadata(
+        id: Option<&str>,
+        schema_string: Option<&str>,
+        created_time: Option<u64>,
+        ict_config: Option<(String, String)>,
+        ict_enabled_but_missing_version: bool,
+    ) -> serde_json::Value {
+        let config = if ict_enabled_but_missing_version {
+            // Special case for testing ICT enabled but missing enablement info
+            json!({
+                "delta.enableInCommitTimestamps": "true"
+            })
+        } else if let Some((enablement_version, enablement_timestamp)) = ict_config {
+            json!({
+                "delta.enableInCommitTimestamps": "true",
+                "delta.inCommitTimestampEnablementVersion": enablement_version,
+                "delta.inCommitTimestampEnablementTimestamp": enablement_timestamp
+            })
+        } else {
+            json!({})
+        };
+
+        json!({
+            "metaData": {
+                "id": id.unwrap_or("testId"),
+                "format": {"provider": "parquet", "options": {}},
+                "schemaString": schema_string.unwrap_or("{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}"),
+                "partitionColumns": [],
+                "configuration": config,
+                "createdTime": created_time.unwrap_or(1587968586154u64)
+            }
+        })
+    }
+
+    fn create_basic_commit(ict_enabled: bool, ict_config: Option<(String, String)>) -> String {
+        let protocol = create_protocol(ict_enabled, None);
+        let metadata = create_metadata(None, None, None, ict_config, false);
+        format!("{}\n{}", protocol, metadata)
+    }
+
+    fn create_commit_with_ict_missing_enablement() -> String {
+        let protocol = create_protocol(true, None);
+        let metadata = create_metadata(None, None, None, None, true);
+        format!("{}\n{}", protocol, metadata)
+    }
 
     #[test]
     fn test_snapshot_read_metadata() {
@@ -1057,5 +1209,219 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Invalid version range"));
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let url = url::Url::parse("memory://test/")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create a basic commit without ICT enabled
+        let commit0 = create_basic_commit(false, None);
+        add_commit(store.as_ref(), 0, commit0).await?;
+
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+
+        // When ICT is disabled, get_timestamp should fail
+        let result = snapshot.get_in_commit_timestamp(&engine);
+        assert!(
+            result.is_err(),
+            "get_in_commit_timestamp should fail when ICT is not enabled"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("In-Commit Timestamps are not available"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_with_ict_enabled_current_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let url = url::Url::parse("memory://test/")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create initial commit
+        let commit0 =
+            create_basic_commit(true, Some(("1".to_string(), "1587968586154".to_string())));
+        add_commit(store.as_ref(), 0, commit0).await?;
+
+        // Create commit with ICT enabled
+        let expected_timestamp = 1587968586200i64;
+        let commit1 = format!(
+            r#"{{"commitInfo":{{"timestamp":1587968586154,"inCommitTimestamp":{},"operation":"WRITE"}}}}"#,
+            expected_timestamp
+        );
+        add_commit(store.as_ref(), 1, commit1.to_string()).await?;
+
+        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+
+        // When ICT is enabled and available, timestamp() should return inCommitTimestamp
+        let timestamp = snapshot.get_in_commit_timestamp(&engine)?;
+        assert_eq!(timestamp, expected_timestamp);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_with_ict_enabled_pre_enablement_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let url = url::Url::parse("memory://test/")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create initial commit without ICT
+        let commit0 = create_basic_commit(false, None);
+        add_commit(store.as_ref(), 0, commit0).await?;
+
+        // Create commit that enables ICT (version 1 = enablement version)
+        let commit1 =
+            create_basic_commit(true, Some(("1".to_string(), "1587968586200".to_string())));
+        add_commit(store.as_ref(), 1, commit1).await?;
+
+        // Read snapshot at version 0 (before ICT enablement)
+        let snapshot = Snapshot::builder_for(url).at_version(0).build(&engine)?;
+
+        // This snapshot version predates ICT enablement, so get_timestamp should fail
+        let result = snapshot.get_in_commit_timestamp(&engine);
+        assert!(
+            result.is_err(),
+            "get_timestamp should fail when ICT is not available for this snapshot"
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("In-Commit Timestamps are not available"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_with_ict_missing_enablement_info_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(InMemory::new());
+        let url = url::Url::parse("memory://test/")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create commit with ICT enabled but missing enablement info
+        let commit0 = create_commit_with_ict_missing_enablement();
+        add_commit(store.as_ref(), 0, commit0).await?;
+
+        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+
+        // Should get error due to missing enablement metadata
+        let result = snapshot.get_in_commit_timestamp(&engine);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Enablement version and timestamp are not present"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_timestamp_edge_cases() -> DeltaResult<()> {
+        // Test various edge cases in snapshot timestamp retrieval
+        let url = Url::parse("memory:///")?;
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Test 1: ICT caching - create table with ICT enabled
+        let commit_data = [
+            create_protocol(true, Some(3)),
+            create_metadata(
+                Some("test_id"),
+                Some("{\"type\":\"struct\",\"fields\":[]}"),
+                Some(1677811175819),
+                Some(("0".to_string(), "1612345678".to_string())),
+                false,
+            ),
+        ];
+        commit(store.as_ref(), 0, commit_data.to_vec()).await;
+
+        // Create commit with ICT
+        let commit1 = [create_commit_info(1234567890, Some(9876543210i64))];
+        commit(store.as_ref(), 1, commit1.to_vec()).await;
+
+        let snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+
+        // Test cached timestamp path - first call computes, second uses cache
+        let timestamp1 = snapshot.get_in_commit_timestamp(&engine)?;
+        assert_eq!(timestamp1, 9876543210);
+
+        // Delete commit1 from store to test that caching actually works
+        let commit1_path = ParsedLogPath::new_commit(&url, 1)?;
+        store
+            .delete(&Path::from_url_path(commit1_path.location.path())?)
+            .await?;
+
+        // This should still work because the value is cached
+        let timestamp2 = snapshot.get_in_commit_timestamp(&engine)?;
+        assert_eq!(
+            timestamp2, timestamp1,
+            "Cached value should still be available after deleting commit file"
+        );
+
+        // Test 2: Version predating ICT enablement - should fail
+        let url2 = Url::parse("memory:///table2")?;
+        let commit_data2 = [
+            json!({
+                "protocol": {
+                    "minReaderVersion": 3,
+                    "minWriterVersion": 7,
+                    "readerFeatures": [],
+                    "writerFeatures": ["inCommitTimestamp"]
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id": "test_id2",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {
+                        "delta.enableInCommitTimestamps": "true",
+                        "delta.inCommitTimestampEnablementVersion": "5", // Enablement after version 1
+                        "delta.inCommitTimestampEnablementTimestamp": "1612345678"
+                    },
+                    "createdTime": 1677811175819u64
+                }
+            }),
+        ];
+        commit(store.as_ref(), 0, commit_data2.to_vec()).await;
+
+        // Create commit that predates ICT enablement (no inCommitTimestamp)
+        let commit_predates = [create_commit_info(1234567890, None)];
+        commit(store.as_ref(), 1, commit_predates.to_vec()).await;
+
+        let snapshot_predates = Snapshot::builder_for(url2).at_version(1).build(&engine)?;
+        let result_predates = snapshot_predates.get_in_commit_timestamp(&engine);
+        assert!(result_predates.is_err()); // Should fail for snapshots that predate ICT enablement
+        assert!(result_predates
+            .unwrap_err()
+            .to_string()
+            .contains("In-Commit Timestamps are not available"));
+
+        // Test 3: Missing ICT when it should be present - should error
+        let url3 = Url::parse("memory:///table3")?;
+        commit(store.as_ref(), 0, commit_data.to_vec()).await; // ICT enabled from version 0
+
+        // Create commit without ICT despite being enabled (corrupt case)
+        let commit_missing_ict = [create_commit_info(1234567890, None)];
+        commit(store.as_ref(), 1, commit_missing_ict.to_vec()).await;
+
+        let snapshot_missing = Snapshot::builder_for(url3).at_version(1).build(&engine)?;
+        let result = snapshot_missing.get_in_commit_timestamp(&engine);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("In-Commit Timestamps are not available"));
+
+        Ok(())
     }
 }

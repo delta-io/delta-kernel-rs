@@ -19,6 +19,7 @@ use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::transaction::CommitResult;
+use tempfile::TempDir;
 
 use test_utils::set_json_value;
 
@@ -1215,6 +1216,181 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
     assert!(matches!(res,
         Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ict_first_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a simple table: one int column named 'number' with ICT enabled
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let tmp_dir = TempDir::new()?;
+    let tmp_test_dir_url = Url::from_file_path(&tmp_dir).unwrap();
+
+    let (store, engine, table_location) =
+        engine_store_setup("test_ict_first_commit", Some(&tmp_test_dir_url));
+
+    // Create table with ICT enabled (writer version 7)
+    let table_url = test_utils::create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],                       // no partition columns
+        true,                      // use protocol 3.7
+        vec![],                    // no reader features
+        vec!["inCommitTimestamp"], // Enable ICT!
+    )
+    .await?;
+
+    // FIRST COMMIT: This exercises version() == 0 branch and generates ICT
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(
+        snapshot.version(),
+        0,
+        "Initial snapshot should be version 0"
+    );
+
+    let mut txn = snapshot.transaction()?.with_engine_info("ict test");
+
+    // Add some data
+    let data = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )?;
+
+    let write_context = Arc::new(txn.get_write_context());
+    let file_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(data.clone()),
+            write_context.as_ref(),
+            HashMap::new(),
+            true,
+        )
+        .await?;
+    txn.add_files(file_meta);
+
+    // Commit - this should trigger the version() == 0 branch and generate ICT
+    let commit_result = txn.commit(&engine)?;
+    match commit_result {
+        CommitResult::Committed { version, .. } => {
+            assert_eq!(version, 1, "First commit should result in version 1");
+        }
+        CommitResult::Conflict(_, version) => {
+            panic!(
+                "First commit should not conflict, got conflict at version {}",
+                version
+            );
+        }
+    }
+
+    // VERIFY: Check that the commit log contains inCommitTimestamp
+    let commit_path = table_url.join("_delta_log/00000000000000000001.json")?;
+    let commit1 = store.get(&Path::from_url_path(commit_path.path())?).await?;
+    let commit_content = String::from_utf8(commit1.bytes().await?.to_vec())?;
+
+    // Parse each line of the commit log (NDJSON format)
+    // CommitInfo MUST be the first action when ICT is enabled
+    let lines: Vec<_> = commit_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(!lines.is_empty(), "Commit log should not be empty");
+
+    // First line should contain commitInfo with inCommitTimestamp
+    let first_action: serde_json::Value = serde_json::from_str(lines[0])?;
+    let commit_info = first_action
+        .get("commitInfo")
+        .expect("First action must be commitInfo when ICT is enabled");
+    let actual_ict = commit_info
+        .get("inCommitTimestamp")
+        .expect("commitInfo must have inCommitTimestamp when ICT is enabled")
+        .as_i64()
+        .unwrap();
+
+    // For version() == 0, ICT should be generated since last_commit_timestamp is None
+    assert!(actual_ict > 0, "First commit ICT should be positive");
+
+    // SECOND COMMIT: This exercises the version() != 0 branch
+    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(
+        snapshot2.version(),
+        1,
+        "Second snapshot should be version 1"
+    );
+
+    let mut txn2 = snapshot2.transaction()?.with_engine_info("ict test 2");
+
+    // Add more data
+    let data2 = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+    )?;
+
+    let write_context2 = Arc::new(txn2.get_write_context());
+    let file_meta2 = engine
+        .write_parquet(
+            &ArrowEngineData::new(data2),
+            write_context2.as_ref(),
+            HashMap::new(),
+            true,
+        )
+        .await?;
+    txn2.add_files(file_meta2);
+
+    // Commit - this should trigger the version() != 0 branch
+    let commit_result2 = txn2.commit(&engine)?;
+    match commit_result2 {
+        CommitResult::Committed { version, .. } => {
+            assert_eq!(version, 2, "Second commit should result in version 2");
+        }
+        CommitResult::Conflict(_, version) => {
+            panic!(
+                "Second commit should not conflict, got conflict at version {}",
+                version
+            );
+        }
+    }
+
+    // VERIFY: Check that second commit has proper monotonic ICT
+    let commit2_path = table_url.join("_delta_log/00000000000000000002.json")?;
+    let commit2 = store
+        .get(&Path::from_url_path(commit2_path.path())?)
+        .await?;
+    let commit2_content = String::from_utf8(commit2.bytes().await?.to_vec())?;
+
+    // Parse each line of the second commit log (NDJSON format)
+    // CommitInfo MUST be the first action when ICT is enabled
+    let lines2: Vec<_> = commit2_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(!lines2.is_empty(), "Second commit log should not be empty");
+
+    // First line should contain commitInfo with inCommitTimestamp
+    let first_action2: serde_json::Value = serde_json::from_str(lines2[0])?;
+    let commit_info2 = first_action2
+        .get("commitInfo")
+        .expect("First action must be commitInfo when ICT is enabled");
+    let second_ict = commit_info2
+        .get("inCommitTimestamp")
+        .expect("commitInfo must have inCommitTimestamp when ICT is enabled")
+        .as_i64()
+        .unwrap();
+
+    // Verify monotonic property: second_ict > first_ict
+    // This verifies the version() != 0 branch uses last_commit_timestamp properly
+    assert!(
+        second_ict > actual_ict,
+        "Second ICT ({}) should be greater than first ICT ({})",
+        second_ict,
+        actual_ict
+    );
 
     Ok(())
 }

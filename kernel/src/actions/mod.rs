@@ -623,12 +623,13 @@ pub(crate) struct CommitInfo {
 impl CommitInfo {
     pub(crate) fn new(
         timestamp: i64,
+        in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
-            in_commit_timestamp: None,
+            in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
@@ -1357,7 +1358,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
         // Unknown writer features should cause an error
@@ -1370,7 +1371,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
     }
 
@@ -1469,7 +1470,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);

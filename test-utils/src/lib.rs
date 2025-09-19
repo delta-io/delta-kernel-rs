@@ -275,6 +275,17 @@ pub async fn create_table(
                 json!("another_dummy_column_name"),
             );
         }
+        if writer_features.contains(&"inCommitTimestamp") {
+            config.insert("delta.enableInCommitTimestamps".to_string(), json!("true"));
+            config.insert(
+                "delta.inCommitTimestampEnablementVersion".to_string(),
+                json!("0"),
+            );
+            config.insert(
+                "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                json!("1612345678"),
+            );
+        }
 
         config
     };
