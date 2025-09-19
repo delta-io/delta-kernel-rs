@@ -182,7 +182,7 @@ impl Scalar {
                 // insert an entry for each child builder, even when we're inserting NULL.
                 let builder = builder_as!(array::StructBuilder);
                 require!(
-                    builder.num_fields() == stype.fields_len(),
+                    builder.num_fields() == stype.num_fields(),
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {

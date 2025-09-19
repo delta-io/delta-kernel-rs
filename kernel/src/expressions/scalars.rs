@@ -273,7 +273,7 @@ impl Scalar {
             Self::Binary(_) => DataType::BINARY,
             Self::Decimal(d) => DataType::from(*d.ty()),
             Self::Null(data_type) => data_type.clone(),
-            Self::Struct(data) => DataType::struct_type(data.fields.clone()),
+            Self::Struct(data) => DataType::struct_type_unchecked(data.fields.clone()),
             Self::Array(data) => data.tpe.clone().into(),
             Self::Map(data) => data.data_type.clone().into(),
         }

@@ -457,7 +457,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         // just get a single int column (arbitrary)
-        let null_row_schema = Arc::new(StructType::new(vec![StructField::nullable(
+        let null_row_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "null_col",
             DataType::INTEGER,
         )]));

@@ -1,7 +1,7 @@
 error[E0599]: the method `clone_as_arc` exists for struct `Handle<MutFoo>`, but its trait bounds were not satisfied
   --> tests/invalid-handle-code/mut-clone-handle.rs:13:15
    |
-8  | pub struct MutFoo;
+ 8 | pub struct MutFoo;
    | ----------------- doesn't satisfy `<MutFoo as HandleDescriptor>::Mutable = False`
 ...
 13 |     let r = h.clone_as_arc();
@@ -19,7 +19,7 @@ error[E0271]: type mismatch resolving `<MutFoo as HandleDescriptor>::Mutable == 
 note: expected this to be `False`
   --> tests/invalid-handle-code/mut-clone-handle.rs:7:1
    |
-7  | #[handle_descriptor(target=Foo, mutable=true, sized=true)]
+ 7 | #[handle_descriptor(target=Foo, mutable=true, sized=true)]
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    = note: required for `Handle<MutFoo>` to implement `From<Arc<Foo>>`
    = note: required for `Arc<Foo>` to implement `Into<Handle<MutFoo>>`
@@ -28,7 +28,7 @@ note: expected this to be `False`
 error[E0599]: the method `clone_handle` exists for struct `Handle<MutFoo>`, but its trait bounds were not satisfied
   --> tests/invalid-handle-code/mut-clone-handle.rs:14:15
    |
-8  | pub struct MutFoo;
+ 8 | pub struct MutFoo;
    | ----------------- doesn't satisfy `<MutFoo as HandleDescriptor>::Mutable = False`
 ...
 14 |     let h = h.clone_handle();

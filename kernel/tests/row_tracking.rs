@@ -201,10 +201,10 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
@@ -247,10 +247,10 @@ async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_single_records", schema.clone()).await?;
@@ -284,10 +284,10 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_large_batch", schema.clone()).await?;
@@ -325,10 +325,10 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
@@ -387,10 +387,10 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![
+    let schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
-    ]));
+    ])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_three_transactions", schema.clone()).await?;
@@ -473,10 +473,10 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
@@ -520,10 +520,10 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_append", schema.clone()).await?;
@@ -567,10 +567,10 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
@@ -602,10 +602,10 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_parallel_row_tracking", schema.clone())
@@ -710,10 +710,10 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     // Setup
     let _ = tracing_subscriber::fmt::try_init();
     let tmp_test_dir = tempdir()?;
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     // Create a table without row tracking
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path())

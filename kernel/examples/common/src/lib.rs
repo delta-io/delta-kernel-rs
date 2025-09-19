@@ -81,7 +81,7 @@ pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Sc
                         "Table has no such column: {col}"
                     )))
             });
-            Schema::try_new(selected_fields).map(Arc::new)
+            Schema::try_from_results(selected_fields).map(Arc::new)
         })
         .transpose()?;
     Ok(Some(

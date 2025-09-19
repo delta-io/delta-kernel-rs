@@ -54,15 +54,21 @@ mod tests {
         fn is_unshredded_variant(s: &DataType) -> bool {
             s == &DataType::unshredded_variant()
         }
-        assert!(!is_unshredded_variant(&DataType::variant_type([
-            StructField::not_null("metadata", DataType::BINARY),
-            StructField::nullable("value", DataType::BINARY),
-            StructField::nullable("another_field", DataType::BINARY),
-        ])));
-        assert!(is_unshredded_variant(&DataType::variant_type([
-            StructField::not_null("metadata", DataType::BINARY),
-            StructField::not_null("value", DataType::BINARY),
-        ])));
+        assert!(!is_unshredded_variant(
+            &DataType::variant_type([
+                StructField::not_null("metadata", DataType::BINARY),
+                StructField::nullable("value", DataType::BINARY),
+                StructField::nullable("another_field", DataType::BINARY),
+            ])
+            .unwrap()
+        ));
+        assert!(is_unshredded_variant(
+            &DataType::variant_type([
+                StructField::not_null("metadata", DataType::BINARY),
+                StructField::not_null("value", DataType::BINARY),
+            ])
+            .unwrap()
+        ));
     }
 
     #[test]
@@ -74,22 +80,22 @@ mod tests {
                 WriterFeature::VariantTypePreview,
             ),
         ];
-        let schema_with_variant = StructType::new([
+        let schema_with_variant = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("v", DataType::unshredded_variant(), true),
         ]);
 
-        let schema_without_variant = StructType::new([
+        let schema_without_variant = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("name", DataType::STRING, true),
         ]);
 
         // Nested schema with VARIANT
-        let nested_schema_with_variant = StructType::new([
+        let nested_schema_with_variant = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new([StructField::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
                     "inner_v",
                     DataType::unshredded_variant(),
                     true,

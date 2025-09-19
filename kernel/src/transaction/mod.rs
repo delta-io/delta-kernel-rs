@@ -27,7 +27,7 @@ type EngineDataResultIterator<'a> =
 
 /// The minimal (i.e., mandatory) fields in an add action.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new(vec![
+    Arc::new(StructType::new_unchecked(vec![
         StructField::not_null("path", DataType::STRING),
         StructField::not_null(
             "partitionValues",
@@ -48,10 +48,10 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
 pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
-        DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
+        DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
     );
 
-    Arc::new(StructType::new(
+    Arc::new(StructType::new_unchecked(
         mandatory_add_file_schema().fields().cloned().chain([stats]),
     ))
 });
@@ -85,7 +85,7 @@ fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
         .fields()
         .cloned()
         .chain([StructField::nullable("stats", DataType::STRING)]);
-    Arc::new(StructType::new(fields))
+    Arc::new(StructType::new_unchecked(fields))
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
@@ -96,7 +96,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
         StructField::nullable("baseRowId", DataType::LONG),
         StructField::nullable("defaultRowCommitVersion", DataType::LONG),
     ]);
-    Arc::new(StructType::new(fields))
+    Arc::new(StructType::new_unchecked(fields))
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -221,8 +221,8 @@ impl Transaction {
         let commit_path =
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
         let actions = iter::once(commit_info_action)
-            .chain(set_transaction_actions)
-            .chain(add_actions);
+            .chain(add_actions)
+            .chain(set_transaction_actions);
 
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
@@ -357,35 +357,42 @@ impl Transaction {
             RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
 
         // Create a row tracking visitor and visit all files to collect row tracking information
-        let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark);
-        let mut base_row_id_batches = Vec::with_capacity(self.add_files_metadata.len());
+        let mut row_tracking_visitor =
+            RowTrackingVisitor::new(row_id_high_water_mark, Some(self.add_files_metadata.len()));
 
         // We visit all files with the row visitor before creating the add action iterator
         // because we need to know the final row ID high water mark to create the domain metadata action
         for add_files_batch in &self.add_files_metadata {
             row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
-            base_row_id_batches.push(row_tracking_visitor.base_row_ids.clone());
         }
 
+        // Deconstruct the row tracking visitor to avoid borrowing issues
+        let RowTrackingVisitor {
+            base_row_id_batches,
+            row_id_high_water_mark,
+        } = row_tracking_visitor;
+
         // Generate a domain metadata action based on the final high water mark
-        let domain_metadata = DomainMetadata::try_from(RowTrackingDomainMetadata::new(
-            row_tracking_visitor.row_id_high_water_mark,
-        ))?;
+        let domain_metadata =
+            DomainMetadata::try_from(RowTrackingDomainMetadata::new(row_id_high_water_mark))?;
         let domain_metadata_action =
             domain_metadata.into_engine_data(get_log_domain_metadata_schema().clone(), engine);
+
+        let commit_version = i64::try_from(commit_version)
+            .map_err(|_| Error::generic("Commit version is too large to fit in i64"))?;
 
         // Create an iterator that pairs each add action with its row tracking metadata
         let extended_add_files_metadata =
             self.add_files_metadata.iter().zip(base_row_id_batches).map(
                 move |(add_files_batch, base_row_ids)| {
-                    let commit_versions = vec![commit_version as i64; base_row_ids.len()];
+                    let commit_versions = vec![commit_version; base_row_ids.len()];
                     let base_row_ids =
                         ArrayData::try_new(ArrayType::new(DataType::LONG, true), base_row_ids)?;
                     let row_commit_versions =
                         ArrayData::try_new(ArrayType::new(DataType::LONG, true), commit_versions)?;
 
                     add_files_batch.append_columns(
-                        with_row_tracking_cols(&Arc::new(StructType::new(vec![]))),
+                        with_row_tracking_cols(&Arc::new(StructType::new_unchecked(vec![]))),
                         vec![base_row_ids, row_commit_versions],
                     )
                 },
@@ -481,7 +488,7 @@ mod tests {
     #[test]
     fn test_add_files_schema() {
         let schema = add_files_schema();
-        let expected = StructType::new(vec![
+        let expected = StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
                 "partitionValues",
@@ -492,7 +499,10 @@ mod tests {
             StructField::not_null("dataChange", DataType::BOOLEAN),
             StructField::nullable(
                 "stats",
-                DataType::struct_type(vec![StructField::nullable("numRecords", DataType::LONG)]),
+                DataType::struct_type_unchecked(vec![StructField::nullable(
+                    "numRecords",
+                    DataType::LONG,
+                )]),
             ),
         ]);
         assert_eq!(*schema, expected.into());
