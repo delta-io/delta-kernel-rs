@@ -1,5 +1,129 @@
 # Changelog
 
+## [v0.16.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.16.0/) (2025-09-19)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.15.2...v0.16.0)
+
+
+### 🚀 Features / new APIs
+
+1. Add `UnaryExpression` and `ToJson` expression ([#1192])
+2. Feat!(catalog-managed): SnapshotBuilder ([#1189])
+3. Simplify the Expr::Transform API, add FFI support ([#1243])
+4. Add `numRecords` to `ADD_FILES_SCHEMA` ([#1235])
+5. Add `try_append_columns` to `EngineData` ([#1190])
+6. *(catalog-managed)* Add log_tail to list_log_files ([#1194])
+7. CommitInfo sets a txnId ([#1262])
+8. Add row tracking writer feature ([#1239])
+9. Allow LargeUTF8 -> String and LargeBinary -> Binary in arrow conversion ([#1294])
+10. Implement log compaction ([#1234])
+11. Disallow equal version in log compaction ([#1309])
+12. Introduce `Expression::Variadic` and `Coalesce` expressions ([#1198])
+13. Add `Iterable` to `StructType` ([#1287])
+14. New StructType constructors ([#1278])
+15. Introduce metadata column API ([#1266])
+16. ParsedLogPath for staged commits ([#1305])
+17. Default expression eval supports nested transforms ([#1247])
+18. Introduce row index metadata column ([#1272])
+
+### 🐛 Bug Fixes
+
+1. Make ListedLogFiles::try_new internal-api (again) ([#1226])
+2. Pin comfy-table at 7.1.4 to restore kernel MSRV ([#1231])
+3. Arrow json decoder fix for breakage on long json string ([#1244])
+4. Make ColumnType pub(crate) ([#1258])
+
+### 📚 Documentation
+
+1. Update README.md to enhance FFI documentation ([#1237])
+
+### ⚡ Performance
+
+1. Make checkpoint visitor more efficient using short circuiting ([#1203])
+
+### 🚜 Refactor
+
+1. Factor out a method for LastCheckpointHint path generation ([#1228])
+2. Do not guess Vec size for checkpoints ([#1263])
+3. Introduce current_time_ms() helper ([#1256])
+4. Retention calculation into a new trait ([#1264])
+5. Migrate Snapshot::try_new_from into SnapshotBuilder ([#1289])
+6. Minor Refactoring in Log Compaction ([#1301])
+7. Rename SnapshotBuilder::new to new_for ([#1306])
+8. Move log replay into the action reconciliation module ([#1295])
+9. Introduce SnapshotRef type alias ([#1299])
+10. Row tracking write cleanup ([#1291])
+
+### 🧪 Testing
+
+1. Update invalid-handle tests for rustc 1.90 ([#1321])
+
+### ⚙️ Chores/CI
+
+1. Update changelog for 0.15.1 release ([#1227])
+2. Sync changelog for 0.15.2 ([#1251])
+3. Update data types test to validate full Arrow error message ([#1259])
+4. Add better panic message when not OK ([#1293])
+5. Add test for empty commits and clean up test error types ([#1252])
+6. Make StructType::into_fields return type consistent ([#1327])
+7. Update contributing.md ([#1206])
+
+### Other
+
+1. Create expression benchmark for default engine ([#1220])
+2. Add CDvInfo struct ([#1286])
+3. Add numbers for `KernelError` enum variants ([#1313])
+4. Don't need a whole engine when converting into `ArrowEngineData` ([#1325])
+
+
+[#1192]: https://github.com/delta-io/delta-kernel-rs/pull/1192
+[#1189]: https://github.com/delta-io/delta-kernel-rs/pull/1189
+[#1226]: https://github.com/delta-io/delta-kernel-rs/pull/1226
+[#1227]: https://github.com/delta-io/delta-kernel-rs/pull/1227
+[#1231]: https://github.com/delta-io/delta-kernel-rs/pull/1231
+[#1228]: https://github.com/delta-io/delta-kernel-rs/pull/1228
+[#1203]: https://github.com/delta-io/delta-kernel-rs/pull/1203
+[#1244]: https://github.com/delta-io/delta-kernel-rs/pull/1244
+[#1243]: https://github.com/delta-io/delta-kernel-rs/pull/1243
+[#1251]: https://github.com/delta-io/delta-kernel-rs/pull/1251
+[#1235]: https://github.com/delta-io/delta-kernel-rs/pull/1235
+[#1190]: https://github.com/delta-io/delta-kernel-rs/pull/1190
+[#1194]: https://github.com/delta-io/delta-kernel-rs/pull/1194
+[#1258]: https://github.com/delta-io/delta-kernel-rs/pull/1258
+[#1259]: https://github.com/delta-io/delta-kernel-rs/pull/1259
+[#1263]: https://github.com/delta-io/delta-kernel-rs/pull/1263
+[#1256]: https://github.com/delta-io/delta-kernel-rs/pull/1256
+[#1262]: https://github.com/delta-io/delta-kernel-rs/pull/1262
+[#1264]: https://github.com/delta-io/delta-kernel-rs/pull/1264
+[#1239]: https://github.com/delta-io/delta-kernel-rs/pull/1239
+[#1237]: https://github.com/delta-io/delta-kernel-rs/pull/1237
+[#1294]: https://github.com/delta-io/delta-kernel-rs/pull/1294
+[#1234]: https://github.com/delta-io/delta-kernel-rs/pull/1234
+[#1220]: https://github.com/delta-io/delta-kernel-rs/pull/1220
+[#1289]: https://github.com/delta-io/delta-kernel-rs/pull/1289
+[#1301]: https://github.com/delta-io/delta-kernel-rs/pull/1301
+[#1293]: https://github.com/delta-io/delta-kernel-rs/pull/1293
+[#1306]: https://github.com/delta-io/delta-kernel-rs/pull/1306
+[#1295]: https://github.com/delta-io/delta-kernel-rs/pull/1295
+[#1286]: https://github.com/delta-io/delta-kernel-rs/pull/1286
+[#1313]: https://github.com/delta-io/delta-kernel-rs/pull/1313
+[#1299]: https://github.com/delta-io/delta-kernel-rs/pull/1299
+[#1309]: https://github.com/delta-io/delta-kernel-rs/pull/1309
+[#1198]: https://github.com/delta-io/delta-kernel-rs/pull/1198
+[#1287]: https://github.com/delta-io/delta-kernel-rs/pull/1287
+[#1321]: https://github.com/delta-io/delta-kernel-rs/pull/1321
+[#1278]: https://github.com/delta-io/delta-kernel-rs/pull/1278
+[#1252]: https://github.com/delta-io/delta-kernel-rs/pull/1252
+[#1291]: https://github.com/delta-io/delta-kernel-rs/pull/1291
+[#1266]: https://github.com/delta-io/delta-kernel-rs/pull/1266
+[#1305]: https://github.com/delta-io/delta-kernel-rs/pull/1305
+[#1325]: https://github.com/delta-io/delta-kernel-rs/pull/1325
+[#1247]: https://github.com/delta-io/delta-kernel-rs/pull/1247
+[#1327]: https://github.com/delta-io/delta-kernel-rs/pull/1327
+[#1206]: https://github.com/delta-io/delta-kernel-rs/pull/1206
+[#1272]: https://github.com/delta-io/delta-kernel-rs/pull/1272
+
+
 ## [v0.15.2](https://github.com/delta-io/delta-kernel-rs/tree/v0.15.2/) (2025-09-03)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.15.1...v0.15.2)
