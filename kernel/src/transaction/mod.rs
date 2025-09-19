@@ -201,7 +201,7 @@ impl Transaction {
             let last_commit_timestamp = if self.read_snapshot.version() == 0 {
                 None
             } else {
-                Some(self.read_snapshot.get_timestamp(engine)?)
+                Some(self.read_snapshot.get_in_commit_timestamp(engine)?)
             };
             Some(generate_ict_timestamp(
                 self.commit_timestamp,

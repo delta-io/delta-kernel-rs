@@ -1295,23 +1295,26 @@ async fn test_ict_first_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     let commit_content = String::from_utf8(commit1.bytes().await?.to_vec())?;
 
     // Parse each line of the commit log (NDJSON format)
-    let mut actual_ict = None;
-    for line in commit_content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let json: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(commit_info) = json.get("commitInfo") {
-            if let Some(ict) = commit_info.get("inCommitTimestamp") {
-                actual_ict = Some(ict.as_i64().unwrap());
-                break;
-            }
-        }
-    }
+    // CommitInfo MUST be the first action when ICT is enabled
+    let lines: Vec<_> = commit_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(!lines.is_empty(), "Commit log should not be empty");
 
-    let first_ict = actual_ict.expect("commitInfo with inCommitTimestamp should be present");
+    // First line should contain commitInfo with inCommitTimestamp
+    let first_action: serde_json::Value = serde_json::from_str(lines[0])?;
+    let commit_info = first_action
+        .get("commitInfo")
+        .expect("First action must be commitInfo when ICT is enabled");
+    let actual_ict = commit_info
+        .get("inCommitTimestamp")
+        .expect("commitInfo must have inCommitTimestamp when ICT is enabled")
+        .as_i64()
+        .unwrap();
+
     // For version() == 0, ICT should be generated since last_commit_timestamp is None
-    assert!(first_ict > 0, "First commit ICT should be positive");
+    assert!(actual_ict > 0, "First commit ICT should be positive");
 
     // SECOND COMMIT: This exercises the version() != 0 branch
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
@@ -1362,30 +1365,31 @@ async fn test_ict_first_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     let commit2_content = String::from_utf8(commit2.bytes().await?.to_vec())?;
 
     // Parse each line of the second commit log (NDJSON format)
-    let mut second_ict = None;
-    for line in commit2_content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let json: serde_json::Value = serde_json::from_str(line)?;
-        if let Some(commit_info) = json.get("commitInfo") {
-            if let Some(ict) = commit_info.get("inCommitTimestamp") {
-                second_ict = Some(ict.as_i64().unwrap());
-                break;
-            }
-        }
-    }
+    // CommitInfo MUST be the first action when ICT is enabled
+    let lines2: Vec<_> = commit2_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(!lines2.is_empty(), "Second commit log should not be empty");
 
-    let second_ict =
-        second_ict.expect("Second commitInfo with inCommitTimestamp should be present");
+    // First line should contain commitInfo with inCommitTimestamp
+    let first_action2: serde_json::Value = serde_json::from_str(lines2[0])?;
+    let commit_info2 = first_action2
+        .get("commitInfo")
+        .expect("First action must be commitInfo when ICT is enabled");
+    let second_ict = commit_info2
+        .get("inCommitTimestamp")
+        .expect("commitInfo must have inCommitTimestamp when ICT is enabled")
+        .as_i64()
+        .unwrap();
 
     // Verify monotonic property: second_ict > first_ict
     // This verifies the version() != 0 branch uses last_commit_timestamp properly
     assert!(
-        second_ict > first_ict,
+        second_ict > actual_ict,
         "Second ICT ({}) should be greater than first ICT ({})",
         second_ict,
-        first_ict
+        actual_ict
     );
 
     Ok(())
