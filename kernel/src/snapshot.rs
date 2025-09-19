@@ -492,19 +492,28 @@ mod tests {
         })
     }
 
-    fn create_protocol(ict_enabled: bool) -> serde_json::Value {
+    fn create_protocol(ict_enabled: bool, min_reader_version: Option<u32>) -> serde_json::Value {
+        let reader_version = min_reader_version.unwrap_or(1);
+
         if ict_enabled {
-            json!({
+            let mut protocol = json!({
                 "protocol": {
-                    "minReaderVersion": 1,
+                    "minReaderVersion": reader_version,
                     "minWriterVersion": 7,
                     "writerFeatures": ["inCommitTimestamp"]
                 }
-            })
+            });
+
+            // Only include readerFeatures if minReaderVersion >= 3
+            if reader_version >= 3 {
+                protocol["protocol"]["readerFeatures"] = json!([]);
+            }
+
+            protocol
         } else {
             json!({
                 "protocol": {
-                    "minReaderVersion": 1,
+                    "minReaderVersion": reader_version,
                     "minWriterVersion": 2
                 }
             })
@@ -546,35 +555,15 @@ mod tests {
     }
 
     fn create_basic_commit(ict_enabled: bool, ict_config: Option<(String, String)>) -> String {
-        let protocol = create_protocol(ict_enabled);
+        let protocol = create_protocol(ict_enabled, None);
         let metadata = create_metadata(None, None, None, ict_config, false);
         format!("{}\n{}", protocol, metadata)
     }
 
     fn create_commit_with_ict_missing_enablement() -> String {
-        let protocol = create_protocol(true);
+        let protocol = create_protocol(true, None);
         let metadata = create_metadata(None, None, None, None, true);
         format!("{}\n{}", protocol, metadata)
-    }
-
-    fn create_flexible_protocol(min_reader_version: u32, ict_enabled: bool) -> serde_json::Value {
-        if ict_enabled {
-            json!({
-                "protocol": {
-                    "minReaderVersion": min_reader_version,
-                    "minWriterVersion": 7,
-                    "readerFeatures": [],
-                    "writerFeatures": ["inCommitTimestamp"]
-                }
-            })
-        } else {
-            json!({
-                "protocol": {
-                    "minReaderVersion": min_reader_version,
-                    "minWriterVersion": 2
-                }
-            })
-        }
     }
 
     #[test]
@@ -1341,7 +1330,7 @@ mod tests {
 
         // Test 1: ICT caching - create table with ICT enabled
         let commit_data = [
-            create_flexible_protocol(3, true),
+            create_protocol(true, Some(3)),
             create_metadata(
                 Some("test_id"),
                 Some("{\"type\":\"struct\",\"fields\":[]}"),
