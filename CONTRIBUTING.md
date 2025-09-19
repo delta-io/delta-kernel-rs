@@ -9,7 +9,8 @@
 
 ## How to Contribute
 
-We follow a structured contribution process to ensure high-quality code:
+For trivial fixes, etc. please feel free to open a PR directly. For larger changes, we follow a
+structured contribution process to ensure high-quality code:
 
 1. **Start with an issue and/or design sketch**: Open an issue describing what you want to
    contribute and why. Continue to step 2 after reaching some consensus. This helps us avoid wasted
@@ -23,7 +24,7 @@ We follow a structured contribution process to ensure high-quality code:
 3. **Implementation**: Finally, create PR(s) to implement the feature (production code, tests,
    thorough docs, etc.). Often the initial POC will be split into multiple smaller PRs (e.g.,
    refactors, then feature additions, then public APIs specifically). Care should be taken to ensure
-   each PR is easily reviewable and thoroughly (independently) tested.
+   each PR is easily reviewable and thoroughly tested.
 
 ## Forking and Setup
 
@@ -56,7 +57,22 @@ Our trunk branch is named `main`. Here's the typical workflow:
    git checkout -b my-feature
    ```
    (NB: Consider using `git worktrees` for managing multiple branches!)
-3. Make your changes and test them (cargo test, run clippy, etc. - see what our CI runs)
+3. Make your changes and test them locally. See our CI runs for a full set of tests.
+   ```bash
+   # run most of our tests, typically sufficient for quick iteration
+   cargo test
+   # run clippy
+   cargo clippy --all-features --tests --benches -- -D warnings
+   # build docs
+   cargo doc --workspace --all-features
+   # highly recommend editor that automatically formats, but in case you need to:
+   cargo fmt
+
+   # run more tests
+   cargo test --workspace --all-features -- --skip read_table_version_hdfs
+
+   # see ffi/ dir for more about testing FFI specifically
+   ```
 4. Push to your fork:
    ```bash
    git push origin my-feature
