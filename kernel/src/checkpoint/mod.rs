@@ -35,6 +35,7 @@
 //! # use delta_kernel::checkpoint::CheckpointWriter;
 //! # use delta_kernel::Engine;
 //! # use delta_kernel::Snapshot;
+//! # use delta_kernel::SnapshotRef;
 //! # use delta_kernel::DeltaResult;
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
@@ -47,7 +48,7 @@
 //!
 //! // Create a snapshot for the table at the version you want to checkpoint
 //! let url = delta_kernel::try_parse_uri("./tests/data/app-txn-no-checkpoint")?;
-//! let snapshot = Arc::new(Snapshot::builder(url).build(engine)?);
+//! let snapshot = Snapshot::builder_for(url).build(engine)?;
 //!
 //! // Create a checkpoint writer from the snapshot
 //! let mut writer = snapshot.checkpoint()?;
@@ -79,11 +80,15 @@
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
+//! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.
 use std::sync::{Arc, LazyLock};
 
+use crate::action_reconciliation::log_replay::{
+    ActionReconciliationBatch, ActionReconciliationProcessor,
+};
 use crate::action_reconciliation::RetentionCalculator;
 use crate::actions::{
     Add, Metadata, Protocol, Remove, SetTransaction, Sidecar, ADD_NAME, CHECKPOINT_METADATA_NAME,
@@ -95,14 +100,12 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
-use crate::snapshot::Snapshot;
+use crate::snapshot::SnapshotRef;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
-use log_replay::{CheckpointBatch, CheckpointLogReplayProcessor};
 
 use url::Url;
 
-mod log_replay;
 #[cfg(test)]
 mod tests;
 
@@ -110,7 +113,7 @@ mod tests;
 /// We cannot use `LastCheckpointInfo::to_schema()` as it would include the 'checkpoint_schema'
 /// field, which is only known at runtime.
 static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    StructType::new([
+    StructType::new_unchecked([
         StructField::not_null("version", DataType::LONG),
         StructField::not_null("size", DataType::LONG),
         StructField::nullable("parts", DataType::LONG),
@@ -122,7 +125,7 @@ static LAST_CHECKPOINT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 /// Schema for extracting relevant actions from log files for checkpoint creation
 static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([
+    Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
@@ -136,9 +139,9 @@ static CHECKPOINT_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 // We cannot use `CheckpointMetadata::to_schema()` as it would include the 'tags' field which
 // we're not supporting yet due to the lack of map support TODO(#880).
 static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         CHECKPOINT_METADATA_NAME,
-        DataType::struct_type([StructField::not_null("version", DataType::LONG)]),
+        DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
     )]))
 });
 
@@ -153,7 +156,8 @@ static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
 /// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 pub struct CheckpointDataIterator {
     /// The nested iterator that yields checkpoint batches with action counts
-    checkpoint_batch_iterator: Box<dyn Iterator<Item = DeltaResult<CheckpointBatch>> + Send>,
+    checkpoint_batch_iterator:
+        Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
     /// Running total of actions included in the checkpoint
     actions_count: i64,
     /// Running total of add actions included in the checkpoint
@@ -165,7 +169,7 @@ impl Iterator for CheckpointDataIterator {
 
     /// Advances the iterator and returns the next value.
     ///
-    /// This implementation transforms the `CheckpointBatch` items from the nested iterator into
+    /// This implementation transforms the `ActionReconciliationBatch` items from the nested iterator into
     /// [`FilteredEngineData`] items for the engine to write, while accumulating action counts from
     /// each batch. The [`CheckpointDataIterator`] is passed back to the kernel on call to
     /// [`CheckpointWriter::finalize`] for counts to be read and written to the `_last_checkpoint` file
@@ -192,7 +196,7 @@ impl Iterator for CheckpointDataIterator {
 /// See the [module-level documentation](self) for the complete checkpoint workflow
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
-    pub(crate) snapshot: Arc<Snapshot>,
+    pub(crate) snapshot: SnapshotRef,
 
     /// The version of the snapshot being checkpointed.
     /// Note: Although the version is stored as a u64 in the snapshot, it is stored as an i64
@@ -208,7 +212,7 @@ impl RetentionCalculator for CheckpointWriter {
 
 impl CheckpointWriter {
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
-    pub(crate) fn try_new(snapshot: Arc<Snapshot>) -> DeltaResult<Self> {
+    pub(crate) fn try_new(snapshot: SnapshotRef) -> DeltaResult<Self> {
         let version = i64::try_from(snapshot.version()).map_err(|e| {
             Error::CheckpointWrite(format!(
                 "Failed to convert checkpoint version from u64 {} to i64: {}",
@@ -267,7 +271,7 @@ impl CheckpointWriter {
         )?;
 
         // Create iterator over actions for checkpoint data
-        let checkpoint_data = CheckpointLogReplayProcessor::new(
+        let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
         )
@@ -354,13 +358,13 @@ impl CheckpointWriter {
     /// include the additional metadata field `tags` when map support is added.
     ///
     /// # Returns:
-    /// A [`CheckpointBatch`] batch including the single-row [`EngineData`] batch along with
+    /// A [`ActionReconciliationBatch`] batch including the single-row [`EngineData`] batch along with
     /// an accompanying selection vector with a single `true` value, indicating the action in
     /// batch should be included in the checkpoint.
     fn create_checkpoint_metadata_batch(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<CheckpointBatch> {
+    ) -> DeltaResult<ActionReconciliationBatch> {
         let checkpoint_metadata_batch = engine.evaluation_handler().create_one(
             CHECKPOINT_METADATA_ACTION_SCHEMA.clone(),
             &[Scalar::from(self.version)],
@@ -371,7 +375,7 @@ impl CheckpointWriter {
             selection_vector: vec![true], // Include the action in the checkpoint
         };
 
-        Ok(CheckpointBatch {
+        Ok(ActionReconciliationBatch {
             filtered_data,
             actions_count: 1,
             add_actions_count: 0,

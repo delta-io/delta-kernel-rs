@@ -396,8 +396,8 @@ pub fn test_read(
     url: &Url,
     engine: Arc<dyn Engine>,
 ) -> DeltaResult<()> {
-    let snapshot = Snapshot::builder(url.clone()).build(engine.as_ref())?;
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
     let formatted = pretty_format_batches(&batches).unwrap().to_string();
 

@@ -6,7 +6,7 @@
 //! # use test_utils::DefaultEngineExtension;
 //! # use delta_kernel::engine::default::DefaultEngine;
 //! # use delta_kernel::expressions::{column_expr, Scalar};
-//! # use delta_kernel::{Predicate, Snapshot, Error, Engine};
+//! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, Error, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
 //! # let path = "./tests/data/table-with-cdf";
 //! # let engine = DefaultEngine::new_local();
@@ -40,7 +40,7 @@ use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::{ColumnMappingMode, ReaderFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -97,7 +97,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  ```rust
 ///  # use delta_kernel::engine::default::DefaultEngine;
 ///  # use test_utils::DefaultEngineExtension;
-///  # use delta_kernel::{Snapshot, Error};
+///  # use delta_kernel::{SnapshotRef, Error};
 ///  # use delta_kernel::table_changes::TableChanges;
 ///  # let engine = DefaultEngine::new_local();
 ///  # let path = "./tests/data/table-with-cdf";
@@ -112,7 +112,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 pub struct TableChanges {
     pub(crate) log_segment: LogSegment,
     table_root: Url,
-    end_snapshot: Arc<Snapshot>,
+    end_snapshot: SnapshotRef,
     start_version: Version,
     schema: Schema,
 }
@@ -150,12 +150,15 @@ impl TableChanges {
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
-        let start_snapshot = Arc::new(
-            Snapshot::builder(table_root.as_url().clone())
-                .at_version(start_version)
+        let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
+            .at_version(start_version)
+            .build(engine)?;
+        let end_snapshot = match end_version {
+            Some(version) => Snapshot::builder_from(start_snapshot.clone())
+                .at_version(version)
                 .build(engine)?,
-        );
-        let end_snapshot = Snapshot::try_new_from(start_snapshot.clone(), engine, end_version)?;
+            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+        };
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
@@ -185,13 +188,13 @@ impl TableChanges {
             )));
         }
 
-        let schema = StructType::new(
+        let schema = StructType::try_new(
             end_snapshot
                 .schema()
                 .fields()
                 .cloned()
                 .chain(CDF_FIELDS.clone()),
-        );
+        )?;
 
         Ok(TableChanges {
             table_root,
@@ -318,7 +321,7 @@ mod tests {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
-        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }} }";
+        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} }";
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));

@@ -90,6 +90,7 @@ pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+mod log_compaction;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -146,7 +147,9 @@ pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
+pub use log_compaction::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
 pub use snapshot::Snapshot;
+pub use snapshot::SnapshotRef;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
@@ -454,7 +457,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         // just get a single int column (arbitrary)
-        let null_row_schema = Arc::new(StructType::new(vec![StructField::nullable(
+        let null_row_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "null_col",
             DataType::INTEGER,
         )]));
