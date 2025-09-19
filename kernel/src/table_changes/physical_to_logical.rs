@@ -4,8 +4,8 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use crate::expressions::Scalar;
-use crate::scan::{parse_partition_value, ColumnType};
 use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
+use crate::transforms::ColumnType;
 use crate::{DeltaResult, Error, Expression};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
@@ -50,8 +50,9 @@ pub(crate) fn physical_to_logical_expr(
                     ));
                 };
                 let name = field.physical_name();
+                let raw_value = scan_file.partition_values.get(name);
                 let value_expression =
-                    parse_partition_value(scan_file.partition_values.get(name), field.data_type())?;
+                    crate::transforms::parse_partition_value_raw(raw_value, field.data_type())?;
                 Ok(value_expression.into())
             }
             ColumnType::Selected(field_name) => {
@@ -85,7 +86,6 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::expressions::{column_expr, Expression as Expr, Scalar};
-    use crate::scan::ColumnType;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::physical_to_logical::physical_to_logical_expr;
     use crate::table_changes::scan_file::{CdfScanFile, CdfScanFileType};
@@ -93,6 +93,7 @@ mod tests {
         ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
         REMOVE_CHANGE_TYPE,
     };
+    use crate::transforms::ColumnType;
 
     #[test]
     fn verify_physical_to_logical_expression() {
