@@ -133,9 +133,18 @@ fn evaluate_transform_expression(
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
     let mut output_cols = Vec::new();
 
+    // Helper lambda to get the next output field type
+    let mut output_schema_iter = output_schema.fields();
+    let mut next_output_type = || {
+        output_schema_iter
+            .next()
+            .map(|field| field.data_type())
+            .ok_or_else(|| Error::generic("Too few fields in output schema"))
+    };
+
     // Handle prepends (insertions before any field)
     for expr in &transform.prepended_fields {
-        output_cols.push(evaluate_expression(expr, batch, None)?);
+        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
     }
 
     // Extract the input path, if any
@@ -152,7 +161,7 @@ fn evaluate_transform_expression(
         None => batch,
     };
 
-    // Process each input field in order (unified logic for both cases)
+    // Process each input field in order
     for input_field in source_data.schema_fields() {
         let field_name: &str = input_field.name();
 
@@ -160,12 +169,13 @@ fn evaluate_transform_expression(
         let field_transform = transform.field_transforms.get(field_name);
         if !field_transform.is_some_and(|t| t.is_replace) {
             output_cols.push(extract_column(source_data, &[field_name])?);
+            let _ = next_output_type()?; // consume and discard the output schema field
         }
 
         // Process any insertions that come after this field
         if let Some(field_transform) = field_transform {
             for expr in &field_transform.exprs {
-                output_cols.push(evaluate_expression(expr, batch, None)?);
+                output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
             }
             used_field_transforms += 1;
         }
@@ -178,15 +188,12 @@ fn evaluate_transform_expression(
         ));
     }
 
-    // Verify that the lengths match before attempting to zip them below.
-    if output_cols.len() != output_schema.num_fields() {
-        return Err(Error::generic(format!(
-            "Expression count ({}) doesn't match output schema field count ({})",
-            output_cols.len(),
-            output_schema.num_fields()
-        )));
+    // Verify we consumed all output schema fields
+    if output_schema_iter.next().is_some() {
+        return Err(Error::generic("Too many fields in output schema"));
     }
 
+    // Build the final struct
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
         .zip(output_schema.fields())
@@ -842,8 +849,11 @@ mod tests {
         // Test unused replacement keys
         let transform =
             Transform::new_top_level().with_replaced_field("missing", Expr::literal(1).into());
-        let output_schema =
-            StructType::new_unchecked(vec![StructField::new("a", DataType::INTEGER, false)]);
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
 
         let expr = Expr::Transform(transform);
         let result = evaluate_expression(
@@ -872,13 +882,13 @@ mod tests {
             .to_string()
             .contains("reference invalid input field names"));
 
-        // Test column count mismatch
+        // Test column count mismatch -- too many output schema fields
         let transform3 = Transform::new_top_level().with_dropped_field("a");
 
         let wrong_output_schema = StructType::new_unchecked(vec![
-            StructField::new("a", DataType::INTEGER, false), // expects a field that was dropped
-            StructField::new("b", DataType::INTEGER, false),
-            StructField::new("c", DataType::INTEGER, false),
+            StructField::not_null("a", DataType::INTEGER), // expects a field that was dropped
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
         ]);
 
         let expr3 = Expr::Transform(transform3);
@@ -891,7 +901,25 @@ mod tests {
         assert!(result3
             .unwrap_err()
             .to_string()
-            .contains("Expression count"));
+            .contains("Too many fields in output schema"));
+
+        // Test column count mismatch -- too few output schema fields
+        let transform3 = Transform::new_top_level().with_dropped_field("a");
+
+        let wrong_output_schema =
+            StructType::new_unchecked(vec![StructField::not_null("c", DataType::INTEGER)]);
+
+        let expr3 = Expr::Transform(transform3);
+        let result3 = evaluate_expression(
+            &expr3,
+            &batch,
+            Some(&DataType::Struct(Box::new(wrong_output_schema))),
+        );
+        assert!(result3.is_err());
+        assert!(result3
+            .unwrap_err()
+            .to_string()
+            .contains("Too few fields in output schema"));
 
         // Test missing output schema
         let transform4 = Transform::new_top_level();
@@ -1015,5 +1043,60 @@ mod tests {
             result2,
             "Requested result type Utf8 does not match arrays' data type Int32",
         );
+    }
+
+    #[test]
+    fn test_nested_transforms() {
+        let nested_batch = create_nested_test_batch();
+
+        // Simple nested transform - replace a field in the nested struct
+        let nested_transform =
+            Transform::new_nested(["nested"]).with_replaced_field("x", Expr::literal(999).into());
+
+        let outer_transform = Transform::new_top_level()
+            .with_inserted_field(Some("a"), Expr::Transform(nested_transform).into());
+
+        let nested_output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("x", DataType::INTEGER),
+            StructField::not_null("y", DataType::INTEGER),
+        ]);
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("transformed", nested_output_schema.clone()),
+            StructField::not_null("nested", nested_output_schema),
+        ]);
+
+        let expr = Expr::Transform(outer_transform);
+        let result = evaluate_expression(
+            &expr,
+            &nested_batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_result.num_columns(), 3);
+        assert_eq!(struct_result.len(), 3);
+
+        // Verify original field 'a' (should be [100, 200, 300])
+        validate_i32_column(struct_result, 0, &[100, 200, 300]);
+
+        // Verify nested transform replaced 'x' with literal 999 and passed through 'y' unchanged.
+        let nested_struct_result = struct_result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        validate_i32_column(nested_struct_result, 0, &[999, 999, 999]);
+        validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
+
+        // Verify nested transform passed both 'x' and 'y' unchanged.
+        let nested_struct_result = struct_result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        validate_i32_column(nested_struct_result, 0, &[1, 2, 3]);
+        validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
     }
 }

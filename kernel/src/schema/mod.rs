@@ -926,15 +926,15 @@ impl<'a> Iterator for StructFieldRefIter<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for StructFieldRefIter<'a> {
+impl ExactSizeIterator for StructFieldRefIter<'_> {
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl<'a> FusedIterator for StructFieldRefIter<'a> {}
+impl FusedIterator for StructFieldRefIter<'_> {}
 
-impl<'a> DoubleEndedIterator for StructFieldRefIter<'a> {
+impl DoubleEndedIterator for StructFieldRefIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back()
     }
