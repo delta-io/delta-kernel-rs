@@ -21,7 +21,7 @@ use crate::{DeltaResult, Error};
 pub(crate) enum ColumnType {
     // A column, selected from the data, as is
     Selected(String),
-    // A partition column that needs to be added back in
+    // A partition column that needs to be added back
     Partition(usize),
 }
 
