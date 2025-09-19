@@ -4,9 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
+use test_utils::{create_table, engine_store_setup};
+
 use object_store::path::Path;
 use object_store::ObjectStore;
-use test_utils::{create_table, engine_store_setup};
 use url::Url;
 
 /// Convert a URL to an object_store::Path
@@ -46,11 +47,10 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     .await?;
 
     // Commit 1: Add two files
-    let commit1_content = r#"{"add":{"path":"part-00000-file1.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":10,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 1},\"maxValues\":{\"id\":10}}"}}
+    let commit1_content = r#"{"commitInfo":{"timestamp":1587968586000,"operation":"WRITE","operationParameters":{"mode":"Append"},"isBlindAppend":true}}
+{"add":{"path":"part-00000-file1.parquet","partitionValues":{},"size":1024,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":10,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 1},\"maxValues\":{\"id\":10}}"}}
 {"add":{"path":"part-00001-file2.parquet","partitionValues":{},"size":2048,"modificationTime":1587968586000,"dataChange":true, "stats":"{\"numRecords\":20,\"nullCount\":{\"id\":0},\"minValues\":{\"id\": 11},\"maxValues\":{\"id\":30}}"}}
-{"commitInfo":{"timestamp":1587968586000,"operation":"WRITE","operationParameters":{"mode":"Append"},"isBlindAppend":true}}
 "#;
-    println!("Commit1: {}", commit1_content);
     store
         .put(
             &Path::from("test_compaction_table/_delta_log/00000000000000000001.json"),
@@ -64,12 +64,11 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
         .unwrap()
         .as_millis() as i64;
     let commit2_content = format!(
-        r#"{{"remove":{{"path":"part-00000-file1.parquet","partitionValues":{{}},"size":1024,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{}}}}}
-{{"commitInfo":{{"timestamp":{},"operation":"DELETE","operationParameters":{{"predicate":"id <= 10"}},"isBlindAppend":false}}}}
+        r#"{{"commitInfo":{{"timestamp":{},"operation":"DELETE","operationParameters":{{"predicate":"id <= 10"}},"isBlindAppend":false}}}}
+{{"remove":{{"path":"part-00000-file1.parquet","partitionValues":{{}},"size":1024,"modificationTime":1587968586000,"dataChange":true,"deletionTimestamp":{}}}}}
 "#,
         current_timestamp_millis, current_timestamp_millis
     );
-    println!("Commit2: {}", commit2_content);
     store
         .put(
             &Path::from("test_compaction_table/_delta_log/00000000000000000002.json"),
@@ -88,7 +87,6 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     // Verify the compaction file name
     let expected_filename = "00000000000000000000.00000000000000000002.compacted.json";
     assert!(compaction_path.to_string().ends_with(expected_filename));
-    println!("Compaction file created at: {}", compaction_path);
 
     // Process compaction data batches and collect the actual compacted data
     let mut batch_count = 0;
@@ -110,7 +108,6 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
         batch_count += 1;
     }
 
-    println!("Processed {} compaction data batches", batch_count);
     assert!(
         batch_count > 0,
         "Should have processed at least one compaction batch"
@@ -125,10 +122,6 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let json_bytes = to_json_bytes(compaction_data_iter)?;
     let final_content = String::from_utf8(json_bytes)?;
 
-    println!("=== Compacted JSON content ===");
-    println!("{}", final_content);
-    println!("=== End compacted JSON ===");
-
     let compaction_file_path = url_to_object_store_path(&compaction_path)?;
 
     store
@@ -139,8 +132,6 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     let compacted_content = store.get(&compaction_file_path).await?;
     let compacted_bytes = compacted_content.bytes().await?;
     let compacted_str = std::str::from_utf8(&compacted_bytes)?;
-
-    println!("Compacted content:\n{}", compacted_str);
 
     // Parse and verify the actions
     let compacted_lines: Vec<&str> = compacted_str.trim().lines().collect();
