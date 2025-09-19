@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
@@ -9,23 +10,24 @@ use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
     engine::arrow_data::ArrowEngineData,
-    schema::{DataType, Schema, SchemaRef, StructField, StructType},
+    schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
 
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, RecordBatch, StringArray, StructArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
-    Fields as ArrowFields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use crate::parquet::file::metadata::RowGroupMetaData;
 use crate::parquet::{arrow::ProjectionMask, schema::types::SchemaDescriptor};
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
@@ -98,17 +100,65 @@ pub(crate) fn make_arrow_error(s: impl Into<String>) -> Error {
     .with_backtrace()
 }
 
+/// Prepares to enumerate row indexes of rows in a parquet file, accounting for row group skipping.
+pub(crate) struct RowIndexBuilder {
+    row_group_row_index_ranges: Vec<Range<i64>>,
+    row_group_ordinals: Option<Vec<usize>>,
+}
+
+impl RowIndexBuilder {
+    pub(crate) fn new(row_groups: &[RowGroupMetaData]) -> Self {
+        let mut row_group_row_index_ranges = vec![];
+        let mut offset = 0;
+        for row_group in row_groups {
+            let num_rows = row_group.num_rows();
+            row_group_row_index_ranges.push(offset..offset + num_rows);
+            offset += num_rows;
+        }
+        Self {
+            row_group_row_index_ranges,
+            row_group_ordinals: None,
+        }
+    }
+
+    /// Only produce row indexes for the row groups specified by the ordinals that survived row
+    /// group skipping. The ordinals must be in 0..num_row_groups.
+    pub(crate) fn select_row_groups(&mut self, ordinals: &[usize]) {
+        // NOTE: Don't apply the filtering until we actually build the iterator, because the
+        // filtering is not idempotent and `with_row_groups` could be called more than once.
+        self.row_group_ordinals = Some(ordinals.to_vec())
+    }
+}
+
+impl IntoIterator for RowIndexBuilder {
+    type Item = i64;
+    type IntoIter = std::iter::Flatten<std::vec::IntoIter<Range<Self::Item>>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let starting_offsets = match self.row_group_ordinals {
+            Some(ordinals) => ordinals
+                .iter()
+                .map(|i| self.row_group_row_index_ranges[*i].clone())
+                .collect(),
+            None => self.row_group_row_index_ranges,
+        };
+        starting_offsets.into_iter().flatten()
+    }
+}
+
 /// Applies post-processing to data read from parquet files. This includes `reorder_struct_array` to
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
+/// `row_indexes` are passed through to `reorder_struct_array`.
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
+    row_indexes: Option<&mut <RowIndexBuilder as IntoIterator>::IntoIter>,
 ) -> DeltaResult<T>
 where
     StructArray: Into<T>,
 {
-    let data = reorder_struct_array(batch.into(), requested_ordering)?;
+    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes)?;
     let data = fix_nested_null_masks(data);
     Ok(data.into())
 }
@@ -236,6 +286,8 @@ pub(crate) enum ReorderIndexTransform {
     Identity,
     /// Data is missing, fill in with a null column
     Missing(ArrowFieldRef),
+    /// Row index column requested, compute it
+    RowIndex(ArrowFieldRef),
 }
 
 impl ReorderIndex {
@@ -259,12 +311,18 @@ impl ReorderIndex {
         ReorderIndex::new(index, ReorderIndexTransform::Missing(field))
     }
 
+    fn row_index(index: usize, field: ArrowFieldRef) -> Self {
+        ReorderIndex::new(index, ReorderIndexTransform::RowIndex(field))
+    }
+
     /// Check if this reordering requires a transformation anywhere. See comment below on
     /// [`ordering_needs_transform`] to understand why this is needed.
     fn needs_transform(&self) -> bool {
         match self.transform {
-            // if we're casting or inserting null, we need to transform
-            ReorderIndexTransform::Cast(_) | ReorderIndexTransform::Missing(_) => true,
+            // if we're casting, inserting null, or generating row index, we need to transform
+            ReorderIndexTransform::Cast(_)
+            | ReorderIndexTransform::Missing(_)
+            | ReorderIndexTransform::RowIndex(_) => true,
             // if our nested ordering needs a transform, we need a transform
             ReorderIndexTransform::Nested(ref children) => ordering_needs_transform(children),
             // no transform needed
@@ -508,27 +566,35 @@ fn get_indices(
     }
 
     if found_fields.len() != requested_schema.num_fields() {
-        // some fields are missing, but they might be nullable, need to insert them into the reorder_indices
+        // some fields are missing, but they might be nullable or metadata columns, need to insert them into the reorder_indices
         for (requested_position, field) in requested_schema.fields().enumerate() {
             if !found_fields.contains(field.name()) {
-                if let Some(metadata_spec) = field.get_metadata_column_spec() {
-                    // We don't support reading any metadata columns yet
-                    // TODO: Implement row index support for the Parquet reader
-                    return Err(Error::Generic(format!(
-                        "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
-                    )));
-                }
-                if field.nullable {
-                    debug!("Inserting missing and nullable field: {}", field.name());
-                    reorder_indices.push(ReorderIndex::missing(
-                        requested_position,
-                        Arc::new(field.try_into_arrow()?),
-                    ));
-                } else {
-                    return Err(Error::Generic(format!(
-                        "Requested field not found in parquet schema, and field is not nullable: {}",
-                        field.name()
-                    )));
+                match field.get_metadata_column_spec() {
+                    Some(MetadataColumnSpec::RowIndex) => {
+                        debug!("Inserting a row index column: {}", field.name());
+                        reorder_indices.push(ReorderIndex::row_index(
+                            requested_position,
+                            Arc::new(field.try_into_arrow()?),
+                        ));
+                    }
+                    Some(metadata_spec) => {
+                        return Err(Error::Generic(format!(
+                            "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
+                        )));
+                    }
+                    None if field.nullable => {
+                        debug!("Inserting missing and nullable field: {}", field.name());
+                        reorder_indices.push(ReorderIndex::missing(
+                            requested_position,
+                            Arc::new(field.try_into_arrow()?),
+                        ));
+                    }
+                    None => {
+                        return Err(Error::Generic(format!(
+                            "Requested field not found in parquet schema, and field is not nullable: {}",
+                            field.name()
+                        )));
+                    }
                 }
             }
         }
@@ -642,7 +708,7 @@ pub(crate) fn generate_mask(
     ))
 }
 
-/// Check if an ordering requires transforming the data in any way.  This is true if the indices are
+/// Check if an ordering requires transforming the data in any way. This is true if the indices are
 /// NOT in ascending order (so we have to reorder things), or if we need to do any transformation on
 /// the data read from parquet. We check the ordering here, and also call
 /// `ReorderIndex::needs_transform` on each element to check for other transforms, and to check
@@ -662,15 +728,29 @@ fn ordering_needs_transform(requested_ordering: &[ReorderIndex]) -> bool {
         .any(|ri| (ri[0].index >= ri[1].index) || ri[1].needs_transform())
 }
 
+/// Check if an ordering requires row index computation.
+///
+/// The function only checks if a RowIndex transform is present at the top-level, since metadata
+/// columns are not allowed to be nested.
+pub(crate) fn ordering_needs_row_indexes(requested_ordering: &[ReorderIndex]) -> bool {
+    requested_ordering
+        .iter()
+        .any(|reorder_index| matches!(&reorder_index.transform, ReorderIndexTransform::RowIndex(_)))
+}
+
 // we use this as a placeholder for an array and its associated field. We can fill in a Vec of None
 // of this type and then set elements of the Vec to Some(FieldArrayOpt) for each column
 type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 
 /// Reorder a RecordBatch to match `requested_ordering`. For each non-zero value in
-/// `requested_ordering`, the column at that index will be added in order to returned batch
+/// `requested_ordering`, the column at that index will be added in order to the returned batch.
+///
+/// If the requested ordering contains a [`ReorderIndexTransform::RowIndex`], `row_indexes`
+/// must not be `None` to append a row index column to the output.
 pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
+    mut row_indexes: Option<&mut <RowIndexBuilder as IntoIterator>::IntoIter>,
 ) -> DeltaResult<StructArray> {
     debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
@@ -704,8 +784,11 @@ pub(crate) fn reorder_struct_array(
                     match input_cols[parquet_position].data_type() {
                         ArrowDataType::Struct(_) => {
                             let struct_array = input_cols[parquet_position].as_struct().clone();
-                            let result_array =
-                                Arc::new(reorder_struct_array(struct_array, children)?);
+                            let result_array = Arc::new(reorder_struct_array(
+                                struct_array,
+                                children,
+                                None, // Nested structures don't need row indexes since metadata columns can't be nested
+                            )?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
                                 input_field_name,
@@ -748,6 +831,23 @@ pub(crate) fn reorder_struct_array(
                     let field = field.clone(); // cheap Arc clone
                     final_fields_cols[reorder_index.index] = Some((field, null_array));
                 }
+                ReorderIndexTransform::RowIndex(field) => {
+                    let Some(ref mut row_index_iter) = row_indexes else {
+                        return Err(Error::generic(
+                            "Row index column requested but row index iterator not provided",
+                        ));
+                    };
+                    let row_index_array: PrimitiveArray<Int64Type> =
+                        row_index_iter.take(num_rows).collect();
+                    require!(
+                        row_index_array.len() == num_rows,
+                        Error::internal_error(
+                            "Row index iterator exhausted before reaching the end of the file"
+                        )
+                    );
+                    final_fields_cols[reorder_index.index] =
+                        Some((Arc::clone(field), Arc::new(row_index_array)));
+                }
             }
         }
         let num_cols = final_fields_cols.len();
@@ -773,7 +873,11 @@ fn reorder_list<O: OffsetSizeTrait>(
     let (list_field, offset_buffer, maybe_sa, null_buf) = list_array.into_parts();
     if let Some(struct_array) = maybe_sa.as_struct_opt() {
         let struct_array = struct_array.clone();
-        let result_array = Arc::new(reorder_struct_array(struct_array, children)?);
+        let result_array = Arc::new(reorder_struct_array(
+            struct_array,
+            children,
+            None, // Nested structures don't need row indexes since metadata columns can't be nested
+        )?);
         let new_list_field = Arc::new(ArrowField::new_struct(
             list_field.name(),
             result_array.fields().clone(),
@@ -804,7 +908,11 @@ fn reorder_map(
     children: &[ReorderIndex],
 ) -> DeltaResult<FieldArrayOpt> {
     let (map_field, offset_buffer, struct_array, null_buf, ordered) = map_array.into_parts();
-    let result_array = reorder_struct_array(struct_array, children)?;
+    let result_array = reorder_struct_array(
+        struct_array,
+        children,
+        None, // Nested structures don't need row indexes since metadata columns can't be nested
+    )?;
     let result_fields = result_array.fields();
     let new_map_field = Arc::new(ArrowField::new_struct(
         map_field.name(),
@@ -1577,6 +1685,105 @@ mod tests {
     }
 
     #[test]
+    fn test_ordering_needs_row_indexes() {
+        // Test case 1: No row index needed
+        let ordering_no_row_index = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::cast(1, ArrowDataType::Int64),
+            ReorderIndex::missing(
+                2,
+                Arc::new(ArrowField::new("missing", ArrowDataType::Utf8, true)),
+            ),
+        ];
+        assert!(!ordering_needs_row_indexes(&ordering_no_row_index));
+
+        // Test case 2: Row index needed at top level
+        let ordering_with_row_index = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::row_index(
+                1,
+                Arc::new(ArrowField::new("row_idx", ArrowDataType::Int64, false)),
+            ),
+        ];
+        assert!(ordering_needs_row_indexes(&ordering_with_row_index));
+
+        // Test case 3: Empty ordering
+        assert!(!ordering_needs_row_indexes(&[]));
+    }
+
+    #[test]
+    fn test_reorder_struct_array_missing_row_indexes() {
+        // Test that we get a proper error when row indexes are needed but not provided
+        let arry = make_struct_array();
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::row_index(
+                1,
+                Arc::new(ArrowField::new("row_idx", ArrowDataType::Int64, false)),
+            ),
+        ];
+
+        let result = reorder_struct_array(arry, &reorder, None);
+        assert_result_error_with_message(
+            result,
+            "Row index column requested but row index iterator not provided",
+        );
+    }
+
+    #[test]
+    fn test_reorder_struct_array_with_row_indexes() {
+        // Test that row indexes work when properly provided
+        let arry = make_struct_array();
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::row_index(
+                1,
+                Arc::new(ArrowField::new("row_idx", ArrowDataType::Int64, false)),
+            ),
+        ];
+
+        // Create a mock row index iterator
+        #[allow(clippy::single_range_in_vec_init)]
+        let mut row_indexes = vec![(0..4)].into_iter().flatten();
+
+        let ordered = reorder_struct_array(arry, &reorder, Some(&mut row_indexes)).unwrap();
+        assert_eq!(ordered.column_names(), vec!["b", "row_idx"]);
+
+        // Verify the row index column contains the expected values
+        let row_idx_col = ordered.column(1).as_primitive::<Int64Type>();
+        assert_eq!(row_idx_col.values(), &[0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn simple_row_index_field() {
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::create_metadata_column("my_row_index", MetadataColumnSpec::RowIndex),
+            StructField::nullable("i2", DataType::INTEGER),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new("i2", ArrowDataType::Int32, true),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![0, 1];
+        let mut arrow_row_index_field =
+            ArrowField::new("my_row_index", ArrowDataType::Int64, false);
+        arrow_row_index_field.set_metadata(HashMap::from([(
+            "delta.metadataSpec".to_string(),
+            "row_index".to_string(),
+        )]));
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::identity(2),
+            ReorderIndex::row_index(1, Arc::new(arrow_row_index_field)),
+        ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
     fn nested_indices() {
         column_mapping_cases().into_iter().for_each(|mode| {
             let requested_schema = StructType::new_unchecked([
@@ -2156,7 +2363,7 @@ mod tests {
     fn simple_reorder_struct() {
         let arry = make_struct_array();
         let reorder = vec![ReorderIndex::identity(1), ReorderIndex::identity(0)];
-        let ordered = reorder_struct_array(arry, &reorder).unwrap();
+        let ordered = reorder_struct_array(arry, &reorder, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["c", "b"]);
     }
 
@@ -2204,7 +2411,7 @@ mod tests {
                 ],
             ),
         ];
-        let ordered = reorder_struct_array(nested, &reorder).unwrap();
+        let ordered = reorder_struct_array(nested, &reorder, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["struct2", "struct1"]);
         let ordered_s2 = ordered.column(0).as_struct();
         assert_eq!(ordered_s2.column_names(), vec!["b", "c", "s"]);
@@ -2251,7 +2458,7 @@ mod tests {
             0,
             vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
         )];
-        let ordered = reorder_struct_array(struct_array, &reorder).unwrap();
+        let ordered = reorder_struct_array(struct_array, &reorder, None).unwrap();
         let ordered_list_col = ordered.column(0).as_list::<i32>();
         for i in 0..ordered_list_col.len() {
             let array_item = ordered_list_col.value(i);
@@ -2317,7 +2524,7 @@ mod tests {
                 ],
             ),
         ];
-        let ordered = reorder_struct_array(struct_array, &reorder).unwrap();
+        let ordered = reorder_struct_array(struct_array, &reorder, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["map", "i"]);
         if let ArrowDataType::Map(field, _) = ordered.column(0).data_type() {
             if let ArrowDataType::Struct(fields) = field.data_type() {
