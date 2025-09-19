@@ -1,4 +1,5 @@
 //! An implementation of parquet row group skipping using data skipping predicates over footer stats.
+use crate::engine::arrow_utils::RowIndexBuilder;
 use crate::expressions::{ColumnName, DecimalData, Predicate, Scalar};
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::parquet::arrow::arrow_reader::ArrowReaderBuilder;
@@ -17,22 +18,36 @@ mod tests;
 pub(crate) trait ParquetRowGroupSkipping {
     /// Instructs the parquet reader to perform row group skipping, eliminating any row group whose
     /// stats prove that none of the group's rows can satisfy the given `predicate`.
-    fn with_row_group_filter(self, predicate: &Predicate) -> Self;
+    ///
+    /// If a [`RowIndexBuilder`] is provided, it will be updated to only include row indices of the
+    /// row groups that survived the filter.
+    fn with_row_group_filter(
+        self,
+        predicate: &Predicate,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self;
 }
 impl<T> ParquetRowGroupSkipping for ArrowReaderBuilder<T> {
-    fn with_row_group_filter(self, predicate: &Predicate) -> Self {
-        let indices = self
+    fn with_row_group_filter(
+        self,
+        predicate: &Predicate,
+        row_indexes: Option<&mut RowIndexBuilder>,
+    ) -> Self {
+        let ordinals: Vec<_> = self
             .metadata()
             .row_groups()
             .iter()
             .enumerate()
-            .filter_map(|(index, row_group)| {
-                // If the group survives the filter, return Some(index) so filter_map keeps it.
-                RowGroupFilter::apply(row_group, predicate).then_some(index)
+            .filter_map(|(ordinal, row_group)| {
+                // If the group survives the filter, return Some(ordinal) so filter_map keeps it.
+                RowGroupFilter::apply(row_group, predicate).then_some(ordinal)
             })
             .collect();
-        debug!("with_row_group_filter({predicate:#?}) = {indices:?})");
-        self.with_row_groups(indices)
+        debug!("with_row_group_filter({predicate:#?}) = {ordinals:?})");
+        if let Some(row_indexes) = row_indexes {
+            row_indexes.select_row_groups(&ordinals);
+        }
+        self.with_row_groups(ordinals)
     }
 }
 
