@@ -120,7 +120,7 @@ impl TableChangesScanBuilder {
         let logical_schema = self
             .schema
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
-        let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
+        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
 
         // Loop over all selected fields. We produce the following:
         // - If the field is read from the parquet file then it is ([`ColumnType::Selected`]).
@@ -173,7 +173,7 @@ impl TableChangesScanBuilder {
             logical_schema,
             physical_predicate,
             all_fields: Arc::new(all_fields),
-            physical_schema: StructType::new(read_fields).into(),
+            physical_schema: StructType::try_new(read_fields)?.into(),
         })
     }
 }
@@ -422,7 +422,7 @@ mod tests {
         );
         assert_eq!(
             scan.logical_schema,
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::nullable("id", DataType::INTEGER),
                 StructField::not_null("_commit_version", DataType::LONG),
             ])
@@ -432,7 +432,7 @@ mod tests {
             scan.physical_predicate,
             PhysicalPredicate::Some(
                 predicate,
-                StructType::new([StructField::nullable("id", DataType::INTEGER),]).into()
+                StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER),]).into()
             )
         );
     }

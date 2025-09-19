@@ -222,7 +222,7 @@ pub unsafe extern "C" fn visit_schema(
 fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> usize {
     // Visit all the fields of a struct and return the list of children
     fn visit_struct_fields(visitor: &EngineSchemaVisitor, s: &StructType) -> usize {
-        let child_list_id = (visitor.make_field_list)(visitor.data, s.fields.len());
+        let child_list_id = (visitor.make_field_list)(visitor.data, s.num_fields());
         for field in s.fields() {
             visit_schema_item(
                 field.name(),

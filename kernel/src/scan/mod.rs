@@ -129,7 +129,7 @@ impl ScanBuilder {
         Ok(Scan {
             snapshot: self.snapshot,
             logical_schema,
-            physical_schema: Arc::new(StructType::new(state_info.read_fields)),
+            physical_schema: Arc::new(StructType::try_new(state_info.read_fields)?),
             physical_predicate,
             all_fields: Arc::new(state_info.all_fields),
             have_partition_cols: state_info.have_partition_cols,
@@ -581,9 +581,9 @@ impl Scan {
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-            DataType::struct_type(vec![StructField::nullable(
+            DataType::struct_type_unchecked(vec![StructField::nullable(
                 "add",
-                DataType::struct_type(vec![
+                DataType::struct_type_unchecked(vec![
                     StructField::not_null("path", DataType::STRING),
                     StructField::not_null("partitionValues", partition_values),
                     StructField::not_null("size", DataType::LONG),
@@ -872,7 +872,9 @@ impl StateInfo {
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
         let mut have_partition_cols = false;
-        let mut read_fields = Vec::with_capacity(logical_schema.fields.len());
+        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
+        let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
+
         // Loop over all selected fields and note if they are columns that will be read from the
         // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
         // be filled in by evaluating an expression ([`ColumnType::Partition`])
@@ -881,6 +883,13 @@ impl StateInfo {
             .enumerate()
             .map(|(index, logical_field)| -> DeltaResult<_> {
                 if partition_columns.contains(logical_field.name()) {
+                    if logical_field.is_metadata_column() {
+                        return Err(Error::Schema(format!(
+                            "Metadata column names must not match partition columns: {}",
+                            logical_field.name()
+                        )));
+                    }
+
                     // Store the index into the schema for this field. When we turn it into an
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
@@ -893,10 +902,26 @@ impl StateInfo {
                     debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                     let physical_name = physical_field.name.clone();
                     read_fields.push(physical_field);
+
+                    if !logical_field.is_metadata_column() {
+                        read_field_names.insert(physical_name.clone());
+                    }
+
                     Ok(ColumnType::Selected(physical_name))
                 }
             })
             .try_collect()?;
+
+        // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
+        for metadata_column in logical_schema.metadata_columns() {
+            if read_field_names.contains(metadata_column.name()) {
+                return Err(Error::Schema(format!(
+                    "Metadata column names must not match physical columns: {}",
+                    metadata_column.name()
+                )));
+            }
+        }
+
         Ok(StateInfo {
             all_fields,
             read_fields,
@@ -1027,8 +1052,8 @@ pub(crate) mod test_utils {
         context: T,
         validate_callback: ScanCallback<T>,
     ) {
-        let logical_schema =
-            logical_schema.unwrap_or_else(|| Arc::new(crate::schema::StructType::new(vec![])));
+        let logical_schema = logical_schema
+            .unwrap_or_else(|| Arc::new(crate::schema::StructType::new_unchecked(vec![])));
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -1093,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_physical_predicate() {
-        let logical_schema = StructType::new(vec![
+        let logical_schema = StructType::new_unchecked(vec![
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG).with_metadata([(
                 ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1105,7 +1130,7 @@ mod tests {
             )]),
             StructField::nullable(
                 "nested",
-                StructType::new(vec![
+                StructType::new_unchecked(vec![
                     StructField::nullable("x", DataType::LONG),
                     StructField::nullable("y", DataType::LONG).with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1115,7 +1140,7 @@ mod tests {
             ),
             StructField::nullable(
                 "mapped",
-                StructType::new(vec![StructField::nullable("n", DataType::LONG)
+                StructType::new_unchecked(vec![StructField::nullable("n", DataType::LONG)
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
                         "phys_n",
@@ -1137,18 +1162,22 @@ mod tests {
                 column_pred!("a"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("a").into(),
-                    StructType::new(vec![StructField::nullable("a", DataType::LONG)]).into(),
+                    StructType::new_unchecked(vec![StructField::nullable("a", DataType::LONG)])
+                        .into(),
                 )),
             ),
             (
                 column_pred!("b"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("phys_b").into(),
-                    StructType::new(vec![StructField::nullable("phys_b", DataType::LONG)
-                        .with_metadata([(
-                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                            "phys_b",
-                        )])])
+                    StructType::new_unchecked(vec![StructField::nullable(
+                        "phys_b",
+                        DataType::LONG,
+                    )
+                    .with_metadata([(
+                        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                        "phys_b",
+                    )])])
                     .into(),
                 )),
             ),
@@ -1156,9 +1185,9 @@ mod tests {
                 column_pred!("nested.x"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("nested.x").into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "nested",
-                        StructType::new(vec![StructField::nullable("x", DataType::LONG)]),
+                        StructType::new_unchecked(vec![StructField::nullable("x", DataType::LONG)]),
                     )])
                     .into(),
                 )),
@@ -1167,13 +1196,16 @@ mod tests {
                 column_pred!("nested.y"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("nested.phys_y").into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "nested",
-                        StructType::new(vec![StructField::nullable("phys_y", DataType::LONG)
-                            .with_metadata([(
-                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                                "phys_y",
-                            )])]),
+                        StructType::new_unchecked(vec![StructField::nullable(
+                            "phys_y",
+                            DataType::LONG,
+                        )
+                        .with_metadata([(
+                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                            "phys_y",
+                        )])]),
                     )])
                     .into(),
                 )),
@@ -1182,13 +1214,16 @@ mod tests {
                 column_pred!("mapped.n"),
                 Some(PhysicalPredicate::Some(
                     column_pred!("phys_mapped.phys_n").into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "phys_mapped",
-                        StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
-                            .with_metadata([(
-                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                                "phys_n",
-                            )])]),
+                        StructType::new_unchecked(vec![StructField::nullable(
+                            "phys_n",
+                            DataType::LONG,
+                        )
+                        .with_metadata([(
+                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                            "phys_n",
+                        )])]),
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
@@ -1201,13 +1236,16 @@ mod tests {
                 Pred::and(column_pred!("mapped.n"), Pred::literal(true)),
                 Some(PhysicalPredicate::Some(
                     Pred::and(column_pred!("phys_mapped.phys_n"), Pred::literal(true)).into(),
-                    StructType::new(vec![StructField::nullable(
+                    StructType::new_unchecked(vec![StructField::nullable(
                         "phys_mapped",
-                        StructType::new(vec![StructField::nullable("phys_n", DataType::LONG)
-                            .with_metadata([(
-                                ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-                                "phys_n",
-                            )])]),
+                        StructType::new_unchecked(vec![StructField::nullable(
+                            "phys_n",
+                            DataType::LONG,
+                        )
+                        .with_metadata([(
+                            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+                            "phys_n",
+                        )])]),
                     )
                     .with_metadata([(
                         ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),

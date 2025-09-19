@@ -127,8 +127,8 @@ impl AddRemoveDedupVisitor<'_> {
         field_idx: usize,
         partition_values: &HashMap<String, String>,
     ) -> DeltaResult<(usize, (String, Scalar))> {
-        let field = self.logical_schema.fields.get_index(field_idx);
-        let Some((_, field)) = field else {
+        let field = self.logical_schema.field_at_index(field_idx);
+        let Some(field) = field else {
             return Err(Error::InternalError(format!(
                 "out of bounds partition column field index {field_idx}"
             )));
@@ -329,8 +329,8 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     // Note that fields projected out of a nullable struct must be nullable
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values =
-        StructType::new([StructField::nullable("partitionValues", partition_values)]);
-    Arc::new(StructType::new([
+        StructType::new_unchecked([StructField::nullable("partitionValues", partition_values)]);
+    Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn test_no_transforms() {
         let batch = vec![add_batch_simple(get_log_schema().clone())];
-        let logical_schema = Arc::new(crate::schema::StructType::new(vec![]));
+        let logical_schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_simple_transform() {
-        let schema: SchemaRef = Arc::new(StructType::new([
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::new("value", DataType::INTEGER, true),
             StructField::new("date", DataType::DATE, true),
         ]));
