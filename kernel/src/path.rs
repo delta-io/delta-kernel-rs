@@ -181,7 +181,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         match self.file_type {
             LogPathFileType::Commit
             | LogPathFileType::SinglePartCheckpoint
-            | LogPathFileType::UuidCheckpoint(_)
+            | LogPathFileType::UuidCheckpoint
             | LogPathFileType::MultiPartCheckpoint { .. }
             | LogPathFileType::CompactedCommit { .. }
             | LogPathFileType::Crc
@@ -785,10 +785,7 @@ mod tests {
             (LogPathFileType::Commit, true),
             (LogPathFileType::StagedCommit, false),
             (LogPathFileType::SinglePartCheckpoint, true),
-            (
-                LogPathFileType::UuidCheckpoint("some-uuid".to_string()),
-                true,
-            ),
+            (LogPathFileType::UuidCheckpoint, true),
             (
                 LogPathFileType::MultiPartCheckpoint {
                     part_num: 1,
