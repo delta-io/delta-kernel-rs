@@ -7,9 +7,9 @@ use crate::arrow::datatypes::{
 };
 
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::error::{DeltaResult, Error};
-use crate::expressions::{Expression, ExpressionRef, PredicateRef, Scalar};
+use crate::expressions::{ArrayData, Expression, ExpressionRef, PredicateRef, Scalar};
 use crate::schema::{DataType, PrimitiveType, SchemaRef};
 use crate::utils::require;
 use crate::{EngineData, EvaluationHandler, ExpressionEvaluator, PredicateEvaluator};
@@ -54,7 +54,7 @@ impl Scalar {
     // NOTE: `ListBuilder` and `MapBuilder` are take generic element/key/value builders in order to
     // work with specific builder types directly. However, `array::make_builder` instantiates them
     // with `Box<dyn Builder>` instead, which greatly simplifies our job in working with them. We
-    // can just extract the builder trait,and let recursive calls cast it to the desired type.
+    // can just extract the builder trait, and let recursive calls cast it to the desired type.
     //
     // WARNING: List and map builders do _NOT_ require appending any child entries to NULL list/map
     // rows, because empty list/map is a valid state. But struct builders _DO_ require appending
@@ -182,7 +182,7 @@ impl Scalar {
                 // insert an entry for each child builder, even when we're inserting NULL.
                 let builder = builder_as!(array::StructBuilder);
                 require!(
-                    builder.num_fields() == stype.fields_len(),
+                    builder.num_fields() == stype.num_fields(),
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
@@ -210,6 +210,22 @@ impl Scalar {
             }
         }
         Ok(())
+    }
+}
+
+impl ArrayData {
+    /// Convert kernel [`ArrayData`] to an Arrow [`ArrayRef`] of the equivalent type.
+    pub fn to_arrow(&self) -> DeltaResult<ArrayRef> {
+        let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())?;
+
+        #[allow(deprecated)]
+        let elements = self.array_elements();
+        let mut builder = array::make_builder(&arrow_data_type, elements.len());
+        for element in elements {
+            element.append_to(&mut builder, 1)?;
+        }
+
+        Ok(builder.finish())
     }
 }
 
@@ -265,11 +281,7 @@ pub struct DefaultExpressionEvaluator {
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.expression);
-        let batch = batch
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
+        let batch = extract_record_batch(batch)?;
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {
@@ -317,11 +329,7 @@ pub struct DefaultPredicateEvaluator {
 impl PredicateEvaluator for DefaultPredicateEvaluator {
     fn evaluate(&self, batch: &dyn EngineData) -> DeltaResult<Box<dyn EngineData>> {
         debug!("Arrow evaluator evaluating: {:#?}", self.predicate);
-        let batch = batch
-            .any_ref()
-            .downcast_ref::<ArrowEngineData>()
-            .ok_or_else(|| Error::engine_data_type("ArrowEngineData"))?
-            .record_batch();
+        let batch = extract_record_batch(batch)?;
         let _input_schema: ArrowSchema = self.input_schema.as_ref().try_into_arrow()?;
         // TODO: make sure we have matching schemas for validation
         // if batch.schema().as_ref() != &input_schema {

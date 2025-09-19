@@ -68,7 +68,7 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
 static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([
+    Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
         StructField::nullable(METADATA_NAME, Metadata::to_schema()),
@@ -83,28 +83,28 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         ADD_NAME,
         Add::to_schema(),
     )]))
 });
 
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         COMMIT_INFO_NAME,
         CommitInfo::to_schema(),
     )]))
 });
 
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         SET_TRANSACTION_NAME,
         SetTransaction::to_schema(),
     )]))
 });
 
 static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new([StructField::nullable(
+    Arc::new(StructType::new_unchecked([StructField::nullable(
         DOMAIN_METADATA_NAME,
         DomainMetadata::to_schema(),
     )]))
@@ -130,6 +130,16 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+/// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
+///
+/// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
+/// schema in a top-level "add" struct.
+pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME, schema,
+    )]))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -166,7 +176,7 @@ impl TryFrom<Format> for Scalar {
         )
         .map(Scalar::Map)?;
         Ok(Scalar::Struct(StructData::try_new(
-            Format::to_schema().fields().cloned().collect(),
+            Format::to_schema().into_fields().collect(),
             vec![provider, options],
         )?))
     }
@@ -180,6 +190,7 @@ impl TryFrom<Format> for Scalar {
 )]
 #[internal_api]
 pub(crate) struct Metadata {
+    // TODO: Make the struct fields private to force using the try_new function.
     /// Unique identifier for this table
     pub(crate) id: String,
     /// User-provided identifier for this table
@@ -209,6 +220,16 @@ impl Metadata {
         created_time: i64,
         configuration: HashMap<String, String>,
     ) -> DeltaResult<Self> {
+        // Validate that the schema does not contain metadata columns
+        // Note: We don't have to look for nested metadata columns because that is already validated
+        // when creating a StructType.
+        if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
+            return Err(Error::Schema(format!(
+                "Table schema must not contain metadata columns. Found metadata column: '{}'",
+                metadata_field.name
+            )));
+        }
+
         Ok(Self {
             id: uuid::Uuid::new_v4().to_string(),
             name,
@@ -461,7 +482,18 @@ impl Protocol {
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
-                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)
+                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)?;
+
+                // ensure that there is no illegal combination of features
+                if writer_features.contains(&WriterFeature::RowTracking)
+                    && !writer_features.contains(&WriterFeature::DomainMetadata)
+                {
+                    Err(Error::invalid_protocol(
+                        "rowTracking feature requires domainMetadata to also be enabled",
+                    ))
+                } else {
+                    Ok(())
+                }
             }
             Some(_) => {
                 // there are features, but we're not on 7, so the protocol is actually broken
@@ -584,8 +616,7 @@ pub(crate) struct CommitInfo {
     pub(crate) kernel_version: Option<String>,
     /// A place for the engine to store additional metadata associated with this commit
     pub(crate) engine_info: Option<String>,
-    /// A unique transaction identified for this commit. When the `catalogManaged` table feature is
-    /// enabled (not yet implemented), this field will be required. Otherwise, it is optional.
+    /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
 }
 
@@ -602,7 +633,7 @@ impl CommitInfo {
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
-            txn_id: None,
+            txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
     }
 }
@@ -675,7 +706,7 @@ pub(crate) struct Add {
 
     /// Default generated Row ID of the first row in the file. The default generated Row IDs
     /// of the other rows in the file can be reconstructed by adding the physical index of the
-    /// row within the file to the base Row ID
+    /// row within the file to the base Row ID.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub base_row_id: Option<i64>,
 
@@ -883,6 +914,17 @@ pub(crate) struct DomainMetadata {
 }
 
 impl DomainMetadata {
+    /// Create a new DomainMetadata action.
+    // TODO: Discuss if we should remove `removed` from this method and introduce a dedicated
+    // method for removed domain metadata.
+    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
+        DomainMetadata {
+            domain,
+            configuration,
+            removed,
+        }
+    }
+
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
@@ -901,8 +943,7 @@ mod tests {
         },
         arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
         arrow::json::ReaderBuilder,
-        engine::arrow_data::ArrowEngineData,
-        engine::arrow_expression::ArrowEvaluationHandler,
+        engine::{arrow_data::ArrowEngineData, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
         utils::test_utils::assert_result_error_with_message,
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
@@ -961,15 +1002,15 @@ mod tests {
             .project(&[METADATA_NAME])
             .expect("Couldn't get metaData field");
 
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "metaData",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("id", DataType::STRING),
                 StructField::nullable("name", DataType::STRING),
                 StructField::nullable("description", DataType::STRING),
                 StructField::not_null(
                     "format",
-                    StructType::new([
+                    StructType::new_unchecked([
                         StructField::not_null("provider", DataType::STRING),
                         StructField::not_null(
                             "options",
@@ -995,9 +1036,9 @@ mod tests {
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "add",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
                     "partitionValues",
@@ -1037,7 +1078,7 @@ mod tests {
     fn deletion_vector_field() -> StructField {
         StructField::nullable(
             "deletionVector",
-            DataType::struct_type([
+            DataType::struct_type_unchecked([
                 StructField::not_null("storageType", DataType::STRING),
                 StructField::not_null("pathOrInlineDv", DataType::STRING),
                 StructField::nullable("offset", DataType::INTEGER),
@@ -1052,9 +1093,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "remove",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::nullable("deletionTimestamp", DataType::LONG),
                 StructField::not_null("dataChange", DataType::BOOLEAN),
@@ -1075,9 +1116,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[CDC_NAME])
             .expect("Couldn't get cdc field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "cdc",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null(
                     "partitionValues",
@@ -1096,9 +1137,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[SIDECAR_NAME])
             .expect("Couldn't get sidecar field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "sidecar",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("path", DataType::STRING),
                 StructField::not_null("sizeInBytes", DataType::LONG),
                 StructField::not_null("modificationTime", DataType::LONG),
@@ -1113,9 +1154,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[CHECKPOINT_METADATA_NAME])
             .expect("Couldn't get checkpointMetadata field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "checkpointMetadata",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("version", DataType::LONG),
                 tags_field(),
             ]),
@@ -1129,9 +1170,9 @@ mod tests {
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "txn",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("appId", DataType::STRING),
                 StructField::not_null("version", DataType::LONG),
                 StructField::nullable("lastUpdated", DataType::LONG),
@@ -1146,9 +1187,9 @@ mod tests {
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
-        let expected = Arc::new(StructType::new(vec![StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "commitInfo",
-            StructType::new(vec![
+            StructType::new_unchecked(vec![
                 StructField::nullable("timestamp", DataType::LONG),
                 StructField::nullable("inCommitTimestamp", DataType::LONG),
                 StructField::nullable("operation", DataType::STRING),
@@ -1169,9 +1210,9 @@ mod tests {
         let schema = get_log_schema()
             .project(&[DOMAIN_METADATA_NAME])
             .expect("Couldn't get domainMetadata field");
-        let expected = Arc::new(StructType::new([StructField::nullable(
+        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
             "domainMetadata",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::not_null("domain", DataType::STRING),
                 StructField::not_null("configuration", DataType::STRING),
                 StructField::not_null("removed", DataType::BOOLEAN),
@@ -1297,22 +1338,58 @@ mod tests {
             Some(vec![
                 WriterFeature::AppendOnly,
                 WriterFeature::DeletionVectors,
+                WriterFeature::DomainMetadata,
                 WriterFeature::Invariants,
+                WriterFeature::RowTracking,
             ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
 
+        // Verify that unsupported writer features are rejected
+        // NOTE: Unsupported reader features should not cause an error here
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
-            Some([WriterFeature::RowTracking]),
+            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
+            Some([WriterFeature::IdentityColumns]),
         )
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "rowTracking". Supported WriterFeatures: "appendOnly", "deletionVectors", "invariants", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+        );
+
+        // Unknown writer features should cause an error
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
+            Some([WriterFeature::Unknown("unsupported writer".to_string())]),
+        )
+        .unwrap();
+        assert_result_error_with_message(
+            protocol.ensure_write_supported(),
+            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+        );
+    }
+
+    #[test]
+    fn test_illegal_writer_feature_combination() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                // No domain metadata even though that is required
+                WriterFeature::RowTracking,
+            ]),
+        )
+        .unwrap();
+
+        assert_result_error_with_message(
+            protocol.ensure_write_supported(),
+            "rowTracking feature requires domainMetadata to also be enabled",
         );
     }
 
@@ -1393,6 +1470,7 @@ mod tests {
         let engine = ExprEngine::new();
 
         let commit_info = CommitInfo::new(0, None, None);
+        let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
 
@@ -1416,7 +1494,7 @@ mod tests {
                 operation_parameters,
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
-                Arc::new(StringArray::from(vec![None::<String>])),
+                Arc::new(StringArray::from(vec![commit_info_txn_id])),
             ],
         )
         .unwrap();
@@ -1459,7 +1537,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new() {
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
         let config = HashMap::from([("key1".to_string(), "value1".to_string())]);
 
         let metadata = Metadata::try_new(
@@ -1484,7 +1562,7 @@ mod tests {
 
     #[test]
     fn test_metadata_try_new_default() {
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         assert!(!metadata.id.is_empty());
@@ -1494,7 +1572,7 @@ mod tests {
 
     #[test]
     fn test_metadata_unique_ids() {
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
         let m1 = Metadata::try_new(None, None, schema.clone(), vec![], 0, HashMap::new()).unwrap();
         let m2 = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         assert_ne!(m1.id, m2.id);
@@ -1581,7 +1659,7 @@ mod tests {
     #[test]
     fn test_metadata_into_engine_data() {
         let engine = ExprEngine::new();
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
 
         let test_metadata = Metadata::try_new(
             Some("test".to_string()),
@@ -1632,7 +1710,7 @@ mod tests {
     #[test]
     fn test_metadata_with_log_schema() {
         let engine = ExprEngine::new();
-        let schema = StructType::new([StructField::not_null("id", DataType::INTEGER)]);
+        let schema = StructType::new_unchecked([StructField::not_null("id", DataType::INTEGER)]);
 
         let metadata = Metadata::try_new(
             Some("table".to_string()),
