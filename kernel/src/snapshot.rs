@@ -511,64 +511,19 @@ mod tests {
         }
     }
 
-    fn create_metadata(ict_config: Option<(String, String)>) -> serde_json::Value {
-        let base_config = json!({});
-        let config = if let Some((enablement_version, enablement_timestamp)) = ict_config {
-            json!({
-                "delta.enableInCommitTimestamps": "true",
-                "delta.inCommitTimestampEnablementVersion": enablement_version,
-                "delta.inCommitTimestampEnablementTimestamp": enablement_timestamp
-            })
-        } else {
-            base_config
-        };
-
-        json!({
-            "metaData": {
-                "id": "testId",
-                "format": {"provider": "parquet", "options": {}},
-                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns": [],
-                "configuration": config,
-                "createdTime": 1587968586154u64
-            }
-        })
-    }
-
-    fn create_basic_commit(ict_enabled: bool, ict_config: Option<(String, String)>) -> String {
-        let protocol = create_protocol(ict_enabled);
-        let metadata = create_metadata(ict_config);
-        format!("{}\n{}", protocol, metadata)
-    }
-
-    fn create_metadata_with_ict_but_missing_enablement() -> serde_json::Value {
-        json!({
-            "metaData": {
-                "id": "testId",
-                "format": {"provider": "parquet", "options": {}},
-                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns": [],
-                "configuration": {
-                    "delta.enableInCommitTimestamps": "true"
-                },
-                "createdTime": 1587968586154u64
-            }
-        })
-    }
-
-    fn create_commit_with_ict_missing_enablement() -> String {
-        let protocol = create_protocol(true);
-        let metadata = create_metadata_with_ict_but_missing_enablement();
-        format!("{}\n{}", protocol, metadata)
-    }
-
-    fn create_flexible_metadata(
-        id: &str,
-        schema_string: &str,
-        created_time: u64,
+    fn create_metadata(
+        id: Option<&str>,
+        schema_string: Option<&str>,
+        created_time: Option<u64>,
         ict_config: Option<(String, String)>,
+        ict_enabled_but_missing_version: bool,
     ) -> serde_json::Value {
-        let config = if let Some((enablement_version, enablement_timestamp)) = ict_config {
+        let config = if ict_enabled_but_missing_version {
+            // Special case for testing ICT enabled but missing enablement info
+            json!({
+                "delta.enableInCommitTimestamps": "true"
+            })
+        } else if let Some((enablement_version, enablement_timestamp)) = ict_config {
             json!({
                 "delta.enableInCommitTimestamps": "true",
                 "delta.inCommitTimestampEnablementVersion": enablement_version,
@@ -580,14 +535,26 @@ mod tests {
 
         json!({
             "metaData": {
-                "id": id,
+                "id": id.unwrap_or("testId"),
                 "format": {"provider": "parquet", "options": {}},
-                "schemaString": schema_string,
+                "schemaString": schema_string.unwrap_or("{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}"),
                 "partitionColumns": [],
                 "configuration": config,
-                "createdTime": created_time
+                "createdTime": created_time.unwrap_or(1587968586154u64)
             }
         })
+    }
+
+    fn create_basic_commit(ict_enabled: bool, ict_config: Option<(String, String)>) -> String {
+        let protocol = create_protocol(ict_enabled);
+        let metadata = create_metadata(None, None, None, ict_config, false);
+        format!("{}\n{}", protocol, metadata)
+    }
+
+    fn create_commit_with_ict_missing_enablement() -> String {
+        let protocol = create_protocol(true);
+        let metadata = create_metadata(None, None, None, None, true);
+        format!("{}\n{}", protocol, metadata)
     }
 
     fn create_flexible_protocol(min_reader_version: u32, ict_enabled: bool) -> serde_json::Value {
@@ -1375,11 +1342,12 @@ mod tests {
         // Test 1: ICT caching - create table with ICT enabled
         let commit_data = [
             create_flexible_protocol(3, true),
-            create_flexible_metadata(
-                "test_id",
-                "{\"type\":\"struct\",\"fields\":[]}",
-                1677811175819,
+            create_metadata(
+                Some("test_id"),
+                Some("{\"type\":\"struct\",\"fields\":[]}"),
+                Some(1677811175819),
                 Some(("0".to_string(), "1612345678".to_string())),
+                false,
             ),
         ];
         commit(store.as_ref(), 0, commit_data.to_vec()).await;
