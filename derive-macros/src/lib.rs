@@ -1,9 +1,9 @@
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
-use syn::parse_macro_input;
 use syn::spanned::Spanned;
+use syn::{parse_macro_input, Attribute, Field};
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
+    Data, DataStruct, DeriveInput, Error, Fields, Item, Lit, Meta, PathArguments, Type, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -38,7 +38,7 @@ pub fn parse_column_name(input: proc_macro::TokenStream) -> proc_macro::TokenStr
 /// the values of the container (i.e. a `key` -> `null` in a `HashMap`). Therefore the schema should
 /// mark the value field as nullable, but those mappings will be dropped when converting to an
 /// actual rust `HashMap`. Currently this can _only_ be set on `HashMap` fields.
-#[proc_macro_derive(ToSchema, attributes(allow_null_container_values))]
+#[proc_macro_derive(ToSchema, attributes(allow_null_container_values, field_id))]
 pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = input.ident;
@@ -82,6 +82,93 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
+/// Helper function to create field_id related errors
+fn field_id_error(span: Span, message: &str) -> Error {
+    Error::new(span, format!("field_id error: {}", message))
+}
+
+fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
+    field_attributes
+        .iter()
+        .filter_map(|attr| match &attr.meta {
+            Meta::NameValue(nv) => Some(nv),
+            _ => None,
+        })
+        .find(|nv| matches!(nv.path.get_ident(), Some(ident) if ident == "field_id"))
+        .map(|nv| {
+            let span = nv.value.span();
+            match &nv.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: Lit::Int(lit_int),
+                    ..
+                }) => lit_int.base10_parse().map_err(|e| {
+                    field_id_error(lit_int.span(), &format!("failed to parse integer: {}", e))
+                }),
+                _ => Err(field_id_error(span, "must be an integer literal")),
+            }
+        })
+        .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
+}
+
+fn gen_schema_field(field: &Field) -> TokenStream {
+    let name = field.ident.as_ref().unwrap(); // we know these are named fields
+    let name = get_schema_name(name);
+    let have_schema_null = field.attrs.iter().any(|attr| {
+        // check if we have allow_null_container_values attr
+        match &attr.meta {
+            Meta::Path(path) => path
+                .get_ident()
+                .is_some_and(|ident| ident == "allow_null_container_values"),
+            _ => false,
+        }
+    });
+
+    match field.ty {
+        Type::Path(ref type_path) => {
+            let type_path_quoted = type_path.path.segments.iter().map(|segment| {
+                let segment_ident = &segment.ident;
+                match &segment.arguments {
+                    PathArguments::None => quote! { #segment_ident :: },
+                    PathArguments::AngleBracketed(angle_args) => {
+                        quote! { #segment_ident::#angle_args :: }
+                    }
+                    _ => Error::new(
+                        segment.arguments.span(),
+                        "Can only handle <> type path args",
+                    )
+                    .to_compile_error(),
+                }
+            });
+
+            // First, determine which base function to call based on schema_null setting
+            let base_call = if have_schema_null {
+                if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
+                    if last_ident != "HashMap" {
+                        return Error::new(
+                            last_ident.span(),
+                            format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
+                        ).to_compile_error();
+                    }
+                }
+                quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name)) }
+            } else {
+                quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name)) }
+            };
+
+            // Then, add field-id metadata if present
+            match get_field_id(&field.attrs) {
+                Ok(Some(id)) => {
+                    quote_spanned! { field.span() => #base_call.add_metadata([("parquet.field.id", #id)]) }
+                }
+                Ok(None) => quote_spanned! { field.span() => #base_call },
+                Err(err) => err.to_compile_error(),
+            }
+        }
+        _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty))
+            .to_compile_error(),
+    }
+}
+
 fn gen_schema_fields(data: &Data) -> TokenStream {
     let fields = match data {
         Data::Struct(DataStruct {
@@ -97,44 +184,8 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
         }
     };
 
-    let schema_fields = fields.iter().map(|field| {
-        let name = field.ident.as_ref().unwrap(); // we know these are named fields
-        let name = get_schema_name(name);
-        let have_schema_null = field.attrs.iter().any(|attr| {
-            // check if we have allow_null_container_values attr
-            match &attr.meta {
-                Meta::Path(path) => path.get_ident().is_some_and(|ident| ident == "allow_null_container_values"),
-                _ => false,
-            }
-        });
+    let schema_fields = fields.iter().map(gen_schema_field);
 
-        match field.ty {
-            Type::Path(ref type_path) => {
-                let type_path_quoted = type_path.path.segments.iter().map(|segment| {
-                    let segment_ident = &segment.ident;
-                    match &segment.arguments {
-                        PathArguments::None => quote! { #segment_ident :: },
-                        PathArguments::AngleBracketed(angle_args) => quote! { #segment_ident::#angle_args :: },
-                        _ => Error::new(segment.arguments.span(), "Can only handle <> type path args").to_compile_error()
-                    }
-                });
-                if have_schema_null {
-                    if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
-                        if last_ident != "HashMap" {
-                           return Error::new(
-                                last_ident.span(),
-                                format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
-                            ).to_compile_error()
-                        }
-                    }
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_nullable_container_struct_field(stringify!(#name))}
-                } else {
-                    quote_spanned! { field.span() => #(#type_path_quoted)* get_struct_field(stringify!(#name))}
-                }
-            }
-            _ => Error::new(field.span(), format!("Can't handle type: {:?}", field.ty)).to_compile_error()
-        }
-    });
     quote! { #(#schema_fields),* }
 }
 
@@ -253,4 +304,76 @@ fn make_public(mut item: Item) -> Item {
     }
 
     item
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Tests for field_id parsing and validation
+
+    // Helper function to parse a struct and extract the field_id logic
+    fn test_field_id_parsing(input: &str) -> Result<TokenStream, String> {
+        let input = syn::parse_str::<DeriveInput>(input).map_err(|e| e.to_string())?;
+        let tokens = gen_schema_fields(&input.data);
+        Ok(tokens)
+    }
+
+    #[test]
+    fn test_valid_field_id_parsing() {
+        let input = r#"
+            struct TestStruct {
+                #[field_id = 123]
+                valid_field: String,
+                
+                #[field_id = 456]
+                another_valid_field: i32,
+                
+                normal_field: bool,
+            }
+        "#;
+
+        let result = test_field_id_parsing(input);
+        assert!(result.is_ok(), "Valid field_id should parse successfully");
+
+        let tokens = result.unwrap();
+        let token_string = tokens.to_string();
+
+        // Should contain metadata for valid field_ids
+        assert!(token_string.contains("123"));
+        assert!(token_string.contains("456"));
+        assert!(token_string.contains("add_metadata"));
+    }
+
+    #[test]
+    fn test_field_id_edge_cases() {
+        // Test with zero
+        let input_zero = r#"
+            struct TestStruct {
+                #[field_id = 0]
+                zero_field: String,
+            }
+        "#;
+        let result = test_field_id_parsing(input_zero);
+        assert!(result.is_ok(), "field_id = 0 should be valid");
+
+        // Test with negative number
+        let input_negative = r#"
+            struct TestStruct {
+                #[field_id = -1]
+                negative_field: String,
+            }
+        "#;
+        let result = test_field_id_parsing(input_negative);
+        assert!(result.is_ok(), "field_id = -1 should be valid");
+
+        // Test with large number
+        let input_large = r#"
+            struct TestStruct {
+                #[field_id = 9223372036854775807]
+                large_field: String,
+            }
+        "#;
+        let result = test_field_id_parsing(input_large);
+        assert!(result.is_ok(), "Large field_id should be valid");
+    }
 }
