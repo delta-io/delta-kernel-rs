@@ -97,7 +97,7 @@ impl Snapshot {
     /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
     /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
     /// snapshot to a later version.
-    fn try_new_from(
+    async fn try_new_from(
         existing_snapshot: SnapshotRef,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
@@ -130,7 +130,7 @@ impl Snapshot {
             &log_root,
             Some(listing_start),
             new_version,
-        )?;
+        ).await?;
 
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log

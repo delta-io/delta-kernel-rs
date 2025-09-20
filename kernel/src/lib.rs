@@ -80,6 +80,7 @@ use std::time::SystemTime;
 use std::{cmp::Ordering, ops::Range};
 
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use url::Url;
 
 use self::schema::{DataType, SchemaRef};
@@ -521,8 +522,7 @@ pub trait StorageHandler: AsAny {
     ///
     /// If the path is directory-like (ends with '/'), the result should contain
     /// all the files in the directory.
-    fn list_from(&self, path: &Url)
-        -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>>;
+    fn list_from(&self, path: &Url) -> DeltaResult<BoxStream<'_, DeltaResult<FileMeta>>>;
 
     /// Read data specified by the start and end offset from the file.
     fn read_files(

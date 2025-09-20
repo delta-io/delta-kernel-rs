@@ -133,7 +133,7 @@ impl TableChanges {
     /// - `start_version`: The start version of the change data feed
     /// - `end_version`: The end version (inclusive) of the change data feed. If this is none, this
     ///   defaults to the newest table version.
-    pub fn try_new(
+    pub async fn try_new(
         table_root: Url,
         engine: &dyn Engine,
         start_version: Version,
@@ -145,19 +145,19 @@ impl TableChanges {
             log_root,
             start_version,
             end_version,
-        )?;
+        ).await?;
 
         // Both snapshots ensure that reading is supported at the start and end version using
         // `ensure_read_supported`. Note that we must still verify that reading is
         // supported for every protocol action in the CDF range.
         let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
             .at_version(start_version)
-            .build(engine)?;
+            .build(engine).await?;
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
-                .build(engine)?,
-            None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
+                .build(engine).await?,
+            None => Snapshot::builder_from(start_snapshot.clone()).build(engine).await?,
         };
 
         // Verify CDF is enabled at the beginning and end of the interval using

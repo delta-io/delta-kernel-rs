@@ -141,18 +141,18 @@ impl LogSegment {
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
     #[internal_api]
-    pub(crate) fn for_snapshot(
+    pub(crate) async fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
         time_travel_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
-        let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-        Self::for_snapshot_impl(storage, log_root, checkpoint_hint, time_travel_version)
+        let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root).await?;
+        Self::for_snapshot_impl(storage, log_root, checkpoint_hint, time_travel_version).await
     }
 
     // factored out for testing
-    pub(crate) fn for_snapshot_impl(
+    pub(crate) async fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
         checkpoint_hint: Option<LastCheckpointHint>,
@@ -160,7 +160,7 @@ impl LogSegment {
     ) -> DeltaResult<Self> {
         let listed_files = match (checkpoint_hint, time_travel_version) {
             (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None)?
+                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None).await?
             }
             (Some(cp), Some(end_version)) if cp.version <= end_version => {
                 ListedLogFiles::list_with_checkpoint_hint(
@@ -168,9 +168,9 @@ impl LogSegment {
                     storage,
                     &log_root,
                     Some(end_version),
-                )?
+                ).await?
             }
-            _ => ListedLogFiles::list(storage, &log_root, None, time_travel_version)?,
+            _ => ListedLogFiles::list(storage, &log_root, None, time_travel_version).await?,
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version)
@@ -181,7 +181,7 @@ impl LogSegment {
     /// between versions `start_version` (inclusive) and `end_version` (inclusive). If no `end_version`
     /// is specified it will be the most recent version by default.
     #[internal_api]
-    pub(crate) fn for_table_changes(
+    pub(crate) async fn for_table_changes(
         storage: &dyn StorageHandler,
         log_root: Url,
         start_version: Version,
@@ -198,7 +198,7 @@ impl LogSegment {
 
         // TODO: compactions?
         let listed_files =
-            ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version)?;
+            ListedLogFiles::list_commits(storage, &log_root, Some(start_version), end_version).await?;
         // - Here check that the start version is correct.
         // - [`LogSegment::try_new`] will verify that the `end_version` is correct if present.
         // - [`ListedLogFiles::list_commits`] also checks that there are no gaps between commits.
@@ -223,7 +223,7 @@ impl LogSegment {
     ///
     // This lists all files starting from `end-limit` if `limit` is defined. For large tables,
     // listing with a `limit` can be a significant speedup over listing _all_ the files in the log.
-    pub(crate) fn for_timestamp_conversion(
+    pub(crate) async fn for_timestamp_conversion(
         storage: &dyn StorageHandler,
         log_root: Url,
         end_version: Version,
@@ -242,7 +242,7 @@ impl LogSegment {
         // this is a list of commits with possible gaps, we want to take the latest contiguous
         // chunk of commits
         let mut listed_commits =
-            ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
+            ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version)).await?;
 
         // remove gaps - return latest contiguous chunk of commits
         let commits = &mut listed_commits.ascending_commit_files;

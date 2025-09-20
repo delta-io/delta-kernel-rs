@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use itertools::Itertools;
 use url::Url;
 
@@ -9,10 +10,7 @@ pub(crate) struct SyncStorageHandler;
 impl StorageHandler for SyncStorageHandler {
     /// List the paths in the same directory that are lexicographically greater or equal to
     /// (UTF-8 sorting) the given `path`. The result is sorted by the file name.
-    fn list_from(
-        &self,
-        url_path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, url_path: &Url) -> DeltaResult<BoxStream<'_, DeltaResult<FileMeta>>> {
         if url_path.scheme() == "file" {
             let path = url_path
                 .to_file_path()
@@ -46,7 +44,7 @@ impl StorageHandler for SyncStorageHandler {
                 .into_iter()
                 .sorted_by_key(|ent| ent.path())
                 .map(TryFrom::try_from);
-            Ok(Box::new(it))
+            Ok(Box::pin(futures::stream::iter(it)))
         } else {
             Err(Error::generic("Can only read local filesystem"))
         }

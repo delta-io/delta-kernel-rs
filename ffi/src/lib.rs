@@ -608,7 +608,7 @@ fn snapshot_impl(
     } else {
         builder
     };
-    let snapshot = builder.build(extern_engine.engine().as_ref())?;
+    let snapshot = futures::executor::block_on(builder.build(extern_engine.engine().as_ref()))?;
     Ok(snapshot.into())
 }
 

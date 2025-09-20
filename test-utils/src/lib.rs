@@ -391,12 +391,12 @@ pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<Record
         .try_collect()
 }
 
-pub fn test_read(
+pub async fn test_read(
     expected: &ArrowEngineData,
     url: &Url,
     engine: Arc<dyn Engine>,
 ) -> DeltaResult<()> {
-    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref()).await?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
     let formatted = pretty_format_batches(&batches).unwrap().to_string();

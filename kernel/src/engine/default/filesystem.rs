@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
-use futures::stream::StreamExt;
+use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore};
@@ -37,10 +37,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
 }
 
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    fn list_from(&self, path: &Url) -> DeltaResult<BoxStream<'_, DeltaResult<FileMeta>>> {
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
         // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
@@ -80,39 +77,53 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // So we just need to know if we're local and then if so, we sort the returned file list
         let has_ordered_listing = path.scheme() != "file";
 
-        // This channel will become the iterator
-        let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
         let url = path.clone();
-        self.task_executor.spawn(async move {
-            let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
-            while let Some(meta) = stream.next().await {
-                match meta {
-                    Ok(meta) => {
-                        let mut location = url.clone();
-                        location.set_path(&format!("/{}", meta.location.as_ref()));
-                        sender
-                            .send(Ok(FileMeta {
+        if !has_ordered_listing {
+            // For local filesystem, we need to collect and sort first
+            let stream = store
+                .list_with_offset(Some(&prefix), &offset)
+                .map(move |meta_result| {
+                    meta_result
+                        .map(|meta| {
+                            let mut location = url.clone();
+                            location.set_path(&format!("/{}", meta.location.as_ref()));
+                            FileMeta {
                                 location,
                                 last_modified: meta.last_modified.timestamp_millis(),
                                 size: meta.size,
-                            }))
-                            .ok();
-                    }
-                    Err(e) => {
-                        sender.send(Err(e.into())).ok();
-                    }
-                }
-            }
-        });
+                            }
+                        })
+                        .map_err(|e: object_store::Error| -> Error { e.into() })
+                });
 
-        if !has_ordered_listing {
-            // This FS doesn't return things in the order we require
-            let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
-            fms.sort_unstable();
-            Ok(Box::new(fms.into_iter().map(Ok)))
+            // Collect all items, sort them, then return as a stream
+            let collected = Box::pin(async move {
+                let mut items: Vec<FileMeta> = stream.try_collect().await?;
+                items.sort_unstable();
+                Ok::<_, Error>(futures::stream::iter(items.into_iter().map(Ok)))
+            });
+
+            Ok(Box::pin(futures::stream::once(collected).try_flatten()))
         } else {
-            Ok(Box::new(receiver.into_iter()))
+            // For cloud storage, we can stream directly since it's already sorted
+            let stream = store
+                .list_with_offset(Some(&prefix), &offset)
+                .map(move |meta_result| {
+                    meta_result
+                        .map(|meta| {
+                            let mut location = url.clone();
+                            location.set_path(&format!("/{}", meta.location.as_ref()));
+                            FileMeta {
+                                location,
+                                last_modified: meta.last_modified.timestamp_millis(),
+                                size: meta.size,
+                            }
+                        })
+                        .map_err(|e: object_store::Error| -> Error { e.into() })
+                });
+
+            Ok(Box::pin(stream))
         }
     }
 

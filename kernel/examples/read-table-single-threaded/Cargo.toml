@@ -15,6 +15,7 @@ delta_kernel = { path = "../../../kernel", features = [
 ] }
 env_logger = "0.11.8"
 itertools = "0.14"
+tokio = { version = "1", features = ["rt", "macros"] }
 
 # for cargo-release
 [package.metadata.release]

@@ -65,13 +65,13 @@ impl SnapshotBuilder {
     /// # Parameters
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
-    pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+    pub async fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
         if let Some(table_root) = self.table_root {
             let log_segment = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
                 self.version,
-            )?;
+            ).await?;
             Ok(Snapshot::try_new_from_log_segment(table_root, log_segment, engine)?.into())
         } else {
             let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
@@ -79,7 +79,7 @@ impl SnapshotBuilder {
                     "SnapshotBuilder should have either table_root or existing_snapshot",
                 )
             })?;
-            Snapshot::try_new_from(existing_snapshot, engine, self.version)
+            Snapshot::try_new_from(existing_snapshot, engine, self.version).await
         }
     }
 }

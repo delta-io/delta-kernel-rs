@@ -73,7 +73,7 @@ impl LogCompactionWriter {
     /// Get an iterator over the compaction data to be written
     ///
     /// Performs action reconciliation for the version range specified in the constructor
-    pub fn compaction_data(
+    pub async fn compaction_data(
         &mut self,
         engine: &dyn Engine,
     ) -> DeltaResult<LogCompactionDataIterator> {
@@ -93,7 +93,7 @@ impl LogCompactionWriter {
             self.snapshot.log_segment().log_root.clone(),
             self.start_version,
             Some(self.end_version),
-        )?;
+        ).await?;
 
         // Read actions from the version-filtered log segment
         let actions_iter = compaction_log_segment.read_actions(

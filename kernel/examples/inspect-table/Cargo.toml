@@ -13,6 +13,7 @@ delta_kernel = { path = "../../../kernel", features = [
   "internal-api",
 ] }
 env_logger = "0.11.8"
+tokio = { version = "1", features = ["rt", "macros"] }
 
 # for cargo-release
 [package.metadata.release]

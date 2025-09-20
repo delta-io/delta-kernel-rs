@@ -51,7 +51,8 @@ enum Commands {
 
 fn main() -> ExitCode {
     env_logger::init();
-    match try_main() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    match runtime.block_on(try_main()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
@@ -177,12 +178,12 @@ fn print_scan_file(
     );
 }
 
-fn try_main() -> DeltaResult<()> {
+async fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let snapshot = Snapshot::builder_for(url).build(&engine).await?;
 
     match cli.command {
         Commands::TableVersion => {

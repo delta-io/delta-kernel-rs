@@ -37,7 +37,9 @@ fn transaction_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
+    let snapshot = futures::executor::block_on(
+        Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())
+    )?;
     let transaction = snapshot.transaction();
     Ok(Box::new(transaction?).into())
 }

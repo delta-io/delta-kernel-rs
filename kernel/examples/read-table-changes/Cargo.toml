@@ -17,3 +17,4 @@ delta_kernel = { path = "../../../kernel", features = [
   "internal-api",
 ] }
 itertools = "0.14"
+tokio = { version = "1", features = ["rt", "macros"] }

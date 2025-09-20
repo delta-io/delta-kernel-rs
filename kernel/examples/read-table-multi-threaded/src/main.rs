@@ -41,7 +41,8 @@ struct Cli {
 
 fn main() -> ExitCode {
     env_logger::init();
-    match try_main() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    match runtime.block_on(try_main()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("{e:#?}");
@@ -93,13 +94,13 @@ struct ScanState {
     logical_schema: SchemaRef,
 }
 
-fn try_main() -> DeltaResult<()> {
+async fn try_main() -> DeltaResult<()> {
     let cli = Cli::parse();
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let snapshot = Snapshot::builder_for(url).build(&engine).await?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
