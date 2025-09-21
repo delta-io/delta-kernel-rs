@@ -7,8 +7,9 @@ use tracing::debug;
 use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
-use crate::scan::{ColumnType, PhysicalPredicate, ScanResult};
+use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
+use crate::transforms::ColumnType;
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
@@ -361,10 +362,11 @@ mod tests {
 
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, Scalar};
-    use crate::scan::{ColumnType, PhysicalPredicate};
+    use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_changes::TableChanges;
     use crate::table_changes::COMMIT_VERSION_COL_NAME;
+    use crate::transforms::ColumnType;
     use crate::Predicate;
 
     #[test]

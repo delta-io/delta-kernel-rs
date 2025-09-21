@@ -674,7 +674,9 @@ impl StructType {
     }
 
     /// Gets an iterator over all the fields in this struct type.
-    pub fn into_fields(self) -> impl ExactSizeIterator<Item = StructField> {
+    pub fn into_fields(
+        self,
+    ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
         self.fields.into_values()
     }
 
