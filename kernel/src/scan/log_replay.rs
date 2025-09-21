@@ -14,7 +14,7 @@ use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::transforms::{get_transform_expr, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -133,15 +133,15 @@ impl AddRemoveDedupVisitor<'_> {
         field_idx: usize,
         partition_values: &HashMap<String, String>,
     ) -> DeltaResult<(usize, (String, Scalar))> {
-        let field = self.logical_schema.fields.get_index(field_idx);
-        let Some((_, field)) = field else {
+        let field = self.logical_schema.field_at_index(field_idx);
+        let Some(field) = field else {
             return Err(Error::InternalError(format!(
                 "out of bounds partition column field index {field_idx}"
             )));
         };
         let name = field.physical_name(self.column_mapping_mode);
         let partition_value =
-            super::parse_partition_value(partition_values.get(name), field.data_type())?;
+            crate::transforms::parse_partition_value_raw(partition_values.get(name), field.data_type())?;
         Ok((field_idx, (name.to_string(), partition_value)))
     }
 
@@ -153,14 +153,14 @@ impl AddRemoveDedupVisitor<'_> {
         transform_spec
             .iter()
             .filter_map(|field_transform| match field_transform {
-                FieldTransformSpec::PartitionColumn { field_index, .. } => {
+                crate::transforms::FieldTransformSpec::PartitionColumn { field_index, .. } => {
                     Some(self.parse_partition_value(*field_index, partition_values))
                 }
-                FieldTransformSpec::StaticInsert { .. }
-                | FieldTransformSpec::StaticReplace { .. }
-                | FieldTransformSpec::StaticDrop { .. } => None,
+                crate::transforms::FieldTransformSpec::StaticInsert { .. }
+                | crate::transforms::FieldTransformSpec::StaticReplace { .. }
+                | crate::transforms::FieldTransformSpec::StaticDrop { .. } => None,
             })
-            .try_collect()
+            .collect::<DeltaResult<HashMap<_, _>>>()
     }
 
     /// Compute an expression that will transform from physical to logical for a given Add file action
@@ -176,7 +176,7 @@ impl AddRemoveDedupVisitor<'_> {
         let mut transform = crate::expressions::Transform::new_top_level();
 
         for field_transform in transform_spec {
-            use FieldTransformSpec::*;
+            use crate::transforms::FieldTransformSpec::*;
             transform = match field_transform {
                 StaticInsert { insert_after, expr } => {
                     transform.with_inserted_field(insert_after.clone(), expr.clone())
@@ -251,7 +251,7 @@ impl AddRemoveDedupVisitor<'_> {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
                 let partition_values =
-                    parse_partition_values(&self.logical_schema, transform, &partition_values)?;
+                    self.parse_partition_values(transform, &partition_values)?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }

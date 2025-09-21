@@ -5,8 +5,8 @@ use itertools::Itertools;
 
 use crate::expressions::Scalar;
 use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
-use crate::transforms::ColumnType;
 use crate::table_features::ColumnMappingMode;
+use crate::transforms::ColumnType;
 use crate::{DeltaResult, Error, Expression};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
@@ -51,9 +51,8 @@ pub(crate) fn physical_to_logical_expr(
                         "logical schema did not contain expected field, can't transform data",
                     ));
                 };
-                let name = field.physical_name();
-                let raw_value = scan_file.partition_values.get(name);
                 let name = field.physical_name(column_mapping_mode);
+                let raw_value = scan_file.partition_values.get(name);
                 let value_expression =
                     crate::transforms::parse_partition_value_raw(raw_value, field.data_type())?;
                 Ok(value_expression.into())
@@ -96,11 +95,8 @@ mod tests {
         ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
         REMOVE_CHANGE_TYPE,
     };
-<<<<<<< HEAD
-    use crate::transforms::ColumnType;
-=======
     use crate::table_features::ColumnMappingMode;
->>>>>>> 652cd67 (feat(kernel): pass ColumnMappingMode to physical_name)
+    use crate::transforms::ColumnType;
 
     #[test]
     fn verify_physical_to_logical_expression() {

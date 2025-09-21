@@ -431,14 +431,9 @@ impl StructField {
                                     .is_some_and(|x| matches!(x, MetadataValue::String(_))));
                             }
                         }
-<<<<<<< HEAD
-                        field.physical_name().to_owned()
-=======
                         field.physical_name(self.column_mapping_mode).to_owned()
->>>>>>> 652cd67 (feat(kernel): pass ColumnMappingMode to physical_name)
                     }
                 };
-
                 Some(Cow::Owned(field.with_name(name).with_metadata(metadata)))
             }
 
@@ -687,9 +682,7 @@ impl StructType {
     }
 
     /// Gets an iterator over all the fields in this struct type.
-    pub fn into_fields(
-        self,
-    ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
+    pub fn into_fields(self) -> impl ExactSizeIterator<Item = StructField> {
         self.fields.into_values()
     }
 
@@ -941,15 +934,15 @@ impl<'a> Iterator for StructFieldRefIter<'a> {
     }
 }
 
-impl ExactSizeIterator for StructFieldRefIter<'_> {
+impl<'a> ExactSizeIterator for StructFieldRefIter<'a> {
     fn len(&self) -> usize {
         self.inner.len()
     }
 }
 
-impl FusedIterator for StructFieldRefIter<'_> {}
+impl<'a> FusedIterator for StructFieldRefIter<'a> {}
 
-impl DoubleEndedIterator for StructFieldRefIter<'_> {
+impl<'a> DoubleEndedIterator for StructFieldRefIter<'a> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.inner.next_back()
     }
