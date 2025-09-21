@@ -171,7 +171,7 @@ fn parse_schema(schema_str: &str) -> DeltaResult<SchemaRef> {
         })
         .collect::<DeltaResult<Vec<_>>>()?;
 
-    Ok(Arc::new(StructType::new(fields)))
+    Ok(Arc::new(StructType::try_new(fields)?))
 }
 
 /// Create a new Delta table with the given schema.

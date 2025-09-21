@@ -11,7 +11,7 @@ fn create_kernel_schema() -> delta_kernel::schema::Schema {
     use delta_kernel::schema::{DataType, StructField};
     let field_a = StructField::not_null("a", DataType::LONG);
     let field_b = StructField::not_null("b", DataType::BOOLEAN);
-    delta_kernel::schema::Schema::new(vec![field_a, field_b])
+    delta_kernel::schema::Schema::try_new(vec![field_a, field_b]).unwrap()
 }
 
 fn main() {
