@@ -9,18 +9,20 @@ use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
-    engine::arrow_data::ArrowEngineData,
     schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
+    engine::arrow_data::{extract_record_batch, ArrowEngineData},
     utils::require,
     DeltaResult, EngineData, Error,
 };
+use crate::engine_data::FilteredEngineData,
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray, MapArray,
     OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
+use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -1076,13 +1078,17 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
-    data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send,
+    data: impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send,
 ) -> DeltaResult<Vec<u8>> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
     for chunk in data {
-        let arrow_data = ArrowEngineData::try_from_engine_data(chunk?)?;
-        let record_batch = arrow_data.record_batch();
-        writer.write(record_batch)?;
+        let filtered_data = chunk?;
+        // Extract the underlying data and apply the selection vector to get only selected rows
+        let batch = extract_record_batch(&*filtered_data.data)?;
+        let filtered_batch =
+            filter_record_batch(batch, &BooleanArray::from(filtered_data.selection_vector))
+                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
+        writer.write(&filtered_batch)?;
     }
     writer.finish()?;
     Ok(writer.into_inner())
@@ -2767,7 +2773,8 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
         )?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
-        let json = to_json_bytes(Box::new(std::iter::once(Ok(data))))?;
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data))))?;
         assert_eq!(
             json,
             "{\"string\":\"string1\"}\n{\"string\":\"string2\"}\n".as_bytes()
