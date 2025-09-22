@@ -29,5 +29,5 @@ error[E0433]: failed to resolve: use of unresolved module or unlinked crate `del
    = note: this error originates in the derive macro `ToSchema` (in Nightly builds, run with -Z macro-backtrace for more info)
 help: consider importing this struct
    |
-1  + use crate::StructType;
+ 1 + use crate::StructType;
    |
