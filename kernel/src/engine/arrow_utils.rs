@@ -1091,14 +1091,21 @@ pub(crate) fn to_json_bytes(
         let num_rows = batch.num_rows();
         let mut selection_vector = filtered_data.selection_vector.clone();
 
-        if selection_vector.len() < num_rows {
-            // Extend the selection vector with `true` for uncovered rows
-            selection_vector.resize(num_rows, true);
-        }
-
-        let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
-            .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
-        writer.write(&filtered_batch)?;
+        if selection_vector.is_empty() {
+            // If selection vector is empty, write all rows per contract.
+            writer.write(batch)?;
+        } else {
+            if selection_vector.len() < num_rows {
+                // Extend the selection vector with `true` for uncovered rows
+                selection_vector.resize(num_rows, true);
+            } else if selection_vector.len() > num_rows {
+                // Take a sublist of the selection vector equal to the data size
+                selection_vector = selection_vector[..num_rows].to_vec();
+            }
+            let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
+                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
+            writer.write(&filtered_batch)?
+        };
     }
     writer.finish()?;
     Ok(writer.into_inner())
@@ -2859,6 +2866,22 @@ mod tests {
         };
         let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
         assert_eq!(json_one, "{\"value\":\"row1\"}\n".as_bytes());
+
+        // Test case 6: Only one row selected implicitly by short vector
+        let one_selected = FilteredEngineData {
+            data: create_engine_data(),
+            selection_vector: vec![false, false, false],
+        };
+        let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
+        assert_eq!(json_one, "{\"value\":\"row3\"}\n".as_bytes());
+
+        // Test case 7: No rows selected with longer vector.
+        let one_selected = FilteredEngineData {
+            data: create_engine_data(),
+            selection_vector: vec![false, false, false, false, true],
+        };
+        let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
+        assert_eq!(json_one, "".as_bytes());
 
         Ok(())
     }

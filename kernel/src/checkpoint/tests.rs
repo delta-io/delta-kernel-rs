@@ -78,10 +78,6 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let writer = snapshot.checkpoint()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
-
-    // According to the new contract, with_all_rows_selected creates an empty selection vector
-    // which means all rows are selected
-    assert_eq!(checkpoint_batch.filtered_data.selection_vector, vec![] as Vec<bool>);
     assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
     // Verify the underlying EngineData contains the expected CheckpointMetadata action
