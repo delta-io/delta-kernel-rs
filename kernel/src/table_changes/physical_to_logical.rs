@@ -5,11 +5,10 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
-use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
-
-// CDF change type constants
-const ADD_CHANGE_TYPE: &str = "insert";
-const REMOVE_CHANGE_TYPE: &str = "delete";
+use super::{
+    ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
+    REMOVE_CHANGE_TYPE,
+};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
 ///
@@ -107,7 +106,7 @@ pub(crate) fn prepare_cdf_partition_values(
         partition_values.extend(parsed_values);
     }
 
-    // Handle CDF metadata columns using the new get_cdf_columns approach
+    // Handle CDF metadata columns
     if let Ok(cdf_values) = get_cdf_columns(logical_schema, scan_file) {
         partition_values.extend(cdf_values);
     }

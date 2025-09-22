@@ -9,24 +9,8 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-<<<<<<< HEAD
-use crate::expressions::{Expression, ExpressionRef};
-use crate::schema::{DataType, SchemaRef};
-use crate::{DeltaResult, Error};
-
-/// Scan uses this to set up what kinds of top-level columns it is scanning. For `Selected` we just
-/// store the name of the column, as that's all that's needed during the actual query. For
-/// `Partition` we store an index into the logical schema for this query since later we need the
-/// data type as well to materialize the partition column.
-#[derive(PartialEq, Debug)]
-pub(crate) enum ColumnType {
-    // A column, selected from the data, as is
-    Selected(String),
-    // A partition column that needs to be added back in
-    Partition(usize),
-=======
 use crate::expressions::{Expression, ExpressionRef, Scalar, Transform};
-use crate::schema::{DataType, SchemaRef};
+use crate::schema::{DataType, SchemaRef, StructType};
 use crate::{DeltaResult, Error};
 
 /// Categorizes columns in a scan based on their data source and processing requirements.
@@ -52,22 +36,11 @@ pub(crate) enum ColumnType {
         /// Name to look for in the physical schema
         physical_name: String,
     },
->>>>>>> 2b01c19 (what)
 }
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
 pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 
-<<<<<<< HEAD
-/// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
-/// things like partition columns need to filled in. This enum holds an expression that's part of a
-/// [`TransformSpec`].
-#[derive(Debug)]
-pub(crate) enum FieldTransformSpec {
-    /// Insert the given expression after the named input column (None = prepend instead)
-    // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
-    // which would usually be expressed as a drop+insert pair of transforms.
-=======
 /// Describes a single field transformation to apply when converting physical data to logical schema.
 ///
 /// These transformations are "sparse" - they only specify what changes, while unchanged fields
@@ -77,39 +50,20 @@ pub(crate) enum FieldTransformSpec {
     /// Insert a static expression after the named input column.
     /// If `insert_after` is None, prepend before all fields.
     // NOTE: Row tracking and other features may use this for computed columns.
->>>>>>> 2b01c19 (what)
     #[allow(unused)]
     StaticInsert {
         insert_after: Option<String>,
         expr: ExpressionRef,
     },
-<<<<<<< HEAD
-    /// Replace the named input column with an expression
-    // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
-    // to compute non-materialized row ids and row commit versions.
-=======
 
     /// Replace the named input column with a new expression.
     // NOTE: Row tracking will use this to replace physical rowid columns with
     // COALESCE expressions for non-materialized row ids.
->>>>>>> 2b01c19 (what)
     #[allow(unused)]
     StaticReplace {
         field_name: String,
         expr: ExpressionRef,
     },
-<<<<<<< HEAD
-    /// Drops the named input column
-    // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
-    // they should not appear in the query's output.
-    #[allow(unused)]
-    StaticDrop { field_name: String },
-    /// Inserts a partition column after the named input column. The partition column is identified
-    /// by its field index in the logical table schema (the column is not present in the physical
-    /// read schema). Its value varies from file to file and is obtained from file metadata.
-    PartitionColumn {
-        field_index: usize,
-=======
 
     /// Remove the named input column from the output.
     // NOTE: Row tracking will use this to drop internal metadata columns.
@@ -134,7 +88,6 @@ pub(crate) enum FieldTransformSpec {
         /// Name to check for in physical schema
         physical_name: String,
         /// Where to insert/reorder this column
->>>>>>> 2b01c19 (what)
         insert_after: Option<String>,
     },
 }
@@ -144,11 +97,7 @@ pub(crate) fn parse_partition_value(
     field_idx: usize,
     logical_schema: &SchemaRef,
     partition_values: &HashMap<String, String>,
-<<<<<<< HEAD
-) -> DeltaResult<(usize, (String, crate::expressions::Scalar))> {
-=======
 ) -> DeltaResult<(usize, (String, Scalar))> {
->>>>>>> 2b01c19 (what)
     let Some(field) = logical_schema.field_at_index(field_idx) else {
         return Err(Error::InternalError(format!(
             "out of bounds partition column field index {field_idx}"
@@ -159,23 +108,15 @@ pub(crate) fn parse_partition_value(
     Ok((field_idx, (name.to_string(), partition_value)))
 }
 
-<<<<<<< HEAD
-/// Parse all partition values from a transform spec
-=======
 /// Parse all partition values from a transform spec.
 ///
 /// Extracts partition column indices from the transform spec and looks up their values
 /// in the provided HashMap, parsing them according to their data types in the schema.
->>>>>>> 2b01c19 (what)
 pub(crate) fn parse_partition_values(
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
     partition_values: &HashMap<String, String>,
-<<<<<<< HEAD
-) -> DeltaResult<HashMap<usize, (String, crate::expressions::Scalar)>> {
-=======
 ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
->>>>>>> 2b01c19 (what)
     transform_spec
         .iter()
         .filter_map(|field_transform| match field_transform {
@@ -184,8 +125,6 @@ pub(crate) fn parse_partition_values(
                 logical_schema,
                 partition_values,
             )),
-<<<<<<< HEAD
-=======
             FieldTransformSpec::DynamicColumn { field_index, .. } => {
                 // Dynamic columns may also need metadata values when not physical
                 Some(parse_partition_value(
@@ -194,7 +133,6 @@ pub(crate) fn parse_partition_values(
                     partition_values,
                 ))
             }
->>>>>>> 2b01c19 (what)
             FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::StaticReplace { .. }
             | FieldTransformSpec::StaticDrop { .. } => None,
@@ -202,27 +140,7 @@ pub(crate) fn parse_partition_values(
         .try_collect()
 }
 
-<<<<<<< HEAD
-/// Compute an expression that will transform from physical to logical for a given Add file action
-///
-/// An empty `transform_spec` is valid and represents the case where only column mapping is needed
-/// (e.g., no partition columns to inject). The resulting empty `Expression::Transform` will
-/// pass all input fields through unchanged while applying the output schema for name mapping.
-pub(crate) fn get_transform_expr(
-    transform_spec: &TransformSpec,
-    mut partition_values: HashMap<usize, (String, crate::expressions::Scalar)>,
-) -> DeltaResult<ExpressionRef> {
-    let mut transform = crate::expressions::Transform::new_top_level();
-=======
 /// Build a transform expression that converts physical data to the logical schema.
-///
-/// # Arguments
-/// * `transform_spec` - The list of field transformations to apply
-/// * `partition_values` - Values for partition columns and dynamic columns when not physical
-/// * `physical_schema` - Optional physical schema, required when using Dynamic columns
-///
-/// # Returns
-/// An expression that transforms physical data to match the logical schema
 ///
 /// An empty `transform_spec` is valid and represents the case where only column mapping is needed.
 /// The resulting empty `Expression::Transform` will pass all input fields through unchanged
@@ -230,10 +148,9 @@ pub(crate) fn get_transform_expr(
 pub(crate) fn get_transform_expr(
     transform_spec: &TransformSpec,
     mut partition_values: HashMap<usize, (String, Scalar)>,
-    physical_schema: &crate::schema::StructType,
+    physical_schema: &StructType,
 ) -> DeltaResult<ExpressionRef> {
     let mut transform = Transform::new_top_level();
->>>>>>> 2b01c19 (what)
 
     for field_transform in transform_spec {
         use FieldTransformSpec::*;
@@ -258,8 +175,6 @@ pub(crate) fn get_transform_expr(
                 let partition_value = Arc::new(partition_value.into());
                 transform.with_inserted_field(insert_after.clone(), partition_value)
             }
-<<<<<<< HEAD
-=======
             DynamicColumn {
                 field_index,
                 physical_name,
@@ -291,33 +206,16 @@ pub(crate) fn get_transform_expr(
                     transform.with_inserted_field(insert_after.clone(), partition_value)
                 }
             }
->>>>>>> 2b01c19 (what)
         }
     }
 
     Ok(Arc::new(Expression::Transform(transform)))
 }
 
-<<<<<<< HEAD
-/// Computes the transform spec for this scan. Static (query-level) transforms can already be
-/// turned into expressions now, but file-level transforms like partition values can only be
-/// described now; they are converted to expressions during the scan, using file metadata.
-///
-/// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
-/// change (added, replaced, dropped); the transform implicitly captures all fields that pass
-/// from input to output unchanged and in the same relative order.
-=======
 /// Generate a transform specification that describes how to convert physical data to logical schema.
 ///
 /// The transform spec captures only the fields that need to be added, replaced, or reordered.
 /// Unchanged fields pass through implicitly in their original order (sparse transform).
-///
-/// # Arguments
-/// * `all_fields` - The column types for all fields in the logical schema, in order
-///
-/// # Returns
-/// A list of field transformations to apply to the physical data
->>>>>>> 2b01c19 (what)
 pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
     let mut transform_spec = TransformSpec::new();
     let mut last_physical_field: Option<&str> = None;
@@ -325,25 +223,16 @@ pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
     for field in all_fields {
         match field {
             ColumnType::Selected(physical_name) => {
-<<<<<<< HEAD
-                // Track physical field for calculating partition value insertion points.
-                last_physical_field = Some(physical_name);
-            }
-            ColumnType::Partition(logical_idx) => {
-=======
                 // Track the last physical field for calculating insertion points
                 last_physical_field = Some(physical_name);
             }
             ColumnType::Partition(logical_idx) => {
                 // Partition columns are inserted after the last physical field
->>>>>>> 2b01c19 (what)
                 transform_spec.push(FieldTransformSpec::PartitionColumn {
                     insert_after: last_physical_field.map(String::from),
                     field_index: *logical_idx,
                 });
             }
-<<<<<<< HEAD
-=======
             ColumnType::Dynamic {
                 logical_index,
                 physical_name,
@@ -355,7 +244,6 @@ pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
                     insert_after: last_physical_field.map(String::from),
                 });
             }
->>>>>>> 2b01c19 (what)
         }
     }
 
@@ -367,12 +255,7 @@ pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
-<<<<<<< HEAD
-) -> DeltaResult<crate::expressions::Scalar> {
-    use crate::expressions::Scalar;
-=======
 ) -> DeltaResult<Scalar> {
->>>>>>> 2b01c19 (what)
     match (raw, data_type.as_primitive_opt()) {
         (Some(v), Some(primitive)) => primitive.parse_scalar(v),
         (Some(_), None) => Err(Error::generic(format!(
@@ -385,10 +268,6 @@ pub(crate) fn parse_partition_value_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< HEAD
-    use crate::expressions::Scalar;
-=======
->>>>>>> 2b01c19 (what)
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use std::collections::HashMap;
 
@@ -452,13 +331,9 @@ mod tests {
         }];
         let partition_values = HashMap::new(); // Missing required partition value
 
-<<<<<<< HEAD
-        let result = get_transform_expr(&transform_spec, partition_values);
-=======
         // Create a minimal physical schema for test
         let physical_schema = StructType::new_unchecked(vec![]);
         let result = get_transform_expr(&transform_spec, partition_values, &physical_schema);
->>>>>>> 2b01c19 (what)
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -482,18 +357,12 @@ mod tests {
                 field_name: "col3".to_string(),
             },
         ];
-<<<<<<< HEAD
-        let partition_values = HashMap::new();
-
-        let result = get_transform_expr(&transform_spec, partition_values).unwrap();
-=======
         let metadata_values = HashMap::new();
 
         // Create a minimal physical schema for test
         let physical_schema = StructType::new_unchecked(vec![]);
         let result =
             get_transform_expr(&transform_spec, metadata_values, &physical_schema).unwrap();
->>>>>>> 2b01c19 (what)
         assert!(matches!(result.as_ref(), Expression::Transform(_)));
     }
 
@@ -505,13 +374,6 @@ mod tests {
         ];
 
         let result = get_transform_spec(&all_fields);
-<<<<<<< HEAD
-        assert!(result.is_empty()); // No partition columns = empty transform spec
-    }
-
-    #[test]
-    fn test_get_transform_spec_with_partitions() {
-=======
         assert!(result.is_empty()); // No metadata columns = empty transform spec
     }
 
@@ -572,7 +434,6 @@ mod tests {
 
     #[test]
     fn test_get_transform_spec_with_metadata() {
->>>>>>> 2b01c19 (what)
         let all_fields = vec![
             ColumnType::Selected("col1".to_string()),
             ColumnType::Partition(1),
@@ -583,11 +444,7 @@ mod tests {
         let result = get_transform_spec(&all_fields);
         assert_eq!(result.len(), 2);
 
-<<<<<<< HEAD
-        // Check first partition column
-=======
         // Check first metadata column
->>>>>>> 2b01c19 (what)
         if let FieldTransformSpec::PartitionColumn {
             field_index,
             insert_after,
@@ -599,11 +456,7 @@ mod tests {
             panic!("Expected PartitionColumn transform");
         }
 
-<<<<<<< HEAD
-        // Check second partition column
-=======
         // Check second metadata column
->>>>>>> 2b01c19 (what)
         if let FieldTransformSpec::PartitionColumn {
             field_index,
             insert_after,
