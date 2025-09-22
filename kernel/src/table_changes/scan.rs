@@ -9,7 +9,7 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::transforms::ColumnType;
+use crate::transforms::{get_transform_spec, ColumnType, TransformSpec};
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
@@ -254,7 +254,7 @@ impl TableChangesScan {
         let dv_engine_ref = engine.clone();
 
         // Generate transform_spec once and pass it to read_scan_file
-        let transform_spec = crate::transforms::get_transform_spec(&all_fields);
+        let transform_spec = get_transform_spec(&all_fields);
 
         let result = scan_files
             .map(move |scan_file| {
@@ -287,7 +287,7 @@ fn read_scan_file(
     table_root: &Url,
     logical_schema: &SchemaRef,
     physical_schema: &SchemaRef,
-    transform_spec: &crate::transforms::TransformSpec,
+    transform_spec: &TransformSpec,
     _physical_predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
