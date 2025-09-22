@@ -29,6 +29,7 @@ use crate::schema::{
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
+use crate::transforms::{get_transform_spec, ColumnType};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
@@ -307,21 +308,6 @@ impl ScanResult {
     }
 }
 
-/// Scan uses this to set up what kinds of top-level columns it is scanning. For `Selected` we just
-/// store the name of the column, as that's all that's needed during the actual query. For
-/// `Partition` we store an index into the logical schema for this query since later we need the
-/// data type as well to materialize the partition column.
-#[derive(PartialEq, Debug)]
-pub(crate) enum ColumnType {
-    // A column, selected from the data, as is
-    Selected(String),
-    // A partition column that needs to be added back in
-    Partition(usize),
-}
-
-/// A list of field transforms that describes a transform expression to be created at scan time.
-type TransformSpec = Vec<FieldTransformSpec>;
-
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row
@@ -330,40 +316,6 @@ pub fn get_transform_for_row(
     transforms: &[Option<ExpressionRef>],
 ) -> Option<ExpressionRef> {
     transforms.get(row).cloned().flatten()
-}
-
-/// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
-/// things like partition columns need to filled in. This enum holds an expression that's part of a
-/// [`TransformSpec`].
-pub(crate) enum FieldTransformSpec {
-    /// Insert the given expression after the named input column (None = prepend instead)
-    // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
-    // which would usually be expressed as a drop+insert pair of transforms.
-    #[allow(unused)]
-    StaticInsert {
-        insert_after: Option<String>,
-        expr: ExpressionRef,
-    },
-    /// Replace the named input column with an expression
-    // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
-    // to compute non-materialized row ids and row commit versions.
-    #[allow(unused)]
-    StaticReplace {
-        field_name: String,
-        expr: ExpressionRef,
-    },
-    /// Drops the named input column
-    // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
-    // they should not appear in the query's output.
-    #[allow(unused)]
-    StaticDrop { field_name: String },
-    /// Inserts a partition column after the named input column. The partition column is identified
-    /// by its field index in the logical table schema (the column is not present in the physical
-    /// read schema). Its value varies from file to file and is obtained from file metadata.
-    PartitionColumn {
-        field_index: usize,
-        insert_after: Option<String>,
-    },
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
@@ -472,35 +424,6 @@ impl Scan {
         } else {
             None
         }
-    }
-
-    /// Computes the transform spec for this scan. Static (query-level) transforms can already be
-    /// turned into expressions now, but file-level transforms like partition values can only be
-    /// described now; they are converted to expressions during the scan, using file metadata.
-    ///
-    /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
-    /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
-    /// from input to output unchanged and in the same relative order.
-    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
-        let mut transform_spec = TransformSpec::new();
-        let mut last_physical_field: Option<&str> = None;
-
-        for field in all_fields {
-            match field {
-                ColumnType::Selected(physical_name) => {
-                    // Track physical field for calculating partition value insertion points.
-                    last_physical_field = Some(physical_name);
-                }
-                ColumnType::Partition(logical_idx) => {
-                    transform_spec.push(FieldTransformSpec::PartitionColumn {
-                        insert_after: last_physical_field.map(String::from),
-                        field_index: *logical_idx,
-                    });
-                }
-            }
-        }
-
-        transform_spec
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
@@ -672,7 +595,7 @@ impl Scan {
         // - Column mapping: Physical field names must be mapped to logical field names via output schema
         let static_transform = (self.have_partition_cols
             || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then(|| Arc::new(Scan::get_transform_spec(&self.all_fields)));
+            .then(|| Arc::new(get_transform_spec(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
@@ -841,19 +764,6 @@ pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
-pub(crate) fn parse_partition_value(
-    raw: Option<&String>,
-    data_type: &DataType,
-) -> DeltaResult<Scalar> {
-    match (raw, data_type.as_primitive_opt()) {
-        (Some(v), Some(primitive)) => primitive.parse_scalar(v),
-        (Some(_), None) => Err(Error::generic(format!(
-            "Unexpected partition column type: {data_type:?}"
-        ))),
-        _ => Ok(Scalar::Null(data_type.clone())),
-    }
-}
-
 /// All the state needed to process a scan.
 struct StateInfo {
     /// All fields referenced by the query.
@@ -960,7 +870,8 @@ pub(crate) mod test_utils {
         JsonHandler,
     };
 
-    use super::{state::ScanCallback, TransformSpec};
+    use super::state::ScanCallback;
+    use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
@@ -1446,7 +1357,7 @@ mod tests {
         ];
 
         for (raw, data_type, expected) in &cases {
-            let value = parse_partition_value(
+            let value = crate::transforms::parse_partition_value_raw(
                 Some(&raw.to_string()),
                 &DataType::Primitive(data_type.clone()),
             )
