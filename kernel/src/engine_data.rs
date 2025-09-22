@@ -12,7 +12,8 @@ use crate::{AsAny, DeltaResult, Error};
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
 /// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
-/// while `false` means the row is logically deleted and should be ignored.
+/// while `false` means the row is logically deleted and should be ignored. If the selection vector is shorter
+/// then the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
 ///
 /// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
@@ -28,10 +29,9 @@ impl FilteredEngineData {
     /// This is a convenience method for the common case where you want to wrap
     /// `EngineData` in `FilteredEngineData` without any filtering.
     pub fn with_all_rows_selected(data: Box<dyn EngineData>) -> Self {
-        let len = data.len();
         Self {
             data,
-            selection_vector: vec![true; len],
+            selection_vector: vec![],
         }
     }
 }
@@ -39,6 +39,10 @@ impl FilteredEngineData {
 impl HasSelectionVector for FilteredEngineData {
     /// Returns true if any row in the selection vector is marked as selected
     fn has_selected_rows(&self) -> bool {
+        // If selection vector is empty, all rows are selected according to the new contract
+        if self.selection_vector.len() < self.data.len() {
+            return true;
+        }
         self.selection_vector.contains(&true)
     }
 }
@@ -379,9 +383,10 @@ mod tests {
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
 
-        assert_eq!(filtered_data.selection_vector.len(), 1);
-        assert_eq!(filtered_data.selection_vector, vec![true]);
+        // According to the new contract, empty selection vector means all rows are selected
+        assert!(filtered_data.selection_vector.is_empty());
         assert_eq!(filtered_data.data.len(), 1);
+        assert!(filtered_data.has_selected_rows());
     }
 
     #[test]
@@ -403,8 +408,9 @@ mod tests {
 
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
 
-        assert_eq!(filtered_data.selection_vector.len(), 4);
-        assert_eq!(filtered_data.selection_vector, vec![true, true, true, true]);
+        // According to the new contract, empty selection vector means all rows are selected
+        assert!(filtered_data.selection_vector.is_empty());
         assert_eq!(filtered_data.data.len(), 4);
+        assert!(filtered_data.has_selected_rows());
     }
 }

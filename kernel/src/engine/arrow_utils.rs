@@ -7,18 +7,18 @@ use std::sync::{Arc, OnceLock};
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::engine_data::FilteredEngineData;
 use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
-    schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
     engine::arrow_data::{extract_record_batch, ArrowEngineData},
+    schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
-use crate::engine_data::FilteredEngineData;
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
@@ -1085,9 +1085,19 @@ pub(crate) fn to_json_bytes(
         let filtered_data = chunk?;
         // Extract the underlying data and apply the selection vector to get only selected rows
         let batch = extract_record_batch(&*filtered_data.data)?;
-        let filtered_batch =
-            filter_record_batch(batch, &BooleanArray::from(filtered_data.selection_vector))
-                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
+
+        // Honor the new contract: if selection vector is shorter than the number of rows,
+        // then all rows not covered by the selection vector are assumed to be selected
+        let num_rows = batch.num_rows();
+        let mut selection_vector = filtered_data.selection_vector.clone();
+
+        if selection_vector.len() < num_rows {
+            // Extend the selection vector with `true` for uncovered rows
+            selection_vector.resize(num_rows, true);
+        }
+
+        let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
+            .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
         writer.write(&filtered_batch)?;
     }
     writer.finish()?;
