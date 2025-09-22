@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
-use crate::expressions::Scalar;
+use crate::expressions::{Expression, Scalar};
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::transforms::{get_transform_expr, parse_partition_values};
+use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::DeltaResult;
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{
@@ -84,18 +85,10 @@ pub(crate) fn scan_file_physical_schema(
 /// - Partition values from the scan file
 /// - CDF metadata (_commit_version, _commit_timestamp)
 /// - _change_type value (for Dynamic column when not physical)
-///
-/// # Arguments
-/// * `scan_file` - The CDF scan file containing metadata
-/// * `logical_schema` - The logical schema to find field indices
-/// * `transform_spec` - The transform specification for parsing partition values
-///
-/// # Returns
-/// A HashMap mapping field indices to (name, value) pairs
 pub(crate) fn prepare_cdf_partition_values(
     scan_file: &CdfScanFile,
     logical_schema: &SchemaRef,
-    transform_spec: &crate::transforms::TransformSpec,
+    transform_spec: &TransformSpec,
 ) -> HashMap<usize, (String, Scalar)> {
     let mut partition_values = HashMap::new();
 
@@ -115,21 +108,12 @@ pub(crate) fn prepare_cdf_partition_values(
 }
 
 /// Generates the transform expression for converting physical data to logical data.
-///
-/// # Arguments
-/// * `transform_spec` - The transform specification (generated once in execute)
-/// * `scan_file` - The CDF scan file containing metadata
-/// * `logical_schema` - The logical schema
-/// * `physical_schema` - The physical schema
-///
-/// # Returns
-/// The transform expression for data conversion
 pub(crate) fn get_cdf_transform_expr(
-    transform_spec: &crate::transforms::TransformSpec,
+    transform_spec: &TransformSpec,
     scan_file: &CdfScanFile,
     logical_schema: &SchemaRef,
     physical_schema: &SchemaRef,
-) -> crate::DeltaResult<std::sync::Arc<crate::expressions::Expression>> {
+) -> DeltaResult<std::sync::Arc<Expression>> {
     let partition_values = prepare_cdf_partition_values(scan_file, logical_schema, transform_spec);
     let physical_schema = scan_file_physical_schema(scan_file, physical_schema.as_ref());
     get_transform_expr(transform_spec, partition_values, physical_schema.as_ref())
