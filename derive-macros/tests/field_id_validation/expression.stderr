@@ -1,4 +1,4 @@
-error: field_id error: must be an integer literal
+error: field_id error: Expected field-id to be an integer
   --> tests/field_id_validation/expression.rs:14:18
    |
 14 |     #[field_id = MY_ID]  // Should be literal, not expression

@@ -102,9 +102,9 @@ fn get_field_id(field_attributes: &[Attribute]) -> Result<Option<i64>, Error> {
                     lit: Lit::Int(lit_int),
                     ..
                 }) => lit_int.base10_parse().map_err(|e| {
-                    field_id_error(lit_int.span(), &format!("failed to parse integer: {}", e))
+                    field_id_error(lit_int.span(), &format!("Failed to parse integer: {}", e))
                 }),
-                _ => Err(field_id_error(span, "must be an integer literal")),
+                _ => Err(field_id_error(span, "Expected field-id to be an integer")),
             }
         })
         .transpose() // Convert Option<Result<T, E>> to Result<Option<T>, E>
