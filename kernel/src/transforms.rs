@@ -621,9 +621,8 @@ mod tests {
         let transform_spec = get_transform_spec(&all_fields);
 
         // Physical schema without _change_type (so it needs to come from metadata)
-        let physical_schema = StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-        ]);
+        let physical_schema =
+            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
 
         // Empty metadata values - missing required _change_type
         let metadata_values = HashMap::new();
@@ -632,7 +631,9 @@ mod tests {
         let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("missing partition value for dynamic column"));
+        assert!(err
+            .to_string()
+            .contains("missing partition value for dynamic column"));
         assert!(err.to_string().contains("_change_type"));
     }
 
