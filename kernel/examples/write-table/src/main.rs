@@ -101,7 +101,8 @@ async fn try_main() -> DeltaResult<()> {
 
     // Commit the transaction
     match txn.commit(&engine)? {
-        CommitResult::Committed { version, .. } => {
+        CommitResult::CommittedTransaction(committed) => {
+            let version = committed.version();
             println!("✓ Committed transaction at version {version}");
             println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
 
@@ -111,7 +112,8 @@ async fn try_main() -> DeltaResult<()> {
 
             Ok(())
         }
-        CommitResult::Conflict(_, conflicting_version) => {
+        CommitResult::ConflictedTransaction(conflicted) => {
+            let conflicting_version = conflicted.conflict_version;
             println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
             Err(Error::generic("Commit failed"))
         }

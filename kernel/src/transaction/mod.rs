@@ -18,7 +18,7 @@ use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version,
+    RowVisitor, Snapshot, Version,
 };
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -221,22 +221,12 @@ impl Transaction {
 
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
-            Ok(()) => Ok(CommitResult::Committed {
-                version: commit_version,
-                post_commit_stats: PostCommitStats {
-                    commits_since_checkpoint: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_checkpoint()
-                        + 1,
-                    commits_since_log_compaction: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_log_compaction_or_checkpoint()
-                        + 1,
-                },
-            }),
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
+            Ok(()) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(commit_version),
+            )),
+            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::ConflictedTransaction(
+                self.into_conflicted(commit_version),
+            )),
             Err(e) => Err(e),
         }
     }
@@ -479,6 +469,31 @@ impl Transaction {
             Ok((Box::new(add_actions), None))
         }
     }
+
+    fn into_committed(self, version: Version) -> CommittedTransaction {
+        let stats = PostCommitStats {
+            commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
+                + 1,
+            commits_since_log_compaction: self
+                .read_snapshot
+                .log_segment()
+                .commits_since_log_compaction_or_checkpoint()
+                + 1,
+        };
+
+        CommittedTransaction {
+            transaction: self,
+            commit_version: version,
+            post_commit_stats: stats,
+        }
+    }
+
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction {
+        ConflictedTransaction {
+            transaction: self,
+            conflict_version,
+        }
+    }
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -530,18 +545,48 @@ pub struct PostCommitStats {
 #[derive(Debug)]
 pub enum CommitResult {
     /// The transaction was successfully committed.
-    Committed {
-        /// the version of the table that was just committed
-        version: Version,
-        /// The [`PostCommitStats`] for this transaction
-        post_commit_stats: PostCommitStats,
-    },
+    CommittedTransaction(CommittedTransaction),
     /// This transaction conflicted with an existing version (at the version given). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    Conflict(Transaction, Version),
+    ConflictedTransaction(ConflictedTransaction),
+}
+
+#[derive(Debug)]
+pub struct CommittedTransaction {
+    transaction: Transaction,
+    /// the version of the table that was just committed
+    commit_version: Version,
+    /// The [`PostCommitStats`] for this transaction
+    post_commit_stats: PostCommitStats,
+}
+
+impl CommittedTransaction {
+    /// The version of the table that was just committed
+    pub fn version(&self) -> Version {
+        self.commit_version
+    }
+
+    /// The [`PostCommitStats`] for this transaction
+    pub fn post_commit_stats(&self) -> &PostCommitStats {
+        &self.post_commit_stats
+    }
+
+    /// Compute a new snapshot for the table at the commit version. Note this is generally more
+    /// efficient than creating a new snapshot from scratch.
+    pub fn post_commit_snapshot(&self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        Snapshot::builder_from(self.transaction.read_snapshot.clone())
+            .at_version(self.commit_version)
+            .build(engine)
+    }
+}
+
+#[derive(Debug)]
+pub struct ConflictedTransaction {
+    pub transaction: Transaction,
+    pub conflict_version: Version,
 }
 
 #[cfg(test)]
