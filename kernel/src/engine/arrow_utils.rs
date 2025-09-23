@@ -129,31 +129,36 @@ impl RowIndexBuilder {
         // filtering is not idempotent and `with_row_groups` could be called more than once.
         self.row_group_ordinals = Some(ordinals.to_vec())
     }
-}
 
-impl IntoIterator for RowIndexBuilder {
-    type Item = i64;
-    type IntoIter = FlattenedRangeIterator<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        let starting_offsets =
-            match self.row_group_ordinals {
-                Some(ordinals) => {
-                    // We generally ignore invalid row group ordinals, but in non-optimized builds,
-                    // we verify that all ordinals are within bounds
-                    debug_assert!(
-                        ordinals.iter().all(|&i| i < self.row_group_row_index_ranges.len()),
-                        "All row group ordinals must be within bounds of row_group_row_index_ranges"
-                    );
-                    // We have to clone here to avoid modifying the original vector in each iteration
-                    ordinals
-                        .iter()
-                        .filter_map(|&i| self.row_group_row_index_ranges.get(i).cloned())
-                        .collect()
-                }
-                None => self.row_group_row_index_ranges,
-            };
-        starting_offsets.into_iter().flatten()
+    /// Build an iterator of row indexes, filtering out row groups that were skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are duplicate or out of bounds row group ordinals.
+    pub(crate) fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
+        let starting_offsets = match self.row_group_ordinals {
+            Some(ordinals) => {
+                let mut seen_ordinals = HashSet::new();
+                ordinals
+                    .iter()
+                    .map(|&i| {
+                        // We verify that there are no duplicate or out of bounds ordinals
+                        if !seen_ordinals.insert(i) {
+                            return Err(Error::generic("Found duplicate row group ordinal"));
+                        }
+                        // We have to clone here to avoid modifying the original vector in each iteration
+                        self.row_group_row_index_ranges
+                            .get(i)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::generic(format!("Row group ordinal {i} is out of bounds"))
+                            })
+                    })
+                    .try_collect()
+            }
+            None => Ok(self.row_group_row_index_ranges),
+        }?;
+        Ok(starting_offsets.into_iter().flatten())
     }
 }
 
@@ -1838,7 +1843,7 @@ mod tests {
         ];
 
         let builder = RowIndexBuilder::new(&row_groups);
-        let row_indexes: Vec<i64> = builder.into_iter().collect();
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
 
         // Should produce consecutive indexes from 0 to 11
         assert_eq!(row_indexes, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
@@ -1856,7 +1861,7 @@ mod tests {
         let mut builder = RowIndexBuilder::new(&row_groups);
         builder.select_row_groups(&[0, 2]);
 
-        let row_indexes: Vec<i64> = builder.into_iter().collect();
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
 
         // Should produce indexes from row groups 0 and 2: [0-4] and [8-11]
         assert_eq!(row_indexes, vec![0, 1, 2, 3, 4, 8, 9, 10, 11]);
@@ -1869,7 +1874,7 @@ mod tests {
         let mut builder = RowIndexBuilder::new(&row_groups);
         builder.select_row_groups(&[0]);
 
-        let row_indexes: Vec<i64> = builder.into_iter().collect();
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
 
         assert_eq!(row_indexes, vec![0, 1, 2, 3, 4, 5, 6]);
     }
@@ -1881,7 +1886,7 @@ mod tests {
         let mut builder = RowIndexBuilder::new(&row_groups);
         builder.select_row_groups(&[]);
 
-        let row_indexes: Vec<i64> = builder.into_iter().collect();
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
 
         // Should produce no indexes
         assert_eq!(row_indexes, Vec::<i64>::new());
@@ -1898,27 +1903,32 @@ mod tests {
         let mut builder = RowIndexBuilder::new(&row_groups);
         builder.select_row_groups(&[2, 0]);
 
-        let row_indexes: Vec<i64> = builder.into_iter().collect();
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
 
         // Should produce indexes in the order specified: group 2 first, then group 0
         assert_eq!(row_indexes, vec![5, 0, 1]);
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(
-        expected = "All row group ordinals must be within bounds of row_group_row_index_ranges"
-    )]
-    fn test_row_index_builder_expect_debug_panic_for_out_of_bounds_row_group_ordinals() {
+    fn test_row_index_builder_out_of_bounds_row_group_ordinals() {
         let row_groups = vec![create_mock_row_group(2)];
 
         let mut builder = RowIndexBuilder::new(&row_groups);
         builder.select_row_groups(&[1]);
 
-        // This should panic because the row group ordinal is out of bounds
-        // NOTE: This panic only happens in non-optimized builds
-        let row_indexes: Vec<i64> = builder.into_iter().collect();
-        assert_eq!(row_indexes, vec![0, 1]);
+        let result = builder.build();
+        assert_result_error_with_message(result, "Row group ordinal 1 is out of bounds");
+    }
+
+    #[test]
+    fn test_row_index_builder_duplicate_row_group_ordinals() {
+        let row_groups = vec![create_mock_row_group(2), create_mock_row_group(3)];
+
+        let mut builder = RowIndexBuilder::new(&row_groups);
+        builder.select_row_groups(&[1, 1]);
+
+        let result = builder.build();
+        assert_result_error_with_message(result, "Found duplicate row group ordinal");
     }
 
     #[test]
