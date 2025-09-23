@@ -660,22 +660,35 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     // Commit the first transaction - this should succeed
     let result1 = txn1.commit(engine1.as_ref())?;
     match result1 {
-        CommitResult::Committed { version, .. } => {
-            assert_eq!(version, 1, "First transaction should commit at version 1");
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(
+                committed.version(),
+                1,
+                "First transaction should commit at version 1"
+            );
         }
-        CommitResult::Conflict(_, version) => {
-            panic!("First transaction should not conflict, got conflict at version {version}");
+        CommitResult::ConflictedTransaction(conflicted) => {
+            panic!(
+                "First transaction should not conflict, got conflict at version {}",
+                conflicted.conflict_version
+            );
         }
     }
 
     // Commit the second transaction - this should result in a conflict
     let result2 = txn2.commit(engine2.as_ref())?;
     match result2 {
-        CommitResult::Committed { version, .. } => {
-            panic!("Second transaction should conflict, but got committed at version {version}");
+        CommitResult::CommittedTransaction(committed) => {
+            panic!(
+                "Second transaction should conflict, but got committed at version {}",
+                committed.version()
+            );
         }
-        CommitResult::Conflict(_conflicted_txn, version) => {
-            assert_eq!(version, 1, "Conflict should be at version 1");
+        CommitResult::ConflictedTransaction(conflicted) => {
+            assert_eq!(
+                conflicted.conflict_version, 1,
+                "Conflict should be at version 1"
+            );
 
             // TODO: In the future, we need to resolve conflicts and retry the commit
             // For now, we just verify that we got the conflict as expected
