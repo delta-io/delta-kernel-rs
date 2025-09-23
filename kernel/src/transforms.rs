@@ -23,9 +23,9 @@ pub(crate) enum ColumnType {
     /// The string contains the physical column name (after any column mapping).
     Selected(String),
 
-    /// A partition column that needs to be added back in.
+    /// A metadata-derived column (e.g., partition columns, CDF metadata columns).
     /// The usize is the index of this column in the logical schema.
-    Partition(usize),
+    MetadataDerivedColumn(usize),
 
     /// A column whose source varies by context (physical vs. metadata-derived).
     /// Used for CDF's _change_type which exists physically in CDC files but
@@ -55,7 +55,6 @@ pub(crate) enum FieldTransformSpec {
         insert_after: Option<String>,
         expr: ExpressionRef,
     },
-
     /// Replace the named input column with a new expression.
     // NOTE: Row tracking will use this to replace physical rowid columns with
     // COALESCE expressions for non-materialized row ids.
@@ -64,22 +63,20 @@ pub(crate) enum FieldTransformSpec {
         field_name: String,
         expr: ExpressionRef,
     },
-
-    /// Remove the named input column from the output.
-    // NOTE: Row tracking will use this to drop internal metadata columns.
+    /// Drops the named input column
+    // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
+    // they should not appear in the query's output.
     #[allow(unused)]
     StaticDrop { field_name: String },
-
     /// Insert a partition column after the named input column.
     /// The partition column is identified by its field index in the logical table schema.
     /// Its value varies from file to file and is obtained from file metadata.
-    PartitionColumn {
+    MetadataDerivedColumn {
         /// Index in the logical schema to get the column's data type
         field_index: usize,
         /// Insert after this physical column (None = prepend)
         insert_after: Option<String>,
     },
-
     /// Insert or reorder a dynamic column that may be physical or metadata-derived.
     /// Used for CDF's _change_type column which requires different handling per file type.
     DynamicColumn {
@@ -109,9 +106,6 @@ pub(crate) fn parse_partition_value(
 }
 
 /// Parse all partition values from a transform spec.
-///
-/// Extracts partition column indices from the transform spec and looks up their values
-/// in the provided HashMap, parsing them according to their data types in the schema.
 pub(crate) fn parse_partition_values(
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
@@ -120,11 +114,9 @@ pub(crate) fn parse_partition_values(
     transform_spec
         .iter()
         .filter_map(|field_transform| match field_transform {
-            FieldTransformSpec::PartitionColumn { field_index, .. } => Some(parse_partition_value(
-                *field_index,
-                logical_schema,
-                partition_values,
-            )),
+            FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => Some(
+                parse_partition_value(*field_index, logical_schema, partition_values),
+            ),
             FieldTransformSpec::DynamicColumn { field_index, .. } => {
                 // Dynamic columns may also need metadata values when not physical
                 Some(parse_partition_value(
@@ -162,12 +154,12 @@ pub(crate) fn get_transform_expr(
                 transform.with_replaced_field(field_name.clone(), expr.clone())
             }
             StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
-            PartitionColumn {
+            MetadataDerivedColumn {
                 field_index,
                 insert_after,
             } => {
                 let Some((_, partition_value)) = partition_values.remove(field_index) else {
-                    return Err(Error::InternalError(format!(
+                    return Err(Error::MissingData(format!(
                         "missing partition value for field index {field_index}"
                     )));
                 };
@@ -196,7 +188,7 @@ pub(crate) fn get_transform_expr(
                 } else {
                     // Column doesn't exist physically - treat as partition column
                     let Some((_, partition_value)) = partition_values.remove(field_index) else {
-                        return Err(Error::InternalError(format!(
+                        return Err(Error::MissingData(format!(
                             "missing partition value for dynamic column '{}' at index {}",
                             physical_name, field_index
                         )));
@@ -226,9 +218,9 @@ pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
                 // Track the last physical field for calculating insertion points
                 last_physical_field = Some(physical_name);
             }
-            ColumnType::Partition(logical_idx) => {
+            ColumnType::MetadataDerivedColumn(logical_idx) => {
                 // Partition columns are inserted after the last physical field
-                transform_spec.push(FieldTransformSpec::PartitionColumn {
+                transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
                     insert_after: last_physical_field.map(String::from),
                     field_index: *logical_idx,
                 });
@@ -251,7 +243,6 @@ pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
 }
 
 /// Parse a partition value from the raw string representation
-/// This was originally `parse_partition_value` in scan/mod.rs
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
     data_type: &DataType,
@@ -291,14 +282,14 @@ mod tests {
             StructField::nullable("age", DataType::LONG),
         ]));
         let transform_spec = vec![
-            FieldTransformSpec::PartitionColumn {
+            FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 1,
                 insert_after: Some("id".to_string()),
             },
             FieldTransformSpec::StaticDrop {
                 field_name: "unused".to_string(),
             },
-            FieldTransformSpec::PartitionColumn {
+            FieldTransformSpec::MetadataDerivedColumn {
                 field_index: 0,
                 insert_after: None,
             },
@@ -325,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_get_transform_expr_missing_partition_value() {
-        let transform_spec = vec![FieldTransformSpec::PartitionColumn {
+        let transform_spec = vec![FieldTransformSpec::MetadataDerivedColumn {
             field_index: 0,
             insert_after: None,
         }];
@@ -378,25 +369,32 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_column_transform() {
-        // Test Dynamic column that exists physically (like _change_type in CDC files)
-        let _schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("id", DataType::STRING),
-            StructField::nullable("_change_type", DataType::STRING),
-            StructField::nullable("_commit_version", DataType::LONG),
-        ]));
-
+    fn test_dynamic_column_transform_physical_reorder() {
         let all_fields = vec![
             ColumnType::Selected("id".to_string()),
             ColumnType::Dynamic {
                 logical_index: 1,
                 physical_name: "_change_type".to_string(),
             },
-            ColumnType::Partition(2),
+            ColumnType::MetadataDerivedColumn(2),
         ];
 
         let transform_spec = get_transform_spec(&all_fields);
         assert_eq!(transform_spec.len(), 2); // Dynamic and Metadata columns
+
+        // Verify the transform spec contains expected operations
+        match &transform_spec[0] {
+            FieldTransformSpec::DynamicColumn {
+                field_index,
+                physical_name,
+                insert_after,
+            } => {
+                assert_eq!(*field_index, 1);
+                assert_eq!(physical_name, "_change_type");
+                assert_eq!(insert_after, &Some("id".to_string()));
+            }
+            _ => panic!("Expected DynamicColumn transform"),
+        }
 
         // Test transform expression with physical _change_type
         let physical_schema = StructType::new_unchecked(vec![
@@ -407,8 +405,27 @@ mod tests {
         metadata_values.insert(2, ("_commit_version".to_string(), Scalar::Long(42)));
 
         let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
-        assert!(result.is_ok());
-        // The transform should drop and reinsert _change_type for consistent ordering
+        let transform_expr = result.expect("Transform expression should be created successfully");
+
+        // Verify it's a Transform expression that will reorder _change_type
+        assert!(
+            matches!(transform_expr.as_ref(), Expression::Transform(_)),
+            "Expected Transform expression for reordering"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_column_transform_metadata_insertion() {
+        let all_fields = vec![
+            ColumnType::Selected("id".to_string()),
+            ColumnType::Dynamic {
+                logical_index: 1,
+                physical_name: "_change_type".to_string(),
+            },
+            ColumnType::MetadataDerivedColumn(2),
+        ];
+
+        let transform_spec = get_transform_spec(&all_fields);
 
         // Test transform expression without physical _change_type (Add/Remove files)
         let physical_schema_no_change_type =
@@ -428,24 +445,29 @@ mod tests {
             metadata_values,
             &physical_schema_no_change_type,
         );
-        assert!(result.is_ok());
-        // The transform should insert _change_type from metadata
+        let transform_expr = result.expect("Transform expression should be created successfully");
+
+        // Verify it's a Transform expression that will insert _change_type from metadata
+        assert!(
+            matches!(transform_expr.as_ref(), Expression::Transform(_)),
+            "Expected Transform expression for metadata insertion"
+        );
     }
 
     #[test]
     fn test_get_transform_spec_with_metadata() {
         let all_fields = vec![
             ColumnType::Selected("col1".to_string()),
-            ColumnType::Partition(1),
+            ColumnType::MetadataDerivedColumn(1),
             ColumnType::Selected("col2".to_string()),
-            ColumnType::Partition(2),
+            ColumnType::MetadataDerivedColumn(2),
         ];
 
         let result = get_transform_spec(&all_fields);
         assert_eq!(result.len(), 2);
 
         // Check first metadata column
-        if let FieldTransformSpec::PartitionColumn {
+        if let FieldTransformSpec::MetadataDerivedColumn {
             field_index,
             insert_after,
         } = &result[0]
@@ -453,11 +475,11 @@ mod tests {
             assert_eq!(*field_index, 1);
             assert_eq!(insert_after.as_ref().unwrap(), "col1");
         } else {
-            panic!("Expected PartitionColumn transform");
+            panic!("Expected MetadataDerivedColumn transform");
         }
 
         // Check second metadata column
-        if let FieldTransformSpec::PartitionColumn {
+        if let FieldTransformSpec::MetadataDerivedColumn {
             field_index,
             insert_after,
         } = &result[1]
@@ -465,7 +487,7 @@ mod tests {
             assert_eq!(*field_index, 2);
             assert_eq!(insert_after.as_ref().unwrap(), "col2");
         } else {
-            panic!("Expected PartitionColumn transform");
+            panic!("Expected MetadataDerivedColumn transform");
         }
     }
 
@@ -512,5 +534,181 @@ mod tests {
             &DataType::Primitive(PrimitiveType::Integer),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cdf_partition_values_with_cdc_file() {
+        // Test partition values + CDF columns for CDC files (where _change_type is physical)
+
+        // Create a logical schema with regular columns, partition columns, and CDF columns
+        let logical_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("year", DataType::INTEGER), // Partition column
+            StructField::nullable("month", DataType::INTEGER), // Partition column
+            StructField::nullable("_change_type", DataType::STRING), // CDF Dynamic column
+            StructField::nullable("_commit_version", DataType::LONG), // CDF metadata column
+        ]));
+
+        // Define the all_fields with mix of selected, partition, and CDF columns
+        let all_fields = vec![
+            ColumnType::Selected("id".to_string()),
+            ColumnType::MetadataDerivedColumn(1), // year partition
+            ColumnType::MetadataDerivedColumn(2), // month partition
+            ColumnType::Dynamic {
+                logical_index: 3,
+                physical_name: "_change_type".to_string(),
+            },
+            ColumnType::MetadataDerivedColumn(4), // _commit_version
+        ];
+
+        // Get the transform spec
+        let transform_spec = get_transform_spec(&all_fields);
+        assert_eq!(transform_spec.len(), 4); // 2 partition columns + 1 dynamic + 1 CDF metadata
+
+        // Physical schema for CDC files includes _change_type
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("_change_type", DataType::STRING),
+        ]);
+
+        // Prepare all metadata values (partitions + CDF metadata)
+        let mut partition_values = HashMap::new();
+        partition_values.insert("year".to_string(), "2024".to_string());
+        partition_values.insert("month".to_string(), "3".to_string());
+
+        let mut all_metadata_values =
+            parse_partition_values(&logical_schema, &transform_spec, &partition_values)
+                .expect("Should parse partition values");
+
+        // parse_partition_values will try to parse all MetadataDerivedColumn entries
+        // It will return nulls for CDF columns not in partition_values
+        assert!(all_metadata_values.contains_key(&1)); // year
+        assert!(all_metadata_values.contains_key(&2)); // month
+        assert_eq!(
+            all_metadata_values.get(&1).unwrap().1,
+            Scalar::Integer(2024)
+        );
+        assert_eq!(all_metadata_values.get(&2).unwrap().1, Scalar::Integer(3));
+        // _commit_version (index 4) will be null since not in partition_values
+        assert!(matches!(
+            all_metadata_values.get(&4).map(|(_, v)| v),
+            Some(Scalar::Null(_))
+        ));
+
+        // Add CDF metadata
+        all_metadata_values.insert(4, ("_commit_version".to_string(), Scalar::Long(100)));
+
+        // Create and validate the transform expression
+        let transform_expr =
+            get_transform_expr(&transform_spec, all_metadata_values, &physical_schema)
+                .expect("Should create transform expression");
+
+        // Verify it creates a transform that will reorder _change_type from physical
+        assert!(matches!(transform_expr.as_ref(), Expression::Transform(_)));
+    }
+
+    #[test]
+    fn test_dynamic_column_missing_metadata_error() {
+        // Test that we get an error when a Dynamic column needs metadata but it's not provided
+        let all_fields = vec![
+            ColumnType::Selected("id".to_string()),
+            ColumnType::Dynamic {
+                logical_index: 1,
+                physical_name: "_change_type".to_string(),
+            },
+        ];
+
+        let transform_spec = get_transform_spec(&all_fields);
+
+        // Physical schema without _change_type (so it needs to come from metadata)
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+        ]);
+
+        // Empty metadata values - missing required _change_type
+        let metadata_values = HashMap::new();
+
+        // Should fail with missing data error
+        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("missing partition value for dynamic column"));
+        assert!(err.to_string().contains("_change_type"));
+    }
+
+    #[test]
+    fn test_cdf_partition_values_with_add_remove_file() {
+        // Test partition values + CDF columns for Add/Remove files (where _change_type is metadata)
+
+        // Create a logical schema with regular columns, partition columns, and CDF columns
+        let logical_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("year", DataType::INTEGER), // Partition column
+            StructField::nullable("month", DataType::INTEGER), // Partition column
+            StructField::nullable("_change_type", DataType::STRING), // CDF Dynamic column
+            StructField::nullable("_commit_version", DataType::LONG), // CDF metadata column
+        ]));
+
+        // Define the all_fields with mix of selected, partition, and CDF columns
+        let all_fields = vec![
+            ColumnType::Selected("id".to_string()),
+            ColumnType::MetadataDerivedColumn(1), // year partition
+            ColumnType::MetadataDerivedColumn(2), // month partition
+            ColumnType::Dynamic {
+                logical_index: 3,
+                physical_name: "_change_type".to_string(),
+            },
+            ColumnType::MetadataDerivedColumn(4), // _commit_version
+        ];
+
+        // Get the transform spec
+        let transform_spec = get_transform_spec(&all_fields);
+        assert_eq!(transform_spec.len(), 4);
+
+        // Physical schema for Add/Remove files - no _change_type
+        let physical_schema =
+            StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
+
+        // Prepare all metadata values including _change_type
+        let mut partition_values = HashMap::new();
+        partition_values.insert("year".to_string(), "2024".to_string());
+        partition_values.insert("month".to_string(), "3".to_string());
+        partition_values.insert("_change_type".to_string(), "insert".to_string()); // Computed for Add file
+
+        let mut all_metadata_values =
+            parse_partition_values(&logical_schema, &transform_spec, &partition_values)
+                .expect("Should parse all values including dynamic _change_type");
+
+        // Verify we parsed all expected values including _change_type
+        // parse_partition_values processes all metadata columns, returning nulls for missing ones
+        assert!(all_metadata_values.contains_key(&1)); // year
+        assert!(all_metadata_values.contains_key(&2)); // month
+        assert!(all_metadata_values.contains_key(&3)); // _change_type
+        assert!(all_metadata_values.contains_key(&4)); // _commit_version (will be null)
+        assert_eq!(
+            all_metadata_values.get(&1).unwrap().1,
+            Scalar::Integer(2024)
+        );
+        assert_eq!(all_metadata_values.get(&2).unwrap().1, Scalar::Integer(3));
+        assert_eq!(
+            all_metadata_values.get(&3).unwrap().1,
+            Scalar::String("insert".to_string())
+        );
+        // _commit_version will be null since not provided
+        assert!(matches!(
+            all_metadata_values.get(&4).map(|(_, v)| v),
+            Some(Scalar::Null(_))
+        ));
+
+        // Add CDF metadata
+        all_metadata_values.insert(4, ("_commit_version".to_string(), Scalar::Long(100)));
+
+        // Create and validate the transform expression
+        let transform_expr =
+            get_transform_expr(&transform_spec, all_metadata_values, &physical_schema)
+                .expect("Should create transform expression with metadata _change_type");
+
+        // Verify it creates a transform that will insert _change_type from metadata
+        assert!(matches!(transform_expr.as_ref(), Expression::Transform(_)));
     }
 }
