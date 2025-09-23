@@ -23,13 +23,16 @@ pub(crate) enum ColumnType {
     /// The string contains the physical column name (after any column mapping).
     Selected(String),
 
-    /// A metadata-derived column (e.g., partition columns, CDF metadata columns).
+    /// A metadata-derived column (e.g., partition columns, CDF version and timestamp columns).
     /// The usize is the index of this column in the logical schema.
     MetadataDerivedColumn(usize),
 
     /// A column whose source varies by context (physical vs. metadata-derived).
-    /// Used for CDF's _change_type which exists physically in CDC files but
-    /// must be computed for Add/Remove files.
+    /// If the column exists in the physical schema, this reorders it to the correct index.
+    /// Otherwise, this is treated as a MetadataDerivedColumn.
+    ///
+    /// This is used for CDF's _change_type which may exist physically in `.cdc` files but
+    /// is metadata derived Add/Remove files.
     Dynamic {
         /// Index of this column in the logical schema
         logical_index: usize,
@@ -117,15 +120,8 @@ pub(crate) fn parse_partition_values(
             FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => Some(
                 parse_partition_value(*field_index, logical_schema, partition_values),
             ),
-            FieldTransformSpec::DynamicColumn { field_index, .. } => {
-                // Dynamic columns may also need metadata values when not physical
-                Some(parse_partition_value(
-                    *field_index,
-                    logical_schema,
-                    partition_values,
-                ))
-            }
-            FieldTransformSpec::StaticInsert { .. }
+            FieldTransformSpec::DynamicColumn { .. }
+            | FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::StaticReplace { .. }
             | FieldTransformSpec::StaticDrop { .. } => None,
         })
@@ -139,7 +135,7 @@ pub(crate) fn parse_partition_values(
 /// while applying the output schema for name mapping.
 pub(crate) fn get_transform_expr(
     transform_spec: &TransformSpec,
-    mut partition_values: HashMap<usize, (String, Scalar)>,
+    mut metadata_values: HashMap<usize, (String, Scalar)>,
     physical_schema: &StructType,
 ) -> DeltaResult<ExpressionRef> {
     let mut transform = Transform::new_top_level();
@@ -158,7 +154,7 @@ pub(crate) fn get_transform_expr(
                 field_index,
                 insert_after,
             } => {
-                let Some((_, partition_value)) = partition_values.remove(field_index) else {
+                let Some((_, partition_value)) = metadata_values.remove(field_index) else {
                     return Err(Error::MissingData(format!(
                         "missing partition value for field index {field_index}"
                     )));
@@ -187,7 +183,7 @@ pub(crate) fn get_transform_expr(
                     transform
                 } else {
                     // Column doesn't exist physically - treat as partition column
-                    let Some((_, partition_value)) = partition_values.remove(field_index) else {
+                    let Some((_, partition_value)) = metadata_values.remove(field_index) else {
                         return Err(Error::MissingData(format!(
                             "missing partition value for dynamic column '{}' at index {}",
                             physical_name, field_index
@@ -260,6 +256,7 @@ pub(crate) fn parse_partition_value_raw(
 mod tests {
     use super::*;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use std::collections::HashMap;
 
     // Tests for parse_partition_value function
@@ -272,8 +269,7 @@ mod tests {
         let partition_values = HashMap::new();
 
         let result = parse_partition_value(5, &schema, &partition_values);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("out of bounds"));
+        assert_result_error_with_message(result, "out of bounds");
     }
 
     // Tests for parse_partition_values function
@@ -308,10 +304,10 @@ mod tests {
         partition_values.insert("_change_type".to_string(), "insert".to_string());
 
         let result = parse_partition_values(&schema, &transform_spec, &partition_values).unwrap();
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert!(result.contains_key(&0));
         assert!(result.contains_key(&1));
-        assert!(result.contains_key(&2));
+        assert!(!result.contains_key(&2));
 
         // Verify the parsed values
         assert_eq!(
@@ -319,10 +315,6 @@ mod tests {
             Scalar::String("test".to_string())
         );
         assert_eq!(result.get(&1).unwrap().1, Scalar::Long(30));
-        assert_eq!(
-            result.get(&2).unwrap().1,
-            Scalar::String("insert".to_string())
-        );
     }
 
     #[test]
@@ -365,11 +357,7 @@ mod tests {
             Some(&"value".to_string()),
             &DataType::struct_type_unchecked(vec![]), // Non-primitive type
         );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unexpected partition column type"));
+        assert_result_error_with_message(result, "Unexpected partition column type");
     }
 
     #[test]
@@ -378,7 +366,7 @@ mod tests {
             Some(&"not_a_number".to_string()),
             &DataType::Primitive(PrimitiveType::Integer),
         );
-        assert!(result.is_err());
+        assert_result_error_with_message(result, "Failed to parse value");
     }
 
     // Tests for get_transform_spec function
@@ -469,11 +457,7 @@ mod tests {
         // Create a minimal physical schema for test
         let physical_schema = StructType::new_unchecked(vec![]);
         let result = get_transform_expr(&transform_spec, partition_values, &physical_schema);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("missing partition value"));
+        assert_result_error_with_message(result, "missing partition value");
     }
 
     #[test]
@@ -494,11 +478,43 @@ mod tests {
         ];
         let metadata_values = HashMap::new();
 
-        // Create a minimal physical schema for test
-        let physical_schema = StructType::new_unchecked(vec![]);
+        // Create a physical schema with the relevant columns
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("col1", DataType::STRING),
+            StructField::nullable("col2", DataType::INTEGER),
+            StructField::nullable("col3", DataType::LONG),
+        ]);
         let result =
             get_transform_expr(&transform_spec, metadata_values, &physical_schema).unwrap();
-        assert!(matches!(result.as_ref(), Expression::Transform(_)));
+
+        let Expression::Transform(transform) = result.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        // Verify StaticInsert: should insert after col1
+        assert!(transform.field_transforms.contains_key("col1"));
+        assert!(!transform.field_transforms["col1"].is_replace);
+        assert_eq!(transform.field_transforms["col1"].exprs.len(), 1);
+        let Expression::Literal(scalar) = transform.field_transforms["col1"].exprs[0].as_ref()
+        else {
+            panic!("Expected literal expression for insert");
+        };
+        assert_eq!(scalar, &Scalar::Integer(42));
+
+        // Verify StaticReplace: should replace col2 with the expression
+        assert!(transform.field_transforms.contains_key("col2"));
+        assert!(transform.field_transforms["col2"].is_replace);
+        assert_eq!(transform.field_transforms["col2"].exprs.len(), 1);
+        let Expression::Literal(scalar) = transform.field_transforms["col2"].exprs[0].as_ref()
+        else {
+            panic!("Expected literal expression for replace");
+        };
+        assert_eq!(scalar, &Scalar::Integer(42));
+
+        // Verify StaticDrop: should drop col3 (empty expressions and is_replace = true)
+        assert!(transform.field_transforms.contains_key("col3"));
+        assert!(transform.field_transforms["col3"].is_replace);
+        assert!(transform.field_transforms["col3"].exprs.is_empty());
     }
 
     #[test]
@@ -509,6 +525,7 @@ mod tests {
             insert_after: Some("id".to_string()),
         }];
 
+        // Physical schema contains change_type
         let physical_schema = StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("_change_type", DataType::STRING),
@@ -546,6 +563,7 @@ mod tests {
             insert_after: Some("id".to_string()),
         }];
 
+        // Physical schema does not contain change_type
         let physical_schema =
             StructType::new_unchecked(vec![StructField::nullable("id", DataType::STRING)]);
         let mut metadata_values = HashMap::new();
@@ -629,11 +647,6 @@ mod tests {
 
         // Should fail with missing data error
         let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("missing partition value for dynamic column"));
-        assert!(err.to_string().contains("_change_type"));
+        assert_result_error_with_message(result, "missing partition value for dynamic column");
     }
 }

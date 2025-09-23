@@ -3,13 +3,10 @@ use std::collections::HashMap;
 use crate::expressions::Scalar;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transforms::{parse_partition_values, TransformSpec};
-use crate::DeltaResult;
+use crate::{DeltaResult, Error};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
-use super::{
-    ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
-    REMOVE_CHANGE_TYPE,
-};
+use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
 
 /// Gets CDF metadata columns from the logical schema and scan file.
 ///
@@ -18,18 +15,13 @@ use super::{
 fn get_cdf_columns(
     logical_schema: &SchemaRef,
     scan_file: &CdfScanFile,
-) -> impl Iterator<Item = (usize, (String, Scalar))> {
+) -> DeltaResult<impl Iterator<Item = (usize, (String, Scalar))>> {
     // Handle _change_type
     let change_type_field = logical_schema.field_with_index(CHANGE_TYPE_COL_NAME);
     let change_type_metadata = match (change_type_field, &scan_file.scan_type) {
-        (Some((idx, field)), CdfScanFileType::Add) => {
+        (Some((idx, field)), CdfScanFileType::Add | CdfScanFileType::Remove) => {
             let name = field.name().to_string();
-            let value = Scalar::String(ADD_CHANGE_TYPE.to_string());
-            Some((idx, (name, value)))
-        }
-        (Some((idx, field)), CdfScanFileType::Remove) => {
-            let name = field.name().to_string();
-            let value = Scalar::String(REMOVE_CHANGE_TYPE.to_string());
+            let value = Scalar::String(scan_file.scan_type.get_cdf_string_value().to_string());
             Some((idx, (name, value)))
         }
         (Some(_), CdfScanFileType::Cdc) | (None, _) => {
@@ -40,12 +32,14 @@ fn get_cdf_columns(
 
     // Handle _commit_timestamp
     let timestamp_field = logical_schema.field_with_index(COMMIT_TIMESTAMP_COL_NAME);
-    let timestamp_metadata = timestamp_field.and_then(|(idx, field)| {
-        let name = field.name().to_string();
-        Scalar::timestamp_from_millis(scan_file.commit_timestamp)
-            .ok()
-            .map(|value| (idx, (name, value)))
-    });
+    let timestamp_metadata: Result<Option<(usize, (String, Scalar))>, Error> = timestamp_field
+        .map(|(idx, field)| {
+            let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp).map_err(|e| {
+                Error::generic(format!("Failed to process {}: {e}", scan_file.path))
+            })?;
+            Ok((idx, (field.name().to_string(), value)))
+        })
+        .transpose();
 
     // Handle _commit_version
     let version_field = logical_schema.field_with_index(COMMIT_VERSION_COL_NAME);
@@ -55,10 +49,10 @@ fn get_cdf_columns(
         (idx, (name, value))
     });
 
-    change_type_metadata
+    Ok(change_type_metadata
         .into_iter()
-        .chain(timestamp_metadata)
-        .chain(version_metadata)
+        .chain(timestamp_metadata?)
+        .chain(version_metadata))
 }
 
 /// Gets the physical schema that will be used to read data in the `scan_file` path.
@@ -95,7 +89,7 @@ pub(crate) fn prepare_cdf_partition_values(
     partition_values.extend(parsed_values);
 
     // Handle CDF metadata columns
-    let cdf_values = get_cdf_columns(logical_schema, scan_file);
+    let cdf_values = get_cdf_columns(logical_schema, scan_file)?;
     partition_values.extend(cdf_values);
 
     Ok(partition_values)
