@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::expressions::Scalar;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::transforms::{parse_partition_values, TransformSpec};
-use crate::{DeltaResult, Error};
+use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::{DeltaResult, Error, ExpressionRef};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME};
@@ -70,17 +70,19 @@ pub(crate) fn scan_file_physical_schema(
     }
 }
 
-/// Prepares partition values for CDF columns and partition columns.
-///
-/// This function collects all partition values needed for the transform:
-/// - Partition values from the scan file
-/// - CDF metadata (_commit_version, _commit_timestamp)
-/// - _change_type value (for Dynamic column when not physical)
-pub(crate) fn prepare_cdf_partition_values(
+// Get the transform expression for a CDF scan file
+//
+// Note: parse_partition_values returns null values for missing partition columns,
+// and CDF metadata columns (commit_timestamp, commit_version, change_type) are then
+// added to overwrite any conflicting values. This behavior can be made more strict by changing
+// the parse_partition_values function to return an error for missing partition values,
+// and adding cdf values to the partition_values map
+pub(crate) fn get_cdf_transform_expr(
     scan_file: &CdfScanFile,
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
-) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
+    physical_schema: &StructType,
+) -> DeltaResult<ExpressionRef> {
     let mut partition_values = HashMap::new();
 
     // Handle regular partition values using parse_partition_values
@@ -92,5 +94,251 @@ pub(crate) fn prepare_cdf_partition_values(
     let cdf_values = get_cdf_columns(logical_schema, scan_file)?;
     partition_values.extend(cdf_values);
 
-    Ok(partition_values)
+    get_transform_expr(transform_spec, partition_values, physical_schema)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expressions::{Expression, Scalar};
+    use crate::scan::state::DvInfo;
+    use crate::schema::{DataType, StructField, StructType};
+    use crate::transforms::FieldTransformSpec;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn create_test_logical_schema() -> SchemaRef {
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("age", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("_change_type", DataType::STRING),
+            StructField::nullable("_commit_version", DataType::LONG),
+            StructField::nullable("_commit_timestamp", DataType::TIMESTAMP),
+        ]))
+    }
+
+    fn create_test_physical_schema() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("name", DataType::STRING),
+        ])
+    }
+
+    fn create_test_cdf_scan_file() -> CdfScanFile {
+        CdfScanFile {
+            path: "test/file.parquet".to_string(),
+            partition_values: {
+                let mut map = HashMap::new();
+                map.insert("age".to_string(), "30".to_string());
+                map
+            },
+            scan_type: CdfScanFileType::Add,
+            commit_version: 100,
+            commit_timestamp: 1000000000000,
+            dv_info: DvInfo::default(),
+            remove_dv: None,
+        }
+    }
+
+    #[test]
+    fn test_get_cdf_transform_expr_with_partition_and_cdf_metadata() {
+        // Tests the core functionality: combining partition values with CDF metadata
+        let scan_file = create_test_cdf_scan_file();
+        let logical_schema = create_test_logical_schema();
+        let physical_schema = create_test_physical_schema();
+
+        // Transform spec with partition column and CDF columns
+        let transform_spec = vec![
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index: 1, // age partition column
+                insert_after: Some("id".to_string()),
+            },
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index: 4, // _commit_version (will get null then overwritten)
+                insert_after: Some("name".to_string()),
+            },
+        ];
+
+        let result = get_cdf_transform_expr(
+            &scan_file,
+            &logical_schema,
+            &transform_spec,
+            &physical_schema,
+        );
+        assert!(result.is_ok());
+
+        let expr = result.unwrap();
+
+        let Expression::Transform(transform) = expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        // Should have transforms for both fields
+        assert_eq!(transform.field_transforms.len(), 2);
+        assert!(transform.field_transforms.contains_key("id"));
+        assert!(transform.field_transforms.contains_key("name"));
+
+        // Verify the age partition value is inserted after "id"
+        let id_transform = &transform.field_transforms["id"];
+        assert!(!id_transform.is_replace);
+        assert_eq!(id_transform.exprs.len(), 1);
+        // Check it's a literal with value 30 (age from partition_values)
+        let Expression::Literal(age_scalar) = id_transform.exprs[0].as_ref() else {
+            panic!("Expected literal expression for age");
+        };
+        assert_eq!(age_scalar, &Scalar::Long(30));
+
+        // Verify _commit_version is inserted after "name"
+        let name_transform = &transform.field_transforms["name"];
+        assert!(!name_transform.is_replace);
+        assert_eq!(name_transform.exprs.len(), 1);
+        // Check it's a literal with value 100 (commit_version)
+        let Expression::Literal(version_scalar) = name_transform.exprs[0].as_ref() else {
+            panic!("Expected literal expression for commit_version");
+        };
+        assert_eq!(version_scalar, &Scalar::Long(100));
+    }
+
+    #[test]
+    fn test_get_cdf_transform_expr_null_overwrite_behavior() {
+        // Documents the current behavior where CDF columns in transform_spec
+        // get null values from parse_partition_values, then get overwritten
+        let scan_file = create_test_cdf_scan_file();
+        let logical_schema = create_test_logical_schema();
+        let physical_schema = create_test_physical_schema();
+
+        // Transform spec requesting CDF columns as partition values
+        // These don't exist in partition_values map, so will be null
+        let transform_spec = vec![
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index: 3, // _change_type - not in partition_values
+                insert_after: Some("id".to_string()),
+            },
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index: 4, // _commit_version - not in partition_values
+                insert_after: Some("id".to_string()),
+            },
+        ];
+
+        let result = get_cdf_transform_expr(
+            &scan_file,
+            &logical_schema,
+            &transform_spec,
+            &physical_schema,
+        );
+        assert!(result.is_ok());
+
+        // The function succeeds because:
+        // 1. parse_partition_values returns Scalar::Null for missing CDF columns
+        // 2. get_cdf_columns then provides the real values, overwriting the nulls
+        // This is inefficient but currently works
+
+        let expr = result.unwrap();
+        let Expression::Transform(transform) = expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        let id_transform = &transform.field_transforms["id"];
+        assert!(!id_transform.is_replace);
+        // Should have both CDF values after overwrite
+        assert_eq!(id_transform.exprs.len(), 2);
+
+        // Verify _change_type is "insert" (for Add files)
+        let Expression::Literal(change_type_scalar) = id_transform.exprs[0].as_ref() else {
+            panic!("Expected literal expression for _change_type");
+        };
+        assert_eq!(change_type_scalar, &Scalar::String("insert".to_string()));
+
+        // Verify _commit_version is 100
+        let Expression::Literal(version_scalar) = id_transform.exprs[1].as_ref() else {
+            panic!("Expected literal expression for _commit_version");
+        };
+        assert_eq!(version_scalar, &Scalar::Long(100));
+    }
+
+    #[test]
+    fn test_get_cdf_transform_expr_cdc_file_type() {
+        // CDC files have _change_type physically, so no metadata for it
+        let mut scan_file = create_test_cdf_scan_file();
+        scan_file.scan_type = CdfScanFileType::Cdc;
+
+        let logical_schema = create_test_logical_schema();
+        let physical_schema = create_test_physical_schema();
+        let transform_spec = vec![];
+
+        let result = get_cdf_transform_expr(
+            &scan_file,
+            &logical_schema,
+            &transform_spec,
+            &physical_schema,
+        );
+        assert!(result.is_ok());
+
+        // CDC files should still get _commit_version and _commit_timestamp metadata
+        // but NOT _change_type metadata (it exists physically)
+        // With empty transform_spec, the transform should just be pass-through
+        let expr = result.unwrap();
+        let Expression::Transform(transform) = expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        // With empty transform_spec and no partitions, should be empty transform
+        assert_eq!(transform.field_transforms.len(), 0);
+    }
+
+    #[test]
+    fn test_get_cdf_transform_expr_invalid_timestamp() {
+        // Tests error propagation from timestamp parsing
+        let mut scan_file = create_test_cdf_scan_file();
+        scan_file.commit_timestamp = i64::MAX; // Invalid for timestamp conversion
+
+        let logical_schema = create_test_logical_schema();
+        let physical_schema = create_test_physical_schema();
+        let transform_spec = vec![];
+
+        let result = get_cdf_transform_expr(
+            &scan_file,
+            &logical_schema,
+            &transform_spec,
+            &physical_schema,
+        );
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("Failed to process"));
+    }
+
+    #[test]
+    fn test_scan_file_physical_schema_for_cdc() {
+        // CDC files need _change_type added to physical schema
+        let physical_schema = create_test_physical_schema();
+        let mut scan_file = create_test_cdf_scan_file();
+        scan_file.scan_type = CdfScanFileType::Cdc;
+
+        let result = scan_file_physical_schema(&scan_file, &physical_schema);
+
+        assert_eq!(result.fields().len(), 3); // Original 2 + _change_type
+        let change_type_field = result.field_at_index(2).unwrap();
+        assert_eq!(change_type_field.name(), "_change_type");
+        assert_eq!(change_type_field.data_type(), &DataType::STRING);
+        assert!(!change_type_field.is_nullable()); // Should be non-nullable
+    }
+
+    #[test]
+    fn test_scan_file_physical_schema_for_add_remove() {
+        // Add/Remove files don't modify physical schema
+        let physical_schema = create_test_physical_schema();
+        let scan_file = create_test_cdf_scan_file();
+
+        // Test Add file
+        let result = scan_file_physical_schema(&scan_file, &physical_schema);
+        assert_eq!(result.fields().len(), 2); // No change
+
+        // Test Remove file
+        let mut remove_file = scan_file.clone();
+        remove_file.scan_type = CdfScanFileType::Remove;
+        let result = scan_file_physical_schema(&remove_file, &physical_schema);
+        assert_eq!(result.fields().len(), 2); // No change
+    }
 }

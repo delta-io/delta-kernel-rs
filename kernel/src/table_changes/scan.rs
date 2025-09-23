@@ -9,11 +9,11 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
-use crate::transforms::{get_transform_expr, get_transform_spec, ColumnType, TransformSpec};
+use crate::transforms::{get_transform_spec, ColumnType, TransformSpec};
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
-use super::physical_to_logical::{prepare_cdf_partition_values, scan_file_physical_schema};
+use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
 use super::{TableChanges, CDF_FIELDS, CHANGE_TYPE_COL_NAME};
@@ -295,10 +295,12 @@ fn read_scan_file(
     } = resolved_scan_file;
 
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
-    let partition_values =
-        prepare_cdf_partition_values(&scan_file, logical_schema, transform_spec)?;
-    let transform_expr =
-        get_transform_expr(transform_spec, partition_values, physical_schema.as_ref())?;
+    let transform_expr = get_cdf_transform_expr(
+        &scan_file,
+        logical_schema,
+        transform_spec,
+        physical_schema.as_ref(),
+    )?;
 
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
