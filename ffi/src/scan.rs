@@ -518,7 +518,6 @@ mod tests {
 
     use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
 
-    #[no_mangle]
     extern "C" fn visit_entry(
         engine_context: NullableCvoid,
         key: KernelStringSlice,
