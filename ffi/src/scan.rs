@@ -527,7 +527,9 @@ mod tests {
         let map_ptr: *mut HashMap<String, String> = engine_context.unwrap().as_ptr().cast();
         let key = unsafe { String::try_from_slice(&key).unwrap() };
         let value = unsafe { String::try_from_slice(&value).unwrap() };
-        unsafe{ (*map_ptr).insert(key, value); }
+        unsafe {
+            (*map_ptr).insert(key, value);
+        }
     }
 
     #[test]
