@@ -142,20 +142,119 @@ mod tests {
     }
 
     #[test]
-    fn test_get_cdf_transform_expr_with_partition_and_cdf_metadata() {
-        // Tests the core functionality: combining partition values with CDF metadata
-        let scan_file = create_test_cdf_scan_file();
+    fn test_get_cdf_transform_expr_add_file_with_cdf_metadata() {
+        // Add files need _change_type metadata injected
+        let scan_file = create_test_cdf_scan_file(); // Default is Add type
         let logical_schema = create_test_logical_schema();
         let physical_schema = create_test_physical_schema();
 
-        // Transform spec with partition column and CDF columns
+        // Request CDF metadata columns in transform
+        // _change_type should be DynamicColumn (physical in CDC, metadata in Add/Remove)
         let transform_spec = vec![
-            FieldTransformSpec::MetadataDerivedColumn {
-                field_index: 1, // age partition column
+            FieldTransformSpec::DynamicColumn {
+                field_index: 3, // _change_type
+                physical_name: "_change_type".to_string(),
                 insert_after: Some("id".to_string()),
             },
             FieldTransformSpec::MetadataDerivedColumn {
-                field_index: 4, // _commit_version (will get null then overwritten)
+                field_index: 4, // _commit_version
+                insert_after: Some("id".to_string()),
+            },
+        ];
+
+        let result = get_cdf_transform_expr(
+            &scan_file,
+            &logical_schema,
+            &transform_spec,
+            &physical_schema,
+        );
+        assert!(result.is_ok());
+
+        let expr = result.unwrap();
+        let Expression::Transform(transform) = expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        // Should have transform for "id" field with CDF metadata
+        assert!(transform.field_transforms.contains_key("id"));
+        let id_transform = &transform.field_transforms["id"];
+        assert!(!id_transform.is_replace);
+        assert_eq!(id_transform.exprs.len(), 2);
+
+        // Verify _change_type is "insert" for Add files
+        let Expression::Literal(change_type) = id_transform.exprs[0].as_ref() else {
+            panic!("Expected literal for _change_type");
+        };
+        assert_eq!(change_type, &Scalar::String("insert".to_string()));
+
+        // Verify _commit_version
+        let Expression::Literal(version) = id_transform.exprs[1].as_ref() else {
+            panic!("Expected literal for _commit_version");
+        };
+        assert_eq!(version, &Scalar::Long(100));
+    }
+
+    #[test]
+    fn test_get_cdf_transform_expr_remove_file_with_cdf_metadata() {
+        // Remove files need _change_type metadata with "delete" value
+        let mut scan_file = create_test_cdf_scan_file();
+        scan_file.scan_type = CdfScanFileType::Remove;
+
+        let logical_schema = create_test_logical_schema();
+        let physical_schema = create_test_physical_schema();
+
+        let transform_spec = vec![FieldTransformSpec::DynamicColumn {
+            field_index: 3, // _change_type
+            physical_name: "_change_type".to_string(),
+            insert_after: Some("name".to_string()),
+        }];
+
+        let result = get_cdf_transform_expr(
+            &scan_file,
+            &logical_schema,
+            &transform_spec,
+            &physical_schema,
+        );
+        assert!(result.is_ok());
+
+        let expr = result.unwrap();
+        let Expression::Transform(transform) = expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        let name_transform = &transform.field_transforms["name"];
+        assert_eq!(name_transform.exprs.len(), 1);
+
+        // Verify _change_type is "delete" for Remove files
+        let Expression::Literal(change_type) = name_transform.exprs[0].as_ref() else {
+            panic!("Expected literal for _change_type");
+        };
+        assert_eq!(change_type, &Scalar::String("delete".to_string()));
+    }
+
+    #[test]
+    fn test_get_cdf_transform_expr_cdc_file_with_partition() {
+        // CDC files with partitions - should get partition values but not _change_type metadata
+        let mut scan_file = create_test_cdf_scan_file();
+        scan_file.scan_type = CdfScanFileType::Cdc;
+
+        let logical_schema = create_test_logical_schema();
+        // For CDC, physical schema needs _change_type column
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("_change_type", DataType::STRING),
+        ]);
+
+        // Request both partition and CDF columns
+        let transform_spec = vec![
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index: 1, // age partition
+                insert_after: Some("id".to_string()),
+            },
+            FieldTransformSpec::DynamicColumn {
+                field_index: 3, // _change_type - physical in CDC files
+                physical_name: "_change_type".to_string(),
                 insert_after: Some("name".to_string()),
             },
         ];
@@ -169,59 +268,28 @@ mod tests {
         assert!(result.is_ok());
 
         let expr = result.unwrap();
-
         let Expression::Transform(transform) = expr.as_ref() else {
             panic!("Expected Transform expression");
         };
 
-        // Should have transforms for both fields
-        assert_eq!(transform.field_transforms.len(), 2);
-        assert!(transform.field_transforms.contains_key("id"));
-        assert!(transform.field_transforms.contains_key("name"));
-
-        // Verify the age partition value is inserted after "id"
+        // Should have age partition value
         let id_transform = &transform.field_transforms["id"];
-        assert!(!id_transform.is_replace);
         assert_eq!(id_transform.exprs.len(), 1);
-        // Check it's a literal with value 30 (age from partition_values)
-        let Expression::Literal(age_scalar) = id_transform.exprs[0].as_ref() else {
-            panic!("Expected literal expression for age");
+        let Expression::Literal(age_value) = id_transform.exprs[0].as_ref() else {
+            panic!("Expected literal for age");
         };
-        assert_eq!(age_scalar, &Scalar::Long(30));
+        assert_eq!(age_value, &Scalar::Long(30));
 
-        // Verify _commit_version is inserted after "name"
+        // For CDC files with DynamicColumn, _change_type is handled as physical
+        // The transform spec has DynamicColumn which becomes a Column expression for CDC files
+        // (not a literal metadata value)
         let name_transform = &transform.field_transforms["name"];
-        assert!(!name_transform.is_replace);
         assert_eq!(name_transform.exprs.len(), 1);
-        // Check it's a literal with value 100 (commit_version)
-        let Expression::Literal(version_scalar) = name_transform.exprs[0].as_ref() else {
-            panic!("Expected literal expression for commit_version");
-        };
-        assert_eq!(version_scalar, &Scalar::Long(100));
-    }
-
-    #[test]
-    fn test_get_cdf_transform_expr_cdc_file_type() {
-        // CDC files have _change_type physically, so no metadata for it
-        let mut scan_file = create_test_cdf_scan_file();
-        scan_file.scan_type = CdfScanFileType::Cdc;
-
-        let logical_schema = create_test_logical_schema();
-        let physical_schema = create_test_physical_schema();
-        let transform_spec = vec![];
-
-        let result = get_cdf_transform_expr(
-            &scan_file,
-            &logical_schema,
-            &transform_spec,
-            &physical_schema,
-        );
-        assert!(result.is_ok());
-
-        // CDC files should still get _commit_version and _commit_timestamp metadata
-        // but NOT _change_type metadata (it exists physically)
-        let expr = result.unwrap();
-        assert!(matches!(expr.as_ref(), Expression::Transform(_)));
+        // Should be a Column expression, not a Literal
+        assert!(matches!(
+            name_transform.exprs[0].as_ref(),
+            Expression::Column(_)
+        ));
     }
 
     #[test]
