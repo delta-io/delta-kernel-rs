@@ -9,10 +9,11 @@ use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
+use crate::committer::{CommitMetadata, CommitResponse, Committer, FileSystemCommitter};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
-use crate::path::ParsedLogPath;
+use crate::path::LogRoot;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
@@ -24,7 +25,7 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 /// Type alias for an iterator of [`EngineData`] results.
-type EngineDataResultIterator<'a> =
+pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange column.
@@ -118,6 +119,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: SnapshotRef,
+    committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -163,7 +165,8 @@ impl Transaction {
         let commit_timestamp = current_time_ms()?;
 
         Ok(Transaction {
-            read_snapshot,
+            read_snapshot: read_snapshot.clone(),
+            committer: Box::new(FileSystemCommitter::new(read_snapshot)),
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
@@ -172,6 +175,20 @@ impl Transaction {
             domain_metadatas: vec![],
             data_change: true,
         })
+    }
+
+    /// Set the committer that will be used to commit this transaction. If not set, the default
+    /// filesystem-based committer will be used. Note that the default committer is only allowed
+    /// for non-catalog-managed tables. That is, you _must_ provide a committer via this API in
+    /// order to write to catalog-managed tables.
+    ///
+    /// See [`committer`] module for more details.
+    ///
+    /// [`committer`]: crate::committer
+    #[cfg(feature = "catalog-managed")]
+    pub fn with_committer(mut self, committer: Box<dyn Committer>) -> Self {
+        self.committer = committer;
+        self
     }
 
     /// Consume the transaction and commit it to the table. The result is a result of
@@ -231,26 +248,27 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Commit the actions as a JSON file to the Delta log
-        let commit_path =
-            ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
+        // Step 5: Chain all our actions to be handed off to the Committer
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
-
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
 
-        let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
+        // Step 6: Commit via the committer
+        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
+        let commit_metadata = CommitMetadata::new(log_root, commit_version);
+        match self
+            .committer
+            .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
-            Ok(()) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(commit_version),
+            Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(version),
             )),
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::ConflictedTransaction(
-                self.into_conflicted(commit_version),
+            Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
+                self.into_conflicted(version),
             )),
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
