@@ -525,12 +525,9 @@ mod tests {
         value: KernelStringSlice,
     ) {
         let map_ptr: *mut HashMap<String, String> = engine_context.unwrap().as_ptr().cast();
-        let mut map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
         let key = unsafe { String::try_from_slice(&key).unwrap() };
         let value = unsafe { String::try_from_slice(&value).unwrap() };
-        map.insert(key, value);
-        // prevent the map from being freed
-        let _ = Box::into_raw(Box::new(map));
+        unsafe{ (*map_ptr).insert(key, value); }
     }
 
     #[test]
@@ -542,8 +539,8 @@ mod tests {
             ("G".into(), "H".into()),
         ]);
         let cmap: super::CStringMap = test_map.clone().into();
-        let map_ptr: *mut HashMap<String, String> =
-            Box::into_raw(Box::new(HashMap::<String, String>::new()));
+        let context_map: Box<HashMap<String, String>> = Box::default();
+        let map_ptr: *mut HashMap<String, String> = Box::into_raw(context_map);
         unsafe {
             let ptr = NonNull::new_unchecked(map_ptr.cast());
             super::visit_string_map(&cmap, Some(ptr), visit_entry);
