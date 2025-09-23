@@ -274,7 +274,7 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-        - (1 * 24 * 60 * 60 * 1000); // 1 day ago
+        - (24 * 60 * 60 * 1000); // 1 day ago
 
     let commit3_content = format!(
         r#"{{"commitInfo":{{"timestamp":{},"operation":"DELETE","operationParameters":{{"predicate":"id BETWEEN 11 AND 30"}},"isBlindAppend":false}}}}
