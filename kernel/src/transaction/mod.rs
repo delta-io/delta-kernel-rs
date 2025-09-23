@@ -9,21 +9,18 @@ use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
+use crate::committer::{CommitMetadata, CommitResponse, Committer, FileSystemCommitter};
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, require};
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Snapshot, Version,
+    DataType, DeltaResult, Engine, EngineData, EngineDataResultIterator, Expression,
+    ExpressionRef, IntoEngineData, RowVisitor, Snapshot, Version,
 };
-
-/// Type alias for an iterator of [`EngineData`] results.
-type EngineDataResultIterator<'a> =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The minimal (i.e., mandatory) fields in an add action.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -115,6 +112,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: SnapshotRef,
+    committer: Option<Arc<dyn Committer>>,
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -159,6 +157,7 @@ impl Transaction {
 
         Ok(Transaction {
             read_snapshot,
+            committer: None,
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
@@ -168,9 +167,32 @@ impl Transaction {
         })
     }
 
+    /// Set the committer that will be used to commit this transaction. If not set, the default
+    /// filesystem-based committer will be used. Note that the default committer is only allowed
+    /// for non-catalog-managed tables.
+    #[cfg(feature = "catalog-managed")]
+    pub fn with_committer(mut self, committer: impl Into<Arc<dyn Committer>>) -> Self {
+        self.committer = Some(committer.into());
+        self
+    }
+
     /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
     /// will include the failed transaction in case of a conflict so the user can retry.
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+    pub fn commit(mut self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+        // Step 0: Determine the committer to use
+        #[cfg(feature = "catalog-managed")]
+        if self.committer.is_none() {
+            require!(
+                !self.read_snapshot.table_configuration().protocol().is_catalog_managed(),
+                Error::generic("Cannot use the default committer for a catalog-managed table. Please provide a committer via Transaction::with_committer.")
+            );
+        }
+
+        let committer = self
+            .committer
+            .take()
+            .unwrap_or_else(|| FileSystemCommitter::new());
+
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -219,15 +241,14 @@ impl Transaction {
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
-        let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
-            Ok(()) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(commit_version),
+        let commit_metadata = CommitMetadata::new(commit_path, commit_version);
+        match committer.commit(engine, Box::new(actions), commit_metadata)? {
+            CommitResponse::Committed { version } => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(version),
             )),
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::ConflictedTransaction(
-                self.into_conflicted(commit_version),
+            CommitResponse::Conflict { version } => Ok(CommitResult::ConflictedTransaction(
+                self.into_conflicted(version),
             )),
-            Err(e) => Err(e),
         }
     }
 
