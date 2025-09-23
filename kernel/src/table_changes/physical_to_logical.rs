@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::expressions::Scalar;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transforms::{parse_partition_values, TransformSpec};
+use crate::DeltaResult;
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
 use super::{
@@ -85,19 +86,17 @@ pub(crate) fn prepare_cdf_partition_values(
     scan_file: &CdfScanFile,
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
-) -> HashMap<usize, (String, Scalar)> {
+) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
     let mut partition_values = HashMap::new();
 
     // Handle regular partition values using parse_partition_values
-    if let Ok(parsed_values) =
-        parse_partition_values(logical_schema, transform_spec, &scan_file.partition_values)
-    {
-        partition_values.extend(parsed_values);
-    }
+    let parsed_values =
+        parse_partition_values(logical_schema, transform_spec, &scan_file.partition_values)?;
+    partition_values.extend(parsed_values);
 
     // Handle CDF metadata columns
     let cdf_values = get_cdf_columns(logical_schema, scan_file);
     partition_values.extend(cdf_values);
 
-    partition_values
+    Ok(partition_values)
 }

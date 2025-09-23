@@ -295,7 +295,7 @@ fn read_scan_file(
     } = resolved_scan_file;
 
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
-    let partition_values = prepare_cdf_partition_values(&scan_file, logical_schema, transform_spec);
+    let partition_values = prepare_cdf_partition_values(&scan_file, logical_schema, transform_spec)?;
     let transform_expr =
         get_transform_expr(transform_spec, partition_values, physical_schema.as_ref())?;
 

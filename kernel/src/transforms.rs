@@ -47,17 +47,17 @@ pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 /// pass through implicitly in their original order.
 #[derive(Debug)]
 pub(crate) enum FieldTransformSpec {
-    /// Insert a static expression after the named input column.
-    /// If `insert_after` is None, prepend before all fields.
-    // NOTE: Row tracking and other features may use this for computed columns.
+    /// Insert the given expression after the named input column (None = prepend instead)
+    // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
+    // which would usually be expressed as a drop+insert pair of transforms
     #[allow(unused)]
     StaticInsert {
         insert_after: Option<String>,
         expr: ExpressionRef,
     },
-    /// Replace the named input column with a new expression.
-    // NOTE: Row tracking will use this to replace physical rowid columns with
-    // COALESCE expressions for non-materialized row ids.
+    /// Replace the named input column with an expression.
+    // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
+    // to compute non-materialized row ids and row commit versions.
     #[allow(unused)]
     StaticReplace {
         field_name: String,
