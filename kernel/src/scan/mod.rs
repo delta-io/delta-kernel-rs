@@ -116,10 +116,17 @@ impl ScanBuilder {
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+        let partition_columns = self
+            .snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let column_mapping_mode = self.snapshot.table_configuration().column_mapping_mode();
+
         let state_info = StateInfo::try_new(
             logical_schema,
-            self.snapshot.metadata().partition_columns(),
-            self.snapshot.table_configuration().column_mapping_mode(),
+            partition_columns,
+            column_mapping_mode,
             self.predicate,
         )?;
 
