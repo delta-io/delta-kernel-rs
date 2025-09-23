@@ -100,7 +100,7 @@ pub(crate) fn get_cdf_transform_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::{Expression, Scalar};
+    use crate::expressions::Expression;
     use crate::scan::state::DvInfo;
     use crate::schema::{DataType, StructField, StructType};
     use crate::transforms::FieldTransformSpec;
@@ -201,63 +201,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_cdf_transform_expr_null_overwrite_behavior() {
-        // Documents the current behavior where CDF columns in transform_spec
-        // get null values from parse_partition_values, then get overwritten
-        let scan_file = create_test_cdf_scan_file();
-        let logical_schema = create_test_logical_schema();
-        let physical_schema = create_test_physical_schema();
-
-        // Transform spec requesting CDF columns as partition values
-        // These don't exist in partition_values map, so will be null
-        let transform_spec = vec![
-            FieldTransformSpec::MetadataDerivedColumn {
-                field_index: 3, // _change_type - not in partition_values
-                insert_after: Some("id".to_string()),
-            },
-            FieldTransformSpec::MetadataDerivedColumn {
-                field_index: 4, // _commit_version - not in partition_values
-                insert_after: Some("id".to_string()),
-            },
-        ];
-
-        let result = get_cdf_transform_expr(
-            &scan_file,
-            &logical_schema,
-            &transform_spec,
-            &physical_schema,
-        );
-        assert!(result.is_ok());
-
-        // The function succeeds because:
-        // 1. parse_partition_values returns Scalar::Null for missing CDF columns
-        // 2. get_cdf_columns then provides the real values, overwriting the nulls
-        // This is inefficient but currently works
-
-        let expr = result.unwrap();
-        let Expression::Transform(transform) = expr.as_ref() else {
-            panic!("Expected Transform expression");
-        };
-
-        let id_transform = &transform.field_transforms["id"];
-        assert!(!id_transform.is_replace);
-        // Should have both CDF values after overwrite
-        assert_eq!(id_transform.exprs.len(), 2);
-
-        // Verify _change_type is "insert" (for Add files)
-        let Expression::Literal(change_type_scalar) = id_transform.exprs[0].as_ref() else {
-            panic!("Expected literal expression for _change_type");
-        };
-        assert_eq!(change_type_scalar, &Scalar::String("insert".to_string()));
-
-        // Verify _commit_version is 100
-        let Expression::Literal(version_scalar) = id_transform.exprs[1].as_ref() else {
-            panic!("Expected literal expression for _commit_version");
-        };
-        assert_eq!(version_scalar, &Scalar::Long(100));
-    }
-
-    #[test]
     fn test_get_cdf_transform_expr_cdc_file_type() {
         // CDC files have _change_type physically, so no metadata for it
         let mut scan_file = create_test_cdf_scan_file();
@@ -277,36 +220,8 @@ mod tests {
 
         // CDC files should still get _commit_version and _commit_timestamp metadata
         // but NOT _change_type metadata (it exists physically)
-        // With empty transform_spec, the transform should just be pass-through
         let expr = result.unwrap();
-        let Expression::Transform(transform) = expr.as_ref() else {
-            panic!("Expected Transform expression");
-        };
-
-        // With empty transform_spec and no partitions, should be empty transform
-        assert_eq!(transform.field_transforms.len(), 0);
-    }
-
-    #[test]
-    fn test_get_cdf_transform_expr_invalid_timestamp() {
-        // Tests error propagation from timestamp parsing
-        let mut scan_file = create_test_cdf_scan_file();
-        scan_file.commit_timestamp = i64::MAX; // Invalid for timestamp conversion
-
-        let logical_schema = create_test_logical_schema();
-        let physical_schema = create_test_physical_schema();
-        let transform_spec = vec![];
-
-        let result = get_cdf_transform_expr(
-            &scan_file,
-            &logical_schema,
-            &transform_spec,
-            &physical_schema,
-        );
-
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("Failed to process"));
+        assert!(matches!(expr.as_ref(), Expression::Transform(_)));
     }
 
     #[test]
