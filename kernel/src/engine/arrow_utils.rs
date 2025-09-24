@@ -154,10 +154,10 @@ impl RowIndexBuilder {
                                 Error::generic(format!("Row group ordinal {i} is out of bounds"))
                             })
                     })
-                    .try_collect()
+                    .try_collect()?
             }
-            None => Ok(self.row_group_row_index_ranges),
-        }?;
+            None => self.row_group_row_index_ranges,
+        };
         Ok(starting_offsets.into_iter().flatten())
     }
 }
