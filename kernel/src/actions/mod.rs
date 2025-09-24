@@ -479,6 +479,11 @@ impl Protocol {
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+        #[cfg(feature = "catalog-managed")]
+        require!(
+            !self.is_catalog_managed(),
+            Error::unsupported("Writes are not yet supported for catalog-managed tables")
+        );
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
@@ -512,6 +517,17 @@ impl Protocol {
                 Ok(())
             }
         }
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.reader_features.as_ref().is_some_and(|fs| {
+            fs.contains(&ReaderFeature::CatalogManaged)
+                || fs.contains(&ReaderFeature::CatalogOwnedPreview)
+        }) || self.writer_features.as_ref().is_some_and(|fs| {
+            fs.contains(&WriterFeature::CatalogManaged)
+                || fs.contains(&WriterFeature::CatalogOwnedPreview)
+        })
     }
 }
 
@@ -1424,6 +1440,26 @@ mod tests {
             ReaderFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
         assert_eq!(parse_features::<ReaderFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_no_catalog_managed_writes() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogManaged]),
+            Some([WriterFeature::CatalogManaged]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogOwnedPreview]),
+            Some([WriterFeature::CatalogOwnedPreview]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
     }
 
     #[test]

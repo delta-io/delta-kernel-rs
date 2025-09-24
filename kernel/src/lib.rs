@@ -82,6 +82,8 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
+use crate::path::ParsedLogPath;
+
 use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
@@ -91,6 +93,7 @@ pub mod engine_data;
 pub mod error;
 pub mod expressions;
 mod log_compaction;
+mod log_path;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -100,6 +103,8 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 pub(crate) mod transforms;
+
+pub use log_path::LogPath;
 
 mod row_tracking;
 
