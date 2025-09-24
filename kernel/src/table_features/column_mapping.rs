@@ -1,5 +1,5 @@
 //! Code to handle column mapping, including modes and schema transforms
-use super::ReaderFeature;
+use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
     ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField, StructType,
@@ -38,7 +38,8 @@ pub(crate) fn column_mapping_mode(
         // (but should be ignored) even when the feature is not supported. For details see
         // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
         (Some(mode), 2) => mode,
-        (Some(mode), 3) if protocol.has_reader_feature(&ReaderFeature::ColumnMapping) => mode,
+        // TODO: replace with `has_table_feature` whenever column mapping for write is supported
+        (Some(mode), 3) if protocol.has_reader_feature(&TableFeature::ColumnMapping) => mode,
         _ => ColumnMappingMode::None,
     }
 }
@@ -204,7 +205,7 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::ColumnMapping]),
+            Some([TableFeature::ColumnMapping]),
             empty_features.clone(),
         )
         .unwrap();
@@ -222,7 +223,7 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
             empty_features.clone(),
         )
         .unwrap();
@@ -240,7 +241,7 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors, ReaderFeature::ColumnMapping]),
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
             empty_features,
         )
         .unwrap();
