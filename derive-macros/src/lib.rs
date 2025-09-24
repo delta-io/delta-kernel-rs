@@ -125,7 +125,7 @@ fn gen_schema_field(field: &Field) -> TokenStream {
 
     match field.ty {
         Type::Path(ref type_path) => {
-            // Convert the type path segments into a single quoted string 
+            // Convert the type path segments into a single quoted string
             let type_path_quoted = type_path.path.segments.iter().map(|segment| {
                 let segment_ident = &segment.ident;
                 match &segment.arguments {
