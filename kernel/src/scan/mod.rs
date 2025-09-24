@@ -118,7 +118,7 @@ impl ScanBuilder {
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
         let state_info = StateInfo::try_new(
             logical_schema.as_ref(),
-            &self.snapshot.metadata().partition_columns,
+            self.snapshot.metadata().partition_columns(),
             self.snapshot.table_configuration().column_mapping_mode(),
         )?;
 
