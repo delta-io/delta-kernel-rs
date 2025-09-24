@@ -1,27 +1,5 @@
 error: field_id error: Failed to parse integer: number too large to fit in target type
-  --> tests/field_id_validation/invalid_integer.rs:12:18
-   |
-12 |     #[field_id = 18446744073709551616]  // This is u64::MAX + 1, too large for i64
-   |                  ^^^^^^^^^^^^^^^^^^^^
-
-error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
-  --> tests/field_id_validation/invalid_integer.rs:10:10
-   |
-10 | #[derive(ToSchema)]
-   |          ^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
-   |
-   = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
-   = note: this error originates in the derive macro `ToSchema` (in Nightly builds, run with -Z macro-backtrace for more info)
-
-error[E0433]: failed to resolve: use of unresolved module or unlinked crate `delta_kernel`
-  --> tests/field_id_validation/invalid_integer.rs:10:10
-   |
-10 | #[derive(ToSchema)]
-   |          ^^^^^^^^ use of unresolved module or unlinked crate `delta_kernel`
-   |
-   = help: if you wanted to use a crate named `delta_kernel`, use `cargo add delta_kernel` to add it to your `Cargo.toml`
-   = note: this error originates in the derive macro `ToSchema` (in Nightly builds, run with -Z macro-backtrace for more info)
-help: consider importing this struct
-   |
- 1 + use crate::StructType;
-   |
+ --> tests/field_id_validation/invalid_integer.rs:5:18
+  |
+5 |     #[field_id = 18446744073709551616]  // This is u64::MAX + 1, too large for i64
+  |                  ^^^^^^^^^^^^^^^^^^^^
