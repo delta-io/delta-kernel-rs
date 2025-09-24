@@ -5,13 +5,13 @@
 //! Supports nested field comparison within structs, arrays, and maps.
 
 use super::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+    ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
 };
 use std::collections::{HashMap, HashSet};
 
 /// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
-pub struct SchemaDiff {
+pub(crate) struct SchemaDiff {
     /// Fields that were added in the new schema
     pub added_fields: Vec<FieldChange>,
     /// Fields that were removed from the original schema  
@@ -22,7 +22,7 @@ pub struct SchemaDiff {
 
 /// Represents a field change (added or removed) at any nesting level
 #[derive(Debug, Clone, PartialEq)]
-pub struct FieldChange {
+pub(crate) struct FieldChange {
     /// The field that was added or removed
     pub field: StructField,
     /// The path to this field (e.g., "user.address.street", or just "name" for top-level)
@@ -31,7 +31,7 @@ pub struct FieldChange {
 
 /// Represents an update to a field between two schema versions
 #[derive(Debug, Clone, PartialEq)]
-pub struct FieldUpdate {
+pub(crate) struct FieldUpdate {
     /// The field as it existed in the original schema
     pub before: StructField,
     /// The field as it exists in the new schema
@@ -44,7 +44,7 @@ pub struct FieldUpdate {
 
 /// The types of changes that can occur to a field
 #[derive(Debug, Clone, PartialEq)]
-pub enum FieldChangeType {
+pub(crate) enum FieldChangeType {
     /// Field was renamed (logical name changed, but field ID stayed the same)
     Renamed,
     /// Field nullability was loosened (non-nullable -> nullable) - safe change
@@ -67,7 +67,7 @@ pub enum FieldChangeType {
 
 /// Errors that can occur during schema diffing
 #[derive(Debug, thiserror::Error)]
-pub enum SchemaDiffError {
+pub(crate) enum SchemaDiffError {
     #[error("Field at path '{path}' is missing column mapping ID")]
     MissingFieldId { path: String },
     #[error("Duplicate field ID {id} found at paths '{path1}' and '{path2}'")]
@@ -80,19 +80,19 @@ pub enum SchemaDiffError {
 
 impl SchemaDiff {
     /// Returns true if there are no differences between the schemas
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.added_fields.is_empty()
             && self.removed_fields.is_empty()
             && self.updated_fields.is_empty()
     }
 
     /// Returns the total number of changes
-    pub fn change_count(&self) -> usize {
+    pub(crate) fn change_count(&self) -> usize {
         self.added_fields.len() + self.removed_fields.len() + self.updated_fields.len()
     }
 
     /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
-    pub fn has_breaking_changes(&self) -> bool {
+    pub(crate) fn has_breaking_changes(&self) -> bool {
         !self.removed_fields.is_empty()
             || self
                 .updated_fields
@@ -118,7 +118,7 @@ impl SchemaDiff {
     }
 
     /// Get all changes at the top level only (fields without dots in their path)
-    pub fn top_level_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
+    pub(crate) fn top_level_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
         let added = self
             .added_fields
             .iter()
@@ -138,7 +138,7 @@ impl SchemaDiff {
     }
 
     /// Get all changes at nested levels only (fields with dots in their path)
-    pub fn nested_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
+    pub(crate) fn nested_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
         let added = self
             .added_fields
             .iter()
@@ -210,7 +210,7 @@ struct FieldWithPath {
 /// assert_eq!(diff.updated_fields[0].path, "user.full_name");
 /// assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 /// ```
-pub fn compute_schema_diff(
+pub(crate) fn compute_schema_diff(
     current: &StructType,
     new: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
