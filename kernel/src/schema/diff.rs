@@ -1,51 +1,88 @@
 //! Schema diffing implementation for Delta Lake schemas
-//! 
+//!
 //! This module provides functionality to compute differences between two schemas
 //! using field IDs as the primary mechanism for identifying fields across schema versions.
+//! Supports nested field comparison within structs, arrays, and maps.
 
+use super::{
+    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, StructField, StructType,
+};
 use std::collections::{HashMap, HashSet};
-use super::{StructField, StructType, MetadataValue, ColumnMetadataKey};
 
+/// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaDiff {
-    /// Added in new
-    pub added_fields: Vec<StructField>,
-    /// Removed from old
-    pub removed_fields: Vec<StructField>,
+    /// Fields that were added in the new schema
+    pub added_fields: Vec<FieldChange>,
+    /// Fields that were removed from the original schema  
+    pub removed_fields: Vec<FieldChange>,
+    /// Fields that were modified between schemas
     pub updated_fields: Vec<FieldUpdate>,
 }
 
+/// Represents a field change (added or removed) at any nesting level
+#[derive(Debug, Clone, PartialEq)]
+pub struct FieldChange {
+    /// The field that was added or removed
+    pub field: StructField,
+    /// The path to this field (e.g., "user.address.street", or just "name" for top-level)
+    pub path: String,
+}
+
+/// Represents an update to a field between two schema versions
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldUpdate {
+    /// The field as it existed in the original schema
     pub before: StructField,
+    /// The field as it exists in the new schema
     pub after: StructField,
+    /// The path to this field (e.g., "user.address.street", or just "name" for top-level)
+    pub path: String,
+    /// The type of change that occurred
     pub change_type: FieldChangeType,
 }
 
+/// The types of changes that can occur to a field
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldChangeType {
+    /// Field was renamed (logical name changed, but field ID stayed the same)
     Renamed,
-    NullabilityChanged,
+    /// Field nullability was loosened (non-nullable -> nullable) - safe change
+    NullabilityLoosened,
+    /// Field nullability was tightened (nullable -> non-nullable) - breaking change
+    NullabilityTightened,
+    /// Field data type was changed
     TypeChanged,
+    /// Field metadata was changed (excluding column mapping metadata)
     MetadataChanged,
+    /// Field physical name changed (breaking - causes parquet read issues)
+    PhysicalNameChanged,
+    /// Multiple aspects of the field changed
     Multiple(Vec<FieldChangeType>),
+    /// The container nullability was loosened (safe change)
+    ContainerNullabilityLoosened,
+    /// The container nullability was tightened (breaking change)
+    ContainerNullabilityTightened,
 }
 
+/// Errors that can occur during schema diffing
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaDiffError {
-    #[error("Field '{0}' is missing column mapping ID")]
-    MissingFieldId(String),
-    #[error("Duplicate field ID {0} found in schema")]
-    DuplicateFieldId(i64),
-    #[error("Schema contains fields without column mapping IDs")]
-    MissingColumnMappingIds,
+    #[error("Field at path '{path}' is missing column mapping ID")]
+    MissingFieldId { path: String },
+    #[error("Duplicate field ID {id} found at paths '{path1}' and '{path2}'")]
+    DuplicateFieldId {
+        id: i64,
+        path1: String,
+        path2: String,
+    },
 }
 
 impl SchemaDiff {
     /// Returns true if there are no differences between the schemas
     pub fn is_empty(&self) -> bool {
-        self.added_fields.is_empty() 
-            && self.removed_fields.is_empty() 
+        self.added_fields.is_empty()
+            && self.removed_fields.is_empty()
             && self.updated_fields.is_empty()
     }
 
@@ -54,91 +91,197 @@ impl SchemaDiff {
         self.added_fields.len() + self.removed_fields.len() + self.updated_fields.len()
     }
 
-    /// Returns true if there are any breaking changes (removed fields or type changes)
+    /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
     pub fn has_breaking_changes(&self) -> bool {
-        !self.removed_fields.is_empty() || 
-        self.updated_fields.iter().any(|update| {
-            matches!(update.change_type, 
-                FieldChangeType::TypeChanged | 
-                FieldChangeType::Multiple(ref changes) if changes.contains(&FieldChangeType::TypeChanged)
-            )
-        })
+        !self.removed_fields.is_empty()
+            || self.updated_fields.iter().any(|update| {
+                matches!(update.change_type,
+                    FieldChangeType::TypeChanged |
+                    FieldChangeType::NullabilityTightened |
+                    FieldChangeType::PhysicalNameChanged |
+                    FieldChangeType::ContainerNullabilityTightened |
+                    FieldChangeType::Multiple(ref changes) if changes.iter().any(|c| matches!(c,
+                        FieldChangeType::TypeChanged |
+                        FieldChangeType::NullabilityTightened |
+                        FieldChangeType::PhysicalNameChanged |
+                        FieldChangeType::ContainerNullabilityTightened
+                    ))
+                )
+            })
     }
+
+    /// Get all changes at the top level only (fields without dots in their path)
+    pub fn top_level_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
+        let added = self
+            .added_fields
+            .iter()
+            .filter(|f| !f.path.contains('.'))
+            .collect();
+        let removed = self
+            .removed_fields
+            .iter()
+            .filter(|f| !f.path.contains('.'))
+            .collect();
+        let updated = self
+            .updated_fields
+            .iter()
+            .filter(|f| !f.path.contains('.'))
+            .collect();
+        (added, removed, updated)
+    }
+
+    /// Get all changes at nested levels only (fields with dots in their path)
+    pub fn nested_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
+        let added = self
+            .added_fields
+            .iter()
+            .filter(|f| f.path.contains('.'))
+            .collect();
+        let removed = self
+            .removed_fields
+            .iter()
+            .filter(|f| f.path.contains('.'))
+            .collect();
+        let updated = self
+            .updated_fields
+            .iter()
+            .filter(|f| f.path.contains('.'))
+            .collect();
+        (added, removed, updated)
+    }
+}
+
+/// Internal representation of a field with its path and ID
+#[derive(Debug, Clone)]
+struct FieldWithPath {
+    field: StructField,
+    path: String,
+    field_id: i64,
 }
 
 /// Computes the difference between two schemas using field IDs for identification
 ///
 /// This function requires that both schemas have column mapping enabled and all fields
 /// have valid field IDs. Fields are matched by their field ID rather than name,
-/// allowing detection of renames.
+/// allowing detection of renames at any nesting level within structs, arrays, and maps.
 ///
 /// # Arguments
 /// * `current` - The current/original schema
 /// * `new` - The new schema to compare against
 ///
 /// # Returns
-/// A `SchemaDiff` describing all changes, or an error if the schemas are invalid
+/// A `SchemaDiff` describing all changes including nested fields, or an error if the schemas are invalid
 ///
 /// # Example
 /// ```rust,ignore
 /// use delta_kernel::schema::{StructType, StructField, DataType};
-/// 
+///
 /// let current = StructType::try_new([
 ///     StructField::new("id", DataType::LONG, false)
 ///         .add_metadata([("delta.columnMapping.id", 1i64)]),
-///     StructField::new("name", DataType::STRING, false)  
-///         .add_metadata([("delta.columnMapping.id", 2i64)]),
+///     StructField::new("user", DataType::try_struct_type([
+///         StructField::new("name", DataType::STRING, false)
+///             .add_metadata([("delta.columnMapping.id", 3i64)]),
+///     ])?, false).add_metadata([("delta.columnMapping.id", 2i64)]),
 /// ])?;
-/// 
+///
 /// let new = StructType::try_new([
 ///     StructField::new("id", DataType::LONG, false)
 ///         .add_metadata([("delta.columnMapping.id", 1i64)]),
-///     StructField::new("full_name", DataType::STRING, false) // Renamed!
-///         .add_metadata([("delta.columnMapping.id", 2i64)]),
-///     StructField::new("age", DataType::INTEGER, true) // Added!
-///         .add_metadata([("delta.columnMapping.id", 3i64)]),
+///     StructField::new("user", DataType::try_struct_type([
+///         StructField::new("full_name", DataType::STRING, false) // Renamed nested field!
+///             .add_metadata([("delta.columnMapping.id", 3i64)]),
+///         StructField::new("age", DataType::INTEGER, true) // Added nested field!
+///             .add_metadata([("delta.columnMapping.id", 4i64)]),
+///     ])?, false).add_metadata([("delta.columnMapping.id", 2i64)]),
 /// ])?;
-/// 
+///
 /// let diff = compute_schema_diff(&current, &new)?;
 /// assert_eq!(diff.added_fields.len(), 1);
+/// assert_eq!(diff.added_fields[0].path, "user.age");
 /// assert_eq!(diff.updated_fields.len(), 1);
+/// assert_eq!(diff.updated_fields[0].path, "user.full_name");
 /// assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 /// ```
 pub fn compute_schema_diff(
-    current: &StructType, 
-    new: &StructType
+    current: &StructType,
+    new: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
-    // Build field ID maps for both schemas
-    let current_by_id = build_field_id_map(current)?;
-    let new_by_id = build_field_id_map(new)?;
+    // Collect all fields with their paths from both schemas
+    let current_fields = collect_all_fields_with_paths(current, "")?;
+    let new_fields = collect_all_fields_with_paths(new, "")?;
+
+    // Build maps by field ID
+    let current_by_id = build_field_map_by_id(&current_fields)?;
+    let new_by_id = build_field_map_by_id(&new_fields)?;
 
     let current_field_ids: HashSet<i64> = current_by_id.keys().cloned().collect();
     let new_field_ids: HashSet<i64> = new_by_id.keys().cloned().collect();
 
     // Find added, removed, and potentially updated fields
-    let added_ids: Vec<i64> = new_field_ids.difference(&current_field_ids).cloned().collect();
-    let removed_ids: Vec<i64> = current_field_ids.difference(&new_field_ids).cloned().collect();
-    let common_ids: Vec<i64> = current_field_ids.intersection(&new_field_ids).cloned().collect();
+    let added_ids: Vec<i64> = new_field_ids
+        .difference(&current_field_ids)
+        .cloned()
+        .collect();
+    let removed_ids: Vec<i64> = current_field_ids
+        .difference(&new_field_ids)
+        .cloned()
+        .collect();
+    let common_ids: Vec<i64> = current_field_ids
+        .intersection(&new_field_ids)
+        .cloned()
+        .collect();
 
     // Collect added fields
-    let added_fields: Vec<StructField> = added_ids
+    let mut added_fields: Vec<FieldChange> = added_ids
         .into_iter()
-        .map(|id| new_by_id[&id].clone())
+        .map(|id| {
+            let field_with_path = &new_by_id[&id];
+            FieldChange {
+                field: field_with_path.field.clone(),
+                path: field_with_path.path.clone(),
+            }
+        })
         .collect();
 
-    // Collect removed fields  
-    let removed_fields: Vec<StructField> = removed_ids
+    // Build set of added ancestor paths to filter out descendant noise
+    let added_ancestor_paths = build_added_ancestor_paths(&added_fields);
+
+    // Filter out added fields that are descendants of newly added ancestors
+    added_fields.retain(|change| !has_added_ancestor(&change.path, &added_ancestor_paths));
+
+    // Collect removed fields
+    let mut removed_fields: Vec<FieldChange> = removed_ids
         .into_iter()
-        .map(|id| current_by_id[&id].clone())
+        .map(|id| {
+            let field_with_path = &current_by_id[&id];
+            FieldChange {
+                field: field_with_path.field.clone(),
+                path: field_with_path.path.clone(),
+            }
+        })
         .collect();
 
-    // Check for updates in common fields
+    // Build set of removed ancestor paths to filter out descendant noise
+    let removed_ancestor_paths = build_added_ancestor_paths(&removed_fields);
+
+    // Filter out removed fields that are descendants of removed ancestors
+    removed_fields.retain(|change| !has_added_ancestor(&change.path, &removed_ancestor_paths));
+
+    // Check for updates in common fields, filtering out those under added ancestors
     let mut updated_fields = Vec::new();
     for id in common_ids {
-        let current_field = &current_by_id[&id];
-        let new_field = &new_by_id[&id];
-        
-        if let Some(field_update) = compare_fields(current_field, new_field) {
+        let current_field_with_path = &current_by_id[&id];
+        let new_field_with_path = &new_by_id[&id];
+
+        // Skip updates for fields under newly added ancestors
+        if has_added_ancestor(&new_field_with_path.path, &added_ancestor_paths) {
+            continue;
+        }
+
+        if let Some(field_update) =
+            compare_fields_with_paths(current_field_with_path, new_field_with_path)
+        {
             updated_fields.push(field_update);
         }
     }
@@ -150,53 +293,176 @@ pub fn compute_schema_diff(
     })
 }
 
-/// Builds a map from field ID to StructField for the given schema
-fn build_field_id_map(schema: &StructType) -> Result<HashMap<i64, StructField>, SchemaDiffError> {
-    let mut field_map = HashMap::new();
-    
-    for field in schema.fields() {
-        let field_id = get_field_id(field)?;
-        
-        if field_map.insert(field_id, field.clone()).is_some() {
-            return Err(SchemaDiffError::DuplicateFieldId(field_id));
+/// Builds a set of added ancestor paths to filter out descendant noise
+fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<String> {
+    let mut ancestor_paths = HashSet::new();
+    let mut all_paths: Vec<_> = added_fields.iter().map(|f| &f.path).collect();
+    all_paths.sort();
+
+    for path in all_paths {
+        // Check if this path is a descendant of any existing ancestor
+        let is_descendant = ancestor_paths.iter().any(|ancestor| {
+            path.starts_with(ancestor) && path.chars().nth(ancestor.len()) == Some('.')
+        });
+
+        if !is_descendant {
+            ancestor_paths.insert(path.clone());
         }
     }
-    
+
+    ancestor_paths
+}
+
+/// Checks if a path has an added ancestor (is a descendant of a newly added field)
+fn has_added_ancestor(path: &str, added_ancestor_paths: &HashSet<String>) -> bool {
+    added_ancestor_paths.iter().any(|ancestor| {
+        path != ancestor
+            && path.starts_with(ancestor)
+            && path.chars().nth(ancestor.len()) == Some('.')
+    })
+}
+
+/// Gets the physical name of a field if present
+fn physical_name(field: &StructField) -> Option<&str> {
+    match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
+        Some(MetadataValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Recursively collects all struct fields with their paths from a schema
+fn collect_all_fields_with_paths(
+    schema: &StructType,
+    parent_path: &str,
+) -> Result<Vec<FieldWithPath>, SchemaDiffError> {
+    let mut fields = Vec::new();
+
+    for field in schema.fields() {
+        let field_path = if parent_path.is_empty() {
+            field.name().clone()
+        } else {
+            format!("{}.{}", parent_path, field.name())
+        };
+
+        // Only struct fields can have field IDs in column mapping
+        let field_id = get_field_id_for_path(field, &field_path)?;
+
+        fields.push(FieldWithPath {
+            field: field.clone(),
+            path: field_path.clone(),
+            field_id,
+        });
+
+        // Recursively collect nested struct fields
+        match field.data_type() {
+            DataType::Struct(nested_struct) => {
+                let nested_fields = collect_all_fields_with_paths(nested_struct, &field_path)?;
+                fields.extend(nested_fields);
+            }
+            DataType::Array(array_type) => {
+                if let DataType::Struct(element_struct) = array_type.element_type() {
+                    // For arrays of structs, we use "element" as the path segment
+                    let element_path = format!("{}.element", field_path);
+                    let nested_fields =
+                        collect_all_fields_with_paths(element_struct, &element_path)?;
+                    fields.extend(nested_fields);
+                }
+            }
+            DataType::Map(map_type) => {
+                // Handle map key structs
+                if let DataType::Struct(key_struct) = map_type.key_type() {
+                    let key_path = format!("{}.key", field_path);
+                    let key_fields = collect_all_fields_with_paths(key_struct, &key_path)?;
+                    fields.extend(key_fields);
+                }
+                // Handle map value structs
+                if let DataType::Struct(value_struct) = map_type.value_type() {
+                    let value_path = format!("{}.value", field_path);
+                    let value_fields = collect_all_fields_with_paths(value_struct, &value_path)?;
+                    fields.extend(value_fields);
+                }
+            }
+            _ => {
+                // Primitive types don't have nested fields
+            }
+        }
+    }
+
+    Ok(fields)
+}
+
+/// Builds a map from field ID to FieldWithPath
+fn build_field_map_by_id(
+    fields: &[FieldWithPath],
+) -> Result<HashMap<i64, FieldWithPath>, SchemaDiffError> {
+    let mut field_map = HashMap::new();
+
+    for field_with_path in fields {
+        let field_id = field_with_path.field_id;
+
+        if let Some(existing) = field_map.insert(field_id, field_with_path.clone()) {
+            return Err(SchemaDiffError::DuplicateFieldId {
+                id: field_id,
+                path1: existing.path,
+                path2: field_with_path.path.clone(),
+            });
+        }
+    }
+
     Ok(field_map)
 }
 
-/// Extracts the field ID from a StructField's metadata
-fn get_field_id(field: &StructField) -> Result<i64, SchemaDiffError> {
+/// Extracts the field ID from a StructField's metadata with path for error reporting
+fn get_field_id_for_path(field: &StructField, path: &str) -> Result<i64, SchemaDiffError> {
     match field.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
         Some(MetadataValue::Number(id)) => Ok(*id),
-        _ => Err(SchemaDiffError::MissingFieldId(field.name().clone())),
+        _ => Err(SchemaDiffError::MissingFieldId {
+            path: path.to_string(),
+        }),
     }
 }
 
 /// Compares two fields with the same ID and returns a FieldUpdate if they differ
-fn compare_fields(before: &StructField, after: &StructField) -> Option<FieldUpdate> {
+fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> Option<FieldUpdate> {
     let mut changes = Vec::new();
-    
+
     // Check for name change (rename)
-    if before.name() != after.name() {
+    if before.field.name() != after.field.name() {
         changes.push(FieldChangeType::Renamed);
     }
-    
-    // Check for nullability change
-    if before.nullable != after.nullable {
-        changes.push(FieldChangeType::NullabilityChanged);
+
+    // Check for nullability change - distinguish between tightening and loosening
+    match (before.field.nullable, after.field.nullable) {
+        (true, false) => changes.push(FieldChangeType::NullabilityTightened), // Breaking
+        (false, true) => changes.push(FieldChangeType::NullabilityLoosened),  // Safe
+        _ => {}                                                               // No change
     }
-    
-    // Check for type change
-    if before.data_type() != after.data_type() {
-        changes.push(FieldChangeType::TypeChanged);
+
+    // Check for physical name change - only compare if both are present
+    let bp = physical_name(&before.field);
+    let ap = physical_name(&after.field);
+    if let (Some(b), Some(a)) = (bp, ap) {
+        if b != a {
+            changes.push(FieldChangeType::PhysicalNameChanged);
+        }
     }
-    
+
+    // Check for type change (including container changes)
+    if before.field.data_type() != after.field.data_type() {
+        if let Some(container_change) =
+            classify_container_change(before.field.data_type(), after.field.data_type())
+        {
+            changes.push(container_change);
+        } else {
+            changes.push(FieldChangeType::TypeChanged);
+        }
+    }
+
     // Check for metadata changes (excluding column mapping metadata)
-    if has_metadata_changes(before, after) {
+    if has_metadata_changes(&before.field, &after.field) {
         changes.push(FieldChangeType::MetadataChanged);
     }
-    
+
     if changes.is_empty() {
         None
     } else {
@@ -204,28 +470,68 @@ fn compare_fields(before: &StructField, after: &StructField) -> Option<FieldUpda
             1 => changes.into_iter().next().unwrap(),
             _ => FieldChangeType::Multiple(changes),
         };
-        
+
         Some(FieldUpdate {
-            before: before.clone(),
-            after: after.clone(),
+            before: before.field.clone(),
+            after: after.field.clone(),
+            path: after.path.clone(), // Use the new path in case of renames
             change_type,
         })
+    }
+}
+
+/// Classifies container changes as loosened, tightened, or incompatible
+fn classify_container_change(before: &DataType, after: &DataType) -> Option<FieldChangeType> {
+    match (before, after) {
+        // Array nullability changes
+        (DataType::Array(before_array), DataType::Array(after_array)) => {
+            if before_array.element_type() == after_array.element_type() {
+                match (before_array.contains_null(), after_array.contains_null()) {
+                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened), // Safe
+                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened), // Breaking
+                    _ => None, // No nullability change
+                }
+            } else {
+                None // Element type changed - this is a type change, not container change
+            }
+        }
+        // Map nullability changes
+        (DataType::Map(before_map), DataType::Map(after_map)) => {
+            if before_map.key_type() == after_map.key_type()
+                && before_map.value_type() == after_map.value_type()
+            {
+                match (
+                    before_map.value_contains_null(),
+                    after_map.value_contains_null(),
+                ) {
+                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened), // Safe
+                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened), // Breaking
+                    _ => None, // No nullability change
+                }
+            } else {
+                None // Key/value type changed - this is a type change, not container change
+            }
+        }
+        // Struct changes where fields are added/removed are handled at field level
+        (DataType::Struct(_), DataType::Struct(_)) => None,
+        _ => None, // Incompatible types
     }
 }
 
 /// Checks if two fields have different metadata (excluding column mapping metadata)
 fn has_metadata_changes(before: &StructField, after: &StructField) -> bool {
     let filter_column_mapping_metadata = |metadata: &HashMap<String, MetadataValue>| {
-        metadata.iter()
+        metadata
+            .iter()
             .filter(|(key, _)| {
                 !key.starts_with("delta.columnMapping") && !key.starts_with("parquet.field")
             })
             .collect::<HashMap<_, _>>()
     };
-    
+
     let before_filtered = filter_column_mapping_metadata(&before.metadata);
     let after_filtered = filter_column_mapping_metadata(&after.metadata);
-    
+
     before_filtered != after_filtered
 }
 
@@ -234,7 +540,12 @@ mod tests {
     use super::*;
     use crate::schema::{DataType, StructField, StructType};
 
-    fn create_field_with_id(name: &str, data_type: DataType, nullable: bool, id: i64) -> StructField {
+    fn create_field_with_id(
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        id: i64,
+    ) -> StructField {
         StructField::new(name, data_type, nullable)
             .add_metadata([("delta.columnMapping.id", MetadataValue::Number(id))])
     }
@@ -251,10 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn test_added_field() {
-        let current = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-        ]);
+    fn test_top_level_added_field() {
+        let current =
+            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
         let new = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
@@ -263,164 +573,558 @@ mod tests {
 
         let diff = compute_schema_diff(&current, &new).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].name(), "name");
-        assert_eq!(diff.removed_fields.len(), 0);
-        assert_eq!(diff.updated_fields.len(), 0);
+        assert_eq!(diff.added_fields[0].path, "name");
+        assert_eq!(diff.added_fields[0].field.name(), "name");
     }
 
     #[test]
-    fn test_removed_field() {
+    fn test_removed_ancestor_filtering() {
+        // Test that when a parent struct is removed, its children aren't reported separately
         let current = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
-            create_field_with_id("name", DataType::STRING, false, 2),
+            create_field_with_id(
+                "user",
+                DataType::try_struct_type([
+                    create_field_with_id("name", DataType::STRING, false, 3),
+                    create_field_with_id("email", DataType::STRING, true, 4),
+                    create_field_with_id(
+                        "address",
+                        DataType::try_struct_type([
+                            create_field_with_id("street", DataType::STRING, false, 6),
+                            create_field_with_id("city", DataType::STRING, false, 7),
+                        ])
+                        .unwrap(),
+                        true,
+                        5,
+                    ),
+                ])
+                .unwrap(),
+                false,
+                2,
+            ),
         ]);
 
-        let new = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-        ]);
+        let new = StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
-        assert_eq!(diff.added_fields.len(), 0);
+
+        // Only the top-level "user" field should be reported as removed
         assert_eq!(diff.removed_fields.len(), 1);
-        assert_eq!(diff.removed_fields[0].name(), "name");
+        assert_eq!(diff.removed_fields[0].path, "user");
+
+        // No nested fields should be reported as removed
         assert_eq!(diff.updated_fields.len(), 0);
-    }
-
-    #[test]
-    fn test_renamed_field() {
-        let current = StructType::new_unchecked([
-            create_field_with_id("name", DataType::STRING, false, 1),
-        ]);
-
-        let new = StructType::new_unchecked([
-            create_field_with_id("full_name", DataType::STRING, false, 1),
-        ]);
-
-        let diff = compute_schema_diff(&current, &new).unwrap();
         assert_eq!(diff.added_fields.len(), 0);
-        assert_eq!(diff.removed_fields.len(), 0);
-        assert_eq!(diff.updated_fields.len(), 1);
-        
-        let update = &diff.updated_fields[0];
-        assert_eq!(update.before.name(), "name");
-        assert_eq!(update.after.name(), "full_name");
-        assert_eq!(update.change_type, FieldChangeType::Renamed);
     }
 
     #[test]
-    fn test_nullability_change() {
-        let current = StructType::new_unchecked([
-            create_field_with_id("name", DataType::STRING, false, 1),
-        ]);
-
+    fn test_physical_name_only_when_both_present() {
+        // Test: no physical name metadata - should not report change
+        let current =
+            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)]);
         let new = StructType::new_unchecked([
-            create_field_with_id("name", DataType::STRING, true, 1),
+            create_field_with_id("full_name", DataType::STRING, false, 1), // Renamed
         ]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::NullabilityChanged);
-    }
+        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 
-    #[test]
-    fn test_type_change() {
-        let current = StructType::new_unchecked([
-            create_field_with_id("value", DataType::INTEGER, false, 1),
-        ]);
-
+        // Test: one has physical name, other doesn't - should not report physical name change
+        let current =
+            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)
+                .add_metadata([(
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col_001".to_string()),
+                )])]);
         let new = StructType::new_unchecked([
-            create_field_with_id("value", DataType::LONG, false, 1),
+            create_field_with_id("name", DataType::STRING, false, 1), // No physical name
         ]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
+        // Should report no changes since we only compare physical names when both are present
+        assert!(diff.is_empty());
+
+        // Test: both have physical names and they differ - should report change
+        let current =
+            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)
+                .add_metadata([(
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col_001".to_string()),
+                )])]);
+        let new =
+            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)
+                .add_metadata([(
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col_002".to_string()),
+                )])]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::TypeChanged);
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::PhysicalNameChanged
+        );
         assert!(diff.has_breaking_changes());
     }
 
     #[test]
-    fn test_multiple_changes() {
-        let current = StructType::new_unchecked([
-            create_field_with_id("name", DataType::STRING, false, 1),
-        ]);
-
-        let new = StructType::new_unchecked([
-            create_field_with_id("full_name", DataType::STRING, true, 1),
-        ]);
+    fn test_container_nullability_changes() {
+        // Test array nullability loosened (safe)
+        let current = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            false,
+            1,
+        )]);
+        let new = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+            false,
+            1,
+        )]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
-        
-        let update = &diff.updated_fields[0];
-        if let FieldChangeType::Multiple(changes) = &update.change_type {
-            assert_eq!(changes.len(), 2);
-            assert!(changes.contains(&FieldChangeType::Renamed));
-            assert!(changes.contains(&FieldChangeType::NullabilityChanged));
-        } else {
-            panic!("Expected Multiple change type");
-        }
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityLoosened
+        );
+        assert!(!diff.has_breaking_changes());
+
+        // Test array nullability tightened (breaking)
+        let current = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+            false,
+            1,
+        )]);
+        let new = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            false,
+            1,
+        )]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityTightened
+        );
+        assert!(diff.has_breaking_changes());
+
+        // Test map value nullability loosened (safe)
+        let current = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                false,
+            ))),
+            false,
+            1,
+        )]);
+        let new = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityLoosened
+        );
+        assert!(!diff.has_breaking_changes());
     }
 
     #[test]
-    fn test_missing_field_id_error() {
-        let current = StructType::new_unchecked([
-            StructField::new("id", DataType::LONG, false), // Missing field ID
-        ]);
+    fn test_ancestor_filtering() {
+        // Test that when a parent struct is added, its children aren't reported separately
+        let current =
+            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
         let new = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
+            create_field_with_id(
+                "user",
+                DataType::try_struct_type([
+                    create_field_with_id("name", DataType::STRING, false, 3),
+                    create_field_with_id("email", DataType::STRING, true, 4),
+                    create_field_with_id(
+                        "address",
+                        DataType::try_struct_type([
+                            create_field_with_id("street", DataType::STRING, false, 6),
+                            create_field_with_id("city", DataType::STRING, false, 7),
+                        ])
+                        .unwrap(),
+                        true,
+                        5,
+                    ),
+                ])
+                .unwrap(),
+                false,
+                2,
+            ),
         ]);
 
-        let result = compute_schema_diff(&current, &new);
-        assert!(matches!(result, Err(SchemaDiffError::MissingFieldId(_))));
+        let diff = compute_schema_diff(&current, &new).unwrap();
+
+        // Only the top-level "user" field should be reported as added
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, "user");
+
+        // No nested fields should be reported as added or updated
+        assert_eq!(diff.updated_fields.len(), 0);
+
+        // The filtered paths would have been: user.name, user.email, user.address, user.address.street, user.address.city
     }
 
     #[test]
-    fn test_duplicate_field_id_error() {
+    fn test_ancestor_filtering_with_mixed_changes() {
         let current = StructType::new_unchecked([
-            create_field_with_id("id1", DataType::LONG, false, 1),
-            create_field_with_id("id2", DataType::LONG, false, 1), // Duplicate ID
+            create_field_with_id("existing", DataType::STRING, false, 1),
+            create_field_with_id(
+                "existing_struct",
+                DataType::try_struct_type([create_field_with_id(
+                    "old_name",
+                    DataType::STRING,
+                    false,
+                    3,
+                )])
+                .unwrap(),
+                false,
+                2,
+            ),
         ]);
 
         let new = StructType::new_unchecked([
-            create_field_with_id("id1", DataType::LONG, false, 1),
+            create_field_with_id("existing", DataType::STRING, true, 1), // Changed nullability
+            create_field_with_id(
+                "existing_struct",
+                DataType::try_struct_type([
+                    create_field_with_id("new_name", DataType::STRING, false, 3), // Renamed
+                ])
+                .unwrap(),
+                false,
+                2,
+            ),
+            create_field_with_id(
+                "new_struct", // Completely new struct
+                DataType::try_struct_type([create_field_with_id(
+                    "nested_field",
+                    DataType::INTEGER,
+                    false,
+                    5,
+                )])
+                .unwrap(),
+                false,
+                4,
+            ),
         ]);
 
-        let result = compute_schema_diff(&current, &new);
-        assert!(matches!(result, Err(SchemaDiffError::DuplicateFieldId(1))));
+        let diff = compute_schema_diff(&current, &new).unwrap();
+
+        // Should see: existing changed, existing_struct.old_name->new_name renamed, new_struct added
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, "new_struct");
+
+        assert_eq!(diff.updated_fields.len(), 2);
+        let paths: HashSet<String> = diff.updated_fields.iter().map(|u| u.path.clone()).collect();
+        assert!(paths.contains("existing"));
+        assert!(paths.contains("existing_struct.new_name"));
+
+        // nested_field should NOT appear as added since new_struct is its ancestor
     }
 
     #[test]
-    fn test_metadata_change() {
-        let current = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1)
-                .add_metadata([("custom.metadata", MetadataValue::String("old_value".to_string()))]),
-        ]);
+    fn test_nested_field_rename() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "user",
+            DataType::try_struct_type([create_field_with_id("name", DataType::STRING, false, 2)])
+                .unwrap(),
+            false,
+            1,
+        )]);
 
-        let new = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1)
-                .add_metadata([("custom.metadata", MetadataValue::String("new_value".to_string()))]),
-        ]);
+        let new = StructType::new_unchecked([create_field_with_id(
+            "user",
+            DataType::try_struct_type([
+                create_field_with_id("full_name", DataType::STRING, false, 2), // Renamed!
+            ])
+            .unwrap(),
+            false,
+            1,
+        )]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::MetadataChanged);
+
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, "user.full_name");
+        assert_eq!(update.change_type, FieldChangeType::Renamed);
     }
 
-    #[test] 
-    fn test_column_mapping_metadata_ignored() {
+    #[test]
+    fn test_nested_field_added() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "user",
+            DataType::try_struct_type([create_field_with_id("name", DataType::STRING, false, 2)])
+                .unwrap(),
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "user",
+            DataType::try_struct_type([
+                create_field_with_id("name", DataType::STRING, false, 2),
+                create_field_with_id("age", DataType::INTEGER, true, 3), // Added!
+            ])
+            .unwrap(),
+            false,
+            1,
+        )]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
+        assert_eq!(diff.added_fields.len(), 1);
+
+        let added = &diff.added_fields[0];
+        assert_eq!(added.path, "user.age");
+        assert_eq!(added.field.name(), "age");
+    }
+
+    #[test]
+    fn test_array_element_struct_field_changes() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([
+                    create_field_with_id("title", DataType::STRING, false, 2), // Renamed!
+                ])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, "items.element.title");
+        assert_eq!(update.change_type, FieldChangeType::Renamed);
+    }
+
+    #[test]
+    fn test_map_value_struct_field_changes() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([create_field_with_id(
+                    "value",
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([
+                    create_field_with_id("count", DataType::INTEGER, false, 2), // Renamed!
+                ])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, "lookup.value.count");
+        assert_eq!(update.change_type, FieldChangeType::Renamed);
+    }
+
+    #[test]
+    fn test_deeply_nested_changes() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "level1",
+            DataType::try_struct_type([create_field_with_id(
+                "level2",
+                DataType::try_struct_type([create_field_with_id(
+                    "deep_field",
+                    DataType::STRING,
+                    false,
+                    3,
+                )])
+                .unwrap(),
+                false,
+                2,
+            )])
+            .unwrap(),
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "level1",
+            DataType::try_struct_type([create_field_with_id(
+                "level2",
+                DataType::try_struct_type([
+                    create_field_with_id("very_deep_field", DataType::STRING, false, 3), // Renamed!
+                ])
+                .unwrap(),
+                false,
+                2,
+            )])
+            .unwrap(),
+            false,
+            1,
+        )]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, "level1.level2.very_deep_field");
+        assert_eq!(update.change_type, FieldChangeType::Renamed);
+    }
+
+    #[test]
+    fn test_top_level_vs_nested_filtering() {
         let current = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1)
-                .add_metadata([("delta.columnMapping.physicalName", MetadataValue::String("col_1".to_string()))]),
+            create_field_with_id("top_field", DataType::STRING, false, 1),
+            create_field_with_id(
+                "user",
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    3,
+                )])
+                .unwrap(),
+                false,
+                2,
+            ),
         ]);
 
         let new = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1)
-                .add_metadata([("delta.columnMapping.physicalName", MetadataValue::String("col_2".to_string()))]),
+            create_field_with_id("renamed_top", DataType::STRING, false, 1), // Renamed top-level
+            create_field_with_id(
+                "user",
+                DataType::try_struct_type([
+                    create_field_with_id("full_name", DataType::STRING, false, 3), // Renamed nested
+                    create_field_with_id("age", DataType::INTEGER, true, 4),       // Added nested
+                ])
+                .unwrap(),
+                false,
+                2,
+            ),
         ]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
-        // Column mapping metadata changes should be ignored
-        assert!(diff.is_empty());
+
+        let (top_added, _, top_updated) = diff.top_level_changes();
+        let (nested_added, _, nested_updated) = diff.nested_changes();
+
+        assert_eq!(top_added.len(), 0);
+        assert_eq!(top_updated.len(), 1);
+        assert_eq!(top_updated[0].path, "renamed_top");
+
+        assert_eq!(nested_added.len(), 1);
+        assert_eq!(nested_added[0].path, "user.age");
+        assert_eq!(nested_updated.len(), 1);
+        assert_eq!(nested_updated[0].path, "user.full_name");
+    }
+
+    #[test]
+    fn test_mixed_changes() {
+        let current = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, false, 1),
+            create_field_with_id(
+                "user",
+                DataType::try_struct_type([
+                    create_field_with_id("name", DataType::STRING, false, 3),
+                    create_field_with_id("email", DataType::STRING, true, 4),
+                ])
+                .unwrap(),
+                false,
+                2,
+            ),
+        ]);
+
+        let new = StructType::new_unchecked([
+            create_field_with_id("identifier", DataType::LONG, false, 1), // Renamed top-level
+            create_field_with_id(
+                "user",
+                DataType::try_struct_type([
+                    create_field_with_id("full_name", DataType::STRING, false, 3), // Renamed nested
+                    // email removed (id=4)
+                    create_field_with_id("age", DataType::INTEGER, true, 5), // Added nested
+                ])
+                .unwrap(),
+                false,
+                2,
+            ),
+            create_field_with_id("created_at", DataType::TIMESTAMP, false, 6), // Added top-level
+        ]);
+
+        let diff = compute_schema_diff(&current, &new).unwrap();
+
+        // Check totals
+        assert_eq!(diff.added_fields.len(), 2);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 2);
+
+        // Check specific changes
+        let added_paths: HashSet<String> =
+            diff.added_fields.iter().map(|f| f.path.clone()).collect();
+        assert!(added_paths.contains("user.age"));
+        assert!(added_paths.contains("created_at"));
+
+        let removed_paths: HashSet<String> =
+            diff.removed_fields.iter().map(|f| f.path.clone()).collect();
+        assert!(removed_paths.contains("user.email"));
+
+        let updated_paths: HashSet<String> =
+            diff.updated_fields.iter().map(|f| f.path.clone()).collect();
+        assert!(updated_paths.contains("identifier"));
+        assert!(updated_paths.contains("user.full_name"));
     }
 }
