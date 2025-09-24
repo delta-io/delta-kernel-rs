@@ -2,11 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::arrow::array::{
-    ffi::{FFI_ArrowArray, FFI_ArrowSchema},
-    ArrayData, RecordBatch, StructArray,
-};
+use delta_kernel::arrow::array::{Array, ArrayData, RecordBatch, StructArray};
 use delta_kernel::arrow::compute::filter_record_batch;
+use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::ScanResult;
 use delta_kernel::table_changes::scan::TableChangesScan;
@@ -180,7 +178,7 @@ fn table_changes_scan_impl(
         let mut visitor_state = KernelExpressionVisitorState::default();
         let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
         let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
-        debug!("Got predicate: {:#?}", predicate);
+        debug!("Table changes got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
     Ok(Arc::new(scan_builder.build()?).into())
@@ -257,14 +255,14 @@ pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<Handle<SharedScanTableChangesIterator>> {
-    let table_changes_scan = unsafe { table_changes_scan.clone_as_arc() };
+    let table_changes_scan = unsafe { table_changes_scan.as_ref() };
     let engine = unsafe { engine.clone_as_arc() };
     table_changes_scan_execute_impl(table_changes_scan, engine.clone())
         .into_extern_result(&engine.as_ref())
 }
 
 fn table_changes_scan_execute_impl(
-    table_changes_scan: Arc<TableChangesScan>,
+    table_changes_scan: &TableChangesScan,
     engine: Arc<dyn ExternEngine>,
 ) -> DeltaResult<Handle<SharedScanTableChangesIterator>> {
     let table_changes_iter = table_changes_scan.execute(engine.engine().clone())?;
@@ -290,16 +288,16 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 #[no_mangle]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
-) -> ExternResult<*mut ArrowFFIData> {
+) -> ExternResult<ArrowFFIData> {
     let data = unsafe { data.as_ref() };
     scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
 }
 
-fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<*mut ArrowFFIData> {
+fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<ArrowFFIData> {
     let mut data = data
         .data
         .lock()
-        .map_err(|_| Error::generic("poisoned mutex"))?;
+        .map_err(|_| Error::generic("poisoned scan table changes iterator mutex"))?;
     if let Some(scan_result) = data.next().transpose()? {
         let mask = scan_result.full_mask();
         let data = scan_result.raw_data?;
@@ -313,23 +311,22 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
             record_batch = filter_record_batch(&record_batch, &mask.into())?;
         }
 
-        let sa: StructArray = record_batch.into();
-        let array_data: ArrayData = sa.into();
-        let array = FFI_ArrowArray::new(&array_data);
-        let schema = FFI_ArrowSchema::try_from(array_data.data_type())?;
-        let ret_data = Box::new(ArrowFFIData { array, schema });
-        Ok(Box::leak(ret_data))
+        let batch_struct_array: StructArray = record_batch.into();
+        let array_data: ArrayData = batch_struct_array.into_data();
+        let (out_array, out_schema) = to_ffi(&array_data)?;
+        Ok(ArrowFFIData {
+            array: out_array,
+            schema: out_schema,
+        })
     } else {
-        Ok(std::ptr::null_mut())
+        Ok(ArrowFFIData::empty())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_test_utils::{
-        allocate_err, allocate_str, ok_or_panic, recover_string, EngineErrorWithMessage,
-    };
+    use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
     use crate::{engine_to_handle, kernel_string_slice};
 
     use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
@@ -521,7 +518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_changes() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_table_changes_getters() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
         commit_add_file(storage.as_ref(), 0, PARQUET_FILE1.to_string()).await?;
         commit_add_file(storage.as_ref(), 1, PARQUET_FILE2.to_string()).await?;
@@ -535,95 +532,68 @@ mod tests {
         let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
-        let table_changes = unsafe {
+        let table_changes = ok_or_panic(unsafe {
             table_changes_from_version(kernel_string_slice!(path), engine.shallow_copy(), 0)
-        };
+        });
 
-        match table_changes {
-            ExternResult::Ok(ref handle) => {
-                assert_eq!(
-                    unsafe { table_changes_start_version(handle.shallow_copy()) },
-                    0
-                );
-                assert_eq!(
-                    unsafe { table_changes_end_version(handle.shallow_copy()) },
-                    1
-                );
+        assert_eq!(
+            unsafe { table_changes_start_version(table_changes.shallow_copy()) },
+            0
+        );
+        assert_eq!(
+            unsafe { table_changes_end_version(table_changes.shallow_copy()) },
+            1
+        );
 
-                let table_root =
-                    unsafe { table_changes_table_root(handle.shallow_copy(), allocate_str) };
-                assert_eq!(recover_string(table_root.unwrap()), path);
+        let table_root =
+            unsafe { table_changes_table_root(table_changes.shallow_copy(), allocate_str) };
+        assert_eq!(recover_string(table_root.unwrap()), path);
 
-                let schema = unsafe { table_changes_schema(handle.shallow_copy()).shallow_copy() };
-                let schema_ref = unsafe { schema.as_ref() };
-                assert_eq!(schema_ref.fields().len(), 5);
-                check_columns_in_schema(
-                    &[
-                        "id",
-                        "val",
-                        "_change_type",
-                        "_commit_version",
-                        "_commit_timestamp",
-                    ],
-                    schema_ref,
-                );
-            }
-            ExternResult::Err(e) => unsafe {
-                let err_with_msg: &EngineErrorWithMessage = &*(e as *mut EngineErrorWithMessage);
-                eprintln!(
-                    "Error type: {:?}, message: {:?}",
-                    (*err_with_msg).etype,
-                    (*err_with_msg).message
-                );
-                std::process::exit(1);
-            },
-        }
+        let schema = unsafe { table_changes_schema(table_changes.shallow_copy()).shallow_copy() };
+        let schema_ref = unsafe { schema.as_ref() };
+        assert_eq!(schema_ref.fields().len(), 5);
+        check_columns_in_schema(
+            &[
+                "id",
+                "val",
+                "_change_type",
+                "_commit_version",
+                "_commit_timestamp",
+            ],
+            schema_ref,
+        );
 
-        let table_changes = ok_or_panic(table_changes);
         let table_changes_scan =
-            unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) };
+            ok_or_panic(unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) });
 
-        match table_changes_scan {
-            ExternResult::Ok(ref handle) => {
-                let table_root =
-                    unsafe { table_changes_scan_table_root(handle.shallow_copy(), allocate_str) };
-                assert_eq!(recover_string(table_root.unwrap()), path);
+        let table_root = unsafe {
+            table_changes_scan_table_root(table_changes_scan.shallow_copy(), allocate_str)
+        };
+        assert_eq!(recover_string(table_root.unwrap()), path);
 
-                let logical_schema = unsafe {
-                    table_changes_scan_logical_schema(handle.shallow_copy()).shallow_copy()
-                };
-                let logical_schema_ref = unsafe { logical_schema.as_ref() };
-                assert_eq!(logical_schema_ref.fields().len(), 5);
-                check_columns_in_schema(
-                    &[
-                        "id",
-                        "val",
-                        "_change_type",
-                        "_commit_version",
-                        "_commit_timestamp",
-                    ],
-                    logical_schema_ref,
-                );
+        let logical_schema = unsafe {
+            table_changes_scan_logical_schema(table_changes_scan.shallow_copy()).shallow_copy()
+        };
+        let logical_schema_ref = unsafe { logical_schema.as_ref() };
+        assert_eq!(logical_schema_ref.fields().len(), 5);
+        check_columns_in_schema(
+            &[
+                "id",
+                "val",
+                "_change_type",
+                "_commit_version",
+                "_commit_timestamp",
+            ],
+            logical_schema_ref,
+        );
 
-                let physical_schema = unsafe {
-                    table_changes_scan_physical_schema(handle.shallow_copy()).shallow_copy()
-                };
-                let physical_schema_ref = unsafe { physical_schema.as_ref() };
-                assert_eq!(physical_schema_ref.fields().len(), 2);
-                check_columns_in_schema(&["id", "val"], physical_schema_ref);
-            }
-            ExternResult::Err(e) => unsafe {
-                let err_with_msg: &EngineErrorWithMessage = &*(e as *mut EngineErrorWithMessage);
-                eprintln!(
-                    "Error type: {:?}, message: {:?}",
-                    (*err_with_msg).etype,
-                    (*err_with_msg).message
-                );
-                std::process::exit(1);
-            },
-        }
+        let physical_schema = unsafe {
+            table_changes_scan_physical_schema(table_changes_scan.shallow_copy()).shallow_copy()
+        };
+        let physical_schema_ref = unsafe { physical_schema.as_ref() };
+        assert_eq!(physical_schema_ref.fields().len(), 2);
+        check_columns_in_schema(&["id", "val"], physical_schema_ref);
 
-        let table_changes_scan = ok_or_panic(table_changes_scan);
         unsafe {
             free_table_changes_scan(table_changes_scan);
         }
@@ -708,41 +678,22 @@ mod tests {
         let table_changes_scan =
             ok_or_panic(unsafe { table_changes_scan(table_changes, engine.shallow_copy(), None) });
 
-        let table_changes_scan_iter = unsafe {
+        let table_changes_scan_iter_result = ok_or_panic(unsafe {
             table_changes_scan_execute(table_changes_scan.shallow_copy(), engine.shallow_copy())
-        };
+        });
 
-        match table_changes_scan_iter {
-            ExternResult::Ok(ref _handle) => {}
-            ExternResult::Err(e) => unsafe {
-                let err_with_msg: &EngineErrorWithMessage = &*(e as *mut EngineErrorWithMessage);
-                eprintln!(
-                    "Error type: {:?}, message: {:?}",
-                    (*err_with_msg).etype,
-                    (*err_with_msg).message
-                );
-                std::process::exit(1);
-            },
-        }
-
-        let table_changes_scan_iter = ok_or_panic(table_changes_scan_iter);
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut i: i32 = 0;
         loop {
             i += 1;
             let data = ok_or_panic(unsafe {
-                scan_table_changes_next(table_changes_scan_iter.shallow_copy())
+                scan_table_changes_next(table_changes_scan_iter_result.shallow_copy())
             });
-            if data.is_null() {
+            if data.array.is_empty() {
                 break;
             }
-
-            let engine_data = unsafe {
-                let data_ref = &mut *data;
-                let array = std::mem::replace(&mut data_ref.array, FFI_ArrowArray::empty());
-                get_engine_data(array, &(*data).schema, allocate_err)
-            };
-            let engine_data = ok_or_panic(engine_data);
+            let engine_data =
+                ok_or_panic(unsafe { get_engine_data(data.array, &data.schema, allocate_err) });
             let record_batch = unsafe { to_arrow(engine_data.into_inner()) }?;
 
             println!("Batch ({i}) num rows {:?}", record_batch.num_rows());
@@ -777,9 +728,7 @@ mod tests {
 
         unsafe {
             free_table_changes_scan(table_changes_scan);
-        }
-        unsafe {
-            free_scan_table_changes_iter(table_changes_scan_iter);
+            free_scan_table_changes_iter(table_changes_scan_iter_result);
         }
         Ok(())
     }
