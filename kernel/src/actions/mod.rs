@@ -479,6 +479,11 @@ impl Protocol {
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+        #[cfg(feature = "catalog-managed")]
+        require!(
+            !self.is_catalog_managed(),
+            Error::unsupported("Writes are not yet supported for catalog-managed tables")
+        );
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
@@ -512,6 +517,17 @@ impl Protocol {
                 Ok(())
             }
         }
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.reader_features.as_ref().is_some_and(|fs| {
+            fs.contains(&ReaderFeature::CatalogManaged)
+                || fs.contains(&ReaderFeature::CatalogOwnedPreview)
+        }) || self.writer_features.as_ref().is_some_and(|fs| {
+            fs.contains(&WriterFeature::CatalogManaged)
+                || fs.contains(&WriterFeature::CatalogOwnedPreview)
+        })
     }
 }
 
@@ -915,21 +931,23 @@ pub(crate) struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
-    // TODO: Discuss if we should remove `removed` from this method and introduce a dedicated
-    // method for removed domain metadata.
-    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
-        DomainMetadata {
+    pub(crate) fn new(domain: String, configuration: String) -> Self {
+        Self {
             domain,
             configuration,
-            removed,
+            removed: false,
         }
     }
 
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
-    fn is_internal(&self) -> bool {
+    pub(crate) fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
     }
 }
 
@@ -1424,6 +1442,26 @@ mod tests {
             ReaderFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
         assert_eq!(parse_features::<ReaderFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_no_catalog_managed_writes() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogManaged]),
+            Some([WriterFeature::CatalogManaged]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogOwnedPreview]),
+            Some([WriterFeature::CatalogOwnedPreview]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
     }
 
     #[test]
