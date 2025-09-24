@@ -94,20 +94,27 @@ impl SchemaDiff {
     /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
     pub fn has_breaking_changes(&self) -> bool {
         !self.removed_fields.is_empty()
-            || self.updated_fields.iter().any(|update| {
-                matches!(update.change_type,
-                    FieldChangeType::TypeChanged |
-                    FieldChangeType::NullabilityTightened |
-                    FieldChangeType::PhysicalNameChanged |
-                    FieldChangeType::ContainerNullabilityTightened |
-                    FieldChangeType::Multiple(ref changes) if changes.iter().any(|c| matches!(c,
-                        FieldChangeType::TypeChanged |
-                        FieldChangeType::NullabilityTightened |
-                        FieldChangeType::PhysicalNameChanged |
-                        FieldChangeType::ContainerNullabilityTightened
-                    ))
-                )
-            })
+            || self
+                .updated_fields
+                .iter()
+                .any(|update| match &update.change_type {
+                    FieldChangeType::TypeChanged
+                    | FieldChangeType::NullabilityTightened
+                    | FieldChangeType::PhysicalNameChanged
+                    | FieldChangeType::ContainerNullabilityTightened => true,
+                    FieldChangeType::Multiple(multiple_changes) => {
+                        multiple_changes.iter().any(|c| {
+                            matches!(
+                                c,
+                                FieldChangeType::TypeChanged
+                                    | FieldChangeType::NullabilityTightened
+                                    | FieldChangeType::PhysicalNameChanged
+                                    | FieldChangeType::ContainerNullabilityTightened
+                            )
+                        })
+                    }
+                    _ => false,
+                })
     }
 
     /// Get all changes at the top level only (fields without dots in their path)
@@ -301,7 +308,7 @@ fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<String> {
 
     for path in all_paths {
         // Check if this path is a descendant of any existing ancestor
-        let is_descendant = ancestor_paths.iter().any(|ancestor| {
+        let is_descendant = ancestor_paths.iter().any(|ancestor: &String| {
             path.starts_with(ancestor) && path.chars().nth(ancestor.len()) == Some('.')
         });
 
@@ -489,17 +496,42 @@ fn are_same_container_type(before: &DataType, after: &DataType) -> bool {
     match (before, after) {
         // Both are structs - the nested field changes are handled separately via field IDs
         (DataType::Struct(_), DataType::Struct(_)) => true,
-        // Both are arrays with same element type - nested changes handled separately
+
+        // Both are arrays - check if they're the same array type regardless of element content
         (DataType::Array(before_array), DataType::Array(after_array)) => {
-            before_array.element_type() == after_array.element_type()
-                && before_array.contains_null() == after_array.contains_null()
+            // Check if both element types are the same kind of type (both structs, both primitives, etc)
+            match (before_array.element_type(), after_array.element_type()) {
+                (DataType::Struct(_), DataType::Struct(_)) => {
+                    // Both have struct elements - nested changes handled via field IDs
+                    before_array.contains_null() == after_array.contains_null()
+                }
+                _ => {
+                    // For non-struct elements, require exact type match
+                    before_array.element_type() == after_array.element_type()
+                        && before_array.contains_null() == after_array.contains_null()
+                }
+            }
         }
-        // Both are maps with same key/value types - nested changes handled separately
+
+        // Both are maps - check if they're the same map type regardless of nested struct content
         (DataType::Map(before_map), DataType::Map(after_map)) => {
-            before_map.key_type() == after_map.key_type()
-                && before_map.value_type() == after_map.value_type()
+            // Check key types (must match exactly)
+            let keys_match = match (before_map.key_type(), after_map.key_type()) {
+                (DataType::Struct(_), DataType::Struct(_)) => true, // Struct keys, changes handled via field IDs
+                (k1, k2) => k1 == k2, // Non-struct keys must match exactly
+            };
+
+            // Check value types
+            let values_match = match (before_map.value_type(), after_map.value_type()) {
+                (DataType::Struct(_), DataType::Struct(_)) => true, // Struct values, changes handled via field IDs
+                (v1, v2) => v1 == v2, // Non-struct values must match exactly
+            };
+
+            keys_match
+                && values_match
                 && before_map.value_contains_null() == after_map.value_contains_null()
         }
+
         _ => false,
     }
 }
@@ -544,17 +576,24 @@ fn classify_container_change(before: &DataType, after: &DataType) -> Option<Fiel
 
 /// Checks if two fields have different metadata (excluding column mapping metadata)
 fn has_metadata_changes(before: &StructField, after: &StructField) -> bool {
-    let filter_column_mapping_metadata = |metadata: &HashMap<String, MetadataValue>| {
-        metadata
-            .iter()
-            .filter(|(key, _)| {
-                !key.starts_with("delta.columnMapping") && !key.starts_with("parquet.field")
-            })
-            .collect::<HashMap<_, _>>()
-    };
+    // Instead of returning a HashMap of references, we'll compare directly
+    let before_filtered: HashMap<String, MetadataValue> = before
+        .metadata
+        .iter()
+        .filter(|(key, _)| {
+            !key.starts_with("delta.columnMapping") && !key.starts_with("parquet.field")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
-    let before_filtered = filter_column_mapping_metadata(&before.metadata);
-    let after_filtered = filter_column_mapping_metadata(&after.metadata);
+    let after_filtered: HashMap<String, MetadataValue> = after
+        .metadata
+        .iter()
+        .filter(|(key, _)| {
+            !key.starts_with("delta.columnMapping") && !key.starts_with("parquet.field")
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     before_filtered != after_filtered
 }
@@ -562,7 +601,7 @@ fn has_metadata_changes(before: &StructField, after: &StructField) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
     fn create_field_with_id(
         name: &str,
