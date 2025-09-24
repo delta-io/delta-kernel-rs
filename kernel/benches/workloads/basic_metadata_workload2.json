@@ -1,0 +1,6 @@
+{
+  "type": "read_metadata",
+  "table_root": "file:///Users/oussama.saoudi/pyspark_playground/test_2000_large_commits/_delta_log",
+  "snapshot_version": 1000,
+  "expected_scan_metadata": "path_to_metadata.parquet"
+}
