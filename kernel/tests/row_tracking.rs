@@ -56,7 +56,7 @@ async fn write_data_to_table(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref()).await?;
     let mut txn = snapshot.transaction()?;
 
     // Write data out by spawning async tasks to simulate executors
@@ -237,7 +237,7 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
         )?),
         &table_url,
         engine,
-    )?;
+    ).await?;
 
     Ok(())
 }
@@ -315,7 +315,7 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
         )?),
         &table_url,
         engine,
-    )?;
+    ).await?;
 
     Ok(())
 }
@@ -377,7 +377,7 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
         )?),
         &table_url,
         engine,
-    )?;
+    ).await?;
 
     Ok(())
 }
@@ -510,7 +510,7 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
         )?),
         &table_url,
         engine,
-    )?;
+    ).await?;
 
     Ok(())
 }
@@ -575,7 +575,7 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let (table_url, engine, store) =
         create_row_tracking_table(&tmp_test_dir, "test_consecutive_commits", schema.clone())
             .await?;
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref()).await?;
     let txn = snapshot.transaction()?;
 
     // Commit without adding any add files

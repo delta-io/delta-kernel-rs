@@ -174,13 +174,13 @@ mod tests {
     use crate::engine::tests::test_arrow_engine;
     use object_store::local::LocalFileSystem;
 
-    #[test]
-    fn test_default_engine() {
+    #[tokio::test]
+    async fn test_default_engine() {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
-        test_arrow_engine(&engine, &url);
+        test_arrow_engine(&engine, &url).await;
     }
 
     #[test]

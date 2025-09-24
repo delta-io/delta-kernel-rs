@@ -26,13 +26,13 @@ fn count_total_scan_rows(
         .fold_ok(0, Add::add)
 }
 
-#[test]
-fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = DefaultEngine::new_local();
 
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).await?;
     let scan = snapshot.scan_builder().build()?;
 
     let stream = scan.execute(engine)?;
@@ -41,13 +41,13 @@ fn dv_table() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn non_dv_table() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/"))?;
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = DefaultEngine::new_local();
 
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).await?;
     let scan = snapshot.scan_builder().build()?;
 
     let stream = scan.execute(engine)?;

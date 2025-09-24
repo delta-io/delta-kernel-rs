@@ -414,8 +414,8 @@ mod tests {
     use crate::utils::test_utils::string_array_to_engine_data;
     use test_utils::{add_commit, delta_path_for_version};
 
-    #[test]
-    fn test_snapshot_read_metadata() {
+    #[tokio::test]
+    async fn test_snapshot_read_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
@@ -424,7 +424,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url)
             .at_version(1)
             .build(&engine)
-            .unwrap();
+            .await.unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -435,14 +435,14 @@ mod tests {
         assert_eq!(snapshot.schema(), expected);
     }
 
-    #[test]
-    fn test_new_snapshot() {
+    #[tokio::test]
+    async fn test_new_snapshot() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
@@ -484,11 +484,11 @@ mod tests {
         let old_snapshot = Snapshot::builder_for(url.clone())
             .at_version(1)
             .build(&engine)
-            .unwrap();
+            .await.unwrap();
         // 1. new version < existing version: error
         let snapshot_res = Snapshot::builder_from(old_snapshot.clone())
             .at_version(0)
-            .build(&engine);
+            .build(&engine).await;
         assert!(matches!(
             snapshot_res,
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 0 is older than snapshot hint version 1"
@@ -498,7 +498,7 @@ mod tests {
         let snapshot = Snapshot::builder_from(old_snapshot.clone())
             .at_version(1)
             .build(&engine)
-            .unwrap();
+            .await.unwrap();
         let expected = old_snapshot.clone();
         assert_eq!(snapshot, expected);
 
@@ -511,18 +511,18 @@ mod tests {
         // - commit 1 -> final snapshots at this version
         //
         // in each test we will modify versions 1 and 2 to test different scenarios
-        fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
+        async fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
             let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
             let base_snapshot = Snapshot::builder_for(url.clone())
                 .at_version(0)
-                .build(&engine)?;
+                .build(&engine).await?;
             let snapshot = Snapshot::builder_from(base_snapshot.clone())
                 .at_version(1)
-                .build(&engine)?;
+                .build(&engine).await?;
             let expected = Snapshot::builder_for(url.clone())
                 .at_version(1)
-                .build(&engine)?;
+                .build(&engine).await?;
             assert_eq!(snapshot, expected);
             Ok(())
         }
@@ -569,15 +569,15 @@ mod tests {
         );
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
-        let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine)?;
+            .build(&engine).await?;
+        let snapshot = Snapshot::builder_from(base_snapshot.clone()).build(&engine).await?;
         let expected = Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine).await?;
         assert_eq!(snapshot, expected);
         // version exceeds latest version of the table = err
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine),
+            Snapshot::builder_from(base_snapshot.clone()).at_version(1).build(&engine).await,
             Err(Error::Generic(msg)) if msg == "Requested snapshot version 1 is newer than the latest version 0"
         ));
 
@@ -621,7 +621,7 @@ mod tests {
             )
             .await
             .unwrap();
-        test_new_from(store_3a.into())?;
+        test_new_from(store_3a.into()).await?;
 
         // c. log segment for old..=new version has no checkpoint
         // i. commits have (new protocol, new metadata)
@@ -635,16 +635,16 @@ mod tests {
         });
         commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
         commit(store_3c_i.as_ref(), 1, commit1).await;
-        test_new_from(store_3c_i.clone())?;
+        test_new_from(store_3c_i.clone()).await?;
 
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine).await?;
         assert!(matches!(
-            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine),
+            Snapshot::builder_from(base_snapshot.clone()).at_version(2).build(&engine).await,
             Err(Error::Generic(msg)) if msg == "LogSegment end version 1 not the same as the specified end version 2"
         ));
 
@@ -659,7 +659,7 @@ mod tests {
         });
         commit1.remove(2); // remove metadata
         commit(&store_3c_ii, 1, commit1).await;
-        test_new_from(store_3c_ii.into())?;
+        test_new_from(store_3c_ii.into()).await?;
 
         // iii. commits have (no protocol, new metadata)
         let store_3c_iii = store.fork();
@@ -667,13 +667,13 @@ mod tests {
         commit1[2]["partitionColumns"] = serde_json::to_value(["some_partition_column"])?;
         commit1.remove(1); // remove protocol
         commit(&store_3c_iii, 1, commit1).await;
-        test_new_from(store_3c_iii.into())?;
+        test_new_from(store_3c_iii.into()).await?;
 
         // iv. commits have (no protocol, no metadata)
         let store_3c_iv = store.fork();
         let commit1 = vec![commit0[0].clone()];
         commit(&store_3c_iv, 1, commit1).await;
-        test_new_from(store_3c_iv.into())?;
+        test_new_from(store_3c_iv.into()).await?;
 
         Ok(())
     }
@@ -751,15 +751,15 @@ mod tests {
         // base snapshot is at version 0
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
-            .build(&engine)?;
+            .build(&engine).await?;
 
         // first test: no new crc
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine).await?;
         let expected = Snapshot::builder_for(url.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine).await?;
         assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
@@ -785,10 +785,10 @@ mod tests {
         store.put(&path, crc.to_string().into()).await?;
         let snapshot = Snapshot::builder_from(base_snapshot.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine).await?;
         let expected = Snapshot::builder_for(url.clone())
             .at_version(1)
-            .build(&engine)?;
+            .build(&engine).await?;
         assert_eq!(snapshot, expected);
         assert_eq!(
             snapshot
@@ -803,8 +803,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_read_table_with_missing_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_missing_last_checkpoint() {
         // this table doesn't have a _last_checkpoint file
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/table-with-dv-small/_delta_log/",
@@ -815,7 +815,7 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
-        let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
+        let cp = LastCheckpointHint::try_read(&storage, &url).await.unwrap();
         assert!(cp.is_none());
     }
 
@@ -823,8 +823,8 @@ mod tests {
         r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
     }
 
-    #[test]
-    fn test_read_table_with_empty_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -844,12 +844,12 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(&storage, &url).await.expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
-    #[test]
-    fn test_read_table_with_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -875,9 +875,9 @@ mod tests {
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+        let valid = LastCheckpointHint::try_read(&storage, &url).await.expect("read last checkpoint");
         let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+        let invalid = LastCheckpointHint::try_read(&storage, &url).await.expect("read last checkpoint");
         let expected = LastCheckpointHint {
             version: 1,
             size: 8,
@@ -891,15 +891,15 @@ mod tests {
         assert!(invalid.is_none());
     }
 
-    #[test_log::test]
-    fn test_read_table_with_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_checkpoint() {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
         ))
         .unwrap();
         let location = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(location).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(location).build(&engine).await.unwrap();
 
         assert_eq!(snapshot.log_segment.checkpoint_parts.len(), 1);
         assert_eq!(
@@ -1006,7 +1006,7 @@ mod tests {
         .join("\n");
         add_commit(store.as_ref(), 1, commit).await.unwrap();
 
-        let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
+        let snapshot = Snapshot::builder_for(url.clone()).build(&engine).await?;
 
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
@@ -1025,14 +1025,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_log_compaction_writer() {
+    #[tokio::test]
+    async fn test_log_compaction_writer() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
 
         let engine = SyncEngine::new();
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
 
         // Test creating a log compaction writer
         let writer = snapshot.clone().log_compaction_writer(0, 1).unwrap();

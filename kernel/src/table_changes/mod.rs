@@ -285,8 +285,8 @@ mod tests {
     use crate::Error;
     use itertools::assert_equal;
 
-    #[test]
-    fn table_changes_checks_enable_cdf_flag() {
+    #[tokio::test]
+    async fn table_changes_checks_enable_cdf_flag() {
         // Table with CDF enabled, then disabled at version 2 and enabled at version 3
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
@@ -300,7 +300,7 @@ mod tests {
                 start_version,
                 end_version.into(),
             )
-            .unwrap();
+            .await.unwrap();
             assert_eq!(table_changes.start_version, start_version);
             assert_eq!(table_changes.end_version(), end_version);
         }
@@ -312,24 +312,24 @@ mod tests {
                 engine.as_ref(),
                 start_version,
                 end_version.into(),
-            );
+            ).await;
             assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))))
         }
     }
-    #[test]
-    fn schema_evolution_fails() {
+    #[tokio::test]
+    async fn schema_evolution_fails() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
         let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} }";
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));
+        let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4)).await;
         assert!(matches!(table_changes_res, Err(Error::Generic(msg)) if msg == expected_msg));
     }
 
-    #[test]
-    fn table_changes_has_cdf_schema() {
+    #[tokio::test]
+    async fn table_changes_has_cdf_schema() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
@@ -341,7 +341,7 @@ mod tests {
         .chain(CDF_FIELDS.clone());
 
         let table_changes =
-            TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).unwrap();
+            TableChanges::try_new(url.clone(), engine.as_ref(), 0, 0.into()).await.unwrap();
         assert_equal(expected_schema, table_changes.schema().fields().cloned());
     }
 }

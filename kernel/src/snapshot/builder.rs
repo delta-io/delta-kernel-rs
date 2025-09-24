@@ -177,18 +177,18 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         let engine = engine.as_ref();
         create_table(&store, &table_root)?;
 
-        let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
+        let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine).await?;
         assert_eq!(snapshot.version(), 1);
 
         let snapshot = SnapshotBuilder::new_for(table_root.clone())
             .at_version(0)
-            .build(engine)?;
+            .build(engine).await?;
         assert_eq!(snapshot.version(), 0);
 
         Ok(())

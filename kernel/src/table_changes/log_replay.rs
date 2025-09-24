@@ -25,7 +25,7 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
-use itertools::Itertools;
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 
 #[cfg(test)]
 mod tests;
@@ -43,28 +43,34 @@ pub(crate) struct TableChangesScanMetadata {
     pub(crate) remove_dvs: Arc<HashMap<String, DvInfo>>,
 }
 
-/// Given an iterator of [`ParsedLogPath`] returns an iterator of [`TableChangesScanMetadata`].
+/// Given an iterator of [`ParsedLogPath`] returns a stream of [`TableChangesScanMetadata`].
 /// Each row that is selected in the returned `TableChangesScanMetadata.scan_metadata` (according
 /// to the `selection_vector` field) _must_ be processed to complete the scan. Non-selected
 /// rows _must_ be ignored.
 ///
 /// Note: The [`ParsedLogPath`]s in the `commit_files` iterator must be ordered, contiguous
 /// (JSON) commit files.
-pub(crate) fn table_changes_action_iter(
+pub(crate) async fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+) -> DeltaResult<impl futures::Stream<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
-    let result = commit_files
-        .into_iter()
-        .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema)?;
-            scanner.into_scan_batches(engine.clone(), filter.clone())
-        }) //Iterator-Result-Iterator-Result
-        .flatten_ok() // Iterator-Result-Result
-        .map(|x| x?); // Iterator-Result
+
+    // Convert the commit_files iterator into a stream and process them
+    let result = stream::iter(commit_files)
+        .then(move |commit_file| {
+            let engine = engine.clone();
+            let table_schema = table_schema.clone();
+            let filter = filter.clone();
+            async move {
+                let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema).await?;
+                Ok::<_, crate::Error>(scanner.into_scan_batches(engine, filter).await?)
+            }
+        })
+        .try_flatten();
+
     Ok(result)
 }
 
@@ -142,7 +148,7 @@ impl LogReplayScanner {
     /// 3. Perform validation on each protocol and metadata action in the commit.
     ///
     /// For more details, see the documentation for [`LogReplayScanner`].
-    fn try_new(
+    async fn try_new(
         engine: &dyn Engine,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
@@ -212,14 +218,14 @@ impl LogReplayScanner {
             remove_dvs,
         })
     }
-    /// Generates an iterator of [`TableChangesScanMetadata`] by iterating over each action of the
+    /// Generates a stream of [`TableChangesScanMetadata`] by iterating over each action of the
     /// commit, generating a selection vector, and transforming the engine data. This performs
     /// phase 2 of [`LogReplayScanner`].
-    fn into_scan_batches(
+    async fn into_scan_batches(
         self,
         engine: Arc<dyn Engine>,
         filter: Option<Arc<DataSkippingFilter>>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> DeltaResult<impl Stream<Item = DeltaResult<TableChangesScanMetadata>>> {
         let Self {
             has_cdc_action,
             remove_dvs,
@@ -245,7 +251,8 @@ impl LogReplayScanner {
             cdf_scan_row_schema().into(),
         );
 
-        let result = action_iter.map(move |actions| -> DeltaResult<_> {
+        // Convert the iterator to a stream and process each batch
+        let result = futures::stream::iter(action_iter).map(move |actions| -> DeltaResult<_> {
             let actions = actions?;
 
             // Apply data skipping to get back a selection vector for actions that passed skipping.

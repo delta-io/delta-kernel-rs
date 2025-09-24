@@ -4,27 +4,27 @@ use crate::engine::sync::SyncEngine;
 use crate::snapshot::Snapshot;
 use crate::SnapshotRef;
 
-fn create_mock_snapshot() -> SnapshotRef {
+async fn create_mock_snapshot() -> SnapshotRef {
     let path = std::fs::canonicalize(std::path::PathBuf::from(
         "./tests/data/table-with-dv-small/",
     ))
     .unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
-    Snapshot::builder_for(url).build(&engine).unwrap()
+    Snapshot::builder_for(url).build(&engine).await.unwrap()
 }
 
-fn create_multi_version_snapshot() -> SnapshotRef {
+async fn create_multi_version_snapshot() -> SnapshotRef {
     let path =
         std::fs::canonicalize(std::path::PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
     let url = url::Url::from_directory_path(path).unwrap();
     let engine = SyncEngine::new();
-    Snapshot::builder_for(url).build(&engine).unwrap()
+    Snapshot::builder_for(url).build(&engine).await.unwrap()
 }
 
-#[test]
-fn test_log_compaction_writer_creation() {
-    let snapshot = create_mock_snapshot();
+#[tokio::test]
+async fn test_log_compaction_writer_creation() {
+    let snapshot = create_mock_snapshot().await;
     let start_version = 0;
     let end_version = 1;
 
@@ -36,12 +36,12 @@ fn test_log_compaction_writer_creation() {
     assert!(path.to_string().ends_with(expected_filename));
 }
 
-#[test]
-fn test_invalid_version_range() {
+#[tokio::test]
+async fn test_invalid_version_range() {
     let start_version = 20;
     let end_version = 10; // Invalid: start > end
 
-    let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
+    let result = LogCompactionWriter::try_new(create_mock_snapshot().await, start_version, end_version);
 
     assert!(result.is_err());
     assert!(result
@@ -50,12 +50,12 @@ fn test_invalid_version_range() {
         .contains("Invalid version range"));
 }
 
-#[test]
-fn test_equal_version_range_invalid() {
+#[tokio::test]
+async fn test_equal_version_range_invalid() {
     let start_version = 5;
     let end_version = 5; // Invalid: start == end (must be start < end)
 
-    let result = LogCompactionWriter::try_new(create_mock_snapshot(), start_version, end_version);
+    let result = LogCompactionWriter::try_new(create_mock_snapshot().await, start_version, end_version);
 
     assert!(result.is_err());
     assert!(result
@@ -64,8 +64,8 @@ fn test_equal_version_range_invalid() {
         .contains("Invalid version range"));
 }
 
-#[test]
-fn test_should_compact() {
+#[tokio::test]
+async fn test_should_compact() {
     assert!(should_compact(9, 10));
     assert!(!should_compact(5, 10));
     assert!(!should_compact(10, 0));
@@ -73,8 +73,8 @@ fn test_should_compact() {
     assert!(should_compact(19, 10));
 }
 
-#[test]
-fn test_compaction_actions_schema_access() {
+#[tokio::test]
+async fn test_compaction_actions_schema_access() {
     let schema = &*COMPACTION_ACTIONS_SCHEMA;
     assert!(schema.fields().len() > 0);
 
@@ -86,22 +86,22 @@ fn test_compaction_actions_schema_access() {
     assert!(field_names.contains(&"protocol"));
 }
 
-#[test]
-fn test_writer_debug_impl() {
-    let snapshot = create_mock_snapshot();
+#[tokio::test]
+async fn test_writer_debug_impl() {
+    let snapshot = create_mock_snapshot().await;
     let writer = LogCompactionWriter::try_new(snapshot, 1, 5).unwrap();
 
     let debug_str = format!("{:?}", writer);
     assert!(debug_str.contains("LogCompactionWriter"));
 }
 
-#[test]
-fn test_compaction_data() {
-    let snapshot = create_mock_snapshot();
+#[tokio::test]
+async fn test_compaction_data() {
+    let snapshot = create_mock_snapshot().await;
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
     let engine = SyncEngine::new();
 
-    let result = writer.compaction_data(&engine);
+    let result = writer.compaction_data(&engine).await;
     assert!(result.is_ok());
 
     let iterator = result.unwrap();
@@ -117,16 +117,16 @@ fn test_compaction_data() {
     assert!(debug_str.contains("add_actions_count"));
 }
 
-#[test]
-fn test_end_version_exceeds_snapshot_version() {
-    let snapshot = create_mock_snapshot();
+#[tokio::test]
+async fn test_end_version_exceeds_snapshot_version() {
+    let snapshot = create_mock_snapshot().await;
     let snapshot_version = snapshot.version();
 
     // Negative test to create a writer with end_version greater than snapshot version
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, snapshot_version + 100).unwrap();
     let engine = SyncEngine::new();
 
-    let result = writer.compaction_data(&engine);
+    let result = writer.compaction_data(&engine).await;
     assert!(result.is_err());
     assert!(result
         .unwrap_err()
@@ -134,22 +134,22 @@ fn test_end_version_exceeds_snapshot_version() {
         .contains("exceeds snapshot version"));
 }
 
-#[test]
-fn test_retention_calculator() {
-    let snapshot = create_mock_snapshot();
+#[tokio::test]
+async fn test_retention_calculator() {
+    let snapshot = create_mock_snapshot().await;
     let writer = LogCompactionWriter::try_new(snapshot.clone(), 0, 1).unwrap();
 
     let table_props = writer.table_properties();
     assert_eq!(table_props, snapshot.table_properties());
 }
 
-#[test]
-fn test_compaction_data_with_actual_iterator() {
-    let snapshot = create_multi_version_snapshot();
+#[tokio::test]
+async fn test_compaction_data_with_actual_iterator() {
+    let snapshot = create_multi_version_snapshot().await;
     let mut writer = LogCompactionWriter::try_new(snapshot, 0, 1).unwrap();
     let engine = SyncEngine::new();
 
-    let mut iterator = writer.compaction_data(&engine).unwrap();
+    let mut iterator = writer.compaction_data(&engine).await.unwrap();
 
     let mut batch_count = 0;
     let initial_actions = iterator.total_actions();
@@ -171,9 +171,9 @@ fn test_compaction_data_with_actual_iterator() {
     assert!(batch_count > 0, "Expected to process at least one batch");
 }
 
-#[test]
-fn test_compaction_paths() {
-    let snapshot = create_mock_snapshot();
+#[tokio::test]
+async fn test_compaction_paths() {
+    let snapshot = create_mock_snapshot().await;
 
     // Test various version ranges produce correct paths
     let test_cases = vec![
@@ -206,16 +206,16 @@ fn test_compaction_paths() {
     }
 }
 
-#[test]
-fn test_version_filtering() {
-    let snapshot = create_multi_version_snapshot();
+#[tokio::test]
+async fn test_version_filtering() {
+    let snapshot = create_multi_version_snapshot().await;
     let engine = SyncEngine::new();
     let snapshot_version = snapshot.version();
 
     if snapshot_version >= 1 {
         let mut writer = LogCompactionWriter::try_new(snapshot.clone(), 0, 1).unwrap();
 
-        let result = writer.compaction_data(&engine);
+        let result = writer.compaction_data(&engine).await;
         assert!(
             result.is_ok(),
             "Failed to get compaction data: {:?}",

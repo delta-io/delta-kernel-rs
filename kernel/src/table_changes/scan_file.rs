@@ -2,7 +2,7 @@
 //! metadata required to generate a change data feed. [`CdfScanFile`] can be constructed using
 //! [`CdfScanFileVisitor`]. The visitor reads from engine data with the schema [`cdf_scan_row_schema`].
 //! You can convert engine data to this schema using the [`cdf_scan_row_expression`].
-use itertools::Itertools;
+use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -47,19 +47,23 @@ pub(crate) struct CdfScanFile {
 
 pub(crate) type CdfScanCallback<T> = fn(context: &mut T, scan_file: CdfScanFile);
 
-/// Transforms an iterator of [`TableChangesScanMetadata`] into an iterator of
+/// Transforms a stream of [`TableChangesScanMetadata`] into a stream of
 /// [`CdfScanFile`] by visiting the engine data.
 pub(crate) fn scan_metadata_to_scan_file(
-    scan_metadata: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>,
-) -> impl Iterator<Item = DeltaResult<CdfScanFile>> {
+    scan_metadata: impl futures::Stream<Item = DeltaResult<TableChangesScanMetadata>>,
+) -> impl futures::Stream<Item = DeltaResult<CdfScanFile>> {
     scan_metadata
         .map(|scan_metadata| -> DeltaResult<_> {
             let scan_metadata = scan_metadata?;
             let callback: CdfScanCallback<Vec<CdfScanFile>> =
                 |context, scan_file| context.push(scan_file);
-            Ok(visit_cdf_scan_files(&scan_metadata, vec![], callback)?.into_iter())
-        }) // Iterator-Result-Iterator
-        .flatten_ok() // Iterator-Result
+            Ok(futures::stream::iter(
+                visit_cdf_scan_files(&scan_metadata, vec![], callback)?
+                    .into_iter()
+                    .map(Ok)
+            ))
+        }) // Stream-Result-Stream
+        .try_flatten() // Stream-Result
 }
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the
@@ -328,7 +332,7 @@ mod tests {
         let log_root = table_root.join("_delta_log/").unwrap();
         let log_segment =
             LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
-                .unwrap();
+                .await.unwrap();
         let table_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
@@ -339,10 +343,10 @@ mod tests {
             table_schema.into(),
             None,
         )
-        .unwrap();
+        .await.unwrap();
         let scan_files: Vec<_> = scan_metadata_to_scan_file(scan_metadata)
             .try_collect()
-            .unwrap();
+            .await.unwrap();
 
         // Generate the expected [`CdfScanFile`]
         let timestamps = log_segment

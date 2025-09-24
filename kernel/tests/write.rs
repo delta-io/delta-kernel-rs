@@ -143,7 +143,7 @@ async fn write_data_and_check_result_and_stats(
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref()).await?;
     let mut txn = snapshot.transaction()?;
 
     // create two new arrow record batches to append
@@ -338,7 +338,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
             )?),
             &table_url,
             engine,
-        )?;
+        ).await?;
     }
     Ok(())
 }
@@ -407,7 +407,7 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
             )?),
             &table_url,
             engine,
-        )?;
+        ).await?;
     }
     Ok(())
 }
@@ -553,7 +553,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
             )?),
             &table_url,
             engine,
-        )?;
+        ).await?;
     }
     Ok(())
 }
@@ -833,7 +833,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     assert!(parsed_commits[1].get("add").is_some());
 
     // Verify the data can be read back correctly
-    test_read(&ArrowEngineData::new(data), &table_url, engine)?;
+    test_read(&ArrowEngineData::new(data), &table_url, engine).await?;
 
     Ok(())
 }
@@ -1079,7 +1079,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     )
     .unwrap();
 
-    test_read(&ArrowEngineData::new(expected_data), &table_url, engine)?;
+    test_read(&ArrowEngineData::new(expected_data), &table_url, engine).await?;
 
     Ok(())
 }
@@ -1212,7 +1212,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     // Check that the add action exists
     assert!(parsed_commits[1].get("add").is_some());
 
-    let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
+    let res = test_read(&ArrowEngineData::new(data), &table_url, engine).await;
     assert!(matches!(res,
         Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
 

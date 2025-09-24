@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use itertools::Itertools;
+use futures::{stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use tracing::debug;
 use url::Url;
 
@@ -180,16 +181,16 @@ impl TableChangesScanBuilder {
 }
 
 impl TableChangesScan {
-    /// Returns an iterator of [`TableChangesScanMetadata`] necessary to read CDF. Each row
+    /// Returns a stream of [`TableChangesScanMetadata`] necessary to read CDF. Each row
     /// represents an action in the delta log. These rows are filtered to yield only the actions
     /// necessary to read CDF. Additionally, [`TableChangesScanMetadata`] holds metadata on the
     /// deletion vectors present in the commit. The engine data in each scan metadata is guaranteed
     /// to belong to the same commit. Several [`TableChangesScanMetadata`] may belong to the same
     /// commit.
-    fn scan_metadata(
+    async fn scan_metadata(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
+    ) -> DeltaResult<BoxStream<'static, DeltaResult<TableChangesScanMetadata>>> {
         let commits = self
             .table_changes
             .log_segment
@@ -197,13 +198,19 @@ impl TableChangesScan {
             .clone();
         // NOTE: This is a cheap arc clone
         let physical_predicate = match self.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
+            PhysicalPredicate::StaticSkipAll => None, // We'll handle this after getting the stream
             PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
             PhysicalPredicate::None => None,
         };
         let schema = self.table_changes.end_snapshot.schema();
-        let it = table_changes_action_iter(engine, commits, schema, physical_predicate)?;
-        Ok(Some(it).into_iter().flatten())
+        let stream = table_changes_action_iter(engine, commits, schema, physical_predicate).await?;
+
+        // Check if we should return an empty stream
+        if matches!(self.physical_predicate, PhysicalPredicate::StaticSkipAll) {
+            Ok(futures::stream::empty().boxed())
+        } else {
+            Ok(stream.boxed())
+        }
     }
 
     /// Get a shared reference to the logical [`Schema`] of the table changes scan.
@@ -234,47 +241,59 @@ impl TableChangesScan {
     }
 
     /// Perform an "all in one" scan to get the change data feed. This will use the provided `engine`
-    /// to read and process all the data for the query. Each [`ScanResult`] in the resultant iterator
+    /// to read and process all the data for the query. Each [`ScanResult`] in the resultant stream
     /// encapsulates the raw data and an optional boolean vector built from the deletion vector if it
     /// was present. See the documentation for [`ScanResult`] for more details.
-    pub fn execute(
+    pub async fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
-        let scan_metadata = self.scan_metadata(engine.clone())?;
+    ) -> DeltaResult<impl Stream<Item = DeltaResult<ScanResult>> + use<'_>> {
+        let scan_metadata = self.scan_metadata(engine.clone()).await?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let table_root = self.table_changes.table_root().clone();
         let all_fields = self.all_fields.clone();
         let physical_predicate = self.physical_predicate();
         let dv_engine_ref = engine.clone();
+        let logical_schema = self.logical_schema().clone();
+        let physical_schema = self.physical_schema().clone();
+        let table_root_for_read = table_root.clone();
 
         let result = scan_files
-            .map(move |scan_file| {
-                resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file?)
-            }) // Iterator-Result-Iterator
-            .flatten_ok() // Iterator-Result
-            .map(move |resolved_scan_file| -> DeltaResult<_> {
-                read_scan_file(
-                    engine.as_ref(),
-                    resolved_scan_file?,
-                    self.table_root(),
-                    self.logical_schema(),
-                    self.physical_schema(),
-                    &all_fields,
-                    physical_predicate.clone(),
-                )
-            }) // Iterator-Result-Iterator-Result
-            .flatten_ok() // Iterator-Result-Result
-            .map(|x| x?); // Iterator-Result
+            .map(move |scan_file| -> DeltaResult<_> {
+                let scan_file = scan_file?;
+                let resolved_files = resolve_scan_file_dv(dv_engine_ref.as_ref(), &table_root, scan_file)?;
+                Ok(futures::stream::iter(resolved_files.map(Ok)))
+            }) // Stream-Result-Stream
+            .try_flatten() // Stream-Result
+            .and_then(move |resolved_scan_file| {
+                let engine = engine.clone();
+                let logical_schema = logical_schema.clone();
+                let physical_schema = physical_schema.clone();
+                let all_fields = all_fields.clone();
+                let physical_predicate = physical_predicate.clone();
+                let table_root = table_root_for_read.clone();
+                async move {
+                    read_scan_file(
+                        engine.as_ref(),
+                        resolved_scan_file,
+                        &table_root,
+                        &logical_schema,
+                        &physical_schema,
+                        &all_fields,
+                        physical_predicate,
+                    ).await
+                }
+            }) // Stream-Result-Stream-Result
+            .try_flatten(); // Stream-Result
 
         Ok(result)
     }
 }
 
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
-/// The result is a fallible iterator of [`ScanResult`] containing the logical data.
-fn read_scan_file(
+/// The result is a fallible stream of [`ScanResult`] containing the logical data.
+async fn read_scan_file(
     engine: &dyn Engine,
     resolved_scan_file: ResolvedCdfScanFile,
     table_root: &Url,
@@ -282,7 +301,7 @@ fn read_scan_file(
     physical_schema: &SchemaRef,
     all_fields: &[ColumnType],
     _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
+) -> DeltaResult<impl Stream<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -311,7 +330,7 @@ fn read_scan_file(
             .parquet_handler()
             .read_parquet_files(&[file], physical_schema, None)?;
 
-    let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
+    let result = futures::stream::iter(read_result_iter).map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
         // to transform the physical data into the correct logical form
         let logical = phys_to_logical_eval.evaluate(batch.as_ref());
@@ -369,14 +388,14 @@ mod tests {
     use crate::transforms::ColumnType;
     use crate::Predicate;
 
-    #[test]
-    fn simple_table_changes_scan_builder() {
+    #[tokio::test]
+    async fn simple_table_changes_scan_builder() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).await.unwrap();
 
         let scan = table_changes.into_scan_builder().build().unwrap();
         // Note that this table is not partitioned. `part` is a regular field
@@ -394,14 +413,14 @@ mod tests {
         assert_eq!(scan.physical_predicate, PhysicalPredicate::None);
     }
 
-    #[test]
-    fn projected_and_filtered_table_changes_scan_builder() {
+    #[tokio::test]
+    async fn projected_and_filtered_table_changes_scan_builder() {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
 
         // A field in the schema goes from being nullable to non-nullable
-        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+        let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).await.unwrap();
 
         let schema = table_changes
             .schema()

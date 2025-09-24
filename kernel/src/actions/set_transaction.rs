@@ -105,7 +105,7 @@ mod tests {
     use crate::arrow::array::StringArray;
     use itertools::Itertools;
 
-    fn get_latest_transactions(
+    async fn get_latest_transactions(
         path: &str,
         app_id: &str,
     ) -> (SetTransactionMap, Option<SetTransaction>) {
@@ -113,7 +113,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
         let log_segment = snapshot.log_segment();
 
         (
@@ -122,13 +122,13 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_txn() {
-        let (txns, txn) = get_latest_transactions("./tests/data/basic_partitioned/", "test");
+    #[tokio::test]
+    async fn test_txn() {
+        let (txns, txn) = get_latest_transactions("./tests/data/basic_partitioned/", "test").await;
         assert!(txn.is_none());
         assert_eq!(txns.len(), 0);
 
-        let (txns, txn) = get_latest_transactions("./tests/data/app-txn-no-checkpoint/", "my-app");
+        let (txns, txn) = get_latest_transactions("./tests/data/app-txn-no-checkpoint/", "my-app").await;
         assert!(txn.is_some());
         assert_eq!(txns.len(), 2);
         assert_eq!(txns.get("my-app"), txn.as_ref());
@@ -142,7 +142,7 @@ mod tests {
             .as_ref()
         );
 
-        let (txns, txn) = get_latest_transactions("./tests/data/app-txn-checkpoint/", "my-app");
+        let (txns, txn) = get_latest_transactions("./tests/data/app-txn-checkpoint/", "my-app").await;
         assert!(txn.is_some());
         assert_eq!(txns.len(), 2);
         assert_eq!(txns.get("my-app"), txn.as_ref());
@@ -157,13 +157,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_replay_for_app_ids() {
+    #[tokio::test]
+    async fn test_replay_for_app_ids() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
         let log_segment = snapshot.log_segment();
 
         // The checkpoint has five parts, each containing one action. There are two app ids.
@@ -174,13 +174,13 @@ mod tests {
         assert_eq!(data.len(), 2);
     }
 
-    #[test]
-    fn test_txn_retention_filtering() {
+    #[tokio::test]
+    async fn test_txn_retention_filtering() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/app-txn-with-last-updated/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
         let log_segment = snapshot.log_segment();
 
         // Test with no retention (should get all transactions)

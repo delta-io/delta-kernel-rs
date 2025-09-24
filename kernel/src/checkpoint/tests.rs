@@ -22,8 +22,8 @@ use serde_json::{from_slice, json, Value};
 use test_utils::delta_path_for_version;
 use url::Url;
 
-#[test]
-fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
     const MILLIS_PER_SECOND: i64 = 1_000;
 
     let reference_time_secs = 10_000;
@@ -55,8 +55,8 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
@@ -72,7 +72,7 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).await?;
     let writer = snapshot.checkpoint()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
@@ -109,8 +109,8 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_create_last_checkpoint_data() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     let version = 10;
     let total_actions_counter = 100;
     let add_actions_counter = 75;
@@ -268,8 +268,8 @@ fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - No version specified (latest version is used)
-#[test]
-fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
@@ -295,7 +295,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).await?;
     let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.
@@ -338,8 +338,8 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 /// Tests the `checkpoint()` API with:
 /// - A table that does not support v2Checkpoint
 /// - A specific version specified (version 0)
-#[test]
-fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
@@ -365,7 +365,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     // Specify version 0 for checkpoint
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
-        .build(&engine)?;
+        .build(&engine).await?;
     let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the specified version.
@@ -400,8 +400,8 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
@@ -415,7 +415,7 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root)
         .at_version(0)
-        .build(&engine)?;
+        .build(&engine).await?;
     let writer = snapshot.checkpoint()?;
     let data_iter = writer.checkpoint_data(&engine)?;
 
@@ -442,8 +442,8 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
 /// Tests the `checkpoint()` API with:
 /// - A table that does supports v2Checkpoint
 /// - No version specified (latest version is used)
-#[test]
-fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
+#[tokio::test]
+async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
@@ -469,7 +469,7 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     )?;
 
     let table_root = Url::parse("memory:///")?;
-    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).await?;
     let writer = snapshot.checkpoint()?;
 
     // Verify the checkpoint file path is the latest version by default.

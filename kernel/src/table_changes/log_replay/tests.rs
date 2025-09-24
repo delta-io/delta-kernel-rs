@@ -27,7 +27,7 @@ fn get_schema() -> StructType {
     ])
 }
 
-fn get_segment(
+async fn get_segment(
     engine: &dyn Engine,
     path: &Path,
     start_version: Version,
@@ -40,7 +40,7 @@ fn get_segment(
         log_root,
         start_version,
         end_version,
-    )?;
+    ).await?;
     Ok(log_segment.ascending_commit_files)
 }
 
@@ -82,7 +82,7 @@ async fn metadata_protocol() {
         ])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -107,7 +107,7 @@ async fn cdf_not_enabled() {
         })])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -135,7 +135,7 @@ async fn unsupported_reader_feature() {
         )])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -166,7 +166,7 @@ async fn column_mapping_should_fail() {
         })])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -197,7 +197,7 @@ async fn incompatible_schemas_fail() {
             })])
             .await;
 
-        let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
             .unwrap()
             .into_iter();
 
@@ -287,7 +287,7 @@ async fn add_remove() {
         ])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -337,7 +337,7 @@ async fn filter_data_change() {
         ])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -383,7 +383,7 @@ async fn cdc_selection() {
         ])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -442,7 +442,7 @@ async fn dv() {
         ])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -526,7 +526,7 @@ async fn data_skipping_filter() {
         Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
         other => panic!("Unexpected result: {other:?}"),
     };
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -571,7 +571,7 @@ async fn failing_protocol() {
         ])
         .await;
 
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 
@@ -599,7 +599,7 @@ async fn file_meta_timestamp() {
         })])
         .await;
 
-    let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+    let mut commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None).await
         .unwrap()
         .into_iter();
 

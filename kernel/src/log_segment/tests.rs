@@ -44,8 +44,8 @@ use super::*;
 //              type    nulls  min / max
 // txn.appId    BINARY  0      "3ae45b72-24e1-865a-a211-3..." / "3ae45b72-24e1-865a-a211-3..."
 // txn.version  INT64   0      "4390" / "4390"
-#[test]
-fn test_replay_for_metadata() {
+#[tokio::test]
+async fn test_replay_for_metadata() {
     let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
     let url = url::Url::from_directory_path(path.unwrap()).unwrap();
     let engine = SyncEngine::new();

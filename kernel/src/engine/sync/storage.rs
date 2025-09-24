@@ -77,6 +77,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::{BufMut, BytesMut};
+    use futures::{StreamExt, TryStreamExt};
     use itertools::Itertools;
     use url::Url;
 
@@ -89,8 +90,8 @@ mod tests {
         format!("{index:020}.json")
     }
 
-    #[test]
-    fn test_file_meta_is_correct() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_file_meta_is_correct() -> Result<(), Box<dyn std::error::Error>> {
         let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
 
@@ -103,7 +104,7 @@ mod tests {
 
         let url_path = tmp_dir.path().join(get_json_filename(0));
         let url = Url::from_file_path(url_path).unwrap();
-        let files: Vec<_> = storage.list_from(&url)?.try_collect()?;
+        let files: Vec<_> = storage.list_from(&url)?.try_collect().await?;
 
         assert!(!files.is_empty());
         for meta in files.iter() {
@@ -113,8 +114,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_list_from() -> Result<(), Box<dyn std::error::Error>> {
         let storage = SyncStorageHandler;
         let tmp_dir = tempfile::tempdir().unwrap();
         let mut expected = vec![];
@@ -126,28 +127,36 @@ mod tests {
         }
         let url_path = tmp_dir.path().join(get_json_filename(1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
+        let mut list = storage.list_from(&url)?;
         let mut file_count = 0;
-        for (i, file) in list.enumerate() {
+        let mut i = 0;
+        while let Some(file) = list.try_next().await? {
             // i+1 in index because we started at 0001 in the listing
             assert_eq!(
-                file?.location.to_file_path().unwrap().to_str().unwrap(),
+                file.location.to_file_path().unwrap().to_str().unwrap(),
                 expected[i + 2].to_str().unwrap()
             );
             file_count += 1;
+            i += 1;
         }
         assert_eq!(file_count, 1);
 
         let url_path = tmp_dir.path().join("");
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
-        file_count = list.count();
+        let mut list = storage.list_from(&url)?;
+        file_count = 0;
+        while let Some(_) = list.try_next().await? {
+            file_count += 1;
+        }
         assert_eq!(file_count, 3);
 
         let url_path = tmp_dir.path().join(format!("{:020}", 1));
         let url = Url::from_file_path(url_path).unwrap();
-        let list = storage.list_from(&url)?;
-        file_count = list.count();
+        let mut list = storage.list_from(&url)?;
+        file_count = 0;
+        while let Some(_) = list.try_next().await? {
+            file_count += 1;
+        }
         assert_eq!(file_count, 2);
         Ok(())
     }

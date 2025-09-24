@@ -15,7 +15,7 @@ mod common;
 use test_utils::DefaultEngineExtension;
 use test_utils::{load_test_data, to_arrow};
 
-fn read_cdf_for_table(
+async fn read_cdf_for_table(
     test_name: impl AsRef<str>,
     start_version: Version,
     end_version: impl Into<Option<Version>>,
@@ -30,7 +30,7 @@ fn read_cdf_for_table(
         engine.as_ref(),
         start_version,
         end_version.into(),
-    )?;
+    ).await?;
 
     // Project out the commit timestamp since file modification time may change anytime git clones
     // or switches branches
@@ -66,9 +66,9 @@ fn read_cdf_for_table(
     Ok(batches)
 }
 
-#[test]
-fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
-    let batches = read_cdf_for_table("cdf-table-with-dv", 0, None, None)?;
+#[tokio::test]
+async fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
+    let batches = read_cdf_for_table("cdf-table-with-dv", 0, None, None).await?;
     // Each commit performs the following:
     // 0. Insert  0..=9
     // 1. Remove  [0, 9]
@@ -112,9 +112,9 @@ fn cdf_with_deletion_vector() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[test]
-fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
-    let batches = read_cdf_for_table("cdf-table", 0, None, None)?;
+#[tokio::test]
+async fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
+    let batches = read_cdf_for_table("cdf-table", 0, None, None).await?;
     let mut expected = vec![
         "+----+--------+------------+------------------+-----------------+",
         "| id | name   | birthday   | _change_type     | _commit_version |",
@@ -149,9 +149,9 @@ fn basic_cdf() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[test]
-fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
-    let batches = read_cdf_for_table("cdf-table-non-partitioned", 0, None, None)?;
+#[tokio::test]
+async fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
+    let batches = read_cdf_for_table("cdf-table-non-partitioned", 0, None, None).await?;
     let mut expected = vec![
              "+----+--------+------------+-------------------+---------------+--------------+----------------+------------------+-----------------+",
              "| id | name   | birthday   | long_field        | boolean_field | double_field | smallint_field | _change_type     | _commit_version |",
@@ -188,9 +188,9 @@ fn cdf_non_partitioned() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[test]
-fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
-    let batches = read_cdf_for_table("cdf-table-with-cdc-and-dvs", 0, None, None)?;
+#[tokio::test]
+async fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
+    let batches = read_cdf_for_table("cdf-table-with-cdc-and-dvs", 0, None, None).await?;
     let mut expected = vec![
         "+----+--------------------+------------------+-----------------+",
         "| id | comment            | _change_type     | _commit_version |",
@@ -245,9 +245,9 @@ fn cdf_with_cdc_and_dvs() -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
-#[test]
-fn simple_cdf_version_ranges() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-simple", 0, 0, None)?;
+#[tokio::test]
+async fn simple_cdf_version_ranges() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-simple", 0, 0, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",
@@ -267,7 +267,7 @@ fn simple_cdf_version_ranges() -> DeltaResult<()> {
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
 
-    let batches = read_cdf_for_table("cdf-table-simple", 1, 1, None)?;
+    let batches = read_cdf_for_table("cdf-table-simple", 1, 1, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",
@@ -287,7 +287,7 @@ fn simple_cdf_version_ranges() -> DeltaResult<()> {
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
 
-    let batches = read_cdf_for_table("cdf-table-simple", 2, 2, None)?;
+    let batches = read_cdf_for_table("cdf-table-simple", 2, 2, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",
@@ -302,7 +302,7 @@ fn simple_cdf_version_ranges() -> DeltaResult<()> {
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);
 
-    let batches = read_cdf_for_table("cdf-table-simple", 0, 2, None)?;
+    let batches = read_cdf_for_table("cdf-table-simple", 0, 2, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",
@@ -339,9 +339,9 @@ fn simple_cdf_version_ranges() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn update_operations() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-update-ops", 0, 2, None)?;
+#[tokio::test]
+async fn update_operations() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-update-ops", 0, 2, None).await?;
     // Note: `update_pre` and `update_post` are technically not part of the delta spec, and instead
     // should be `update_preimage` and `update_postimage` respectively. However, the tests in
     // delta-spark use the post and pre.
@@ -376,9 +376,9 @@ fn update_operations() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn false_data_change_is_ignored() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-data-change", 0, 1, None)?;
+#[tokio::test]
+async fn false_data_change_is_ignored() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-data-change", 0, 1, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",
@@ -400,24 +400,24 @@ fn false_data_change_is_ignored() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn invalid_range_end_before_start() {
-    let res = read_cdf_for_table("cdf-table-simple", 1, 0, None);
+#[tokio::test]
+async fn invalid_range_end_before_start() {
+    let res = read_cdf_for_table("cdf-table-simple", 1, 0, None).await;
     let expected_msg =
         "Failed to build LogSegment: start_version cannot be greater than end_version";
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
 }
 
-#[test]
-fn invalid_range_start_after_last_version_of_table() {
-    let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
+#[tokio::test]
+async fn invalid_range_start_after_last_version_of_table() {
+    let res = read_cdf_for_table("cdf-table-simple", 3, 4, None).await;
     let expected_msg = "Expected the first commit to have version 3";
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
 }
 
-#[test]
-fn partition_table() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-partitioned", 0, 2, None)?;
+#[tokio::test]
+async fn partition_table() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-partitioned", 0, 2, None).await?;
     let mut expected = vec![
         "+----+------+------+------------------+-----------------+",
         "| id | text | part | _change_type     | _commit_version |",
@@ -441,9 +441,9 @@ fn partition_table() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn backtick_column_names() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-backtick-column-names", 0, None, None)?;
+#[tokio::test]
+async fn backtick_column_names() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-backtick-column-names", 0, None, None).await?;
     let mut expected = vec![
         "+--------+----------+--------------------------+--------------+-----------------+",
         "| id.num | id.num`s | struct_col               | _change_type | _commit_version |",
@@ -460,9 +460,9 @@ fn backtick_column_names() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn unconditional_delete() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-delete-unconditional", 0, None, None)?;
+#[tokio::test]
+async fn unconditional_delete() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-delete-unconditional", 0, None, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",
@@ -494,9 +494,9 @@ fn unconditional_delete() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn conditional_delete_all_rows() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-delete-conditional-all-rows", 0, None, None)?;
+#[tokio::test]
+async fn conditional_delete_all_rows() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-delete-conditional-all-rows", 0, None, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",
@@ -528,9 +528,9 @@ fn conditional_delete_all_rows() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
-fn conditional_delete_two_rows() -> DeltaResult<()> {
-    let batches = read_cdf_for_table("cdf-table-delete-conditional-two-rows", 0, None, None)?;
+#[tokio::test]
+async fn conditional_delete_two_rows() -> DeltaResult<()> {
+    let batches = read_cdf_for_table("cdf-table-delete-conditional-two-rows", 0, None, None).await?;
     let mut expected = vec![
         "+----+--------------+-----------------+",
         "| id | _change_type | _commit_version |",

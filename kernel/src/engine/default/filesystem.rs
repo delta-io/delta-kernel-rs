@@ -193,6 +193,7 @@ mod tests {
     use std::ops::Range;
     use std::time::Duration;
 
+    use futures::TryStreamExt;
     use itertools::Itertools;
     use object_store::memory::InMemory;
     use object_store::{local::LocalFileSystem, ObjectStore};
@@ -266,6 +267,7 @@ mod tests {
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
             .unwrap()
             .try_collect()
+            .await
             .unwrap();
 
         assert!(!files.is_empty());
@@ -291,20 +293,21 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
-        let files = engine
+        let files: Vec<_> = engine
             .storage_handler()
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())
+            .unwrap()
+            .try_collect()
+            .await
             .unwrap();
         let mut len = 0;
-        for (file, expected) in files.zip(expected_names.iter()) {
+        for (file, expected) in files.iter().zip(expected_names.iter()) {
             assert!(
-                file.as_ref()
-                    .unwrap()
-                    .location
+                file.location
                     .path()
                     .ends_with(expected.as_ref()),
                 "{} does not end with {}",
-                file.unwrap().location.path(),
+                file.location.path(),
                 expected
             );
             len += 1;

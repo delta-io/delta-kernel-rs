@@ -1002,8 +1002,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_static_skipping() {
+    #[tokio::test]
+    async fn test_static_skipping() {
         const NULL: Pred = Pred::null_literal();
         let test_cases = [
             (false, column_pred!("a")),
@@ -1027,8 +1027,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_physical_predicate() {
+    #[tokio::test]
+    async fn test_physical_predicate() {
         let logical_schema = StructType::new_unchecked(vec![
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG).with_metadata([(
@@ -1202,14 +1202,14 @@ mod tests {
         Ok(files)
     }
 
-    #[test]
-    fn test_scan_metadata_paths() {
+    #[tokio::test]
+    async fn test_scan_metadata_paths() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         let files = get_files_for_scan(scan, &engine).unwrap();
         assert_eq!(files.len(), 1);
@@ -1219,14 +1219,14 @@ mod tests {
         );
     }
 
-    #[test_log::test]
-    fn test_scan_metadata() {
+    #[tokio::test]
+    async fn test_scan_metadata() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).await.unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<ScanResult> = scan.execute(engine).unwrap().try_collect().unwrap();
 
@@ -1235,14 +1235,14 @@ mod tests {
         assert_eq!(num_rows, 10)
     }
 
-    #[test_log::test]
-    fn test_scan_metadata_from_same_version() {
+    #[tokio::test]
+    async fn test_scan_metadata_from_same_version() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).await.unwrap();
         let version = snapshot.version();
         let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<_> = scan
@@ -1270,8 +1270,8 @@ mod tests {
 
     // reading v0 with 3 files.
     // updating to v1 with 3 more files added.
-    #[test_log::test]
-    fn test_scan_metadata_from_with_update() {
+    #[tokio::test]
+    async fn test_scan_metadata_from_with_update() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = Arc::new(SyncEngine::new());
@@ -1279,7 +1279,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(engine.as_ref())
-            .unwrap();
+            .await.unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         let files: Vec<_> = scan
             .scan_metadata(engine.as_ref())
@@ -1303,7 +1303,7 @@ mod tests {
         let snapshot = Snapshot::builder_for(url)
             .at_version(1)
             .build(engine.as_ref())
-            .unwrap();
+            .await.unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         let new_files: Vec<_> = scan
             .scan_metadata_from(engine.as_ref(), 0, files, None)
@@ -1322,8 +1322,8 @@ mod tests {
         assert_eq!(new_files[1].num_rows(), 3);
     }
 
-    #[test]
-    fn test_get_partition_value() {
+    #[tokio::test]
+    async fn test_get_partition_value() {
         let cases = [
             (
                 "string",
@@ -1366,13 +1366,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_replay_for_scan_metadata() {
+    #[tokio::test]
+    async fn test_replay_for_scan_metadata() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
         let data: Vec<_> = scan
             .replay_for_scan_metadata(&engine)
@@ -1386,13 +1386,13 @@ mod tests {
         assert_eq!(data.len(), 5);
     }
 
-    #[test]
-    fn test_data_row_group_skipping() {
+    #[tokio::test]
+    async fn test_data_row_group_skipping() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).await.unwrap();
 
         // No predicate pushdown attempted, so the one data file should be returned.
         //
@@ -1429,13 +1429,13 @@ mod tests {
         assert_eq!(data.len(), 1);
     }
 
-    #[test]
-    fn test_missing_column_row_group_skipping() {
+    #[tokio::test]
+    async fn test_missing_column_row_group_skipping() {
         let path = std::fs::canonicalize(PathBuf::from("./tests/data/parquet_row_group_skipping/"));
         let url = url::Url::from_directory_path(path.unwrap()).unwrap();
         let engine = Arc::new(SyncEngine::new());
 
-        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).await.unwrap();
 
         // Predicate over a logically valid but physically missing column. No data files should be
         // returned because the column is inferred to be all-null.
@@ -1461,8 +1461,8 @@ mod tests {
             .expect_err("unknown column");
     }
 
-    #[test_log::test]
-    fn test_scan_with_checkpoint() -> DeltaResult<()> {
+    #[tokio::test]
+    async fn test_scan_with_checkpoint() -> DeltaResult<()> {
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/",
         ))?;
@@ -1470,7 +1470,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).await.unwrap();
         let scan = snapshot.scan_builder().build()?;
         let files = get_files_for_scan(scan, &engine)?;
         // test case:

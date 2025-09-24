@@ -68,7 +68,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
 
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref()).await?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
@@ -120,7 +120,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_data = vec![batch.clone(), batch];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = Snapshot::builder_for(location).build(&engine).await?;
     let scan = snapshot.scan_builder().build()?;
 
     let mut files = 0;
@@ -173,7 +173,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
 
     let expected_data = vec![batch];
 
-    let snapshot = Snapshot::builder_for(location).build(&engine)?;
+    let snapshot = Snapshot::builder_for(location).build(&engine).await?;
     let scan = snapshot.scan_builder().build()?;
 
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
@@ -244,7 +244,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref()).await?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
     // we validate the boundary values where we expect the set of matched files to change.
@@ -420,7 +420,7 @@ fn read_with_scan_metadata(
     Ok(())
 }
 
-fn read_table_data(
+async fn read_table_data(
     path: &str,
     select_cols: Option<&[&str]>,
     predicate: Option<Pred>,
@@ -435,7 +435,7 @@ fn read_table_data(
         Arc::new(TokioBackgroundExecutor::new()),
     )?);
 
-    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref()).await?;
 
     let read_schema = select_cols.map(|select_cols| {
         let table_schema = snapshot.schema();
@@ -458,7 +458,7 @@ fn read_table_data(
 }
 
 // util to take a Vec<&str> and call read_table_data with Vec<String>
-fn read_table_data_str(
+async fn read_table_data_str(
     path: &str,
     select_cols: Option<&[&str]>,
     predicate: Option<Pred>,
@@ -469,11 +469,11 @@ fn read_table_data_str(
         select_cols,
         predicate,
         expected.into_iter().map(String::from).collect(),
-    )
+    ).await
 }
 
-#[test]
-fn data() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn data() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+--------+--------+---------+",
         "| letter | number | a_float |",
@@ -486,13 +486,13 @@ fn data() -> Result<(), Box<dyn std::error::Error>> {
         "| e      | 5      | 5.5     |",
         "+--------+--------+---------+",
     ];
-    read_table_data_str("./tests/data/basic_partitioned", None, None, expected)?;
+    read_table_data_str("./tests/data/basic_partitioned", None, None, expected).await?;
 
     Ok(())
 }
 
-#[test]
-fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+--------+",
         "| a_float | letter | number |",
@@ -510,13 +510,13 @@ fn column_ordering() -> Result<(), Box<dyn std::error::Error>> {
         Some(&["a_float", "letter", "number"]),
         None,
         expected,
-    )?;
+    ).await?;
 
     Ok(())
 }
 
-#[test]
-fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+",
         "| a_float | number |",
@@ -534,7 +534,7 @@ fn column_ordering_and_projection() -> Result<(), Box<dyn std::error::Error>> {
         Some(&["a_float", "number"]),
         None,
         expected,
-    )?;
+    ).await?;
 
     Ok(())
 }
@@ -576,8 +576,8 @@ fn table_for_letters(letters: &[char]) -> Vec<String> {
     res
 }
 
-#[test]
-fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
             column_expr!("number").lt(Expr::literal(4i64)),
@@ -616,8 +616,8 @@ fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
     // Test basic column pruning. Note that the actual predicate machinery is already well-tested,
     // so we're just testing wiring here.
     let null_row_table: Vec<String> = vec![
@@ -674,8 +674,8 @@ fn predicate_on_letter() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     // Partition skipping and file skipping are currently implemented separately. Mixing them in an
     // AND clause will evaulate each separately, but mixing them in an OR clause disables both.
     let full_table: Vec<String> = vec![
@@ -734,8 +734,8 @@ fn predicate_on_letter_and_number() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
             Pred::not(column_expr!("number").lt(Expr::literal(4i64))),
@@ -773,8 +773,8 @@ fn predicate_on_number_not() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------+--------+",
         "| a_float | number |",
@@ -791,24 +791,24 @@ fn predicate_on_number_with_not_null() -> Result<(), Box<dyn std::error::Error>>
             column_expr!("number").lt(Expr::literal(3i64)),
         )),
         expected,
-    )?;
+    ).await?;
     Ok(())
 }
 
-#[test]
-fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn predicate_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![]; // number is never null
     read_table_data_str(
         "./tests/data/basic_partitioned",
         Some(&["a_float", "number"]),
         Some(column_expr!("number").is_null()),
         expected,
-    )?;
+    ).await?;
     Ok(())
 }
 
-#[test]
-fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+------+--------------+",
         "| part | n            |",
@@ -830,12 +830,12 @@ fn mixed_null() -> Result<(), Box<dyn std::error::Error>> {
         Some(&["part", "n"]),
         Some(column_expr!("n").is_null()),
         expected,
-    )?;
+    ).await?;
     Ok(())
 }
 
-#[test]
-fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+------+--------------+",
         "| part | n            |",
@@ -857,12 +857,12 @@ fn mixed_not_null() -> Result<(), Box<dyn std::error::Error>> {
         Some(&["part", "n"]),
         Some(column_expr!("n").is_not_null()),
         expected,
-    )?;
+    ).await?;
     Ok(())
 }
 
-#[test]
-fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
             Pred::and(
@@ -904,8 +904,8 @@ fn and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let cases = vec![
         (
             Pred::not(Pred::and(
@@ -947,8 +947,8 @@ fn not_and_or_predicates() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     let empty_struct = Expr::struct_from(Vec::<ExpressionRef>::new());
     let cases = vec![
         (Pred::literal(false), table_for_numbers(vec![])),
@@ -1000,8 +1000,8 @@ fn invalid_skips_none_predicates() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[test]
-fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+-------+",
         "| value |",
@@ -1021,7 +1021,7 @@ fn with_predicate_and_removes() -> Result<(), Box<dyn std::error::Error>> {
         None,
         Some(Pred::gt(column_expr!("value"), Expr::literal(3))),
         expected,
-    )?;
+    ).await?;
     Ok(())
 }
 
@@ -1059,7 +1059,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref()).await?;
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
     let scan = snapshot
@@ -1121,7 +1121,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref()).await?;
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
     let scan = snapshot
@@ -1143,8 +1143,8 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[test]
-fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+-------+--------------------------+---------------------+",
         "| id | value | timestamp                | rand                |",
@@ -1158,12 +1158,12 @@ fn short_dv() -> Result<(), Box<dyn std::error::Error>> {
         "| 9  | 9     | 2023-05-31T18:58:33.633Z | 0.5175919190815845  |",
         "+----+-------+--------------------------+---------------------+",
     ];
-    read_table_data_str("./tests/data/with-short-dv/", None, None, expected)?;
+    read_table_data_str("./tests/data/with-short-dv/", None, None, expected).await?;
     Ok(())
 }
 
-#[test]
-fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----------------+---------+--------------+------------------------+",
         "| part           | col1    | col2         | col3                   |",
@@ -1174,12 +1174,12 @@ fn basic_decimal() -> Result<(), Box<dyn std::error::Error>> {
         "| 2342222.23454  | 111.11  | 22222.22222  | 3333333333.3333333333  |",
         "+----------------+---------+--------------+------------------------+",
     ];
-    read_table_data_str("./tests/data/basic-decimal-table/", None, None, expected)?;
+    read_table_data_str("./tests/data/basic-decimal-table/", None, None, expected).await?;
     Ok(())
 }
 
-#[test]
-fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+----------------------------+----------------------------+",
         "| id | tsNtz                      | tsNtzPartition             |",
@@ -1200,12 +1200,12 @@ fn timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
         None,
         None,
         expected,
-    )?;
+    ).await?;
     Ok(())
 }
 
-#[test]
-fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+---------------------+---------------------+--------------------+----------------+----------------+----------------+----------------------------+",
         "| byte_long           | int_long            | float_double       | byte_double    | short_double   | int_double     | date_timestamp_ntz         |",
@@ -1224,11 +1224,11 @@ fn type_widening_basic() -> Result<(), Box<dyn std::error::Error>> {
         "date_timestamp_ntz",
     ]);
 
-    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected).await
 }
 
-#[test]
-fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----------------------------+-------------------------------+--------------+---------------+--------------+----------------------+",
         "| decimal_decimal_same_scale | decimal_decimal_greater_scale | byte_decimal | short_decimal | int_decimal  | long_decimal         |",
@@ -1245,12 +1245,12 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
         "int_decimal",
         "long_decimal",
     ]);
-    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
+    read_table_data_str("./tests/data/type-widening/", select_cols, None, expected).await
 }
 
 // Verify that predicates over invalid/missing columns do not cause skipping.
-#[test]
-fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::error::Error>> {
     // Attempted skipping over a logically valid but physically missing column. We should be able to
     // skip the data file because the missing column is inferred to be all-null.
     //
@@ -1280,7 +1280,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         Some(columns),
         Some(predicate),
         expected,
-    )?;
+    ).await.await?;
 
     // Attempted skipping over an invalid (logically missing) column. Ideally this should throw a
     // query error, but at a minimum it should not cause incorrect data skipping.
@@ -1301,7 +1301,7 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
         Some(columns),
         Some(predicate),
         expected,
-    )
+    ).await
     .expect_err("unknown column");
     Ok(())
 }
@@ -1310,8 +1310,8 @@ fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::erro
 // `time=1971-07-22T03:06:40.000000Z`. This is disallowed in windows due to having a `:` in
 // the name.
 #[cfg(not(windows))]
-#[test]
-fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+-----+---+----------------------+",
         "| id | x   | s | time                 |",
@@ -1322,11 +1322,11 @@ fn timestamp_partitioned_table() -> Result<(), Box<dyn std::error::Error>> {
     let test_name = "timestamp-partitioned-table";
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
-    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected).await
 }
 
-#[test]
-fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = vec![
         "+----+--------------------+",
         "| id | comment            |",
@@ -1341,16 +1341,16 @@ fn compacted_log_files_table() -> Result<(), Box<dyn std::error::Error>> {
     let test_name = "compacted-log-files-table";
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
-    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected).await
 }
 
-#[test]
-fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn unshredded_variant_table() -> Result<(), Box<dyn std::error::Error>> {
     let expected = include!("data/unshredded-variant.expected.in");
     let test_name = "unshredded-variant";
     let test_dir = load_test_data("./tests/data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
-    read_table_data_str(test_path.to_str().unwrap(), None, None, expected)
+    read_table_data_str(test_path.to_str().unwrap(), None, None, expected).await
 }
 
 #[tokio::test]
@@ -1414,7 +1414,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
         StructField::nullable("value", DataType::STRING),
     ])?);
 
-    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref()).await?;
     let scan = snapshot.scan_builder().with_schema(schema).build()?;
 
     let mut file_count = 0;
@@ -1497,7 +1497,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         ),
     ];
     for (column_name, metadata_spec, error_text) in test_cases {
-        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref()).await?;
         let schema = Arc::new(StructType::try_new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::create_metadata_column(column_name, metadata_spec),

@@ -10,25 +10,25 @@ use test_utils::{load_test_data, DefaultEngineExtension};
 use itertools::Itertools;
 use test_utils::read_scan;
 
-fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
+async fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<RecordBatch>> {
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
 
     let engine = DefaultEngine::new_local();
     let url =
         delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string")).unwrap();
-    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).await.unwrap();
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
 
     Ok(batches)
 }
 
-fn test_v2_checkpoint_with_table(
+async fn test_v2_checkpoint_with_table(
     table_name: &str,
     mut expected_table: Vec<String>,
 ) -> DeltaResult<()> {
-    let batches = read_v2_checkpoint_table(table_name)?;
+    let batches = read_v2_checkpoint_table(table_name).await?;
 
     sort_lines!(expected_table);
     assert_batches_sorted_eq!(expected_table, &batches);
@@ -163,63 +163,63 @@ fn get_without_sidecars_table() -> Vec<String> {
 /// - `V2 Checkpoint compat file equivalency to normal V2 Checkpoint` -> `v2_classic_checkpoint_parquet`
 /// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_json_with_last_checkpoint`
 /// - `last checkpoint contains correct schema for v1/v2 Checkpoints` -> `v2_checkpoints_parquet_with_last_checkpoint`
-#[test]
-fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
+#[tokio::test]
+async fn v2_checkpoints_json_with_sidecars() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-sidecars",
         generate_sidecar_expected_data(),
-    )
+    ).await
 }
 
-#[test]
-fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
+#[tokio::test]
+async fn v2_checkpoints_parquet_with_sidecars() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-sidecars",
         generate_sidecar_expected_data(),
-    )
+    ).await
 }
 
-#[test]
-fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
+#[tokio::test]
+async fn v2_checkpoints_json_without_sidecars() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-without-sidecars",
         get_without_sidecars_table(),
-    )
+    ).await
 }
 
-#[test]
-fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
+#[tokio::test]
+async fn v2_checkpoints_parquet_without_sidecars() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-without-sidecars",
         get_without_sidecars_table(),
-    )
+    ).await
 }
 
-#[test]
-fn v2_classic_checkpoint_json() -> DeltaResult<()> {
-    test_v2_checkpoint_with_table("v2-classic-checkpoint-json", get_classic_checkpoint_table())
+#[tokio::test]
+async fn v2_classic_checkpoint_json() -> DeltaResult<()> {
+    test_v2_checkpoint_with_table("v2-classic-checkpoint-json", get_classic_checkpoint_table()).await
 }
 
-#[test]
-fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
+#[tokio::test]
+async fn v2_classic_checkpoint_parquet() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
         "v2-classic-checkpoint-parquet",
         get_classic_checkpoint_table(),
-    )
+    ).await
 }
 
-#[test]
-fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
+#[tokio::test]
+async fn v2_checkpoints_json_with_last_checkpoint() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-json-with-last-checkpoint",
         get_simple_id_table(),
-    )
+    ).await
 }
 
-#[test]
-fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
+#[tokio::test]
+async fn v2_checkpoints_parquet_with_last_checkpoint() -> DeltaResult<()> {
     test_v2_checkpoint_with_table(
         "v2-checkpoints-parquet-with-last-checkpoint",
         get_simple_id_table(),
-    )
+    ).await
 }

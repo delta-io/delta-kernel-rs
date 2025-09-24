@@ -29,6 +29,7 @@ pub mod parquet_row_group_skipping;
 
 #[cfg(test)]
 mod tests {
+    use futures::TryStreamExt;
     use itertools::Itertools;
     use object_store::path::Path;
     use std::sync::Arc;
@@ -41,7 +42,7 @@ mod tests {
 
     use test_utils::delta_path_for_version;
 
-    fn test_list_from_should_sort_and_filter(
+    async fn test_list_from_should_sort_and_filter(
         engine: &dyn Engine,
         base_url: &Url,
         engine_data: impl Fn() -> Box<dyn EngineData>,
@@ -64,7 +65,7 @@ mod tests {
 
         // list files after an offset
         let test_url = base_url.join(expected_names[0].as_ref()).unwrap();
-        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().await.unwrap();
         assert_eq!(files.len(), expected_names.len() - 1);
         for (file, expected) in files.iter().zip(expected_names.iter().skip(1)) {
             assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
@@ -73,12 +74,12 @@ mod tests {
         let test_url = base_url
             .join(delta_path_for_version(0, "json").as_ref())
             .unwrap();
-        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().await.unwrap();
         assert_eq!(files.len(), expected_names.len());
 
         // list files inside a directory / key prefix
         let test_url = base_url.join("_delta_log/").unwrap();
-        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().unwrap();
+        let files: Vec<_> = storage.list_from(&test_url).unwrap().try_collect().await.unwrap();
         assert_eq!(files.len(), expected_names.len());
         for (file, expected) in files.iter().zip(expected_names.iter()) {
             assert_eq!(file.location, base_url.join(expected.as_ref()).unwrap());
@@ -99,7 +100,7 @@ mod tests {
         Box::new(ArrowEngineData::new(data))
     }
 
-    pub(crate) fn test_arrow_engine(engine: &dyn Engine, base_url: &Url) {
-        test_list_from_should_sort_and_filter(engine, base_url, get_arrow_data);
+    pub(crate) async fn test_arrow_engine(engine: &dyn Engine, base_url: &Url) {
+        test_list_from_should_sort_and_filter(engine, base_url, get_arrow_data).await;
     }
 }
