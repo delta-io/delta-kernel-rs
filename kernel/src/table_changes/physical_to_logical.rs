@@ -32,14 +32,13 @@ fn get_cdf_columns(
 
     // Handle _commit_timestamp
     let timestamp_field = logical_schema.field_with_index(COMMIT_TIMESTAMP_COL_NAME);
-    let timestamp_metadata: Result<Option<(usize, (String, Scalar))>, Error> = timestamp_field
-        .map(|(idx, field)| {
-            let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp).map_err(|e| {
-                Error::generic(format!("Failed to process {}: {e}", scan_file.path))
-            })?;
-            Ok((idx, (field.name().to_string(), value)))
-        })
-        .transpose();
+    let timestamp_metadata = if let Some((idx, field)) = timestamp_field {
+        let value = Scalar::timestamp_from_millis(scan_file.commit_timestamp)
+            .map_err(|e| Error::generic(format!("Failed to process {}: {e}", scan_file.path)))?;
+        Some((idx, (field.name().to_string(), value)))
+    } else {
+        None
+    };
 
     // Handle _commit_version
     let version_field = logical_schema.field_with_index(COMMIT_VERSION_COL_NAME);
@@ -51,7 +50,7 @@ fn get_cdf_columns(
 
     Ok(change_type_metadata
         .into_iter()
-        .chain(timestamp_metadata?)
+        .chain(timestamp_metadata)
         .chain(version_metadata))
 }
 
