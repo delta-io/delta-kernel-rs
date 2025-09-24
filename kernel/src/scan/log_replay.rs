@@ -13,7 +13,8 @@ use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, Log
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
-use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::table_features::ColumnMappingMode;
+use crate::transforms::{get_transform_expr, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -45,6 +46,7 @@ pub(crate) struct ScanLogReplayProcessor {
     add_transform: Arc<dyn ExpressionEvaluator>,
     logical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
+    column_mapping_mode: ColumnMappingMode,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -58,6 +60,7 @@ impl ScanLogReplayProcessor {
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
         logical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
+        column_mapping_mode: ColumnMappingMode,
     ) -> Self {
         Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
@@ -70,6 +73,7 @@ impl ScanLogReplayProcessor {
             seen_file_keys: Default::default(),
             logical_schema,
             transform_spec,
+            column_mapping_mode,
         }
     }
 }
@@ -84,6 +88,7 @@ struct AddRemoveDedupVisitor<'seen> {
     logical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     partition_filter: Option<PredicateRef>,
+    column_mapping_mode: ColumnMappingMode,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
@@ -102,6 +107,7 @@ impl AddRemoveDedupVisitor<'_> {
         logical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
         partition_filter: Option<PredicateRef>,
+        column_mapping_mode: ColumnMappingMode,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
         AddRemoveDedupVisitor {
@@ -117,8 +123,85 @@ impl AddRemoveDedupVisitor<'_> {
             logical_schema,
             transform_spec,
             partition_filter,
+            column_mapping_mode,
             row_transform_exprs: Vec::new(),
         }
+    }
+
+    fn parse_partition_value(
+        &self,
+        field_idx: usize,
+        partition_values: &HashMap<String, String>,
+    ) -> DeltaResult<(usize, (String, Scalar))> {
+        let field = self.logical_schema.field_at_index(field_idx);
+        let Some(field) = field else {
+            return Err(Error::InternalError(format!(
+                "out of bounds partition column field index {field_idx}"
+            )));
+        };
+        let name = field.physical_name(self.column_mapping_mode);
+        let partition_value =
+            crate::transforms::parse_partition_value_raw(partition_values.get(name), field.data_type())?;
+        Ok((field_idx, (name.to_string(), partition_value)))
+    }
+
+    fn parse_partition_values(
+        &self,
+        transform_spec: &TransformSpec,
+        partition_values: &HashMap<String, String>,
+    ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
+        transform_spec
+            .iter()
+            .filter_map(|field_transform| match field_transform {
+                crate::transforms::FieldTransformSpec::PartitionColumn { field_index, .. } => {
+                    Some(self.parse_partition_value(*field_index, partition_values))
+                }
+                crate::transforms::FieldTransformSpec::StaticInsert { .. }
+                | crate::transforms::FieldTransformSpec::StaticReplace { .. }
+                | crate::transforms::FieldTransformSpec::StaticDrop { .. } => None,
+            })
+            .collect::<DeltaResult<HashMap<_, _>>>()
+    }
+
+    /// Compute an expression that will transform from physical to logical for a given Add file action
+    ///
+    /// An empty `transform_spec` is valid and represents the case where only column mapping is needed
+    /// (e.g., no partition columns to inject). The resulting empty `Expression::Transform` will
+    /// pass all input fields through unchanged while applying the output schema for name mapping.
+    fn get_transform_expr(
+        &self,
+        transform_spec: &TransformSpec,
+        mut partition_values: HashMap<usize, (String, Scalar)>,
+    ) -> DeltaResult<ExpressionRef> {
+        let mut transform = crate::expressions::Transform::new_top_level();
+
+        for field_transform in transform_spec {
+            use crate::transforms::FieldTransformSpec::*;
+            transform = match field_transform {
+                StaticInsert { insert_after, expr } => {
+                    transform.with_inserted_field(insert_after.clone(), expr.clone())
+                }
+                StaticReplace { field_name, expr } => {
+                    transform.with_replaced_field(field_name.clone(), expr.clone())
+                }
+                StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
+                PartitionColumn {
+                    field_index,
+                    insert_after,
+                } => {
+                    let Some((_, partition_value)) = partition_values.remove(field_index) else {
+                        return Err(Error::InternalError(format!(
+                            "missing partition value for field index {field_index}"
+                        )));
+                    };
+
+                    let partition_value = Arc::new(partition_value.into());
+                    transform.with_inserted_field(insert_after.clone(), partition_value)
+                }
+            }
+        }
+
+        Ok(Arc::new(Expression::Transform(transform)))
     }
 
     fn is_file_partition_pruned(
@@ -168,7 +251,7 @@ impl AddRemoveDedupVisitor<'_> {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
                 let partition_values =
-                    parse_partition_values(&self.logical_schema, transform, &partition_values)?;
+                    self.parse_partition_values(transform, &partition_values)?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -323,6 +406,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             self.logical_schema.clone(),
             self.transform_spec.clone(),
             self.partition_filter.clone(),
+            self.column_mapping_mode,
             is_log_batch,
         );
         visitor.visit_rows_of(actions.as_ref())?;
@@ -355,9 +439,16 @@ pub(crate) fn scan_action_iter(
     logical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    column_mapping_mode: ColumnMappingMode,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform_spec)
-        .process_actions_iter(action_iter)
+    ScanLogReplayProcessor::new(
+        engine,
+        physical_predicate,
+        logical_schema,
+        transform_spec,
+        column_mapping_mode,
+    )
+    .process_actions_iter(action_iter)
 }
 
 #[cfg(test)]
@@ -441,6 +532,7 @@ mod tests {
             logical_schema,
             None,
             None,
+            ColumnMappingMode::None,
         );
         for res in iter {
             let scan_metadata = res.unwrap();
@@ -470,6 +562,7 @@ mod tests {
             schema,
             static_transform,
             None,
+            ColumnMappingMode::None,
         );
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {

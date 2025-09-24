@@ -11,6 +11,7 @@ use itertools::Itertools;
 
 use crate::expressions::{Expression, ExpressionRef};
 use crate::schema::{DataType, SchemaRef};
+use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 /// Scan uses this to set up what kinds of top-level columns it is scanning. For `Selected` we just
@@ -68,13 +69,14 @@ pub(crate) fn parse_partition_value(
     field_idx: usize,
     logical_schema: &SchemaRef,
     partition_values: &HashMap<String, String>,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<(usize, (String, crate::expressions::Scalar))> {
     let Some(field) = logical_schema.field_at_index(field_idx) else {
         return Err(Error::InternalError(format!(
             "out of bounds partition column field index {field_idx}"
         )));
     };
-    let name = field.physical_name();
+    let name = field.physical_name(column_mapping_mode);
     let partition_value = parse_partition_value_raw(partition_values.get(name), field.data_type())?;
     Ok((field_idx, (name.to_string(), partition_value)))
 }
@@ -84,6 +86,7 @@ pub(crate) fn parse_partition_values(
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
     partition_values: &HashMap<String, String>,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<HashMap<usize, (String, crate::expressions::Scalar)>> {
     transform_spec
         .iter()
@@ -92,6 +95,7 @@ pub(crate) fn parse_partition_values(
                 *field_index,
                 logical_schema,
                 partition_values,
+                column_mapping_mode,
             )),
             FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::StaticReplace { .. }
@@ -190,6 +194,7 @@ mod tests {
     use super::*;
     use crate::expressions::Scalar;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
+    use crate::table_features::ColumnMappingMode;
     use std::collections::HashMap;
 
     #[test]
@@ -200,7 +205,7 @@ mod tests {
         )]));
         let partition_values = HashMap::new();
 
-        let result = parse_partition_value(5, &schema, &partition_values);
+        let result = parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out of bounds"));
     }
@@ -228,7 +233,7 @@ mod tests {
         partition_values.insert("age".to_string(), "30".to_string());
         partition_values.insert("id".to_string(), "test".to_string());
 
-        let result = parse_partition_values(&schema, &transform_spec, &partition_values).unwrap();
+        let result = parse_partition_values(&schema, &transform_spec, &partition_values, ColumnMappingMode::None).unwrap();
         assert_eq!(result.len(), 2);
         assert!(result.contains_key(&0));
         assert!(result.contains_key(&1));
@@ -240,7 +245,7 @@ mod tests {
         let transform_spec = vec![];
         let partition_values = HashMap::new();
 
-        let result = parse_partition_values(&schema, &transform_spec, &partition_values).unwrap();
+        let result = parse_partition_values(&schema, &transform_spec, &partition_values, ColumnMappingMode::None).unwrap();
         assert!(result.is_empty());
     }
 

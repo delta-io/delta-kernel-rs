@@ -5,6 +5,7 @@ use itertools::Itertools;
 
 use crate::expressions::Scalar;
 use crate::schema::{ColumnName, DataType, SchemaRef, StructField, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::transforms::ColumnType;
 use crate::{DeltaResult, Error, Expression};
 
@@ -37,6 +38,7 @@ pub(crate) fn physical_to_logical_expr(
     scan_file: &CdfScanFile,
     logical_schema: &StructType,
     all_fields: &[ColumnType],
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<Expression> {
     let mut cdf_columns = get_cdf_columns(scan_file)?;
     let all_fields = all_fields
@@ -49,7 +51,7 @@ pub(crate) fn physical_to_logical_expr(
                         "logical schema did not contain expected field, can't transform data",
                     ));
                 };
-                let name = field.physical_name();
+                let name = field.physical_name(column_mapping_mode);
                 let raw_value = scan_file.partition_values.get(name);
                 let value_expression =
                     crate::transforms::parse_partition_value_raw(raw_value, field.data_type())?;
@@ -93,6 +95,7 @@ mod tests {
         ADD_CHANGE_TYPE, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
         REMOVE_CHANGE_TYPE,
     };
+    use crate::table_features::ColumnMappingMode;
     use crate::transforms::ColumnType;
 
     #[test]
@@ -121,8 +124,13 @@ mod tests {
                 ColumnType::Selected(COMMIT_VERSION_COL_NAME.to_string()),
                 ColumnType::Selected(COMMIT_TIMESTAMP_COL_NAME.to_string()),
             ];
-            let phys_to_logical_expr =
-                physical_to_logical_expr(&scan_file, &logical_schema, &all_fields).unwrap();
+            let phys_to_logical_expr = physical_to_logical_expr(
+                &scan_file,
+                &logical_schema,
+                &all_fields,
+                ColumnMappingMode::None,
+            )
+            .unwrap();
             let expected_expr = Expr::struct_from([
                 column_expr!("id"),
                 Scalar::Long(20).into(),

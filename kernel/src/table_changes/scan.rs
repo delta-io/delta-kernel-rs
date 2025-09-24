@@ -9,6 +9,7 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::transforms::ColumnType;
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
@@ -165,7 +166,11 @@ impl TableChangesScanBuilder {
             })
             .try_collect()?;
         let physical_predicate = match self.predicate {
-            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
+            Some(predicate) => PhysicalPredicate::try_new(
+                &predicate,
+                &logical_schema,
+                self.table_changes.end_snapshot.column_mapping_mode(),
+            )?,
             None => PhysicalPredicate::None,
         };
 
@@ -262,6 +267,7 @@ impl TableChangesScan {
                     self.logical_schema(),
                     self.physical_schema(),
                     &all_fields,
+                    self.table_changes.end_snapshot.column_mapping_mode(),
                     physical_predicate.clone(),
                 )
             }) // Iterator-Result-Iterator-Result
@@ -281,6 +287,7 @@ fn read_scan_file(
     logical_schema: &SchemaRef,
     physical_schema: &SchemaRef,
     all_fields: &[ColumnType],
+    column_mapping_mode: ColumnMappingMode,
     _physical_predicate: Option<PredicateRef>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
@@ -288,8 +295,12 @@ fn read_scan_file(
         mut selection_vector,
     } = resolved_scan_file;
 
-    let physical_to_logical_expr =
-        physical_to_logical_expr(&scan_file, logical_schema.as_ref(), all_fields)?;
+    let physical_to_logical_expr = physical_to_logical_expr(
+        &scan_file,
+        logical_schema.as_ref(),
+        all_fields,
+        column_mapping_mode,
+    )?;
     let physical_schema = scan_file_physical_schema(&scan_file, physical_schema.as_ref());
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
         physical_schema.clone(),
