@@ -1443,6 +1443,26 @@ mod tests {
     }
 
     #[test]
+    fn test_no_catalog_managed_writes() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogManaged]),
+            Some([WriterFeature::CatalogManaged]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogOwnedPreview]),
+            Some([WriterFeature::CatalogOwnedPreview]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
+    }
+
+    #[test]
     fn test_into_engine_data() {
         let engine = ExprEngine::new();
 
