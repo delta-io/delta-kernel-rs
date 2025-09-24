@@ -13,7 +13,7 @@ use crate::schema::{
     ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::table_features::{
-    ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
+    FeatureType, TableFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -348,11 +348,11 @@ pub(crate) struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    reader_features: Option<Vec<ReaderFeature>>,
+    reader_features: Option<Vec<TableFeature>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    writer_features: Option<Vec<WriterFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
 }
 
 fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
@@ -429,26 +429,39 @@ impl Protocol {
 
     /// Get the reader features for the protocol
     #[internal_api]
-    pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
+    pub(crate) fn reader_features(&self) -> Option<&[TableFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
     #[internal_api]
-    pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
+    pub(crate) fn writer_features(&self) -> Option<&[TableFeature]> {
         self.writer_features.as_deref()
     }
 
     /// True if this protocol has the requested reader feature
-    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
+    /// Note: Use `has_table_feature` instead if given feature is supported for both read/write.
+    pub(crate) fn has_reader_feature(&self, feature: &TableFeature) -> bool {
         self.reader_features()
             .is_some_and(|features| features.contains(feature))
     }
 
-    /// True if this protocol has the requested writer feature
-    pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
-        self.writer_features()
-            .is_some_and(|features| features.contains(feature))
+    /// True if this protocol has the requested table feature
+    /// - ReaderWriter features must be in both reader features and writer features.
+    /// - Writer features only need to be in writer features.
+    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
+        match feature.feature_type() {
+            FeatureType::ReaderWriter => {
+                self.reader_features()
+                    .is_some_and(|features| features.contains(feature))
+                    && self
+                        .writer_features()
+                        .is_some_and(|features| features.contains(feature))
+            }
+            FeatureType::Writer => self
+                .writer_features()
+                .is_some_and(|features| features.contains(feature)),
+        }
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -496,8 +509,8 @@ impl Protocol {
                 ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)?;
 
                 // ensure that there is no illegal combination of features
-                if writer_features.contains(&WriterFeature::RowTracking)
-                    && !writer_features.contains(&WriterFeature::DomainMetadata)
+                if writer_features.contains(&TableFeature::RowTracking)
+                    && !writer_features.contains(&TableFeature::DomainMetadata)
                 {
                     Err(Error::invalid_protocol(
                         "rowTracking feature requires domainMetadata to also be enabled",
@@ -593,7 +606,7 @@ where
         return Ok(());
     }
 
-    // we get the type name (ReaderFeature/WriterFeature) for better error messages
+    // we get the type name (TableFeature) for better error messages
     let features_type = std::any::type_name::<T>()
         .rsplit("::")
         .next()
@@ -1291,8 +1304,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::V2Checkpoint]),
-            Some([ReaderFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -1312,7 +1325,7 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
             Some(&empty_features),
         )
         .unwrap();
@@ -1322,7 +1335,7 @@ mod tests {
             3,
             7,
             Some(&empty_features),
-            Some([WriterFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -1330,8 +1343,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::V2Checkpoint]),
-            Some([WriterFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -1360,11 +1373,11 @@ mod tests {
             7,
             Some::<Vec<String>>(vec![]),
             Some(vec![
-                WriterFeature::AppendOnly,
-                WriterFeature::DeletionVectors,
-                WriterFeature::DomainMetadata,
-                WriterFeature::Invariants,
-                WriterFeature::RowTracking,
+                TableFeature::AppendOnly,
+                TableFeature::DeletionVectors,
+                TableFeature::DomainMetadata,
+                TableFeature::Invariants,
+                TableFeature::RowTracking,
             ]),
         )
         .unwrap();
@@ -1375,26 +1388,26 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
-            Some([WriterFeature::IdentityColumns]),
+            Some([TableFeature::Unknown("unsupported reader".to_string())]),
+            Some([TableFeature::IdentityColumns]),
         )
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown TableFeatures: "identityColumns". Supported TableFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
         // Unknown writer features should cause an error
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
-            Some([WriterFeature::Unknown("unsupported writer".to_string())]),
+            Some([TableFeature::Unknown("unsupported reader".to_string())]),
+            Some([TableFeature::Unknown("unsupported writer".to_string())]),
         )
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown TableFeatures: "unsupported writer". Supported TableFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
     }
 
@@ -1406,7 +1419,7 @@ mod tests {
             Some::<Vec<String>>(vec![]),
             Some(vec![
                 // No domain metadata even though that is required
-                WriterFeature::RowTracking,
+                TableFeature::RowTracking,
             ]),
         )
         .unwrap();
@@ -1419,16 +1432,16 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors];
-        let table_features = vec![ReaderFeature::ColumnMapping];
+        let supported_features = [TableFeature::ColumnMapping, TableFeature::DeletionVectors];
+        let table_features = vec![TableFeature::ColumnMapping];
         ensure_supported_features(&table_features, &supported_features).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeature::ColumnMapping, ReaderFeature::unknown("idk")];
+        let table_features = vec![TableFeature::ColumnMapping, TableFeature::unknown("idk")];
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures: \"idk\". Supported ReaderFeatures: \"columnMapping\", \"deletionVectors\""
+                "Unknown TableFeatures: \"idk\". Supported TableFeatures: \"columnMapping\", \"deletionVectors\""
             => {},
             _ => panic!("Expected unsupported error, got: {error}"),
         }
@@ -1438,16 +1451,16 @@ mod tests {
     fn test_parse_table_feature_never_fails() {
         // parse a non-str
         let features = Some([5]);
-        let expected = Some(vec![ReaderFeature::unknown("5")]);
-        assert_eq!(parse_features::<ReaderFeature>(features), expected);
+        let expected = Some(vec![TableFeature::unknown("5")]);
+        assert_eq!(parse_features::<TableFeature>(features), expected);
 
         // weird strs
         let features = Some(["", "absurD_)(+13%^⚙️"]);
         let expected = Some(vec![
-            ReaderFeature::unknown(""),
-            ReaderFeature::unknown("absurD_)(+13%^⚙️"),
+            TableFeature::unknown(""),
+            TableFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
-        assert_eq!(parse_features::<ReaderFeature>(features), expected);
+        assert_eq!(parse_features::<TableFeature>(features), expected);
     }
 
     #[test]
@@ -1808,8 +1821,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::ColumnMapping]),
-            Some([WriterFeature::DeletionVectors]),
+            Some([TableFeature::ColumnMapping]),
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
 

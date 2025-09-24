@@ -2,7 +2,7 @@
 
 use crate::actions::Protocol;
 use crate::schema::{Schema, SchemaTransform, StructType};
-use crate::table_features::{ReaderFeature, WriterFeature};
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 use std::borrow::Cow;
@@ -24,10 +24,8 @@ pub(crate) fn validate_variant_type_feature_support(
 ) -> DeltaResult<()> {
     // Both the reader and writer need to have either the VariantType or the VariantTypePreview
     // features.
-    if (!protocol.has_reader_feature(&ReaderFeature::VariantType)
-        && !protocol.has_reader_feature(&ReaderFeature::VariantTypePreview))
-        || (!protocol.has_writer_feature(&WriterFeature::VariantType)
-            && !protocol.has_writer_feature(&WriterFeature::VariantTypePreview))
+    if !protocol.has_table_feature(&TableFeature::VariantType)
+        && !protocol.has_table_feature(&TableFeature::VariantTypePreview)
     {
         let mut uses_variant = UsesVariant::default();
         let _ = uses_variant.transform_struct(schema);
@@ -46,7 +44,7 @@ mod tests {
     use super::*;
     use crate::actions::Protocol;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
@@ -74,10 +72,10 @@ mod tests {
     #[test]
     fn test_variant_feature_validation() {
         let features = [
-            (ReaderFeature::VariantType, WriterFeature::VariantType),
+            (TableFeature::VariantType, TableFeature::VariantType),
             (
-                ReaderFeature::VariantTypePreview,
-                WriterFeature::VariantTypePreview,
+                TableFeature::VariantTypePreview,
+                TableFeature::VariantTypePreview,
             ),
         ];
         let schema_with_variant = StructType::new_unchecked([
