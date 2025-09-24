@@ -10,7 +10,6 @@ use tracing::{
     Event as TracingEvent, Subscriber,
 };
 
-use tracing::trace;
 use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
@@ -278,18 +277,93 @@ where
 }
 
 struct GlobalTracingState {
-    dispatch: tracing_core::Dispatch,
-    reload_handle: tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>,
+    dispatch: Option<tracing_core::Dispatch>,
+    reload_handle:
+        Option<tracing_subscriber::reload::Handle<LevelFilter, tracing_subscriber::Registry>>,
     /// callback for event subscriber
     event_callback: Option<Arc<Mutex<TracingEventFn>>>,
     /// callback for log line subscriber
     log_line_callback: Option<Arc<Mutex<TracingLogLineFn>>>,
 }
 
-static TRACING_STATE: LazyLock<Mutex<Option<GlobalTracingState>>> =
-    LazyLock::new(|| Mutex::new(None));
+impl GlobalTracingState {
+    fn uninitialized() -> Self {
+        GlobalTracingState {
+            dispatch: None,
+            reload_handle: None,
+            event_callback: None,
+            log_line_callback: None,
+        }
+    }
 
-fn get_event_dispatcher(
+    fn register_event_callback(
+        &mut self,
+        callback: TracingEventFn,
+        max_level: Level,
+    ) -> DeltaResult<()> {
+        if !max_level.is_valid() {
+            return Err(Error::generic("max_level out of range"));
+        }
+
+        if let (Some(reload), Some(event_cb)) = (&self.reload_handle, &self.event_callback) {
+            *event_cb.lock().unwrap() = callback;
+            return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
+                warn!("Failed to reload tracing level: {e}");
+                Error::generic(format!("Unable to reload subscriber: {e}"))
+            });
+        }
+
+        let (dispatch, reload_handle, event_callback) = create_event_dispatch(callback, max_level);
+        set_global_default(dispatch.clone())?;
+        self.dispatch = Some(dispatch);
+        self.reload_handle = Some(reload_handle);
+        self.event_callback = Some(event_callback);
+        Ok(())
+    }
+
+    fn register_log_line_callback(
+        &mut self,
+        callback: TracingLogLineFn,
+        max_level: Level,
+        format: LogLineFormat,
+        ansi: bool,
+        with_time: bool,
+        with_level: bool,
+        with_target: bool,
+    ) -> DeltaResult<()> {
+        if !max_level.is_valid() {
+            return Err(Error::generic("max_level out of range"));
+        }
+
+        if let (Some(reload), Some(log_cb)) = (&self.reload_handle, &self.log_line_callback) {
+            *log_cb.lock().unwrap() = callback;
+            return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
+                warn!("Failed to reload log level: {e}");
+                Error::generic(format!("Unable to reload subscriber: {e}"))
+            });
+        }
+
+        let (dispatch, reload_handle, log_line_callback) = create_log_line_dispatch(
+            callback,
+            max_level,
+            format,
+            ansi,
+            with_time,
+            with_level,
+            with_target,
+        );
+        set_global_default(dispatch.clone())?;
+        self.dispatch = Some(dispatch);
+        self.reload_handle = Some(reload_handle);
+        self.log_line_callback = Some(log_line_callback);
+        Ok(())
+    }
+}
+
+static TRACING_STATE: LazyLock<Mutex<GlobalTracingState>> =
+    LazyLock::new(|| Mutex::new(GlobalTracingState::uninitialized()));
+
+fn create_event_dispatch(
     callback: TracingEventFn,
     max_level: Level,
 ) -> (
@@ -316,40 +390,8 @@ fn get_event_dispatcher(
 }
 
 fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
-    if !max_level.is_valid() {
-        return Err(Error::generic("max_level out of range"));
-    }
-    let mut locked_state = TRACING_STATE.lock().unwrap();
-    if let Some(state) = locked_state.as_mut() {
-        if let Some(event_callback) = &state.event_callback {
-            *event_callback.lock().unwrap() = callback;
-        } else {
-            state.event_callback = Some(Arc::new(Mutex::new(callback)));
-        }
-        return state
-            .reload_handle
-            .reload(LevelFilter::from(max_level))
-            .map_err(|e| {
-                warn!("Failed to reload tracing level: {e}");
-                Error::generic(format!("Unable to reload subscriber: {e}"))
-            });
-    } else {
-        let (dispatch, reload_handle, event_callback) = get_event_dispatcher(callback, max_level);
-        match set_global_default(dispatch.clone()) {
-            Ok(()) => {
-                *locked_state = Some(GlobalTracingState {
-                    dispatch,
-                    reload_handle,
-                    event_callback: Some(event_callback),
-                    log_line_callback: None,
-                });
-                Ok(())
-            }
-            Err(e) => Err(Error::generic(format!(
-                "Unable to set default subscriber: {e}"
-            ))),
-        }
-    }
+    let mut state = TRACING_STATE.lock().unwrap();
+    state.register_event_callback(callback, max_level)
 }
 
 // utility code below for setting up the tracing subscriber for log lines
@@ -413,7 +455,7 @@ impl<'a> MakeWriter<'a> for BufferedMessageWriter {
     }
 }
 
-fn get_log_line_dispatch(
+fn create_log_line_dispatch(
     callback: TracingLogLineFn,
     max_level: Level,
     format: LogLineFormat,
@@ -484,49 +526,16 @@ fn setup_log_line_subscriber(
     with_level: bool,
     with_target: bool,
 ) -> DeltaResult<()> {
-    if !max_level.is_valid() {
-        return Err(Error::generic("max_level out of range"));
-    }
-    let mut locked_state = TRACING_STATE.lock().unwrap();
-    if let Some(state) = locked_state.as_mut() {
-        if let Some(log_line_callback) = &state.log_line_callback {
-            *log_line_callback.lock().unwrap() = callback;
-        } else {
-            state.log_line_callback = Some(Arc::new(Mutex::new(callback)));
-        }
-
-        return state
-            .reload_handle
-            .reload(LevelFilter::from(max_level))
-            .map_err(|e| {
-                warn!("Failed to reload log level: {e}");
-                Error::generic(format!("Unable to reload subscriber: {e}"))
-            });
-    } else {
-        let (dispatch, reload_handle, log_line_callback) = get_log_line_dispatch(
-            callback,
-            max_level,
-            format,
-            ansi,
-            with_time,
-            with_level,
-            with_target,
-        );
-        match set_global_default(dispatch.clone()) {
-            Ok(()) => {
-                *locked_state = Some(GlobalTracingState {
-                    dispatch,
-                    reload_handle,
-                    event_callback: None,
-                    log_line_callback: Some(log_line_callback),
-                });
-                Ok(())
-            }
-            Err(e) => Err(Error::generic(format!(
-                "Unable to set default subscriber: {e}"
-            ))),
-        }
-    }
+    let mut state = TRACING_STATE.lock().unwrap();
+    state.register_log_line_callback(
+        callback,
+        max_level,
+        format,
+        ansi,
+        with_time,
+        with_level,
+        with_target,
+    )
 }
 
 #[cfg(test)]
@@ -547,7 +556,7 @@ mod tests {
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     static MESSAGES: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
-    extern "C" fn record_callback_impl(line: KernelStringSlice, expected_log_lines: Vec<&str>) {
+    fn record_callback_impl(line: KernelStringSlice, expected_log_lines: Vec<&str>) {
         let line_str: &str = unsafe { TryFromStringSlice::try_from_slice(&line).unwrap() };
         let line_str = line_str.to_string();
         let ok = expected_log_lines.is_empty()
@@ -675,7 +684,7 @@ mod tests {
     fn info_logs_with_formatted_log_line_tracing() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_messages();
-        let (dispatch, _, _) = get_log_line_dispatch(
+        let (dispatch, _, _) = create_log_line_dispatch(
             record_callback,
             Level::INFO,
             LogLineFormat::COMPACT,
@@ -732,7 +741,7 @@ mod tests {
         }
     }
 
-    extern "C" fn event_callback_impl(event: Event, expected_log_lines: Vec<&str>) {
+    fn event_callback_impl(event: Event, expected_log_lines: Vec<&str>) {
         let msg: &str = unsafe { TryFromStringSlice::try_from_slice(&event.message).unwrap() };
         let target: &str = unsafe { TryFromStringSlice::try_from_slice(&event.target).unwrap() };
         let file: &str = unsafe { TryFromStringSlice::try_from_slice(&event.file).unwrap() };
@@ -787,7 +796,7 @@ mod tests {
     fn trace_event_tracking() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
-        let (dispatch, _filter, _) = get_event_dispatcher(event_callback, Level::TRACE);
+        let (dispatch, _filter, _) = create_event_dispatch(event_callback, Level::TRACE);
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1", "Another line"];
             for line in lines {
