@@ -45,20 +45,27 @@ mod tests {
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
     };
+    #[cfg(feature = "default-engine-base")]
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
-    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    #[cfg(feature = "default-engine-base")]
     use delta_kernel::engine::default::DefaultEngine;
+    #[cfg(feature = "default-engine-base")]
     use delta_kernel::DeltaResult;
+    #[cfg(feature = "default-engine-base")]
     use object_store::memory::InMemory;
+    #[cfg(feature = "default-engine-base")]
     use serde_json::json;
+    #[cfg(feature = "default-engine-base")]
     use std::sync::Arc;
+    #[cfg(feature = "default-engine-base")]
     use test_utils::add_commit;
 
+    #[cfg(feature = "default-engine-base")]
     #[tokio::test]
     async fn test_domain_metadata() -> DeltaResult<()> {
         let storage = Arc::new(InMemory::new());
 
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone(), ::tokio::runtime::Handle::current());
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 

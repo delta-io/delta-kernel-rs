@@ -18,6 +18,7 @@ release = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+tokio = { version = "1.47", features = ["rt-multi-thread"], optional = true }
 tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
@@ -36,7 +37,6 @@ rand = "0.9.2"
 serde = "1.0.219"
 serde_json = "1.0.142"
 test_utils = { path = "../test-utils" }
-tokio = { version = "1.47" }
 trybuild = "1.0"
 tempfile = "3.20.0"
 itertools = "0.14.0"
@@ -50,7 +50,7 @@ default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-b
 # This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
 # default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
-default-engine-base = ["delta_kernel/default-engine-base", "delta_kernel/arrow"]
+default-engine-base = ["delta_kernel/default-engine-base", "delta_kernel/arrow", "tokio"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []

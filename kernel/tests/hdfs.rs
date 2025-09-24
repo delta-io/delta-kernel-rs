@@ -7,7 +7,6 @@
 //   cargo test --features integration-test --test hdfs
 #![cfg(all(feature = "integration-test", not(target_os = "windows")))]
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::Snapshot;
 use hdfs_native::{Client, WriteOptions};
@@ -15,7 +14,6 @@ use hdfs_native_object_store::minidfs::MiniDfs;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 extern crate walkdir;
 use walkdir::WalkDir;
 
@@ -70,7 +68,7 @@ async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
     let engine = DefaultEngine::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     )?;
 
     let snapshot = Snapshot::builder_for(url).build(&engine)?;

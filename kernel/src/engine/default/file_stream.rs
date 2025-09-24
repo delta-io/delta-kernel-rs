@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::mem;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use crate::arrow::array::RecordBatch;
@@ -10,9 +9,9 @@ use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
+use tokio::runtime::Handle;
 use tracing::error;
 
-use super::executor::TaskExecutor;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta};
 
@@ -102,8 +101,8 @@ impl FileStream {
     /// Creates a new `FileStream` from a given schema, `FileOpener`, and files list; the files are
     /// processed asynchronously by the provided `TaskExecutor`. Returns an `Iterator` that consumes
     /// the results.
-    pub fn new_async_read_iterator<E: TaskExecutor>(
-        task_executor: Arc<E>,
+    pub fn new_async_read_iterator(
+        task_executor: Handle,
         schema: ArrowSchemaRef,
         file_opener: Box<dyn FileOpener>,
         files: &[FileMeta],

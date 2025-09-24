@@ -15,7 +15,6 @@ use uuid::Uuid;
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
@@ -75,7 +74,7 @@ async fn try_main() -> DeltaResult<()> {
     let engine = DefaultEngine::try_new(
         &url,
         HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     )?;
 
     // Create or get the table
@@ -290,10 +289,7 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
 }
 
 /// Read and display data from the table.
-async fn read_and_display_data(
-    table_url: &Url,
-    engine: DefaultEngine<TokioBackgroundExecutor>,
-) -> DeltaResult<()> {
+async fn read_and_display_data(table_url: &Url, engine: DefaultEngine) -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let scan = snapshot.scan_builder().build()?;
 

@@ -7,7 +7,6 @@ use delta_kernel::arrow::array::AsArray as _;
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
@@ -63,7 +62,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     ));
 
     let expected_data = vec![batch.clone(), batch];
@@ -116,7 +115,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(storage.clone(), tokio::runtime::Handle::current());
 
     let expected_data = vec![batch.clone(), batch];
 
@@ -169,7 +168,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(storage.clone(), tokio::runtime::Handle::current());
 
     let expected_data = vec![batch];
 
@@ -242,7 +241,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
     let location = Url::parse("memory:///").unwrap();
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     ));
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
@@ -432,7 +431,7 @@ fn read_table_data(
     let engine = Arc::new(DefaultEngine::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     )?);
 
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
@@ -1057,7 +1056,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
 
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     ));
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
@@ -1119,7 +1118,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
 
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     ));
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
@@ -1404,7 +1403,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     ));
 
     // Create a schema that includes a row index metadata column
@@ -1484,7 +1483,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     ));
 
     // Test that unsupported metadata columns fail with appropriate errors

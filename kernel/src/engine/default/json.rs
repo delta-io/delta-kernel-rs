@@ -13,10 +13,10 @@ use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
+use tokio::runtime::Handle;
 use tracing::warn;
 use url::Url;
 
-use super::executor::TaskExecutor;
 use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
@@ -30,11 +30,11 @@ const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug)]
-pub struct DefaultJsonHandler<E: TaskExecutor> {
+pub struct DefaultJsonHandler {
     /// The object store to read files from
     store: Arc<DynObjectStore>,
     /// The executor to run async tasks on
-    task_executor: Arc<E>,
+    runtime: Handle,
     /// The maximum number of read requests to buffer in memory at once. Note that this actually
     /// controls two things: the number of concurrent requests (done by `buffered`) and the size of
     /// the buffer (via our `sync_channel`).
@@ -44,11 +44,11 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     batch_size: usize,
 }
 
-impl<E: TaskExecutor> DefaultJsonHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+impl DefaultJsonHandler {
+    pub fn new(store: Arc<DynObjectStore>, runtime: Handle) -> Self {
         Self {
             store,
-            task_executor,
+            runtime,
             buffer_size: DEFAULT_BUFFER_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
         }
@@ -83,7 +83,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     }
 }
 
-impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
+impl JsonHandler for DefaultJsonHandler {
     fn parse_json(
         &self,
         json_strings: Box<dyn EngineData>,
@@ -109,7 +109,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let files = files.to_vec();
         let buffer_size = self.buffer_size;
 
-        self.task_executor.spawn(async move {
+        self.runtime.spawn(async move {
             // an iterator of futures that open each file
             let file_futures = files.into_iter().map(|file| file_opener.open(file, None));
 
@@ -149,12 +149,16 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let store = self.store.clone(); // cheap Arc
         let path = Path::from_url_path(path.path())?;
         let path_str = path.to_string();
-        self.task_executor
-            .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
-                e => e.into(),
-            })?;
+
+        // Use futures::executor::block_on for synchronous execution
+        // This works both inside and outside of a tokio runtime context
+        futures::executor::block_on(async move {
+            store.put_opts(&path, buffer.into(), put_mode.into()).await
+        })
+        .map_err(|e| match e {
+            object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
+            e => e.into(),
+        })?;
         Ok(())
     }
 }
@@ -255,9 +259,6 @@ mod tests {
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::{
-        TokioBackgroundExecutor, TokioMultiThreadExecutor,
-    };
     use crate::schema::{DataType as DeltaDataType, Schema, StructField};
     use crate::utils::test_utils::string_array_to_engine_data;
     use futures::future;
@@ -479,7 +480,7 @@ mod tests {
     #[test]
     fn test_parse_json() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(store, tokio::runtime::Handle::current());
 
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"}}}"#,
@@ -498,7 +499,7 @@ mod tests {
     #[test]
     fn test_parse_json_drop_field() {
         let store = Arc::new(LocalFileSystem::new());
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(store, tokio::runtime::Handle::current());
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2, "maxRowId": 3}}}"#,
         ]);
@@ -539,7 +540,7 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultJsonHandler::new(store, tokio::runtime::Handle::current());
         let data: Vec<RecordBatch> = handler
             .read_json_files(files, get_log_schema().clone(), None)
             .unwrap()
@@ -694,12 +695,7 @@ mod tests {
             let files = future::join_all(ordered_file_meta).await;
 
             // fire off the read_json_files call (for all the files in order)
-            let handler = DefaultJsonHandler::new(
-                store,
-                Arc::new(TokioMultiThreadExecutor::new(
-                    tokio::runtime::Handle::current(),
-                )),
-            );
+            let handler = DefaultJsonHandler::new(store, tokio::runtime::Handle::current());
             let handler = handler.with_buffer_size(*buffer_size);
             let physical_schema = Arc::new(Schema::new_unchecked(vec![StructField::nullable(
                 "val",
@@ -767,8 +763,7 @@ mod tests {
 
     async fn do_test_write_json_file(overwrite: bool) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = DefaultJsonHandler::new(store.clone(), executor);
+        let handler = DefaultJsonHandler::new(store.clone(), tokio::runtime::Handle::current());
         let path = Url::parse("memory:///test/data/00000000000000000001.json")?;
         let object_path = Path::from("/test/data/00000000000000000001.json");
 

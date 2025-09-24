@@ -6,25 +6,25 @@ use futures::stream::StreamExt;
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore};
+use tokio::runtime::Handle;
 use url::Url;
 
 use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 #[derive(Debug)]
-pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
+pub struct ObjectStoreStorageHandler {
     inner: Arc<DynObjectStore>,
-    task_executor: Arc<E>,
+    runtime: Handle,
     readahead: usize,
 }
 
-impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
+impl ObjectStoreStorageHandler {
     #[internal_api]
-    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(store: Arc<DynObjectStore>, runtime: Handle) -> Self {
         Self {
             inner: store,
-            task_executor,
+            runtime,
             readahead: 10,
         }
     }
@@ -36,7 +36,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     }
 }
 
-impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
+impl StorageHandler for ObjectStoreStorageHandler {
     fn list_from(
         &self,
         path: &Url,
@@ -83,7 +83,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
         let url = path.clone();
-        self.task_executor.spawn(async move {
+        self.runtime.spawn(async move {
             let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
             while let Some(meta) = stream.next().await {
@@ -133,7 +133,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // buffer size to 0.
         let (sender, receiver) = std::sync::mpsc::sync_channel(0);
 
-        self.task_executor.spawn(
+        self.runtime.spawn(
             futures::stream::iter(files)
                 .map(move |(url, range)| {
                     let store = store.clone();
@@ -188,7 +188,6 @@ mod tests {
 
     use test_utils::delta_path_for_version;
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::utils::current_time_duration;
     use crate::Engine as _;
@@ -217,7 +216,7 @@ mod tests {
         let mut url = Url::from_directory_path(tmp.path()).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let executor = tokio::runtime::Handle::current();
         let storage = ObjectStoreStorageHandler::new(store, executor);
 
         let mut slices: Vec<FileSlice> = Vec::new();
@@ -249,7 +248,7 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store, tokio::runtime::Handle::current());
         let files: Vec<_> = engine
             .storage_handler()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
@@ -279,7 +278,7 @@ mod tests {
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store, tokio::runtime::Handle::current());
         let files = engine
             .storage_handler()
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())

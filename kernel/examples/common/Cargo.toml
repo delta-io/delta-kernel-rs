@@ -17,4 +17,5 @@ delta_kernel = { path = "../../../kernel", features = [
   "default-engine-rustls",
   "internal-api",
 ] }
+tokio = { version = "1.47", features = ["rt-multi-thread"] }
 url = "2"
