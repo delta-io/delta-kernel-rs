@@ -25,6 +25,16 @@ pub(crate) enum CdfScanFileType {
     Cdc,
 }
 
+impl CdfScanFileType {
+    pub(crate) fn get_cdf_string_value(&self) -> &str {
+        match self {
+            CdfScanFileType::Add => super::ADD_CHANGE_TYPE,
+            CdfScanFileType::Remove => super::REMOVE_CHANGE_TYPE,
+            CdfScanFileType::Cdc => "not-expected",
+        }
+    }
+}
+
 /// Represents all the metadata needed to read a Change Data Feed.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct CdfScanFile {
