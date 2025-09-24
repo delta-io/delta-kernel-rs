@@ -359,7 +359,6 @@ mod list_log_files_with_log_tail_tests {
     use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
     use url::Url;
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::FileMeta;
 
@@ -416,7 +415,7 @@ mod list_log_files_with_log_tail_tests {
             }
         });
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let executor = tokio::runtime::Handle::current();
         let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
         (storage, log_root)
     }

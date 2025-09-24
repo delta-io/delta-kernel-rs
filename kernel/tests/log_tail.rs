@@ -4,7 +4,6 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use url::Url;
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{FileMeta, LogPath, Snapshot};
 
@@ -27,16 +26,12 @@ fn create_file_meta(table_root: &Url, commit_path: Path) -> FileMeta {
     }
 }
 
-fn setup_test() -> (
-    Arc<InMemory>,
-    Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    Url,
-) {
+fn setup_test() -> (Arc<InMemory>, Arc<DefaultEngine>, Url) {
     let storage = Arc::new(InMemory::new());
     let table_root = Url::parse("memory:///").unwrap();
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     ));
     (storage, engine, table_root)
 }

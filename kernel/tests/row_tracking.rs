@@ -12,7 +12,6 @@ use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::CommitResult;
@@ -25,11 +24,7 @@ async fn create_row_tracking_table(
     tmp_dir: &TempDir,
     table_name: &str,
     schema: SchemaRef,
-) -> DeltaResult<(
-    Url,
-    Arc<DefaultEngine<TokioBackgroundExecutor>>,
-    Arc<dyn ObjectStore>,
-)> {
+) -> DeltaResult<(Url, Arc<DefaultEngine>, Arc<dyn ObjectStore>)> {
     let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path())
         .map_err(|_| Error::generic("Failed to convert directory path to URL"))?;
     let (store, engine, table_location) = engine_store_setup(table_name, Some(&tmp_test_dir_url));
@@ -53,7 +48,7 @@ async fn create_row_tracking_table(
 /// Helper function to write data and return the number of records written.
 async fn write_data_to_table(
     table_url: &Url,
-    engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    engine: Arc<DefaultEngine>,
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;

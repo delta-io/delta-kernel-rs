@@ -435,7 +435,6 @@ mod tests {
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -479,7 +478,7 @@ mod tests {
             size: meta.size,
         }];
 
-        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let handler = DefaultParquetHandler::new(store, tokio::runtime::Handle::current());
         let data: Vec<RecordBatch> = handler
             .read_parquet_files(
                 files,
@@ -557,7 +556,7 @@ mod tests {
     async fn test_write_parquet() {
         let store = Arc::new(InMemory::new());
         let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+            DefaultParquetHandler::new(store.clone(), tokio::runtime::Handle::current());
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(
@@ -627,7 +626,7 @@ mod tests {
     async fn test_disallow_non_trailing_slash() {
         let store = Arc::new(InMemory::new());
         let parquet_handler =
-            DefaultParquetHandler::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+            DefaultParquetHandler::new(store.clone(), tokio::runtime::Handle::current());
 
         let data = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![(

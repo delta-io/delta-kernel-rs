@@ -16,7 +16,6 @@ use delta_kernel::parquet::arrow::async_reader::{
 };
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Snapshot};
 
@@ -164,7 +163,7 @@ fn assert_eq(actual: &StructArray, expected: &StructArray) {
 
 // do a full table scan at the latest snapshot of the table and compare with the expected data
 async fn latest_snapshot_test(
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: DefaultEngine,
     url: Url,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -199,14 +198,7 @@ async fn latest_snapshot_test(
     Ok(())
 }
 
-fn setup_golden_table(
-    test_name: &str,
-) -> (
-    DefaultEngine<TokioBackgroundExecutor>,
-    Url,
-    Option<PathBuf>,
-    tempfile::TempDir,
-) {
+fn setup_golden_table(test_name: &str) -> (DefaultEngine, Url, Option<PathBuf>, tempfile::TempDir) {
     let test_dir = load_test_data("tests/golden_data", test_name).unwrap();
     let test_path = test_dir.path().join(test_name);
     let table_path = test_path.join("delta");
@@ -215,7 +207,7 @@ fn setup_golden_table(
     let engine = DefaultEngine::try_new(
         &url,
         std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
+        tokio::runtime::Handle::current(),
     )
     .unwrap();
     let expected_path = test_path.join("expected");
@@ -266,7 +258,7 @@ macro_rules! golden_test {
 // TODO use in canonicalized paths tests
 #[allow(dead_code)]
 async fn canonicalized_paths_test(
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: DefaultEngine,
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -280,7 +272,7 @@ async fn canonicalized_paths_test(
 }
 
 async fn checkpoint_test(
-    engine: DefaultEngine<TokioBackgroundExecutor>,
+    engine: DefaultEngine,
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {

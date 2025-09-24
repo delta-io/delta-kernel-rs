@@ -13,7 +13,6 @@ use crate::actions::{
     SIDECAR_NAME,
 };
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
@@ -114,7 +113,7 @@ fn build_log_with_paths_and_checkpoint(
         }
     });
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let storage = ObjectStoreStorageHandler::new(store, tokio::runtime::Handle::current());
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
@@ -959,7 +958,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 #[test]
 fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
     let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
@@ -999,7 +998,7 @@ fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1026,7 +1025,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 #[test]
 fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
     let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let checkpoint_batch =
@@ -1124,7 +1123,7 @@ fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_actio
 fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
@@ -1170,7 +1169,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
 fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1237,7 +1236,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
 fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars() -> DeltaResult<()>
 {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
 
     add_checkpoint_to_store(
         &store,
@@ -1279,7 +1278,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
 #[test]
 fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1336,7 +1335,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
 
     add_checkpoint_to_store(
         &store,

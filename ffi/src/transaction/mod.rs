@@ -139,10 +139,13 @@ mod tests {
     use delta_kernel::parquet::file::properties::WriterProperties;
     use delta_kernel::transaction::add_files_schema;
 
+    #[cfg(feature = "default-engine-base")]
     use delta_kernel_ffi::engine_data::get_engine_data;
+    #[cfg(feature = "default-engine-base")]
     use delta_kernel_ffi::engine_data::ArrowFFIData;
 
     use delta_kernel_ffi::ffi_test_utils::{allocate_str, ok_or_panic, recover_string};
+    #[cfg(feature = "default-engine-base")]
     use delta_kernel_ffi::tests::get_default_engine;
 
     use crate::{free_engine, free_schema, kernel_string_slice};
@@ -170,6 +173,7 @@ mod tests {
             .expect("txnId should be present in commitInfo");
     }
 
+    #[cfg(feature = "default-engine-base")]
     fn create_arrow_ffi_from_json(
         schema: ArrowSchema,
         json_string: &str,
@@ -188,6 +192,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "default-engine-base")]
     fn create_file_metadata(
         path: &str,
         num_rows: i64,
@@ -206,6 +211,7 @@ mod tests {
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
     }
 
+    #[cfg(feature = "default-engine-base")]
     fn write_parquet_file(
         delta_path: &str,
         file_path: &str,
@@ -226,6 +232,7 @@ mod tests {
         create_file_metadata(file_path, res.num_rows)
     }
 
+    #[cfg(feature = "default-engine-base")]
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {

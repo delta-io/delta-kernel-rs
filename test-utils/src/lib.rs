@@ -10,8 +10,6 @@ use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::executor::TaskExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
@@ -200,19 +198,15 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
 /// Note: we implment this extension trait here so that we can import this trait (from test-utils
 /// crate) and get to use all these test-only helper methods from places where we don't have access
 pub trait DefaultEngineExtension {
-    type Executor: TaskExecutor;
-
-    fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
+    fn new_local() -> Arc<DefaultEngine>;
 }
 
-impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
-    type Executor = TokioBackgroundExecutor;
-
-    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
+impl DefaultEngineExtension for DefaultEngine {
+    fn new_local() -> Arc<DefaultEngine> {
         let object_store = Arc::new(LocalFileSystem::new());
         Arc::new(DefaultEngine::new(
             object_store,
-            TokioBackgroundExecutor::new().into(),
+            tokio::runtime::Handle::current(),
         ))
     }
 }
@@ -221,11 +215,7 @@ impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
 pub fn engine_store_setup(
     table_name: &str,
     local_directory: Option<&Url>,
-) -> (
-    Arc<dyn ObjectStore>,
-    DefaultEngine<TokioBackgroundExecutor>,
-    Url,
-) {
+) -> (Arc<dyn ObjectStore>, DefaultEngine, Url) {
     let (storage, url): (Arc<dyn ObjectStore>, Url) = match local_directory {
         None => (
             Arc::new(InMemory::new()),
@@ -236,8 +226,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
+    let engine = DefaultEngine::new(Arc::clone(&storage), tokio::runtime::Handle::current());
 
     (storage, engine, url)
 }
@@ -333,15 +322,8 @@ pub async fn setup_test_tables(
     partition_columns: &[&str],
     local_directory: Option<&Url>,
     table_base_name: &str,
-) -> Result<
-    Vec<(
-        Url,
-        DefaultEngine<TokioBackgroundExecutor>,
-        Arc<dyn ObjectStore>,
-        &'static str,
-    )>,
-    Box<dyn std::error::Error>,
-> {
+) -> Result<Vec<(Url, DefaultEngine, Arc<dyn ObjectStore>, &'static str)>, Box<dyn std::error::Error>>
+{
     let table_name_11 = format!("{table_base_name}_11");
     let table_name_37 = format!("{table_base_name}_37");
     let (store_11, engine_11, table_location_11) =

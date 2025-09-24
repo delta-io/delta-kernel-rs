@@ -167,17 +167,16 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use object_store::local::LocalFileSystem;
 
-    #[test]
-    fn test_default_engine() {
+    #[tokio::test]
+    async fn test_default_engine() {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(object_store, tokio::runtime::Handle::current());
         test_arrow_engine(&engine, &url);
     }
 

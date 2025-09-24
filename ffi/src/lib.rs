@@ -2,7 +2,6 @@
 //!
 //! Exposes that an engine needs to call from C/C++ to interface with kernel
 
-#[cfg(feature = "default-engine-base")]
 use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
@@ -540,14 +539,26 @@ fn get_default_engine_impl(
     options: HashMap<String, String>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
-    let engine = DefaultEngine::<TokioBackgroundExecutor>::try_new(
-        &url,
-        options,
-        Arc::new(TokioBackgroundExecutor::new()),
-    );
+    // Create a tokio runtime and get its handle
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+    let handle = rt.handle().clone();
+    let engine = DefaultEngine::try_new(&url, options, handle);
     Ok(engine_to_handle(Arc::new(engine?), allocate_error))
+}
+
+#[cfg(not(feature = "default-engine-base"))]
+fn get_default_engine_impl(
+    _url: Url,
+    _options: HashMap<String, String>,
+    _allocate_error: AllocateErrorFn,
+) -> DeltaResult<Handle<SharedExternEngine>> {
+    Err(delta_kernel::Error::Generic(
+        "Default engine not available. Enable 'default-engine-rustls' or 'default-engine-native-tls' feature.".to_string()
+    ))
 }
 
 /// # Safety
@@ -794,8 +805,11 @@ mod tests {
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
     };
-    use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    #[cfg(feature = "default-engine-base")]
+    use delta_kernel::engine::default::DefaultEngine;
+    #[cfg(feature = "default-engine-base")]
     use object_store::memory::InMemory;
+    #[cfg(feature = "default-engine-base")]
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
     #[no_mangle]
@@ -818,12 +832,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "default-engine-base")]
     pub(crate) fn get_default_engine(path: &str) -> Handle<SharedExternEngine> {
         let path = kernel_string_slice!(path);
         let builder = unsafe { ok_or_panic(get_engine_builder(path, allocate_err)) };
         unsafe { ok_or_panic(builder_build(builder)) }
     }
 
+    #[cfg(feature = "default-engine-base")]
     #[test]
     fn engine_builder() {
         let engine = get_default_engine("memory:///doesntmatter/foo");
@@ -832,6 +848,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "default-engine-base")]
     #[tokio::test]
     async fn test_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
@@ -841,7 +858,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone(), ::tokio::runtime::Handle::current());
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
@@ -878,6 +895,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "default-engine-base")]
     #[tokio::test]
     async fn test_snapshot_partition_cols() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
@@ -887,7 +905,7 @@ mod tests {
             actions_to_string_partitioned(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone(), ::tokio::runtime::Handle::current());
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
@@ -914,6 +932,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "default-engine-base")]
     #[tokio::test]
     async fn allocate_null_err_okay() -> Result<(), Box<dyn std::error::Error>> {
         let storage = Arc::new(InMemory::new());
@@ -923,7 +942,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone(), ::tokio::runtime::Handle::current());
         let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
         let path = "memory:///";
 

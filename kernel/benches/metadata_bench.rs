@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
@@ -34,16 +33,19 @@ use url::Url;
 // force scan metadata bench to use smaller sample size so test runs faster (100 -> 20)
 const SCAN_METADATA_BENCH_SAMPLE_SIZE: usize = 20;
 
-fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
+fn setup() -> (TempDir, Url, Arc<DefaultEngine>) {
     // note this table _only_ has a _delta_log, no data files (can only do metadata reads)
     let table = "300k-add-files-100-col-partitioned";
     let tempdir = load_test_data("./tests/data", table).unwrap();
     let table_path = tempdir.path().join(table);
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
     // TODO: use multi-threaded executor
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::try_new(&url, HashMap::<String, String>::new(), executor)
-        .expect("Failed to create engine");
+    let engine = DefaultEngine::try_new(
+        &url,
+        HashMap::<String, String>::new(),
+        tokio::runtime::Handle::current(),
+    )
+    .expect("Failed to create engine");
 
     (tempdir, url, Arc::new(engine))
 }

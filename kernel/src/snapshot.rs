@@ -402,7 +402,6 @@ mod tests {
     use crate::parquet::arrow::ArrowWriter;
 
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
@@ -510,7 +509,7 @@ mod tests {
         // in each test we will modify versions 1 and 2 to test different scenarios
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
-            let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+            let engine = DefaultEngine::new(store, tokio::runtime::Handle::current());
             let base_snapshot = Snapshot::builder_for(url.clone())
                 .at_version(0)
                 .build(&engine)?;
@@ -560,10 +559,7 @@ mod tests {
         // 3. new version > existing version
         // a. no new log segment
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(
-            Arc::new(store.fork()),
-            Arc::new(TokioBackgroundExecutor::new()),
-        );
+        let engine = DefaultEngine::new(Arc::new(store.fork()), tokio::runtime::Handle::current());
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
@@ -636,7 +632,7 @@ mod tests {
 
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store_3c_i, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store_3c_i, tokio::runtime::Handle::current());
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
@@ -680,7 +676,7 @@ mod tests {
     async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
         let protocol = |reader_version, writer_version| {
             json!({
                 "protocol": {
@@ -810,7 +806,7 @@ mod tests {
         let url = url::Url::from_directory_path(path).unwrap();
 
         let store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let executor = tokio::runtime::Handle::current();
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
@@ -838,7 +834,7 @@ mod tests {
                     .expect("put _last_checkpoint");
             });
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let executor = tokio::runtime::Handle::current();
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
@@ -869,7 +865,7 @@ mod tests {
                     .expect("put _last_checkpoint");
             });
 
-        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let executor = tokio::runtime::Handle::current();
         let storage = ObjectStoreStorageHandler::new(store, executor);
         let url = Url::parse("memory:///valid/").expect("valid url");
         let valid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
@@ -924,7 +920,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone(), tokio::runtime::Handle::current());
 
         // commit0
         // - domain1: not removed

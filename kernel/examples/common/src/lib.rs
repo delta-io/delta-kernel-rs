@@ -4,10 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use clap::Args;
 use delta_kernel::{
-    arrow::array::RecordBatch,
-    engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
-    scan::Scan,
-    schema::Schema,
+    arrow::array::RecordBatch, engine::default::DefaultEngine, scan::Scan, schema::Schema,
     DeltaResult, SnapshotRef,
 };
 
@@ -45,10 +42,7 @@ pub struct ScanArgs {
 }
 
 /// Get an engine configured to read table at `url` and `LocationArgs`
-pub fn get_engine(
-    url: &Url,
-    args: &LocationArgs,
-) -> DeltaResult<DefaultEngine<TokioBackgroundExecutor>> {
+pub fn get_engine(url: &Url, args: &LocationArgs) -> DeltaResult<DefaultEngine> {
     let mut options = if let Some(ref region) = args.region {
         HashMap::from([("region", region.clone())])
     } else {
@@ -57,7 +51,7 @@ pub fn get_engine(
     if args.public {
         options.insert("skip_signature", "true".to_string());
     }
-    DefaultEngine::try_new(url, options, Arc::new(TokioBackgroundExecutor::new()))
+    DefaultEngine::try_new(url, options, tokio::runtime::Handle::current())
 }
 
 /// Construct a scan at the latest snapshot. This is over the specified table and using the passed

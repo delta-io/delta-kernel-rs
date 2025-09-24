@@ -215,13 +215,16 @@ fn evaluate_expression_impl(
 #[cfg(test)]
 mod tests {
     use super::{free_expression_evaluator, new_expression_evaluator};
-    use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
+    #[cfg(feature = "default-engine-base")]
+    use crate::tests::get_default_engine;
+    use crate::{free_engine, handle::Handle, SharedSchema};
     use delta_kernel::{
         schema::{DataType, StructField, StructType},
         Expression,
     };
     use std::sync::Arc;
 
+    #[cfg(feature = "default-engine-base")]
     #[test]
     fn test_new_expression_evaluator() {
         let engine = get_default_engine("memory:///doesntmatter/foo");
