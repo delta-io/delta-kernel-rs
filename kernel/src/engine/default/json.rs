@@ -13,10 +13,10 @@ use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
+use tokio::runtime::Handle;
 use tracing::warn;
 use url::Url;
 
-use super::executor::TaskExecutor;
 use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
@@ -30,11 +30,11 @@ const DEFAULT_BUFFER_SIZE: usize = 1000;
 const DEFAULT_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug)]
-pub struct DefaultJsonHandler<E: TaskExecutor> {
+pub struct DefaultJsonHandler {
     /// The object store to read files from
     store: Arc<DynObjectStore>,
     /// The executor to run async tasks on
-    task_executor: Arc<E>,
+    runtime: Handle,
     /// The maximum number of read requests to buffer in memory at once. Note that this actually
     /// controls two things: the number of concurrent requests (done by `buffered`) and the size of
     /// the buffer (via our `sync_channel`).
@@ -44,11 +44,11 @@ pub struct DefaultJsonHandler<E: TaskExecutor> {
     batch_size: usize,
 }
 
-impl<E: TaskExecutor> DefaultJsonHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+impl DefaultJsonHandler {
+    pub fn new(store: Arc<DynObjectStore>, runtime: Handle) -> Self {
         Self {
             store,
-            task_executor,
+            runtime,
             buffer_size: DEFAULT_BUFFER_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
         }
@@ -83,7 +83,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     }
 }
 
-impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
+impl JsonHandler for DefaultJsonHandler {
     fn parse_json(
         &self,
         json_strings: Box<dyn EngineData>,
@@ -109,7 +109,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let files = files.to_vec();
         let buffer_size = self.buffer_size;
 
-        self.task_executor.spawn(async move {
+        self.runtime.spawn(async move {
             // an iterator of futures that open each file
             let file_futures = files.into_iter().map(|file| file_opener.open(file, None));
 
@@ -149,7 +149,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         let store = self.store.clone(); // cheap Arc
         let path = Path::from_url_path(path.path())?;
         let path_str = path.to_string();
-        self.task_executor
+        self.runtime
             .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
             .map_err(|e| match e {
                 object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),

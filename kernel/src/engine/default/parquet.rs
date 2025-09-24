@@ -15,6 +15,7 @@ use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatc
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::DynObjectStore;
+use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -25,7 +26,6 @@ use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
-use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::transaction::add_files_schema;
@@ -35,9 +35,9 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct DefaultParquetHandler<E: TaskExecutor> {
+pub struct DefaultParquetHandler {
     store: Arc<DynObjectStore>,
-    task_executor: Arc<E>,
+    runtime: Handle,
     readahead: usize,
 }
 
@@ -122,11 +122,11 @@ impl DataFileMetadata {
     }
 }
 
-impl<E: TaskExecutor> DefaultParquetHandler<E> {
-    pub fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+impl DefaultParquetHandler {
+    pub fn new(store: Arc<DynObjectStore>, runtime: Handle) -> Self {
         Self {
             store,
-            task_executor,
+            runtime,
             readahead: 10,
         }
     }
@@ -205,7 +205,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     }
 }
 
-impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
+impl ParquetHandler for DefaultParquetHandler {
     fn read_parquet_files(
         &self,
         files: &[FileMeta],
@@ -239,7 +239,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             ))
         };
         FileStream::new_async_read_iterator(
-            self.task_executor.clone(),
+            self.runtime.clone(),
             Arc::new(physical_schema.as_ref().try_into_arrow()?),
             file_opener,
             files,

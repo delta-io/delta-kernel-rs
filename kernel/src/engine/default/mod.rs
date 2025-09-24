@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use self::storage::parse_url_opts;
 use object_store::DynObjectStore;
+use tokio::runtime::Handle;
 use url::Url;
 
-use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
@@ -26,7 +26,6 @@ use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
 
-pub mod executor;
 pub mod file_stream;
 pub mod filesystem;
 pub mod json;
@@ -34,15 +33,16 @@ pub mod parquet;
 pub mod storage;
 
 #[derive(Debug)]
-pub struct DefaultEngine<E: TaskExecutor> {
+pub struct DefaultEngine {
+    runtime: Handle,
     object_store: Arc<DynObjectStore>,
-    storage: Arc<ObjectStoreStorageHandler<E>>,
-    json: Arc<DefaultJsonHandler<E>>,
-    parquet: Arc<DefaultParquetHandler<E>>,
+    storage: Arc<ObjectStoreStorageHandler>,
+    json: Arc<DefaultJsonHandler>,
+    parquet: Arc<DefaultParquetHandler>,
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
-impl<E: TaskExecutor> DefaultEngine<E> {
+impl DefaultEngine {
     /// Create a new [`DefaultEngine`] instance
     ///
     /// # Parameters
@@ -53,7 +53,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     pub fn try_new<K, V>(
         table_root: &Url,
         options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
+        runtime: Handle,
     ) -> DeltaResult<Self>
     where
         K: AsRef<str>,
@@ -61,7 +61,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     {
         // table root is the path of the table in the ObjectStore
         let (object_store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(object_store), task_executor))
+        Ok(Self::new(Arc::new(object_store), runtime))
     }
 
     /// Create a new [`DefaultEngine`] instance
@@ -69,21 +69,19 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    /// - `runtime`: tokio handle to use for async tasks.
+    pub fn new(object_store: Arc<DynObjectStore>, runtime: Handle) -> Self {
         Self {
+            runtime: runtime.clone(),
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
-                task_executor.clone(),
+                runtime.clone(),
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
-                task_executor.clone(),
+                runtime.clone(),
             )),
-            parquet: Arc::new(DefaultParquetHandler::new(
-                object_store.clone(),
-                task_executor,
-            )),
+            parquet: Arc::new(DefaultParquetHandler::new(object_store.clone(), runtime)),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
         }
@@ -120,7 +118,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     }
 }
 
-impl<E: TaskExecutor> Engine for DefaultEngine<E> {
+impl Engine for DefaultEngine {
     fn evaluation_handler(&self) -> Arc<dyn EvaluationHandler> {
         self.evaluation.clone()
     }

@@ -6,25 +6,25 @@ use futures::stream::StreamExt;
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore};
+use tokio::runtime::Handle;
 use url::Url;
 
 use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 #[derive(Debug)]
-pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
+pub struct ObjectStoreStorageHandler {
     inner: Arc<DynObjectStore>,
-    task_executor: Arc<E>,
+    runtime: Handle,
     readahead: usize,
 }
 
-impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
+impl ObjectStoreStorageHandler {
     #[internal_api]
-    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(store: Arc<DynObjectStore>, runtime: Handle) -> Self {
         Self {
             inner: store,
-            task_executor,
+            runtime,
             readahead: 10,
         }
     }
@@ -36,7 +36,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     }
 }
 
-impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
+impl StorageHandler for ObjectStoreStorageHandler {
     fn list_from(
         &self,
         path: &Url,
@@ -83,7 +83,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // This channel will become the iterator
         let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
         let url = path.clone();
-        self.task_executor.spawn(async move {
+        self.runtime.spawn(async move {
             let mut stream = store.list_with_offset(Some(&prefix), &offset);
 
             while let Some(meta) = stream.next().await {
@@ -133,7 +133,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // buffer size to 0.
         let (sender, receiver) = std::sync::mpsc::sync_channel(0);
 
-        self.task_executor.spawn(
+        self.runtime.spawn(
             futures::stream::iter(files)
                 .map(move |(url, range)| {
                     let store = store.clone();
