@@ -18,7 +18,6 @@ use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, CowExt as _};
 use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
-pub(crate) use diff::compute_schema_diff;
 
 pub(crate) mod compare;
 pub(crate) mod diff;
