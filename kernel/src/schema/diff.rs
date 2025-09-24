@@ -449,7 +449,11 @@ fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> O
 
     // Check for type change (including container changes)
     if before.field.data_type() != after.field.data_type() {
-        if let Some(container_change) =
+        // Don't report type changes for containers when only nested content changed
+        if are_same_container_type(before.field.data_type(), after.field.data_type()) {
+            // This is a container with the same structure but different nested content
+            // The nested changes are already captured via field IDs, so don't report container change
+        } else if let Some(container_change) =
             classify_container_change(before.field.data_type(), after.field.data_type())
         {
             changes.push(container_change);
@@ -477,6 +481,26 @@ fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> O
             path: after.path.clone(), // Use the new path in case of renames
             change_type,
         })
+    }
+}
+
+/// Checks if two data types are the same container type (struct/array/map) but with different content
+fn are_same_container_type(before: &DataType, after: &DataType) -> bool {
+    match (before, after) {
+        // Both are structs - the nested field changes are handled separately via field IDs
+        (DataType::Struct(_), DataType::Struct(_)) => true,
+        // Both are arrays with same element type - nested changes handled separately
+        (DataType::Array(before_array), DataType::Array(after_array)) => {
+            before_array.element_type() == after_array.element_type()
+                && before_array.contains_null() == after_array.contains_null()
+        }
+        // Both are maps with same key/value types - nested changes handled separately
+        (DataType::Map(before_map), DataType::Map(after_map)) => {
+            before_map.key_type() == after_map.key_type()
+                && before_map.value_type() == after_map.value_type()
+                && before_map.value_contains_null() == after_map.value_contains_null()
+        }
+        _ => false,
     }
 }
 
@@ -669,67 +693,117 @@ mod tests {
     }
 
     #[test]
-    fn test_container_nullability_changes() {
-        // Test array nullability loosened (safe)
+    fn test_container_with_nested_changes_not_reported_as_type_change() {
+        // Test that when a struct's nested fields change, the struct itself isn't reported as TypeChanged
         let current = StructType::new_unchecked([create_field_with_id(
-            "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
+            "user",
+            DataType::try_struct_type([
+                create_field_with_id("name", DataType::STRING, false, 2),
+                create_field_with_id("email", DataType::STRING, true, 3),
+            ])
+            .unwrap(),
             false,
             1,
         )]);
+
         let new = StructType::new_unchecked([create_field_with_id(
-            "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+            "user",
+            DataType::try_struct_type([
+                create_field_with_id("full_name", DataType::STRING, false, 2), // Renamed
+                create_field_with_id("email", DataType::STRING, true, 3),
+                create_field_with_id("age", DataType::INTEGER, true, 4), // Added
+            ])
+            .unwrap(),
             false,
             1,
         )]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
+
+        // Should see the nested field changes but NOT a type change on the parent struct
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, "user.age");
+
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityLoosened
-        );
+        assert_eq!(diff.updated_fields[0].path, "user.full_name");
+        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+
+        // Crucially, there should be NO update reported for the "user" field itself
+        // even though its DataType::Struct contains different nested fields
+        let top_level_updates: Vec<_> = diff
+            .updated_fields
+            .iter()
+            .filter(|u| !u.path.contains('.'))
+            .collect();
+        assert_eq!(top_level_updates.len(), 0);
+
+        // Not a breaking change since it's just a rename and an added nullable field
         assert!(!diff.has_breaking_changes());
+    }
 
-        // Test array nullability tightened (breaking)
-        let current = StructType::new_unchecked([create_field_with_id(
-            "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
-            false,
-            1,
-        )]);
-        let new = StructType::new_unchecked([create_field_with_id(
-            "items",
-            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))),
-            false,
-            1,
-        )]);
+    #[test]
+    fn test_actual_struct_type_change_still_reported() {
+        // Test that actual type changes (not just nested content changes) are still reported
+        let current =
+            StructType::new_unchecked([create_field_with_id("data", DataType::STRING, false, 1)]);
+
+        let new = StructType::new_unchecked([
+            create_field_with_id(
+                "data",
+                DataType::try_struct_type([create_field_with_id(
+                    "nested",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+                1,
+            ), // Changed from STRING to STRUCT
+        ]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
+
+        // This IS a real type change from primitive to struct
         assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, "data");
         assert_eq!(
             diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityTightened
+            FieldChangeType::TypeChanged
         );
         assert!(diff.has_breaking_changes());
 
-        // Test map value nullability loosened (safe)
+        // The new nested field should also be reported as added
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, "data.nested");
+    }
+
+    #[test]
+    fn test_array_with_struct_element_changes() {
+        // Test that array containers aren't reported as changed when their struct elements change
         let current = StructType::new_unchecked([create_field_with_id(
-            "lookup",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::INTEGER,
-                false,
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "name",
+                    DataType::STRING,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                true,
             ))),
             false,
             1,
         )]);
+
         let new = StructType::new_unchecked([create_field_with_id(
-            "lookup",
-            DataType::Map(Box::new(MapType::new(
-                DataType::STRING,
-                DataType::INTEGER,
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([
+                    create_field_with_id("title", DataType::STRING, false, 2), // Renamed
+                ])
+                .unwrap(),
                 true,
             ))),
             false,
@@ -737,12 +811,19 @@ mod tests {
         )]);
 
         let diff = compute_schema_diff(&current, &new).unwrap();
+
+        // Should only see the nested field rename, not a change to the array container
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityLoosened
-        );
-        assert!(!diff.has_breaking_changes());
+        assert_eq!(diff.updated_fields[0].path, "items.element.title");
+        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+
+        // No change should be reported for the "items" array itself
+        let array_updates: Vec<_> = diff
+            .updated_fields
+            .iter()
+            .filter(|u| u.path == "items")
+            .collect();
+        assert_eq!(array_updates.len(), 0);
     }
 
     #[test]
