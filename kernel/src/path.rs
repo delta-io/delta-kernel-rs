@@ -144,7 +144,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["crc"] => LogPathFileType::Crc,
             ["checkpoint", "parquet"] => LogPathFileType::SinglePartCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] => {
-                parse_path_part::<String>(uuid, UUID_PART_LEN, url)?;
+                let _ = parse_path_part::<String>(uuid, UUID_PART_LEN, url)?;
                 LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] => {
