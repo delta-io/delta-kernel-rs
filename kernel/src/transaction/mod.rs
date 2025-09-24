@@ -16,7 +16,6 @@ use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
-use crate::Snapshot;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
     RowVisitor, Version,
@@ -209,12 +208,8 @@ impl Transaction {
             self.generate_adds(engine, commit_version)?;
 
         // Step 4: Generate all domain metadata actions (user and system domains)
-        let domain_metadata_actions = Self::generate_domain_metadata_actions(
-            engine,
-            &self.domain_metadatas,
-            &self.read_snapshot,
-            row_tracking_domain_metadata,
-        )?;
+        let domain_metadata_actions =
+            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Step 5: Commit the actions as a JSON file to the Delta log
         let commit_path =
@@ -275,6 +270,7 @@ impl Transaction {
     /// of the same domain are disallowed in a single transaction, as well as setting and removing
     /// the same domain in a single transaction. If a duplicate domain is included, the commit will
     /// fail (that is, we don't eagerly check domain validity here).
+    /// Setting metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
         self.domain_metadatas
             .push(DomainMetadata::new(domain, configuration));
@@ -283,14 +279,14 @@ impl Transaction {
 
     /// Generate domain metadata actions with validation. Handle both user and system domains.
     fn generate_domain_metadata_actions<'a>(
+        &'a self,
         engine: &'a dyn Engine,
-        domain_metadatas: &'a [DomainMetadata],
-        read_snapshot: &Snapshot,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
         // if there are domain metadata actions, the table must support it
-        if !domain_metadatas.is_empty()
-            && !read_snapshot
+        if !self.domain_metadatas.is_empty()
+            && !self
+                .read_snapshot
                 .table_configuration()
                 .is_domain_metadata_supported()
         {
@@ -299,9 +295,9 @@ impl Transaction {
             ));
         }
 
-        // cannot have multiple actions for the same domain in a txn
+        // validate domain metadata
         let mut domains = HashSet::new();
-        for domain_metadata in domain_metadatas {
+        for domain_metadata in &self.domain_metadatas {
             if domain_metadata.is_internal() {
                 return Err(Error::Generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled"
@@ -321,7 +317,8 @@ impl Transaction {
             .transpose()?
             .into_iter();
 
-        Ok(domain_metadatas
+        Ok(self
+            .domain_metadatas
             .iter()
             .cloned()
             .chain(system_domains)
@@ -418,11 +415,18 @@ impl Transaction {
             .should_write_row_tracking();
 
         if needs_row_tracking {
+            // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
             let row_id_high_water_mark =
                 RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
-                let mut row_tracking_visitor = RowTrackingVisitor::new(row_id_high_water_mark, Some(self.add_files_metadata.len()));
 
-            // Visit all files to collect row tracking info
+            // Create a row tracking visitor and visit all files to collect row tracking information
+            let mut row_tracking_visitor = RowTrackingVisitor::new(
+                row_id_high_water_mark,
+                Some(self.add_files_metadata.len()),
+            );
+
+            // We visit all files with the row visitor before creating the add action iterator
+            // because we need to know the final row ID high water mark to create the domain metadata action
             for add_files_batch in &self.add_files_metadata {
                 row_tracking_visitor.visit_rows_of(add_files_batch.deref())?;
             }
@@ -458,6 +462,7 @@ impl Transaction {
                 ))),
             );
 
+            // Generate a row tracking domain metadata based on the final high water mark
             let row_tracking_domain_metadata: RowTrackingDomainMetadata =
                 RowTrackingDomainMetadata::new(row_id_high_water_mark);
 
