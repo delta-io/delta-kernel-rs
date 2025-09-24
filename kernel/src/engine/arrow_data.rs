@@ -352,7 +352,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
 
@@ -394,11 +394,11 @@ mod tests {
         assert_eq!(protocol.min_writer_version(), 7);
         assert_eq!(
             protocol.reader_features(),
-            Some([ReaderFeature::unknown("rw1")].as_slice())
+            Some([TableFeature::unknown("rw1")].as_slice())
         );
         assert_eq!(
             protocol.writer_features(),
-            Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
+            Some([TableFeature::unknown("rw1"), TableFeature::unknown("w2")].as_slice())
         );
         Ok(())
     }
