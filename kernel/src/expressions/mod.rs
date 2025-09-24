@@ -1,6 +1,6 @@
 //! Definitions and functions to create and manipulate kernel expressions
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
@@ -52,6 +52,13 @@ pub enum BinaryPredicateOp {
     In,
 }
 
+/// A unary expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryExpressionOp {
+    /// Convert struct data to JSON-encoded strings
+    ToJson,
+}
+
 /// A binary expression operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryExpressionOp {
@@ -63,6 +70,13 @@ pub enum BinaryExpressionOp {
     Multiply,
     /// Arithmetic Divide
     Divide,
+}
+
+/// A variadic expression operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VariadicExpressionOp {
+    /// Collapse multiple values into one by taking the first non-null value
+    Coalesce,
 }
 
 /// A junction (AND/OR) predicate operator.
@@ -195,6 +209,14 @@ pub struct BinaryPredicate {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct UnaryExpression {
+    /// The operator.
+    pub op: UnaryExpressionOp,
+    /// The input expression.
+    pub expr: Box<Expression>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct BinaryExpression {
     /// The operator.
     pub op: BinaryExpressionOp,
@@ -202,6 +224,14 @@ pub struct BinaryExpression {
     pub left: Box<Expression>,
     /// The right-hand side of the operation.
     pub right: Box<Expression>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VariadicExpression {
+    /// The operator.
+    pub op: VariadicExpressionOp,
+    /// The input expressions.
+    pub exprs: Vec<Expression>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -244,6 +274,100 @@ impl OpaqueExpression {
     }
 }
 
+/// A transformation affecting a single field (one pieces of a [`Transform`]). The transformation
+/// could insert 0+ new fields after the target, or could replace the target with 0+ a new fields).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FieldTransform {
+    /// The list of expressions this field transform emits at the target location.
+    pub exprs: Vec<ExpressionRef>,
+    /// If true, the output expressions replace the input field instead of following after it.
+    pub is_replace: bool,
+}
+
+/// A transformation that efficiently represents sparse modifications to struct schemas.
+///
+/// `Transform` achieves `O(changes)` space complexity instead of `O(schema_width)` by only
+/// specifying those fields that actually change (inserted, replaced, or deleted). Any input field
+/// not specifically mentioned by the transform is passed through, unmodified and with the same
+/// relative field ordering. This is particularly useful for wide schemas where only a few columns
+/// need to be modified and/or dropped, or where a small number of columns need to be injected.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Transform {
+    /// The path to the nested input struct this transform operates on (if any). If no path is
+    /// given, the transform operates directly on top-level columns.
+    pub input_path: Option<ColumnName>,
+    /// A mapping from named input fields to the transform to be performed on each field.
+    pub field_transforms: HashMap<String, FieldTransform>,
+    /// A list of new fields to emit before processing the first input field.
+    pub prepended_fields: Vec<ExpressionRef>,
+}
+
+impl Transform {
+    /// Creates a new top-level identity transform. The various `with_xxx` helper methods can be
+    /// used to add specific field transforms.
+    pub fn new_top_level() -> Self {
+        Self::default()
+    }
+
+    /// Creates a new identity transform that operates on fields of a nested struct identified by
+    /// `path`. The various `with_xxx` helper methods can be used to add specific field transforms.
+    pub fn new_nested<A>(path: impl IntoIterator<Item = A>) -> Self
+    where
+        ColumnName: FromIterator<A>,
+    {
+        Self {
+            input_path: Some(ColumnName::new(path)),
+            ..Default::default()
+        }
+    }
+
+    /// Specifies a field to drop.
+    pub fn with_dropped_field(mut self, name: impl Into<String>) -> Self {
+        let field_transform = self.field_transform(name);
+        field_transform.is_replace = true;
+        self
+    }
+
+    /// Specifies an expression to replace a field with.
+    pub fn with_replaced_field(mut self, name: impl Into<String>, expr: ExpressionRef) -> Self {
+        let field_transform = self.field_transform(name);
+        field_transform.exprs.push(expr);
+        field_transform.is_replace = true;
+        self
+    }
+
+    /// Specifies an expression to insert after an optional predecessor (None = prepend, emit the
+    /// expression before the first input field). Multiple fields can be inserted after the same
+    /// predecessor, and they will be emitted in the same order they were registered.
+    pub fn with_inserted_field(
+        mut self,
+        after: Option<impl Into<String>>,
+        expr: ExpressionRef,
+    ) -> Self {
+        match after {
+            Some(field_name) => self.field_transform(field_name).exprs.push(expr),
+            None => self.prepended_fields.push(expr),
+        }
+        self
+    }
+
+    /// True if this is the identity transform (all input fields pass through unchanged, with no new
+    /// fields inserted).
+    pub fn is_identity(&self) -> bool {
+        self.prepended_fields.is_empty() && self.field_transforms.is_empty()
+    }
+
+    /// None, if this is a top-level transform. Otherwise, the path of this nested transform.
+    pub fn input_path(&self) -> Option<&ColumnName> {
+        self.input_path.as_ref()
+    }
+
+    // Gets or creates the field transform for a named input field
+    fn field_transform(&mut self, field_name: impl Into<String>) -> &mut FieldTransform {
+        self.field_transforms.entry(field_name.into()).or_default()
+    }
+}
+
 /// A SQL expression.
 ///
 /// These expressions do not track or validate data types, other than the type
@@ -259,8 +383,15 @@ pub enum Expression {
     Predicate(Box<Predicate>), // should this be Arc?
     /// A struct computed from a Vec of expressions
     Struct(Vec<ExpressionRef>),
+    /// A sparse transformation of a struct schema. More efficient than `Struct` for wide schemas
+    /// where only a few fields change, achieving O(changes) instead of O(schema_width) complexity.
+    Transform(Transform),
+    /// An expression that takes one expression as input.
+    Unary(UnaryExpression),
     /// An expression that takes two expressions as input.
     Binary(BinaryExpression),
+    /// An expression that takes a variable number of expressions as input.
+    Variadic(VariadicExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
     Opaque(OpaqueExpression),
@@ -336,6 +467,13 @@ impl JunctionPredicateOp {
     }
 }
 
+impl UnaryExpression {
+    fn new(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+        let expr = Box::new(expr.into());
+        Self { op, expr }
+    }
+}
+
 impl UnaryPredicate {
     fn new(op: UnaryPredicateOp, expr: impl Into<Expression>) -> Self {
         let expr = Box::new(expr.into());
@@ -364,6 +502,16 @@ impl BinaryPredicate {
         let left = Box::new(left.into());
         let right = Box::new(right.into());
         Self { op, left, right }
+    }
+}
+
+impl VariadicExpression {
+    fn new(
+        op: VariadicExpressionOp,
+        exprs: impl IntoIterator<Item = impl Into<Expression>>,
+    ) -> Self {
+        let exprs = exprs.into_iter().map(Into::into).collect();
+        Self { op, exprs }
     }
 }
 
@@ -412,6 +560,11 @@ impl Expression {
         Self::Struct(exprs.into_iter().map(Into::into).collect())
     }
 
+    /// Create a new transform expression
+    pub fn transform(transform: Transform) -> Self {
+        Self::Transform(transform)
+    }
+
     /// Create a new predicate `self IS NULL`
     pub fn is_null(self) -> Predicate {
         Predicate::is_null(self)
@@ -457,17 +610,26 @@ impl Expression {
         Predicate::distinct(self, other)
     }
 
+    /// Creates a new unary expression
+    pub fn unary(op: UnaryExpressionOp, expr: impl Into<Expression>) -> Self {
+        Self::Unary(UnaryExpression::new(op, expr))
+    }
+
     /// Creates a new binary expression lhs OP rhs
     pub fn binary(
         op: BinaryExpressionOp,
         lhs: impl Into<Expression>,
         rhs: impl Into<Expression>,
     ) -> Self {
-        Self::Binary(BinaryExpression {
-            op,
-            left: Box::new(lhs.into()),
-            right: Box::new(rhs.into()),
-        })
+        Self::Binary(BinaryExpression::new(op, lhs, rhs))
+    }
+
+    /// Creates a new variadic expression
+    pub fn variadic(
+        op: VariadicExpressionOp,
+        exprs: impl IntoIterator<Item = impl Into<Expression>>,
+    ) -> Self {
+        Self::Variadic(VariadicExpression::new(op, exprs))
     }
 
     /// Creates a new opaque expression
@@ -640,6 +802,15 @@ impl PartialEq for OpaqueExpression {
     }
 }
 
+impl Display for UnaryExpressionOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use UnaryExpressionOp::*;
+        match self {
+            ToJson => write!(f, "TO_JSON"),
+        }
+    }
+}
+
 impl Display for BinaryExpressionOp {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use BinaryExpressionOp::*;
@@ -648,6 +819,15 @@ impl Display for BinaryExpressionOp {
             Minus => write!(f, "-"),
             Multiply => write!(f, "*"),
             Divide => write!(f, "/"),
+        }
+    }
+}
+
+impl Display for VariadicExpressionOp {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use VariadicExpressionOp::*;
+        match self {
+            Coalesce => write!(f, "COALESCE"),
         }
     }
 }
@@ -681,7 +861,39 @@ impl Display for Expression {
             Column(name) => write!(f, "Column({name})"),
             Predicate(p) => write!(f, "{p}"),
             Struct(exprs) => write!(f, "Struct({})", format_child_list(exprs)),
+            Transform(transform) => {
+                write!(f, "Transform(")?;
+                let mut sep = "";
+                if !transform.prepended_fields.is_empty() {
+                    let prepended_fields = format_child_list(&transform.prepended_fields);
+                    write!(f, "prepend [{prepended_fields}]")?;
+                    sep = ", ";
+                }
+                for (field_name, field_transform) in &transform.field_transforms {
+                    let insertions = &field_transform.exprs;
+                    if insertions.is_empty() {
+                        if field_transform.is_replace {
+                            write!(f, "{sep}drop {field_name}")?;
+                        } else {
+                            continue; // no-op; ignore it and don't change `sep` below
+                        }
+                    } else {
+                        let insertions = format_child_list(insertions);
+                        if field_transform.is_replace {
+                            write!(f, "{sep}replace {field_name} with [{insertions}]")?;
+                        } else {
+                            write!(f, "{sep}after {field_name} insert [{insertions}]")?;
+                        }
+                    }
+                    sep = ", ";
+                }
+                write!(f, ")")
+            }
+            Unary(UnaryExpression { op, expr }) => write!(f, "{op}({expr})"),
             Binary(BinaryExpression { op, left, right }) => write!(f, "{left} {op} {right}"),
+            Variadic(VariadicExpression { op, exprs }) => {
+                write!(f, "{op}({})", format_child_list(exprs))
+            }
             Opaque(OpaqueExpression { op, exprs }) => {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }

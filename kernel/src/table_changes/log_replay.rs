@@ -241,7 +241,7 @@ impl LogReplayScanner {
             .map_err(|_| Error::generic("Failed to convert commit version to i64"))?;
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             get_log_add_schema().clone(),
-            cdf_scan_row_expression(timestamp, commit_version),
+            Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
             cdf_scan_row_schema().into(),
         );
 
@@ -281,7 +281,7 @@ struct PreparePhaseVisitor<'a> {
 }
 impl PreparePhaseVisitor<'_> {
     fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new(vec![
+        Arc::new(StructType::new_unchecked(vec![
             StructField::nullable(ADD_NAME, Add::to_schema()),
             StructField::nullable(REMOVE_NAME, Remove::to_schema()),
             StructField::nullable(CDC_NAME, Cdc::to_schema()),
@@ -381,7 +381,7 @@ impl<'a> FileActionSelectionVisitor<'a> {
         }
     }
     fn schema() -> Arc<StructType> {
-        Arc::new(StructType::new(vec![
+        Arc::new(StructType::new_unchecked(vec![
             StructField::nullable(CDC_NAME, Cdc::to_schema()),
             StructField::nullable(ADD_NAME, Add::to_schema()),
             StructField::nullable(REMOVE_NAME, Remove::to_schema()),

@@ -71,8 +71,10 @@ impl EnsureDataTypes {
             }
             // strings, bools, and binary  aren't primitive in arrow
             (&DataType::BOOLEAN, ArrowDataType::Boolean)
+            | (&DataType::STRING, ArrowDataType::LargeUtf8)
             | (&DataType::STRING, ArrowDataType::Utf8)
             | (&DataType::STRING, ArrowDataType::Utf8View)
+            | (&DataType::BINARY, ArrowDataType::LargeBinary)
             | (&DataType::BINARY, ArrowDataType::BinaryView)
             | (&DataType::BINARY, ArrowDataType::Binary) => Ok(DataTypeCompat::Identical),
             (DataType::Array(inner_type), ArrowDataType::List(arrow_list_field))
@@ -108,7 +110,7 @@ impl EnsureDataTypes {
                 // build a list of kernel fields that matches the order of the arrow fields
                 let mapped_fields = arrow_fields
                     .iter()
-                    .filter_map(|f| kernel_fields.fields.get(f.name()));
+                    .filter_map(|f| kernel_fields.field(f.name()));
 
                 // keep track of how many fields we matched up
                 let mut found_fields = 0;
@@ -120,12 +122,11 @@ impl EnsureDataTypes {
                 }
 
                 // require that we found the number of fields that we requested.
-                require!(kernel_fields.fields.len() == found_fields, {
+                require!(kernel_fields.num_fields() == found_fields, {
                     let arrow_field_map: HashSet<&String> =
                         HashSet::from_iter(arrow_fields.iter().map(|f| f.name()));
                     let missing_field_names = kernel_fields
-                        .fields
-                        .keys()
+                        .field_names()
                         .filter(|kernel_field| !arrow_field_map.contains(kernel_field))
                         .take(5)
                         .join(", ");
@@ -351,10 +352,7 @@ mod tests {
                 &incorrect_variant_arrow_type(),
                 true,
             ),
-            // TODO(#1140): Arrow has different printing for different versions. We use the
-            // common prefix to check the error. Once the minimum version of arrow is greater
-            // than 55.1, assert the full message
-            "Invalid argument error: Incorrect datatype. Expected Struct",
+            "Invalid argument error: Incorrect datatype. Expected Struct(metadata Binary, value Binary), got Struct(field_1 Binary, field_2 Binary)",
         )
     }
 
@@ -453,10 +451,10 @@ mod tests {
 
     #[test]
     fn ensure_struct() {
-        let schema = DataType::struct_type([StructField::nullable(
+        let schema = DataType::struct_type_unchecked([StructField::nullable(
             "a",
             ArrayType::new(
-                DataType::struct_type([
+                DataType::struct_type_unchecked([
                     StructField::nullable("w", DataType::LONG),
                     StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
                     StructField::nullable(
@@ -465,7 +463,7 @@ mod tests {
                     ),
                     StructField::nullable(
                         "z",
-                        DataType::struct_type([
+                        DataType::struct_type_unchecked([
                             StructField::nullable("n", DataType::LONG),
                             StructField::nullable("m", DataType::STRING),
                         ]),
@@ -477,7 +475,7 @@ mod tests {
         let arrow_struct = ArrowDataType::try_from_kernel(&schema).unwrap();
         assert!(ensure_data_types(&schema, &arrow_struct, true).is_ok());
 
-        let kernel_simple = DataType::struct_type([
+        let kernel_simple = DataType::struct_type_unchecked([
             StructField::nullable("w", DataType::LONG),
             StructField::nullable("x", DataType::LONG),
         ]);
@@ -552,6 +550,18 @@ mod tests {
                 true
             )
             .unwrap(),
+            DataTypeCompat::Identical
+        );
+    }
+
+    #[test]
+    fn ensure_large_strings_and_binary() {
+        assert_eq!(
+            ensure_data_types(&DataType::STRING, &ArrowDataType::LargeUtf8, true).unwrap(),
+            DataTypeCompat::Identical
+        );
+        assert_eq!(
+            ensure_data_types(&DataType::BINARY, &ArrowDataType::LargeBinary, true).unwrap(),
             DataTypeCompat::Identical
         );
     }

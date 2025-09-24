@@ -9,7 +9,6 @@ use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
-use std::sync::Arc;
 
 /// A handle representing an exclusive transaction on a Delta table. (Similar to a Box<_>)
 ///
@@ -38,11 +37,7 @@ fn transaction_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
-    let snapshot = Arc::new(Snapshot::try_from_uri(
-        url?,
-        extern_engine.engine().as_ref(),
-        None,
-    )?);
+    let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
     let transaction = snapshot.transaction();
     Ok(Box::new(transaction?).into())
 }
@@ -134,13 +129,15 @@ mod tests {
     use delta_kernel::schema::{DataType, StructField, StructType};
 
     use delta_kernel::arrow::array::{Array, ArrayRef, Int32Array, StringArray, StructArray};
-    use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
+    use delta_kernel::transaction::add_files_schema;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
@@ -161,9 +158,17 @@ mod tests {
 
     use std::sync::Arc;
 
+    const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
     use super::*;
 
     use tempfile::tempdir;
+
+    fn check_txn_id_exists(commit_info: &serde_json::Value) {
+        commit_info["txnId"]
+            .as_str()
+            .expect("txnId should be present in commitInfo");
+    }
 
     fn create_arrow_ffi_from_json(
         schema: ArrowSchema,
@@ -187,30 +192,7 @@ mod tests {
         path: &str,
         num_rows: i64,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        let schema = ArrowSchema::new(vec![
-            Field::new("path", ArrowDataType::Utf8, false),
-            Field::new(
-                "partitionValues",
-                ArrowDataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        ArrowDataType::Struct(
-                            vec![
-                                Field::new("key", ArrowDataType::Utf8, false),
-                                Field::new("value", ArrowDataType::Utf8, true),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                false,
-            ),
-            Field::new("size", ArrowDataType::Int64, false),
-            Field::new("modificationTime", ArrowDataType::Int64, false),
-            Field::new("dataChange", ArrowDataType::Boolean, false),
-        ]);
+        let schema: ArrowSchema = add_files_schema().as_ref().try_into_arrow()?;
 
         let current_time: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -218,7 +200,7 @@ mod tests {
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": {{"numRecords": {num_rows}}}}}"#,
         );
 
         create_arrow_ffi_from_json(schema, file_metadata.as_str())
@@ -247,10 +229,10 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(miri, ignore)] // FIXME: re-enable miri (can't call foreign function `linkat` on OS `linux`)
     async fn test_basic_append() -> Result<(), Box<dyn std::error::Error>> {
-        let schema = Arc::new(StructType::new(vec![
+        let schema = Arc::new(StructType::try_new(vec![
             StructField::nullable("number", DataType::INTEGER),
             StructField::nullable("string", DataType::STRING),
-        ]));
+        ])?);
 
         // Create a temporary local directory for use during this test
         let tmp_test_dir = tempdir()?;
@@ -292,11 +274,17 @@ mod tests {
             // Ensure we get the correct schema
             let write_schema = unsafe { get_write_schema(write_context.shallow_copy()) };
             let write_schema_ref = unsafe { write_schema.as_ref() };
-            assert_eq!(write_schema_ref.fields.len(), 2);
-            assert_eq!(write_schema_ref.fields[0].name, "number");
-            assert_eq!(write_schema_ref.fields[0].data_type, DataType::INTEGER);
-            assert_eq!(write_schema_ref.fields[1].name, "string");
-            assert_eq!(write_schema_ref.fields[1].data_type, DataType::STRING);
+            assert_eq!(write_schema_ref.num_fields(), 2);
+            assert_eq!(write_schema_ref.field_at_index(0).unwrap().name, "number");
+            assert_eq!(
+                write_schema_ref.field_at_index(0).unwrap().data_type,
+                DataType::INTEGER
+            );
+            assert_eq!(write_schema_ref.field_at_index(1).unwrap().name, "string");
+            assert_eq!(
+                write_schema_ref.field_at_index(1).unwrap().data_type,
+                DataType::STRING
+            );
 
             // Ensure the ffi returns the correct table path
             let write_path = unsafe { get_write_path(write_context.shallow_copy(), allocate_str) };
@@ -326,7 +314,11 @@ mod tests {
             let file_info = write_parquet_file(table_path_str, "my_file.parquet", &batch)?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
-                get_engine_data(file_info.array, &file_info.schema, engine.shallow_copy())
+                get_engine_data(
+                    file_info.array,
+                    &file_info.schema,
+                    crate::ffi_test_utils::allocate_err,
+                )
             });
 
             unsafe { add_files(txn_with_engine_info.shallow_copy(), file_info_engine_data) };
@@ -344,9 +336,12 @@ mod tests {
                 .into_iter::<serde_json::Value>()
                 .try_collect()?;
 
-            // set timestamps to 0 and paths to known string values for comparison
-            // (otherwise timestamps are non-deterministic and paths are random UUIDs)
+            check_txn_id_exists(&parsed_commits[0]["commitInfo"]);
+
+            // set timestamps to 0, paths and txn_id to known string values for comparison
+            // (otherwise timestamps are non-deterministic, paths and txn_id are random UUIDs)
             set_json_value(&mut parsed_commits[0], "commitInfo.timestamp", json!(0))?;
+            set_json_value(&mut parsed_commits[0], "commitInfo.txnId", json!(ZERO_UUID))?;
             set_json_value(&mut parsed_commits[1], "add.modificationTime", json!(0))?;
             set_json_value(&mut parsed_commits[1], "add.size", json!(0))?;
 
@@ -358,6 +353,7 @@ mod tests {
                         "operation": "UNKNOWN",
                         "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                         "operationParameters": {},
+                        "txnId": ZERO_UUID
                     }
                 }),
                 json!({
@@ -366,7 +362,8 @@ mod tests {
                         "partitionValues": {},
                         "size": 0,
                         "modificationTime": 0,
-                        "dataChange": true
+                        "dataChange": true,
+                        "stats": "{\"numRecords\":5}"
                     }
                 }),
             ];

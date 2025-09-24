@@ -84,11 +84,13 @@ use url::Url;
 
 use self::schema::{DataType, SchemaRef};
 
+mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
+mod log_compaction;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -97,6 +99,9 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
+pub(crate) mod transforms;
+
+mod row_tracking;
 
 mod arrow_compat;
 #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
@@ -143,7 +148,9 @@ pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
+pub use log_compaction::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
 pub use snapshot::Snapshot;
+pub use snapshot::SnapshotRef;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
@@ -412,7 +419,7 @@ pub trait EvaluationHandler: AsAny {
     fn new_expression_evaluator(
         &self,
         input_schema: SchemaRef,
-        expression: Expression,
+        expression: ExpressionRef,
         output_type: DataType,
     ) -> Arc<dyn ExpressionEvaluator>;
 
@@ -430,7 +437,7 @@ pub trait EvaluationHandler: AsAny {
     fn new_predicate_evaluator(
         &self,
         input_schema: SchemaRef,
-        predicate: Predicate,
+        predicate: PredicateRef,
     ) -> Arc<dyn PredicateEvaluator>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
@@ -451,7 +458,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
     // future)
     fn create_one(&self, schema: SchemaRef, values: &[Scalar]) -> DeltaResult<Box<dyn EngineData>> {
         // just get a single int column (arbitrary)
-        let null_row_schema = Arc::new(StructType::new(vec![StructField::nullable(
+        let null_row_schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "null_col",
             DataType::INTEGER,
         )]));
@@ -462,7 +469,7 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.try_into_expr()?;
 
-        let eval = self.new_expression_evaluator(null_row_schema, row_expr, schema.into());
+        let eval = self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into());
         eval.evaluate(null_row.as_ref())
     }
 }

@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
+use std::iter::{DoubleEndedIterator, FusedIterator};
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
 
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -99,7 +101,9 @@ pub enum ColumnMetadataKey {
     IdentityStep,
     IdentityHighWaterMark,
     IdentityAllowExplicitInsert,
+    InternalColumn,
     Invariants,
+    MetadataSpec,
 }
 
 impl AsRef<str> for ColumnMetadataKey {
@@ -113,7 +117,61 @@ impl AsRef<str> for ColumnMetadataKey {
             Self::IdentityHighWaterMark => "delta.identity.highWaterMark",
             Self::IdentityStart => "delta.identity.start",
             Self::IdentityStep => "delta.identity.step",
+            Self::InternalColumn => "delta.isInternalColumn",
             Self::Invariants => "delta.invariants",
+            Self::MetadataSpec => "delta.metadataSpec",
+        }
+    }
+}
+
+/// Enumeration of metadata columns recognized by Delta Kernel.
+///
+/// Metadata columns provide additional information about rows in a Delta table.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub enum MetadataColumnSpec {
+    RowIndex,
+    RowId,
+    RowCommitVersion,
+}
+
+impl MetadataColumnSpec {
+    /// A human-readable name for the specified metadata column.
+    pub fn text_value(&self) -> &'static str {
+        match self {
+            Self::RowIndex => "row_index",
+            Self::RowId => "row_id",
+            Self::RowCommitVersion => "row_commit_version",
+        }
+    }
+
+    /// The data type of the specified metadata column.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            Self::RowIndex => DataType::LONG,
+            Self::RowId => DataType::LONG,
+            Self::RowCommitVersion => DataType::LONG,
+        }
+    }
+
+    /// Whether the specified metadata column is nullable.
+    pub fn nullable(&self) -> bool {
+        match self {
+            Self::RowIndex => false,
+            Self::RowId => false,
+            Self::RowCommitVersion => false,
+        }
+    }
+}
+
+impl FromStr for MetadataColumnSpec {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "row_index" => Ok(Self::RowIndex),
+            "row_id" => Ok(Self::RowId),
+            "row_commit_version" => Ok(Self::RowCommitVersion),
+            _ => Err(Error::Schema(format!("Unknown metadata column spec: {s}"))),
         }
     }
 }
@@ -132,6 +190,15 @@ pub struct StructField {
 }
 
 impl StructField {
+    /// The name of the default row index metadata column.
+    ///
+    /// Note that the dot does not indicate a nested field, it is just a separator for the metadata column name.
+    const DEFAULT_ROW_INDEX_COLUMN_NAME: &'static str = "_metadata.row_index";
+
+    /////////////////
+    // Static methods
+    /////////////////
+
     /// Creates a new field
     pub fn new(name: impl Into<String>, data_type: impl Into<DataType>, nullable: bool) -> Self {
         Self {
@@ -151,6 +218,37 @@ impl StructField {
     pub fn not_null(name: impl Into<String>, data_type: impl Into<DataType>) -> Self {
         Self::new(name, data_type, false)
     }
+
+    /// Creates a metadata column of the given spec with the given name.
+    pub fn create_metadata_column(name: impl Into<String>, spec: MetadataColumnSpec) -> Self {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            ColumnMetadataKey::MetadataSpec.as_ref().to_string(),
+            MetadataValue::String(spec.text_value().to_string()),
+        );
+
+        Self {
+            name: name.into(),
+            data_type: spec.data_type(),
+            nullable: spec.nullable(),
+            metadata,
+        }
+    }
+
+    /// Returns the default row index metadata column used by Kernel.
+    pub fn default_row_index_column() -> &'static StructField {
+        static DEFAULT_ROW_INDEX_COLUMN: LazyLock<StructField> = LazyLock::new(|| {
+            StructField::create_metadata_column(
+                StructField::DEFAULT_ROW_INDEX_COLUMN_NAME,
+                MetadataColumnSpec::RowIndex,
+            )
+        });
+        &DEFAULT_ROW_INDEX_COLUMN
+    }
+
+    ///////////////////
+    // Instance methods
+    ///////////////////
 
     /// Replaces `self.metadata` with the list of <key, value> pairs in `metadata`.
     pub fn with_metadata(
@@ -172,6 +270,42 @@ impl StructField {
         self.metadata
             .extend(metadata.into_iter().map(|(k, v)| (k.into(), v.into())));
         self
+    }
+
+    /// Returns true if this field is a metadata column.
+    pub fn is_metadata_column(&self) -> bool {
+        self.metadata
+            .contains_key(ColumnMetadataKey::MetadataSpec.as_ref())
+    }
+
+    /// Returns the metadata column spec if this is a metadata column, otherwise returns None.
+    pub fn get_metadata_column_spec(&self) -> Option<MetadataColumnSpec> {
+        match self
+            .metadata
+            .get(ColumnMetadataKey::MetadataSpec.as_ref())?
+        {
+            MetadataValue::String(s) => MetadataColumnSpec::from_str(s).ok(),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this field is an internal column added by Kernel.
+    ///
+    /// Internal columns must be removed before returning scan results to the user.
+    pub fn is_internal_column(&self) -> bool {
+        matches!(
+            self.metadata
+                .get(ColumnMetadataKey::InternalColumn.as_ref()),
+            Some(MetadataValue::Boolean(true))
+        )
+    }
+
+    /// Marks this field as an internal column.
+    pub fn as_internal_column(self) -> Self {
+        self.add_metadata(vec![(
+            ColumnMetadataKey::InternalColumn.as_ref().to_string(),
+            MetadataValue::Boolean(true),
+        )])
     }
 
     pub fn get_config_value(&self, key: &ColumnMetadataKey) -> Option<&MetadataValue> {
@@ -274,10 +408,20 @@ impl StructField {
                     ColumnMappingMode::None => field.name().to_owned(),
                     ColumnMappingMode::Id | ColumnMappingMode::Name => {
                         // Assert that the physical name is present
-                        debug_assert!(field
-                            .metadata
-                            .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-                            .is_some_and(|x| matches!(x, MetadataValue::String(_))));
+                        match field.is_metadata_column() {
+                            true => {
+                                debug_assert!(
+                                    false,
+                                    "Metadata column should not have a physical name"
+                                );
+                            }
+                            false => {
+                                debug_assert!(field
+                                    .metadata
+                                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                                    .is_some_and(|x| matches!(x, MetadataValue::String(_))));
+                            }
+                        }
                         field.physical_name().to_owned()
                     }
                 };
@@ -362,28 +506,95 @@ impl StructField {
 /// as well as struct columns that contain nested columns.
 #[derive(Debug, PartialEq, Clone, Eq)]
 pub struct StructType {
-    pub type_name: String,
-    /// The type of element stored in this array
+    type_name: String,
+    /// The fields stored in this struct
     // We use indexmap to preserve the order of fields as they are defined in the schema
     // while also allowing for fast lookup by name. The alternative is to do a linear search
     // for each field by name would be potentially quite expensive for large schemas.
-    pub fields: IndexMap<String, StructField>,
+    fields: IndexMap<String, StructField>,
+    /// The metadata columns in this struct
+    // We use a dedicated map for metadata columns to allow for fast lookup without having to iterate
+    // over all fields.
+    metadata_columns: HashMap<MetadataColumnSpec, usize>,
 }
 
 impl StructType {
-    pub fn new(fields: impl IntoIterator<Item = StructField>) -> Self {
+    /// Creates a new [`StructType`] from the given fields.
+    ///
+    /// Returns an error if:
+    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate metadata columns
+    /// - the schema contains nested metadata columns
+    pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        let mut field_map = IndexMap::new();
+        let mut metadata_columns = HashMap::new();
+
+        // Validate each field during insertion
+        for (i, field) in fields.into_iter().enumerate() {
+            // Verify that there are no nested metadata columns
+            if !matches!(field.data_type, DataType::Primitive(_)) {
+                Self::ensure_no_metadata_columns_in_field(&field)?;
+            }
+
+            // Check for duplicate metadata columns
+            if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
+                if metadata_columns.insert(metadata_column_spec, i).is_some() {
+                    return Err(Error::schema(format!(
+                        "Duplicate metadata column: {metadata_column_spec:?}",
+                    )));
+                }
+            }
+
+            // Check for duplicate field names
+            if let Some(dup) = field_map.insert(field.name.clone(), field) {
+                return Err(Error::schema(format!("Duplicate field name: {}", dup.name)));
+            }
+        }
+
+        Ok(Self {
+            type_name: "struct".into(),
+            fields: field_map,
+            metadata_columns,
+        })
+    }
+
+    /// Creates a new [`StructType`] from a fallible iterator of fields.
+    ///
+    /// This constructor collects all fields from the iterator, returning the first error
+    /// encountered, or a new [`StructType`] if all fields are successfully collected and validated.
+    pub fn try_from_results<E: Into<Error>>(
+        fields: impl IntoIterator<Item = Result<StructField, E>>,
+    ) -> DeltaResult<Self> {
+        fields
+            .into_iter()
+            .map(|result| result.map_err(Into::into))
+            .process_results(|iter| Self::try_new(iter))?
+    }
+
+    /// Creates a new [`StructType`] from the given fields without validating them.
+    ///
+    /// This should only be used when you are sure that the fields are valid.
+    /// Refer to [`StructType::try_new`] for more details on the validation checks.
+    #[internal_api]
+    pub(crate) fn new_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
+        let mut field_map = IndexMap::new();
+        let mut metadata_columns = HashMap::new();
+
+        for (i, field) in fields.into_iter().enumerate() {
+            if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
+                metadata_columns.insert(metadata_column_spec, i);
+            }
+            field_map.insert(field.name.clone(), field);
+        }
+
         Self {
             type_name: "struct".into(),
-            fields: fields.into_iter().map(|f| (f.name.clone(), f)).collect(),
+            fields: field_map,
+            metadata_columns,
         }
     }
 
-    pub fn try_new<E>(fields: impl IntoIterator<Item = Result<StructField, E>>) -> Result<Self, E> {
-        let fields: Vec<_> = fields.into_iter().try_collect()?;
-        Ok(Self::new(fields))
-    }
-
-    /// Get a [`StructType`] containing [`StructField`]s of the given names. The order of fields in
+    /// Gets a [`StructType`] containing [`StructField`]s of the given names. The order of fields in
     /// the returned schema will match the order passed to this function, which can be different
     /// from this order in this schema. Returns an Err if a specified field doesn't exist.
     pub fn project_as_struct(&self, names: &[impl AsRef<str>]) -> DeltaResult<StructType> {
@@ -393,10 +604,10 @@ impl StructType {
                 .cloned()
                 .ok_or_else(|| Error::missing_column(name.as_ref()))
         });
-        Self::try_new(fields)
+        Self::try_from_results(fields)
     }
 
-    /// Get a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
+    /// Gets a [`SchemaRef`] containing [`StructField`]s of the given names. The order of fields in
     /// the returned schema will match the order passed to this function, which can be different
     /// from this order in this schema. Returns an Err if a specified field doesn't exist.
     pub fn project(&self, names: &[impl AsRef<str>]) -> DeltaResult<SchemaRef> {
@@ -404,26 +615,94 @@ impl StructType {
         Ok(Arc::new(struct_type))
     }
 
-    pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
-        self.fields.get(name.as_ref())
+    /// Adds fields to this [`StructType`], returning a new [`StructType`].
+    pub fn add(&self, fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Self::try_new(self.fields.values().cloned().chain(fields))
     }
 
+    /// Adds a predefined metadata column to this [`StructType`], returning a new [`StructType`].
+    pub fn add_metadata_column(
+        &self,
+        name: impl Into<String>,
+        spec: MetadataColumnSpec,
+    ) -> DeltaResult<Self> {
+        self.add([StructField::create_metadata_column(name, spec)])
+    }
+
+    /// Returns the index of the field with the given name, or None if not found.
     pub fn index_of(&self, name: impl AsRef<str>) -> Option<usize> {
         self.fields.get_index_of(name.as_ref())
     }
 
-    pub fn fields(&self) -> impl Iterator<Item = &StructField> {
+    /// Returns the index of the metadata column with the given spec, or None if not found.
+    pub fn index_of_metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&usize> {
+        self.metadata_columns.get(spec)
+    }
+
+    /// Checks if the [`StructType`] contains a field with the specified name.
+    pub fn contains(&self, name: impl AsRef<str>) -> bool {
+        self.fields.contains_key(name.as_ref())
+    }
+
+    /// Checks if the [`StructType`] contains a metadata column with the given spec.
+    pub fn contains_metadata_column(&self, spec: &MetadataColumnSpec) -> bool {
+        self.metadata_columns.contains_key(spec)
+    }
+
+    /// Gets the field with the given name.
+    pub fn field(&self, name: impl AsRef<str>) -> Option<&StructField> {
+        self.fields.get(name.as_ref())
+    }
+
+    /// Gets the field with the given name and its index.
+    pub fn field_with_index(&self, name: impl AsRef<str>) -> Option<(usize, &StructField)> {
+        self.fields
+            .get_full(name.as_ref())
+            .map(|(index, _, field)| (index, field))
+    }
+
+    /// Gets the field at the given index.
+    pub fn field_at_index(&self, index: usize) -> Option<&StructField> {
+        self.fields.get_index(index).map(|(_, field)| field)
+    }
+
+    /// Gets a reference to all the fields in this struct type.
+    pub fn fields(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &StructField> + DoubleEndedIterator + FusedIterator {
         self.fields.values()
     }
 
-    pub(crate) fn fields_len(&self) -> usize {
+    /// Gets an iterator over all the fields in this struct type.
+    pub fn into_fields(
+        self,
+    ) -> impl ExactSizeIterator<Item = StructField> + DoubleEndedIterator + FusedIterator {
+        self.fields.into_values()
+    }
+
+    /// Gets all the field names in this struct type in the order they are defined.
+    pub fn field_names(&self) -> impl ExactSizeIterator<Item = &String> {
+        self.fields.keys()
+    }
+
+    /// Gets the number of fields in this struct type.
+    pub fn num_fields(&self) -> usize {
         // O(1) for indexmap
         self.fields.len()
     }
 
-    // Checks if the `StructType` contains a field with the specified name.
-    pub(crate) fn contains(&self, name: impl AsRef<str>) -> bool {
-        self.fields.contains_key(name.as_ref())
+    /// Gets a reference to the metadata column with the given spec.
+    pub fn metadata_column(&self, spec: &MetadataColumnSpec) -> Option<&StructField> {
+        self.metadata_columns
+            .get(spec)
+            .and_then(|index| self.fields.get_index(*index).map(|(_, field)| field))
+    }
+
+    /// Gets an iterator over all the metadata columns in this struct type.
+    pub fn metadata_columns(&self) -> impl Iterator<Item = &StructField> {
+        self.metadata_columns
+            .values()
+            .filter_map(|index| self.fields.get_index(*index).map(|(_, field)| field))
     }
 
     /// Extracts the name and type of all leaf columns, in schema order. Caller should pass Some
@@ -453,7 +732,213 @@ impl StructType {
         let fields = self
             .fields()
             .map(|field| field.make_physical(column_mapping_mode));
-        Self::new(fields)
+        Self::new_unchecked(fields)
+    }
+
+    /// Validates that there are no metadata columns in the given fields.
+    pub(crate) fn ensure_no_metadata_columns(
+        fields: &mut dyn Iterator<Item = &StructField>,
+    ) -> DeltaResult<()> {
+        for field in fields {
+            Self::ensure_no_metadata_columns_in_field(field)?;
+        }
+        Ok(())
+    }
+
+    /// Validates that there are no metadata columns in the given field.
+    pub(crate) fn ensure_no_metadata_columns_in_field(field: &StructField) -> DeltaResult<()> {
+        if field.is_metadata_column() {
+            return Err(Error::schema(
+                "Metadata columns are only allowed at the top level of a schema".to_string(),
+            ));
+        }
+
+        match &field.data_type {
+            DataType::Struct(struct_type) => {
+                // Only check leaf fields; nested structs were validated at their creation
+                Self::ensure_no_metadata_columns(&mut struct_type.fields().filter(|f| {
+                    !matches!(f.data_type, DataType::Struct(_) | DataType::Variant(_))
+                }))?;
+            }
+            DataType::Array(array_type) => {
+                if let DataType::Struct(struct_type) = array_type.element_type() {
+                    Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
+                }
+            }
+            DataType::Map(map_type) => {
+                if let DataType::Struct(struct_type) = map_type.key_type() {
+                    Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
+                }
+                if let DataType::Struct(struct_type) = map_type.value_type() {
+                    Self::ensure_no_metadata_columns(&mut struct_type.fields())?;
+                }
+            }
+            // Primitive types cannot contain nested metadata columns and variant types are validated at creation
+            DataType::Primitive(_) | DataType::Variant(_) => {}
+        };
+
+        Ok(())
+    }
+}
+
+impl IntoIterator for StructType {
+    type Item = StructField;
+    type IntoIter = StructFieldIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        StructFieldIntoIter {
+            inner: self.fields.into_values(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a StructType {
+    type Item = &'a StructField;
+    type IntoIter = StructFieldRefIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        StructFieldRefIter {
+            inner: self.fields.values(),
+        }
+    }
+}
+
+/// An iterator that yields owned [`StructField`]s from a [`StructType`].
+///
+/// This iterator is returned by the [`IntoIterator`] implementation for [`StructType`] and
+/// consumes the original struct. It yields each field in the order they were defined in the
+/// schema, preserving the insertion order maintained by the underlying [`IndexMap`].
+///
+/// # Examples
+///
+/// ```
+/// # use delta_kernel::Error;
+/// use delta_kernel::schema::{StructType, StructField, DataType};
+///
+/// let fields = vec![
+///     StructField::new("name", DataType::STRING, false),
+///     StructField::new("age", DataType::INTEGER, true),
+/// ];
+/// let struct_type = StructType::try_new(fields)?;
+///
+/// // Consume the struct_type and iterate over owned fields
+/// for field in struct_type {
+///     println!("Field: {} ({})", field.name(), field.data_type());
+/// }
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// [`IndexMap`]: indexmap::IndexMap
+#[derive(Debug)]
+pub struct StructFieldIntoIter {
+    inner: indexmap::map::IntoValues<String, StructField>,
+}
+
+impl Iterator for StructFieldIntoIter {
+    type Item = StructField;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+
+    fn count(self) -> usize {
+        self.inner.count()
+    }
+
+    fn last(self) -> Option<Self::Item> {
+        self.inner.last()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.inner.nth(n)
+    }
+}
+
+impl ExactSizeIterator for StructFieldIntoIter {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl FusedIterator for StructFieldIntoIter {}
+
+impl DoubleEndedIterator for StructFieldIntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back()
+    }
+}
+
+/// An iterator that yields references to [`StructField`]s from a [`StructType`].
+///
+/// This iterator is returned by the [`IntoIterator`] implementation for `&StructType` and by
+/// the [`StructType::fields()`] method. Unlike [`StructFieldIntoIter`], this iterator does not
+/// consume the original struct and yields references to the fields. It preserves the insertion
+/// order maintained by the underlying [`IndexMap`].
+///
+/// This iterator implements [`Clone`], allowing you to create multiple independent iterators
+/// over the same set of fields.
+///
+/// # Examples
+///
+/// ```
+/// # use delta_kernel::Error;
+/// use delta_kernel::schema::{StructType, StructField, DataType};
+///
+/// let fields = vec![
+///     StructField::new("name", DataType::STRING, false),
+///     StructField::new("age", DataType::INTEGER, true),
+/// ];
+/// let struct_type = StructType::try_new(fields)?;
+///
+/// // Iterate over field references without consuming the struct_type
+/// for field in &struct_type {
+///     println!("Field: {} ({})", field.name(), field.data_type());
+/// }
+///
+/// // struct_type is still available for use
+/// assert_eq!(struct_type.field("name").unwrap().name(), "name");
+///
+/// // Or use the fields() method explicitly
+/// for field in struct_type.fields() {
+///     println!("Field type: {}", field.data_type());
+/// }
+/// # Ok::<(), Error>(())
+/// ```
+///
+/// [`StructType::fields()`]: StructType::fields
+/// [`IndexMap`]: indexmap::IndexMap
+#[derive(Debug, Clone)]
+pub struct StructFieldRefIter<'a> {
+    inner: indexmap::map::Values<'a, String, StructField>,
+}
+
+impl<'a> Iterator for StructFieldRefIter<'a> {
+    type Item = &'a StructField;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for StructFieldRefIter<'_> {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl FusedIterator for StructFieldRefIter<'_> {}
+
+impl DoubleEndedIterator for StructFieldRefIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back()
     }
 }
 
@@ -535,14 +1020,7 @@ impl<'de> Deserialize<'de> for StructType {
         Self: Sized,
     {
         let helper = StructTypeSerDeHelper::deserialize(deserializer)?;
-        Ok(Self {
-            type_name: helper.type_name,
-            fields: helper
-                .fields
-                .into_iter()
-                .map(|f| (f.name.clone(), f))
-                .collect(),
-        })
+        StructType::try_new(helper.fields).map_err(serde::de::Error::custom)
     }
 }
 
@@ -622,7 +1100,7 @@ impl MapType {
 
     /// Create a schema assuming the map is stored as a struct with the specified key and value field names
     pub fn as_struct_schema(&self, key_name: String, val_name: String) -> Schema {
-        StructType::new([
+        StructType::new_unchecked([
             StructField::not_null(key_name, self.key_type.clone()),
             StructField::new(val_name, self.value_type.clone(), self.value_contains_null),
         ])
@@ -867,30 +1345,47 @@ impl DataType {
     }
 
     /// Create a new struct type with the given fields.
-    pub fn struct_type(fields: impl IntoIterator<Item = StructField>) -> Self {
-        StructType::new(fields).into()
+    pub fn try_struct_type(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        Ok(StructType::try_new(fields)?.into())
     }
 
     /// Create a new struct type from a fallible iterator of fields.
-    pub fn try_struct_type<E>(
+    pub fn try_struct_type_from_results<E: Into<Error>>(
         fields: impl IntoIterator<Item = Result<StructField, E>>,
-    ) -> Result<Self, E> {
-        Ok(StructType::try_new(fields)?.into())
+    ) -> DeltaResult<Self> {
+        StructType::try_from_results(fields).map(Self::from)
+    }
+
+    /// Create a new struct type with the given fields without validating them.
+    pub(crate) fn struct_type_unchecked(fields: impl IntoIterator<Item = StructField>) -> Self {
+        StructType::new_unchecked(fields).into()
     }
 
     /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
     /// binary fields: `metadata` and `value`.
     pub fn unshredded_variant() -> Self {
-        DataType::variant_type([
+        DataType::Variant(Box::new(StructType::new_unchecked([
             StructField::not_null("metadata", DataType::BINARY),
             StructField::not_null("value", DataType::BINARY),
-        ])
+        ])))
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
     /// should prefer using [`DataType::unshredded_variant`].
-    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> Self {
-        DataType::Variant(Box::new(StructType::new(fields)))
+    pub fn variant_type(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
+        // Different from regular StructTypes, Variants are not allowed to contain metadata columns
+        // at all, so we also need to check their top-level primitive types.
+        Ok(DataType::Variant(Box::new(StructType::try_from_results(
+            fields.into_iter().map(|field| {
+                if field.is_metadata_column() {
+                    Err(Error::schema(
+                        "Metadata columns are not allowed in Variant types".to_string(),
+                    ))
+                } else {
+                    Ok(field)
+                }
+            }),
+        )?)))
     }
 
     /// Attempt to convert this data type to a [`PrimitiveType`]. Returns `None` if this is a
@@ -1055,7 +1550,7 @@ pub trait SchemaTransform<'a> {
             None
         } else if num_borrowed < stype.fields.len() {
             // At least one field was changed or filtered out, so make a new struct
-            Some(Owned(StructType::new(
+            Some(Owned(StructType::new_unchecked(
                 fields.into_iter().map(|f| f.into_owned()),
             )))
         } else {
@@ -1186,6 +1681,8 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::test_utils::assert_result_error_with_message;
+
     use super::*;
     use serde_json;
 
@@ -1511,11 +2008,11 @@ mod tests {
 
     #[test]
     fn test_depth_checker() {
-        let schema = DataType::struct_type([
+        let schema = DataType::try_struct_type([
             StructField::nullable(
                 "a",
                 ArrayType::new(
-                    DataType::struct_type([
+                    DataType::try_struct_type([
                         StructField::nullable("w", DataType::LONG),
                         StructField::nullable("x", ArrayType::new(DataType::LONG, true)),
                         StructField::nullable(
@@ -1524,18 +2021,20 @@ mod tests {
                         ),
                         StructField::nullable(
                             "z",
-                            DataType::struct_type([
+                            DataType::try_struct_type([
                                 StructField::nullable("n", DataType::LONG),
                                 StructField::nullable("m", DataType::STRING),
-                            ]),
+                            ])
+                            .unwrap(),
                         ),
-                    ]),
+                    ])
+                    .unwrap(),
                     true,
                 ),
             ),
             StructField::nullable(
                 "b",
-                DataType::struct_type([
+                DataType::try_struct_type([
                     StructField::nullable("o", ArrayType::new(DataType::LONG, true)),
                     StructField::nullable(
                         "p",
@@ -1543,32 +2042,37 @@ mod tests {
                     ),
                     StructField::nullable(
                         "q",
-                        DataType::struct_type([
+                        DataType::try_struct_type([
                             StructField::nullable(
                                 "s",
-                                DataType::struct_type([
+                                DataType::try_struct_type([
                                     StructField::nullable("u", DataType::LONG),
                                     StructField::nullable("v", DataType::LONG),
-                                ]),
+                                ])
+                                .unwrap(),
                             ),
                             StructField::nullable("t", DataType::LONG),
-                        ]),
+                        ])
+                        .unwrap(),
                     ),
                     StructField::nullable("r", DataType::LONG),
-                ]),
+                ])
+                .unwrap(),
             ),
             StructField::nullable(
                 "c",
                 MapType::new(
                     DataType::LONG,
-                    DataType::struct_type([
+                    DataType::try_struct_type([
                         StructField::nullable("f", DataType::LONG),
                         StructField::nullable("g", DataType::STRING),
-                    ]),
+                    ])
+                    .unwrap(),
                     true,
                 ),
             ),
-        ]);
+        ])
+        .unwrap();
 
         // Similar to SchemaDepthChecker::check, but also returns call count
         let check_with_call_count =
@@ -1615,29 +2119,29 @@ mod tests {
     }
 
     #[test]
-    fn test_fields_len() {
-        let schema = StructType::new([]);
-        assert!(schema.fields_len() == 0);
-        let schema = StructType::new([
+    fn test_num_fields() {
+        let schema = StructType::new_unchecked([]);
+        assert!(schema.num_fields() == 0);
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::LONG),
             StructField::nullable("b", DataType::LONG),
             StructField::nullable("c", DataType::LONG),
             StructField::nullable("d", DataType::LONG),
         ]);
-        assert_eq!(schema.fields_len(), 4);
-        let schema = StructType::new([
+        assert_eq!(schema.num_fields(), 4);
+        let schema = StructType::new_unchecked([
             StructField::nullable("b", DataType::LONG),
             StructField::not_null("b", DataType::LONG),
             StructField::nullable("c", DataType::LONG),
             StructField::nullable("c", DataType::LONG),
         ]);
-        assert_eq!(schema.fields_len(), 2);
+        assert_eq!(schema.num_fields(), 2);
     }
 
     #[test]
     fn test_has_invariants() {
         // Schema with no invariants
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
         ]);
@@ -1650,23 +2154,25 @@ mod tests {
             MetadataValue::String("c > 0".to_string()),
         );
 
-        let schema = StructType::new([StructField::nullable("a", DataType::STRING), field]);
+        let schema =
+            StructType::new_unchecked([StructField::nullable("a", DataType::STRING), field]);
         assert!(InvariantChecker::has_invariants(&schema));
 
         // Schema with nested invariant in a struct
         let nested_field = StructField::nullable(
             "nested_c",
-            DataType::struct_type([{
+            DataType::try_struct_type([{
                 let mut field = StructField::nullable("d", DataType::INTEGER);
                 field.metadata.insert(
                     ColumnMetadataKey::Invariants.as_ref().to_string(),
                     MetadataValue::String("d > 0".to_string()),
                 );
                 field
-            }]),
+            }])
+            .unwrap(),
         );
 
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             nested_field,
@@ -1677,19 +2183,20 @@ mod tests {
         let array_field = StructField::nullable(
             "array_field",
             ArrayType::new(
-                DataType::struct_type([{
+                DataType::try_struct_type([{
                     let mut field = StructField::nullable("d", DataType::INTEGER);
                     field.metadata.insert(
                         ColumnMetadataKey::Invariants.as_ref().to_string(),
                         MetadataValue::String("d > 0".to_string()),
                     );
                     field
-                }]),
+                }])
+                .unwrap(),
                 true,
             ),
         );
 
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             array_field,
@@ -1701,23 +2208,683 @@ mod tests {
             "map_field",
             MapType::new(
                 DataType::STRING,
-                DataType::struct_type([{
+                DataType::try_struct_type([{
                     let mut field = StructField::nullable("d", DataType::INTEGER);
                     field.metadata.insert(
                         ColumnMetadataKey::Invariants.as_ref().to_string(),
                         MetadataValue::String("d > 0".to_string()),
                     );
                     field
-                }]),
+                }])
+                .unwrap(),
                 true,
             ),
         );
 
-        let schema = StructType::new([
+        let schema = StructType::new_unchecked([
             StructField::nullable("a", DataType::STRING),
             StructField::nullable("b", DataType::INTEGER),
             map_field,
         ]);
         assert!(InvariantChecker::has_invariants(&schema));
+    }
+
+    #[test]
+    fn test_struct_type_iterator_basic() {
+        let fields = vec![
+            StructField::new("field1", DataType::STRING, true),
+            StructField::new("field2", DataType::INTEGER, false),
+            StructField::new("field3", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new_unchecked(fields.clone());
+
+        // Test fields() method returns reference iterator
+        let field_names: Vec<_> = struct_type.fields().map(|f| f.name()).collect();
+        assert_eq!(field_names, vec!["field1", "field2", "field3"]);
+
+        // Test that we can still access the struct_type after using fields()
+        assert_eq!(struct_type.field("field1").unwrap().name, "field1");
+    }
+
+    #[test]
+    fn test_struct_type_into_iterator_owned() {
+        let fields = vec![
+            StructField::new("a", DataType::STRING, true),
+            StructField::new("b", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test owned iteration (consumes the struct)
+        let mut field_names = Vec::new();
+        for field in struct_type {
+            field_names.push(field.name);
+        }
+        assert_eq!(field_names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_struct_type_into_iterator_references() {
+        let fields = vec![
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new("y", DataType::FLOAT, false),
+            StructField::new("z", DataType::LONG, true),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test reference iteration (does not consume the struct)
+        let mut field_names = Vec::new();
+        for field in &struct_type {
+            field_names.push(field.name().clone());
+        }
+        assert_eq!(field_names, vec!["x", "y", "z"]);
+
+        // Should still be able to use struct_type after iteration
+        assert_eq!(struct_type.field("x").unwrap().name, "x");
+    }
+
+    #[test]
+    fn test_iterator_exact_size() {
+        let fields = vec![
+            StructField::new("field1", DataType::STRING, true),
+            StructField::new("field2", DataType::INTEGER, false),
+            StructField::new("field3", DataType::BOOLEAN, true),
+            StructField::new("field4", DataType::DATE, true),
+        ];
+
+        // Test ExactSizeIterator for reference iterator
+        let struct_type = StructType::new_unchecked(fields.clone());
+        let ref_iter = struct_type.fields();
+        assert_eq!(ref_iter.len(), 4);
+
+        // Test ExactSizeIterator for &StructType into_iter
+        let struct_type = StructType::new_unchecked(fields.clone());
+        let into_ref_iter = (&struct_type).into_iter();
+        assert_eq!(into_ref_iter.len(), 4);
+
+        // Test ExactSizeIterator for StructType into_iter (consuming)
+        let struct_type = StructType::new_unchecked(fields);
+        let into_owned_iter = struct_type.into_iter();
+        assert_eq!(into_owned_iter.len(), 4);
+    }
+
+    #[test]
+    fn test_iterator_with_metadata() {
+        let field_with_metadata = StructField::new("test_field", DataType::STRING, true)
+            .with_metadata([("key1", MetadataValue::String("value1".to_string()))]);
+
+        let struct_type = StructType::new_unchecked([field_with_metadata]);
+
+        // Test that metadata is preserved through iteration
+        for field in &struct_type {
+            assert_eq!(field.metadata().len(), 1);
+            assert_eq!(
+                field.metadata().get("key1"),
+                Some(&MetadataValue::String("value1".to_string()))
+            );
+        }
+
+        // Test consuming iterator preserves metadata
+        for field in struct_type {
+            assert_eq!(field.metadata().len(), 1);
+            assert_eq!(
+                field.metadata().get("key1"),
+                Some(&MetadataValue::String("value1".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_empty_struct_type_iterator() {
+        let struct_type = StructType::new_unchecked(std::iter::empty::<StructField>());
+
+        // Test all iterator methods with empty struct
+        assert_eq!(struct_type.fields().count(), 0);
+        assert_eq!((&struct_type).into_iter().count(), 0);
+        assert_eq!(struct_type.into_iter().count(), 0);
+    }
+
+    #[test]
+    fn test_iterator_order_preservation() {
+        let fields = vec![
+            StructField::new("zebra", DataType::STRING, true),
+            StructField::new("apple", DataType::INTEGER, false),
+            StructField::new("banana", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // IndexMap should preserve insertion order
+        let field_names: Vec<_> = struct_type.fields().map(|f| f.name()).collect();
+        assert_eq!(field_names, vec!["zebra", "apple", "banana"]);
+
+        // Order should be the same across different iterator methods
+        let ref_names: Vec<_> = (&struct_type).into_iter().map(|f| f.name()).collect();
+        assert_eq!(ref_names, vec!["zebra", "apple", "banana"]);
+
+        // Test consuming iterator maintains order too
+        let owned_names: Vec<_> = struct_type.into_iter().map(|f| f.name).collect();
+        assert_eq!(owned_names, vec!["zebra", "apple", "banana"]);
+    }
+
+    #[test]
+    fn test_iterator_collect() {
+        let original_fields = vec![
+            StructField::new("field1", DataType::STRING, true),
+            StructField::new("field2", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new_unchecked(original_fields.clone());
+
+        // Test collecting from reference iterator
+        let collected_refs: Vec<&StructField> = struct_type.fields().collect();
+        assert_eq!(collected_refs.len(), 2);
+        assert_eq!(collected_refs[0].name, "field1");
+        assert_eq!(collected_refs[1].name, "field2");
+
+        // Test collecting from consuming iterator
+        let collected_owned: Vec<StructField> = struct_type.into_iter().collect();
+        assert_eq!(collected_owned.len(), 2);
+        assert_eq!(collected_owned[0].name, "field1");
+        assert_eq!(collected_owned[1].name, "field2");
+    }
+
+    #[test]
+    fn test_iterator_functional_methods() {
+        let fields = vec![
+            StructField::new("nullable_string", DataType::STRING, true),
+            StructField::new("required_int", DataType::INTEGER, false),
+            StructField::new("nullable_bool", DataType::BOOLEAN, true),
+            StructField::new("required_long", DataType::LONG, false),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test filter - find nullable fields
+        let nullable_count = struct_type.fields().filter(|f| f.is_nullable()).count();
+        assert_eq!(nullable_count, 2);
+
+        // Test map and filter chain
+        let required_field_names: Vec<_> = struct_type
+            .fields()
+            .filter(|f| !f.is_nullable())
+            .map(|f| f.name())
+            .collect();
+        assert_eq!(required_field_names, vec!["required_int", "required_long"]);
+
+        // Test enumerate
+        for (index, field) in struct_type.fields().enumerate() {
+            match index {
+                0 => assert_eq!(field.name, "nullable_string"),
+                1 => assert_eq!(field.name, "required_int"),
+                2 => assert_eq!(field.name, "nullable_bool"),
+                3 => assert_eq!(field.name, "required_long"),
+                _ => panic!("Unexpected field index: {}", index),
+            }
+        }
+    }
+
+    #[test]
+    fn test_double_ended_iterator_ref() {
+        let fields = vec![
+            StructField::new("first", DataType::STRING, true),
+            StructField::new("second", DataType::INTEGER, false),
+            StructField::new("third", DataType::BOOLEAN, true),
+            StructField::new("fourth", DataType::LONG, false),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test iterating from both ends using reference iterator
+        let mut iter = struct_type.fields();
+
+        // Forward iteration
+        assert_eq!(iter.next().unwrap().name, "first");
+        assert_eq!(iter.next().unwrap().name, "second");
+
+        // Backward iteration
+        assert_eq!(iter.next_back().unwrap().name, "fourth");
+        assert_eq!(iter.next_back().unwrap().name, "third");
+
+        // Should be exhausted
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_double_ended_iterator_owned() {
+        let fields = vec![
+            StructField::new("alpha", DataType::STRING, true),
+            StructField::new("beta", DataType::INTEGER, false),
+            StructField::new("gamma", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test iterating from both ends using owned iterator
+        let mut iter = struct_type.into_iter();
+
+        // Backward iteration first
+        assert_eq!(iter.next_back().unwrap().name, "gamma");
+
+        // Forward iteration
+        assert_eq!(iter.next().unwrap().name, "alpha");
+
+        // Backward iteration again
+        assert_eq!(iter.next_back().unwrap().name, "beta");
+
+        // Should be exhausted
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_double_ended_iterator_collect_reverse() {
+        let fields = vec![
+            StructField::new("one", DataType::STRING, true),
+            StructField::new("two", DataType::INTEGER, false),
+            StructField::new("three", DataType::BOOLEAN, true),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test collecting in reverse order using DoubleEndedIterator
+        let reversed_names: Vec<_> = struct_type.fields().rev().map(|f| f.name()).collect();
+        assert_eq!(reversed_names, vec!["three", "two", "one"]);
+
+        // Test that we can still use the original struct
+        assert_eq!(struct_type.field("two").unwrap().name, "two");
+    }
+
+    #[test]
+    fn test_double_ended_iterator_with_into_iter_ref() {
+        let fields = vec![
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new("y", DataType::FLOAT, false),
+            StructField::new("z", DataType::LONG, true),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test DoubleEndedIterator with &StructType into_iter
+        let mut iter = (&struct_type).into_iter();
+
+        // Mix forward and backward iteration
+        assert_eq!(iter.next().unwrap().name, "x");
+        assert_eq!(iter.next_back().unwrap().name, "z");
+        assert_eq!(iter.next().unwrap().name, "y");
+
+        // Should be exhausted
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_fused_iterator_ref() {
+        let fields = vec![
+            StructField::new("test1", DataType::STRING, true),
+            StructField::new("test2", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Verify that reference iterator implements FusedIterator
+        let mut iter = struct_type.fields();
+
+        // Exhaust the iterator
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
+        // FusedIterator guarantees that calling next() after exhaustion always returns None
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_fused_iterator_owned() {
+        let fields = vec![
+            StructField::new("item1", DataType::STRING, true),
+            StructField::new("item2", DataType::INTEGER, false),
+        ];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Verify that owned iterator implements FusedIterator
+        let mut iter = struct_type.into_iter();
+
+        // Exhaust the iterator
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
+        // FusedIterator guarantees that calling next() after exhaustion always returns None
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_fused_iterator_with_into_iter_ref() {
+        let fields = vec![StructField::new("field_a", DataType::BOOLEAN, true)];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Verify that &StructType into_iter implements FusedIterator
+        let mut iter = (&struct_type).into_iter();
+
+        // Exhaust the iterator
+        assert!(iter.next().is_some());
+        assert!(iter.next().is_none());
+
+        // FusedIterator guarantees that calling next() after exhaustion always returns None
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_fused_double_ended_iterator_empty() {
+        let struct_type = StructType::new_unchecked(std::iter::empty::<StructField>());
+
+        // Test both forward and backward iteration on empty iterator
+        let mut iter = struct_type.fields();
+
+        // Empty iterator should return None immediately
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+
+        // FusedIterator guarantees continued None after exhaustion
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_double_ended_iterator_single_element() {
+        let fields = vec![StructField::new("single", DataType::STRING, true)];
+        let struct_type = StructType::new_unchecked(fields);
+
+        // Test DoubleEndedIterator with single element
+        let mut iter = struct_type.fields();
+
+        // Should get the single element from next()
+        assert_eq!(iter.next().unwrap().name, "single");
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+
+        // Test getting single element from next_back()
+        let struct_type =
+            StructType::new_unchecked([StructField::new("single2", DataType::INTEGER, false)]);
+        let mut iter = struct_type.into_iter();
+
+        assert_eq!(iter.next_back().unwrap().name, "single2");
+        assert!(iter.next().is_none());
+        assert!(iter.next_back().is_none());
+    }
+
+    #[test]
+    fn test_metadata_column_spec() -> DeltaResult<()> {
+        // Test text_value
+        assert_eq!(MetadataColumnSpec::RowIndex.text_value(), "row_index");
+        assert_eq!(MetadataColumnSpec::RowId.text_value(), "row_id");
+        assert_eq!(
+            MetadataColumnSpec::RowCommitVersion.text_value(),
+            "row_commit_version"
+        );
+
+        // Test data_type
+        assert_eq!(MetadataColumnSpec::RowIndex.data_type(), DataType::LONG);
+        assert_eq!(MetadataColumnSpec::RowId.data_type(), DataType::LONG);
+        assert_eq!(
+            MetadataColumnSpec::RowCommitVersion.data_type(),
+            DataType::LONG
+        );
+
+        // Test nullable
+        assert!(!MetadataColumnSpec::RowIndex.nullable());
+        assert!(!MetadataColumnSpec::RowId.nullable());
+        assert!(!MetadataColumnSpec::RowCommitVersion.nullable());
+
+        // Test from_str
+        assert_eq!(
+            MetadataColumnSpec::from_str("row_index")?,
+            MetadataColumnSpec::RowIndex
+        );
+        assert_eq!(
+            MetadataColumnSpec::from_str("row_id")?,
+            MetadataColumnSpec::RowId
+        );
+        assert_eq!(
+            MetadataColumnSpec::from_str("row_commit_version")?,
+            MetadataColumnSpec::RowCommitVersion
+        );
+
+        // Test invalid from_str
+        assert!(MetadataColumnSpec::from_str("invalid").is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_metadata_column() {
+        let field =
+            StructField::create_metadata_column("test_row_index", MetadataColumnSpec::RowIndex);
+
+        assert_eq!(field.name(), "test_row_index");
+        assert_eq!(field.data_type(), &DataType::LONG);
+        assert!(!field.nullable);
+        assert!(field.is_metadata_column());
+        assert_eq!(
+            field.get_metadata_column_spec(),
+            Some(MetadataColumnSpec::RowIndex)
+        );
+    }
+
+    #[test]
+    fn test_default_row_index_column() {
+        let field = StructField::default_row_index_column();
+
+        assert_eq!(field.name(), "_metadata.row_index");
+        assert_eq!(field.data_type(), &DataType::LONG);
+        assert!(!field.nullable);
+        assert!(field.is_metadata_column());
+        assert_eq!(
+            field.get_metadata_column_spec(),
+            Some(MetadataColumnSpec::RowIndex)
+        );
+    }
+
+    #[test]
+    fn test_add_column() -> DeltaResult<()> {
+        let schema = StructType::try_new([StructField::nullable("col1", DataType::STRING)])?;
+
+        let new_field = StructField::nullable("col2", DataType::INTEGER);
+        let updated_schema = schema.add([new_field])?;
+
+        assert_eq!(updated_schema.fields().count(), 2);
+        assert!(updated_schema.contains("col1"));
+        assert!(updated_schema.contains("col2"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_metadata_column() -> DeltaResult<()> {
+        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+
+        let schema_with_metadata =
+            schema.add_metadata_column("my_row_index", MetadataColumnSpec::RowIndex)?;
+
+        assert_eq!(schema_with_metadata.fields().count(), 2);
+        assert!(schema_with_metadata.contains_metadata_column(&MetadataColumnSpec::RowIndex));
+        assert!(schema_with_metadata.contains("my_row_index"));
+        assert_eq!(
+            schema_with_metadata.index_of_metadata_column(&MetadataColumnSpec::RowIndex),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_duplicate_metadata_columns() -> DeltaResult<()> {
+        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+
+        let schema_with_metadata =
+            schema.add_metadata_column("row_index1", MetadataColumnSpec::RowIndex)?;
+
+        // Adding another row index metadata column should fail
+        let result =
+            schema_with_metadata.add_metadata_column("row_index2", MetadataColumnSpec::RowIndex);
+
+        assert_result_error_with_message(result, "Duplicate metadata column");
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_metadata_columns_validation_struct() -> DeltaResult<()> {
+        // Test that metadata columns in nested structs are rejected
+        let nested_field_with_metadata =
+            StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
+        let nested_struct = StructType {
+            type_name: "struct".into(),
+            fields: [(
+                nested_field_with_metadata.name.clone(),
+                nested_field_with_metadata,
+            )]
+            .into_iter()
+            .collect(),
+            metadata_columns: HashMap::new(),
+        };
+
+        let result = StructType::try_new([
+            StructField::nullable("regular_col", DataType::STRING),
+            StructField::nullable("nested", DataType::Struct(Box::new(nested_struct))),
+        ]);
+
+        assert_result_error_with_message(result, "only allowed at the top level");
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_metadata_columns_validation_array() -> DeltaResult<()> {
+        // Test that metadata columns in array element structs are rejected
+        let nested_field_with_metadata =
+            StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
+        let nested_struct = StructType {
+            type_name: "struct".into(),
+            fields: [(
+                nested_field_with_metadata.name.clone(),
+                nested_field_with_metadata,
+            )]
+            .into_iter()
+            .collect(),
+            metadata_columns: HashMap::new(),
+        };
+        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct)), true);
+
+        let result = StructType::try_new([
+            StructField::nullable("regular_col", DataType::STRING),
+            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
+        ]);
+
+        assert_result_error_with_message(result, "only allowed at the top level");
+        Ok(())
+    }
+
+    #[test]
+    fn test_nested_metadata_columns_validation_map() -> DeltaResult<()> {
+        // Test that metadata columns in map key structs or map value structs are rejected
+        let nested_field_with_metadata =
+            StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
+        let nested_struct = StructType {
+            type_name: "struct".into(),
+            fields: [(
+                nested_field_with_metadata.name.clone(),
+                nested_field_with_metadata,
+            )]
+            .into_iter()
+            .collect(),
+            metadata_columns: HashMap::new(),
+        };
+
+        for map_type in [
+            MapType::new(
+                DataType::Struct(Box::new(nested_struct.clone())),
+                DataType::STRING,
+                true,
+            ),
+            MapType::new(
+                DataType::STRING,
+                DataType::Struct(Box::new(nested_struct)),
+                true,
+            ),
+        ] {
+            let result = StructType::try_new([
+                StructField::nullable("regular_col", DataType::STRING),
+                StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+            ]);
+
+            assert_result_error_with_message(result, "only allowed at the top level");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_column_identifier_trait() -> DeltaResult<()> {
+        let schema = StructType::try_new([
+            StructField::nullable("regular_col", DataType::STRING),
+            StructField::create_metadata_column("row_index_col", MetadataColumnSpec::RowIndex),
+        ])?;
+
+        // Test string identifier
+        assert!(schema.contains("regular_col"));
+        assert!(schema.contains("row_index_col"));
+        assert!(!schema.contains("nonexistent"));
+
+        // Test String identifier
+        assert!(schema.contains("regular_col"));
+        assert!(schema.contains("row_index_col"));
+
+        // Test MetadataColumnSpec identifier
+        assert!(schema.contains_metadata_column(&MetadataColumnSpec::RowIndex));
+        assert!(!schema.contains_metadata_column(&MetadataColumnSpec::RowId));
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_column_serialization() -> DeltaResult<()> {
+        let field = StructField::create_metadata_column("test_row_id", MetadataColumnSpec::RowId);
+
+        // Test that serialization works
+        let json = serde_json::to_string(&field)?;
+        let deserialized: StructField = serde_json::from_str(&json)?;
+
+        assert_eq!(deserialized.name(), field.name());
+        assert_eq!(deserialized.data_type(), field.data_type());
+        assert_eq!(deserialized.nullable, field.nullable);
+        assert!(deserialized.is_metadata_column());
+        assert_eq!(
+            deserialized.get_metadata_column_spec(),
+            Some(MetadataColumnSpec::RowId)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_metadata_column_specs() -> DeltaResult<()> {
+        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+
+        let schema = schema
+            .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
+            .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?;
+
+        assert_eq!(schema.fields().count(), 4);
+        assert!(schema.contains_metadata_column(&MetadataColumnSpec::RowIndex));
+        assert!(schema.contains_metadata_column(&MetadataColumnSpec::RowId));
+        assert!(schema.contains_metadata_column(&MetadataColumnSpec::RowCommitVersion));
+
+        assert_eq!(
+            schema.index_of_metadata_column(&MetadataColumnSpec::RowIndex),
+            Some(&1)
+        );
+        assert_eq!(
+            schema.index_of_metadata_column(&MetadataColumnSpec::RowId),
+            Some(&2)
+        );
+        assert_eq!(
+            schema.index_of_metadata_column(&MetadataColumnSpec::RowCommitVersion),
+            Some(&3)
+        );
+        Ok(())
     }
 }

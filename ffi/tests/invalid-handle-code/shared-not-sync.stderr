@@ -21,7 +21,7 @@ error[E0277]: `*mut u32` cannot be shared between threads safely
 note: required because it appears within the type `NotSync`
   --> tests/invalid-handle-code/shared-not-sync.rs:5:12
    |
-5  | pub struct NotSync(*mut u32);
+ 5 | pub struct NotSync(*mut u32);
    |            ^^^^^^^
    = note: required for `SharedNotSync` to implement `handle::private::SharedHandleOps<NotSync, True>`
    = note: required for `Handle<SharedNotSync>` to implement `From<Arc<NotSync>>`

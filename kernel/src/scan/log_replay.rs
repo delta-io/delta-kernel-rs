@@ -2,19 +2,18 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
-
 use super::data_skipping::DataSkippingFilter;
-use super::{ScanMetadata, Transform};
+use super::ScanMetadata;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
-use crate::scan::{Scalar, TransformExpr};
+use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
+use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -45,7 +44,7 @@ pub(crate) struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
     logical_schema: SchemaRef,
-    transform: Option<Arc<Transform>>,
+    transform_spec: Option<Arc<TransformSpec>>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -58,7 +57,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
         logical_schema: SchemaRef,
-        transform: Option<Arc<Transform>>,
+        transform_spec: Option<Arc<TransformSpec>>,
     ) -> Self {
         Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
@@ -70,7 +69,7 @@ impl ScanLogReplayProcessor {
             ),
             seen_file_keys: Default::default(),
             logical_schema,
-            transform,
+            transform_spec,
         }
     }
 }
@@ -83,7 +82,7 @@ struct AddRemoveDedupVisitor<'seen> {
     deduplicator: FileActionDeduplicator<'seen>,
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
-    transform: Option<Arc<Transform>>,
+    transform_spec: Option<Arc<TransformSpec>>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
@@ -101,7 +100,7 @@ impl AddRemoveDedupVisitor<'_> {
         seen: &mut HashSet<FileActionKey>,
         selection_vector: Vec<bool>,
         logical_schema: SchemaRef,
-        transform: Option<Arc<Transform>>,
+        transform_spec: Option<Arc<TransformSpec>>,
         partition_filter: Option<PredicateRef>,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
@@ -116,66 +115,10 @@ impl AddRemoveDedupVisitor<'_> {
             ),
             selection_vector,
             logical_schema,
-            transform,
+            transform_spec,
             partition_filter,
             row_transform_exprs: Vec::new(),
         }
-    }
-
-    fn parse_partition_value(
-        &self,
-        field_idx: usize,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<(usize, (String, Scalar))> {
-        let field = self.logical_schema.fields.get_index(field_idx);
-        let Some((_, field)) = field else {
-            return Err(Error::InternalError(format!(
-                "out of bounds partition column field index {field_idx}"
-            )));
-        };
-        let name = field.physical_name();
-        let partition_value =
-            super::parse_partition_value(partition_values.get(name), field.data_type())?;
-        Ok((field_idx, (name.to_string(), partition_value)))
-    }
-
-    fn parse_partition_values(
-        &self,
-        transform: &Transform,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
-        transform
-            .iter()
-            .filter_map(|transform_expr| match transform_expr {
-                TransformExpr::Partition(field_idx) => {
-                    Some(self.parse_partition_value(*field_idx, partition_values))
-                }
-                TransformExpr::Static(_) => None,
-            })
-            .try_collect()
-    }
-
-    /// Compute an expression that will transform from physical to logical for a given Add file action
-    fn get_transform_expr(
-        &self,
-        transform: &Transform,
-        mut partition_values: HashMap<usize, (String, Scalar)>,
-    ) -> DeltaResult<ExpressionRef> {
-        let transforms = transform
-            .iter()
-            .map(|transform_expr| match transform_expr {
-                TransformExpr::Partition(field_idx) => {
-                    let Some((_, partition_value)) = partition_values.remove(field_idx) else {
-                        return Err(Error::InternalError(format!(
-                            "missing partition value for field index {field_idx}"
-                        )));
-                    };
-                    Ok(Arc::new(partition_value.into()))
-                }
-                TransformExpr::Static(field_expr) => Ok(field_expr.clone()),
-            })
-            .try_collect()?;
-        Ok(Arc::new(Expression::Struct(transforms)))
     }
 
     fn is_file_partition_pruned(
@@ -220,11 +163,12 @@ impl AddRemoveDedupVisitor<'_> {
         // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
         // removes), because they are needed to suppress earlier incompatible adds we might
         // encounter if the table's schema was replaced after the most recent checkpoint.
-        let partition_values = match &self.transform {
+        let partition_values = match &self.transform_spec {
             Some(transform) if is_add => {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values = self.parse_partition_values(transform, &partition_values)?;
+                let partition_values =
+                    parse_partition_values(&self.logical_schema, transform, &partition_values)?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -238,9 +182,9 @@ impl AddRemoveDedupVisitor<'_> {
             return Ok(false);
         }
         let transform = self
-            .transform
+            .transform_spec
             .as_ref()
-            .map(|transform| self.get_transform_expr(transform, partition_values))
+            .map(|transform| get_transform_expr(transform, partition_values))
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
@@ -309,8 +253,8 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     // Note that fields projected out of a nullable struct must be nullable
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values =
-        StructType::new([StructField::nullable("partitionValues", partition_values)]);
-    Arc::new(StructType::new([
+        StructType::new_unchecked([StructField::nullable("partitionValues", partition_values)]);
+    Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
@@ -323,32 +267,40 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
 pub(crate) static SCAN_ROW_DATATYPE: LazyLock<DataType> =
     LazyLock::new(|| SCAN_ROW_SCHEMA.clone().into());
 
-fn get_add_transform_expr() -> Expression {
+fn get_add_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
-    Expression::Struct(vec![
-        column_expr_ref!("add.path"),
-        column_expr_ref!("add.size"),
-        column_expr_ref!("add.modificationTime"),
-        column_expr_ref!("add.stats"),
-        column_expr_ref!("add.deletionVector"),
-        Arc::new(Expression::Struct(vec![column_expr_ref!(
-            "add.partitionValues"
-        )])),
-    ])
+    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+        Arc::new(Expression::Struct(vec![
+            column_expr_ref!("add.path"),
+            column_expr_ref!("add.size"),
+            column_expr_ref!("add.modificationTime"),
+            column_expr_ref!("add.stats"),
+            column_expr_ref!("add.deletionVector"),
+            Arc::new(Expression::Struct(vec![column_expr_ref!(
+                "add.partitionValues"
+            )])),
+        ]))
+    });
+    EXPR.clone()
 }
 
 // TODO: remove once `scan_metadata_from` is pub.
 #[allow(unused)]
-pub(crate) fn get_scan_metadata_transform_expr() -> Expression {
+pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
-    Expression::Struct(vec![Arc::new(Expression::Struct(vec![
-        column_expr_ref!("path"),
-        column_expr_ref!("fileConstantValues.partitionValues"),
-        column_expr_ref!("size"),
-        column_expr_ref!("modificationTime"),
-        column_expr_ref!("stats"),
-        column_expr_ref!("deletionVector"),
-    ]))])
+    static EXPR: LazyLock<ExpressionRef> = LazyLock::new(|| {
+        Arc::new(Expression::Struct(vec![Arc::new(Expression::Struct(
+            vec![
+                column_expr_ref!("path"),
+                column_expr_ref!("fileConstantValues.partitionValues"),
+                column_expr_ref!("size"),
+                column_expr_ref!("modificationTime"),
+                column_expr_ref!("stats"),
+                column_expr_ref!("deletionVector"),
+            ],
+        ))]))
+    });
+    EXPR.clone()
 }
 
 impl LogReplayProcessor for ScanLogReplayProcessor {
@@ -369,7 +321,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &mut self.seen_file_keys,
             selection_vector,
             self.logical_schema.clone(),
-            self.transform.clone(),
+            self.transform_spec.clone(),
             self.partition_filter.clone(),
             is_log_batch,
         );
@@ -401,10 +353,10 @@ pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     logical_schema: SchemaRef,
-    transform: Option<Arc<Transform>>,
+    transform_spec: Option<Arc<TransformSpec>>,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform)
+    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform_spec)
         .process_actions_iter(action_iter)
 }
 
@@ -413,14 +365,14 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::actions::get_log_schema;
-    use crate::expressions::{column_name, Scalar};
+    use crate::expressions::Scalar;
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
         add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
         run_with_validate_callback,
     };
-    use crate::scan::{Scan, StateInfo};
+    use crate::scan::{get_transform_spec, StateInfo};
     use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
@@ -480,7 +432,7 @@ mod tests {
     #[test]
     fn test_no_transforms() {
         let batch = vec![add_batch_simple(get_log_schema().clone())];
-        let logical_schema = Arc::new(crate::schema::StructType::new(vec![]));
+        let logical_schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
@@ -501,14 +453,14 @@ mod tests {
 
     #[test]
     fn test_simple_transform() {
-        let schema: SchemaRef = Arc::new(StructType::new([
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::new("value", DataType::INTEGER, true),
             StructField::new("date", DataType::DATE, true),
         ]));
         let partition_cols = ["date".to_string()];
         let state_info =
             StateInfo::try_new(schema.as_ref(), &partition_cols, ColumnMappingMode::None).unwrap();
-        let static_transform = Some(Arc::new(Scan::get_static_transform(&state_info.all_fields)));
+        let static_transform = Some(Arc::new(get_transform_spec(&state_info.all_fields)));
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -522,24 +474,24 @@ mod tests {
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
-            let Expr::Struct(inner) = transform.unwrap().as_ref() else {
-                panic!("Transform should always be a struct expr");
+            let Expr::Transform(transform) = transform.unwrap().as_ref() else {
+                panic!("Transform should always be a Transform expr");
             };
-            assert_eq!(inner.len(), 2, "expected two items in transform struct");
 
-            let Expr::Column(ref name) = inner[0].as_ref() else {
-                panic!("Expected first expression to be a column");
+            // With sparse transforms, we expect only one insertion for the partition column
+            assert!(transform.prepended_fields.is_empty());
+            let mut field_transforms = transform.field_transforms.iter();
+            let (field_name, field_transform) = field_transforms.next().unwrap();
+            assert_eq!(field_name, "value");
+            assert!(!field_transform.is_replace);
+            let [expr] = &field_transform.exprs[..] else {
+                panic!("Expected a single insertion");
             };
-            assert_eq!(name, &column_name!("value"), "First col should be 'value'");
-
-            let Expr::Literal(ref scalar) = inner[1].as_ref() else {
-                panic!("Expected second expression to be a literal");
+            let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {
+                panic!("Expected a literal date");
             };
-            assert_eq!(
-                scalar,
-                &Scalar::Date(expected_date_offset),
-                "Didn't get expected date offset"
-            );
+            assert_eq!(*date_offset, expected_date_offset);
+            assert!(field_transforms.next().is_none());
         }
 
         for res in iter {
