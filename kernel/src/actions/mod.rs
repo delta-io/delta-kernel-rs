@@ -931,21 +931,23 @@ pub(crate) struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
-    // TODO: Discuss if we should remove `removed` from this method and introduce a dedicated
-    // method for removed domain metadata.
-    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
-        DomainMetadata {
+    pub(crate) fn new(domain: String, configuration: String) -> Self {
+        Self {
             domain,
             configuration,
-            removed,
+            removed: false,
         }
     }
 
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
-    fn is_internal(&self) -> bool {
+    pub(crate) fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
     }
 }
 
