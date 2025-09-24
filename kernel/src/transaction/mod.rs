@@ -287,7 +287,7 @@ impl Transaction {
     /// Removing metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.domain_metadatas
-            .push(DomainMetadata::remove(domain.clone()));
+            .push(DomainMetadata::remove(domain));
         self
     }
 
