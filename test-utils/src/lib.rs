@@ -153,6 +153,12 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+pub fn staged_commit_path_for_version(version: u64) -> Path {
+    let uuid = uuid::Uuid::new_v4();
+    let path = format!("_delta_log/_staged_commits/{version:020}.{uuid}.json");
+    Path::from(path.as_str())
+}
+
 /// get an ObjectStore path for a compressed log file, based on the start/end versions
 pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suffix: &str) -> Path {
     let path = format!("_delta_log/{start_version:020}.{end_version:020}.compacted.{suffix}");
@@ -168,6 +174,16 @@ pub async fn add_commit(
     let path = delta_path_for_version(version, "json");
     store.put(&path, data.into()).await?;
     Ok(())
+}
+
+pub async fn add_staged_commit(
+    store: &dyn ObjectStore,
+    version: u64,
+    data: String,
+) -> Result<Path, Box<dyn std::error::Error>> {
+    let path = staged_commit_path_for_version(version);
+    store.put(&path, data.into()).await?;
+    Ok(path)
 }
 
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from

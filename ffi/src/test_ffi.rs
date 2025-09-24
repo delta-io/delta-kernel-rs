@@ -97,7 +97,7 @@ pub unsafe extern "C" fn get_testing_kernel_expression() -> Handle<SharedExpress
     ];
     let nested_values = vec![Scalar::Integer(500), Scalar::Array(array_data.clone())];
     let nested_struct = StructData::try_new(nested_fields.clone(), nested_values).unwrap();
-    let nested_struct_type = StructType::new(nested_fields);
+    let nested_struct_type = StructType::try_new(nested_fields).unwrap();
 
     let top_level_struct = StructData::try_new(
         vec![StructField::nullable(

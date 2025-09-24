@@ -160,6 +160,17 @@ impl TableChanges {
             None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
         };
 
+        // we block reading catalog-managed tables with CDF for now. note this is best-effort just
+        // checking that start/end snapshots are not catalog-managed.
+        //
+        // TODO: link issue
+        #[cfg(feature = "catalog-managed")]
+        require!(
+            !start_snapshot.protocol().is_catalog_managed()
+                && !end_snapshot.protocol().is_catalog_managed(),
+            Error::unsupported("Change data feed is not supported for catalog-managed tables")
+        );
+
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
         // disabled.
@@ -188,13 +199,13 @@ impl TableChanges {
             )));
         }
 
-        let schema = StructType::new(
+        let schema = StructType::try_new(
             end_snapshot
                 .schema()
                 .fields()
                 .cloned()
                 .chain(CDF_FIELDS.clone()),
-        );
+        )?;
 
         Ok(TableChanges {
             table_root,
@@ -321,7 +332,7 @@ mod tests {
         let path = "./tests/data/table-with-cdf";
         let engine = Box::new(SyncEngine::new());
         let url = delta_kernel::try_parse_uri(path).unwrap();
-        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }} }";
+        let expected_msg = "Failed to build TableChanges: Start and end version schemas are different. Found start version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: true, metadata: {} }}, metadata_columns: {} } and end version schema StructType { type_name: \"struct\", fields: {\"part\": StructField { name: \"part\", data_type: Primitive(Integer), nullable: true, metadata: {} }, \"id\": StructField { name: \"id\", data_type: Primitive(Integer), nullable: false, metadata: {} }}, metadata_columns: {} }";
 
         // A field in the schema goes from being nullable to non-nullable
         let table_changes_res = TableChanges::try_new(url, engine.as_ref(), 3, Some(4));

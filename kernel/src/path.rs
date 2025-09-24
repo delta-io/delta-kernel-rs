@@ -21,6 +21,8 @@ const UUID_PART_LEN: usize = 36;
 #[internal_api]
 pub(crate) enum LogPathFileType {
     Commit,
+    /// Staged commits are commits with UUID filenames, stored in _delta_log/_staged_commits dir.
+    StagedCommit,
     SinglePartCheckpoint,
     #[allow(unused)]
     UuidCheckpoint(String),
@@ -40,6 +42,15 @@ pub(crate) enum LogPathFileType {
     Unknown,
 }
 
+/// A ParsedLogPath is a well-understood path to a file in the _delta_log directory.
+///
+/// Note this includes things like checkpoints and commits (containing current table state), but
+/// also files used for various optimizations like CRC, compaction, etc.
+///
+/// Every parsed log path has a version. And additionally, we implement a 'should_list' method
+/// which controls whether or not we include this file in our listing. For example, when we list
+/// the _delta_log we may see _staged_commits/00000000000000000000.{uuid}.json, but we MUST NOT
+/// include those in listing, as only the catalog can tell us which are valid commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
@@ -85,13 +96,15 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
-        #[allow(clippy::unwrap_used)]
-        let filename = url
+        let mut path_segments = url
             .path_segments()
-            .ok_or_else(|| Error::invalid_log_path(url))?
+            .ok_or_else(|| Error::invalid_log_path(url))?;
+        #[allow(clippy::unwrap_used)]
+        let filename = path_segments
             .next_back()
             .unwrap() // "the iterator always contains at least one string (which may be empty)"
             .to_string();
+        let subdir = path_segments.next_back();
         if filename.is_empty() {
             return Err(Error::invalid_log_path(url));
         }
@@ -121,6 +134,13 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         // Parse the file type, based on the number of remaining parts
         let file_type = match split.as_slice() {
             ["json"] => LogPathFileType::Commit,
+            [uuid, "json"] if subdir == Some("_staged_commits") => {
+                // staged commits like _delta_log/_staged_commits/00000000000000000000.{uuid}.json
+                match parse_path_part::<String>(uuid, UUID_PART_LEN, url) {
+                    Ok(_uuid) => LogPathFileType::StagedCommit,
+                    Err(_) => LogPathFileType::Unknown,
+                }
+            }
             ["crc"] => LogPathFileType::Crc,
             ["checkpoint", "parquet"] => LogPathFileType::SinglePartCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] => {
@@ -157,9 +177,25 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         }))
     }
 
+    pub(crate) fn should_list(&self) -> bool {
+        match self.file_type {
+            LogPathFileType::Commit
+            | LogPathFileType::SinglePartCheckpoint
+            | LogPathFileType::UuidCheckpoint(_)
+            | LogPathFileType::MultiPartCheckpoint { .. }
+            | LogPathFileType::CompactedCommit { .. }
+            | LogPathFileType::Crc
+            | LogPathFileType::Unknown => true,
+            LogPathFileType::StagedCommit => false,
+        }
+    }
+
     #[internal_api]
     pub(crate) fn is_commit(&self) -> bool {
-        matches!(self.file_type, LogPathFileType::Commit)
+        matches!(
+            self.file_type,
+            LogPathFileType::Commit | LogPathFileType::StagedCommit
+        )
     }
 
     #[internal_api]
@@ -688,5 +724,90 @@ mod tests {
             LogPathFileType::SinglePartCheckpoint
         ));
         assert_eq!(log_path.filename, "00000000000000000010.checkpoint.parquet");
+    }
+
+    #[test]
+    fn test_staged_commit_paths() {
+        let table_log_dir = table_log_dir_url();
+
+        // valid staged commit
+        let log_path = table_log_dir
+            .join("_staged_commits/00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
+            .unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        assert_eq!(
+            log_path.filename,
+            "00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"
+        );
+        assert_eq!(log_path.extension, "json");
+        assert_eq!(log_path.version, 10);
+        assert!(matches!(log_path.file_type, LogPathFileType::StagedCommit));
+        assert!(log_path.is_commit());
+        assert!(!log_path.is_checkpoint());
+        assert!(!log_path.is_unknown());
+
+        // invalid uuid
+        let log_path = table_log_dir
+            .join("_staged_commits/00000000000000000010.not-a-uuid.json")
+            .unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        assert!(log_path.is_unknown());
+        assert!(!log_path.is_commit());
+        assert!(!log_path.is_checkpoint());
+
+        // outside _staged_commits directory
+        let log_path = table_log_dir
+            .join("00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
+            .unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        assert_eq!(
+            log_path.filename,
+            "00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"
+        );
+        assert_eq!(log_path.extension, "json");
+        assert_eq!(log_path.version, 10);
+        assert!(matches!(log_path.file_type, LogPathFileType::Unknown));
+        assert!(!log_path.is_commit());
+        assert!(!log_path.is_checkpoint());
+        assert!(log_path.is_unknown());
+    }
+
+    #[test]
+    fn test_should_list() {
+        let mut path = ParsedLogPath {
+            location: table_log_dir_url(),
+            filename: "".to_string(),
+            extension: "".to_string(),
+            version: 0,
+            file_type: LogPathFileType::Commit,
+        };
+
+        for (file_type, should_list) in [
+            (LogPathFileType::Commit, true),
+            (LogPathFileType::StagedCommit, false),
+            (LogPathFileType::SinglePartCheckpoint, true),
+            (
+                LogPathFileType::UuidCheckpoint("some-uuid".to_string()),
+                true,
+            ),
+            (
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num: 1,
+                    num_parts: 2,
+                },
+                true,
+            ),
+            (LogPathFileType::CompactedCommit { hi: 10 }, true),
+            (LogPathFileType::Crc, true),
+            (LogPathFileType::Unknown, true),
+        ] {
+            path.file_type = file_type;
+            assert_eq!(
+                path.should_list(),
+                should_list,
+                "file_type: {:?}",
+                path.file_type
+            );
+        }
     }
 }

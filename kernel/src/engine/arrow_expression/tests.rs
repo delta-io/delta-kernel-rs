@@ -158,7 +158,7 @@ fn test_literal_complex_type_array() {
         StructField::nullable("map", map_type.clone()),
         StructField::nullable("null_map", map_type.clone()),
     ];
-    let struct_type = StructType::new(struct_fields.clone());
+    let struct_type = StructType::new_unchecked(struct_fields.clone());
     let struct_value = Scalar::Struct(
         crate::expressions::StructData::try_new(
             struct_fields.clone(),
@@ -646,10 +646,10 @@ fn test_opaque() {
 #[test]
 fn test_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
-    let schema = Arc::new(StructType::new(vec![
+    let schema = Arc::new(StructType::new_unchecked(vec![
         StructField::nullable(
             "x",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::nullable("a", KernelDataType::INTEGER),
                 StructField::not_null("b", KernelDataType::STRING),
             ]),
@@ -683,7 +683,7 @@ fn test_null_row() {
 
 #[test]
 fn test_null_row_err() {
-    let not_null_schema = Arc::new(StructType::new(vec![StructField::not_null(
+    let not_null_schema = Arc::new(StructType::new_unchecked(vec![StructField::not_null(
         "a",
         KernelDataType::STRING,
     )]));
@@ -714,7 +714,7 @@ fn test_create_one() {
         3.into(),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new([
+    let schema = Arc::new(StructType::new_unchecked([
         StructField::nullable("a", KernelDataType::INTEGER),
         StructField::nullable("b", KernelDataType::STRING),
         StructField::not_null("c", KernelDataType::INTEGER),
@@ -743,9 +743,9 @@ fn test_create_one() {
 #[test]
 fn test_create_one_nested() {
     let values: &[Scalar] = &[1.into(), 2.into()];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
-        KernelDataType::struct_type([
+        KernelDataType::struct_type_unchecked([
             StructField::nullable("b", KernelDataType::INTEGER),
             StructField::not_null("c", KernelDataType::INTEGER),
         ]),
@@ -781,9 +781,9 @@ fn test_create_one_nested() {
 #[test]
 fn test_create_one_nested_null() {
     let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
-        KernelDataType::struct_type([
+        KernelDataType::struct_type_unchecked([
             StructField::nullable("b", KernelDataType::INTEGER),
             StructField::not_null("c", KernelDataType::INTEGER),
         ]),
@@ -820,7 +820,7 @@ fn test_create_one_nested_null() {
 fn test_create_one_mismatching_scalar_types() {
     // Scalar is a LONG but schema specifies INTEGER
     let values: &[Scalar] = &[Scalar::Long(10)];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "version",
         KernelDataType::INTEGER,
     )]));
@@ -837,9 +837,9 @@ fn test_create_one_not_null_struct() {
         Scalar::Null(KernelDataType::INTEGER),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
-        KernelDataType::struct_type([
+        KernelDataType::struct_type_unchecked([
             StructField::not_null("b", KernelDataType::INTEGER),
             StructField::nullable("c", KernelDataType::INTEGER),
         ]),
@@ -856,7 +856,7 @@ fn test_create_one_top_level_null() {
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "col_1",
         KernelDataType::INTEGER,
     )]));
@@ -939,7 +939,7 @@ fn test_apply_schema_column_count_mismatch() {
     ]);
 
     // Create a schema with only 2 fields (mismatch)
-    let schema = KernelDataType::Struct(Box::new(StructType::new([
+    let schema = KernelDataType::Struct(Box::new(StructType::new_unchecked([
         StructField::not_null("a", KernelDataType::INTEGER),
         StructField::not_null("b", KernelDataType::INTEGER),
     ])));

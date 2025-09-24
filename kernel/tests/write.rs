@@ -54,10 +54,10 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
@@ -208,10 +208,10 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -259,10 +259,10 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -347,14 +347,50 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
+async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, store, table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+        let txn = snapshot.transaction()?.with_engine_info("default engine");
+
+        // Commit without adding any add files
+        txn.commit(&engine)?;
+
+        let commit1 = store
+            .get(&Path::from(format!(
+                "/{table_name}/_delta_log/00000000000000000001.json"
+            )))
+            .await?;
+
+        let parsed_actions: Vec<_> = Deserializer::from_slice(&commit1.bytes().await?)
+            .into_iter::<serde_json::Value>()
+            .try_collect()?;
+
+        // Verify that there only is a commit info action
+        assert_eq!(parsed_actions.len(), 1, "Expected only one action");
+        assert!(parsed_actions[0].get("commitInfo").is_some());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     for (table_url, engine, _, _) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -388,14 +424,14 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a simple partitioned table: one int column named 'number', partitioned by string
     // column named 'partition'
-    let table_schema = Arc::new(StructType::new(vec![
+    let table_schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("number", DataType::INTEGER),
         StructField::nullable("partition", DataType::STRING),
-    ]));
-    let data_schema = Arc::new(StructType::new(vec![StructField::nullable(
+    ])?);
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
@@ -530,15 +566,15 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let table_schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let table_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
     // incompatible data schema: one string column named 'string'
-    let data_schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let data_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "string",
         DataType::STRING,
-    )]));
+    )])?);
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(table_schema, &[], None, "test_table").await?
@@ -592,10 +628,10 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
@@ -728,10 +764,10 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a table with TIMESTAMP_NTZ column
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "ts_ntz",
         DataType::TIMESTAMP_NTZ,
-    )]));
+    )])?);
 
     let (store, engine, table_location) = engine_store_setup("test_table_timestamp_ntz", None);
     let table_url = create_table(
@@ -814,6 +850,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             StructField::not_null("value", DataType::BINARY),
             StructField::not_null("metadata", DataType::BINARY),
         ])
+        .unwrap()
     }
     fn variant_arrow_type_flipped() -> ArrowDataType {
         let metadata_field = Field::new("metadata", ArrowDataType::Binary, false);
@@ -823,7 +860,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // create a table with VARIANT column
-    let table_schema = Arc::new(StructType::new(vec![
+    let table_schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("v", DataType::unshredded_variant())
             .with_metadata([("delta.columnMapping.physicalName", "col1")])
             .add_metadata([("delta.columnMapping.id", 1)]),
@@ -833,28 +870,28 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         StructField::nullable(
             "nested",
             // We flip the value and metadata fields in the actual parquet file for the test
-            StructType::new(vec![StructField::nullable(
+            StructType::try_new(vec![StructField::nullable(
                 "nested_v",
                 unshredded_variant_schema_flipped(),
             )
             .with_metadata([("delta.columnMapping.physicalName", "col21")])
-            .add_metadata([("delta.columnMapping.id", 3)])]),
+            .add_metadata([("delta.columnMapping.id", 3)])])?,
         )
         .with_metadata([("delta.columnMapping.physicalName", "col3")])
         .add_metadata([("delta.columnMapping.id", 4)]),
-    ]));
+    ])?);
 
-    let write_schema = Arc::new(StructType::new(vec![
+    let write_schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("col1", DataType::unshredded_variant()),
         StructField::nullable("col2", DataType::INTEGER),
         StructField::nullable(
             "col3",
-            StructType::new(vec![StructField::nullable(
+            StructType::try_new(vec![StructField::nullable(
                 "col21",
                 unshredded_variant_schema_flipped(),
-            )]),
+            )])?,
         ),
-    ]));
+    ])?);
 
     let tmp_test_dir = tempdir()?;
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
@@ -1007,17 +1044,18 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     assert!(parsed_commits[1].get("add").is_some());
 
     // The scanned data will match the logical schema, not the physical one
-    let expected_schema = Arc::new(StructType::new(vec![
+    let expected_schema = Arc::new(StructType::try_new(vec![
         StructField::nullable("v", DataType::unshredded_variant()),
         StructField::nullable("i", DataType::INTEGER),
         StructField::nullable(
             "nested",
-            StructType::new(vec![StructField::nullable(
+            StructType::try_new(vec![StructField::nullable(
                 "nested_v",
                 DataType::unshredded_variant(),
-            )]),
+            )])
+            .unwrap(),
         ),
-    ]));
+    ])?);
 
     // During the read, the flipped fields should be reordered into metadata, value.
     let variant_nested_v_array_expected = Arc::new(StructArray::try_new(
@@ -1055,22 +1093,22 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
-    let table_schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let table_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "v",
         DataType::unshredded_variant(),
-    )]));
+    )])?);
 
     // The table will be attempted to be written in this form but be read into
     // STRUCT<metadata: BINARY, value: BINARY>. The read should fail because the default engine
     // currently does not support shredded reads.
-    let shredded_write_schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let shredded_write_schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "v",
-        DataType::struct_type([
+        DataType::try_struct_type([
             StructField::new("metadata", DataType::BINARY, true),
             StructField::new("value", DataType::BINARY, true),
             StructField::new("typed_value", DataType::INTEGER, true),
-        ]),
-    )]));
+        ])?,
+    )])?);
 
     let tmp_test_dir = tempdir()?;
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
@@ -1188,10 +1226,10 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let table_name = "test_domain_metadata_basic";
 
@@ -1265,10 +1303,10 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
 async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let table_name = "test_domain_metadata_errors";
     let (store, engine, table_location) = engine_store_setup(table_name, None);
@@ -1314,10 +1352,10 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::new(vec![StructField::nullable(
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
         "number",
         DataType::INTEGER,
-    )]));
+    )])?);
 
     let table_name = "test_domain_metadata_unsupported";
 
