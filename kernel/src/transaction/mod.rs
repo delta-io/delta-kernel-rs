@@ -9,6 +9,7 @@ use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
+use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::ParsedLogPath;
@@ -219,8 +220,13 @@ impl Transaction {
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
+        // Convert EngineData to FilteredEngineData with all rows selected
+        let filtered_actions = actions
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
+
         let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
+        match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
+        {
             Ok(()) => Ok(CommitResult::Committed {
                 version: commit_version,
                 post_commit_stats: PostCommitStats {

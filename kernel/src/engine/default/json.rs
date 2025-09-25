@@ -21,6 +21,7 @@ use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -136,7 +137,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buffer = to_json_bytes(data)?;
@@ -774,7 +775,9 @@ mod tests {
 
         // First write with no existing file
         let data = create_test_data(vec!["remi", "wilson"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+        let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
+        let result =
+            handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
         // Verify the first write is successful
         assert!(result.is_ok());
@@ -783,7 +786,9 @@ mod tests {
 
         // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+        let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
+        let result =
+            handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
             // Verify the second write is successful
