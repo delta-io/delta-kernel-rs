@@ -340,6 +340,30 @@ pub unsafe extern "C" fn get_from_string_map(
         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
 }
 
+/// Visit all values in a CStringMap. The callback will be called once for each element of the map
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CStringMap`] pointer and callback
+#[no_mangle]
+pub unsafe extern "C" fn visit_string_map(
+    map: &CStringMap,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    for (key, val) in map.values.iter() {
+        visitor(
+            engine_context,
+            kernel_string_slice!(key),
+            kernel_string_slice!(val),
+        );
+    }
+}
+
 /// Transformation expressions that need to be applied to each row `i` in ScanMetadata. You can use
 /// [`get_transform_for_row`] to get the transform for a particular row. If that returns an
 /// associated expression, it _must_ be applied to the data read from the file specified by the
@@ -486,4 +510,43 @@ pub unsafe extern "C" fn visit_scan_metadata(
     scan_metadata
         .visit_scan_files(context_wrapper, rust_callback)
         .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, ptr::NonNull};
+
+    use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
+
+    extern "C" fn visit_entry(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ) {
+        let map_ptr: *mut HashMap<String, String> = engine_context.unwrap().as_ptr().cast();
+        let key = unsafe { String::try_from_slice(&key).unwrap() };
+        let value = unsafe { String::try_from_slice(&value).unwrap() };
+        unsafe {
+            (*map_ptr).insert(key, value);
+        }
+    }
+
+    #[test]
+    fn visit_string_map() {
+        let test_map: HashMap<String, String> = HashMap::from([
+            ("A".into(), "B".into()),
+            ("C".into(), "D".into()),
+            ("E".into(), "F".into()),
+            ("G".into(), "H".into()),
+        ]);
+        let cmap: super::CStringMap = test_map.clone().into();
+        let context_map: Box<HashMap<String, String>> = Box::default();
+        let map_ptr: *mut HashMap<String, String> = Box::into_raw(context_map);
+        unsafe {
+            let ptr = NonNull::new_unchecked(map_ptr.cast());
+            super::visit_string_map(&cmap, Some(ptr), visit_entry);
+        }
+        let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
+        assert_eq!(test_map, final_map);
+    }
 }

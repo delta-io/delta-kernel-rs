@@ -44,6 +44,7 @@ pub(crate) struct ScanLogReplayProcessor {
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
     logical_schema: SchemaRef,
+    physical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
@@ -57,6 +58,7 @@ impl ScanLogReplayProcessor {
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
         logical_schema: SchemaRef,
+        physical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
     ) -> Self {
         Self {
@@ -69,6 +71,7 @@ impl ScanLogReplayProcessor {
             ),
             seen_file_keys: Default::default(),
             logical_schema,
+            physical_schema,
             transform_spec,
         }
     }
@@ -82,6 +85,7 @@ struct AddRemoveDedupVisitor<'seen> {
     deduplicator: FileActionDeduplicator<'seen>,
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
+    physical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
@@ -100,6 +104,7 @@ impl AddRemoveDedupVisitor<'_> {
         seen: &mut HashSet<FileActionKey>,
         selection_vector: Vec<bool>,
         logical_schema: SchemaRef,
+        physical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
         partition_filter: Option<PredicateRef>,
         is_log_batch: bool,
@@ -115,6 +120,7 @@ impl AddRemoveDedupVisitor<'_> {
             ),
             selection_vector,
             logical_schema,
+            physical_schema,
             transform_spec,
             partition_filter,
             row_transform_exprs: Vec::new(),
@@ -184,7 +190,7 @@ impl AddRemoveDedupVisitor<'_> {
         let transform = self
             .transform_spec
             .as_ref()
-            .map(|transform| get_transform_expr(transform, partition_values))
+            .map(|transform| get_transform_expr(transform, partition_values, &self.physical_schema))
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
@@ -321,6 +327,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             &mut self.seen_file_keys,
             selection_vector,
             self.logical_schema.clone(),
+            self.physical_schema.clone(),
             self.transform_spec.clone(),
             self.partition_filter.clone(),
             is_log_batch,
@@ -353,11 +360,18 @@ pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     logical_schema: SchemaRef,
+    physical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform_spec)
-        .process_actions_iter(action_iter)
+    ScanLogReplayProcessor::new(
+        engine,
+        physical_predicate,
+        logical_schema,
+        physical_schema,
+        transform_spec,
+    )
+    .process_actions_iter(action_iter)
 }
 
 #[cfg(test)]
@@ -438,6 +452,7 @@ mod tests {
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            logical_schema.clone(),
             logical_schema,
             None,
             None,
@@ -467,6 +482,7 @@ mod tests {
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            schema.clone(),
             schema,
             static_transform,
             None,
