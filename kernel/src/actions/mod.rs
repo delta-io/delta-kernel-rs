@@ -190,27 +190,32 @@ impl TryFrom<Format> for Scalar {
 )]
 #[internal_api]
 pub(crate) struct Metadata {
-    // TODO: Make the struct fields private to force using the try_new function.
     /// Unique identifier for this table
-    pub(crate) id: String,
+    id: String,
     /// User-provided identifier for this table
-    pub(crate) name: Option<String>,
+    name: Option<String>,
     /// User-provided description for this table
-    pub(crate) description: Option<String>,
+    description: Option<String>,
     /// Specification of the encoding for the files stored in the table
-    pub(crate) format: Format,
+    format: Format,
     /// Schema of the table
-    pub(crate) schema_string: String,
+    schema_string: String,
     /// Column names by which the data should be partitioned
-    pub(crate) partition_columns: Vec<String>,
+    partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
-    pub(crate) created_time: Option<i64>,
+    created_time: Option<i64>,
     /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
-    pub(crate) configuration: HashMap<String, String>,
+    configuration: HashMap<String, String>,
 }
 
 impl Metadata {
+    /// Create a new [`Metadata`] instances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are any metadata columns in the schema.
     // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
+    #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
@@ -246,6 +251,13 @@ impl Metadata {
         })
     }
 
+    #[internal_api]
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+        let mut visitor = MetadataVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.metadata)
+    }
+
     // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
     #[internal_api]
     #[allow(dead_code)]
@@ -269,12 +281,6 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn created_time(&self) -> Option<i64> {
         self.created_time
-    }
-
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
-        let mut visitor = MetadataVisitor::default();
-        visitor.visit_rows_of(data)?;
-        Ok(visitor.metadata)
     }
 
     #[internal_api]
