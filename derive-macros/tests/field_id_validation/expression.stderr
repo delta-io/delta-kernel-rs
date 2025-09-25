@@ -1,0 +1,11 @@
+error: field_id error: Expected field-id to be an integer
+ --> tests/field_id_validation/expression.rs:7:18
+  |
+7 |     #[field_id = MY_ID]  // Should be literal, not expression
+  |                  ^^^^^
+
+error: attribute value must be a literal
+ --> tests/field_id_validation/expression.rs:7:18
+  |
+7 |     #[field_id = MY_ID]  // Should be literal, not expression
+  |                  ^^^^^

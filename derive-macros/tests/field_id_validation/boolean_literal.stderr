@@ -1,0 +1,5 @@
+error: field_id error: Expected field-id to be an integer
+ --> tests/field_id_validation/boolean_literal.rs:5:18
+  |
+5 |     #[field_id = true]  // Should be integer, not boolean
+  |                  ^^^^

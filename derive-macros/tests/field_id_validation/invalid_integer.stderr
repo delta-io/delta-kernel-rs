@@ -1,0 +1,5 @@
+error: field_id error: Failed to parse integer: number too large to fit in target type
+ --> tests/field_id_validation/invalid_integer.rs:5:18
+  |
+5 |     #[field_id = 18446744073709551616]  // This is u64::MAX + 1, too large for i64
+  |                  ^^^^^^^^^^^^^^^^^^^^
