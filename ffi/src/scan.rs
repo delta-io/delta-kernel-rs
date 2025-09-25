@@ -17,7 +17,8 @@ use crate::expressions::SharedExpression;
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
+    TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -389,13 +390,14 @@ pub struct CTransforms {
 pub unsafe extern "C" fn get_transform_for_row(
     row: usize,
     transforms: &CTransforms,
-) -> Option<Handle<SharedExpression>> {
+) -> OptionalValue<Handle<SharedExpression>> {
     transforms
         .transforms
         .get(row)
         .cloned()
         .flatten()
         .map(Into::into)
+        .into()
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
