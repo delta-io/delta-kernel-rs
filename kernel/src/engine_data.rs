@@ -19,11 +19,26 @@ use crate::{AsAny, DeltaResult, Error};
 pub struct FilteredEngineData {
     // The underlying engine data
     pub data: Box<dyn EngineData>,
-    // The selection vector where `true` marks rows to include in results
+    // The selection vector where `true` marks rows to include in results. N.B. this selection
+    // vector may be less then `data.len()` and any gaps represent rows that are assumed to be selected.
     pub selection_vector: Vec<bool>,
 }
 
 impl FilteredEngineData {
+    pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> DeltaResult<Self> {
+        if selection_vector.len() > data.len() {
+            return Err(Error::InvalidSelectionVector(format!(
+                "Selection vector is larger than data length: {} > {}",
+                selection_vector.len(),
+                data.len()
+            )));
+        }
+        Ok(Self {
+            data,
+            selection_vector,
+        })
+    }
+
     /// Creates a new `FilteredEngineData` with all rows selected.
     ///
     /// This is a convenience method for the common case where you want to wrap
@@ -43,9 +58,8 @@ impl HasSelectionVector for FilteredEngineData {
         if self.selection_vector.len() < self.data.len() {
             return true;
         }
-        let relevant_selection = &self.selection_vector[..self.data.len()];
 
-        relevant_selection.contains(&true)
+        self.selection_vector.contains(&true)
     }
 }
 
@@ -431,10 +445,7 @@ mod tests {
         .unwrap();
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
 
-        let filtered_data = FilteredEngineData {
-            data,
-            selection_vector: vec![],
-        };
+        let filtered_data = FilteredEngineData::try_new(data, vec![]).unwrap();
 
         // Empty data should return false even with empty selection vector
         assert!(!filtered_data.has_selected_rows());
@@ -456,10 +467,7 @@ mod tests {
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
 
         // Selection vector with only 2 elements for 3 rows of data
-        let filtered_data = FilteredEngineData {
-            data,
-            selection_vector: vec![false, false],
-        };
+        let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
 
         // Should return true because selection vector is shorter than data
         assert!(filtered_data.has_selected_rows());
@@ -480,10 +488,7 @@ mod tests {
         .unwrap();
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
 
-        let filtered_data = FilteredEngineData {
-            data,
-            selection_vector: vec![false, false],
-        };
+        let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
 
         // Should return false because no rows are selected
         assert!(!filtered_data.has_selected_rows());
@@ -504,33 +509,37 @@ mod tests {
         .unwrap();
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
 
-        let filtered_data = FilteredEngineData {
-            data,
-            selection_vector: vec![true, false, true],
-        };
+        let filtered_data = FilteredEngineData::try_new(data, vec![true, false, true]).unwrap();
 
         // Should return true because some rows are selected
         assert!(filtered_data.has_selected_rows());
     }
 
     #[test]
-    fn test_has_selected_rows_selection_vector_longer_than_data() {
-        // Test with selection vector longer than data (edge case)
+    fn test_try_new_selection_vector_larger_than_data() {
+        // Test with selection vector larger than data length - should return error
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "value",
             ArrowDataType::Utf8,
             true,
         )]));
-        let record_batch =
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["row1"]))]).unwrap();
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["row1", "row2"]))],
+        )
+        .unwrap();
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
 
-        let filtered_data = FilteredEngineData {
-            data,
-            selection_vector: vec![false, true],
-        };
+        // Selection vector with 3 elements for 2 rows of data - should fail
+        let result = FilteredEngineData::try_new(data, vec![true, false, true]);
 
-        // Selected row is passed, engine data.
-        assert!(!filtered_data.has_selected_rows());
+        // Should return an error
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e
+                .to_string()
+                .contains("Selection vector is larger than data length"));
+            assert!(e.to_string().contains("3 > 2"));
+        }
     }
 }

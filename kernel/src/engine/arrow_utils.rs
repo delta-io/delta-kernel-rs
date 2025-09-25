@@ -2819,10 +2819,8 @@ mod tests {
             || -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch.clone())) };
 
         // Test case 1: All rows selected (should include all 4 rows)
-        let all_selected = FilteredEngineData {
-            data: create_engine_data(),
-            selection_vector: vec![true, true, true, true],
-        };
+        let all_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![true, true, true, true])?;
         let json_all = to_json_bytes(Box::new(std::iter::once(Ok(all_selected))))?;
         assert_eq!(
             json_all,
@@ -2830,10 +2828,8 @@ mod tests {
         );
 
         // Test case 2: Only first and last rows selected (should include only 2 rows)
-        let partial_selected = FilteredEngineData {
-            data: create_engine_data(),
-            selection_vector: vec![true, false, false, true],
-        };
+        let partial_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![true, false, false, true])?;
         let json_partial = to_json_bytes(Box::new(std::iter::once(Ok(partial_selected))))?;
         assert_eq!(
             json_partial,
@@ -2841,10 +2837,8 @@ mod tests {
         );
 
         // Test case 3: Only middle rows selected (should include only 2 rows)
-        let middle_selected = FilteredEngineData {
-            data: create_engine_data(),
-            selection_vector: vec![false, true, true, false],
-        };
+        let middle_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, true, true, false])?;
         let json_middle = to_json_bytes(Box::new(std::iter::once(Ok(middle_selected))))?;
         assert_eq!(
             json_middle,
@@ -2852,36 +2846,22 @@ mod tests {
         );
 
         // Test case 4: No rows selected (should produce empty output)
-        let none_selected = FilteredEngineData {
-            data: create_engine_data(),
-            selection_vector: vec![false, false, false, false],
-        };
+        let none_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, false, false, false])?;
         let json_none = to_json_bytes(Box::new(std::iter::once(Ok(none_selected))))?;
         assert_eq!(json_none, "".as_bytes());
 
         // Test case 5: Only one row selected (should include only 1 row)
-        let one_selected = FilteredEngineData {
-            data: create_engine_data(),
-            selection_vector: vec![false, true, false, false],
-        };
+        let one_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, true, false, false])?;
         let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
         assert_eq!(json_one, "{\"value\":\"row1\"}\n".as_bytes());
 
         // Test case 6: Only one row selected implicitly by short vector
-        let one_selected = FilteredEngineData {
-            data: create_engine_data(),
-            selection_vector: vec![false, false, false],
-        };
+        let one_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, false, false])?;
         let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
         assert_eq!(json_one, "{\"value\":\"row3\"}\n".as_bytes());
-
-        // Test case 7: No rows selected with longer vector.
-        let one_selected = FilteredEngineData {
-            data: create_engine_data(),
-            selection_vector: vec![false, false, false, false, true],
-        };
-        let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
-        assert_eq!(json_one, "".as_bytes());
 
         Ok(())
     }
