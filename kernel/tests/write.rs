@@ -183,17 +183,14 @@ async fn write_data_and_check_result_and_stats(
 
     // commit!
     match txn.commit(engine.as_ref())? {
-        CommitResult::Committed {
-            version,
-            post_commit_stats,
-        } => {
-            assert_eq!(version, expected_since_commit as Version);
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.version(), expected_since_commit as Version);
             assert_eq!(
-                post_commit_stats.commits_since_checkpoint,
+                committed.post_commit_stats().commits_since_checkpoint,
                 expected_since_commit
             );
             assert_eq!(
-                post_commit_stats.commits_since_log_compaction,
+                committed.post_commit_stats().commits_since_log_compaction,
                 expected_since_commit
             );
         }
