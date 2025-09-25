@@ -1384,7 +1384,8 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 }
 
 #[tokio::test]
-async fn test_remove_domain_metadata_basic() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn std::error::Error>>
+{
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -1411,7 +1412,7 @@ async fn test_remove_domain_metadata_basic() -> Result<(), Box<dyn std::error::E
 
     let domain = "app.deprecated";
 
-    // removing domain metadata that is not present is allowed; the log simply contains a tombstone action
+    // removing domain metadata that doesn't exist should NOT write a tombstone
     txn.with_domain_metadata_removed(domain.to_string())
         .commit(&engine)?;
 
@@ -1426,13 +1427,11 @@ async fn test_remove_domain_metadata_basic() -> Result<(), Box<dyn std::error::E
         .into_iter()
         .try_collect()?;
 
-    let domain_action = actions
-        .iter()
-        .find(|v| v.get("domainMetadata").is_some())
-        .unwrap();
-    assert_eq!(domain_action["domainMetadata"]["domain"], "app.deprecated");
-    assert_eq!(domain_action["domainMetadata"]["configuration"], "");
-    assert_eq!(domain_action["domainMetadata"]["removed"], true);
+    let domain_action = actions.iter().find(|v| v.get("domainMetadata").is_some());
+    assert!(
+        domain_action.is_none(),
+        "No tombstone should be written for non-existent domain"
+    );
 
     let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let config = final_snapshot.get_domain_metadata(domain, &engine)?;
@@ -1513,8 +1512,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
 }
 
 #[tokio::test]
-async fn test_domain_metadata_set_then_remove_across_transactions(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
@@ -1537,20 +1535,21 @@ async fn test_domain_metadata_set_then_remove_across_transactions(
     .await?;
 
     let domain = "app.config";
+    let configuration = r#"{"version": 1}"#;
 
-    // txn 1: Set domain metadata
+    // txn 1: set domain metadata
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let txn = snapshot.transaction()?;
-    txn.with_domain_metadata(domain.to_string(), r#"{"version": 1}"#.to_string())
+    txn.with_domain_metadata(domain.to_string(), configuration.to_string())
         .commit(&engine)?;
 
-    // txn 2: Remove the same domain metadata
+    // txn 2: remove the same domain metadata
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let txn = snapshot.transaction()?;
     txn.with_domain_metadata_removed(domain.to_string())
         .commit(&engine)?;
 
-    // verify removal commit
+    // verify removal commit preserves the previous configuration
     let commit_data = store
         .get(&Path::from(format!(
             "/{table_name}/_delta_log/00000000000000000002.json"
@@ -1567,7 +1566,10 @@ async fn test_domain_metadata_set_then_remove_across_transactions(
         .find(|v| v.get("domainMetadata").is_some())
         .unwrap();
     assert_eq!(domain_action["domainMetadata"]["domain"], domain);
-    assert_eq!(domain_action["domainMetadata"]["configuration"], "");
+    assert_eq!(
+        domain_action["domainMetadata"]["configuration"],
+        configuration
+    );
     assert_eq!(domain_action["domainMetadata"]["removed"], true);
 
     // verify reads see the metadata removal
