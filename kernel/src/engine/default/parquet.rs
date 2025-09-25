@@ -338,7 +338,7 @@ impl FileOpener for ParquetOpener {
                 builder = builder.with_limit(limit)
             }
 
-            let mut row_indexes = row_indexes.map(|rb| rb.into_iter());
+            let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = builder.with_batch_size(batch_size).build()?;
 
             let stream = stream.map(move |rbr| {
@@ -416,7 +416,7 @@ impl FileOpener for PresignedUrlOpener {
 
             let reader = builder.with_batch_size(batch_size).build()?;
 
-            let mut row_indexes = row_indexes.map(|rb| rb.into_iter());
+            let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
                 fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())
