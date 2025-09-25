@@ -43,7 +43,6 @@ impl HasSelectionVector for FilteredEngineData {
         if self.selection_vector.len() < self.data.len() {
             return true;
         }
-        // Trim the selection vector to the data length, just to be thorough.
         let relevant_selection = &self.selection_vector[..self.data.len()];
 
         relevant_selection.contains(&true)
