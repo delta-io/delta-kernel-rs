@@ -341,18 +341,15 @@ pub struct ScanMetadata {
 }
 
 impl ScanMetadata {
-    fn new(
+    fn try_new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
-    ) -> Self {
-        Self {
-            scan_files: FilteredEngineData {
-                data,
-                selection_vector,
-            },
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
-        }
+        })
     }
 }
 

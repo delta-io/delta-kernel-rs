@@ -114,10 +114,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         self.seen_protocol = visitor.seen_protocol;
         self.seen_metadata = visitor.seen_metadata;
 
-        let filtered_data = FilteredEngineData {
-            data: actions,
-            selection_vector: visitor.selection_vector,
-        };
+        let filtered_data = FilteredEngineData::try_new(actions, visitor.selection_vector)?;
 
         Ok(ActionReconciliationBatch {
             filtered_data,
