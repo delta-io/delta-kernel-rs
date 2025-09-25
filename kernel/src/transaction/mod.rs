@@ -330,7 +330,7 @@ impl Transaction {
     fn generate_logical_to_physical(&self) -> Expression {
         // for now, we just pass through all the columns except partition columns.
         // note this is _incorrect_ if table config deems we need partition columns.
-        let partition_columns = &self.read_snapshot.metadata().partition_columns;
+        let partition_columns = self.read_snapshot.metadata().partition_columns();
         let schema = self.read_snapshot.schema();
         let fields = schema
             .fields()
