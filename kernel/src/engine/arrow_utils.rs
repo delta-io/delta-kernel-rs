@@ -63,6 +63,7 @@ macro_rules! prim_array_cmp {
 pub(crate) use prim_array_cmp;
 
 type FieldIndex = usize;
+type FlattenedRangeIterator<T> = std::iter::Flatten<std::vec::IntoIter<Range<T>>>;
 
 /// contains information about a StructField matched to a parquet struct field
 ///
@@ -128,21 +129,36 @@ impl RowIndexBuilder {
         // filtering is not idempotent and `with_row_groups` could be called more than once.
         self.row_group_ordinals = Some(ordinals.to_vec())
     }
-}
 
-impl IntoIterator for RowIndexBuilder {
-    type Item = i64;
-    type IntoIter = std::iter::Flatten<std::vec::IntoIter<Range<Self::Item>>>;
-
-    fn into_iter(self) -> Self::IntoIter {
+    /// Build an iterator of row indexes, filtering out row groups that were skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are duplicate or out of bounds row group ordinals.
+    pub(crate) fn build(self) -> DeltaResult<FlattenedRangeIterator<i64>> {
         let starting_offsets = match self.row_group_ordinals {
-            Some(ordinals) => ordinals
-                .iter()
-                .map(|i| self.row_group_row_index_ranges[*i].clone())
-                .collect(),
+            Some(ordinals) => {
+                let mut seen_ordinals = HashSet::new();
+                ordinals
+                    .iter()
+                    .map(|&i| {
+                        // We verify that there are no duplicate or out of bounds ordinals
+                        if !seen_ordinals.insert(i) {
+                            return Err(Error::generic("Found duplicate row group ordinal"));
+                        }
+                        // We have to clone here to avoid modifying the original vector in each iteration
+                        self.row_group_row_index_ranges
+                            .get(i)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::generic(format!("Row group ordinal {i} is out of bounds"))
+                            })
+                    })
+                    .try_collect()?
+            }
             None => self.row_group_row_index_ranges,
         };
-        starting_offsets.into_iter().flatten()
+        Ok(starting_offsets.into_iter().flatten())
     }
 }
 
@@ -153,7 +169,7 @@ impl IntoIterator for RowIndexBuilder {
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
-    row_indexes: Option<&mut <RowIndexBuilder as IntoIterator>::IntoIter>,
+    row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
 ) -> DeltaResult<T>
 where
     StructArray: Into<T>,
@@ -750,7 +766,7 @@ type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
-    mut row_indexes: Option<&mut <RowIndexBuilder as IntoIterator>::IntoIter>,
+    mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
 ) -> DeltaResult<StructArray> {
     debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
@@ -1151,6 +1167,41 @@ mod tests {
                 name.as_ref().to_string().into(),
             ),
         ])
+    }
+
+    /// Helper function to create mock row group metadata for testing
+    fn create_mock_row_group(num_rows: i64) -> RowGroupMetaData {
+        use crate::parquet::basic::{Encoding, Type as PhysicalType};
+        use crate::parquet::file::metadata::ColumnChunkMetaData;
+        use crate::parquet::schema::types::Type;
+
+        // Create a minimal schema descriptor
+        let schema = Arc::new(SchemaDescriptor::new(Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(vec![Arc::new(
+                    Type::primitive_type_builder("test_col", PhysicalType::INT32)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        )));
+
+        // Create a minimal column chunk metadata
+        let column_chunk = ColumnChunkMetaData::builder(schema.column(0))
+            .set_encodings(vec![Encoding::PLAIN])
+            .set_total_compressed_size(100)
+            .set_total_uncompressed_size(100)
+            .set_num_values(num_rows)
+            .build()
+            .unwrap();
+
+        RowGroupMetaData::builder(schema)
+            .set_num_rows(num_rows)
+            .set_total_byte_size(100)
+            .set_column_metadata(vec![column_chunk])
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -1781,6 +1832,103 @@ mod tests {
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn test_row_index_builder_no_skipping() {
+        let row_groups = vec![
+            create_mock_row_group(5), // 5 rows: indexes 0-4
+            create_mock_row_group(3), // 3 rows: indexes 5-7
+            create_mock_row_group(4), // 4 rows: indexes 8-11
+        ];
+
+        let builder = RowIndexBuilder::new(&row_groups);
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
+
+        // Should produce consecutive indexes from 0 to 11
+        assert_eq!(row_indexes, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn test_row_index_builder_with_skipping() {
+        let row_groups = vec![
+            create_mock_row_group(5), // 5 rows: indexes 0-4
+            create_mock_row_group(3), // 3 rows: indexes 5-7 (will be skipped)
+            create_mock_row_group(4), // 4 rows: indexes 8-11
+            create_mock_row_group(2), // 2 rows: indexes 12-13 (will be skipped)
+        ];
+
+        let mut builder = RowIndexBuilder::new(&row_groups);
+        builder.select_row_groups(&[0, 2]);
+
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
+
+        // Should produce indexes from row groups 0 and 2: [0-4] and [8-11]
+        assert_eq!(row_indexes, vec![0, 1, 2, 3, 4, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn test_row_index_builder_single_row_group() {
+        let row_groups = vec![create_mock_row_group(7)];
+
+        let mut builder = RowIndexBuilder::new(&row_groups);
+        builder.select_row_groups(&[0]);
+
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
+
+        assert_eq!(row_indexes, vec![0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_row_index_builder_empty_selection() {
+        let row_groups = vec![create_mock_row_group(3), create_mock_row_group(2)];
+
+        let mut builder = RowIndexBuilder::new(&row_groups);
+        builder.select_row_groups(&[]);
+
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
+
+        // Should produce no indexes
+        assert_eq!(row_indexes, Vec::<i64>::new());
+    }
+
+    #[test]
+    fn test_row_index_builder_out_of_order_selection() {
+        let row_groups = vec![
+            create_mock_row_group(2), // 2 rows: indexes 0-1
+            create_mock_row_group(3), // 3 rows: indexes 2-4
+            create_mock_row_group(1), // 1 row: index 5
+        ];
+
+        let mut builder = RowIndexBuilder::new(&row_groups);
+        builder.select_row_groups(&[2, 0]);
+
+        let row_indexes: Vec<i64> = builder.build().unwrap().collect();
+
+        // Should produce indexes in the order specified: group 2 first, then group 0
+        assert_eq!(row_indexes, vec![5, 0, 1]);
+    }
+
+    #[test]
+    fn test_row_index_builder_out_of_bounds_row_group_ordinals() {
+        let row_groups = vec![create_mock_row_group(2)];
+
+        let mut builder = RowIndexBuilder::new(&row_groups);
+        builder.select_row_groups(&[1]);
+
+        let result = builder.build();
+        assert_result_error_with_message(result, "Row group ordinal 1 is out of bounds");
+    }
+
+    #[test]
+    fn test_row_index_builder_duplicate_row_group_ordinals() {
+        let row_groups = vec![create_mock_row_group(2), create_mock_row_group(3)];
+
+        let mut builder = RowIndexBuilder::new(&row_groups);
+        builder.select_row_groups(&[1, 1]);
+
+        let result = builder.build();
+        assert_result_error_with_message(result, "Found duplicate row group ordinal");
     }
 
     #[test]

@@ -64,7 +64,6 @@ impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
         Ok(DomainMetadata::new(
             RowTrackingDomainMetadata::ROW_TRACKING_DOMAIN_NAME.to_string(),
             serde_json::to_string(&metadata)?,
-            false,
         ))
     }
 }
