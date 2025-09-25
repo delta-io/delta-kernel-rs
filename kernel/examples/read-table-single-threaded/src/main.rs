@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use common::{LocationArgs, ScanArgs};
+use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::{DeltaResult, Snapshot};
 
@@ -39,7 +39,7 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
