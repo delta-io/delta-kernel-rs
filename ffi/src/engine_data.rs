@@ -13,12 +13,13 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
 use std::ffi::c_void;
+use std::sync::Arc;
 
 #[cfg(feature = "default-engine-base")]
 use crate::error::AllocateErrorFn;
 use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
-use crate::{ExternResult, IntoExternResult, SharedExternEngine};
+use crate::{ExternResult, IntoExternResult, SharedEngineData, SharedExternEngine};
 
 use super::handle::Handle;
 
@@ -116,7 +117,7 @@ pub unsafe extern "C" fn get_engine_data(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
     allocate_error: AllocateErrorFn,
-) -> ExternResult<Handle<ExclusiveEngineData>> {
+) -> ExternResult<Handle<SharedEngineData>> {
     get_engine_data_impl(array, schema).into_extern_result(&allocate_error)
 }
 
@@ -124,10 +125,10 @@ pub unsafe extern "C" fn get_engine_data(
 unsafe fn get_engine_data_impl(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-) -> DeltaResult<Handle<ExclusiveEngineData>> {
+) -> DeltaResult<Handle<SharedEngineData>> {
     let array_data = unsafe { arrow::array::ffi::from_ffi(array, schema) };
     let record_batch: RecordBatch = StructArray::from(array_data?).into();
     let arrow_engine_data: ArrowEngineData = record_batch.into();
-    let engine_data: Box<dyn EngineData> = Box::new(arrow_engine_data);
+    let engine_data: Arc<dyn EngineData> = Arc::new(arrow_engine_data);
     Ok(engine_data.into())
 }

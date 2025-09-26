@@ -68,7 +68,7 @@ impl DataFileMetadata {
         &self,
         partition_values: &HashMap<String, String>,
         data_change: bool,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> DeltaResult<Arc<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
                 FileMeta {
@@ -108,7 +108,7 @@ impl DataFileMetadata {
             1,
         )?);
 
-        Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
+        Ok(Arc::new(ArrowEngineData::new(RecordBatch::try_new(
             Arc::new(add_files_schema().as_ref().try_into_arrow()?),
             vec![
                 path,
@@ -199,7 +199,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
         data_change: bool,
-    ) -> DeltaResult<Box<dyn EngineData>> {
+    ) -> DeltaResult<Arc<dyn EngineData>> {
         let parquet_metadata = self.write_parquet(path, data).await?;
         parquet_metadata.as_record_batch(&partition_values, data_change)
     }
@@ -505,10 +505,14 @@ mod tests {
         let data_file_metadata = DataFileMetadata::new(file_metadata, num_records);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
         let data_change = true;
-        let actual = data_file_metadata
+        let actual_arc = data_file_metadata
             .as_record_batch(&partition_values, data_change)
             .unwrap();
-        let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
+        // Downcast Arc<dyn EngineData> to get the ArrowEngineData for testing
+        let actual_any = actual_arc.as_any();
+        let actual = actual_any
+            .downcast_ref::<ArrowEngineData>()
+            .unwrap();
 
         let schema = Arc::new(
             crate::transaction::add_files_schema()
