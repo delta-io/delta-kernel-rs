@@ -82,8 +82,6 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
-use crate::path::ParsedLogPath;
-
 use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;

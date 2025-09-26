@@ -1,8 +1,11 @@
 //! Utilities to make working with directory and file paths easier
 
+use std::slice;
 use std::str::FromStr;
 
-use crate::{DeltaResult, Error, FileMeta, Version};
+use crate::actions::visitors::InCommitTimestampVisitor;
+use crate::engine_data::RowVisitor;
+use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
 use url::Url;
@@ -298,6 +301,50 @@ impl ParsedLogPath<Url> {
             ));
         }
         Ok(path)
+    }
+
+    /// Extract the In-Commit Timestamp from the CommitInfo action in this commit log file.
+    /// This is a utility function that can be used by multiple parts of the codebase
+    /// (snapshot, CDF, time travel, etc.).
+    ///
+    /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
+    /// Callers should handle enablement version checks before calling this method.
+    #[internal_api]
+    pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+        // Only works on commit files
+        if !self.is_commit() {
+            return Err(Error::generic(format!(
+                "read_in_commit_timestamp can only be called on commit files, got: {:?}",
+                self.file_type
+            )));
+        }
+
+        let file_meta = FileMeta {
+            location: self.location.clone(),
+            last_modified: 0, // Not used for reading
+            size: 0,          // Not used for reading
+        };
+
+        let mut action_iter = engine.json_handler().read_json_files(
+            slice::from_ref(&file_meta),
+            InCommitTimestampVisitor::schema(),
+            None,
+        )?;
+
+        // Process the actions to find inCommitTimestamp
+        // According to protocol, CommitInfo MUST be the first action when ICT is enabled,
+        // so we can optimize by only reading the first batch
+        match action_iter.next() {
+            Some(Ok(actions)) => {
+                let mut visitor = InCommitTimestampVisitor::default();
+                visitor.visit_rows_of(actions.as_ref())?;
+                visitor
+                    .in_commit_timestamp
+                    .ok_or_else(|| Error::generic("In-Commit Timestamp not found in commit file"))
+            }
+            Some(Err(err)) => Err(err),
+            None => Err(Error::generic("Commit file contains no actions")),
+        }
     }
 }
 
