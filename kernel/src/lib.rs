@@ -108,6 +108,10 @@ pub use log_path::LogPath;
 
 mod row_tracking;
 
+mod create_table;
+#[cfg(feature = "internal-api")]
+pub use create_table::CreateTableBuilder;
+
 mod arrow_compat;
 #[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
 pub use arrow_compat::*;
@@ -167,6 +171,8 @@ use schema::{SchemaTransform, StructField, StructType};
     feature = "arrow-conversion"
 ))]
 pub mod engine;
+
+pub(crate) const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Delta table version is 8 byte unsigned int
 pub type Version = u64;
