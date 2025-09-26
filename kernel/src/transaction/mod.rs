@@ -117,7 +117,7 @@ pub struct Transaction {
     read_snapshot: SnapshotRef,
     operation: Option<String>,
     engine_info: Option<String>,
-    add_files_metadata: Vec<Box<dyn EngineData>>,
+    add_files_metadata: Vec<Arc<dyn EngineData>>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -360,7 +360,7 @@ impl Transaction {
     /// to add multiple batches.
     ///
     /// The expected schema for `add_metadata` is given by [`add_files_schema`].
-    pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
+    pub fn add_files(&mut self, add_metadata: Arc<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
 
