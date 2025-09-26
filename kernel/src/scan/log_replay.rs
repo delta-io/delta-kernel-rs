@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use super::data_skipping::DataSkippingFilter;
-use super::ScanMetadata;
+use super::{PhysicalPredicate, ScanMetadata, StateInfo};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -43,9 +43,7 @@ pub(crate) struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    transform_spec: Option<Arc<TransformSpec>>,
+    state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -54,13 +52,23 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(
-        engine: &dyn Engine,
-        physical_predicate: Option<(PredicateRef, SchemaRef)>,
-        logical_schema: SchemaRef,
-        physical_schema: SchemaRef,
-        transform_spec: Option<Arc<TransformSpec>>,
-    ) -> Self {
+    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> Self {
+        // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
+        // The DataSkippingFilter and partition_filter components expect the predicate
+        // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
+        // the enum representation to the tuple format.
+        let physical_predicate = match &state_info.physical_predicate {
+            PhysicalPredicate::Some(predicate, schema) => {
+                // Valid predicate that can be used for data skipping and partition filtering
+                Some((predicate.clone(), schema.clone()))
+            }
+            _ => {
+                // Either PhysicalPredicate::None (no predicate provided) or
+                // PhysicalPredicate::StaticSkipAll (predicate always false).
+                // StaticSkipAll is handled at a higher level, so here we treat both as None.
+                None
+            }
+        };
         Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
             data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
@@ -70,9 +78,7 @@ impl ScanLogReplayProcessor {
                 SCAN_ROW_DATATYPE.clone(),
             ),
             seen_file_keys: Default::default(),
-            logical_schema,
-            physical_schema,
-            transform_spec,
+            state_info,
         }
     }
 }
@@ -326,9 +332,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let mut visitor = AddRemoveDedupVisitor::new(
             &mut self.seen_file_keys,
             selection_vector,
-            self.logical_schema.clone(),
-            self.physical_schema.clone(),
-            self.transform_spec.clone(),
+            self.state_info.logical_schema.clone(),
+            self.state_info.physical_schema.clone(),
+            self.state_info.transform_spec.clone(),
             self.partition_filter.clone(),
             is_log_batch,
         );
@@ -359,19 +365,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    transform_spec: Option<Arc<TransformSpec>>,
-    physical_predicate: Option<(PredicateRef, SchemaRef)>,
+    state_info: Arc<StateInfo>,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(
-        engine,
-        physical_predicate,
-        logical_schema,
-        physical_schema,
-        transform_spec,
-    )
-    .process_actions_iter(action_iter)
+    ScanLogReplayProcessor::new(engine, state_info).process_actions_iter(action_iter)
 }
 
 #[cfg(test)]
@@ -386,7 +382,7 @@ mod tests {
         add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
         run_with_validate_callback,
     };
-    use crate::scan::{get_transform_spec, StateInfo};
+    use crate::scan::StateInfo;
     use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
@@ -447,15 +443,18 @@ mod tests {
     fn test_no_transforms() {
         let batch = vec![add_batch_simple(get_log_schema().clone())];
         let logical_schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: logical_schema.clone(),
+            physical_schema: logical_schema.clone(),
+            physical_predicate: crate::scan::PhysicalPredicate::None,
+            transform_spec: None,
+        });
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            logical_schema.clone(),
-            logical_schema,
-            None,
-            None,
+            state_info,
         );
         for res in iter {
             let scan_metadata = res.unwrap();
@@ -473,19 +472,20 @@ mod tests {
             StructField::new("date", DataType::DATE, true),
         ]));
         let partition_cols = ["date".to_string()];
-        let state_info =
-            StateInfo::try_new(schema.as_ref(), &partition_cols, ColumnMappingMode::None).unwrap();
-        let static_transform = Some(Arc::new(get_transform_spec(&state_info.all_fields)));
+        let state_info = StateInfo::try_new(
+            schema.clone(),
+            &partition_cols,
+            ColumnMappingMode::None,
+            None,
+        )
+        .unwrap();
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            schema.clone(),
-            schema,
-            static_transform,
-            None,
+            Arc::new(state_info),
         );
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
