@@ -118,7 +118,11 @@ impl ScanBuilder {
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
         let state_info = StateInfo::try_new(
             logical_schema.as_ref(),
-            self.snapshot.metadata().partition_columns(),
+            &self
+                .snapshot
+                .table_configuration()
+                .metadata()
+                .partition_columns,
             self.snapshot.table_configuration().column_mapping_mode(),
         )?;
 
@@ -594,7 +598,8 @@ impl Scan {
         // - Partition columns: Must be injected from partition values
         // - Column mapping: Physical field names must be mapped to logical field names via output schema
         let static_transform = (self.have_partition_cols
-            || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
+            || self.snapshot.table_configuration().column_mapping_mode()
+                != ColumnMappingMode::None)
             .then(|| Arc::new(get_transform_spec(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
             PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
