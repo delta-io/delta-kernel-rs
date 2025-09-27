@@ -900,21 +900,16 @@ impl StructType {
     }
 
     fn check_case_insensitive_duplicates(struct_type: &StructType) -> DeltaResult<()> {
-        let mut lowercase_names = HashSet::new();
+        let mut lowercase_names = HashMap::new();
         for field in struct_type.fields() {
             let lowercase_name = field.name.to_lowercase();
-            if !lowercase_names.insert(lowercase_name.clone()) {
-                // Find the existing field with the same lowercase name
-                let existing_field = struct_type
-                    .fields()
-                    .find(|f| f.name.to_lowercase() == lowercase_name && f.name != field.name)
-                    .map(|f| f.name.as_str())
-                    .unwrap_or("<unknown>");
+            if Some(field) = lowercase_names.get(lowercase_name) {
                 return Err(Error::schema(format!(
                     "Nested struct contains duplicate field names (case-insensitive): '{}' conflicts with '{}'",
-                    field.name, existing_field
+                    field.name, field
                 )));
             }
+            lowercase_name.insert(lowercase_name, field);
             // Recursively check nested structs
             Self::ensure_no_case_insensitive_duplicates_in_nested(field)?;
         }
