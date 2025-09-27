@@ -439,7 +439,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = snapshot
             .transaction()?
             .with_engine_info("default engine")
-            .with_data_change(true);
+            .with_data_change(false);
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -527,7 +527,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true,
+                    "dataChange": false,
                     "stats": "{\"numRecords\":3}"
                 }
             }),
@@ -539,7 +539,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true,
+                    "dataChange": false,
                     "stats": "{\"numRecords\":3}"
                 }
             }),
