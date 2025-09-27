@@ -16,7 +16,7 @@ use crate::table_configuration::TableConfiguration;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::LogCompactionWriter;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, ParsedLogPath, Version};
 use delta_kernel_derive::internal_api;
 
 mod builder;
@@ -97,7 +97,8 @@ impl Snapshot {
     /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
     /// snapshot to a later version.
     fn try_new_from(
-        existing_snapshot: SnapshotRef,
+        existing_snapshot: Arc<Snapshot>,
+        log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<Arc<Self>> {
@@ -127,6 +128,7 @@ impl Snapshot {
         let new_listed_files = ListedLogFiles::list(
             storage.as_ref(),
             &log_root,
+            log_tail,
             Some(listing_start),
             new_version,
         )?;
@@ -314,11 +316,6 @@ impl Snapshot {
 
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
-        ScanBuilder::new(self)
-    }
-
-    /// Consume this `Snapshot` to create a [`ScanBuilder`]
-    pub fn into_scan_builder(self) -> ScanBuilder {
         ScanBuilder::new(self)
     }
 

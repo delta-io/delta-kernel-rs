@@ -371,9 +371,9 @@ mod tests {
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
         let metadata = Metadata::try_new_from_data(parsed.as_ref())?.unwrap();
-        assert_eq!(metadata.id, "aff5cb91-8cd9-4195-aef9-446908507302");
-        assert_eq!(metadata.created_time, Some(1670892997849));
-        assert_eq!(metadata.partition_columns, vec!("c1", "c2"));
+        assert_eq!(metadata.id(), "aff5cb91-8cd9-4195-aef9-446908507302");
+        assert_eq!(metadata.created_time(), Some(1670892997849));
+        assert_eq!(*metadata.partition_columns(), vec!("c1", "c2"));
         Ok(())
     }
 

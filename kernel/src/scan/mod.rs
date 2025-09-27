@@ -610,6 +610,7 @@ impl Scan {
             engine,
             action_batch_iter,
             self.logical_schema.clone(),
+            self.physical_schema.clone(),
             static_transform,
             physical_predicate,
         );
@@ -792,7 +793,7 @@ impl StateInfo {
 
         // Loop over all selected fields and note if they are columns that will be read from the
         // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-        // be filled in by evaluating an expression ([`ColumnType::Partition`])
+        // be filled in by evaluating an expression ([`ColumnType::MetadataDerivedColumn`])
         let all_fields = logical_schema
             .fields()
             .enumerate()
@@ -809,7 +810,7 @@ impl StateInfo {
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
                     have_partition_cols = true;
-                    Ok(ColumnType::Partition(index))
+                    Ok(ColumnType::MetadataDerivedColumn(index))
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
@@ -975,6 +976,7 @@ pub(crate) mod test_utils {
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            logical_schema.clone(),
             logical_schema,
             transform_spec,
             None,

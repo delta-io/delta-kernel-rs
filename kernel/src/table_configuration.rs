@@ -417,6 +417,7 @@ mod test {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
+    use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -426,14 +427,16 @@ mod test {
 
     #[test]
     fn dv_supported_not_enabled() {
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -448,18 +451,22 @@ mod test {
     }
     #[test]
     fn dv_enabled() {
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            ),
-            (
-                "delta.enableDeletionVectors".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([
+                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                (
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -474,16 +481,29 @@ mod test {
     }
     #[test]
     fn ict_supported_and_enabled() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            configuration: HashMap::from_iter([(
-                "delta.enableInCommitTimestamps".to_string(),
-                "true".to_string(),
-            ),
-                ("delta.inCommitTimestampEnablementVersion".to_string(), "5".to_string()),
-                ("delta.inCommitTimestampEnablementTimestamp".to_string(), "100".to_string())]),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([
+                (
+                    "delta.enableInCommitTimestamps".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "delta.inCommitTimestampEnablementVersion".to_string(),
+                    "5".to_string(),
+                ),
+                (
+                    "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                    "100".to_string(),
+                ),
+            ]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -500,14 +520,19 @@ mod test {
     }
     #[test]
     fn ict_supported_and_enabled_without_enablement_info() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            configuration: HashMap::from_iter([(
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([(
                 "delta.enableInCommitTimestamps".to_string(),
                 "true".to_string(),
             )]),
-            ..Default::default()
-        };
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -525,10 +550,8 @@ mod test {
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -543,10 +566,8 @@ mod test {
     }
     #[test]
     fn fails_on_unsupported_feature() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0)
@@ -554,14 +575,16 @@ mod test {
     }
     #[test]
     fn dv_not_supported() {
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -577,15 +600,16 @@ mod test {
 
     #[test]
     fn test_try_new_from() {
-        let schema_string =r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string();
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: schema_string.clone(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -596,8 +620,15 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
-        let new_metadata = Metadata {
-            configuration: HashMap::from_iter([
+        let new_schema =
+            StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let new_metadata = Metadata::try_new(
+            None,
+            None,
+            new_schema,
+            vec![],
+            0,
+            HashMap::from_iter([
                 (
                     "delta.enableChangeDataFeed".to_string(),
                     "false".to_string(),
@@ -607,9 +638,8 @@ mod test {
                     "true".to_string(),
                 ),
             ]),
-            schema_string,
-            ..Default::default()
-        };
+        )
+        .unwrap();
         let new_protocol = Protocol::try_new(
             3,
             7,
@@ -652,11 +682,9 @@ mod test {
     #[test]
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
-        let schema_string = r#"{"type":"struct","fields":[{"name":"ts","type":"timestamp_ntz","nullable":true,"metadata":{}}]}"#.to_string();
-        let metadata = Metadata {
-            schema_string,
-            ..Default::default()
-        };
+        let schema =
+            StructType::new_unchecked([StructField::nullable("ts", DataType::TIMESTAMP_NTZ)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_timestamp_ntz_features = Protocol::try_new(
             3,
@@ -699,11 +727,9 @@ mod test {
     #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
-        let schema_string = r#"{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}"#.to_string();
-        let metadata = Metadata {
-            schema_string,
-            ..Default::default()
-        };
+        let schema =
+            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_variant_features = Protocol::try_new(
             3,
