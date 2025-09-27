@@ -1,7 +1,7 @@
 //! Definitions and functions to create and manipulate kernel schema
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
@@ -522,12 +522,14 @@ impl StructType {
     /// Creates a new [`StructType`] from the given fields.
     ///
     /// Returns an error if:
-    /// - the schema contains duplicate field names
+    /// - the schema contains duplicate field names (exact match)
+    /// - the schema contains field names that are duplicates when compared case-insensitively
     /// - the schema contains duplicate metadata columns
     /// - the schema contains nested metadata columns
     pub fn try_new(fields: impl IntoIterator<Item = StructField>) -> DeltaResult<Self> {
-        let mut field_map = IndexMap::new();
+        let mut field_map: IndexMap<String, StructField> = IndexMap::new();
         let mut metadata_columns = HashMap::new();
+        let mut lowercase_field_names = HashSet::new();
 
         // Validate each field during insertion
         for (i, field) in fields.into_iter().enumerate() {
@@ -535,6 +537,9 @@ impl StructType {
             if !matches!(field.data_type, DataType::Primitive(_)) {
                 Self::ensure_no_metadata_columns_in_field(&field)?;
             }
+
+            // Verify that nested structs also follow case-insensitive uniqueness
+            Self::ensure_no_case_insensitive_duplicates_in_nested(&field)?;
 
             // Check for duplicate metadata columns
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
@@ -545,7 +550,25 @@ impl StructType {
                 }
             }
 
-            // Check for duplicate field names
+            // Check for case-insensitive duplicate field names
+            // This follows the Delta protocol requirement that field names must be unique
+            // when compared case-insensitively (e.g., "id" and "ID" are not allowed)
+            let lowercase_name = field.name.to_lowercase();
+            if !lowercase_field_names.insert(lowercase_name.clone()) {
+                // Find the existing field with the same lowercase name for a better error message
+                let existing_field = field_map
+                    .values()
+                    .find(|f| f.name.to_lowercase() == lowercase_name)
+                    .map(|f| f.name.as_str())
+                    .unwrap_or("<unknown>");
+                return Err(Error::schema(format!(
+                    "Duplicate field name (case-insensitive): '{}' conflicts with existing field '{}'",
+                    field.name, existing_field
+                )));
+            }
+
+            // Check for exact duplicate field names (this should never happen after case-insensitive check,
+            // but we keep it for better error messages in case of exact duplicates)
             if let Some(dup) = field_map.insert(field.name.clone(), field) {
                 return Err(Error::schema(format!("Duplicate field name: {}", dup.name)));
             }
@@ -777,6 +800,49 @@ impl StructType {
             DataType::Primitive(_) | DataType::Variant(_) => {}
         };
 
+        Ok(())
+    }
+
+    /// Ensures that nested structs within a field also follow case-insensitive uniqueness rules
+    fn ensure_no_case_insensitive_duplicates_in_nested(field: &StructField) -> DeltaResult<()> {
+        match &field.data_type {
+            DataType::Struct(struct_type) => {
+                // Check the nested struct for case-insensitive duplicates
+                Self::check_case_insensitive_duplicates(struct_type)?;
+            }
+            DataType::Array(array_type) => {
+                if let DataType::Struct(struct_type) = array_type.element_type() {
+                    Self::check_case_insensitive_duplicates(struct_type)?;
+                }
+            }
+            DataType::Map(map_type) => {
+                if let DataType::Struct(struct_type) = map_type.key_type() {
+                    Self::check_case_insensitive_duplicates(struct_type)?;
+                }
+                if let DataType::Struct(struct_type) = map_type.value_type() {
+                    Self::check_case_insensitive_duplicates(struct_type)?;
+                }
+            }
+            // Primitive types and variants don't need this check
+            DataType::Primitive(_) | DataType::Variant(_) => {}
+        }
+        Ok(())
+    }
+
+    fn check_case_insensitive_duplicates(struct_type: &StructType) -> DeltaResult<()> {
+        let mut lowercase_names = HashMap::new();
+        for field in struct_type.fields() {
+            let lowercase_name = field.name.to_lowercase();
+            if Some(field) = lowercase_names.get(lowercase_name) {
+                return Err(Error::schema(format!(
+                    "Nested struct contains duplicate field names (case-insensitive): '{}' conflicts with '{}'",
+                    field.name, field
+                )));
+            }
+            lowercase_name.insert(lowercase_name, field);
+            // Recursively check nested structs
+            Self::ensure_no_case_insensitive_duplicates_in_nested(field)?;
+        }
         Ok(())
     }
 }
@@ -2886,5 +2952,154 @@ mod tests {
             Some(&3)
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_reject_case_insensitive_duplicates() {
+        // Should fail: "id" and "ID" are case-insensitive duplicates
+        let result = StructType::try_new([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("ID", DataType::LONG, false),
+        ]);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("case-insensitive"));
+        assert!(error_msg.contains("id") || error_msg.contains("ID"));
+    }
+
+    #[test]
+    fn test_reject_case_insensitive_duplicates_mixed_case() {
+        // Should fail: "Name", "name", and "NAME" are all case-insensitive duplicates
+        let result = StructType::try_new([
+            StructField::new("Name", DataType::STRING, false),
+            StructField::new("age", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, false),
+        ]);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("case-insensitive"));
+        assert!(error_msg.contains("name") || error_msg.contains("Name"));
+    }
+
+    #[test]
+    fn test_allow_similar_but_different_names() {
+        // Should succeed: these are similar but not case-insensitive duplicates
+        let result = StructType::try_new([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("idx", DataType::LONG, false),
+            StructField::new("ID_value", DataType::LONG, false),
+            StructField::new("identifier", DataType::STRING, false),
+        ]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reject_exact_duplicates() {
+        // Should fail: exact duplicates
+        let result = StructType::try_new([
+            StructField::new("field", DataType::LONG, false),
+            StructField::new("field", DataType::STRING, false),
+        ]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Duplicate field name"));
+    }
+
+    #[test]
+    fn test_reject_nested_struct_case_insensitive_duplicates() {
+        // Create a nested struct with case-insensitive duplicate field names
+        let nested_fields = vec![
+            StructField::new("nested_id", DataType::LONG, false),
+            StructField::new("NESTED_ID", DataType::STRING, false),
+        ];
+
+        // Try to create a struct with the nested struct - should fail during validation
+        let nested_struct = DataType::Struct(Box::new(StructType::new_unchecked(nested_fields)));
+        let result = StructType::try_new([StructField::new("outer_field", nested_struct, false)]);
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("case-insensitive"));
+        assert!(error_msg.contains("nested_id") || error_msg.contains("NESTED_ID"));
+    }
+
+    #[test]
+    fn test_reject_array_element_struct_case_insensitive_duplicates() {
+        // Create an array with struct element that has case-insensitive duplicates
+        let element_struct = StructType::new_unchecked([
+            StructField::new("item", DataType::STRING, false),
+            StructField::new("ITEM", DataType::LONG, false),
+        ]);
+        let array_type = ArrayType::new(DataType::Struct(Box::new(element_struct)), true);
+
+        let result = StructType::try_new([StructField::new(
+            "items",
+            DataType::Array(Box::new(array_type)),
+            false,
+        )]);
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("case-insensitive"));
+        assert!(error_msg.contains("item") || error_msg.contains("ITEM"));
+    }
+
+    #[test]
+    fn test_reject_map_value_struct_case_insensitive_duplicates() {
+        // Create a map with struct value that has case-insensitive duplicates
+        let value_struct = StructType::new_unchecked([
+            StructField::new("value", DataType::STRING, false),
+            StructField::new("VALUE", DataType::LONG, false),
+        ]);
+        let map_type = MapType::new(
+            DataType::STRING,
+            DataType::Struct(Box::new(value_struct)),
+            true,
+        );
+
+        let result = StructType::try_new([StructField::new(
+            "map_field",
+            DataType::Map(Box::new(map_type)),
+            false,
+        )]);
+
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("case-insensitive"));
+        assert!(error_msg.contains("value") || error_msg.contains("VALUE"));
+    }
+
+    #[test]
+    fn test_deserialization_rejects_case_insensitive_duplicates() {
+        // JSON with case-insensitive duplicate field names
+        let json = r#"{
+            "type": "struct",
+            "fields": [
+                {"name": "id", "type": "long", "nullable": false, "metadata": {}},
+                {"name": "ID", "type": "long", "nullable": false, "metadata": {}}
+            ]
+        }"#;
+
+        let result: Result<StructType, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("case-insensitive"));
+    }
+
+    // Note: Nested struct deserialization validation happens automatically during DataType deserialization
+    // The test above (test_deserialization_rejects_case_insensitive_duplicates) validates the top-level behavior
+
+    #[test]
+    fn test_new_unchecked_bypasses_validation() {
+        // new_unchecked should allow case-insensitive duplicates
+        let schema = StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("ID", DataType::LONG, false),
+        ]);
+
+        // Should have both fields
+        assert_eq!(schema.fields().count(), 2);
     }
 }
