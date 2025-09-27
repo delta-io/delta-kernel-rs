@@ -82,7 +82,7 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
 /// The stats column is of type string as required by the spec.
 ///
 /// Note that this method is only useful to extend an Add action schema.
-pub(crate) fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
+fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
     let fields = schema
         .fields()
         .cloned()
@@ -169,7 +169,7 @@ impl Transaction {
             set_transactions: vec![],
             commit_timestamp,
             domain_metadatas: vec![],
-            data_change: false,
+            data_change: true,
         })
     }
 
