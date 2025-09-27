@@ -245,11 +245,10 @@ impl ListedLogFiles {
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // TODO: plumb through a log_tail provided by our caller
-        let log_tail = vec![];
         let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
         log_files.process_results(|iter| {
@@ -318,11 +317,13 @@ impl ListedLogFiles {
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let listed_files = Self::list(
             storage,
             log_root,
+            log_tail,
             Some(checkpoint_metadata.version),
             end_version,
         )?;

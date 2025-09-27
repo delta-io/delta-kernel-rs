@@ -160,6 +160,17 @@ impl TableChanges {
             None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
         };
 
+        // we block reading catalog-managed tables with CDF for now. note this is best-effort just
+        // checking that start/end snapshots are not catalog-managed.
+        //
+        // TODO: link issue
+        #[cfg(feature = "catalog-managed")]
+        require!(
+            !start_snapshot.protocol().is_catalog_managed()
+                && !end_snapshot.protocol().is_catalog_managed(),
+            Error::unsupported("Change data feed is not supported for catalog-managed tables")
+        );
+
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
         // disabled.
@@ -225,7 +236,7 @@ impl TableChanges {
     }
     /// The partition columns that will be read.
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
-        &self.end_snapshot.metadata().partition_columns
+        self.end_snapshot.metadata().partition_columns()
     }
 
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.

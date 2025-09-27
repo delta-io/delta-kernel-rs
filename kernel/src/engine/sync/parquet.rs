@@ -38,7 +38,7 @@ fn try_create_from_parquet(
         builder = builder.with_row_group_filter(predicate.as_ref(), row_indexes.as_mut());
     }
 
-    let mut row_indexes = row_indexes.map(|rb| rb.into_iter());
+    let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
     Ok(stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())))
 }

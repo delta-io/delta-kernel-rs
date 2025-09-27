@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
@@ -9,6 +9,7 @@ use crate::arrow::datatypes::{DataType, Schema};
 use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, Snapshot};
 
@@ -206,11 +207,17 @@ fn create_v2_checkpoint_protocol_action() -> Action {
 
 /// Create a Metadata action
 fn create_metadata_action() -> Action {
-    Action::Metadata(Metadata {
-        id: "test-table".into(),
-        schema_string: "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}".to_string(),
-        ..Default::default()
-    })
+    Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            StructType::new_unchecked([StructField::nullable("value", KernelDataType::INTEGER)]),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap(),
+    )
 }
 
 /// Create an Add action with the specified path

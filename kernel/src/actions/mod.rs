@@ -190,27 +190,32 @@ impl TryFrom<Format> for Scalar {
 )]
 #[internal_api]
 pub(crate) struct Metadata {
-    // TODO: Make the struct fields private to force using the try_new function.
     /// Unique identifier for this table
-    pub(crate) id: String,
+    id: String,
     /// User-provided identifier for this table
-    pub(crate) name: Option<String>,
+    name: Option<String>,
     /// User-provided description for this table
-    pub(crate) description: Option<String>,
+    description: Option<String>,
     /// Specification of the encoding for the files stored in the table
-    pub(crate) format: Format,
+    format: Format,
     /// Schema of the table
-    pub(crate) schema_string: String,
+    schema_string: String,
     /// Column names by which the data should be partitioned
-    pub(crate) partition_columns: Vec<String>,
+    partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
-    pub(crate) created_time: Option<i64>,
+    created_time: Option<i64>,
     /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
-    pub(crate) configuration: HashMap<String, String>,
+    configuration: HashMap<String, String>,
 }
 
 impl Metadata {
+    /// Create a new [`Metadata`] instances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are any metadata columns in the schema.
     // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
+    #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
@@ -246,6 +251,13 @@ impl Metadata {
         })
     }
 
+    #[internal_api]
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+        let mut visitor = MetadataVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.metadata)
+    }
+
     // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
     #[internal_api]
     #[allow(dead_code)]
@@ -269,12 +281,6 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn created_time(&self) -> Option<i64> {
         self.created_time
-    }
-
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
-        let mut visitor = MetadataVisitor::default();
-        visitor.visit_rows_of(data)?;
-        Ok(visitor.metadata)
     }
 
     #[internal_api]
@@ -479,6 +485,11 @@ impl Protocol {
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+        #[cfg(feature = "catalog-managed")]
+        require!(
+            !self.is_catalog_managed(),
+            Error::unsupported("Writes are not yet supported for catalog-managed tables")
+        );
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
@@ -512,6 +523,17 @@ impl Protocol {
                 Ok(())
             }
         }
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.reader_features.as_ref().is_some_and(|fs| {
+            fs.contains(&ReaderFeature::CatalogManaged)
+                || fs.contains(&ReaderFeature::CatalogOwnedPreview)
+        }) || self.writer_features.as_ref().is_some_and(|fs| {
+            fs.contains(&WriterFeature::CatalogManaged)
+                || fs.contains(&WriterFeature::CatalogOwnedPreview)
+        })
     }
 }
 
@@ -915,21 +937,23 @@ pub(crate) struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
-    // TODO: Discuss if we should remove `removed` from this method and introduce a dedicated
-    // method for removed domain metadata.
-    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
-        DomainMetadata {
+    pub(crate) fn new(domain: String, configuration: String) -> Self {
+        Self {
             domain,
             configuration,
-            removed,
+            removed: false,
         }
     }
 
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
-    fn is_internal(&self) -> bool {
+    pub(crate) fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
     }
 }
 
@@ -1424,6 +1448,26 @@ mod tests {
             ReaderFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
         assert_eq!(parse_features::<ReaderFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_no_catalog_managed_writes() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogManaged]),
+            Some([WriterFeature::CatalogManaged]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::CatalogOwnedPreview]),
+            Some([WriterFeature::CatalogOwnedPreview]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
     }
 
     #[test]
