@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::AsArray as _;
+use delta_kernel::arrow::array::{AsArray as _, BooleanArray};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
+use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
@@ -14,7 +15,7 @@ use delta_kernel::expressions::{
 };
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
-use delta_kernel::scan::Scan;
+use delta_kernel::scan::{Scan, ScanResult};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 
@@ -32,6 +33,23 @@ mod common;
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
+
+/// Helper function to extract filtered data from a scan result, respecting row masks
+fn extract_record_batch(
+    scan_result: ScanResult,
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let mask = scan_result.full_mask();
+    let record_batch = into_record_batch(scan_result.raw_data?);
+
+    if let Some(mask) = mask {
+        Ok(filter_record_batch(
+            &record_batch,
+            &BooleanArray::from(mask),
+        )?)
+    } else {
+        Ok(record_batch)
+    }
+}
 
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -1382,24 +1400,18 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     )
     .await?;
 
-    storage
-        .put(
-            &Path::from(PARQUET_FILE1),
-            record_batch_to_bytes(&batch1).into(),
-        )
-        .await?;
-    storage
-        .put(
-            &Path::from(PARQUET_FILE2),
-            record_batch_to_bytes(&batch2).into(),
-        )
-        .await?;
-    storage
-        .put(
-            &Path::from(PARQUET_FILE3),
-            record_batch_to_bytes(&batch3).into(),
-        )
-        .await?;
+    for (parquet_file, batch) in [
+        (PARQUET_FILE1, &batch1),
+        (PARQUET_FILE2, &batch2),
+        (PARQUET_FILE3, &batch3),
+    ] {
+        storage
+            .put(
+                &Path::from(parquet_file),
+                record_batch_to_bytes(batch).into(),
+            )
+            .await?;
+    }
 
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngine::new(
@@ -1422,8 +1434,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let stream = scan.execute(engine.clone())?;
 
     for scan_result in stream {
-        let data = scan_result?.raw_data?;
-        let batch = into_record_batch(data);
+        let batch = extract_record_batch(scan_result?)?;
         file_count += 1;
 
         // Verify the schema structure

@@ -55,21 +55,26 @@ fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>
 async fn metadata_protocol() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
-    let schema_string = serde_json::to_string(&get_schema()).unwrap();
     mock_table
         .commit([
-            Action::Metadata(Metadata {
-                schema_string,
-                configuration: HashMap::from([
-                    ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                    (
-                        "delta.enableDeletionVectors".to_string(),
-                        "true".to_string(),
-                    ),
-                    ("delta.columnMapping.mode".to_string(), "none".to_string()),
-                ]),
-                ..Default::default()
-            }),
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    get_schema(),
+                    vec![],
+                    0,
+                    HashMap::from([
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                        ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                    ]),
+                )
+                .unwrap(),
+            ),
             Action::Protocol(
                 Protocol::try_new(
                     3,
@@ -95,16 +100,21 @@ async fn metadata_protocol() {
 async fn cdf_not_enabled() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
-    let schema_string = serde_json::to_string(&get_schema()).unwrap();
     mock_table
-        .commit([Action::Metadata(Metadata {
-            schema_string,
-            configuration: HashMap::from([(
-                "delta.enableDeletionVectors".to_string(),
-                "true".to_string(),
-            )]),
-            ..Default::default()
-        })])
+        .commit([Action::Metadata(
+            Metadata::try_new(
+                None,
+                None,
+                get_schema(),
+                vec![],
+                0,
+                HashMap::from([(
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                )]),
+            )
+            .unwrap(),
+        )])
         .await;
 
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -150,20 +160,25 @@ async fn unsupported_reader_feature() {
 async fn column_mapping_should_fail() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
-    let schema_string = serde_json::to_string(&get_schema()).unwrap();
     mock_table
-        .commit([Action::Metadata(Metadata {
-            schema_string,
-            configuration: HashMap::from([
-                (
-                    "delta.enableDeletionVectors".to_string(),
-                    "true".to_string(),
-                ),
-                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
-                ("delta.columnMapping.mode".to_string(), "id".to_string()),
-            ]),
-            ..Default::default()
-        })])
+        .commit([Action::Metadata(
+            Metadata::try_new(
+                None,
+                None,
+                get_schema(),
+                vec![],
+                0,
+                HashMap::from([
+                    (
+                        "delta.enableDeletionVectors".to_string(),
+                        "true".to_string(),
+                    ),
+                    ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                    ("delta.columnMapping.mode".to_string(), "id".to_string()),
+                ]),
+            )
+            .unwrap(),
+        )])
         .await;
 
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
@@ -185,16 +200,18 @@ async fn incompatible_schemas_fail() {
         let engine = Arc::new(SyncEngine::new());
         let mut mock_table = LocalMockTable::new();
 
-        let schema_string = serde_json::to_string(&commit_schema).unwrap();
         mock_table
-            .commit([Action::Metadata(Metadata {
-                schema_string,
-                configuration: HashMap::from([(
-                    "delta.enableChangeDataFeed".to_string(),
-                    "true".to_string(),
-                )]),
-                ..Default::default()
-            })])
+            .commit([Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    commit_schema,
+                    vec![],
+                    0,
+                    HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+                )
+                .unwrap(),
+            )])
             .await;
 
         let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
