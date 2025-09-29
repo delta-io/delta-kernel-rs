@@ -7,20 +7,22 @@ use std::sync::{Arc, OnceLock};
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
+use crate::engine_data::FilteredEngineData;
 use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
-    engine::arrow_data::ArrowEngineData,
+    engine::arrow_data::{extract_record_batch, ArrowEngineData},
     schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
+use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -1076,13 +1078,30 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
 pub(crate) fn to_json_bytes(
-    data: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send,
+    data: impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send,
 ) -> DeltaResult<Vec<u8>> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
     for chunk in data {
-        let arrow_data = ArrowEngineData::try_from_engine_data(chunk?)?;
-        let record_batch = arrow_data.record_batch();
-        writer.write(record_batch)?;
+        let filtered_data = chunk?;
+        // Honor the new contract: if selection vector is shorter than the number of rows,
+        // then all rows not covered by the selection vector are assumed to be selected
+        let (underlying_data, mut selection_vector) = filtered_data.into_parts();
+        let batch = extract_record_batch(&*underlying_data)?;
+        let num_rows = batch.num_rows();
+
+        if selection_vector.is_empty() {
+            // If selection vector is empty, write all rows per contract.
+            writer.write(batch)?;
+        } else {
+            // Extend the selection vector with `true` for uncovered rows
+            if selection_vector.len() < num_rows {
+                selection_vector.resize(num_rows, true);
+            }
+
+            let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
+                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
+            writer.write(&filtered_batch)?
+        };
     }
     writer.finish()?;
     Ok(writer.into_inner())
@@ -2767,11 +2786,79 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["string1", "string2"]))],
         )?;
         let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(data));
-        let json = to_json_bytes(Box::new(std::iter::once(Ok(data))))?;
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+        let json = to_json_bytes(Box::new(std::iter::once(Ok(filtered_data))))?;
         assert_eq!(
             json,
             "{\"string\":\"string1\"}\n{\"string\":\"string2\"}\n".as_bytes()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_to_json_bytes_filters_data() -> DeltaResult<()> {
+        // Create test data with 4 rows
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                "row0", "row1", "row2", "row3",
+            ]))],
+        )?;
+
+        // Helper function to create EngineData from the same record batch
+        let create_engine_data =
+            || -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch.clone())) };
+
+        // Test case 1: All rows selected (should include all 4 rows)
+        let all_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![true, true, true, true])?;
+        let json_all = to_json_bytes(Box::new(std::iter::once(Ok(all_selected))))?;
+        assert_eq!(
+            json_all,
+            "{\"value\":\"row0\"}\n{\"value\":\"row1\"}\n{\"value\":\"row2\"}\n{\"value\":\"row3\"}\n".as_bytes()
+        );
+
+        // Test case 2: Only first and last rows selected (should include only 2 rows)
+        let partial_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![true, false, false, true])?;
+        let json_partial = to_json_bytes(Box::new(std::iter::once(Ok(partial_selected))))?;
+        assert_eq!(
+            json_partial,
+            "{\"value\":\"row0\"}\n{\"value\":\"row3\"}\n".as_bytes()
+        );
+
+        // Test case 3: Only middle rows selected (should include only 2 rows)
+        let middle_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, true, true, false])?;
+        let json_middle = to_json_bytes(Box::new(std::iter::once(Ok(middle_selected))))?;
+        assert_eq!(
+            json_middle,
+            "{\"value\":\"row1\"}\n{\"value\":\"row2\"}\n".as_bytes()
+        );
+
+        // Test case 4: No rows selected (should produce empty output)
+        let none_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, false, false, false])?;
+        let json_none = to_json_bytes(Box::new(std::iter::once(Ok(none_selected))))?;
+        assert_eq!(json_none, "".as_bytes());
+
+        // Test case 5: Only one row selected (should include only 1 row)
+        let one_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, true, false, false])?;
+        let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
+        assert_eq!(json_one, "{\"value\":\"row1\"}\n".as_bytes());
+
+        // Test case 6: Only one row selected implicitly by short vector
+        let one_selected =
+            FilteredEngineData::try_new(create_engine_data(), vec![false, false, false])?;
+        let json_one = to_json_bytes(Box::new(std::iter::once(Ok(one_selected))))?;
+        assert_eq!(json_one, "{\"value\":\"row3\"}\n".as_bytes());
+
         Ok(())
     }
 

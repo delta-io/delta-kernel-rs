@@ -336,9 +336,10 @@ impl CheckpointWriter {
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
         engine.json_handler().write_json_file(
             &last_checkpoint_path,
-            Box::new(std::iter::once(data)),
+            Box::new(std::iter::once(Ok(filtered_data))),
             true,
         )?;
 
@@ -370,10 +371,7 @@ impl CheckpointWriter {
             &[Scalar::from(self.version)],
         )?;
 
-        let filtered_data = FilteredEngineData {
-            data: checkpoint_metadata_batch,
-            selection_vector: vec![true], // Include the action in the checkpoint
-        };
+        let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
         Ok(ActionReconciliationBatch {
             filtered_data,
