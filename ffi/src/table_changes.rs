@@ -33,7 +33,7 @@ pub struct ExclusiveTableChanges;
 /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
 /// - `engine`: Implementation of [`Engine`] apis.
 /// - `start_version`: The start version of the change data feed
-/// End version will be the newest table version.
+///   End version will be the newest table version.
 ///
 /// # Safety
 ///
@@ -250,6 +250,13 @@ impl Drop for ScanTableChangesIterator {
     }
 }
 
+/// Get an iterator over the data needed to perform a table changes scan. This will return a
+/// [`ScanTableChangesIterator`] which can be passed to [`scan_table_changes_next`] to get the
+/// actual data in the iterator.
+///
+/// # Safety
+///
+/// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedTableChangesScan`]
 #[no_mangle]
 pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
@@ -285,6 +292,12 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
     data.drop_handle();
 }
 
+/// Get next batch of data from the table changes iterator.
+///
+/// # Safety
+///
+/// The iterator must be valid (returned by [table_changes_scan_execute]) and not yet freed by
+/// [`free_scan_table_changes_iter`].
 #[no_mangle]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
@@ -436,7 +449,7 @@ mod tests {
         batch: &RecordBatch,
     ) -> Result<(), Box<dyn std::error::Error>> {
         storage
-            .put(&Path::from(file), record_batch_to_bytes(&batch).into())
+            .put(&Path::from(file), record_batch_to_bytes(batch).into())
             .await?;
         Ok(())
     }
