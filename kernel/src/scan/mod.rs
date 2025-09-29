@@ -341,24 +341,21 @@ pub struct ScanMetadata {
 }
 
 impl ScanMetadata {
-    fn new(
+    fn try_new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
-    ) -> Self {
-        Self {
-            scan_files: FilteredEngineData {
-                data,
-                selection_vector,
-            },
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
-        }
+        })
     }
 }
 
 impl HasSelectionVector for ScanMetadata {
     fn has_selected_rows(&self) -> bool {
-        self.scan_files.selection_vector.contains(&true)
+        self.scan_files.selection_vector().contains(&true)
     }
 }
 
@@ -979,7 +976,10 @@ pub(crate) mod test_utils {
         let mut batch_count = 0;
         for res in iter {
             let scan_metadata = res.unwrap();
-            assert_eq!(scan_metadata.scan_files.selection_vector, expected_sel_vec);
+            assert_eq!(
+                scan_metadata.scan_files.selection_vector(),
+                expected_sel_vec
+            );
             scan_metadata
                 .visit_scan_files(context.clone(), validate_callback)
                 .unwrap();
@@ -1251,12 +1251,12 @@ mod tests {
             .scan_metadata(engine.as_ref())
             .unwrap()
             .map_ok(|ScanMetadata { scan_files, .. }| {
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
                 let filtered_batch =
-                    filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
-                        .unwrap();
+                    filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
                 Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
             })
             .try_collect()
@@ -1287,11 +1287,11 @@ mod tests {
             .scan_metadata(engine.as_ref())
             .unwrap()
             .map_ok(|ScanMetadata { scan_files, .. }| {
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
-                filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
-                    .unwrap()
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
             })
             .try_collect()
             .unwrap();
@@ -1311,11 +1311,11 @@ mod tests {
             .scan_metadata_from(engine.as_ref(), 0, files, None)
             .unwrap()
             .map_ok(|ScanMetadata { scan_files, .. }| {
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
-                filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
-                    .unwrap()
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
             })
             .try_collect()
             .unwrap();

@@ -113,7 +113,7 @@ fn try_main() -> DeltaResult<()> {
 
     if cli.metadata {
         let (scan_metadata_batches, scan_metadata_rows) = scan_metadata
-            .map(|res| res.unwrap().scan_files.data.len())
+            .map(|res| res.unwrap().scan_files.data().len())
             .fold((0, 0), |(batches, rows), len| (batches + 1, rows + len));
         println!("Scan metadata: {scan_metadata_batches} chunks, {scan_metadata_rows} files",);
         return Ok(());
