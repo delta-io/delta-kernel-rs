@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
+use delta_kernel::engine_data::FilteredEngineData;
 use test_utils::{create_table, engine_store_setup};
 
 use object_store::path::Path;
@@ -116,7 +117,9 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     // Convert the end-to-end flow of writing the JSON. We are going beyond the public
     // log compaction APIs since the test is writing the compacted JSON and verifying it
     // bu this is intentional, as most engines would be implementing something similar
-    let compaction_data_iter = compacted_data_batches.into_iter().map(|batch| Ok(batch));
+    let compaction_data_iter = compacted_data_batches
+            .into_iter()
+            .map(|batch| Ok(FilteredEngineData::with_all_rows_selected(batch.into_parts().0)));
     let json_bytes = to_json_bytes(compaction_data_iter)?;
     let final_content = String::from_utf8(json_bytes)?;
 

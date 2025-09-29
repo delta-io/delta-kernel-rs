@@ -69,7 +69,7 @@ impl FilteredEngineData {
 impl HasSelectionVector for FilteredEngineData {
     /// Returns true if any row in the selection vector is marked as selected
     fn has_selected_rows(&self) -> bool {
-        // Per contract if selection is not as long as then at least one row is selected.
+        // Per contract if selection is not as long as data then at least one row is selected.
         if self.selection_vector.len() < self.data.len() {
             return true;
         }

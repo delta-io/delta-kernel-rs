@@ -767,10 +767,10 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2, "Expected two batches in results");
-        assert_eq!(results[0].selection_vector(), &vec![true, true, true][..]);
+        assert_eq!(results[0].selection_vector(), &vec![true, true, true]);
         assert_eq!(
             results[1].selection_vector(),
-            &vec![false, false, false, true][..]
+            &vec![false, false, false, true]
         );
         assert_eq!(actions_count, 4);
         assert_eq!(add_actions, 0);
@@ -809,8 +809,8 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no selected actions
-        assert_eq!(results[0].selection_vector(), &vec![true][..]);
-        assert_eq!(results[1].selection_vector(), &vec![false, true][..]);
+        assert_eq!(results[0].selection_vector(), &vec![true]);
+        assert_eq!(results[1].selection_vector(), &vec![false, true]);
         assert_eq!(actions_count, 2);
         assert_eq!(add_actions, 1);
 
@@ -845,8 +845,8 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].selection_vector(), &vec![true, true][..]);
-        assert_eq!(results[1].selection_vector(), &vec![false, false, true][..]);
+        assert_eq!(results[0].selection_vector(), &vec![true, true]);
+        assert_eq!(results[1].selection_vector(), &vec![false, false, true]);
         assert_eq!(actions_count, 3);
         assert_eq!(add_actions, 2);
 

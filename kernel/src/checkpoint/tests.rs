@@ -313,11 +313,11 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector(), &[true, true][..]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector(), &[true, true][..]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should not be included as the selection vector does not
     // contain any true values, as the file added is removed in a following commit.
@@ -383,7 +383,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector(), &[true, true][..]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // No more data should exist because we only requested version 0
     assert!(data_iter.next().is_none());
@@ -487,11 +487,11 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector(), &[true, true][..]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector(), &[true, true][..]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should be the CheckpointMetaData action.
     let batch = data_iter.next().unwrap()?;
