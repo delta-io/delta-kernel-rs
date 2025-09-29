@@ -1083,31 +1083,23 @@ pub(crate) fn to_json_bytes(
     let mut writer = LineDelimitedWriter::new(Vec::new());
     for chunk in data {
         let filtered_data = chunk?;
-        // Extract the underlying data and apply the selection vector to get only selected rows
-        let batch = extract_record_batch(filtered_data.data())?;
-
         // Honor the new contract: if selection vector is shorter than the number of rows,
         // then all rows not covered by the selection vector are assumed to be selected
+        let (underlying_data, mut selection_vector) = filtered_data.into_parts();
+        let batch = extract_record_batch(&*underlying_data)?;
         let num_rows = batch.num_rows();
-        let selection_vector = filtered_data.selection_vector();
 
         if selection_vector.is_empty() {
             // If selection vector is empty, write all rows per contract.
             writer.write(batch)?;
         } else {
-            let filtered_selection = if selection_vector.len() < num_rows {
-                // Extend the selection vector with `true` for uncovered rows
-                let mut extended = selection_vector.to_vec();
-                extended.resize(num_rows, true);
-                extended
-            } else if selection_vector.len() > num_rows {
-                return Err(Error::deletion_vector("Deletion vector is larger than data length"));
-            } else {
-                selection_vector.to_vec()
-            };
-            let filtered_batch =
-                filter_record_batch(batch, &BooleanArray::from(filtered_selection))
-                    .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
+            // Extend the selection vector with `true` for uncovered rows
+            if selection_vector.len() < num_rows {
+                selection_vector.resize(num_rows, true);
+            }
+
+            let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
+                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
             writer.write(&filtered_batch)?
         };
     }

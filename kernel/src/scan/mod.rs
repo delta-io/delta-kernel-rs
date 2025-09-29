@@ -1255,11 +1255,8 @@ mod tests {
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
-                let filtered_batch = filter_record_batch(
-                    &batch,
-                    &BooleanArray::from(selection_vector),
-                )
-                .unwrap();
+                let filtered_batch =
+                    filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
                 Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
             })
             .try_collect()
@@ -1294,11 +1291,7 @@ mod tests {
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
-                filter_record_batch(
-                    &batch,
-                    &BooleanArray::from(selection_vector),
-                )
-                .unwrap()
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
             })
             .try_collect()
             .unwrap();
@@ -1322,11 +1315,7 @@ mod tests {
                 let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
-                filter_record_batch(
-                    &batch,
-                    &BooleanArray::from(selection_vector),
-                )
-                .unwrap()
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
             })
             .try_collect()
             .unwrap();
