@@ -336,11 +336,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let result = self.add_transform.evaluate(actions.as_ref())?;
-        Ok(ScanMetadata::new(
+        ScanMetadata::try_new(
             result,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        ))
+        )
     }
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
