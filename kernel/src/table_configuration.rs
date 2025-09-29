@@ -25,7 +25,7 @@ use delta_kernel_derive::internal_api;
 
 /// Information about in-commit timestamp enablement state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum InCommitTimestampInfo {
+pub(crate) enum InCommitTimestampEnablement {
     /// In-commit timestamps is not enabled
     NotEnabled,
     /// In-commit timestamps is enabled
@@ -333,15 +333,12 @@ impl TableConfiguration {
 
     /// Returns information about in-commit timestamp enablement state.
     ///
-    /// This function assumes in-commit timestamps is supported. If it's not supported,
-    /// that should be checked at a higher level and treated as an error.
-    ///
     /// Returns an error if only one of the enablement properties is present, as this indicates
     /// an inconsistent state.
     #[allow(unused)]
-    pub(crate) fn in_commit_timestamp_info(&self) -> DeltaResult<InCommitTimestampInfo> {
+    pub(crate) fn in_commit_timestamp_enablement(&self) -> DeltaResult<InCommitTimestampEnablement> {
         if !self.is_in_commit_timestamps_enabled() {
-            return Ok(InCommitTimestampInfo::NotEnabled);
+            return Ok(InCommitTimestampEnablement::NotEnabled);
         }
         
         let enablement_version = self
@@ -352,7 +349,7 @@ impl TableConfiguration {
             .in_commit_timestamp_enablement_timestamp;
 
         match (enablement_version, enablement_timestamp) {
-            (Some(version), Some(timestamp)) => Ok(InCommitTimestampInfo::Enabled { 
+            (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled { 
                 enablement: Some((version, timestamp)) 
             }),
             (Some(_), None) => Err(Error::generic(
@@ -361,9 +358,9 @@ impl TableConfiguration {
             (None, Some(_)) => Err(Error::generic(
                 "In-commit timestamp enabled, but enablement version is missing while enablement timestamp is present"
             )),
-            (None, None) => Ok(InCommitTimestampInfo::Enabled { 
+            (None, None) => Ok(InCommitTimestampEnablement::Enabled { 
                 enablement: None 
-            }), // Normal for tables where ICT was enabled from the beginning
+            }),
         }
     }
 
@@ -440,7 +437,7 @@ mod test {
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
 
-    use super::{TableConfiguration, InCommitTimestampInfo};
+    use super::{TableConfiguration, InCommitTimestampEnablement};
 
     #[test]
     fn dv_supported_not_enabled() {
@@ -497,6 +494,37 @@ mod test {
         assert!(table_config.is_deletion_vector_enabled());
     }
     #[test]
+    fn ict_enabled_from_table_creation() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0, // Table creation version
+            HashMap::from_iter([(
+                "delta.enableInCommitTimestamps".to_string(),
+                "true".to_string(),
+            )]),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(table_config.is_in_commit_timestamps_enabled());
+        // When ICT is enabled from table creation (version 0), it's perfectly normal
+        // for enablement properties to be missing
+        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(info, InCommitTimestampEnablement::Enabled { enablement: None });
+    }
+    #[test]
     fn ict_supported_and_enabled() {
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
@@ -532,8 +560,8 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_in_commit_timestamps_supported());
         assert!(table_config.is_in_commit_timestamps_enabled());
-        let info = table_config.in_commit_timestamp_info().unwrap();
-        assert_eq!(info, InCommitTimestampInfo::Enabled { enablement: Some((5, 100)) })
+        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(info, InCommitTimestampEnablement::Enabled { enablement: Some((5, 100)) })
     }
     #[test]
     fn ict_supported_and_not_enabled() {
@@ -550,8 +578,8 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_in_commit_timestamps_supported());
         assert!(!table_config.is_in_commit_timestamps_enabled());
-        let info = table_config.in_commit_timestamp_info().unwrap();
-        assert_eq!(info, InCommitTimestampInfo::NotEnabled);
+        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
     }
     #[test]
     fn ict_enabled_with_partial_enablement_info() {
@@ -586,43 +614,10 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_in_commit_timestamps_supported());
         assert!(table_config.is_in_commit_timestamps_enabled());
-        // When ICT is enabled but only one enablement property is present, this is an inconsistent state
-        // and should return an error
         assert!(matches!(
-            table_config.in_commit_timestamp_info(),
+            table_config.in_commit_timestamp_enablement(),
             Err(Error::Generic(msg)) if msg.contains("enablement timestamp is missing while enablement version is present")
         ));
-    }
-    #[test]
-    fn ict_enabled_from_table_creation() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
-        let metadata = Metadata::try_new(
-            None,
-            None,
-            schema,
-            vec![],
-            0, // Table creation version
-            HashMap::from_iter([(
-                "delta.enableInCommitTimestamps".to_string(),
-                "true".to_string(),
-            )]),
-        )
-        .unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([WriterFeature::InCommitTimestamp]),
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(table_config.is_in_commit_timestamps_enabled());
-        // When ICT is enabled from table creation (version 0), it's perfectly normal
-        // for enablement properties to be missing
-        let info = table_config.in_commit_timestamp_info().unwrap();
-        assert_eq!(info, InCommitTimestampInfo::Enabled { enablement: None });
     }
     #[test]
     fn fails_on_unsupported_feature() {
