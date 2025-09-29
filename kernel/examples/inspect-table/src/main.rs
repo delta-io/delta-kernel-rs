@@ -1,4 +1,4 @@
-use common::LocationArgs;
+use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
     SetTransactionVisitor,
@@ -178,7 +178,7 @@ fn print_scan_file(
 }
 
 fn try_main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let engine = common::get_engine(&url, &cli.location_args)?;
