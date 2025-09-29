@@ -113,12 +113,12 @@ pub unsafe extern "C" fn commit(
     //       this by making the commit function return the enum somehow.
     match txn.commit(engine.as_ref()) {
         Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.version()),
-        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
-            Err(delta_kernel::Error::Generic(format!(
-                "commit conflict at version {}",
-                conflicted.conflict_version
-            )))
-        }
+        Ok(CommitResult::RetryableTransaction(_)) => Err(delta_kernel::Error::unsupported(
+            "commit failed: retryable transaction not supported in FFI (yet)",
+        )),
+        Ok(CommitResult::ConflictedTransaction(conflicted)) => Err(delta_kernel::Error::Generic(
+            format!("commit conflict at version {}", conflicted.conflict_version),
+        )),
         Err(e) => Err(e),
     }
     .into_extern_result(&extern_engine)

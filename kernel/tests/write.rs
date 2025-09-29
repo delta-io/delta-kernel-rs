@@ -67,7 +67,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // commit!
-        txn.commit(&engine)?;
+        let _ = txn.commit(&engine)?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -216,7 +216,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
-        txn.commit(&engine)?;
+        let _ = txn.commit(&engine)?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -360,7 +360,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // Commit without adding any add files
-        txn.commit(&engine)?;
+        assert!(txn.commit(&engine)?.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -474,7 +474,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // commit!
-        txn.commit(engine.as_ref())?;
+        assert!(txn.commit(engine.as_ref())?.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -652,7 +652,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
-        txn.commit(&engine)?;
+        assert!(txn.commit(&engine)?.is_committed());
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)
@@ -813,7 +813,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Verify the commit was written correctly
     let commit1 = store
@@ -1020,7 +1020,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -1192,7 +1192,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -1255,9 +1255,11 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let domain2 = "spark.settings";
     let config2 = r#"{"cores": 4}"#;
 
-    txn.with_domain_metadata(domain1.to_string(), config1.to_string())
+    assert!(txn
+        .with_domain_metadata(domain1.to_string(), config1.to_string())
         .with_domain_metadata(domain2.to_string(), config2.to_string())
-        .commit(&engine)?;
+        .commit(&engine)?
+        .is_committed());
 
     let commit_data = store
         .get(&Path::from(format!(
