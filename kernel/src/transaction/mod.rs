@@ -169,8 +169,11 @@ impl Transaction {
         })
     }
 
-    /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
-    /// will include the failed transaction in case of a conflict so the user can retry.
+    /// Consume the transaction and commit it to the table. The result is a  result of
+    /// [CommitResult] with the following semantics:
+    /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
+    ///   transaction in case of a conflict so the user can retry, etc.)
+    /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
@@ -233,7 +236,8 @@ impl Transaction {
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(commit_version),
             )),
-            Err(e) => Err(e),
+            // TODO: we may want to be more selective about what is retryable
+            Err(e) => Ok(CommitResult::RetryableTransaction(self.into_retryable(e))),
         }
     }
 
@@ -500,6 +504,13 @@ impl Transaction {
             conflict_version,
         }
     }
+
+    fn into_retryable(self, error: Error) -> RetryableTransaction {
+        RetryableTransaction {
+            transaction: self,
+            error,
+        }
+    }
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -547,8 +558,17 @@ pub struct PostCommitStats {
     pub commits_since_log_compaction: u64,
 }
 
-/// Result of committing a transaction.
+/// The result of attempting to commit this transaction.
+///
+/// The commit result can be one of the following:
+/// - CommittedTransaction: the transaction was successfully committed. post-commit stats and
+///   post-commit snapshot can be obtained from the committed transaction.
+/// - ConflictedTransaction: the transaction conflicted with an existing version. This transcation
+///   must be rebased before retrying.
+/// - RetryableTransaction: an IO (retryable) error occurred during the commit. This transaction
+///   can be retried without rebasing.
 #[derive(Debug)]
+#[must_use]
 pub enum CommitResult {
     /// The transaction was successfully committed.
     CommittedTransaction(CommittedTransaction),
@@ -558,6 +578,15 @@ pub enum CommitResult {
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
     ConflictedTransaction(ConflictedTransaction),
+    /// An IO (retryable) error occurred during the commit.
+    RetryableTransaction(RetryableTransaction),
+}
+
+impl CommitResult {
+    /// Returns true if the commit was successful.
+    pub fn is_committed(&self) -> bool {
+        matches!(self, CommitResult::CommittedTransaction(_))
+    }
 }
 
 #[derive(Debug)]
@@ -593,6 +622,12 @@ impl CommittedTransaction {
 pub struct ConflictedTransaction {
     pub transaction: Transaction,
     pub conflict_version: Version,
+}
+
+#[derive(Debug)]
+pub struct RetryableTransaction {
+    pub transaction: Transaction,
+    pub error: Error,
 }
 
 #[cfg(test)]
