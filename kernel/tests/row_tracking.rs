@@ -217,7 +217,9 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -264,7 +266,9 @@ async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
             vec![int32_array(vec![3])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -295,7 +299,9 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
     // Write a large batch with 1000 records
     let large_batch: Vec<i32> = (1..=1000).collect();
     let data = generate_data(schema.clone(), [vec![int32_array(large_batch.clone())]])?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -342,7 +348,9 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_1).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
+        .await?
+        .is_committed());
 
     // Verify first commit
     verify_row_tracking_in_commit(
@@ -357,7 +365,9 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
     // Second transaction: write one batch with 2 records
     // This should read the existing row tracking domain metadata and assign base row IDs starting from 6
     let data_2 = generate_data(schema.clone(), [vec![int32_array(vec![7, 8])]])?;
-    write_data_to_table(&table_url, engine.clone(), data_2).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
+        .await?
+        .is_committed());
 
     // Verify second commit
     verify_row_tracking_in_commit(
@@ -410,7 +420,9 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
             ],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_1).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
+        .await?
+        .is_committed());
 
     verify_row_tracking_in_commit(
         &store,
@@ -429,7 +441,9 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
             string_array(vec!["g".to_string(), "h".to_string()]),
         ]],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_2).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
+        .await?
+        .is_committed());
 
     verify_row_tracking_in_commit(
         &store,
@@ -454,7 +468,9 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
             ],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_3).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_3)
+        .await?
+        .is_committed());
 
     verify_row_tracking_in_commit(
         &store,
@@ -490,7 +506,9 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -536,7 +554,9 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
             vec![int32_array(Vec::<i32>::new())],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     // NB: The expected high water mark is a bit unintuitive here, as we are appending empty batches.
@@ -579,7 +599,7 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let txn = snapshot.transaction()?;
 
     // Commit without adding any add files
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Fetch and parse the commit
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -673,6 +693,9 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
                 conflicted.conflict_version
             );
         }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("First transaction should not be retryable error");
+        }
     }
 
     // Commit the second transaction - this should result in a conflict
@@ -692,6 +715,9 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
 
             // TODO: In the future, we need to resolve conflicts and retry the commit
             // For now, we just verify that we got the conflict as expected
+        }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("Second transaction should not be retryable error");
         }
     }
 
@@ -758,7 +784,9 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     )?;
 
     // Write data to the table
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify that the commit does NOT contain row tracking fields
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
