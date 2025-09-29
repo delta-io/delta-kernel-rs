@@ -496,7 +496,7 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // The third batch should be the CheckpointMetaData action.
     let batch = data_iter.next().unwrap()?;
     // According to the new contract, with_all_rows_selected creates an empty selection vector
-    assert_eq!(batch.selection_vector(), &vec![] as &[bool]);
+    assert_eq!(batch.selection_vector(), &[] as &[bool]);
     assert!(batch.has_selected_rows());
 
     // No more data should exist
