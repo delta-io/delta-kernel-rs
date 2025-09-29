@@ -124,10 +124,19 @@ pub fn get_engine(
             delta_kernel::Error::Generic(format!("Object store could not parse url: {}", e))
         })?;
         use ObjectStoreScheme::*;
+        let url_str = url.to_string();
         let store: Arc<DynObjectStore> = match scheme {
-            AmazonS3 => Arc::new(AmazonS3Builder::from_env().build()?),
-            GoogleCloudStorage => Arc::new(GoogleCloudStorageBuilder::from_env().build()?),
-            MicrosoftAzure => Arc::new(MicrosoftAzureBuilder::from_env().build()?),
+            AmazonS3 => Arc::new(AmazonS3Builder::from_env().with_url(url_str).build()?),
+            GoogleCloudStorage => Arc::new(
+                GoogleCloudStorageBuilder::from_env()
+                    .with_url(url_str)
+                    .build()?,
+            ),
+            MicrosoftAzure => Arc::new(
+                MicrosoftAzureBuilder::from_env()
+                    .with_url(url_str)
+                    .build()?,
+            ),
             Local | Memory | Http => {
                 return Err(delta_kernel::Error::Generic(format!(
                     "Scheme {scheme:?} doesn't support getting credentials from environment"
@@ -147,7 +156,7 @@ pub fn get_engine(
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
-            (parts[0], parts[1])
+            (parts[0].to_ascii_lowercase(), parts[1])
         });
         DefaultEngine::try_new(url, opts, Arc::new(TokioBackgroundExecutor::new()))
     } else {

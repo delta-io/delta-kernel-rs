@@ -11,8 +11,7 @@ use delta_kernel::{DeltaResult, Snapshot};
 use clap::Parser;
 use itertools::Itertools;
 
-/// An example program that dumps out the data of a delta table. Struct and Map types are not
-/// supported.
+/// An example program that dumps out the data of a delta table.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
