@@ -1084,26 +1084,30 @@ pub(crate) fn to_json_bytes(
     for chunk in data {
         let filtered_data = chunk?;
         // Extract the underlying data and apply the selection vector to get only selected rows
-        let batch = extract_record_batch(&*filtered_data.data)?;
+        let batch = extract_record_batch(filtered_data.data())?;
 
         // Honor the new contract: if selection vector is shorter than the number of rows,
         // then all rows not covered by the selection vector are assumed to be selected
         let num_rows = batch.num_rows();
-        let mut selection_vector = filtered_data.selection_vector.clone();
+        let selection_vector = filtered_data.selection_vector();
 
         if selection_vector.is_empty() {
             // If selection vector is empty, write all rows per contract.
             writer.write(batch)?;
         } else {
-            if selection_vector.len() < num_rows {
+            let filtered_selection = if selection_vector.len() < num_rows {
                 // Extend the selection vector with `true` for uncovered rows
-                selection_vector.resize(num_rows, true);
+                let mut extended = selection_vector.to_vec();
+                extended.resize(num_rows, true);
+                extended
             } else if selection_vector.len() > num_rows {
-                // Take a sublist of the selection vector equal to the data size
-                selection_vector = selection_vector[..num_rows].to_vec();
-            }
-            let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
-                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
+                return Err(Error::deletion_vector("Deletion vector is larger than data length"));
+            } else {
+                selection_vector.to_vec()
+            };
+            let filtered_batch =
+                filter_record_batch(batch, &BooleanArray::from(filtered_selection))
+                    .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
             writer.write(&filtered_batch)?
         };
     }
