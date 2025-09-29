@@ -89,6 +89,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+mod committer;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -182,6 +183,10 @@ pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 /// An iterator of data read from specified files
 pub type FileDataReadResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+
+/// Type alias for an iterator of [`EngineData`] results.
+pub(crate) type EngineDataResultIterator<'a> =
+    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
