@@ -564,24 +564,6 @@ mod test {
         assert_eq!(info, InCommitTimestampEnablement::Enabled { enablement: Some((5, 100)) })
     }
     #[test]
-    fn ict_supported_and_not_enabled() {
-        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
-        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some::<Vec<String>>(vec![]),
-            Some([WriterFeature::InCommitTimestamp]),
-        )
-        .unwrap();
-        let table_root = Url::try_from("file:///").unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(!table_config.is_in_commit_timestamps_enabled());
-        let info = table_config.in_commit_timestamp_enablement().unwrap();
-        assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
-    }
-    #[test]
     fn ict_enabled_with_partial_enablement_info() {
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(
@@ -618,6 +600,24 @@ mod test {
             table_config.in_commit_timestamp_enablement(),
             Err(Error::Generic(msg)) if msg.contains("enablement timestamp is missing while enablement version is present")
         ));
+    }
+    #[test]
+    fn ict_supported_and_not_enabled() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(!table_config.is_in_commit_timestamps_enabled());
+        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
     }
     #[test]
     fn fails_on_unsupported_feature() {
