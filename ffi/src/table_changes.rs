@@ -298,29 +298,30 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
         .data
         .lock()
         .map_err(|_| Error::generic("poisoned scan table changes iterator mutex"))?;
-    if let Some(scan_result) = data.next().transpose()? {
-        let mask = scan_result.full_mask();
-        let data = scan_result.raw_data?;
-        let mut record_batch: RecordBatch = data
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-            .into();
 
-        if let Some(mask) = mask {
-            record_batch = filter_record_batch(&record_batch, &mask.into())?;
-        }
+    let Some(scan_result) = data.next().transpose()? else {
+        return Ok(ArrowFFIData::empty());
+    };
 
-        let batch_struct_array: StructArray = record_batch.into();
-        let array_data: ArrayData = batch_struct_array.into_data();
-        let (out_array, out_schema) = to_ffi(&array_data)?;
-        Ok(ArrowFFIData {
-            array: out_array,
-            schema: out_schema,
-        })
-    } else {
-        Ok(ArrowFFIData::empty())
+    let mask = scan_result.full_mask();
+    let data = scan_result.raw_data?;
+    let mut record_batch: RecordBatch = data
+        .into_any()
+        .downcast::<ArrowEngineData>()
+        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
+        .into();
+
+    if let Some(mask) = mask {
+        record_batch = filter_record_batch(&record_batch, &mask.into())?;
     }
+
+    let batch_struct_array: StructArray = record_batch.into();
+    let array_data: ArrayData = batch_struct_array.into_data();
+    let (out_array, out_schema) = to_ffi(&array_data)?;
+    Ok(ArrowFFIData {
+        array: out_array,
+        schema: out_schema,
+    })
 }
 
 #[cfg(test)]
