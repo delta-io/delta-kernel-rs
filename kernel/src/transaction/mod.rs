@@ -226,14 +226,6 @@ impl Transaction {
 
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
 
-        let commit_info_action = commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
-        let add_actions = generate_file_actions(
-            self.add_files_schema().clone(),
-            get_log_add_schema().clone(),
-            self.add_files_metadata.iter().map(|a| a.as_ref()),
-            engine,
-        );
-        // step two: set new commit version (current_version + 1) and path to write
         let commit_version = self.read_snapshot.version() + 1;
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
@@ -582,7 +574,7 @@ impl Transaction {
     ///
     /// the expected schema for `remove_metadata` is given by [`scan_row_schema`] it, is expected
     /// this will be the result of passing [`FilteredEngineData`] returned from a scan
-    /// with rows modified for removal.
+    /// with rows modified for removal (selected rows in FilteredEngineData are the ones to be removed).
     pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
         self.remove_files_metadata.push(remove_metadata);
     }
