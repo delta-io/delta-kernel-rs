@@ -79,7 +79,7 @@ impl ScanLogReplayProcessor {
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
-struct AddRemoveDedupVisitor<'seen> {
+pub struct AddRemoveDedupVisitor<'seen> {
     deduplicator: FileActionDeduplicator<'seen>,
     selection_vector: Vec<bool>,
     logical_schema: SchemaRef,
@@ -218,7 +218,11 @@ impl AddRemoveDedupVisitor<'_> {
 
     /// True if this row contains an Add action that should survive log replay. Skip it if the row
     /// is not an Add action, or the file has already been seen previously.
-    fn is_valid_add<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
+    pub fn is_valid_add<'a>(
+        &mut self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<bool> {
         // When processing file actions, we extract path and deletion vector information based on action type:
         // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
         // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at indexes 6-8

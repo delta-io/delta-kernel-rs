@@ -16,7 +16,8 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
-use crate::{DataType, DeltaResult, DynPartialEq};
+use crate::schema::{ArrayType, DecimalType, PrimitiveType, SchemaRef, StructField, StructType};
+use crate::{DataType, DeltaResult, DynPartialEq, Error};
 
 mod column_names;
 pub(crate) mod literal_expression_transform;
@@ -495,6 +496,67 @@ impl JunctionPredicate {
 }
 
 impl Expression {
+    pub fn data_type(&self, resolve_with: Option<SchemaRef>) -> DeltaResult<DataType> {
+        let res = match self {
+            Expression::Literal(scalar) => match scalar {
+                Scalar::Integer(_) => DataType::Primitive(PrimitiveType::Integer),
+                Scalar::Long(_) => DataType::Primitive(PrimitiveType::Long),
+                Scalar::Short(_) => DataType::Primitive(PrimitiveType::Short),
+                Scalar::Byte(_) => DataType::Primitive(PrimitiveType::Byte),
+                Scalar::Float(_) => DataType::Primitive(PrimitiveType::Float),
+                Scalar::Double(_) => DataType::Primitive(PrimitiveType::Double),
+                Scalar::String(_) => DataType::Primitive(PrimitiveType::String),
+                Scalar::Boolean(_) => DataType::Primitive(PrimitiveType::Boolean),
+                Scalar::Timestamp(_) => DataType::Primitive(PrimitiveType::Timestamp),
+                Scalar::TimestampNtz(_) => DataType::Primitive(PrimitiveType::TimestampNtz),
+                Scalar::Date(_) => DataType::Primitive(PrimitiveType::Date),
+                Scalar::Binary(_) => DataType::Primitive(PrimitiveType::Binary),
+                Scalar::Decimal(decimal_data) => {
+                    DataType::Primitive(PrimitiveType::Decimal(DecimalType {
+                        precision: decimal_data.precision(),
+                        scale: decimal_data.scale(),
+                    }))
+                }
+                Scalar::Null(data_type) => data_type.clone(),
+                Scalar::Struct(struct_data) => DataType::Struct(Box::new(StructType::new(
+                    struct_data.fields().iter().cloned(),
+                ))),
+                Scalar::Array(array_data) => {
+                    DataType::Array(Box::new(array_data.array_type().clone()))
+                }
+                Scalar::Map(map_data) => DataType::Map(Box::new(map_data.map_type().clone())),
+            },
+            Expression::Column(column_name) => {
+                let Some(schema) = resolve_with else {
+                    return Err(Error::generic("could not resolve!"));
+                };
+                let Some(field) = schema.nested_field(column_name) else {
+                    return Err(Error::generic("could not resolve!"));
+                };
+                field.data_type().clone()
+            }
+            Expression::Predicate(predicate) => DataType::Primitive(PrimitiveType::Boolean),
+            Expression::Struct(expressions) => {
+                let mut counter = 1;
+                let fields: Vec<_> = expressions
+                    .iter()
+                    .map(move |field| field.data_type(resolve_with.clone()))
+                    .map_ok(|data_type| {
+                        StructField::new(format! {"col-{counter}"}, data_type, true)
+                    })
+                    .try_collect()?;
+                DataType::struct_type(fields)
+            }
+            Expression::Transform(transform) => todo!(),
+            Expression::Unary(unary_expression) => todo!(),
+            Expression::Binary(binary_expression) => {
+                binary_expression.left.data_type(resolve_with)?
+            }
+            Expression::Opaque(opaque_expression) => todo!(),
+            Expression::Unknown(_) => todo!(),
+        };
+        Ok(res)
+    }
     /// Returns a set of columns referenced by this expression.
     pub fn references(&self) -> HashSet<&ColumnName> {
         let mut references = GetColumnReferences::default();

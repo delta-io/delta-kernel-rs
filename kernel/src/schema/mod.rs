@@ -408,6 +408,28 @@ impl StructType {
         self.fields.get(name.as_ref())
     }
 
+    pub fn nested_field(&self, name: &ColumnName) -> Option<&StructField> {
+        let mut curr_struct = self;
+        let len = name.len();
+        for (i, field_name) in name.path().iter().enumerate() {
+            let field = curr_struct.field(field_name)?;
+            // If this is the last element, return
+            if len - 1 == i {
+                return Some(field);
+            }
+            match &field.data_type {
+                DataType::Primitive(primitive_type) => todo!(),
+                DataType::Array(array_type) => todo!(),
+                DataType::Struct(ref struct_type) => {
+                    curr_struct = struct_type;
+                }
+                DataType::Map(map_type) => todo!(),
+                DataType::Variant(struct_type) => todo!(),
+            }
+        }
+        None
+    }
+
     pub fn index_of(&self, name: impl AsRef<str>) -> Option<usize> {
         self.fields.get_index_of(name.as_ref())
     }
@@ -636,8 +658,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct DecimalType {
-    precision: u8,
-    scale: u8,
+    pub precision: u8,
+    pub scale: u8,
 }
 
 impl DecimalType {
