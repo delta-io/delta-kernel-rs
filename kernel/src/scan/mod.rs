@@ -508,7 +508,10 @@ impl Scan {
                     StructField::nullable("modificationTime", DataType::LONG),
                     StructField::nullable("stats", DataType::STRING),
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-                    StructField::nullable("tags", MapType::new(DataType::STRING, DataType::STRING, true)),
+                    StructField::nullable(
+                        "tags",
+                        MapType::new(DataType::STRING, DataType::STRING, true),
+                    ),
                     StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
                     StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
                 ]),

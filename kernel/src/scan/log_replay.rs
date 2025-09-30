@@ -271,12 +271,19 @@ pub(crate) static TAGS_NAME: &str = "tags";
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    let file_constant_values =
-        StructType::new_unchecked([StructField::nullable("partitionValues", partition_values),
+    let file_constant_values = StructType::new_unchecked([
+        StructField::nullable("partitionValues", partition_values),
         StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
         StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-        StructField::nullable("tags", MapType::new(DataType::STRING, DataType::STRING, /*valueContainsNull*/ true)),
-        ]);
+        StructField::nullable(
+            "tags",
+            MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                /*valueContainsNull*/ true,
+            ),
+        ),
+    ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
@@ -299,8 +306,8 @@ fn get_add_transform_expr() -> ExpressionRef {
             column_expr_ref!("add.modificationTime"),
             column_expr_ref!("add.stats"),
             column_expr_ref!("add.deletionVector"),
-            Arc::new(Expression::Struct(vec![column_expr_ref!(
-                "add.partitionValues"),
+            Arc::new(Expression::Struct(vec![
+                column_expr_ref!("add.partitionValues"),
                 column_expr_ref!("add.baseRowId"),
                 column_expr_ref!("add.defaultRowCommitVersion"),
                 column_expr_ref!("add.tags"),
