@@ -101,9 +101,9 @@ pub unsafe extern "C" fn add_files(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION and commit info
+/// Caller is responsible for passing a valid handle. 
 #[no_mangle]
-pub unsafe extern "C" fn with_data_change(
+pub unsafe extern "C" fn set_data_change(
     mut txn: Handle<ExclusiveTransaction>,
     data_change: bool,
 ) {
