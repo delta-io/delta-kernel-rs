@@ -271,7 +271,7 @@ impl Transaction {
         self
     }
 
-    /// Same as [`with_data_change`] but set the value directly instead of
+    /// Same as [`Transaction::with_data_change`] but set the value directly instead of
     /// using a fluent API.
     pub fn set_data_change(&mut self, data_change: bool) {
         self.data_change = data_change;
