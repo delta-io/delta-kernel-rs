@@ -351,17 +351,15 @@ impl TableConfiguration {
 
         match (enablement_version, enablement_timestamp) {
             (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled {
-                enablement: Some((version, timestamp))
+                enablement: Some((version, timestamp)),
             }),
             (Some(_), None) => Err(Error::generic(
-                "In-commit timestamp enabled, but enablement timestamp is missing while enablement version is present"
+                "In-commit timestamp enabled, but enablement timestamp is missing",
             )),
             (None, Some(_)) => Err(Error::generic(
-                "In-commit timestamp enabled, but enablement version is missing while enablement timestamp is present"
+                "In-commit timestamp enabled, but enablement version is missing",
             )),
-            (None, None) => Ok(InCommitTimestampEnablement::Enabled {
-                enablement: None
-            }),
+            (None, None) => Ok(InCommitTimestampEnablement::Enabled { enablement: None }),
         }
     }
 
