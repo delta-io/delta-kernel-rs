@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow::array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow::util::pretty::print_batches;
 use clap::Parser;
+use common::{LocationArgs, ParseWithExamples};
 use itertools::Itertools;
 use serde_json::{json, to_vec};
 use url::Url;
@@ -26,9 +27,8 @@ use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Path to the table
-    #[arg(long, short = 'p')]
-    path: String,
+    #[command(flatten)]
+    location_args: LocationArgs,
 
     /// Comma-separated schema specification of the form `field_name:data_type`
     #[arg(
@@ -59,16 +59,19 @@ async fn main() -> ExitCode {
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
 async fn try_main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
-    if !Path::new(&cli.path).exists() {
-        create_dir_all(&cli.path).map_err(|e| {
-            Error::generic(format!("Failed to create directory {}: {e}", &cli.path))
+    if !Path::new(&cli.location_args.path).exists() {
+        create_dir_all(&cli.location_args.path).map_err(|e| {
+            Error::generic(format!(
+                "Failed to create directory {}: {e}",
+                &cli.location_args.path
+            ))
         })?;
     }
 
-    let url = delta_kernel::try_parse_uri(&cli.path)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem

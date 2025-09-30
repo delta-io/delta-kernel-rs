@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use delta_kernel::arrow::compute::filter_record_batch;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::to_json_bytes;
 use delta_kernel::schema::{DataType, StructField, StructType};
 use delta_kernel::Snapshot;
@@ -118,18 +116,7 @@ async fn action_reconciliation_round_trip() -> Result<(), Box<dyn std::error::Er
     // Convert the end-to-end flow of writing the JSON. We are going beyond the public
     // log compaction APIs since the test is writing the compacted JSON and verifying it
     // bu this is intentional, as most engines would be implementing something similar
-    let compaction_data_iter = compacted_data_batches.into_iter().map(|filtered_batch| {
-        let arrow_data = ArrowEngineData::try_from_engine_data(filtered_batch.data)?;
-        let record_batch = arrow_data.record_batch();
-
-        let selected =
-            delta_kernel::arrow::array::BooleanArray::from(filtered_batch.selection_vector);
-        let filtered_record_batch = filter_record_batch(record_batch, &selected)?;
-
-        let filtered_data: Box<dyn delta_kernel::EngineData> =
-            Box::new(ArrowEngineData::new(filtered_record_batch));
-        Ok(filtered_data)
-    });
+    let compaction_data_iter = compacted_data_batches.into_iter().map(Ok);
     let json_bytes = to_json_bytes(compaction_data_iter)?;
     let final_content = String::from_utf8(json_bytes)?;
 
@@ -315,18 +302,7 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
     );
 
     // Convert to JSON and write to storage for verification
-    let compaction_data_iter = compacted_data_batches.into_iter().map(|filtered_batch| {
-        let arrow_data = ArrowEngineData::try_from_engine_data(filtered_batch.data)?;
-        let record_batch = arrow_data.record_batch();
-
-        let selected =
-            delta_kernel::arrow::array::BooleanArray::from(filtered_batch.selection_vector);
-        let filtered_record_batch = filter_record_batch(record_batch, &selected)?;
-
-        let filtered_data: Box<dyn delta_kernel::EngineData> =
-            Box::new(ArrowEngineData::new(filtered_record_batch));
-        Ok(filtered_data)
-    });
+    let compaction_data_iter = compacted_data_batches.into_iter().map(Ok);
     let json_bytes = to_json_bytes(compaction_data_iter)?;
     let final_content = String::from_utf8(json_bytes)?;
 
