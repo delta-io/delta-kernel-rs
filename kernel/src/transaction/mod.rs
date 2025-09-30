@@ -11,7 +11,9 @@ use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::path::ParsedLogPath;
-use crate::scan::log_replay::{BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME,
+};
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::{
@@ -581,14 +583,17 @@ impl Transaction {
                 let file_action_expr = Expression::struct_from([Expression::struct_from([
                     Expression::column(["path"]),
                     Expression::literal(self.commit_timestamp), // deletionTimestamp
-                    Expression::literal(self.data_change), // dataChange
-                    Expression::literal(true), // extendedFileMetadata
+                    Expression::literal(self.data_change),      // dataChange
+                    Expression::literal(true),                  // extendedFileMetadata
                     Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]), // partitionValues
                     Expression::column(["size"]),
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]), // tags
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "tags"]), // tags
                     Expression::column(["deletionVector"]),
                     Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]),
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
+                    Expression::column([
+                        FILE_CONSTANT_VALUES_NAME,
+                        DEFAULT_ROW_COMMIT_VERSION_NAME,
+                    ]),
                 ])]);
                 let file_action_eval = evaluation_handler.new_expression_evaluator(
                     input_schema.clone(),
@@ -598,8 +603,12 @@ impl Transaction {
 
                 // Extract the underlying data and apply the selection vector to get only selected rows
 
-                let updated_engine_data = file_action_eval.evaluate(&*file_metadata_batch.data())?;
-                FilteredEngineData::try_new(updated_engine_data, file_metadata_batch.selection_vector().to_vec())
+                let updated_engine_data =
+                    file_action_eval.evaluate(&*file_metadata_batch.data())?;
+                FilteredEngineData::try_new(
+                    updated_engine_data,
+                    file_metadata_batch.selection_vector().to_vec(),
+                )
             })
     }
 }
@@ -682,7 +691,6 @@ mod tests {
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
-
     fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
