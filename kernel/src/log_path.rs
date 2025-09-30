@@ -12,7 +12,7 @@ use url::Url;
 /// Today, a `LogPath` is a file in the `_delta_log` directory of a Delta table; in the future,
 /// this will expand to support providing inline data in the log path itself.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LogPath(ParsedLogPath);
+pub struct LogPath(pub ParsedLogPath);
 
 impl From<LogPath> for ParsedLogPath {
     fn from(p: LogPath) -> Self {

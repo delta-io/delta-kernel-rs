@@ -8,6 +8,7 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
+use crate::committer::FileSystemCommitter;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
@@ -341,7 +342,7 @@ impl Snapshot {
     }
 
     /// Create a [`Transaction`] for this `SnapshotRef`.
-    pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
+    pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction<FileSystemCommitter>> {
         Transaction::try_new(self)
     }
 

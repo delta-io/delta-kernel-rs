@@ -19,7 +19,7 @@ use crate::snapshot::SnapshotRef;
 use crate::utils::{current_time_ms, require};
 use crate::{
     DataType, DeltaResult, Engine, EngineData, EngineDataResultIterator, Expression, ExpressionRef,
-    IntoEngineData, RowVisitor, Snapshot, Version,
+    IntoEngineData, LogPath, RowVisitor, Snapshot, Version,
 };
 
 /// The minimal (i.e., mandatory) fields in an add action.
@@ -110,9 +110,9 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// // commit! (consume the transaction)
 /// txn.commit(&engine)?;
 /// ```
-pub struct Transaction {
+pub struct Transaction<C: Committer> {
     read_snapshot: SnapshotRef,
-    committer: Option<Arc<dyn Committer>>,
+    committer: Option<C>,
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -128,7 +128,7 @@ pub struct Transaction {
     domain_metadatas: Vec<DomainMetadata>,
 }
 
-impl std::fmt::Debug for Transaction {
+impl<C: Committer> std::fmt::Debug for Transaction<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!(
             "Transaction {{ read_snapshot version: {}, engine_info: {} }}",
@@ -138,7 +138,7 @@ impl std::fmt::Debug for Transaction {
     }
 }
 
-impl Transaction {
+impl Transaction<FileSystemCommitter> {
     /// Create a new transaction from a snapshot. The snapshot will be used to read the current
     /// state of the table (e.g. to read the current version).
     ///
@@ -157,7 +157,7 @@ impl Transaction {
 
         Ok(Transaction {
             read_snapshot,
-            committer: None,
+            committer: Some(FileSystemCommitter {}),
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
@@ -166,22 +166,39 @@ impl Transaction {
             domain_metadatas: vec![],
         })
     }
+}
 
+impl<C: Committer> Transaction<C> {
     /// Set the committer that will be used to commit this transaction. If not set, the default
     /// filesystem-based committer will be used. Note that the default committer is only allowed
     /// for non-catalog-managed tables.
     #[cfg(feature = "catalog-managed")]
-    pub fn with_committer(mut self, committer: impl Into<Arc<dyn Committer>>) -> Self {
-        self.committer = Some(committer.into());
-        self
+    pub fn with_committer<T>(self, committer: impl Into<T>) -> Transaction<T>
+    where
+        T: Committer,
+    {
+        // self.committer = Some(committer.into());
+        // self
+        Transaction {
+            read_snapshot: self.read_snapshot,
+            committer: Some(committer.into()),
+            operation: self.operation,
+            engine_info: self.engine_info,
+            add_files_metadata: self.add_files_metadata,
+            set_transactions: self.set_transactions,
+            commit_timestamp: self.commit_timestamp,
+            domain_metadatas: self.domain_metadatas,
+        }
     }
+}
 
+impl<C: Committer> Transaction<C> {
     /// Consume the transaction and commit it to the table. The result is a  result of
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
-    pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+    pub fn commit(self, engine: &dyn Engine, context: C::Context) -> DeltaResult<CommitResult<C>> {
         // Step 0: Determine the committer to use
         #[cfg(feature = "catalog-managed")]
         if self.committer.is_none() {
@@ -191,14 +208,14 @@ impl Transaction {
             );
         }
 
-        let default_committer: Arc<dyn Committer>;
-        let committer = match self.committer.as_ref() {
-            Some(c) => c,
-            None => {
-                default_committer = FileSystemCommitter::new();
-                &default_committer
-            }
-        };
+        // let default_committer: FileSystemCommitter;
+        // let committer = match self.committer.as_ref() {
+        //     Some(c) => c,
+        //     None => {
+        //         default_committer = FileSystemCommitter::new();
+        //         &default_committer
+        //     }
+        // };
 
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
@@ -223,11 +240,12 @@ impl Transaction {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // Step 2: Construct commit info and initialize the action iterator
-        let commit_info = CommitInfo::new(
+        let mut commit_info = CommitInfo::new(
             self.commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
         );
+        commit_info.in_commit_timestamp = Some(self.commit_timestamp);
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
@@ -241,15 +259,18 @@ impl Transaction {
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Step 5: Commit the actions as a JSON file to the Delta log
-        let commit_path =
-            ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
+        // let commit_path =
+        //     ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
-        let commit_metadata = CommitMetadata::new(commit_path, commit_version);
-        match committer.commit(engine, Box::new(actions), commit_metadata) {
+        // let path = commit_path.0.location.location;
+        // let path = ParsedLogPath::try_from(path).unwrap().unwrap();
+        // let commit_metadata = CommitMetadata::new(path, commit_version);
+        let committer = self.committer.as_ref().unwrap();
+        match committer.commit(engine, Box::new(actions), commit_version, &context) {
             Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(version),
             )),
@@ -500,20 +521,7 @@ impl Transaction {
         }
     }
 
-    pub fn hack_actions(&self, engine: &dyn Engine) -> EngineDataResultIterator<'_> {
-        let mut commit_info = CommitInfo::new(
-            self.commit_timestamp,
-            self.operation.clone(),
-            self.engine_info.clone(),
-        );
-        commit_info.in_commit_timestamp = Some(self.commit_timestamp);
-        let commit_info_action =
-            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
-        let actions = iter::once(commit_info_action);
-        Box::new(actions)
-    }
-
-    fn into_committed(self, version: Version) -> CommittedTransaction {
+    fn into_committed(self, version: Version) -> CommittedTransaction<C> {
         let stats = PostCommitStats {
             commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
                 + 1,
@@ -531,14 +539,14 @@ impl Transaction {
         }
     }
 
-    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction {
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction<C> {
         ConflictedTransaction {
             transaction: self,
             conflict_version,
         }
     }
 
-    fn into_retryable(self, error: Error) -> RetryableTransaction {
+    fn into_retryable(self, error: Error) -> RetryableTransaction<C> {
         RetryableTransaction {
             transaction: self,
             error,
@@ -602,20 +610,20 @@ pub struct PostCommitStats {
 ///   can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
-pub enum CommitResult {
+pub enum CommitResult<C: Committer> {
     /// The transaction was successfully committed.
-    CommittedTransaction(CommittedTransaction),
+    CommittedTransaction(CommittedTransaction<C>),
     /// This transaction conflicted with an existing version (at the version given). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    ConflictedTransaction(ConflictedTransaction),
+    ConflictedTransaction(ConflictedTransaction<C>),
     /// An IO (retryable) error occurred during the commit.
-    RetryableTransaction(RetryableTransaction),
+    RetryableTransaction(RetryableTransaction<C>),
 }
 
-impl CommitResult {
+impl<C: Committer> CommitResult<C> {
     /// Returns true if the commit was successful.
     pub fn is_committed(&self) -> bool {
         matches!(self, CommitResult::CommittedTransaction(_))
@@ -623,15 +631,15 @@ impl CommitResult {
 }
 
 #[derive(Debug)]
-pub struct CommittedTransaction {
-    transaction: Transaction,
+pub struct CommittedTransaction<C: Committer> {
+    transaction: Transaction<C>,
     /// the version of the table that was just committed
     commit_version: Version,
     /// The [`PostCommitStats`] for this transaction
     post_commit_stats: PostCommitStats,
 }
 
-impl CommittedTransaction {
+impl<C: Committer> CommittedTransaction<C> {
     /// The version of the table that was just committed
     pub fn version(&self) -> Version {
         self.commit_version
@@ -652,14 +660,14 @@ impl CommittedTransaction {
 }
 
 #[derive(Debug)]
-pub struct ConflictedTransaction {
-    pub transaction: Transaction,
+pub struct ConflictedTransaction<C: Committer> {
+    pub transaction: Transaction<C>,
     pub conflict_version: Version,
 }
 
 #[derive(Debug)]
-pub struct RetryableTransaction {
-    pub transaction: Transaction,
+pub struct RetryableTransaction<C: Committer> {
+    pub transaction: Transaction<C>,
     pub error: Error,
 }
 

@@ -52,8 +52,7 @@ pub(crate) enum LogPathFileType {
 /// the _delta_log we may see _staged_commits/00000000000000000000.{uuid}.json, but we MUST NOT
 /// include those in listing, as only the catalog can tell us which are valid commits.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[internal_api]
-pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
+pub struct ParsedLogPath<Location: AsUrl = FileMeta> {
     pub location: Location,
     #[allow(unused)]
     pub filename: String,

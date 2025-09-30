@@ -129,26 +129,60 @@ impl UCCommitter {
 use delta_kernel::committer::Committer;
 use delta_kernel::EngineDataResultIterator;
 
+pub struct UCCommitterContext {
+    table_id: String,
+    table_uri: String,
+}
+
 impl Committer for UCCommitter {
+    type Context = UCCommitterContext;
     fn commit<'a>(
         &self,
         engine: &'a dyn Engine,
         actions: EngineDataResultIterator<'a>,
-        commit_metadata: delta_kernel::committer::CommitMetadata,
+        version: Version,
+        context: &UCCommitterContext,
     ) -> delta_kernel::DeltaResult<delta_kernel::committer::CommitResponse> {
-        // let commit_req = CommitRequest::new(
-        //     commit_metadata.table_id,
-        //     commit_metadata.table_uri,
-        //     Commit::new(
-        //         commit_metadata.version as i64,
-        //         commit_metadata.timestamp,
-        //         format!("{}.json", commit_metadata.version),
-        //         123,
-        //         123456789,
-        //     ),
-        // );
-        // self.client.commit(commit_req) // ASYNC!
-        todo!()
+        let last_modified = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let size = 1500;
+        let filename = format!("{:020}.{}.json", version, uuid::Uuid::new_v4());
+        let staged_commit_path = LogPath::staged_commit(
+            Url::parse(&context.table_uri)?,
+            &filename,
+            last_modified,
+            size,
+        )?;
+        engine.json_handler().write_json_file(
+            &staged_commit_path.0.location.location,
+            actions,
+            false,
+        )?;
+        let commit_req = CommitRequest::new(
+            &context.table_id,
+            &context.table_uri,
+            Commit::new(
+                version.try_into().unwrap(),
+                last_modified,
+                filename,
+                size.try_into().unwrap(),
+                last_modified,
+            ),
+        );
+
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(move || {
+            handle.block_on(async move {
+                match self.client.commit(commit_req).await {
+                    Ok(_) => Ok(delta_kernel::committer::CommitResponse::Committed { version }),
+                    Err(e) => Err(delta_kernel::Error::Generic(format!("commit failed: {e}"))),
+                }
+            })
+        })
     }
 }
 
@@ -158,7 +192,7 @@ mod tests {
 
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
-    use delta_kernel::transaction::CommitResult;
+    use delta_kernel::transaction::{CommitResult, Transaction};
     use object_store::ObjectStore;
 
     use super::*;
@@ -236,7 +270,7 @@ mod tests {
     // ignored test which you can run manually to play around with writing to a UC table. run with:
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
     #[ignore]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_uc_table() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
@@ -266,73 +300,49 @@ mod tests {
         ];
 
         let table_url = Url::parse(&table_uri)?;
-        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
+        let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
         let store: Arc<dyn ObjectStore> = store.into();
 
         let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-        let committer = Arc::new(UCCommitter::new(client.clone()));
+        let committer = UCCommitter::new(client.clone());
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)
             .await?;
         println!("latest snapshot version: {:?}", snapshot.version());
-        let txn = snapshot
-            .clone()
-            .transaction()?
-            .with_committer(committer as Arc<dyn Committer>);
+        let txn: Transaction<UCCommitter> =
+            snapshot.clone().transaction()?.with_committer(committer);
         let _write_context = txn.get_write_context();
         // do a write.
 
-        let last_modified = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as i64;
-        let size: i64 = 1500;
-        let uuid = uuid::Uuid::new_v4();
-        let version = snapshot.version() + 1;
-        let filename = format!("{version:020}.{uuid}.json");
-        let mut commit_path = table_url.clone();
-        commit_path.path_segments_mut().unwrap().extend(&[
-            "_delta_log",
-            "_staged_commits",
-            &filename,
-        ]);
-
-        // commit info only
-        let actions = txn.hack_actions(&engine);
-        engine
-            .json_handler()
-            .write_json_file(&commit_path, actions, false)?;
-
         // print the log
-        use futures::stream::StreamExt;
-        let mut stream = store.list(Some(&path));
-        while let Some(path) = stream.next().await {
-            println!("object: {:?}", path.unwrap().location);
-        }
-
-        let commit_req = CommitRequest::new(
-            table_id,
-            table_uri,
-            Commit::new(
-                version.try_into().unwrap(),
-                last_modified,
-                filename,
-                size,
-                last_modified,
-            ),
-        );
-        client.commit(commit_req).await?;
-
-        // match txn.commit(&engine)? {
-        //     CommitResult::CommittedTransaction(t) => {
-        //         println!("🎉 committed version {}", t.version());
-        //     }
-        //     CommitResult::ConflictedTransaction(t) => {
-        //         println!("💥 commit conflicted at version {}", t.conflict_version);
-        //     }
-        //     CommitResult::RetryableTransaction(_) => {
-        //         println!("we should retry...");
-        //     }
+        // use futures::stream::StreamExt;
+        // let mut stream = store.list(Some(&path));
+        // while let Some(path) = stream.next().await {
+        //     println!("object: {:?}", path.unwrap().location);
         // }
+
+        // let commit = store
+        //     .get(&object_store::path::Path::from("19a85dee-54bc-43a2-87ab-023d0ec16013/tables/cdac4b37-fc11-4148-ae02-512e6cc4e1bd/_delta_log/_staged_commits/00000000000000000001.5400fd23-8e08-4f87-8049-7b37431fb826.json"))
+        //     .await
+        //     .unwrap();
+        // let bytes = commit.bytes().await?;
+        // println!("commit file contents:\n{}", String::from_utf8_lossy(&bytes));
+
+        let ctx = UCCommitterContext {
+            table_id: table_id.clone(),
+            table_uri: table_uri.clone(),
+        };
+        match txn.commit(&engine, ctx)? {
+            CommitResult::CommittedTransaction(t) => {
+                println!("🎉 committed version {}", t.version());
+            }
+            CommitResult::ConflictedTransaction(t) => {
+                println!("💥 commit conflicted at version {}", t.conflict_version);
+            }
+            CommitResult::RetryableTransaction(_) => {
+                println!("we should retry...");
+            }
+        }
         Ok(())
     }
 }
