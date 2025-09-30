@@ -240,6 +240,13 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::VariantType,
         WriterFeature::VariantTypePreview,
         WriterFeature::VariantShreddingPreview,
+        WriterFeature::V2Checkpoint,
+        WriterFeature::VacuumProtocolCheck,
+        WriterFeature::InCommitTimestamp,
+        #[cfg(feature = "catalog-managed")]
+        WriterFeature::CatalogManaged,
+        #[cfg(feature = "catalog-managed")]
+        WriterFeature::CatalogOwnedPreview,
     ]
 });
 

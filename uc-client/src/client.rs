@@ -61,12 +61,17 @@ impl UCClient {
             })
             .await?;
 
-        self.handle_response(response).await
+        let res = self.handle_response(response).await;
+        println!("\nGet commits response: {:?}\n", res);
+        res
     }
 
     #[instrument(skip(self))]
     pub async fn commit(&self, request: CommitRequest) -> Result<CommitResponse> {
         let url = self.base_url.join("delta/preview/commits")?;
+
+        let json = serde_json::to_string_pretty(&request).unwrap_or_default();
+        println!("Committing: {json}");
 
         let response = self
             .execute_with_retry(|| {

@@ -578,6 +578,19 @@ impl Transaction {
         }
     }
 
+    pub fn hack_actions(&self, engine: &dyn Engine) -> EngineDataResultIterator<'_> {
+        let mut commit_info = CommitInfo::new(
+            self.commit_timestamp,
+            self.operation.clone(),
+            self.engine_info.clone(),
+        );
+        commit_info.in_commit_timestamp = Some(self.commit_timestamp);
+        let commit_info_action =
+            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
+        let actions = iter::once(commit_info_action);
+        Box::new(actions)
+    }
+
     fn into_committed(self, version: Version) -> CommittedTransaction {
         let stats = PostCommitStats {
             commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()

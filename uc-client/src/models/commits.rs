@@ -50,6 +50,28 @@ pub struct Commit {
 }
 
 impl Commit {
+    pub fn new(
+        version: i64,
+        timestamp: i64,
+        file_name: impl Into<String>,
+        file_size: i64,
+        file_modification_timestamp: i64,
+    ) -> Self {
+        Self {
+            version,
+            timestamp,
+            file_name: file_name.into(),
+            file_size,
+            file_modification_timestamp,
+            is_disown_commit: Some(false),
+        }
+    }
+
+    pub fn with_disown_commit(mut self, disown: bool) -> Self {
+        self.is_disown_commit = Some(disown);
+        self
+    }
+
     pub fn timestamp_as_datetime(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         chrono::DateTime::from_timestamp_millis(self.timestamp)
     }
@@ -61,11 +83,10 @@ impl Commit {
 
 // Structs for creating a new commit
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CommitRequest {
     pub table_id: String,
     pub table_uri: String,
-    pub commit_info: CommitInfo,
+    pub commit_info: Commit,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_backfilled_version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,23 +95,11 @@ pub struct CommitRequest {
     pub protocol: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitInfo {
-    pub version: i64,
-    pub timestamp: i64,
-    pub file_name: String,
-    pub file_size: i64,
-    pub file_modification_timestamp: i64,
-    #[serde(default)]
-    pub is_disown_commit: bool,
-}
-
 impl CommitRequest {
     pub fn new(
         table_id: impl Into<String>,
         table_uri: impl Into<String>,
-        commit_info: CommitInfo,
+        commit_info: Commit,
     ) -> Self {
         Self {
             table_id: table_id.into(),
@@ -118,32 +127,5 @@ impl CommitRequest {
     }
 }
 
-impl CommitInfo {
-    pub fn new(
-        version: i64,
-        timestamp: i64,
-        file_name: impl Into<String>,
-        file_size: i64,
-        file_modification_timestamp: i64,
-    ) -> Self {
-        Self {
-            version,
-            timestamp,
-            file_name: file_name.into(),
-            file_size,
-            file_modification_timestamp,
-            is_disown_commit: false,
-        }
-    }
-
-    pub fn with_disown_commit(mut self, disown: bool) -> Self {
-        self.is_disown_commit = disown;
-        self
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommitResponse {
-    pub commit: Commit,
-}
+pub struct CommitResponse {}
