@@ -3,33 +3,26 @@ use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::{as_log_add_schema, get_log_commit_info_schema, get_log_remove_schema, get_log_txn_schema, get_log_domain_metadata_schema};
+use crate::actions::{
+    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
+    get_log_remove_schema, get_log_txn_schema,
+};
 use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
-use crate::arrow::array::BooleanArray;
-use crate::arrow::compute::filter_record_batch;
-use crate::engine::arrow_data::{ArrowEngineData, extract_record_batch};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::path::ParsedLogPath;
+use crate::scan::log_replay::{BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME};
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType,MapType, SchemaRef, StructField, StructType};
-use crate::snapshot::Snapshot;
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData, RowVisitor, Version
+    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
+    RowVisitor, Version,
 };
 
 use url::Url;
 
-use crate::actions::{
-    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
-};
-use crate::engine_data::FilteredEngineData;
-use crate::error::Error;
-
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
@@ -242,12 +235,7 @@ impl Transaction {
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
-        let remove_actions = generate_remove_actions(
-            scan_row_schema().clone(),
-            get_log_remove_schema().clone(),
-            self.remove_files_metadata.iter().map(|a| a.as_ref()),
-            engine,
-        );
+        let remove_actions = self.generate_remove_actions(engine);
 
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
@@ -579,39 +567,46 @@ impl Transaction {
     pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
         self.remove_files_metadata.push(remove_metadata);
     }
-}
 
+    fn generate_remove_actions<'a>(
+        &'a self,
+        engine: &dyn Engine,
+    ) -> impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a {
+        let input_schema = scan_row_schema();
+        let target_schema = get_log_remove_schema();
+        let evaluation_handler = engine.evaluation_handler();
+        self.remove_files_metadata
+            .iter()
+            .map(move |file_metadata_batch| {
+                let file_action_expr = Expression::struct_from([Expression::struct_from([
+                    Expression::column(["path"]),
+                    Expression::literal(self.commit_timestamp), // deletionTimestamp
+                    Expression::literal(self.data_change), // dataChange
+                    Expression::literal(true), // extendedFileMetadata
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]), // partitionValues
+                    Expression::column(["size"]),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]), // tags
+                    Expression::column(["deletionVector"]),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]),
+                ])]);
+                let file_action_eval = evaluation_handler.new_expression_evaluator(
+                    input_schema.clone(),
+                    Arc::new(file_action_expr),
+                    target_schema.clone().into(),
+                );
+
+                // Extract the underlying data and apply the selection vector to get only selected rows
+
+                let updated_engine_data = file_action_eval.evaluate(&*file_metadata_batch.data())?;
+                FilteredEngineData::try_new(updated_engine_data, file_metadata_batch.selection_vector().to_vec())
+            })
+    }
+}
 
 // Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
 // actions using an expression to transform the data (in a single pass) from [`input_schema`] into
 // [`target_schema`].
-fn generate_remove_actions<'a>(
-    input_schema: SchemaRef,
-    target_schema: SchemaRef,
-    file_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
-    engine: &dyn Engine,
-) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a {
-    let evaluation_handler = engine.evaluation_handler();
-    file_metadata.map(move |file_metadata_batch| {
-        let file_action_expr = Expression::struct_from([Expression::struct_from(
-            input_schema
-                .fields()
-                .map(|f| Expression::column([f.name()])),
-        )]);
-        let file_action_eval = evaluation_handler.new_expression_evaluator(
-            input_schema.clone(),
-            Arc::new(file_action_expr),
-            target_schema.clone().into(),
-        );
-        // Extract the underlying data and apply the selection vector to get only selected rows
-        let batch = extract_record_batch(&*file_metadata_batch.data)?;
-        let filtered_batch = filter_record_batch(batch, &BooleanArray::from(file_metadata_batch.selection_vector.clone()))
-            .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
-        let filtered_engine_data = Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>;
-        
-        file_action_eval.evaluate(&*filtered_engine_data)
-    })
-}
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
 /// write table data.
