@@ -99,12 +99,9 @@ pub unsafe extern "C" fn add_files(
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing a valid handle. 
+/// Caller is responsible for passing a valid handle.
 #[no_mangle]
-pub unsafe extern "C" fn set_data_change(
-    mut txn: Handle<ExclusiveTransaction>,
-    data_change: bool,
-) {
+pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, data_change: bool) {
     let underlying_txn = unsafe { txn.as_mut() };
     underlying_txn.set_data_change(data_change);
 }
