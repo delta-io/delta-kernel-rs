@@ -277,7 +277,7 @@ mod tests {
             let txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
-            unsafe { with_data_change(txn.shallow_copy(), false) };
+            unsafe { set_data_change(txn.shallow_copy(), false) };
 
             // Add engine info
             let engine_info = "default_engine";
