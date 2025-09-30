@@ -1255,9 +1255,6 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let domain2 = "spark.settings";
     let config2 = r#"{"cores": 4}"#;
 
-    txn.with_domain_metadata(domain1.to_string(), config1.to_string())
-        .with_domain_metadata(domain2.to_string(), config2.to_string())
-        .commit(&engine)?;
     assert!(txn
         .with_domain_metadata(domain1.to_string(), config1.to_string())
         .with_domain_metadata(domain2.to_string(), config2.to_string())

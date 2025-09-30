@@ -89,7 +89,6 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
-mod committer;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -104,6 +103,11 @@ pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
 pub(crate) mod transforms;
+
+#[cfg(not(feature = "catalog-managed"))]
+mod committer;
+#[cfg(feature = "catalog-managed")]
+pub mod committer;
 
 pub use log_path::LogPath;
 
@@ -185,7 +189,7 @@ pub type FileDataReadResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
 
 /// Type alias for an iterator of [`EngineData`] results.
-pub(crate) type EngineDataResultIterator<'a> =
+pub type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The metadata that describes an object.

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
 
+use uc_client::models::{Commit, CommitRequest};
 use uc_client::prelude::*;
 
 use itertools::Itertools;
@@ -59,6 +60,12 @@ impl<'a> UCCatalog<'a> {
         // TODO: does it paginate?
         let commits = self.client.get_commits(req).await?;
 
+        // sort them
+        let mut commits = commits;
+        if let Some(c) = commits.commits.as_mut() {
+            c.sort_by_key(|c| c.version)
+        }
+
         // if commits are present, we ensure they are sorted+contiguous
         if let Some(commits) = &commits.commits {
             if !commits.windows(2).all(|w| w[1].version == w[0].version + 1) {
@@ -107,12 +114,52 @@ impl<'a> UCCatalog<'a> {
     }
 }
 
+/// A [UCCommitter] is a Unity Catalog [Committer] implementation for committing to delta tables in
+/// UC.
+pub struct UCCommitter {
+    client: Arc<UCClient>,
+}
+
+impl UCCommitter {
+    pub fn new(client: Arc<UCClient>) -> Self {
+        UCCommitter { client }
+    }
+}
+
+use delta_kernel::committer::Committer;
+use delta_kernel::EngineDataResultIterator;
+
+impl Committer for UCCommitter {
+    fn commit<'a>(
+        &self,
+        engine: &'a dyn Engine,
+        actions: EngineDataResultIterator<'a>,
+        commit_metadata: delta_kernel::committer::CommitMetadata,
+    ) -> delta_kernel::DeltaResult<delta_kernel::committer::CommitResponse> {
+        // let commit_req = CommitRequest::new(
+        //     commit_metadata.table_id,
+        //     commit_metadata.table_uri,
+        //     Commit::new(
+        //         commit_metadata.version as i64,
+        //         commit_metadata.timestamp,
+        //         format!("{}.json", commit_metadata.version),
+        //         123,
+        //         123456789,
+        //     ),
+        // );
+        // self.client.commit(commit_req) // ASYNC!
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::transaction::CommitResult;
+    use object_store::ObjectStore;
 
     use super::*;
 
@@ -183,6 +230,109 @@ mod tests {
 
         println!("🎉 loaded snapshot: {snapshot:?}");
 
+        Ok(())
+    }
+
+    // ignored test which you can run manually to play around with writing to a UC table. run with:
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
+    #[ignore]
+    #[tokio::test]
+    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
+        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
+        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
+
+        // build UC client, get table info and credentials
+        let client = Arc::new(UCClient::builder(endpoint, &token).build()?);
+        let (table_id, table_uri) = get_table(&client, &table_name).await?;
+        let creds = client
+            .get_credentials(&table_id, Operation::ReadWrite)
+            .await
+            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+
+        // build catalog
+        let catalog = UCCatalog::new(&client);
+
+        // TODO: support non-AWS
+        let creds = creds
+            .aws_temp_credentials
+            .ok_or("No AWS temporary credentials found")?;
+
+        let options = [
+            ("region", "us-west-2"),
+            ("access_key_id", &creds.access_key_id),
+            ("secret_access_key", &creds.secret_access_key),
+            ("session_token", &creds.session_token),
+        ];
+
+        let table_url = Url::parse(&table_uri)?;
+        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
+        let store: Arc<dyn ObjectStore> = store.into();
+
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let committer = Arc::new(UCCommitter::new(client.clone()));
+        let snapshot = catalog
+            .load_snapshot(&table_id, &table_uri, &engine)
+            .await?;
+        println!("latest snapshot version: {:?}", snapshot.version());
+        let txn = snapshot
+            .clone()
+            .transaction()?
+            .with_committer(committer as Arc<dyn Committer>);
+        let _write_context = txn.get_write_context();
+        // do a write.
+
+        let last_modified = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
+        let size: i64 = 1500;
+        let uuid = uuid::Uuid::new_v4();
+        let version = snapshot.version() + 1;
+        let filename = format!("{version:020}.{uuid}.json");
+        let mut commit_path = table_url.clone();
+        commit_path.path_segments_mut().unwrap().extend(&[
+            "_delta_log",
+            "_staged_commits",
+            &filename,
+        ]);
+
+        // commit info only
+        let actions = txn.hack_actions(&engine);
+        engine
+            .json_handler()
+            .write_json_file(&commit_path, actions, false)?;
+
+        // print the log
+        use futures::stream::StreamExt;
+        let mut stream = store.list(Some(&path));
+        while let Some(path) = stream.next().await {
+            println!("object: {:?}", path.unwrap().location);
+        }
+
+        let commit_req = CommitRequest::new(
+            table_id,
+            table_uri,
+            Commit::new(
+                version.try_into().unwrap(),
+                last_modified,
+                filename,
+                size,
+                last_modified,
+            ),
+        );
+        client.commit(commit_req).await?;
+
+        // match txn.commit(&engine)? {
+        //     CommitResult::CommittedTransaction(t) => {
+        //         println!("🎉 committed version {}", t.version());
+        //     }
+        //     CommitResult::ConflictedTransaction(t) => {
+        //         println!("💥 commit conflicted at version {}", t.conflict_version);
+        //     }
+        //     CommitResult::RetryableTransaction(_) => {
+        //         println!("we should retry...");
+        //     }
+        // }
         Ok(())
     }
 }
