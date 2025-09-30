@@ -359,6 +359,8 @@ impl TableConfiguration {
             (None, Some(_)) => Err(Error::generic(
                 "In-commit timestamp enabled, but enablement version is missing",
             )),
+            // If InCommitTimestamps was enabled at the beginning of the table's history,
+            // it may have an empty enablement version and timestamp
             (None, None) => Ok(InCommitTimestampEnablement::Enabled { enablement: None }),
         }
     }
@@ -605,7 +607,7 @@ mod test {
         assert!(table_config.is_in_commit_timestamps_enabled());
         assert!(matches!(
             table_config.in_commit_timestamp_enablement(),
-            Err(Error::Generic(msg)) if msg.contains("enablement timestamp is missing while enablement version is present")
+            Err(Error::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
         ));
     }
     #[test]
