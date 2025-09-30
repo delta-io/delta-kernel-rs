@@ -271,6 +271,12 @@ impl Transaction {
         self
     }
 
+    /// Same as [`with_data_change`] but set the value directly instead of
+    /// using a fluent API.
+    pub fn set_data_change(&mut self, data_change: bool) {
+        self.data_change = data_change;
+    }
+
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {

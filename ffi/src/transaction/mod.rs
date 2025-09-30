@@ -104,11 +104,11 @@ pub unsafe extern "C" fn add_files(
 /// Caller is responsible for passing a valid handle. CONSUMES TRANSACTION and commit info
 #[no_mangle]
 pub unsafe extern "C" fn with_data_change(
-    txn: Handle<ExclusiveTransaction>,
+    mut txn: Handle<ExclusiveTransaction>,
     data_change: bool,
-) -> Handle<ExclusiveTransaction> {
-    let txn = unsafe { txn.into_inner() };
-    Box::new(txn.with_data_change(data_change)).into()
+) {
+    let underlying_txn = unsafe { txn.as_mut() };
+    underlying_txn.set_data_change(data_change);
 }
 
 /// Attempt to commit a transaction to the table. Returns version number if successful.
@@ -274,10 +274,10 @@ mod tests {
             let engine = get_default_engine(table_path_str);
 
             // Start the transaction
-            let mut txn = ok_or_panic(unsafe {
+            let txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
-            unsafe { txn = with_data_change(txn.shallow_copy(), true) };
+            unsafe { with_data_change(txn.shallow_copy(), false) };
 
             // Add engine info
             let engine_info = "default_engine";
@@ -395,7 +395,7 @@ mod tests {
                         "partitionValues": {},
                         "size": 0,
                         "modificationTime": 0,
-                        "dataChange": true,
+                        "dataChange": false,
                         "stats": "{\"numRecords\":5}"
                     }
                 }),
