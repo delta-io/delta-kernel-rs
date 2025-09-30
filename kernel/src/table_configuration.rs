@@ -29,10 +29,10 @@ pub(crate) enum InCommitTimestampEnablement {
     /// In-commit timestamps is not enabled
     NotEnabled,
     /// In-commit timestamps is enabled
-    Enabled { 
+    Enabled {
         /// Enablement information, if available. `None` indicates the table was created
         /// with ICT enabled from the beginning (no enablement properties needed).
-        enablement: Option<(Version, i64)> 
+        enablement: Option<(Version, i64)>,
     },
 }
 
@@ -330,17 +330,18 @@ impl TableConfiguration {
                 .unwrap_or(false)
     }
 
-
     /// Returns information about in-commit timestamp enablement state.
     ///
     /// Returns an error if only one of the enablement properties is present, as this indicates
     /// an inconsistent state.
     #[allow(unused)]
-    pub(crate) fn in_commit_timestamp_enablement(&self) -> DeltaResult<InCommitTimestampEnablement> {
+    pub(crate) fn in_commit_timestamp_enablement(
+        &self,
+    ) -> DeltaResult<InCommitTimestampEnablement> {
         if !self.is_in_commit_timestamps_enabled() {
             return Ok(InCommitTimestampEnablement::NotEnabled);
         }
-        
+
         let enablement_version = self
             .table_properties()
             .in_commit_timestamp_enablement_version;
@@ -349,8 +350,8 @@ impl TableConfiguration {
             .in_commit_timestamp_enablement_timestamp;
 
         match (enablement_version, enablement_timestamp) {
-            (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled { 
-                enablement: Some((version, timestamp)) 
+            (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled {
+                enablement: Some((version, timestamp))
             }),
             (Some(_), None) => Err(Error::generic(
                 "In-commit timestamp enabled, but enablement timestamp is missing while enablement version is present"
@@ -358,8 +359,8 @@ impl TableConfiguration {
             (None, Some(_)) => Err(Error::generic(
                 "In-commit timestamp enabled, but enablement version is missing while enablement timestamp is present"
             )),
-            (None, None) => Ok(InCommitTimestampEnablement::Enabled { 
-                enablement: None 
+            (None, None) => Ok(InCommitTimestampEnablement::Enabled {
+                enablement: None
             }),
         }
     }
@@ -437,7 +438,7 @@ mod test {
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
 
-    use super::{TableConfiguration, InCommitTimestampEnablement};
+    use super::{InCommitTimestampEnablement, TableConfiguration};
 
     #[test]
     fn dv_supported_not_enabled() {
@@ -522,7 +523,10 @@ mod test {
         // When ICT is enabled from table creation (version 0), it's perfectly normal
         // for enablement properties to be missing
         let info = table_config.in_commit_timestamp_enablement().unwrap();
-        assert_eq!(info, InCommitTimestampEnablement::Enabled { enablement: None });
+        assert_eq!(
+            info,
+            InCommitTimestampEnablement::Enabled { enablement: None }
+        );
     }
     #[test]
     fn ict_supported_and_enabled() {
@@ -561,7 +565,12 @@ mod test {
         assert!(table_config.is_in_commit_timestamps_supported());
         assert!(table_config.is_in_commit_timestamps_enabled());
         let info = table_config.in_commit_timestamp_enablement().unwrap();
-        assert_eq!(info, InCommitTimestampEnablement::Enabled { enablement: Some((5, 100)) })
+        assert_eq!(
+            info,
+            InCommitTimestampEnablement::Enabled {
+                enablement: Some((5, 100))
+            }
+        )
     }
     #[test]
     fn ict_enabled_with_partial_enablement_info() {
