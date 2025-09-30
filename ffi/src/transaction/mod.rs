@@ -97,8 +97,6 @@ pub unsafe extern "C" fn add_files(
 ///
 /// Mark the transaction as having data changes or not (these are recorded at the file level).
 ///
-/// When set here writers should not provide a data_change column in EngineData.
-///
 /// # Safety
 ///
 /// Caller is responsible for passing a valid handle. 
