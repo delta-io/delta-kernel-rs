@@ -631,6 +631,9 @@ mod list_log_files_with_log_tail_tests {
             ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
                 panic!("read_files used");
             }
+            fn copy(&self, from: &Url, to: &Url) -> DeltaResult<()> {
+                panic!("copy used from {from} to {to}");
+            }
         }
 
         // when log_tail covers the entire requested range, no filesystem listing should occur

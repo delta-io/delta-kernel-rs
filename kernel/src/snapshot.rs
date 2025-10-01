@@ -332,6 +332,22 @@ impl Snapshot {
         Transaction::try_new(self)
     }
 
+    #[cfg(feature = "catalog-managed")]
+    pub fn publish(mut self, engine: &dyn Engine) -> DeltaResult<Self> {
+        // FIXME: remove clone
+        self.log_segment = self.log_segment.clone().publish(engine)?;
+
+        println!("Published log segment");
+        for commit in &self.log_segment.ascending_commit_files {
+            println!("commit: {:?}", commit);
+        }
+
+        // how to get committer + context?
+        // committer.published(self.version(), context)?;
+
+        Ok(self)
+    }
+
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
     ///
     /// Note that this method performs log replay (fetches and processes metadata from storage).

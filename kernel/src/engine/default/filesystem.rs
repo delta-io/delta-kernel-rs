@@ -175,6 +175,17 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
         Ok(Box::new(receiver.into_iter()))
     }
+
+    fn copy(&self, from: &Url, to: &Url) -> DeltaResult<()> {
+        let from_path = Path::from_url_path(from.path())?;
+        let to_path = Path::from_url_path(to.path())?;
+        let store = self.inner.clone();
+        println!("Copying from {from_path:?} to {to_path:?}");
+        // FIXME: ? copy_if_not_exists doesn't work on S3
+        self.task_executor
+            .block_on(async move { store.copy(&from_path, &to_path).await })
+            .map_err(|e| Error::Generic(format!("Failed to copy file: {e}")))
+    }
 }
 
 #[cfg(test)]
