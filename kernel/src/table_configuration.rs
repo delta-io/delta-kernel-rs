@@ -240,7 +240,7 @@ impl TableConfiguration {
     #[allow(unused)] // needed to compile w/o default features
     pub(crate) fn is_deletion_vector_supported(&self) -> bool {
         self.protocol()
-            .has_table_feature(&TableFeature::DeletionVectors)
+            .has_writer_feature(&TableFeature::DeletionVectors)
             && self.protocol.min_reader_version() == 3
             && self.protocol.min_writer_version() == 7
     }
@@ -267,7 +267,7 @@ impl TableConfiguration {
     pub(crate) fn is_append_only_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_table_feature(&TableFeature::AppendOnly) => true,
+            7 if protocol.has_writer_feature(&TableFeature::AppendOnly) => true,
             version => (2..=6).contains(&version),
         }
     }
@@ -281,7 +281,7 @@ impl TableConfiguration {
     pub(crate) fn is_invariants_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
-            7 if protocol.has_table_feature(&TableFeature::Invariants) => true,
+            7 if protocol.has_writer_feature(&TableFeature::Invariants) => true,
             version => (2..=6).contains(&version),
         }
     }
@@ -293,7 +293,7 @@ impl TableConfiguration {
     /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-checkpoint-table-feature>
     pub(crate) fn is_v2_checkpoint_write_supported(&self) -> bool {
         self.protocol()
-            .has_table_feature(&TableFeature::V2Checkpoint)
+            .has_writer_feature(&TableFeature::V2Checkpoint)
     }
 
     /// Returns `true` if the table supports writing in-commit timestamps.
@@ -306,7 +306,7 @@ impl TableConfiguration {
         self.protocol().min_writer_version() == 7
             && self
                 .protocol()
-                .has_table_feature(&TableFeature::InCommitTimestamp)
+                .has_writer_feature(&TableFeature::InCommitTimestamp)
     }
 
     /// Returns `true` if in-commit timestamps is supported and it is enabled. In-commit timestamps
@@ -365,7 +365,7 @@ impl TableConfiguration {
         self.protocol().min_writer_version() == 7
             && self
                 .protocol()
-                .has_table_feature(&TableFeature::DomainMetadata)
+                .has_writer_feature(&TableFeature::DomainMetadata)
     }
 
     /// Returns `true` if the table supports writing row tracking metadata.
@@ -377,7 +377,7 @@ impl TableConfiguration {
         self.protocol().min_writer_version() == 7
             && self
                 .protocol()
-                .has_table_feature(&TableFeature::RowTracking)
+                .has_writer_feature(&TableFeature::RowTracking)
     }
 
     /// Returns `true` if row tracking is enabled for this table.
@@ -547,7 +547,7 @@ mod test {
             3,
             7,
             Some::<Vec<String>>(vec![]),
-            Some([WriterFeature::InCommitTimestamp]),
+            Some([TableFeature::InCommitTimestamp]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();

@@ -440,27 +440,43 @@ impl Protocol {
     }
 
     /// True if this protocol has the requested reader feature
-    /// Note: Use `has_table_feature` instead if given feature is supported for both read/write.
     pub(crate) fn has_reader_feature(&self, feature: &TableFeature) -> bool {
         self.reader_features()
             .is_some_and(|features| features.contains(feature))
     }
 
-    /// True if this protocol has the requested table feature
-    /// - ReaderWriter features must be in both reader features and writer features.
-    /// - Writer features only need to be in writer features.
-    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
-        match feature.feature_type() {
-            FeatureType::ReaderWriter => {
-                self.reader_features()
-                    .is_some_and(|features| features.contains(feature))
-                    && self
-                        .writer_features()
-                        .is_some_and(|features| features.contains(feature))
+    /// True if this protocol has the requested writer feature
+    pub(crate) fn has_writer_feature(&self, feature: &TableFeature) -> bool {
+        self.writer_features()
+            .is_some_and(|features| features.contains(feature))
+    }
+
+    /// Validates the relationship between reader features and writer features in the protocol.
+    pub(crate) fn validate_table_features(&self) -> bool {
+        match (&self.reader_features, &self.writer_features) {
+            (Some(reader_features), Some(writer_features)) => {
+                // Check all reader features are ReaderWriter and present in writer features.
+                let check_r = reader_features.iter().all(|feature| {
+                    // TODO: we relax the condition until column mapping write(#1124) is supported
+                    if matches!(feature, TableFeature::ColumnMapping) {
+                        true
+                    } else {
+                        feature.feature_type() == FeatureType::ReaderWriter
+                            && writer_features.contains(feature)
+                    }
+                });
+                // Check all writer features are either Writer or also in reader features (ReaderWriter).
+                let check_w = writer_features.iter().all(|feature| {
+                    feature.feature_type() == FeatureType::Writer
+                        || reader_features.contains(feature)
+                });
+                check_r && check_w
             }
-            FeatureType::Writer => self
-                .writer_features()
-                .is_some_and(|features| features.contains(feature)),
+            (None, None) => true,
+            (None, Some(writer_features)) => writer_features
+                .iter()
+                .all(|feature| feature.feature_type() == FeatureType::Writer),
+            (Some(_), None) => false,
         }
     }
 
@@ -540,13 +556,8 @@ impl Protocol {
 
     #[cfg(feature = "catalog-managed")]
     pub(crate) fn is_catalog_managed(&self) -> bool {
-        self.reader_features.as_ref().is_some_and(|fs| {
-            fs.contains(&ReaderFeature::CatalogManaged)
-                || fs.contains(&ReaderFeature::CatalogOwnedPreview)
-        }) || self.writer_features.as_ref().is_some_and(|fs| {
-            fs.contains(&WriterFeature::CatalogManaged)
-                || fs.contains(&WriterFeature::CatalogOwnedPreview)
-        })
+        self.has_writer_feature(&TableFeature::CatalogManaged)
+            || self.has_writer_feature(&TableFeature::CatalogOwnedPreview)
     }
 }
 
@@ -1468,16 +1479,16 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::CatalogManaged]),
-            Some([WriterFeature::CatalogManaged]),
+            Some([TableFeature::CatalogManaged]),
+            Some([TableFeature::CatalogManaged]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_err());
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::CatalogOwnedPreview]),
-            Some([WriterFeature::CatalogOwnedPreview]),
+            Some([TableFeature::CatalogOwnedPreview]),
+            Some([TableFeature::CatalogOwnedPreview]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_err());

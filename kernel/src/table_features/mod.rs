@@ -21,7 +21,7 @@ mod timestamp_ntz;
 /// Each variant corresponds to one such feature. A feature is either:
 /// - **ReaderWriter** (must be supported by both readers and writers), or
 /// - **Writer only** (applies only to writers).
-/// There are no Reader only features. See [`TableFeature::feature_type`] for the category of each.
+/// There are no Reader only features. See `TableFeature::feature_type` for the category of each.
 ///
 /// The kernel currently supports all reader features except `V2Checkpoints`.
 #[derive(
@@ -127,7 +127,18 @@ impl TableFeature {
             | TableFeature::VariantTypePreview
             | TableFeature::VariantShreddingPreview
             | TableFeature::Unknown(_) => FeatureType::ReaderWriter,
-            _ => FeatureType::Writer,
+            TableFeature::AppendOnly
+            | TableFeature::DomainMetadata
+            | TableFeature::Invariants
+            | TableFeature::RowTracking
+            | TableFeature::CheckConstraints
+            | TableFeature::ChangeDataFeed
+            | TableFeature::GeneratedColumns
+            | TableFeature::IdentityColumns
+            | TableFeature::InCommitTimestamp
+            | TableFeature::IcebergCompatV1
+            | TableFeature::IcebergCompatV2
+            | TableFeature::ClusteredTable => FeatureType::Writer,
         }
     }
 }

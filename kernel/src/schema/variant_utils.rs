@@ -24,8 +24,9 @@ pub(crate) fn validate_variant_type_feature_support(
 ) -> DeltaResult<()> {
     // Both the reader and writer need to have either the VariantType or the VariantTypePreview
     // features.
-    if !protocol.has_table_feature(&TableFeature::VariantType)
-        && !protocol.has_table_feature(&TableFeature::VariantTypePreview)
+    if !protocol.validate_table_features()
+        || (!protocol.has_writer_feature(&TableFeature::VariantType)
+            && !protocol.has_writer_feature(&TableFeature::VariantTypePreview))
     {
         let mut uses_variant = UsesVariant::default();
         let _ = uses_variant.transform_struct(schema);
