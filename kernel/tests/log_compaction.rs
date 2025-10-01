@@ -356,7 +356,7 @@ async fn expired_tombstone_exclusion() -> Result<(), Box<dyn std::error::Error>>
     );
     assert!(
         !has_add_expired_file,
-        "Compacted file should not contain add action for expired file "
+        "Compacted file should not contain add action for file that was removed by expired remove action"
     );
     assert!(
         !has_add_recent_file,
