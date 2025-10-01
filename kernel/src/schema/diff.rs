@@ -12,12 +12,28 @@ use super::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Arguments for computing a schema diff
+#[derive(Debug, Clone)]
+pub(crate) struct SchemaDiffArgs<'a> {
+    /// The current/original schema
+    pub current: &'a StructType,
+    /// The new schema to compare against
+    pub new: &'a StructType,
+}
+
+impl<'a> SchemaDiffArgs<'a> {
+    /// Compute the difference between the two schemas
+    pub(crate) fn compute_diff(self) -> Result<SchemaDiff, SchemaDiffError> {
+        compute_schema_diff(self.current, self.new)
+    }
+}
+
 /// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SchemaDiff {
     /// Fields that were added in the new schema
     pub added_fields: Vec<FieldChange>,
-    /// Fields that were removed from the original schema  
+    /// Fields that were removed from the original schema
     pub removed_fields: Vec<FieldChange>,
     /// Fields that were modified between schemas
     pub updated_fields: Vec<FieldUpdate>,
@@ -175,45 +191,24 @@ struct FieldWithPath {
 /// have valid field IDs. Fields are matched by their field ID rather than name,
 /// allowing detection of renames at any nesting level within structs, arrays, and maps.
 ///
+/// # Note
+/// It's recommended to use `SchemaDiffArgs` instead of calling this function directly,
+/// as the struct-based API makes it clearer which schema is which:
+///
+/// ```rust,ignore
+/// let diff = SchemaDiffArgs {
+///     current: &old_schema,
+///     new: &new_schema,
+/// }.compute_diff()?;
+/// ```
+///
 /// # Arguments
 /// * `current` - The current/original schema
 /// * `new` - The new schema to compare against
 ///
 /// # Returns
 /// A `SchemaDiff` describing all changes including nested fields, or an error if the schemas are invalid
-///
-/// # Example
-/// ```rust,ignore
-/// use delta_kernel::schema::{StructType, StructField, DataType};
-///
-/// let current = StructType::try_new([
-///     StructField::new("id", DataType::LONG, false)
-///         .add_metadata([("delta.columnMapping.id", 1i64)]),
-///     StructField::new("user", DataType::try_struct_type([
-///         StructField::new("name", DataType::STRING, false)
-///             .add_metadata([("delta.columnMapping.id", 3i64)]),
-///     ])?, false).add_metadata([("delta.columnMapping.id", 2i64)]),
-/// ])?;
-///
-/// let new = StructType::try_new([
-///     StructField::new("id", DataType::LONG, false)
-///         .add_metadata([("delta.columnMapping.id", 1i64)]),
-///     StructField::new("user", DataType::try_struct_type([
-///         StructField::new("full_name", DataType::STRING, false) // Renamed nested field!
-///             .add_metadata([("delta.columnMapping.id", 3i64)]),
-///         StructField::new("age", DataType::INTEGER, true) // Added nested field!
-///             .add_metadata([("delta.columnMapping.id", 4i64)]),
-///     ])?, false).add_metadata([("delta.columnMapping.id", 2i64)]),
-/// ])?;
-///
-/// let diff = compute_schema_diff(&current, &new)?;
-/// assert_eq!(diff.added_fields.len(), 1);
-/// assert_eq!(diff.added_fields[0].path, "user.age");
-/// assert_eq!(diff.updated_fields.len(), 1);
-/// assert_eq!(diff.updated_fields[0].path, "user.full_name");
-/// assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
-/// ```
-pub(crate) fn compute_schema_diff(
+fn compute_schema_diff(
     current: &StructType,
     new: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
@@ -634,7 +629,12 @@ mod tests {
             create_field_with_id("name", DataType::STRING, false, 2),
         ]);
 
-        let diff = compute_schema_diff(&schema, &schema).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &schema,
+            new: &schema,
+        }
+        .compute_diff()
+        .unwrap();
         assert!(diff.is_empty());
     }
 
@@ -648,7 +648,12 @@ mod tests {
             create_field_with_id("name", DataType::STRING, false, 2),
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["name"]));
         assert_eq!(diff.added_fields[0].field.name(), "name");
@@ -683,7 +688,12 @@ mod tests {
 
         let new = StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         // Only the top-level "user" field should be reported as removed
         assert_eq!(diff.removed_fields.len(), 1);
@@ -703,7 +713,12 @@ mod tests {
             create_field_with_id("full_name", DataType::STRING, false, 1), // Renamed
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 
@@ -718,7 +733,12 @@ mod tests {
             create_field_with_id("name", DataType::STRING, false, 1), // No physical name
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         // Should report no changes since we only compare physical names when both are present
         assert!(diff.is_empty());
 
@@ -736,7 +756,12 @@ mod tests {
                     MetadataValue::String("col_002".to_string()),
                 )])]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].change_type,
@@ -771,7 +796,12 @@ mod tests {
             1,
         )]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         // Should see the nested field changes but NOT a type change on the parent struct
         assert_eq!(diff.added_fields.len(), 1);
@@ -815,7 +845,12 @@ mod tests {
             ), // Changed from STRING to STRUCT
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         // This IS a real type change from primitive to struct
         assert_eq!(diff.updated_fields.len(), 1);
@@ -863,7 +898,12 @@ mod tests {
             1,
         )]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         // Should only see the nested field rename, not a change to the array container
         assert_eq!(diff.updated_fields.len(), 1);
@@ -909,7 +949,12 @@ mod tests {
             ),
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         // Only the top-level "user" field should be reported as added
         assert_eq!(diff.added_fields.len(), 1);
@@ -964,7 +1009,12 @@ mod tests {
             ),
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         // Should see: existing changed, existing_struct.old_name->new_name renamed, new_struct added
         assert_eq!(diff.added_fields.len(), 1);
@@ -998,7 +1048,12 @@ mod tests {
             1,
         )]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
@@ -1027,7 +1082,12 @@ mod tests {
             1,
         )]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.added_fields.len(), 1);
 
         let added = &diff.added_fields[0];
@@ -1066,7 +1126,12 @@ mod tests {
             1,
         )]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
@@ -1107,7 +1172,12 @@ mod tests {
             1,
         )]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
@@ -1152,7 +1222,12 @@ mod tests {
             1,
         )]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
@@ -1192,7 +1267,12 @@ mod tests {
             ),
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         let (top_added, _, top_updated) = diff.top_level_changes();
         let (nested_added, _, nested_updated) = diff.nested_changes();
@@ -1239,7 +1319,12 @@ mod tests {
             create_field_with_id("created_at", DataType::TIMESTAMP, false, 6), // Added top-level
         ]);
 
-        let diff = compute_schema_diff(&current, &new).unwrap();
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
 
         // Check totals
         assert_eq!(diff.added_fields.len(), 2);
