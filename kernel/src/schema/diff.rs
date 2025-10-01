@@ -312,7 +312,7 @@ fn is_breaking_change_type(change_type: &FieldChangeType) -> bool {
         | FieldChangeType::PhysicalNameChanged
         | FieldChangeType::ContainerNullabilityTightened => true,
         FieldChangeType::Multiple(multiple_changes) => {
-            multiple_changes.iter().any(|c| is_breaking_change_type(c))
+            multiple_changes.iter().any(is_breaking_change_type)
         }
         _ => false,
     }
