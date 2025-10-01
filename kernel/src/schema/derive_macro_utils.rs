@@ -1,4 +1,5 @@
 //! Utility traits that support the [`delta_kernel_derive::ToSchema`] macro.
+use serde_bytes::ByteBuf;
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
@@ -36,6 +37,7 @@ macro_rules! impl_to_data_type {
 
 impl_to_data_type!(
     (String, DataType::STRING),
+    (ByteBuf, DataType::BINARY),
     (i64, DataType::LONG),
     (i32, DataType::INTEGER),
     (i16, DataType::SHORT),
