@@ -281,17 +281,29 @@ fn compute_schema_diff(
     // Example: If "user" struct was removed, don't also report "user.name", "user.email", etc.
     removed_fields.retain(|change| !has_added_ancestor(&change.path, &removed_ancestor_paths));
 
-    // Check for updates in common fields, but skip those whose parent was just added
+    // Check for updates in common fields
     let mut updated_fields = Vec::new();
     for id in common_ids {
         let current_field_with_path = &current_by_id[&id];
         let new_field_with_path = &new_by_id[&id];
 
-        // Skip updates for nested fields if their parent struct was just added
-        // Example: If "user" struct was just added, we don't care that "user.name" changed
-        if has_added_ancestor(&new_field_with_path.path, &added_ancestor_paths) {
-            continue;
-        }
+        // Invariant: A field in common_ids must have existed in both schemas, which means
+        // its parent path must also have existed in both schemas. Therefore, neither an
+        // added nor removed ancestor should be a parent of an updated field.
+        debug_assert!(
+            !has_added_ancestor(&new_field_with_path.path, &added_ancestor_paths),
+            "Field with ID {} at path '{}' is in common_ids but has an added ancestor. \
+             This violates the invariant that common fields must have existed in both schemas.",
+            id,
+            new_field_with_path.path
+        );
+        debug_assert!(
+            !has_added_ancestor(&new_field_with_path.path, &removed_ancestor_paths),
+            "Field with ID {} at path '{}' is in common_ids but has a removed ancestor. \
+             This violates the invariant that common fields must have existed in both schemas.",
+            id,
+            new_field_with_path.path
+        );
 
         if let Some(field_update) =
             compare_fields_with_paths(current_field_with_path, new_field_with_path)
