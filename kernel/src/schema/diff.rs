@@ -4,6 +4,9 @@
 //! using field IDs as the primary mechanism for identifying fields across schema versions.
 //! Supports nested field comparison within structs, arrays, and maps.
 
+// Allow dead code warnings since this API is not yet used by other modules
+#![allow(dead_code)]
+
 use super::{
     ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType,
 };
