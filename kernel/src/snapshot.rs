@@ -157,7 +157,7 @@ impl Snapshot {
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
-        let new_latest_commit = new_listed_files.latest_commit.clone();
+        let new_latest_commit_file = new_listed_files.latest_commit_file.clone();
         let mut new_log_segment =
             LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
 
@@ -226,9 +226,8 @@ impl Snapshot {
 
         // Use the new latest_commit if available, otherwise use the old one
         // This handles the case where the new listing returned no commits
-        let latest_commit =
-            new_latest_commit.unwrap_or_else(|| old_log_segment.latest_commit.clone());
-
+        let latest_commit_file =
+            new_latest_commit_file.unwrap_or_else(|| old_log_segment.latest_commit_file.clone());
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
@@ -237,7 +236,7 @@ impl Snapshot {
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
-                latest_commit: Some(latest_commit),
+                latest_commit_file: Some(latest_commit_file),
             },
             log_root,
             new_version,

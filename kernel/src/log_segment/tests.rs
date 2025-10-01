@@ -2119,7 +2119,7 @@ fn for_timestamp_conversion_no_commit_files() {
 }
 
 #[test]
-fn test_latest_commit_field_is_captured() {
+fn test_latest_commit_file_field_is_captured() {
     // Test that the latest commit is preserved even after checkpoint filtering
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -2138,7 +2138,7 @@ fn test_latest_commit_field_is_captured() {
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
 
     // The latest commit should be version 5
-    assert_eq!(log_segment.latest_commit.version, 5);
+    assert_eq!(log_segment.latest_commit_file.version, 5);
 
     // The log segment should only contain commits 3, 4, 5 (after checkpoint 2)
     assert_eq!(log_segment.ascending_commit_files.len(), 3);
@@ -2147,7 +2147,7 @@ fn test_latest_commit_field_is_captured() {
 }
 
 #[test]
-fn test_latest_commit_with_checkpoint_filtering() {
+fn test_latest_commit_file_with_checkpoint_filtering() {
     // Test when commits get filtered by checkpoint
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -2164,7 +2164,7 @@ fn test_latest_commit_with_checkpoint_filtering() {
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
 
     // The latest commit should be version 4
-    assert_eq!(log_segment.latest_commit.version, 4);
+    assert_eq!(log_segment.latest_commit_file.version, 4);
 
     // The log segment should have only commit 4 (after checkpoint 3)
     assert_eq!(log_segment.ascending_commit_files.len(), 1);
@@ -2172,7 +2172,7 @@ fn test_latest_commit_with_checkpoint_filtering() {
 }
 
 #[test]
-fn test_latest_commit_with_no_commits() {
+fn test_latest_commit_file_with_no_commits() {
     // Test when there are only checkpoints and no commits at all
     // This should fail because a log segment requires at least one commit
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -2187,7 +2187,7 @@ fn test_latest_commit_with_no_commits() {
 }
 
 #[test]
-fn test_latest_commit_with_checkpoint_at_same_version() {
+fn test_latest_commit_file_with_checkpoint_at_same_version() {
     // Test when checkpoint is at the same version as the latest commit
     // This tests: 0.json, 1.json, 1.checkpoint.parquet
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -2203,7 +2203,7 @@ fn test_latest_commit_with_checkpoint_at_same_version() {
         LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
-    assert_eq!(log_segment.latest_commit.version, 1);
+    assert_eq!(log_segment.latest_commit_file.version, 1);
 
     // The log segment should have no commit files (all filtered by checkpoint at version 1)
     assert_eq!(log_segment.ascending_commit_files.len(), 0);

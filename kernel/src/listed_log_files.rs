@@ -40,7 +40,7 @@ pub(crate) struct ListedLogFiles {
     pub(crate) latest_crc_file: Option<ParsedLogPath>,
     /// The latest commit file seen during listing
     /// This will be None if no commits were found in the listing range.
-    pub(crate) latest_commit: Option<ParsedLogPath>,
+    pub(crate) latest_commit_file: Option<ParsedLogPath>,
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
@@ -179,7 +179,7 @@ impl ListedLogFiles {
         ascending_compaction_files: Vec<ParsedLogPath>,
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
-        latest_commit: Option<ParsedLogPath>,
+        latest_commit_file: Option<ParsedLogPath>,
     ) -> DeltaResult<Self> {
         // We are adding debug_assertions here since we want to validate invariants that are
         // (relatively) expensive to compute
@@ -221,7 +221,7 @@ impl ListedLogFiles {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
-            latest_commit,
+            latest_commit_file,
         })
     }
 
@@ -239,8 +239,8 @@ impl ListedLogFiles {
             list_log_files(storage, log_root, log_tail, start_version, end_version)?
                 .filter_ok(|log_file| log_file.is_commit())
                 .try_collect()?;
-        let latest_commit = listed_commits.last().cloned();
-        ListedLogFiles::try_new(listed_commits, vec![], vec![], None, latest_commit)
+        let latest_commit_file = listed_commits.last().cloned();
+        ListedLogFiles::try_new(listed_commits, vec![], vec![], None, latest_commit_file)
     }
 
     /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -262,7 +262,7 @@ impl ListedLogFiles {
             let mut ascending_compaction_files = Vec::new();
             let mut checkpoint_parts = vec![];
             let mut latest_crc_file: Option<ParsedLogPath> = None;
-            let mut latest_commit: Option<ParsedLogPath> = None;
+            let mut latest_commit_file: Option<ParsedLogPath> = None;
 
             // Group log files by version
             let log_files_per_version = iter.chunk_by(|x| x.version);
@@ -275,11 +275,11 @@ impl ListedLogFiles {
                         Commit | StagedCommit => {
                             ascending_commit_files.push(file.clone());
                             // Track the latest commit seen
-                            if latest_commit
+                            if latest_commit_file
                                 .as_ref()
                                 .is_none_or(|l| l.version < file.version)
                             {
-                                latest_commit = Some(file);
+                                latest_commit_file = Some(file);
                             }
                         }
                         CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
@@ -312,7 +312,7 @@ impl ListedLogFiles {
                 {
                     checkpoint_parts = complete_checkpoint;
                     // Log replay only uses commits/compactions after a complete checkpoint
-                    // Note: we preserve latest_commit even when clearing ascending_commit_files
+                    // Note: we preserve latest_commit_file even when clearing ascending_commit_files
                     ascending_commit_files.clear();
                     ascending_compaction_files.clear();
                 }
@@ -323,7 +323,7 @@ impl ListedLogFiles {
                 ascending_compaction_files,
                 checkpoint_parts,
                 latest_crc_file,
-                latest_commit,
+                latest_commit_file,
             )
         })?
     }
@@ -505,7 +505,7 @@ mod list_log_files_with_log_tail_tests {
     }
 
     #[test]
-    fn test_log_tail_as_latest_commits() {
+    fn test_log_tail_as_latest_commit_files() {
         // Filesystem has commits 0-2, log_tail has commits 3-5 (the latest)
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
