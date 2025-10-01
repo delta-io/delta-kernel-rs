@@ -23,7 +23,7 @@ mod timestamp_ntz;
 /// - **Writer only** (applies only to writers).
 /// There are no Reader only features. See `TableFeature::feature_type` for the category of each.
 ///
-/// The kernel currently supports all reader features except `V2Checkpoints`.
+/// The kernel currently supports all reader features except `V2Checkpoint`.
 #[derive(
     Serialize,
     Deserialize,
@@ -109,6 +109,7 @@ pub(crate) enum TableFeature {
 pub(crate) enum FeatureType {
     Writer,
     ReaderWriter,
+    Unknown,
 }
 
 impl TableFeature {
@@ -125,8 +126,7 @@ impl TableFeature {
             | TableFeature::VacuumProtocolCheck
             | TableFeature::VariantType
             | TableFeature::VariantTypePreview
-            | TableFeature::VariantShreddingPreview
-            | TableFeature::Unknown(_) => FeatureType::ReaderWriter,
+            | TableFeature::VariantShreddingPreview => FeatureType::ReaderWriter,
             TableFeature::AppendOnly
             | TableFeature::DomainMetadata
             | TableFeature::Invariants
@@ -139,6 +139,7 @@ impl TableFeature {
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
             | TableFeature::ClusteredTable => FeatureType::Writer,
+            TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
 }

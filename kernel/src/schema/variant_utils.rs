@@ -24,9 +24,8 @@ pub(crate) fn validate_variant_type_feature_support(
 ) -> DeltaResult<()> {
     // Both the reader and writer need to have either the VariantType or the VariantTypePreview
     // features.
-    if !protocol.validate_table_features()
-        || (!protocol.has_writer_feature(&TableFeature::VariantType)
-            && !protocol.has_writer_feature(&TableFeature::VariantTypePreview))
+    if !protocol.has_writer_feature(&TableFeature::VariantType)
+        && !protocol.has_writer_feature(&TableFeature::VariantTypePreview)
     {
         let mut uses_variant = UsesVariant::default();
         let _ = uses_variant.transform_struct(schema);
@@ -119,15 +118,17 @@ mod tests {
                 )
                 .unwrap();
 
-                // Protocol without variantType writer feature
+                // Since variant features are ReaderWriter feature, protocol that
+                // lists a variant feature in only one of reader/writer feature = ERR
                 let protocol_without_writer_feature =
-                    Protocol::try_new(3, 7, Some([variant_reader]), Some::<Vec<String>>(vec![]))
-                        .unwrap();
+                    Protocol::try_new(3, 7, Some([variant_reader]), Some::<Vec<String>>(vec![]));
+                assert_result_error_with_message(protocol_without_writer_feature,
+                    "Reader features must contain only ReaderWriter features that are also listed in writer features");
 
-                // Protocol without variantType reader feature
                 let protocol_without_reader_feature =
-                    Protocol::try_new(3, 7, Some::<Vec<String>>(vec![]), Some([variant_writer]))
-                        .unwrap();
+                    Protocol::try_new(3, 7, Some::<Vec<String>>(vec![]), Some([variant_writer]));
+                assert_result_error_with_message(protocol_without_reader_feature,
+                    "Writer features must be Writer-only or also listed in reader features");
 
                 // Schema with VARIANT + Protocol with features = OK
                 validate_variant_type_feature_support(
@@ -160,20 +161,6 @@ mod tests {
                 let result = validate_variant_type_feature_support(
                     &nested_schema_with_variant,
                     &protocol_without_features,
-                );
-                assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
-
-                // Schema with VARIANT + Protocol without writer feature = ERROR
-                let result = validate_variant_type_feature_support(
-                    &schema_with_variant,
-                    &protocol_without_writer_feature,
-                );
-                assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
-
-                // Schema with VARIANT + Protocol without reader feature = ERROR
-                let result = validate_variant_type_feature_support(
-                    &schema_with_variant,
-                    &protocol_without_reader_feature,
                 );
                 assert_result_error_with_message(result, "Unsupported: Table contains VARIANT columns but does not have the required 'variantType' feature in reader and writer features");
             });

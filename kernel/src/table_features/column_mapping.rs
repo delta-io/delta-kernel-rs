@@ -224,7 +224,7 @@ mod tests {
             3,
             7,
             Some([TableFeature::DeletionVectors]),
-            empty_features.clone(),
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
 
@@ -242,7 +242,7 @@ mod tests {
             3,
             7,
             Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            empty_features,
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
 

@@ -80,7 +80,7 @@ async fn metadata_protocol() {
                     3,
                     7,
                     Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::ColumnMapping]),
+                    Some([TableFeature::DeletionVectors]),
                 )
                 .unwrap(),
             ),
@@ -139,7 +139,7 @@ async fn unsupported_reader_feature() {
                 3,
                 7,
                 Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-                Some([""; 0]),
+                Some([TableFeature::DeletionVectors]),
             )
             .unwrap(),
         )])

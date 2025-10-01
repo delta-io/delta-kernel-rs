@@ -14,9 +14,7 @@ pub(crate) fn validate_timestamp_ntz_feature_support(
     schema: &Schema,
     protocol: &Protocol,
 ) -> DeltaResult<()> {
-    if !protocol.validate_table_features()
-        || !protocol.has_writer_feature(&TableFeature::TimestampWithoutTimezone)
-    {
+    if !protocol.has_writer_feature(&TableFeature::TimestampWithoutTimezone) {
         let mut uses_timestamp_ntz = UsesTimestampNtz(false);
         let _ = uses_timestamp_ntz.transform_struct(schema);
         require!(
