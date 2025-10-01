@@ -242,7 +242,7 @@ fn compute_schema_diff(
         .collect();
 
     // Collect added fields
-    let mut added_fields: Vec<FieldChange> = added_ids
+    let added_fields: Vec<FieldChange> = added_ids
         .into_iter()
         .map(|id| {
             let field_with_path = &new_by_id[&id];
@@ -253,16 +253,12 @@ fn compute_schema_diff(
         })
         .collect();
 
-    // Find the "top-most" added fields - if both a parent struct and its nested fields
-    // were added, only report the parent to avoid redundant noise
-    let added_ancestor_paths = build_added_ancestor_paths(&added_fields);
-
     // Filter out nested fields whose parent was also added
     // Example: If "user" struct was added, don't also report "user.name", "user.email", etc.
-    added_fields.retain(|change| !has_added_ancestor(&change.path, &added_ancestor_paths));
+    let added_fields = filter_ancestor_fields(added_fields);
 
     // Collect removed fields
-    let mut removed_fields: Vec<FieldChange> = removed_ids
+    let removed_fields: Vec<FieldChange> = removed_ids
         .into_iter()
         .map(|id| {
             let field_with_path = &current_by_id[&id];
@@ -273,13 +269,9 @@ fn compute_schema_diff(
         })
         .collect();
 
-    // Find the "top-most" removed fields - if both a parent struct and its nested fields
-    // were removed, only report the parent to avoid redundant noise
-    let removed_ancestor_paths = build_added_ancestor_paths(&removed_fields);
-
     // Filter out nested fields whose parent was also removed
     // Example: If "user" struct was removed, don't also report "user.name", "user.email", etc.
-    removed_fields.retain(|change| !has_added_ancestor(&change.path, &removed_ancestor_paths));
+    let removed_fields = filter_ancestor_fields(removed_fields);
 
     // Check for updates in common fields
     let mut updated_fields = Vec::new();
@@ -290,20 +282,26 @@ fn compute_schema_diff(
         // Invariant: A field in common_ids must have existed in both schemas, which means
         // its parent path must also have existed in both schemas. Therefore, neither an
         // added nor removed ancestor should be a parent of an updated field.
-        debug_assert!(
-            !has_added_ancestor(&new_field_with_path.path, &added_ancestor_paths),
-            "Field with ID {} at path '{}' is in common_ids but has an added ancestor. \
-             This violates the invariant that common fields must have existed in both schemas.",
-            id,
-            new_field_with_path.path
-        );
-        debug_assert!(
-            !has_added_ancestor(&new_field_with_path.path, &removed_ancestor_paths),
-            "Field with ID {} at path '{}' is in common_ids but has a removed ancestor. \
-             This violates the invariant that common fields must have existed in both schemas.",
-            id,
-            new_field_with_path.path
-        );
+        #[cfg(debug_assertions)]
+        {
+            let added_paths: HashSet<ColumnName> = added_fields.iter().map(|f| f.path.clone()).collect();
+            let removed_paths: HashSet<ColumnName> = removed_fields.iter().map(|f| f.path.clone()).collect();
+
+            debug_assert!(
+                !has_added_ancestor(&new_field_with_path.path, &added_paths),
+                "Field with ID {} at path '{}' is in common_ids but has an added ancestor. \
+                 This violates the invariant that common fields must have existed in both schemas.",
+                id,
+                new_field_with_path.path
+            );
+            debug_assert!(
+                !has_added_ancestor(&new_field_with_path.path, &removed_paths),
+                "Field with ID {} at path '{}' is in common_ids but has a removed ancestor. \
+                 This violates the invariant that common fields must have existed in both schemas.",
+                id,
+                new_field_with_path.path
+            );
+        }
 
         if let Some(field_update) =
             compare_fields_with_paths(current_field_with_path, new_field_with_path)
@@ -319,23 +317,23 @@ fn compute_schema_diff(
     })
 }
 
-/// Finds the least common ancestors (LCA) among a set of field paths.
+/// Filters field changes to keep only the least common ancestors (LCA).
 ///
 /// This filters out descendant fields when their parent is also in the set.
-/// For example, if both "user" and "user.name" are added, this returns only "user"
+/// For example, if both "user" and "user.name" are in the input, this returns only "user"
 /// since reporting "user.name" would be redundant.
 ///
 /// The algorithm is O(n) where n is the number of fields:
 /// 1. Put all paths in a HashSet for O(1) lookup
 /// 2. For each field, check if its immediate parent is in the set
 /// 3. Keep only fields whose parent is NOT in the set
-fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<ColumnName> {
-    // Build a set of all paths for O(1) lookup
-    let all_paths: HashSet<&ColumnName> = added_fields.iter().map(|f| &f.path).collect();
+fn filter_ancestor_fields(fields: Vec<FieldChange>) -> Vec<FieldChange> {
+    // Build a set of all paths for O(1) lookup (owned to avoid lifetime issues)
+    let all_paths: HashSet<ColumnName> = fields.iter().map(|f| f.path.clone()).collect();
 
     // Filter to keep only fields whose parent is NOT in the set
-    added_fields
-        .iter()
+    fields
+        .into_iter()
         .filter(|field_change| {
             let path_parts = field_change.path.path();
 
@@ -347,10 +345,9 @@ fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<ColumnNam
             // Construct parent path by removing the last component
             let parent_path = ColumnName::new(&path_parts[..path_parts.len() - 1]);
 
-            // Keep this field only if its parent was NOT added
+            // Keep this field only if its parent was NOT in the input set
             !all_paths.contains(&parent_path)
         })
-        .map(|field_change| field_change.path.clone())
         .collect()
 }
 
