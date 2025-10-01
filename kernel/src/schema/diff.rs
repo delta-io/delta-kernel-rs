@@ -508,14 +508,9 @@ fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> O
     if changes.is_empty() {
         None
     } else {
-        let change_type = if changes.len() == 1 {
-            // Safety: We just checked that changes.len() == 1, so next() must return Some
-            changes
-                .into_iter()
-                .next()
-                .expect("changes vector has exactly one element")
-        } else {
-            FieldChangeType::Multiple(changes)
+        let change_type = match changes.as_slice() {
+            [single_change] => single_change.clone(),
+            _ => FieldChangeType::Multiple(changes),
         };
 
         Some(FieldUpdate {
