@@ -38,6 +38,9 @@ pub(crate) struct ListedLogFiles {
     pub(crate) ascending_compaction_files: Vec<ParsedLogPath>,
     pub(crate) checkpoint_parts: Vec<ParsedLogPath>,
     pub(crate) latest_crc_file: Option<ParsedLogPath>,
+    /// The latest commit file seen during listing
+    /// This will be None if no commits were found in the listing range.
+    pub(crate) latest_commit: Option<ParsedLogPath>,
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
@@ -176,6 +179,7 @@ impl ListedLogFiles {
         ascending_compaction_files: Vec<ParsedLogPath>,
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
+        latest_commit: Option<ParsedLogPath>,
     ) -> DeltaResult<Self> {
         // We are adding debug_assertions here since we want to validate invariants that are
         // (relatively) expensive to compute
@@ -217,6 +221,7 @@ impl ListedLogFiles {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
+            latest_commit,
         })
     }
 
@@ -230,11 +235,12 @@ impl ListedLogFiles {
     ) -> DeltaResult<Self> {
         // TODO: plumb through a log_tail provided by our caller
         let log_tail = vec![];
-        let listed_commits =
+        let listed_commits: Vec<ParsedLogPath> =
             list_log_files(storage, log_root, log_tail, start_version, end_version)?
                 .filter_ok(|log_file| log_file.is_commit())
                 .try_collect()?;
-        ListedLogFiles::try_new(listed_commits, vec![], vec![], None)
+        let latest_commit = listed_commits.last().cloned();
+        ListedLogFiles::try_new(listed_commits, vec![], vec![], None, latest_commit)
     }
 
     /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -256,6 +262,7 @@ impl ListedLogFiles {
             let mut ascending_compaction_files = Vec::new();
             let mut checkpoint_parts = vec![];
             let mut latest_crc_file: Option<ParsedLogPath> = None;
+            let mut latest_commit: Option<ParsedLogPath> = None;
 
             // Group log files by version
             let log_files_per_version = iter.chunk_by(|x| x.version);
@@ -265,7 +272,16 @@ impl ListedLogFiles {
                 for file in files {
                     use LogPathFileType::*;
                     match file.file_type {
-                        Commit | StagedCommit => ascending_commit_files.push(file),
+                        Commit | StagedCommit => {
+                            ascending_commit_files.push(file.clone());
+                            // Track the latest commit seen
+                            if latest_commit
+                                .as_ref()
+                                .is_none_or(|l| l.version < file.version)
+                            {
+                                latest_commit = Some(file);
+                            }
+                        }
                         CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
                             ascending_compaction_files.push(file);
                         }
@@ -296,6 +312,7 @@ impl ListedLogFiles {
                 {
                     checkpoint_parts = complete_checkpoint;
                     // Log replay only uses commits/compactions after a complete checkpoint
+                    // Note: we preserve latest_commit even when clearing ascending_commit_files
                     ascending_commit_files.clear();
                     ascending_compaction_files.clear();
                 }
@@ -306,6 +323,7 @@ impl ListedLogFiles {
                 ascending_compaction_files,
                 checkpoint_parts,
                 latest_crc_file,
+                latest_commit,
             )
         })?
     }
