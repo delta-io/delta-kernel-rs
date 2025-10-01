@@ -184,6 +184,26 @@ impl Committer for UCCommitter {
             })
         })
     }
+
+    fn published(
+        &self,
+        version: Version,
+        context: &UCCommitterContext,
+    ) -> delta_kernel::DeltaResult<()> {
+        let request =
+            CommitRequest::ack_publish(&context.table_id, &context.table_uri, version as i64);
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(move || {
+            handle.block_on(async move {
+                match self.client.commit(request).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(delta_kernel::Error::Generic(format!(
+                        "publish_commit failed: {e}"
+                    ))),
+                }
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -300,7 +320,7 @@ mod tests {
         ];
 
         let table_url = Url::parse(&table_uri)?;
-        let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
+        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
         let store: Arc<dyn ObjectStore> = store.into();
 
         let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -315,11 +335,11 @@ mod tests {
         // do a write.
 
         // print the log
-        // use futures::stream::StreamExt;
-        // let mut stream = store.list(Some(&path));
-        // while let Some(path) = stream.next().await {
-        //     println!("object: {:?}", path.unwrap().location);
-        // }
+        use futures::stream::StreamExt;
+        let mut stream = store.list(Some(&path));
+        while let Some(path) = stream.next().await {
+            println!("object: {:?}", path.unwrap().location);
+        }
 
         // let commit = store
         //     .get(&object_store::path::Path::from("19a85dee-54bc-43a2-87ab-023d0ec16013/tables/cdac4b37-fc11-4148-ae02-512e6cc4e1bd/_delta_log/_staged_commits/00000000000000000001.5400fd23-8e08-4f87-8049-7b37431fb826.json"))
@@ -332,17 +352,34 @@ mod tests {
             table_id: table_id.clone(),
             table_uri: table_uri.clone(),
         };
-        match txn.commit(&engine, ctx)? {
+        let t = match txn.commit(&engine, ctx)? {
             CommitResult::CommittedTransaction(t) => {
                 println!("🎉 committed version {}", t.version());
+                Some(t)
             }
             CommitResult::ConflictedTransaction(t) => {
                 println!("💥 commit conflicted at version {}", t.conflict_version);
+                None
             }
             CommitResult::RetryableTransaction(_) => {
                 println!("we should retry...");
+                None
             }
-        }
+        };
+
+        // FIXME! need to plumb log_tail
+        // let snapshot = t.unwrap().post_commit_snapshot(&engine)?;
+        let new_version = snapshot.version() + 1;
+        let snapshot = catalog
+            .load_snapshot_at(&table_id, &table_uri, new_version, &engine)
+            .await?;
+        let _published = Arc::into_inner(snapshot).unwrap().publish(&engine)?;
+
+        // notify UC of publish. since Commmitter is tied to Transaction it's a bit hard to plumb
+        // this through to Snapshot... TODO
+        let request = CommitRequest::ack_publish(&table_id, &table_uri, new_version as i64);
+        client.commit(request).await?;
+
         Ok(())
     }
 }

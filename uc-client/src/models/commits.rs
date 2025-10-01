@@ -86,7 +86,8 @@ impl Commit {
 pub struct CommitRequest {
     pub table_id: String,
     pub table_uri: String,
-    pub commit_info: Commit,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_info: Option<Commit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_backfilled_version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -104,8 +105,23 @@ impl CommitRequest {
         Self {
             table_id: table_id.into(),
             table_uri: table_uri.into(),
-            commit_info,
+            commit_info: Some(commit_info),
             latest_backfilled_version: None,
+            metadata: None,
+            protocol: None,
+        }
+    }
+
+    pub fn ack_publish(
+        table_id: impl Into<String>,
+        table_uri: impl Into<String>,
+        last_backfilled_version: i64,
+    ) -> Self {
+        Self {
+            table_id: table_id.into(),
+            table_uri: table_uri.into(),
+            commit_info: None,
+            latest_backfilled_version: Some(last_backfilled_version),
             metadata: None,
             protocol: None,
         }

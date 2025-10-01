@@ -214,6 +214,79 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     }
 }
 
+impl ParsedLogPath<FileMeta> {
+    /// Transform a staged commit into a published commit by updating its location
+    pub(crate) fn into_published(self) -> DeltaResult<ParsedLogPath<FileMeta>> {
+        if !matches!(self.file_type, LogPathFileType::StagedCommit) {
+            return Err(Error::internal_error(
+                "Unable to create a published path from a non-staged commit",
+            ));
+        }
+
+        let published_filename = format!("{:020}.json", self.version);
+        let published_url = transform_staged_commit_url(self.location.location.clone())?;
+
+        Ok(ParsedLogPath {
+            location: FileMeta {
+                location: published_url,
+                last_modified: self.location.last_modified,
+                size: self.location.size,
+            },
+            filename: published_filename,
+            extension: "json".to_string(),
+            version: self.version,
+            file_type: LogPathFileType::Commit,
+        })
+    }
+}
+
+fn transform_staged_commit_url(mut url: Url) -> DeltaResult<Url> {
+    // Collect segments into owned strings to avoid borrowing issues
+    let segments: Vec<String> = url
+        .path_segments()
+        .ok_or(Error::generic("cannot parse path segments"))?
+        .map(|s| s.to_string())
+        .collect();
+
+    let staged_commits_index = segments
+        .iter()
+        .rposition(|s| s == "_staged_commits")
+        .ok_or(Error::generic("_staged_commits not found in path"))?;
+
+    // Build new path: everything before _staged_commits + modified filename
+    let mut new_path = String::new();
+
+    // Add segments up to (but not including) _staged_commits
+    for (i, segment) in segments.iter().enumerate() {
+        if i >= staged_commits_index {
+            break;
+        }
+        if !new_path.is_empty() || !segment.is_empty() {
+            new_path.push('/');
+        }
+        new_path.push_str(segment);
+    }
+
+    // Add the modified filename (remove UUID)
+    if let Some(filename) = segments.get(staged_commits_index + 1) {
+        // Remove UUID from filename: 00000000000000000005.{uuid}.json -> 00000000000000000005.json
+        let new_filename = filename
+            .split('.')
+            .next()
+            .ok_or(Error::generic("invalid filename format"))?
+            .to_string()
+            + ".json";
+
+        if !new_path.is_empty() {
+            new_path.push('/');
+        }
+        new_path.push_str(&new_filename);
+    }
+
+    url.set_path(&new_path);
+    Ok(url)
+}
+
 impl ParsedLogPath<Url> {
     const DELTA_LOG_DIR: &'static str = "_delta_log/";
 

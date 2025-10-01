@@ -570,4 +570,30 @@ impl LogSegment {
         debug_assert!(to_sub <= self.end_version);
         self.end_version - to_sub
     }
+
+    // TODO: decide on API:
+    // 1. should this mutate? should it consume self and hand back a new one?
+    // 2. should we take finer-grained args like which version to publish up to?
+    pub(crate) fn publish(mut self, engine: &dyn Engine) -> DeltaResult<Self> {
+        let storage = engine.storage_handler();
+
+        // Transform staged commits into published commits
+        for i in 0..self.ascending_commit_files.len() {
+            if matches!(self.ascending_commit_files[i].file_type, LogPathFileType::StagedCommit) {
+                // Clone the staged commit to get source location before transforming
+                let source_location = self.ascending_commit_files[i].location.location.clone();
+
+                // Take ownership of the commit to transform it
+                let staged_commit = self.ascending_commit_files.remove(i);
+                let published_commit = staged_commit.into_published()?;
+
+                // Copy the actual file from staged to published location
+                storage.copy(&source_location, &published_commit.location.location)?;
+
+                // Insert the published commit back
+                self.ascending_commit_files.insert(i, published_commit);
+            }
+        }
+        Ok(self)
+    }
 }

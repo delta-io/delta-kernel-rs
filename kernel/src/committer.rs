@@ -37,6 +37,11 @@ pub trait Committer: Send + Sync {
         version: Version,
         context: &Self::Context,
     ) -> DeltaResult<CommitResponse>;
+
+    fn published(&self, version: Version, context: &Self::Context) -> DeltaResult<()> {
+        let _ = (version, context);
+        Ok(())
+    }
 }
 
 pub struct FileSystemCommitter;

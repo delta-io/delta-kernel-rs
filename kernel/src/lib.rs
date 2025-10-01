@@ -543,6 +543,9 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    /// Performs a copy. Must not overwrite.
+    fn copy(&self, from: &Url, to: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

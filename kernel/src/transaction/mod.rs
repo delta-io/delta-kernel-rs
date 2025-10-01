@@ -654,6 +654,7 @@ impl<C: Committer> CommittedTransaction<C> {
     /// efficient than creating a new snapshot from scratch.
     pub fn post_commit_snapshot(&self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
         Snapshot::builder_from(self.transaction.read_snapshot.clone())
+            // .with_log_tail(log_tail)
             .at_version(self.commit_version)
             .build(engine)
     }
