@@ -24,13 +24,13 @@ use itertools::Itertools;
 use tracing::{info, warn};
 use url::Url;
 
-/// A struct to hold the result of listing log files. The commit and compaction files are guaranteed
-/// to be sorted in ascending order by version. The elements of `checkpoint_parts` are all the parts
-/// of the same checkpoint. Checkpoint parts share the same version. The `latest_crc_file` includes
-/// the latest (highest version) CRC file, if any, which may not correspond to the latest commit.
+/// Represents the set of log files found during a listing operation in the Delta log directory.
 ///
-/// NOTE: the `ascending_commit_files` _may_ contain gaps.
-/// NOTE: the `ascending_commit_files` includes both regular commits and staged commits.
+/// - `ascending_commit_files`: All commit and staged commit files found, sorted by version. May contain gaps.
+/// - `ascending_compaction_files`: All compaction commit files found, sorted by version.
+/// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
+/// - `latest_crc_file`: The CRC file with the highest version, if any.
+/// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
 #[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
@@ -38,8 +38,6 @@ pub(crate) struct ListedLogFiles {
     pub(crate) ascending_compaction_files: Vec<ParsedLogPath>,
     pub(crate) checkpoint_parts: Vec<ParsedLogPath>,
     pub(crate) latest_crc_file: Option<ParsedLogPath>,
-    /// The latest commit file seen during listing
-    /// This will be None if no commits were found in the listing range.
     pub(crate) latest_commit_file: Option<ParsedLogPath>,
 }
 
@@ -274,13 +272,7 @@ impl ListedLogFiles {
                     match file.file_type {
                         Commit | StagedCommit => {
                             ascending_commit_files.push(file.clone());
-                            // Track the latest commit seen
-                            if latest_commit_file
-                                .as_ref()
-                                .is_none_or(|l| l.version < file.version)
-                            {
-                                latest_commit_file = Some(file);
-                            }
+                            latest_commit_file = Some(file);
                         }
                         CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
                             ascending_compaction_files.push(file);
