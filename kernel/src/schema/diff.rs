@@ -5,7 +5,7 @@
 //! Supports nested field comparison within structs, arrays, and maps.
 
 use super::{
-    ColumnMetadataKey, DataType, MetadataValue, StructField, StructType,
+    ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -25,8 +25,8 @@ pub(crate) struct SchemaDiff {
 pub(crate) struct FieldChange {
     /// The field that was added or removed
     pub field: StructField,
-    /// The path to this field (e.g., "user.address.street", or just "name" for top-level)
-    pub path: String,
+    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    pub path: ColumnName,
 }
 
 /// Represents an update to a field between two schema versions
@@ -36,8 +36,8 @@ pub(crate) struct FieldUpdate {
     pub before: StructField,
     /// The field as it exists in the new schema
     pub after: StructField,
-    /// The path to this field (e.g., "user.address.street", or just "name" for top-level)
-    pub path: String,
+    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    pub path: ColumnName,
     /// The type of change that occurred
     pub change_type: FieldChangeType,
 }
@@ -69,12 +69,12 @@ pub(crate) enum FieldChangeType {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SchemaDiffError {
     #[error("Field at path '{path}' is missing column mapping ID")]
-    MissingFieldId { path: String },
+    MissingFieldId { path: ColumnName },
     #[error("Duplicate field ID {id} found at paths '{path1}' and '{path2}'")]
     DuplicateFieldId {
         id: i64,
-        path1: String,
-        path2: String,
+        path1: ColumnName,
+        path2: ColumnName,
     },
 }
 
@@ -117,42 +117,42 @@ impl SchemaDiff {
                 })
     }
 
-    /// Get all changes at the top level only (fields without dots in their path)
+    /// Get all changes at the top level only (fields with path length of 1)
     pub(crate) fn top_level_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
         let added = self
             .added_fields
             .iter()
-            .filter(|f| !f.path.contains('.'))
+            .filter(|f| f.path.path().len() == 1)
             .collect();
         let removed = self
             .removed_fields
             .iter()
-            .filter(|f| !f.path.contains('.'))
+            .filter(|f| f.path.path().len() == 1)
             .collect();
         let updated = self
             .updated_fields
             .iter()
-            .filter(|f| !f.path.contains('.'))
+            .filter(|f| f.path.path().len() == 1)
             .collect();
         (added, removed, updated)
     }
 
-    /// Get all changes at nested levels only (fields with dots in their path)
+    /// Get all changes at nested levels only (fields with path length > 1)
     pub(crate) fn nested_changes(&self) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
         let added = self
             .added_fields
             .iter()
-            .filter(|f| f.path.contains('.'))
+            .filter(|f| f.path.path().len() > 1)
             .collect();
         let removed = self
             .removed_fields
             .iter()
-            .filter(|f| f.path.contains('.'))
+            .filter(|f| f.path.path().len() > 1)
             .collect();
         let updated = self
             .updated_fields
             .iter()
-            .filter(|f| f.path.contains('.'))
+            .filter(|f| f.path.path().len() > 1)
             .collect();
         (added, removed, updated)
     }
@@ -162,7 +162,7 @@ impl SchemaDiff {
 #[derive(Debug, Clone)]
 struct FieldWithPath {
     field: StructField,
-    path: String,
+    path: ColumnName,
     field_id: i64,
 }
 
@@ -215,8 +215,9 @@ pub(crate) fn compute_schema_diff(
     new: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
     // Collect all fields with their paths from both schemas
-    let current_fields = collect_all_fields_with_paths(current, "")?;
-    let new_fields = collect_all_fields_with_paths(new, "")?;
+    let empty_path: Vec<String> = vec![];
+    let current_fields = collect_all_fields_with_paths(current, &ColumnName::new(empty_path.clone()))?;
+    let new_fields = collect_all_fields_with_paths(new, &ColumnName::new(empty_path))?;
 
     // Build maps by field ID
     let current_by_id = build_field_map_by_id(&current_fields)?;
@@ -301,15 +302,15 @@ pub(crate) fn compute_schema_diff(
 }
 
 /// Builds a set of added ancestor paths to filter out descendant noise
-fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<String> {
+fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<ColumnName> {
     let mut ancestor_paths = HashSet::new();
     let mut all_paths: Vec<_> = added_fields.iter().map(|f| &f.path).collect();
     all_paths.sort();
 
     for path in all_paths {
         // Check if this path is a descendant of any existing ancestor
-        let is_descendant = ancestor_paths.iter().any(|ancestor: &String| {
-            path.starts_with(ancestor) && path.chars().nth(ancestor.len()) == Some('.')
+        let is_descendant = ancestor_paths.iter().any(|ancestor: &ColumnName| {
+            is_descendant_of(path, ancestor)
         });
 
         if !is_descendant {
@@ -321,12 +322,24 @@ fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<String> {
 }
 
 /// Checks if a path has an added ancestor (is a descendant of a newly added field)
-fn has_added_ancestor(path: &str, added_ancestor_paths: &HashSet<String>) -> bool {
+fn has_added_ancestor(path: &ColumnName, added_ancestor_paths: &HashSet<ColumnName>) -> bool {
     added_ancestor_paths.iter().any(|ancestor| {
-        path != ancestor
-            && path.starts_with(ancestor)
-            && path.chars().nth(ancestor.len()) == Some('.')
+        is_descendant_of(path, ancestor)
     })
+}
+
+/// Checks if `path` is a descendant of `ancestor` (i.e., ancestor is a prefix of path)
+fn is_descendant_of(path: &ColumnName, ancestor: &ColumnName) -> bool {
+    let path_parts = path.path();
+    let ancestor_parts = ancestor.path();
+
+    // Path must be longer than ancestor to be a descendant
+    if path_parts.len() <= ancestor_parts.len() {
+        return false;
+    }
+
+    // Check if ancestor is a prefix of path
+    path_parts.starts_with(ancestor_parts)
 }
 
 /// Gets the physical name of a field if present
@@ -340,16 +353,12 @@ fn physical_name(field: &StructField) -> Option<&str> {
 /// Recursively collects all struct fields with their paths from a schema
 fn collect_all_fields_with_paths(
     schema: &StructType,
-    parent_path: &str,
+    parent_path: &ColumnName,
 ) -> Result<Vec<FieldWithPath>, SchemaDiffError> {
     let mut fields = Vec::new();
 
     for field in schema.fields() {
-        let field_path = if parent_path.is_empty() {
-            field.name().clone()
-        } else {
-            format!("{}.{}", parent_path, field.name())
-        };
+        let field_path = parent_path.join(&ColumnName::new([field.name()]));
 
         // Only struct fields can have field IDs in column mapping
         let field_id = get_field_id_for_path(field, &field_path)?;
@@ -369,7 +378,7 @@ fn collect_all_fields_with_paths(
             DataType::Array(array_type) => {
                 if let DataType::Struct(element_struct) = array_type.element_type() {
                     // For arrays of structs, we use "element" as the path segment
-                    let element_path = format!("{}.element", field_path);
+                    let element_path = field_path.join(&ColumnName::new(["element"]));
                     let nested_fields =
                         collect_all_fields_with_paths(element_struct, &element_path)?;
                     fields.extend(nested_fields);
@@ -378,13 +387,13 @@ fn collect_all_fields_with_paths(
             DataType::Map(map_type) => {
                 // Handle map key structs
                 if let DataType::Struct(key_struct) = map_type.key_type() {
-                    let key_path = format!("{}.key", field_path);
+                    let key_path = field_path.join(&ColumnName::new(["key"]));
                     let key_fields = collect_all_fields_with_paths(key_struct, &key_path)?;
                     fields.extend(key_fields);
                 }
                 // Handle map value structs
                 if let DataType::Struct(value_struct) = map_type.value_type() {
-                    let value_path = format!("{}.value", field_path);
+                    let value_path = field_path.join(&ColumnName::new(["value"]));
                     let value_fields = collect_all_fields_with_paths(value_struct, &value_path)?;
                     fields.extend(value_fields);
                 }
@@ -420,11 +429,11 @@ fn build_field_map_by_id(
 }
 
 /// Extracts the field ID from a StructField's metadata with path for error reporting
-fn get_field_id_for_path(field: &StructField, path: &str) -> Result<i64, SchemaDiffError> {
+fn get_field_id_for_path(field: &StructField, path: &ColumnName) -> Result<i64, SchemaDiffError> {
     match field.get_config_value(&ColumnMetadataKey::ColumnMappingId) {
         Some(MetadataValue::Number(id)) => Ok(*id),
         _ => Err(SchemaDiffError::MissingFieldId {
-            path: path.to_string(),
+            path: path.clone(),
         }),
     }
 }
@@ -636,7 +645,7 @@ mod tests {
 
         let diff = compute_schema_diff(&current, &new).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, "name");
+        assert_eq!(diff.added_fields[0].path, ColumnName::new(["name"]));
         assert_eq!(diff.added_fields[0].field.name(), "name");
     }
 
@@ -673,7 +682,7 @@ mod tests {
 
         // Only the top-level "user" field should be reported as removed
         assert_eq!(diff.removed_fields.len(), 1);
-        assert_eq!(diff.removed_fields[0].path, "user");
+        assert_eq!(diff.removed_fields[0].path, ColumnName::new(["user"]));
 
         // No nested fields should be reported as removed
         assert_eq!(diff.updated_fields.len(), 0);
@@ -761,10 +770,10 @@ mod tests {
 
         // Should see the nested field changes but NOT a type change on the parent struct
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, "user.age");
+        assert_eq!(diff.added_fields[0].path, ColumnName::new(["user", "age"]));
 
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, "user.full_name");
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["user", "full_name"]));
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 
         // Crucially, there should be NO update reported for the "user" field itself
@@ -772,7 +781,7 @@ mod tests {
         let top_level_updates: Vec<_> = diff
             .updated_fields
             .iter()
-            .filter(|u| !u.path.contains('.'))
+            .filter(|u| u.path.path().len() == 1)
             .collect();
         assert_eq!(top_level_updates.len(), 0);
 
@@ -805,7 +814,7 @@ mod tests {
 
         // This IS a real type change from primitive to struct
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, "data");
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["data"]));
         assert_eq!(
             diff.updated_fields[0].change_type,
             FieldChangeType::TypeChanged
@@ -814,7 +823,7 @@ mod tests {
 
         // The new nested field should also be reported as added
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, "data.nested");
+        assert_eq!(diff.added_fields[0].path, ColumnName::new(["data", "nested"]));
     }
 
     #[test]
@@ -853,14 +862,14 @@ mod tests {
 
         // Should only see the nested field rename, not a change to the array container
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].path, "items.element.title");
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["items", "element", "title"]));
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 
         // No change should be reported for the "items" array itself
         let array_updates: Vec<_> = diff
             .updated_fields
             .iter()
-            .filter(|u| u.path == "items")
+            .filter(|u| u.path == ColumnName::new(["items"]))
             .collect();
         assert_eq!(array_updates.len(), 0);
     }
@@ -899,7 +908,7 @@ mod tests {
 
         // Only the top-level "user" field should be reported as added
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, "user");
+        assert_eq!(diff.added_fields[0].path, ColumnName::new(["user"]));
 
         // No nested fields should be reported as added or updated
         assert_eq!(diff.updated_fields.len(), 0);
@@ -954,12 +963,12 @@ mod tests {
 
         // Should see: existing changed, existing_struct.old_name->new_name renamed, new_struct added
         assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, "new_struct");
+        assert_eq!(diff.added_fields[0].path, ColumnName::new(["new_struct"]));
 
         assert_eq!(diff.updated_fields.len(), 2);
-        let paths: HashSet<String> = diff.updated_fields.iter().map(|u| u.path.clone()).collect();
-        assert!(paths.contains("existing"));
-        assert!(paths.contains("existing_struct.new_name"));
+        let paths: HashSet<ColumnName> = diff.updated_fields.iter().map(|u| u.path.clone()).collect();
+        assert!(paths.contains(&ColumnName::new(["existing"])));
+        assert!(paths.contains(&ColumnName::new(["existing_struct", "new_name"])));
 
         // nested_field should NOT appear as added since new_struct is its ancestor
     }
@@ -988,7 +997,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
-        assert_eq!(update.path, "user.full_name");
+        assert_eq!(update.path, ColumnName::new(["user", "full_name"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
     }
 
@@ -1017,7 +1026,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 1);
 
         let added = &diff.added_fields[0];
-        assert_eq!(added.path, "user.age");
+        assert_eq!(added.path, ColumnName::new(["user", "age"]));
         assert_eq!(added.field.name(), "age");
     }
 
@@ -1056,7 +1065,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
-        assert_eq!(update.path, "items.element.title");
+        assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
     }
 
@@ -1097,7 +1106,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
-        assert_eq!(update.path, "lookup.value.count");
+        assert_eq!(update.path, ColumnName::new(["lookup", "value", "count"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
     }
 
@@ -1142,7 +1151,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
-        assert_eq!(update.path, "level1.level2.very_deep_field");
+        assert_eq!(update.path, ColumnName::new(["level1", "level2", "very_deep_field"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
     }
 
@@ -1185,12 +1194,12 @@ mod tests {
 
         assert_eq!(top_added.len(), 0);
         assert_eq!(top_updated.len(), 1);
-        assert_eq!(top_updated[0].path, "renamed_top");
+        assert_eq!(top_updated[0].path, ColumnName::new(["renamed_top"]));
 
         assert_eq!(nested_added.len(), 1);
-        assert_eq!(nested_added[0].path, "user.age");
+        assert_eq!(nested_added[0].path, ColumnName::new(["user", "age"]));
         assert_eq!(nested_updated.len(), 1);
-        assert_eq!(nested_updated[0].path, "user.full_name");
+        assert_eq!(nested_updated[0].path, ColumnName::new(["user", "full_name"]));
     }
 
     #[test]
@@ -1233,18 +1242,18 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 2);
 
         // Check specific changes
-        let added_paths: HashSet<String> =
+        let added_paths: HashSet<ColumnName> =
             diff.added_fields.iter().map(|f| f.path.clone()).collect();
-        assert!(added_paths.contains("user.age"));
-        assert!(added_paths.contains("created_at"));
+        assert!(added_paths.contains(&ColumnName::new(["user", "age"])));
+        assert!(added_paths.contains(&ColumnName::new(["created_at"])));
 
-        let removed_paths: HashSet<String> =
+        let removed_paths: HashSet<ColumnName> =
             diff.removed_fields.iter().map(|f| f.path.clone()).collect();
-        assert!(removed_paths.contains("user.email"));
+        assert!(removed_paths.contains(&ColumnName::new(["user", "email"])));
 
-        let updated_paths: HashSet<String> =
+        let updated_paths: HashSet<ColumnName> =
             diff.updated_fields.iter().map(|f| f.path.clone()).collect();
-        assert!(updated_paths.contains("identifier"));
-        assert!(updated_paths.contains("user.full_name"));
+        assert!(updated_paths.contains(&ColumnName::new(["identifier"])));
+        assert!(updated_paths.contains(&ColumnName::new(["user", "full_name"])));
     }
 }
