@@ -284,8 +284,10 @@ fn compute_schema_diff(
         // added nor removed ancestor should be a parent of an updated field.
         #[cfg(debug_assertions)]
         {
-            let added_paths: HashSet<ColumnName> = added_fields.iter().map(|f| f.path.clone()).collect();
-            let removed_paths: HashSet<ColumnName> = removed_fields.iter().map(|f| f.path.clone()).collect();
+            let added_paths: HashSet<ColumnName> =
+                added_fields.iter().map(|f| f.path.clone()).collect();
+            let removed_paths: HashSet<ColumnName> =
+                removed_fields.iter().map(|f| f.path.clone()).collect();
 
             debug_assert!(
                 !has_added_ancestor(&new_field_with_path.path, &added_paths),
