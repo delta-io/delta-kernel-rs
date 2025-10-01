@@ -34,6 +34,10 @@ pub trait Committer: Send + Sync {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
+
+    fn published(&self, _version: Version) -> DeltaResult<()> {
+        Ok(())
+    }
 }
 
 pub(crate) struct FileSystemCommitter;
