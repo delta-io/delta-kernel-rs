@@ -250,10 +250,12 @@ fn compute_schema_diff(
         })
         .collect();
 
-    // Build set of added ancestor paths to filter out descendant noise
+    // Find the "top-most" added fields - if both a parent struct and its nested fields
+    // were added, only report the parent to avoid redundant noise
     let added_ancestor_paths = build_added_ancestor_paths(&added_fields);
 
-    // Filter out added fields that are descendants of newly added ancestors
+    // Filter out nested fields whose parent was also added
+    // Example: If "user" struct was added, don't also report "user.name", "user.email", etc.
     added_fields.retain(|change| !has_added_ancestor(&change.path, &added_ancestor_paths));
 
     // Collect removed fields
@@ -268,19 +270,22 @@ fn compute_schema_diff(
         })
         .collect();
 
-    // Build set of removed ancestor paths to filter out descendant noise
+    // Find the "top-most" removed fields - if both a parent struct and its nested fields
+    // were removed, only report the parent to avoid redundant noise
     let removed_ancestor_paths = build_added_ancestor_paths(&removed_fields);
 
-    // Filter out removed fields that are descendants of removed ancestors
+    // Filter out nested fields whose parent was also removed
+    // Example: If "user" struct was removed, don't also report "user.name", "user.email", etc.
     removed_fields.retain(|change| !has_added_ancestor(&change.path, &removed_ancestor_paths));
 
-    // Check for updates in common fields, filtering out those under added ancestors
+    // Check for updates in common fields, but skip those whose parent was just added
     let mut updated_fields = Vec::new();
     for id in common_ids {
         let current_field_with_path = &current_by_id[&id];
         let new_field_with_path = &new_by_id[&id];
 
-        // Skip updates for fields under newly added ancestors
+        // Skip updates for nested fields if their parent struct was just added
+        // Example: If "user" struct was just added, we don't care that "user.name" changed
         if has_added_ancestor(&new_field_with_path.path, &added_ancestor_paths) {
             continue;
         }
@@ -299,7 +304,16 @@ fn compute_schema_diff(
     })
 }
 
-/// Builds a set of added ancestor paths to filter out descendant noise
+/// Finds the least common ancestors (LCA) among a set of field paths.
+///
+/// This filters out descendant fields when their parent is also in the set.
+/// For example, if both "user" and "user.name" are added, this returns only "user"
+/// since reporting "user.name" would be redundant.
+///
+/// The algorithm:
+/// 1. Sort paths to process parents before children
+/// 2. For each path, check if any previously seen path is its parent
+/// 3. Only keep paths that don't have a parent in the set
 fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<ColumnName> {
     let mut ancestor_paths = HashSet::new();
     let mut all_paths: Vec<_> = added_fields.iter().map(|f| &f.path).collect();
@@ -319,7 +333,10 @@ fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<ColumnNam
     ancestor_paths
 }
 
-/// Checks if a path has an added ancestor (is a descendant of a newly added field)
+/// Checks if a field path has a parent in the given set of ancestor paths.
+///
+/// Returns true if any path in `added_ancestor_paths` is a prefix of `path`.
+/// For example, "user" is an ancestor of "user.name" and "user.address.street".
 fn has_added_ancestor(path: &ColumnName, added_ancestor_paths: &HashSet<ColumnName>) -> bool {
     added_ancestor_paths.iter().any(|ancestor| {
         is_descendant_of(path, ancestor)
