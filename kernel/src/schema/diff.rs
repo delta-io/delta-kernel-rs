@@ -1405,4 +1405,335 @@ mod tests {
         assert!(updated_paths.contains(&ColumnName::new(["identifier"])));
         assert!(updated_paths.contains(&ColumnName::new(["user", "full_name"])));
     }
+
+    #[test]
+    fn test_change_count() {
+        let current = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, false, 1),
+            create_field_with_id("name", DataType::STRING, false, 2),
+        ]);
+
+        let new = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, true, 1), // Changed
+            create_field_with_id("email", DataType::STRING, false, 3), // Added
+        ]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        // 1 removed (name), 1 added (email), 1 updated (id)
+        assert_eq!(diff.change_count(), 3);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_change_types() {
+        // Test that a field with multiple simultaneous changes produces FieldChangeType::Multiple
+        let current = StructType::new_unchecked([create_field_with_id(
+            "user_name",
+            DataType::STRING,
+            false,
+            1,
+        )
+        .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])]);
+
+        let new = StructType::new_unchecked([
+            create_field_with_id("userName", DataType::STRING, true, 1) // Renamed + nullability loosened
+                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
+        ]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.updated_fields.len(), 1);
+        let update = &diff.updated_fields[0];
+
+        // Should be Multiple with 3 changes
+        match &update.change_type {
+            FieldChangeType::Multiple(changes) => {
+                assert_eq!(changes.len(), 3);
+                assert!(changes.contains(&FieldChangeType::Renamed));
+                assert!(changes.contains(&FieldChangeType::NullabilityLoosened));
+                assert!(changes.contains(&FieldChangeType::MetadataChanged));
+            }
+            _ => panic!(
+                "Expected Multiple change type, got {:?}",
+                update.change_type
+            ),
+        }
+
+        // Not breaking since nullability was loosened (not tightened)
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_multiple_with_breaking_change() {
+        // Test that Multiple changes are correctly identified as breaking when they contain breaking changes
+        let current = StructType::new_unchecked([create_field_with_id(
+            "user_name",
+            DataType::STRING,
+            true,
+            1,
+        )
+        .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])]);
+
+        let new = StructType::new_unchecked([
+            create_field_with_id("userName", DataType::STRING, false, 1) // Renamed + nullability TIGHTENED
+                .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
+        ]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.updated_fields.len(), 1);
+        let update = &diff.updated_fields[0];
+
+        match &update.change_type {
+            FieldChangeType::Multiple(changes) => {
+                assert_eq!(changes.len(), 3);
+                assert!(changes.contains(&FieldChangeType::Renamed));
+                assert!(changes.contains(&FieldChangeType::NullabilityTightened));
+                assert!(changes.contains(&FieldChangeType::MetadataChanged));
+            }
+            _ => panic!(
+                "Expected Multiple change type, got {:?}",
+                update.change_type
+            ),
+        }
+
+        // Breaking because nullability was tightened
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_duplicate_field_id_error() {
+        // Test that duplicate field IDs in the same schema produce an error
+        let schema_with_duplicates = StructType::new_unchecked([
+            create_field_with_id("field1", DataType::STRING, false, 1),
+            create_field_with_id("field2", DataType::STRING, false, 1), // Same ID!
+        ]);
+
+        let result = SchemaDiffArgs {
+            current: &schema_with_duplicates,
+            new: &schema_with_duplicates,
+        }
+        .compute_diff();
+
+        assert!(result.is_err());
+        match result {
+            Err(SchemaDiffError::DuplicateFieldId { id, path1, path2 }) => {
+                assert_eq!(id, 1);
+                assert_eq!(path1, ColumnName::new(["field1"]));
+                assert_eq!(path2, ColumnName::new(["field2"]));
+            }
+            _ => panic!("Expected DuplicateFieldId error"),
+        }
+    }
+
+    #[test]
+    fn test_array_nullability_loosened() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable elements
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), // Nullable elements now
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityLoosened
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_array_nullability_tightened() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), // Nullable elements
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable now
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityTightened
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_map_nullability_loosened() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                false, // Non-nullable values
+            ))),
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                true, // Nullable values now
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityLoosened
+        );
+        assert!(!diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_map_nullability_tightened() {
+        let current = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                true, // Nullable values
+            ))),
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::INTEGER,
+                false, // Non-nullable now
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityTightened
+        );
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_map_with_struct_key() {
+        // Test that maps with struct keys can be diffed
+        let current = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "id",
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::STRING,
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let new = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "identifier", // Renamed key field
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::STRING,
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+
+        // Should see the nested key field renamed
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].path,
+            ColumnName::new(["lookup", "key", "identifier"])
+        );
+        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+    }
 }
