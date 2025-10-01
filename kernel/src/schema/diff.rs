@@ -35,6 +35,8 @@ pub(crate) struct SchemaDiff {
     pub removed_fields: Vec<FieldChange>,
     /// Fields that were modified between schemas
     pub updated_fields: Vec<FieldUpdate>,
+    /// Whether the diff contains breaking changes (computed once during construction)
+    has_breaking_changes: bool,
 }
 
 /// Represents a field change (added or removed) at any nesting level
@@ -110,28 +112,7 @@ impl SchemaDiff {
 
     /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
     pub(crate) fn has_breaking_changes(&self) -> bool {
-        !self.removed_fields.is_empty()
-            || self
-                .updated_fields
-                .iter()
-                .any(|update| match &update.change_type {
-                    FieldChangeType::TypeChanged
-                    | FieldChangeType::NullabilityTightened
-                    | FieldChangeType::PhysicalNameChanged
-                    | FieldChangeType::ContainerNullabilityTightened => true,
-                    FieldChangeType::Multiple(multiple_changes) => {
-                        multiple_changes.iter().any(|c| {
-                            matches!(
-                                c,
-                                FieldChangeType::TypeChanged
-                                    | FieldChangeType::NullabilityTightened
-                                    | FieldChangeType::PhysicalNameChanged
-                                    | FieldChangeType::ContainerNullabilityTightened
-                            )
-                        })
-                    }
-                    _ => false,
-                })
+        self.has_breaking_changes
     }
 
     /// Get all changes at the top level only (fields with path length of 1)
@@ -312,11 +293,40 @@ fn compute_schema_diff(
         }
     }
 
+    // Compute whether there are breaking changes
+    let has_breaking_changes = compute_has_breaking_changes(&removed_fields, &updated_fields);
+
     Ok(SchemaDiff {
         added_fields,
         removed_fields,
         updated_fields,
+        has_breaking_changes,
     })
+}
+
+/// Helper function to check if a change type is breaking
+fn is_breaking_change_type(change_type: &FieldChangeType) -> bool {
+    match change_type {
+        FieldChangeType::TypeChanged
+        | FieldChangeType::NullabilityTightened
+        | FieldChangeType::PhysicalNameChanged
+        | FieldChangeType::ContainerNullabilityTightened => true,
+        FieldChangeType::Multiple(multiple_changes) => {
+            multiple_changes.iter().any(|c| is_breaking_change_type(c))
+        }
+        _ => false,
+    }
+}
+
+/// Computes whether the diff contains breaking changes
+fn compute_has_breaking_changes(
+    removed_fields: &[FieldChange],
+    updated_fields: &[FieldUpdate],
+) -> bool {
+    !removed_fields.is_empty()
+        || updated_fields
+            .iter()
+            .any(|update| is_breaking_change_type(&update.change_type))
 }
 
 /// Filters field changes to keep only the least common ancestors (LCA).
