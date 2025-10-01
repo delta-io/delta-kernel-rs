@@ -313,27 +313,33 @@ fn compute_schema_diff(
 /// For example, if both "user" and "user.name" are added, this returns only "user"
 /// since reporting "user.name" would be redundant.
 ///
-/// The algorithm:
-/// 1. Sort paths to process parents before children
-/// 2. For each path, check if any previously seen path is its parent
-/// 3. Only keep paths that don't have a parent in the set
+/// The algorithm is O(n) where n is the number of fields:
+/// 1. Put all paths in a HashSet for O(1) lookup
+/// 2. For each field, check if its immediate parent is in the set
+/// 3. Keep only fields whose parent is NOT in the set
 fn build_added_ancestor_paths(added_fields: &[FieldChange]) -> HashSet<ColumnName> {
-    let mut ancestor_paths = HashSet::new();
-    let mut all_paths: Vec<_> = added_fields.iter().map(|f| &f.path).collect();
-    all_paths.sort();
+    // Build a set of all paths for O(1) lookup
+    let all_paths: HashSet<&ColumnName> = added_fields.iter().map(|f| &f.path).collect();
 
-    for path in all_paths {
-        // Check if this path is a descendant of any existing ancestor
-        let is_descendant = ancestor_paths
-            .iter()
-            .any(|ancestor: &ColumnName| is_descendant_of(path, ancestor));
+    // Filter to keep only fields whose parent is NOT in the set
+    added_fields
+        .iter()
+        .filter(|field_change| {
+            let path_parts = field_change.path.path();
 
-        if !is_descendant {
-            ancestor_paths.insert(path.clone());
-        }
-    }
+            // Top-level fields (length 1) have no parent, so keep them
+            if path_parts.len() == 1 {
+                return true;
+            }
 
-    ancestor_paths
+            // Construct parent path by removing the last component
+            let parent_path = ColumnName::new(&path_parts[..path_parts.len() - 1]);
+
+            // Keep this field only if its parent was NOT added
+            !all_paths.contains(&parent_path)
+        })
+        .map(|field_change| field_change.path.clone())
+        .collect()
 }
 
 /// Checks if a field path has a parent in the given set of ancestor paths.
