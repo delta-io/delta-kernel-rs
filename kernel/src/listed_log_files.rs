@@ -130,7 +130,7 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
         use LogPathFileType::*;
         match &part_file.file_type {
             SinglePartCheckpoint
-            | UuidCheckpoint(_)
+            | UuidCheckpoint
             | MultiPartCheckpoint {
                 part_num: 1,
                 num_parts: 1,
@@ -270,7 +270,7 @@ impl ListedLogFiles {
                             ascending_compaction_files.push(file);
                         }
                         CompactedCommit { .. } => (), // Failed the bounds check above
-                        SinglePartCheckpoint | UuidCheckpoint(_) | MultiPartCheckpoint { .. } => {
+                        SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                             new_checkpoint_parts.push(file)
                         }
                         Crc => {
