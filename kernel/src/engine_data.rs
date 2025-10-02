@@ -12,19 +12,68 @@ use crate::{AsAny, DeltaResult, Error};
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
 /// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
-/// while `false` means the row is logically deleted and should be ignored.
+/// while `false` means the row is logically deleted and should be ignored. If the selection vector is shorter
+/// then the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
 ///
 /// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
     // The underlying engine data
-    pub data: Box<dyn EngineData>,
-    // The selection vector where `true` marks rows to include in results
-    pub selection_vector: Vec<bool>,
+    data: Box<dyn EngineData>,
+    // The selection vector where `true` marks rows to include in results. N.B. this selection
+    // vector may be less then `data.len()` and any gaps represent rows that are assumed to be selected.
+    selection_vector: Vec<bool>,
+}
+
+impl FilteredEngineData {
+    pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> DeltaResult<Self> {
+        if selection_vector.len() > data.len() {
+            return Err(Error::InvalidSelectionVector(format!(
+                "Selection vector is larger than data length: {} > {}",
+                selection_vector.len(),
+                data.len()
+            )));
+        }
+        Ok(Self {
+            data,
+            selection_vector,
+        })
+    }
+
+    /// Returns a reference to the underlying engine data.
+    pub fn data(&self) -> &dyn EngineData {
+        &*self.data
+    }
+
+    /// Returns a reference to the selection vector.
+    pub fn selection_vector(&self) -> &[bool] {
+        &self.selection_vector
+    }
+
+    /// Consumes the FilteredEngineData and returns the underlying data and selection vector.
+    pub fn into_parts(self) -> (Box<dyn EngineData>, Vec<bool>) {
+        (self.data, self.selection_vector)
+    }
+
+    /// Creates a new `FilteredEngineData` with all rows selected.
+    ///
+    /// This is a convenience method for the common case where you want to wrap
+    /// `EngineData` in `FilteredEngineData` without any filtering.
+    pub fn with_all_rows_selected(data: Box<dyn EngineData>) -> Self {
+        Self {
+            data,
+            selection_vector: vec![],
+        }
+    }
 }
 
 impl HasSelectionVector for FilteredEngineData {
     /// Returns true if any row in the selection vector is marked as selected
     fn has_selected_rows(&self) -> bool {
+        // Per contract if selection is not as long as data then at least one row is selected.
+        if self.selection_vector.len() < self.data.len() {
+            return true;
+        }
+
         self.selection_vector.contains(&true)
     }
 }
@@ -314,4 +363,198 @@ pub trait EngineData: AsAny {
         schema: SchemaRef,
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
+    use crate::engine::arrow_data::ArrowEngineData;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_with_all_rows_selected_empty_data() {
+        // Test with empty data
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(Vec::<String>::new()))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+
+        assert_eq!(filtered_data.selection_vector().len(), 0);
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), 0);
+    }
+
+    #[test]
+    fn test_with_all_rows_selected_single_row() {
+        // Test with single row
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["single_row"]))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+
+        // According to the new contract, empty selection vector means all rows are selected
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), 1);
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_with_all_rows_selected_multiple_rows() {
+        // Test with multiple rows
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                "row1", "row2", "row3", "row4",
+            ]))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+
+        // According to the new contract, empty selection vector means all rows are selected
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), 4);
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_empty_data() {
+        // Test with empty data
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(Vec::<String>::new()))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        let filtered_data = FilteredEngineData::try_new(data, vec![]).unwrap();
+
+        // Empty data should return false even with empty selection vector
+        assert!(!filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_selection_vector_shorter_than_data() {
+        // Test with selection vector shorter than data length
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["row1", "row2", "row3"]))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        // Selection vector with only 2 elements for 3 rows of data
+        let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
+
+        // Should return true because selection vector is shorter than data
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_selection_vector_same_length_all_false() {
+        // Test with selection vector same length as data, all false
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["row1", "row2"]))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
+
+        // Should return false because no rows are selected
+        assert!(!filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_selection_vector_same_length_some_true() {
+        // Test with selection vector same length as data, some true
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["row1", "row2", "row3"]))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        let filtered_data = FilteredEngineData::try_new(data, vec![true, false, true]).unwrap();
+
+        // Should return true because some rows are selected
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_try_new_selection_vector_larger_than_data() {
+        // Test with selection vector larger than data length - should return error
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["row1", "row2"]))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+
+        // Selection vector with 3 elements for 2 rows of data - should fail
+        let result = FilteredEngineData::try_new(data, vec![true, false, true]);
+
+        // Should return an error
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e
+                .to_string()
+                .contains("Selection vector is larger than data length"));
+            assert!(e.to_string().contains("3 > 2"));
+        }
+    }
 }

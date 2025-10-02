@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use common::LocationArgs;
+use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -25,7 +25,12 @@ struct Cli {
 }
 
 fn main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(
+        env!("CARGO_PKG_NAME"),
+        "Read changes in",
+        "read changes in",
+        "",
+    );
     let url = delta_kernel::try_parse_uri(cli.location_args.path.as_str())?;
     let engine = common::get_engine(&url, &cli.location_args)?;
     let table_changes = TableChanges::try_new(url, &engine, cli.start_version, cli.end_version)?;
