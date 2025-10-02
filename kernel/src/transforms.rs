@@ -11,6 +11,7 @@ use itertools::Itertools;
 
 use crate::expressions::{Expression, ExpressionRef, Scalar, Transform};
 use crate::schema::{DataType, SchemaRef, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 // TODO(#1337): Remove ColumnType when CDF is unified with StateInfo pattern
@@ -98,7 +99,7 @@ pub(crate) fn parse_partition_value(
     field_idx: usize,
     logical_schema: &SchemaRef,
     partition_values: &HashMap<String, String>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<(usize, (String, Scalar))> {
     let Some(field) = logical_schema.field_at_index(field_idx) else {
         return Err(Error::InternalError(format!(
@@ -116,7 +117,7 @@ pub(crate) fn parse_partition_values(
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
     partition_values: &HashMap<String, String>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
     transform_spec
         .iter()
@@ -278,12 +279,7 @@ mod tests {
         )]));
         let partition_values = HashMap::new();
 
-        let result = parse_partition_value(
-            5,
-            &schema,
-            &partition_values,
-            crate::table_features::ColumnMappingMode::None,
-        );
+        let result = parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None);
         assert_result_error_with_message(result, "out of bounds");
     }
 
@@ -322,7 +318,7 @@ mod tests {
             &schema,
             &transform_spec,
             &partition_values,
-            crate::table_features::ColumnMappingMode::None,
+            ColumnMappingMode::None,
         )
         .unwrap();
         assert_eq!(result.len(), 2);
@@ -348,7 +344,7 @@ mod tests {
             &schema,
             &transform_spec,
             &partition_values,
-            crate::table_features::ColumnMappingMode::None,
+            ColumnMappingMode::None,
         )
         .unwrap();
         assert!(result.is_empty());

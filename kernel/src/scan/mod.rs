@@ -209,7 +209,7 @@ struct GetReferencedFields<'a> {
     column_mappings: HashMap<ColumnName, ColumnName>,
     logical_path: Vec<String>,
     physical_path: Vec<String>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     // Capture the path mapping for this leaf field

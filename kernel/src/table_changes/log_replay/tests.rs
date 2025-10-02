@@ -10,7 +10,7 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
-use crate::table_features::ReaderFeature;
+use crate::table_features::{ColumnMappingMode, ReaderFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
