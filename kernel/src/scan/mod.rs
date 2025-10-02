@@ -148,6 +148,7 @@ impl PhysicalPredicate {
     pub(crate) fn try_new(
         predicate: &Predicate,
         logical_schema: &Schema,
+        column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
@@ -157,6 +158,7 @@ impl PhysicalPredicate {
             column_mappings: HashMap::new(),
             logical_path: vec![],
             physical_path: vec![],
+            column_mapping_mode,
         };
         let schema_opt = get_referenced_fields.transform_struct(logical_schema);
         let mut unresolved = get_referenced_fields.unresolved_references.into_iter();
@@ -207,6 +209,7 @@ struct GetReferencedFields<'a> {
     column_mappings: HashMap<ColumnName, ColumnName>,
     logical_path: Vec<String>,
     physical_path: Vec<String>,
+    column_mapping_mode: crate::table_features::ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     // Capture the path mapping for this leaf field
@@ -232,7 +235,7 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let physical_name = field.physical_name();
+        let physical_name = field.physical_name(self.column_mapping_mode);
         self.logical_path.push(field.name.clone());
         self.physical_path.push(physical_name.to_string());
         let field = self.recurse_into_struct_field(field);
@@ -745,6 +748,7 @@ pub(crate) struct StateInfo {
     pub(crate) physical_predicate: PhysicalPredicate,
     /// Transform specification for converting physical to logical data
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
+    pub(crate) column_mapping_mode: ColumnMappingMode,
 }
 
 impl StateInfo {
@@ -808,7 +812,7 @@ impl StateInfo {
         let physical_schema = Arc::new(StructType::try_new(read_fields)?);
 
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
@@ -824,6 +828,7 @@ impl StateInfo {
             physical_schema,
             physical_predicate,
             transform_spec,
+            column_mapping_mode,
         })
     }
 }
@@ -847,6 +852,7 @@ pub(crate) mod test_utils {
     use std::sync::Arc;
 
     use crate::log_replay::ActionsBatch;
+    use crate::table_features::ColumnMappingMode;
     use crate::{
         actions::get_log_schema,
         engine::{
@@ -959,6 +965,7 @@ pub(crate) mod test_utils {
             physical_schema: logical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec,
+            column_mapping_mode: ColumnMappingMode::None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -1168,7 +1175,12 @@ mod tests {
         ];
 
         for (predicate, expected) in test_cases {
-            let result = PhysicalPredicate::try_new(&predicate, &logical_schema).ok();
+            let result = PhysicalPredicate::try_new(
+                &predicate,
+                &logical_schema,
+                crate::table_features::ColumnMappingMode::Name,
+            )
+            .ok();
             assert_eq!(
                 result, expected,
                 "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
