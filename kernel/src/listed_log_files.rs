@@ -270,9 +270,7 @@ impl ListedLogFiles {
                 for file in files {
                     use LogPathFileType::*;
                     match file.file_type {
-                        Commit | StagedCommit => {
-                            ascending_commit_files.push(file);
-                        }
+                        Commit | StagedCommit => ascending_commit_files.push(file),
                         CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
                             ascending_compaction_files.push(file);
                         }
@@ -302,8 +300,11 @@ impl ListedLogFiles {
                     .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
                 {
                     checkpoint_parts = complete_checkpoint;
-                    // Save the latest commit file before clearing ascending_commit_files
-                    latest_commit_file = ascending_commit_files.last().cloned();
+                    // Update latest_commit_file if there's a commit at the same version as the checkpoint, otherwise set to None
+                    // Since ascending_commit_files is sorted, the last element is the latest commit would be the same version as the checkpoint
+                    latest_commit_file = ascending_commit_files
+                        .pop()
+                        .filter(|commit| commit.version == version);
                     // Log replay only uses commits/compactions after a complete checkpoint
                     ascending_commit_files.clear();
                     ascending_compaction_files.clear();
@@ -311,6 +312,7 @@ impl ListedLogFiles {
             }
 
             // If ascending_commit_files is non-empty, set latest_commit_file to the last element
+            // This captures the latest commit file that is not part of a checkpoint
             if let Some(commit_file) = ascending_commit_files.last() {
                 latest_commit_file = Some(commit_file.clone());
             }

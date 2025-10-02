@@ -60,7 +60,7 @@ pub(crate) struct LogSegment {
     pub latest_crc_file: Option<ParsedLogPath>,
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
-    pub latest_commit_file: ParsedLogPath,
+    pub latest_commit_file: Option<ParsedLogPath>,
 }
 
 impl LogSegment {
@@ -122,10 +122,6 @@ impl LogSegment {
                 ))
             );
         }
-
-        // LogSegment requires a latest_commit_file
-        let latest_commit_file = latest_commit_file
-            .ok_or_else(|| Error::generic("LogSegment requires at least one commit"))?;
 
         Ok(LogSegment {
             end_version: effective_version,
