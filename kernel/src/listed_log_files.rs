@@ -302,10 +302,9 @@ impl ListedLogFiles {
                     .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
                 {
                     checkpoint_parts = complete_checkpoint;
-                    // Log replay only uses commits/compactions after a complete checkpoint
-                    // Note: we preserve latest_commit_file even when clearing ascending_commit_files
-                    // Save the latest commit file before clearing
+                    // Save the latest commit file before clearing ascending_commit_files
                     latest_commit_file = ascending_commit_files.last().cloned();
+                    // Log replay only uses commits/compactions after a complete checkpoint
                     ascending_commit_files.clear();
                     ascending_compaction_files.clear();
                 }
