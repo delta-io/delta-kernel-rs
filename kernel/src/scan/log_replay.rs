@@ -97,7 +97,7 @@ impl AddRemoveDedupVisitor<'_> {
     const REMOVE_PATH_INDEX: usize = 5; // Position of "remove.path" in getters
     const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
 
-    fn new(
+    pub fn new(
         seen: &mut HashSet<FileActionKey>,
         selection_vector: Vec<bool>,
         logical_schema: SchemaRef,

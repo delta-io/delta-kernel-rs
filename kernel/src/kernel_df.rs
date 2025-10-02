@@ -2,21 +2,27 @@ use std::{
     any::Any,
     cell::RefCell,
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex, RwLock},
 };
 
 use itertools::Itertools;
 use parquet_56::schema;
+use tracing::debug;
 
 use crate::{
+    actions::deletion_vector::DeletionVectorDescriptor,
     checkpoint::log_replay::CheckpointVisitor,
-    engine_data::{self, GetData},
-    log_replay::FileActionDeduplicator,
+    engine_data::{self, GetData, TypedGetData as _},
+    log_replay::{FileActionDeduplicator, FileActionKey},
     log_segment::LogSegment,
     scan::{log_replay::AddRemoveDedupVisitor, CHECKPOINT_READ_SCHEMA, COMMIT_READ_SCHEMA},
     schema::{ColumnName, DataType, Schema, SchemaRef},
     DeltaResult, Engine, EngineData, Error, Expression, ExpressionRef, FileMeta, RowVisitor,
     Snapshot,
+};
+use crate::{
+    expressions::column_name,
+    schema::{ColumnNamesAndTypes, MapType},
 };
 
 pub trait RowFilter: RowVisitor {
@@ -230,6 +236,7 @@ impl DefaultPlanExecutor {
         let child_iter = self.execute(*child)?;
 
         let filtered_iter = child_iter.map(move |x| {
+            println!("executing filtered iter");
             let FilteredEngineData {
                 engine_data,
                 selection_vector,
@@ -328,11 +335,12 @@ impl LogicalPlanNode {
         }))
     }
 
-    fn filter(self, filter: impl RowFilter) -> DeltaResult<Self> {
+    fn filter(self, filter: impl RowFilter + 'static) -> DeltaResult<Self> {
+        let column_names = filter.selected_column_names_and_types().0;
         Ok(Self::Filter(FilterNode {
             child: Box::new(self),
             filter: Arc::new(Mutex::new(filter)),
-            column_names: todo!(),
+            column_names,
         }))
     }
 
@@ -364,12 +372,13 @@ impl LogicalPlanNode {
 
 impl Snapshot {
     fn get_scan_plan(&self) -> DeltaResult<LogicalPlanNode> {
-        let json_paths = self
+        let mut json_paths = self
             .log_segment()
             .ascending_commit_files
             .iter()
             .map(|log_path| log_path.location.clone())
             .collect_vec();
+        json_paths.reverse();
         let json_scan = LogicalPlanNode::scan_json(json_paths, COMMIT_READ_SCHEMA.clone())?;
 
         let parquet_paths = self
@@ -381,7 +390,262 @@ impl Snapshot {
         let parquet_scan =
             LogicalPlanNode::scan_parquet(parquet_paths, COMMIT_READ_SCHEMA.clone())?;
 
-        json_scan.union(parquet_scan)
+        let set = Arc::new(RwLock::new(HashSet::new()));
+        let x = SharedAddRemoveDedupFilter::new(set.clone(), json_scan.schema(), true);
+        let y = SharedAddRemoveDedupFilter::new(set, parquet_scan.schema(), false);
+        json_scan.filter(x)?.union(parquet_scan.filter(y)?)
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedFileActionDeduplicator {
+    /// A set of (data file path, dv_unique_id) pairs that have been seen thus
+    /// far in the log for deduplication. This is a mutable reference to the set
+    /// of seen file keys that persists across multiple log batches.
+    seen_file_keys: Arc<RwLock<HashSet<FileActionKey>>>,
+    // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
+    // to better reflect its role in deduplication logic.
+    /// Whether we're processing a log batch (as opposed to a checkpoint)
+    is_log_batch: bool,
+    /// Index of the getter containing the add.path column
+    add_path_index: usize,
+    /// Index of the getter containing the remove.path column
+    remove_path_index: usize,
+    /// Starting index for add action deletion vector columns
+    add_dv_start_index: usize,
+    /// Starting index for remove action deletion vector columns
+    remove_dv_start_index: usize,
+}
+
+impl SharedFileActionDeduplicator {
+    pub(crate) fn new(
+        seen_file_keys: Arc<RwLock<HashSet<FileActionKey>>>,
+        is_log_batch: bool,
+        add_path_index: usize,
+        remove_path_index: usize,
+        add_dv_start_index: usize,
+        remove_dv_start_index: usize,
+    ) -> Self {
+        Self {
+            seen_file_keys,
+            is_log_batch,
+            add_path_index,
+            remove_path_index,
+            add_dv_start_index,
+            remove_dv_start_index,
+        }
+    }
+
+    /// Checks if log replay already processed this logical file (in which case the current action
+    /// should be ignored). If not already seen, register it so we can recognize future duplicates.
+    /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
+    /// and should process it.
+    pub(crate) fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
+        // Note: each (add.path + add.dv_unique_id()) pair has a
+        // unique Add + Remove pair in the log. For example:
+        // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+
+        if self.seen_file_keys.read().unwrap().contains(&key) {
+            println!(
+                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            true
+        } else {
+            println!(
+                "Including ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            if self.is_log_batch {
+                // Remember file actions from this batch so we can ignore duplicates as we process
+                // batches from older commit and/or checkpoint files. We don't track checkpoint
+                // batches because they are already the oldest actions and never replace anything.
+                self.seen_file_keys.write().unwrap().insert(key);
+            }
+            false
+        }
+    }
+
+    /// Extracts the deletion vector unique ID if it exists.
+    ///
+    /// This function retrieves the necessary fields for constructing a deletion vector unique ID
+    /// by accessing `getters` at `dv_start_index` and the following two indices. Specifically:
+    /// - `dv_start_index` retrieves the storage type (`deletionVector.storageType`).
+    /// - `dv_start_index + 1` retrieves the path or inline deletion vector (`deletionVector.pathOrInlineDv`).
+    /// - `dv_start_index + 2` retrieves the optional offset (`deletionVector.offset`).
+    fn extract_dv_unique_id<'a>(
+        &self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+        dv_start_index: usize,
+    ) -> DeltaResult<Option<String>> {
+        match getters[dv_start_index].get_opt(i, "deletionVector.storageType")? {
+            Some(storage_type) => {
+                let path_or_inline =
+                    getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
+                let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
+
+                Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
+                    storage_type,
+                    path_or_inline,
+                    offset,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Extracts a file action key and determines if it's an add operation.
+    /// This method examines the data at the given index using the provided getters
+    /// to identify whether a file action exists and what type it is.
+    ///
+    /// # Parameters
+    /// - `i`: Index position in the data structure to examine
+    /// - `getters`: Collection of data getter implementations used to access the data
+    /// - `skip_removes`: Whether to skip remove actions when extracting file actions
+    ///
+    /// # Returns
+    /// - `Ok(Some((key, is_add)))`: When a file action is found, returns the key and whether it's an add operation
+    /// - `Ok(None)`: When no file action is found
+    /// - `Err(...)`: On any error during extraction
+    pub(crate) fn extract_file_action<'a>(
+        &self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+        skip_removes: bool,
+    ) -> DeltaResult<Option<(FileActionKey, bool)>> {
+        // Try to extract an add action by the required path column
+        if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
+            let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
+            return Ok(Some((FileActionKey::new(path, dv_unique_id), true)));
+        }
+
+        // The AddRemoveDedupVisitor skips remove actions when extracting file actions from a checkpoint batch.
+        if skip_removes {
+            return Ok(None);
+        }
+
+        // Try to extract a remove action by the required path column
+        if let Some(path) = getters[self.remove_path_index].get_str(i, "remove.path")? {
+            let dv_unique_id = self.extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
+            return Ok(Some((FileActionKey::new(path, dv_unique_id), false)));
+        }
+
+        // No file action found
+        Ok(None)
+    }
+
+    /// Returns whether we are currently processing a log batch.
+    ///
+    /// `true` indicates we are processing a batch from a commit file.
+    /// `false` indicates we are processing a batch from a checkpoint.
+    pub(crate) fn is_log_batch(&self) -> bool {
+        self.is_log_batch
+    }
+}
+
+impl RowFilter for SharedAddRemoveDedupFilter {
+    fn filter_row<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
+        let x = self.is_valid_add(i, getters)?;
+        println!(" is valid is {x}");
+        Ok(x)
+    }
+}
+pub struct SharedAddRemoveDedupFilter {
+    deduplicator: SharedFileActionDeduplicator,
+    logical_schema: SchemaRef,
+}
+
+impl SharedAddRemoveDedupFilter {
+    // These index positions correspond to the order of columns defined in
+    // `selected_column_names_and_types()`
+    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
+    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
+    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
+    const REMOVE_PATH_INDEX: usize = 5; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
+
+    pub fn new(
+        seen: Arc<RwLock<HashSet<FileActionKey>>>,
+        logical_schema: SchemaRef,
+        is_log_batch: bool,
+    ) -> SharedAddRemoveDedupFilter {
+        SharedAddRemoveDedupFilter {
+            deduplicator: SharedFileActionDeduplicator::new(
+                seen,
+                is_log_batch,
+                Self::ADD_PATH_INDEX,
+                Self::REMOVE_PATH_INDEX,
+                Self::ADD_DV_START_INDEX,
+                Self::REMOVE_DV_START_INDEX,
+            ),
+            logical_schema,
+        }
+    }
+
+    /// True if this row contains an Add action that should survive log replay. Skip it if the row
+    /// is not an Add action, or the file has already been seen previously.
+    pub fn is_valid_add<'a>(
+        &mut self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> DeltaResult<bool> {
+        // When processing file actions, we extract path and deletion vector information based on action type:
+        // - For Add actions: path is at index 0, followed by DV fields at indexes 2-4
+        // - For Remove actions (in log batches only): path is at index 5, followed by DV fields at indexes 6-8
+        // The file extraction logic selects the appropriate indexes based on whether we found a valid path.
+        // Remove getters are not included when visiting a non-log batch (checkpoint batch), so do
+        // not try to extract remove actions in that case.
+        let Some((file_key, is_add)) = self.deduplicator.extract_file_action(
+            i,
+            getters,
+            !self.deduplicator.is_log_batch(), // skip_removes. true if this is a checkpoint batch
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // Check both adds and removes (skipping already-seen), but only transform and return adds
+        if self.deduplicator.check_and_record_seen(file_key) || !is_add {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+impl RowVisitor for SharedAddRemoveDedupFilter {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            const STRING: DataType = DataType::STRING;
+            const INTEGER: DataType = DataType::INTEGER;
+            let ss_map: DataType = MapType::new(STRING, STRING, true).into();
+            let types_and_names = vec![
+                (STRING, column_name!("add.path")),
+                (ss_map, column_name!("add.partitionValues")),
+                (STRING, column_name!("add.deletionVector.storageType")),
+                (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
+                (INTEGER, column_name!("add.deletionVector.offset")),
+                (STRING, column_name!("remove.path")),
+                (STRING, column_name!("remove.deletionVector.storageType")),
+                (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
+                (INTEGER, column_name!("remove.deletionVector.offset")),
+            ];
+            let (types, names) = types_and_names.into_iter().unzip();
+            (names, types).into()
+        });
+        let (names, types) = NAMES_AND_TYPES.as_ref();
+        if self.deduplicator.is_log_batch() {
+            (names, types)
+        } else {
+            // All checkpoint actions are already reconciled and Remove actions in checkpoint files
+            // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
+            (&names[..5], &types[..5])
+        }
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        todo!()
     }
 }
 
@@ -406,13 +670,12 @@ mod tests {
     #[test]
     fn test_scan_plan() {
         let path =
-            std::fs::canonicalize(PathBuf::from("./tests/data/table-without-dv-small/")).unwrap();
+            std::fs::canonicalize(PathBuf::from("/Users/oussama/projects/code/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/with_checkpoint/delta/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
         let engine = SyncEngine::new();
 
         let snapshot = Snapshot::builder(url).build(&engine).unwrap();
         let plan = snapshot.get_scan_plan().unwrap();
-        println!("plan: {plan:?}");
         let executor = DefaultPlanExecutor {
             engine: Arc::new(engine),
         };
