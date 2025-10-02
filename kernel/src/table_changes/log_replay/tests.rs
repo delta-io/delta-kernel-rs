@@ -1,6 +1,6 @@
 use super::table_changes_action_iter;
 use super::TableChangesScanMetadata;
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
@@ -422,14 +422,14 @@ async fn dv() {
     let mut mock_table = LocalMockTable::new();
 
     let deletion_vector1 = DeletionVectorDescriptor {
-        storage_type: "u".to_string(),
+        storage_type: DeletionVectorStorageType::PersistedRelative,
         path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
         offset: Some(1),
         size_in_bytes: 36,
         cardinality: 2,
     };
     let deletion_vector2 = DeletionVectorDescriptor {
-        storage_type: "u".to_string(),
+        storage_type: DeletionVectorStorageType::PersistedRelative,
         path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
         offset: Some(1),
         size_in_bytes: 38,
@@ -488,7 +488,7 @@ async fn data_skipping_filter() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     let deletion_vector = Some(DeletionVectorDescriptor {
-        storage_type: "u".to_string(),
+        storage_type: DeletionVectorStorageType::PersistedRelative,
         path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
         offset: Some(1),
         size_in_bytes: 36,
