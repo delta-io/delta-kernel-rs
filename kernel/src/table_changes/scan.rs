@@ -9,6 +9,7 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_spec, ColumnType, TransformSpec};
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
@@ -169,7 +170,11 @@ impl TableChangesScanBuilder {
             })
             .try_collect()?;
         let physical_predicate = match self.predicate {
-            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema, self.table_changes.end_snapshot.column_mapping_mode())?,
+            Some(predicate) => PhysicalPredicate::try_new(
+                &predicate,
+                &logical_schema,
+                self.table_changes.end_snapshot.column_mapping_mode(),
+            )?,
             None => PhysicalPredicate::None,
         };
 
@@ -290,7 +295,7 @@ fn read_scan_file(
     physical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
     _physical_predicate: Option<PredicateRef>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
         scan_file,

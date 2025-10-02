@@ -13,6 +13,7 @@ use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, Log
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -46,7 +47,7 @@ pub(crate) struct ScanLogReplayProcessor {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -61,7 +62,7 @@ impl ScanLogReplayProcessor {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
-        column_mapping_mode: crate::table_features::ColumnMappingMode,
+        column_mapping_mode: ColumnMappingMode,
     ) -> Self {
         Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
@@ -91,7 +92,7 @@ struct AddRemoveDedupVisitor<'seen> {
     physical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     partition_filter: Option<PredicateRef>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
@@ -112,7 +113,7 @@ impl AddRemoveDedupVisitor<'_> {
         physical_schema: SchemaRef,
         transform_spec: Option<Arc<TransformSpec>>,
         partition_filter: Option<PredicateRef>,
-        column_mapping_mode: crate::table_features::ColumnMappingMode,
+        column_mapping_mode: ColumnMappingMode,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
         AddRemoveDedupVisitor {
@@ -180,8 +181,12 @@ impl AddRemoveDedupVisitor<'_> {
             Some(transform) if is_add => {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values =
-                    parse_partition_values(&self.logical_schema, transform, &partition_values, self.column_mapping_mode)?;
+                let partition_values = parse_partition_values(
+                    &self.logical_schema,
+                    transform,
+                    &partition_values,
+                    self.column_mapping_mode,
+                )?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -371,7 +376,7 @@ pub(crate) fn scan_action_iter(
     physical_schema: SchemaRef,
     transform_spec: Option<Arc<TransformSpec>>,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
 ) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
     ScanLogReplayProcessor::new(
         engine,
@@ -466,7 +471,7 @@ mod tests {
             logical_schema,
             None,
             None,
-            crate::table_features::ColumnMappingMode::None,
+            ColumnMappingMode::None,
         );
         for res in iter {
             let scan_metadata = res.unwrap();
@@ -497,7 +502,7 @@ mod tests {
             schema,
             static_transform,
             None,
-            crate::table_features::ColumnMappingMode::None,
+            ColumnMappingMode::None,
         );
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {

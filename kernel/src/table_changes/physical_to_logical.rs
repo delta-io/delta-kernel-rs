@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::expressions::Scalar;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::{DeltaResult, Error, ExpressionRef};
 
@@ -81,13 +82,17 @@ pub(crate) fn get_cdf_transform_expr(
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
     physical_schema: &StructType,
-    column_mapping_mode: crate::table_features::ColumnMappingMode,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<ExpressionRef> {
     let mut partition_values = HashMap::new();
 
     // Handle regular partition values using parse_partition_values
-    let parsed_values =
-        parse_partition_values(logical_schema, transform_spec, &scan_file.partition_values, column_mapping_mode)?;
+    let parsed_values = parse_partition_values(
+        logical_schema,
+        transform_spec,
+        &scan_file.partition_values,
+        column_mapping_mode,
+    )?;
     partition_values.extend(parsed_values);
 
     // Handle CDF metadata columns
@@ -167,7 +172,7 @@ mod tests {
             &logical_schema,
             &transform_spec,
             &physical_schema,
-            crate::table_features::ColumnMappingMode::None,
+            ColumnMappingMode::None,
         );
         assert!(result.is_ok());
 
@@ -215,7 +220,7 @@ mod tests {
             &logical_schema,
             &transform_spec,
             &physical_schema,
-            crate::table_features::ColumnMappingMode::None,
+            ColumnMappingMode::None,
         );
         assert!(result.is_ok());
 
@@ -266,7 +271,7 @@ mod tests {
             &logical_schema,
             &transform_spec,
             &physical_schema,
-            crate::table_features::ColumnMappingMode::None,
+            ColumnMappingMode::None,
         );
         assert!(result.is_ok());
 

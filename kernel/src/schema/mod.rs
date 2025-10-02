@@ -318,8 +318,7 @@ impl StructField {
     /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     #[internal_api]
-    pub(crate) fn physical_name(&self, column_mapping_mode: crate::table_features::ColumnMappingMode) -> &str {
-        use crate::table_features::ColumnMappingMode;
+    pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
         match column_mapping_mode {
             ColumnMappingMode::None => &self.name,
             ColumnMappingMode::Id | ColumnMappingMode::Name => {
