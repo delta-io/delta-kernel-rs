@@ -9,6 +9,7 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::{SchemaRef, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_spec, ColumnType, TransformSpec};
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
@@ -169,7 +170,11 @@ impl TableChangesScanBuilder {
             })
             .try_collect()?;
         let physical_predicate = match self.predicate {
-            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
+            Some(predicate) => PhysicalPredicate::try_new(
+                &predicate,
+                &logical_schema,
+                self.table_changes.end_snapshot.column_mapping_mode(),
+            )?,
             None => PhysicalPredicate::None,
         };
 
@@ -269,6 +274,7 @@ impl TableChangesScan {
                     self.physical_schema(),
                     &transform_spec,
                     self.physical_predicate(),
+                    self.table_changes.end_snapshot.column_mapping_mode(),
                 )
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
@@ -280,6 +286,7 @@ impl TableChangesScan {
 
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
 /// The result is a fallible iterator of [`ScanResult`] containing the logical data.
+#[allow(clippy::too_many_arguments)]
 fn read_scan_file(
     engine: &dyn Engine,
     resolved_scan_file: ResolvedCdfScanFile,
@@ -288,6 +295,7 @@ fn read_scan_file(
     physical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
     _physical_predicate: Option<PredicateRef>,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
     let ResolvedCdfScanFile {
         scan_file,
@@ -300,6 +308,7 @@ fn read_scan_file(
         logical_schema,
         transform_spec,
         physical_schema.as_ref(),
+        column_mapping_mode,
     )?;
 
     let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
