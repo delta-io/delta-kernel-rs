@@ -22,15 +22,15 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
 use crate::scan::state::{DvInfo, Stats};
-use crate::schema::ToSchema as _;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     StructType,
 };
+use crate::schema::{MetadataColumnSpec, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_spec, ColumnType};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Snapshot, Version};
 
 use self::log_replay::scan_action_iter;
 
@@ -116,11 +116,7 @@ impl ScanBuilder {
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
-        let state_info = StateInfo::try_new(
-            logical_schema.as_ref(),
-            self.snapshot.metadata().partition_columns(),
-            self.snapshot.table_configuration().column_mapping_mode(),
-        )?;
+        let state_info = StateInfo::try_new(logical_schema.as_ref(), &self.snapshot)?;
 
         let physical_predicate = match self.predicate {
             Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
@@ -133,7 +129,7 @@ impl ScanBuilder {
             physical_schema: Arc::new(StructType::try_new(state_info.read_fields)?),
             physical_predicate,
             all_fields: Arc::new(state_info.all_fields),
-            have_partition_cols: state_info.have_partition_cols,
+            need_transform: state_info.need_transform,
         })
     }
 }
@@ -367,7 +363,7 @@ pub struct Scan {
     physical_schema: SchemaRef,
     physical_predicate: PhysicalPredicate,
     all_fields: Arc<Vec<ColumnType>>,
-    have_partition_cols: bool,
+    need_transform: bool,
 }
 
 impl std::fmt::Debug for Scan {
@@ -510,6 +506,7 @@ impl Scan {
                     StructField::nullable("modificationTime", DataType::LONG),
                     StructField::nullable("stats", DataType::STRING),
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+                    StructField::nullable("baseRowId", DataType::LONG),
                 ]),
             )])
         });
@@ -590,7 +587,7 @@ impl Scan {
         // needed. We need transforms for:
         // - Partition columns: Must be injected from partition values
         // - Column mapping: Physical field names must be mapped to logical field names via output schema
-        let static_transform = (self.have_partition_cols
+        let static_transform = (self.need_transform
             || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
             .then(|| Arc::new(get_transform_spec(&self.all_fields)));
         let physical_predicate = match self.physical_predicate.clone() {
@@ -754,7 +751,8 @@ impl Scan {
 ///      cardinality: long,
 ///    },
 ///    fileConstantValues: {
-///      partitionValues: map<string, string>
+///      partitionValues: map<string, string>,
+///      baseRowId: long
 ///    }
 /// }
 /// ```
@@ -768,18 +766,16 @@ struct StateInfo {
     all_fields: Vec<ColumnType>,
     /// The physical (parquet) read schema to use.
     read_fields: Vec<StructField>,
-    /// True if this query references any partition columns.
-    have_partition_cols: bool,
+    /// True if this query needs physical -> logical transformation
+    need_transform: bool,
 }
 
 impl StateInfo {
     /// Get the state needed to process a scan.
-    fn try_new(
-        logical_schema: &Schema,
-        partition_columns: &[String],
-        column_mapping_mode: ColumnMappingMode,
-    ) -> DeltaResult<Self> {
-        let mut have_partition_cols = false;
+    fn try_new(logical_schema: &Schema, snapshot: &Snapshot) -> DeltaResult<Self> {
+        let partition_columns = snapshot.metadata().partition_columns();
+        let column_mapping_mode = snapshot.table_configuration().column_mapping_mode();
+        let mut need_transform = false;
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
 
@@ -801,21 +797,61 @@ impl StateInfo {
                     // Store the index into the schema for this field. When we turn it into an
                     // expression in the inner loop, we will index into the schema and get the name and
                     // data type, which we need to properly materialize the column.
-                    have_partition_cols = true;
+                    need_transform = true;
                     Ok(ColumnType::MetadataDerivedColumn(index))
                 } else {
                     // Add to read schema, store field so we can build a `Column` expression later
                     // if needed (i.e. if we have partition columns)
-                    let physical_field = logical_field.make_physical(column_mapping_mode);
-                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                    let physical_name = physical_field.name.clone();
-                    read_fields.push(physical_field);
+                    let mut select_physical_field = || {
+                        let physical_field = logical_field.make_physical(column_mapping_mode);
+                        debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                        let physical_name = physical_field.name.clone();
+                        read_fields.push(physical_field);
 
-                    if !logical_field.is_metadata_column() {
-                        read_field_names.insert(physical_name.clone());
+                        if !logical_field.is_metadata_column() {
+                            read_field_names.insert(physical_name.clone());
+                        }
+
+                        Ok(ColumnType::Selected(physical_name))
+                    };
+                    match logical_field.get_metadata_column_spec() {
+                        Some(MetadataColumnSpec::RowId) => {
+                            if snapshot
+                                .table_configuration()
+                                .table_properties()
+                                .enable_row_tracking
+                                == Some(true)
+                            {
+                                let row_id_col = snapshot
+                                    .metadata()
+                                    .configuration()
+                                    .get("delta.rowTracking.materializedRowIdColumnName")
+                                    .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
+                                let index_column_name = "_metadata.row_indexes_for_row_id".to_string();
+                                read_fields.push(StructField::create_metadata_column(&index_column_name, MetadataColumnSpec::RowIndex));
+                                read_fields.push(StructField::nullable(row_id_col, DataType::LONG));
+                                need_transform = true;
+                                Ok(ColumnType::RowId {
+                                    index_column_name: index_column_name,
+                                    physical_name: row_id_col.to_string(),
+                                })
+                            } else {
+                                return Err(Error::unsupported(
+                                    "Row ids are not enabled on this table",
+                                ));
+                            }
+                        }
+                        Some(MetadataColumnSpec::RowIndex) => {
+                            // handled in parquet reader (TODO: include in output schema?)
+                            select_physical_field()
+                        }
+                        Some(MetadataColumnSpec::RowCommitVersion) => {
+                            return Err(Error::unsupported(
+                                "Row commit versions not supported",
+                            ));
+                        }
+                        _ => select_physical_field()
                     }
-
-                    Ok(ColumnType::Selected(physical_name))
                 }
             })
             .try_collect()?;
@@ -833,7 +869,7 @@ impl StateInfo {
         Ok(StateInfo {
             all_fields,
             read_fields,
-            have_partition_cols,
+            need_transform,
         })
     }
 }

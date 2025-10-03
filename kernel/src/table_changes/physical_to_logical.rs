@@ -93,7 +93,12 @@ pub(crate) fn get_cdf_transform_expr(
     let cdf_values = get_cdf_columns(logical_schema, scan_file)?;
     partition_values.extend(cdf_values);
 
-    get_transform_expr(transform_spec, partition_values, physical_schema)
+    get_transform_expr(
+        transform_spec,
+        partition_values,
+        physical_schema,
+        None, /* base_row_id */
+    )
 }
 
 #[cfg(test)]
