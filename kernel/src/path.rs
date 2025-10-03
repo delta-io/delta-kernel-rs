@@ -1,8 +1,11 @@
 //! Utilities to make working with directory and file paths easier
 
+use std::slice;
 use std::str::FromStr;
 
-use crate::{DeltaResult, Error, FileMeta, Version};
+use crate::actions::visitors::InCommitTimestampVisitor;
+use crate::engine_data::RowVisitor;
+use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
 use url::Url;
@@ -215,6 +218,46 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     }
 }
 
+impl ParsedLogPath<FileMeta> {
+    /// Extract the In-Commit Timestamp from the CommitInfo action in this commit log file.
+    /// This is a utility function that can be used by multiple parts of the codebase
+    /// (snapshot, CDF, time travel, etc.).
+    ///
+    /// Returns the inCommitTimestamp value, or an error if ICT is not found or cannot be read.
+    /// Callers should handle enablement version checks before calling this method.
+    #[internal_api]
+    pub(crate) fn read_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<i64> {
+        // Only works on commit files
+        if !self.is_commit() {
+            return Err(Error::generic(format!(
+                "read_in_commit_timestamp can only be called on commit files, got: {:?}",
+                self.file_type
+            )));
+        }
+
+        let mut action_iter = engine.json_handler().read_json_files(
+            slice::from_ref(&self.location),
+            InCommitTimestampVisitor::schema(),
+            None,
+        )?;
+
+        // Process the actions to find inCommitTimestamp
+        // According to protocol, CommitInfo MUST be the first action when ICT is enabled,
+        // so we can optimize by only reading the first batch
+        match action_iter.next() {
+            Some(Ok(actions)) => {
+                let mut visitor = InCommitTimestampVisitor::default();
+                visitor.visit_rows_of(actions.as_ref())?;
+                visitor
+                    .in_commit_timestamp
+                    .ok_or_else(|| Error::generic("In-Commit Timestamp not found in commit file"))
+            }
+            Some(Err(err)) => Err(err),
+            None => Err(Error::generic("Commit file contains no actions")),
+        }
+    }
+}
+
 impl ParsedLogPath<Url> {
     const DELTA_LOG_DIR: &'static str = "_delta_log/";
 
@@ -306,6 +349,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::engine::sync::SyncEngine;
 
     fn table_log_dir_url() -> Url {
         let path = PathBuf::from("./tests/data/table-with-dv-small/_delta_log/");
@@ -805,5 +849,105 @@ mod tests {
                 path.file_type
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_in_commit_timestamp_success() {
+        use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+        use crate::engine::default::DefaultEngine;
+        use object_store::memory::InMemory;
+        use std::sync::Arc;
+        use test_utils::add_commit;
+
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let table_url = url::Url::parse("memory://test/").unwrap();
+
+        // Create a commit file with ICT using add_commit
+        let commit_content = r#"{"commitInfo":{"timestamp":1000,"inCommitTimestamp":2000},"protocol":{"minReaderVersion":3,"minWriterVersion":7,"writerFeatures":["inCommitTimestamp"]},"metaData":{"id":"test","schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true}]}"}}"#;
+        add_commit(store.as_ref(), 0, commit_content.to_string())
+            .await
+            .unwrap();
+
+        // Create ParsedLogPath for the commit file
+        let commit_path = table_url
+            .join("_delta_log/00000000000000000000.json")
+            .unwrap();
+        let parsed_path = ParsedLogPath::try_from(FileMeta {
+            location: commit_path,
+            last_modified: 0,
+            size: commit_content.len() as u64,
+        })
+        .unwrap()
+        .unwrap();
+
+        // Now actually test reading the timestamp
+        let result = parsed_path.read_in_commit_timestamp(&engine).unwrap();
+        assert_eq!(result, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_read_in_commit_timestamp_missing_ict() {
+        use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+        use crate::engine::default::DefaultEngine;
+        use object_store::memory::InMemory;
+        use std::sync::Arc;
+        use test_utils::add_commit;
+
+        let store = Arc::new(InMemory::new());
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let table_url = url::Url::parse("memory://test/").unwrap();
+
+        // Create a commit file without ICT
+        let commit_content = r#"{"commitInfo":{"timestamp":1000},"protocol":{"minReaderVersion":3,"minWriterVersion":7},"metaData":{"id":"test","schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true}]}"}}"#;
+        add_commit(store.as_ref(), 0, commit_content.to_string())
+            .await
+            .unwrap();
+
+        // Create ParsedLogPath for the commit file
+        let commit_path = table_url
+            .join("_delta_log/00000000000000000000.json")
+            .unwrap();
+        let parsed_path = ParsedLogPath::try_from(FileMeta {
+            location: commit_path,
+            last_modified: 0,
+            size: commit_content.len() as u64,
+        })
+        .unwrap()
+        .unwrap();
+
+        // Should return error when ICT is missing
+        let result = parsed_path.read_in_commit_timestamp(&engine);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("In-Commit Timestamp not found"));
+    }
+
+    #[test]
+    fn test_read_in_commit_timestamp_not_commit_file() {
+        let engine = SyncEngine::new();
+        let table_url = url::Url::try_from("file:///tmp/test_table").unwrap();
+
+        // Create a checkpoint file (not a commit file)
+        let checkpoint_path = table_url
+            .join("_delta_log/00000000000000000000.checkpoint.parquet")
+            .unwrap();
+        let parsed_path = ParsedLogPath::try_from(FileMeta {
+            location: checkpoint_path,
+            last_modified: 0,
+            size: 100,
+        })
+        .unwrap()
+        .unwrap();
+
+        // Should return error for non-commit files
+        let result = parsed_path.read_in_commit_timestamp(&engine);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("read_in_commit_timestamp can only be called on commit files"));
     }
 }
