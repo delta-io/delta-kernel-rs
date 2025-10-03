@@ -1062,4 +1062,166 @@ mod tests {
             .to_string()
             .contains("Invalid version range"));
     }
+
+    #[tokio::test]
+    async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create initial commit
+        let commit0 = vec![
+            json!({
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+        ];
+        commit(store.as_ref(), 0, commit0).await;
+
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
+
+        // Test with empty log tail - should return same snapshot
+        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None)?;
+        assert_eq!(result, base_snapshot);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_try_new_from_latest_commit_preservation() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create commits 0-2
+        let base_commit = vec![
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+        ];
+
+        commit(store.as_ref(), 0, base_commit.clone()).await;
+        commit(
+            store.as_ref(),
+            1,
+            vec![json!({"commitInfo": {"timestamp": 1234}})],
+        )
+        .await;
+        commit(
+            store.as_ref(),
+            2,
+            vec![json!({"commitInfo": {"timestamp": 5678}})],
+        )
+        .await;
+
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+
+        // Verify base snapshot has latest_commit_file at version 1
+        assert_eq!(
+            base_snapshot
+                .log_segment
+                .latest_commit_file
+                .as_ref()
+                .map(|f| f.version),
+            Some(1)
+        );
+
+        // Create log_tail with FileMeta for version 2
+        let commit_2_url = url.join("_delta_log/")?.join("00000000000000000002.json")?;
+        let file_meta = crate::FileMeta {
+            location: commit_2_url,
+            last_modified: 1234567890,
+            size: 100,
+        };
+        let parsed_path = ParsedLogPath::try_from(file_meta)?
+            .ok_or_else(|| Error::Generic("Failed to parse log path".to_string()))?;
+        let log_tail = vec![parsed_path];
+
+        // Create new snapshot from base to version 2 using try_new_from directly
+        let new_snapshot =
+            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2))?;
+
+        // Latest commit should now be version 2
+        assert_eq!(
+            new_snapshot
+                .log_segment
+                .latest_commit_file
+                .as_ref()
+                .map(|f| f.version),
+            Some(2)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create commits
+        let base_commit = vec![
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+        ];
+
+        commit(store.as_ref(), 0, base_commit).await;
+        commit(
+            store.as_ref(),
+            1,
+            vec![json!({"commitInfo": {"timestamp": 1234}})],
+        )
+        .await;
+
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+
+        // Test requesting same version - should return same snapshot
+        let same_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1))?;
+        assert!(Arc::ptr_eq(&same_version, &base_snapshot));
+
+        // Test requesting older version - should error
+        let older_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0));
+        assert!(matches!(
+            older_version,
+            Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")
+        ));
+
+        Ok(())
+    }
 }

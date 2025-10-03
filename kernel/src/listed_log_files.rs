@@ -237,6 +237,7 @@ impl ListedLogFiles {
             list_log_files(storage, log_root, log_tail, start_version, end_version)?
                 .filter_ok(|log_file| log_file.is_commit())
                 .try_collect()?;
+        // .last() on a slice is an O(1) operation
         let latest_commit_file = listed_commits.last().cloned();
         ListedLogFiles::try_new(listed_commits, vec![], vec![], None, latest_commit_file)
     }
@@ -261,6 +262,7 @@ impl ListedLogFiles {
             let mut checkpoint_parts = vec![];
             let mut latest_crc_file: Option<ParsedLogPath> = None;
             let mut latest_commit_file: Option<ParsedLogPath> = None;
+            let mut found_checkpoint = false;
 
             // Group log files by version
             let log_files_per_version = iter.chunk_by(|x| x.version);
@@ -300,6 +302,7 @@ impl ListedLogFiles {
                     .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
                 {
                     checkpoint_parts = complete_checkpoint;
+                    found_checkpoint = true;
                     // Update latest_commit_file if there's a commit at the same version as the checkpoint, otherwise set to None
                     // Since ascending_commit_files is sorted, the last element is the latest commit would be the same version as the checkpoint
                     latest_commit_file = ascending_commit_files
@@ -311,10 +314,10 @@ impl ListedLogFiles {
                 }
             }
 
-            // If ascending_commit_files is non-empty, set latest_commit_file to the last element
-            // This captures the latest commit file that is not part of a checkpoint
-            if let Some(commit_file) = ascending_commit_files.last() {
-                latest_commit_file = Some(commit_file.clone());
+            // If no checkpoint was found and ascending_commit_files is non-empty, set latest_commit_file to the last element
+            // This captures the latest commit file when there is no checkpoint
+            if !found_checkpoint {
+                latest_commit_file = ascending_commit_files.last().cloned();
             }
 
             ListedLogFiles::try_new(
