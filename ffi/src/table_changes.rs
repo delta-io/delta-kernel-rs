@@ -31,7 +31,7 @@ pub struct ExclusiveTableChanges;
 /// Get the table changes from the specified table at a specific version
 ///
 /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
-/// - `engine`: Implementation of [`Engine`] apis.
+/// - `engine`: Implementation of `Engine` apis.
 /// - `start_version`: The start version of the change data feed
 ///   End version will be the newest table version.
 ///
@@ -52,7 +52,7 @@ pub unsafe extern "C" fn table_changes_from_version(
 /// Get the table changes from the specified table between two versions
 ///
 /// - `table_root`: url pointing at the table root (where `_delta_log` folder is located)
-/// - `engine`: Implementation of [`Engine`] apis.
+/// - `engine`: Implementation of `Engine` apis.
 /// - `start_version`: The start version of the change data feed
 /// - `end_version`: The end version (inclusive) of the change data feed.
 ///
@@ -284,7 +284,7 @@ fn table_changes_scan_execute_impl(
 ///
 /// Drops table changes iterator.
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
-/// [`scan_table_changes_execute`].
+/// [`table_changes_scan_execute`].
 #[no_mangle]
 pub unsafe extern "C" fn free_scan_table_changes_iter(
     data: Handle<SharedScanTableChangesIterator>,
