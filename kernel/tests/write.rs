@@ -29,7 +29,9 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType, UNSHREDDED_VARIANT_SCHEMA};
+use delta_kernel::schema::{
+    DataType, SchemaRef, StructField, StructType, UNSHREDDED_VARIANT_SCHEMA,
+};
 
 use test_utils::{
     assert_result_error_with_message, create_table, engine_store_setup, setup_test_tables,

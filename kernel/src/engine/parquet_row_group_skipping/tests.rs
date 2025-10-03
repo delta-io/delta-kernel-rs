@@ -215,10 +215,7 @@ fn test_get_stat_values() {
     // Read a random column as Variant. The actual read does not need to be performed, as stats on
     // Variant should always return None.
     assert_eq!(
-        filter.get_min_stat(
-            &column_name!("chrono.date32"),
-            &UNSHREDDED_VARIANT_SCHEMA,
-        ),
+        filter.get_min_stat(&column_name!("chrono.date32"), &UNSHREDDED_VARIANT_SCHEMA,),
         None
     );
 
@@ -397,10 +394,7 @@ fn test_get_stat_values() {
     // Read a random column as Variant. The actual read does not need to be performed, as stats on
     // Variant should always return None.
     assert_eq!(
-        filter.get_max_stat(
-            &column_name!("chrono.date32"),
-            &UNSHREDDED_VARIANT_SCHEMA,
-        ),
+        filter.get_max_stat(&column_name!("chrono.date32"), &UNSHREDDED_VARIANT_SCHEMA,),
         None
     );
 
