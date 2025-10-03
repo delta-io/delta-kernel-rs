@@ -29,7 +29,7 @@ use serde_json::json;
 use serde_json::Deserializer;
 use tempfile::tempdir;
 
-use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
+use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType, UNSHREDDED_VARIANT_SCHEMA};
 
 use test_utils::{
     assert_result_error_with_message, create_table, engine_store_setup, setup_test_tables,
@@ -951,7 +951,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let value_nested_v_array = Arc::new(BinaryArray::from(value_nested_v)) as ArrayRef;
     let metadata_nested_v_array = Arc::new(BinaryArray::from(metadata_nested_v)) as ArrayRef;
 
-    let variant_arrow = ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap();
+    let variant_arrow = ArrowDataType::try_from_kernel(&UNSHREDDED_VARIANT_SCHEMA).unwrap();
     let variant_arrow_flipped = variant_arrow_type_flipped();
 
     let i_values = vec![31, 32, 33];
@@ -1064,7 +1064,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         Some(null_bitmap),
     )?);
     let variant_arrow_type: ArrowDataType =
-        ArrowDataType::try_from_kernel(&DataType::unshredded_variant()).unwrap();
+        ArrowDataType::try_from_kernel(&UNSHREDDED_VARIANT_SCHEMA).unwrap();
     let expected_data = RecordBatch::try_new(
         Arc::new(expected_schema.as_ref().try_into_arrow()?),
         vec![

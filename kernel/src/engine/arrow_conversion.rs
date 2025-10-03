@@ -12,6 +12,7 @@ use itertools::Itertools;
 use crate::error::Error;
 use crate::schema::{
     ArrayType, DataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
+    UNSHREDDED_VARIANT_SCHEMA,
 };
 
 pub(crate) const LIST_ARRAY_ROOT: &str = "element";
@@ -162,7 +163,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
                 false,
             )),
             DataType::Variant(s) => {
-                if *t == DataType::unshredded_variant() {
+                if *t == *UNSHREDDED_VARIANT_SCHEMA {
                     Ok(ArrowDataType::Struct(
                         s.fields()
                             .map(TryIntoArrow::try_into_arrow)
@@ -326,11 +327,10 @@ mod tests {
 
     #[test]
     fn test_variant_shredded_type_fail() -> DeltaResult<()> {
-        let unshredded_variant = DataType::unshredded_variant();
-        let unshredded_variant_arrow = ArrowDataType::try_from_kernel(&unshredded_variant)?;
+        let unshredded_variant_arrow = ArrowDataType::try_from_kernel(&UNSHREDDED_VARIANT_SCHEMA)?;
         assert!(unshredded_variant_arrow == unshredded_variant_arrow_type());
         let shredded_variant = DataType::variant_type([
-            StructField::nullable("metadata", DataType::BINARY),
+            StructField::not_null("metadata", DataType::BINARY),
             StructField::nullable("value", DataType::BINARY),
             StructField::nullable("typed_value", DataType::INTEGER),
         ])?;

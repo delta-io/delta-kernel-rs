@@ -45,14 +45,14 @@ pub(crate) fn validate_variant_type_feature_support(
 mod tests {
     use super::*;
     use crate::actions::Protocol;
-    use crate::schema::{DataType, StructField, StructType};
+    use crate::schema::{DataType, StructField, StructType, UNSHREDDED_VARIANT_SCHEMA};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
     fn test_is_unshredded_variant() {
         fn is_unshredded_variant(s: &DataType) -> bool {
-            s == &DataType::unshredded_variant()
+            *s == *UNSHREDDED_VARIANT_SCHEMA
         }
         assert!(!is_unshredded_variant(
             &DataType::variant_type([

@@ -2,6 +2,7 @@ use super::*;
 use crate::expressions::{column_name, column_pred};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
+use crate::schema::UNSHREDDED_VARIANT_SCHEMA;
 use crate::Predicate;
 use std::fs::File;
 
@@ -216,7 +217,7 @@ fn test_get_stat_values() {
     assert_eq!(
         filter.get_min_stat(
             &column_name!("chrono.date32"),
-            &DataType::unshredded_variant()
+            &UNSHREDDED_VARIANT_SCHEMA,
         ),
         None
     );
@@ -398,7 +399,7 @@ fn test_get_stat_values() {
     assert_eq!(
         filter.get_max_stat(
             &column_name!("chrono.date32"),
-            &DataType::unshredded_variant()
+            &UNSHREDDED_VARIANT_SCHEMA,
         ),
         None
     );

@@ -1324,6 +1324,15 @@ impl From<SchemaRef> for DataType {
     }
 }
 
+/// A static reference to the canonical unshredded variant schema. Equivalent to
+/// [`DataType::unshredded_variant()`], but static.
+pub static UNSHREDDED_VARIANT_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+    DataType::Variant(Box::new(StructType::new_unchecked([
+        StructField::not_null("metadata", DataType::BINARY),
+        StructField::not_null("value", DataType::BINARY),
+    ])))
+});
+
 /// cbindgen:ignore
 impl DataType {
     pub const STRING: Self = DataType::Primitive(PrimitiveType::String);
@@ -1361,13 +1370,13 @@ impl DataType {
         StructType::new_unchecked(fields).into()
     }
 
-    /// Create a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
+    /// Creates a new unshredded [`DataType::Variant`]. This data type is a struct of two not-null
     /// binary fields: `metadata` and `value`.
+    ///
+    /// NOTE: Callers who only need a borrowed reference can avoid allocations by using
+    /// [`UNSHREDDED_VARIANT_SCHEMA`] instead.
     pub fn unshredded_variant() -> Self {
-        DataType::Variant(Box::new(StructType::new_unchecked([
-            StructField::not_null("metadata", DataType::BINARY),
-            StructField::not_null("value", DataType::BINARY),
-        ])))
+        UNSHREDDED_VARIANT_SCHEMA.clone()
     }
 
     /// Create a new [`DataType::Variant`] from the provided fields. For unshredded variants, you
@@ -1822,7 +1831,7 @@ mod tests {
         }
         "#;
         let field: StructField = serde_json::from_str(data).unwrap();
-        assert_eq!(field.data_type, DataType::unshredded_variant());
+        assert_eq!(field.data_type, *UNSHREDDED_VARIANT_SCHEMA);
 
         let json_str = serde_json::to_string(&field).unwrap();
         assert_eq!(

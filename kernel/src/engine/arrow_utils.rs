@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
-use crate::schema::{ColumnMetadataKey, MetadataValue};
+use crate::schema::{ColumnMetadataKey, MetadataValue, UNSHREDDED_VARIANT_SCHEMA};
 use crate::{
     engine::arrow_data::ArrowEngineData,
     schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
@@ -429,7 +429,7 @@ fn get_indices(
         {
             // If the field is a variant, make sure the parquet schema matches the unshredded variant
             // representation. This is to ensure that shredded reads are not performed.
-            if requested_field.data_type == DataType::unshredded_variant() {
+            if requested_field.data_type == *UNSHREDDED_VARIANT_SCHEMA {
                 validate_parquet_variant(field)?;
             }
             match field.data_type() {
