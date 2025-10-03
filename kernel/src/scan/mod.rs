@@ -1513,6 +1513,7 @@ mod tests {
             &[], // No partition columns
             ColumnMappingMode::None,
             None, // No predicate
+            RegularFieldClassifier,
         )
         .unwrap();
 
@@ -1541,6 +1542,7 @@ mod tests {
             &["date".to_string()], // date is a partition column
             ColumnMappingMode::None,
             None,
+            RegularFieldClassifier,
         )
         .unwrap();
 
@@ -1581,6 +1583,7 @@ mod tests {
             &["part1".to_string(), "part2".to_string()],
             ColumnMappingMode::None,
             None,
+            RegularFieldClassifier,
         )
         .unwrap();
 
@@ -1632,6 +1635,7 @@ mod tests {
             &[],
             ColumnMappingMode::None,
             Some(predicate),
+            RegularFieldClassifier,
         )
         .unwrap();
 
@@ -1659,6 +1663,7 @@ mod tests {
             &["date".to_string()],
             ColumnMappingMode::None,
             None,
+            RegularFieldClassifier,
         )
         .unwrap();
 
