@@ -58,6 +58,9 @@ pub(crate) struct LogSegment {
     pub checkpoint_parts: Vec<ParsedLogPath>,
     /// Latest CRC (checksum) file
     pub latest_crc_file: Option<ParsedLogPath>,
+    /// The latest commit file found during listing, which may not be part of the
+    /// contiguous segment but is needed for ICT timestamp reading
+    pub latest_commit_file: Option<ParsedLogPath>,
 }
 
 impl LogSegment {
@@ -72,6 +75,7 @@ impl LogSegment {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
+            latest_commit_file,
         } = listed_files;
 
         // Ensure commit file versions are contiguous
@@ -127,6 +131,7 @@ impl LogSegment {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
+            latest_commit_file,
         })
     }
 
