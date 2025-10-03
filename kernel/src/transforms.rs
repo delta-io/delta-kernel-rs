@@ -13,6 +13,7 @@ use crate::expressions::{Expression, ExpressionRef, Scalar, Transform};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::{DeltaResult, Error};
 
+// TODO(#1337): Remove ColumnType when CDF is unified with StateInfo pattern
 /// Categorizes columns in a scan based on their data source and processing requirements.
 ///
 /// This enum determines how each column in the logical schema maps to the physical data
@@ -200,6 +201,7 @@ pub(crate) fn get_transform_expr(
     Ok(Arc::new(Expression::Transform(transform)))
 }
 
+// TODO(#1337): Remove get_transform_spec when CDF is unified with StateInfo pattern
 /// Generate a transform specification that describes how to convert physical data to logical schema.
 ///
 /// The transform spec captures only the fields that need to be added, replaced, or reordered.

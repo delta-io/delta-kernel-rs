@@ -253,7 +253,7 @@ mod tests {
     use itertools::Itertools;
 
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};
-    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
@@ -269,7 +269,7 @@ mod tests {
         let mut mock_table = LocalMockTable::new();
 
         let dv_info = DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
             offset: Some(1),
             size_in_bytes: 36,
@@ -292,7 +292,7 @@ mod tests {
         };
 
         let rm_dv = DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
             offset: Some(1),
             size_in_bytes: 38,
