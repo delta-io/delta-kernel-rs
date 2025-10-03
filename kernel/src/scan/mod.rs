@@ -734,7 +734,23 @@ pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
+/// Trait for classifying fields during StateInfo construction.
+/// Allows different scan types (regular, CDF) to customize field handling.
+pub(crate) trait FieldClassifier {
+    /// Classify a field and return its transform spec.
+    /// Returns None if the field is physical (should be read from parquet).
+    /// Returns Some(spec) if the field needs transformation (partition, metadata-derived, or dynamic).
+    fn classify_field(
+        &self,
+        field: &StructField,
+        field_index: usize,
+        partition_columns: &[String],
+        last_physical_field: &Option<String>,
+    ) -> Option<FieldTransformSpec>;
+}
+
 /// All the state needed to process a scan.
+#[derive(Debug)]
 pub(crate) struct StateInfo {
     /// The logical schema for this scan
     pub(crate) logical_schema: SchemaRef,
@@ -747,17 +763,20 @@ pub(crate) struct StateInfo {
 }
 
 impl StateInfo {
+    /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
     /// `partition_columns` - List of column names that are partition columns in the table
     /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
     /// `predicate` - Optional predicate to filter data during the scan
-    pub(crate) fn try_new(
+    /// `classifier` - The classifier to use for different scan types
+    pub(crate) fn try_new_with_classifier<C: FieldClassifier>(
         logical_schema: SchemaRef,
         partition_columns: &[String],
         column_mapping_mode: ColumnMappingMode,
         predicate: Option<PredicateRef>,
+        classifier: C,
     ) -> DeltaResult<Self> {
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
@@ -766,21 +785,29 @@ impl StateInfo {
 
         // Loop over all selected fields and build both the physical schema and transform spec
         for (index, logical_field) in logical_schema.fields().enumerate() {
-            if partition_columns.contains(logical_field.name()) {
-                if logical_field.is_metadata_column() {
+            let transform = classifier.classify_field(
+                logical_field,
+                index,
+                partition_columns,
+                &last_physical_field,
+            );
+
+            if let Some(spec) = transform {
+                // Field needs transformation - not in physical schema
+                transform_spec.push(spec);
+            } else {
+                // Physical field - should be read from parquet
+                // Validate metadata column doesn't conflict with partition columns
+                if logical_field.is_metadata_column()
+                    && partition_columns.contains(logical_field.name())
+                {
                     return Err(Error::Schema(format!(
                         "Metadata column names must not match partition columns: {}",
                         logical_field.name()
                     )));
                 }
 
-                // Partition column: needs to be injected via transform
-                transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
-                    field_index: index,
-                    insert_after: last_physical_field.clone(),
-                });
-            } else {
-                // Regular field: add to physical schema
+                // Add to physical schema
                 let physical_field = logical_field.make_physical(column_mapping_mode);
                 debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                 let physical_name = physical_field.name.clone();
@@ -794,7 +821,7 @@ impl StateInfo {
             }
         }
 
-        // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
+        // Validate metadata columns don't conflict with physical columns
         for metadata_column in logical_schema.metadata_columns() {
             if read_field_names.contains(metadata_column.name()) {
                 return Err(Error::Schema(format!(
@@ -824,6 +851,46 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
         })
+    }
+
+    /// Get the state needed to process a scan.
+    pub(crate) fn try_new(
+        logical_schema: SchemaRef,
+        partition_columns: &[String],
+        column_mapping_mode: ColumnMappingMode,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Self> {
+        // Use the default classifier for regular scans
+        struct RegularFieldClassifier;
+
+        impl FieldClassifier for RegularFieldClassifier {
+            fn classify_field(
+                &self,
+                field: &StructField,
+                field_index: usize,
+                partition_columns: &[String],
+                last_physical_field: &Option<String>,
+            ) -> Option<FieldTransformSpec> {
+                if partition_columns.contains(field.name()) {
+                    // Partition column: needs transform to inject metadata
+                    Some(FieldTransformSpec::MetadataDerivedColumn {
+                        field_index,
+                        insert_after: last_physical_field.clone(),
+                    })
+                } else {
+                    // Regular physical field - no transform needed
+                    None
+                }
+            }
+        }
+
+        Self::try_new_with_classifier(
+            logical_schema,
+            partition_columns,
+            column_mapping_mode,
+            predicate,
+            RegularFieldClassifier,
+        )
     }
 }
 

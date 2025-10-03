@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::expressions::Scalar;
+use crate::scan::StateInfo;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
-use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::{DeltaResult, Error, ExpressionRef};
 
 use super::scan_file::{CdfScanFile, CdfScanFileType};
@@ -78,19 +79,29 @@ pub(crate) fn scan_file_physical_schema(
 // and adding cdf values to the partition_values map
 pub(crate) fn get_cdf_transform_expr(
     scan_file: &CdfScanFile,
-    logical_schema: &SchemaRef,
-    transform_spec: &TransformSpec,
+    state_info: &StateInfo,
     physical_schema: &StructType,
 ) -> DeltaResult<ExpressionRef> {
     let mut partition_values = HashMap::new();
 
+    // Get the transform spec from StateInfo (if present)
+    let empty_spec = Vec::new();
+    let transform_spec = state_info
+        .transform_spec
+        .as_ref()
+        .map(|ts| ts.as_ref())
+        .unwrap_or(&empty_spec);
+
     // Handle regular partition values using parse_partition_values
-    let parsed_values =
-        parse_partition_values(logical_schema, transform_spec, &scan_file.partition_values)?;
+    let parsed_values = parse_partition_values(
+        &state_info.logical_schema,
+        transform_spec,
+        &scan_file.partition_values,
+    )?;
     partition_values.extend(parsed_values);
 
     // Handle CDF metadata columns
-    let cdf_values = get_cdf_columns(logical_schema, scan_file)?;
+    let cdf_values = get_cdf_columns(&state_info.logical_schema, scan_file)?;
     partition_values.extend(cdf_values);
 
     get_transform_expr(transform_spec, partition_values, physical_schema)
@@ -101,6 +112,7 @@ mod tests {
     use super::*;
     use crate::expressions::Expression;
     use crate::scan::state::DvInfo;
+    use crate::scan::{PhysicalPredicate, StateInfo};
     use crate::schema::{DataType, StructField, StructType};
     use crate::transforms::FieldTransformSpec;
     use std::collections::HashMap;
@@ -140,6 +152,20 @@ mod tests {
         }
     }
 
+    // Helper to create StateInfo with a custom transform spec for tests
+    fn create_test_state_info(
+        logical_schema: SchemaRef,
+        transform_spec: Vec<FieldTransformSpec>,
+    ) -> StateInfo {
+        let physical_schema = create_test_physical_schema();
+        StateInfo {
+            logical_schema,
+            physical_schema: physical_schema.into(),
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: Some(Arc::new(transform_spec)),
+        }
+    }
+
     #[test]
     fn test_get_cdf_transform_expr_add_file_with_cdf_metadata() {
         // Add files need _change_type metadata injected
@@ -161,12 +187,9 @@ mod tests {
             },
         ];
 
-        let result = get_cdf_transform_expr(
-            &scan_file,
-            &logical_schema,
-            &transform_spec,
-            &physical_schema,
-        );
+        let state_info = create_test_state_info(logical_schema, transform_spec);
+
+        let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
         assert!(result.is_ok());
 
         let expr = result.unwrap();
@@ -208,12 +231,9 @@ mod tests {
             insert_after: Some("name".to_string()),
         }];
 
-        let result = get_cdf_transform_expr(
-            &scan_file,
-            &logical_schema,
-            &transform_spec,
-            &physical_schema,
-        );
+        let state_info = create_test_state_info(logical_schema, transform_spec);
+
+        let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
         assert!(result.is_ok());
 
         let expr = result.unwrap();
@@ -258,12 +278,9 @@ mod tests {
             },
         ];
 
-        let result = get_cdf_transform_expr(
-            &scan_file,
-            &logical_schema,
-            &transform_spec,
-            &physical_schema,
-        );
+        let state_info = create_test_state_info(logical_schema, transform_spec);
+
+        let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
         assert!(result.is_ok());
 
         let expr = result.unwrap();
