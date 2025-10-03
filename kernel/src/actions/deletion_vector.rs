@@ -1,22 +1,67 @@
 //! Code relating to parsing and using deletion vectors
 
 use std::io::{Cursor, Read};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use delta_kernel::schema::derive_macro_utils::ToDataType;
+use delta_kernel_derive::ToSchema;
 use roaring::RoaringTreemap;
 use url::Url;
 
-use delta_kernel_derive::ToSchema;
-
+use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub enum DeletionVectorStorageType {
+    #[cfg_attr(test, serde(rename = "u"))]
+    PersistedRelative,
+    #[cfg_attr(test, serde(rename = "i"))]
+    Inline,
+    #[cfg_attr(test, serde(rename = "p"))]
+    PersistedAbsolute,
+}
+
+impl FromStr for DeletionVectorStorageType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> DeltaResult<Self> {
+        match s {
+            "u" => Ok(Self::PersistedRelative),
+            "i" => Ok(Self::Inline),
+            "p" => Ok(Self::PersistedAbsolute),
+            _ => Err(Error::internal_error(format!(
+                "Unsupported deletion vector format option: {}",
+                s
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for DeletionVectorStorageType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeletionVectorStorageType::PersistedRelative => write!(f, "u"),
+            DeletionVectorStorageType::Inline => write!(f, "i"),
+            DeletionVectorStorageType::PersistedAbsolute => write!(f, "p"),
+        }
+    }
+}
+
+impl ToDataType for DeletionVectorStorageType {
+    fn to_data_type() -> DataType {
+        DataType::STRING
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(test, derive(serde::Serialize), serde(rename_all = "camelCase"))]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
-    pub storage_type: String,
+    pub storage_type: DeletionVectorStorageType,
 
     /// Three format options are currently proposed:
     /// - If `storageType = 'u'` then `<random prefix - optional><base85 encoded uuid>`:
@@ -47,7 +92,11 @@ pub struct DeletionVectorDescriptor {
 
 impl DeletionVectorDescriptor {
     pub fn unique_id(&self) -> String {
-        Self::unique_id_from_parts(&self.storage_type, &self.path_or_inline_dv, self.offset)
+        Self::unique_id_from_parts(
+            &self.storage_type.to_string(),
+            &self.path_or_inline_dv,
+            self.offset,
+        )
     }
     pub(crate) fn unique_id_from_parts(
         storage_type: &str,
@@ -61,8 +110,8 @@ impl DeletionVectorDescriptor {
     }
 
     pub fn absolute_path(&self, parent: &Url) -> DeltaResult<Option<Url>> {
-        match self.storage_type.as_str() {
-            "u" => {
+        match self.storage_type {
+            DeletionVectorStorageType::PersistedRelative => {
                 let path_len = self.path_or_inline_dv.len();
                 require!(
                     path_len >= 20,
@@ -86,13 +135,12 @@ impl DeletionVectorDescriptor {
                     .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
                 Ok(Some(dv_path))
             }
-            "p" => Ok(Some(Url::parse(&self.path_or_inline_dv).map_err(|_| {
-                Error::DeletionVector(format!("invalid path: {}", self.path_or_inline_dv))
-            })?)),
-            "i" => Ok(None),
-            other => Err(Error::DeletionVector(format!(
-                "Unknown storage format: '{other}'."
-            ))),
+            DeletionVectorStorageType::PersistedAbsolute => {
+                Ok(Some(Url::parse(&self.path_or_inline_dv).map_err(|_| {
+                    Error::DeletionVector(format!("invalid path: {}", self.path_or_inline_dv))
+                })?))
+            }
+            DeletionVectorStorageType::Inline => Ok(None),
         }
     }
 
@@ -295,7 +343,7 @@ mod tests {
 
     fn dv_relative() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "ab^-aqEH.-t@S}K{vb[*k^".to_string(),
             offset: Some(4),
             size_in_bytes: 40,
@@ -305,7 +353,7 @@ mod tests {
 
     fn dv_absolute() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
-            storage_type: "p".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedAbsolute,
             path_or_inline_dv:
                 "s3://mytable/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin".to_string(),
             offset: Some(4),
@@ -316,7 +364,7 @@ mod tests {
 
     fn dv_inline() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
-            storage_type: "i".to_string(),
+            storage_type: DeletionVectorStorageType::Inline,
             path_or_inline_dv: "^Bg9^0rr910000000000iXQKl0rr91000f55c8Xg0@@D72lkbi5=-{L"
                 .to_string(),
             offset: None,
@@ -327,7 +375,7 @@ mod tests {
 
     fn dv_example() -> DeletionVectorDescriptor {
         DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
             offset: Some(1),
             size_in_bytes: 36,
@@ -452,5 +500,66 @@ mod tests {
 
         assert_eq!(row_idx.len(), 6);
         assert_eq!(&row_idx, &[3, 4, 7, 11, 18, 29]);
+    }
+
+    #[test]
+    fn test_deletion_vector_storage_type_from_str_valid() {
+        // Test valid single character codes
+        assert_eq!(
+            "u".parse::<DeletionVectorStorageType>().unwrap(),
+            DeletionVectorStorageType::PersistedRelative
+        );
+        assert_eq!(
+            "i".parse::<DeletionVectorStorageType>().unwrap(),
+            DeletionVectorStorageType::Inline
+        );
+        assert_eq!(
+            "p".parse::<DeletionVectorStorageType>().unwrap(),
+            DeletionVectorStorageType::PersistedAbsolute
+        );
+    }
+
+    #[test]
+    fn test_deletion_vector_storage_type_from_str_invalid() {
+        // Test invalid codes return errors
+        assert!("x".parse::<DeletionVectorStorageType>().is_err());
+        assert!("U".parse::<DeletionVectorStorageType>().is_err());
+        assert!("I".parse::<DeletionVectorStorageType>().is_err());
+        assert!("P".parse::<DeletionVectorStorageType>().is_err());
+        assert!("".parse::<DeletionVectorStorageType>().is_err());
+        assert!("invalid".parse::<DeletionVectorStorageType>().is_err());
+        assert!("PersistedRelative"
+            .parse::<DeletionVectorStorageType>()
+            .is_err());
+        assert!("Inline".parse::<DeletionVectorStorageType>().is_err());
+        assert!("PersistedAbsolute"
+            .parse::<DeletionVectorStorageType>()
+            .is_err());
+    }
+
+    #[test]
+    fn test_deletion_vector_storage_type_from_str_error_message() {
+        // Test that error messages contain the invalid input
+        let result = "invalid".parse::<DeletionVectorStorageType>();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("invalid"));
+        assert!(error_msg.contains("Unsupported deletion vector format option"));
+    }
+
+    #[test]
+    fn test_deletion_vector_storage_type_roundtrip() {
+        // Test that Display -> FromStr roundtrip works
+        let variants = [
+            DeletionVectorStorageType::PersistedRelative,
+            DeletionVectorStorageType::Inline,
+            DeletionVectorStorageType::PersistedAbsolute,
+        ];
+
+        for variant in variants {
+            let string_repr = variant.to_string();
+            let parsed = string_repr.parse::<DeletionVectorStorageType>().unwrap();
+            assert_eq!(variant, parsed);
+        }
     }
 }
