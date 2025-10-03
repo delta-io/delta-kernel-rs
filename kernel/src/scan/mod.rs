@@ -751,6 +751,11 @@ pub(crate) struct StateInfo {
 
 impl StateInfo {
     /// Get the state needed to process a scan.
+    ///
+    /// `logical_schema` - The logical schema of the scan output, which includes partition columns
+    /// `partition_columns` - List of column names that are partition columns in the table
+    /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
+    /// `predicate` - Optional predicate to filter data during the scan
     pub(crate) fn try_new(
         logical_schema: SchemaRef,
         partition_columns: &[String],
@@ -953,7 +958,7 @@ pub(crate) mod test_utils {
             .unwrap_or_else(|| Arc::new(crate::schema::StructType::new_unchecked(vec![])));
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
-            physical_schema: logical_schema.clone(),
+            physical_schema: logical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec,
         });
