@@ -430,6 +430,7 @@ impl RowVisitor for SidecarVisitor {
 /// included to only retain the domain metadata for a specific domain (in order to bound memory
 /// requirements).
 #[derive(Debug, Default)]
+#[internal_api]
 pub(crate) struct DomainMetadataVisitor {
     domain_metadatas: DomainMetadataMap,
     domain_filter: Option<String>,
@@ -444,6 +445,7 @@ impl DomainMetadataVisitor {
         }
     }
 
+    #[internal_api]
     pub(crate) fn visit_domain_metadata<'a>(
         row_index: usize,
         domain: String,
