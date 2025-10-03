@@ -426,7 +426,7 @@ mod tests {
         remove_mock: Option<&'a MockGetData>,
     ) -> Vec<&'a dyn GetData<'a>> {
         use std::sync::LazyLock;
-        static EMPTY: LazyLock<MockGetData> = LazyLock::new(|| MockGetData::new());
+        static EMPTY: LazyLock<MockGetData> = LazyLock::new(MockGetData::new);
 
         let empty_ref = &*EMPTY;
         vec![
