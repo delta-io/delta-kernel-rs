@@ -297,7 +297,7 @@ impl Transaction {
     ///
     /// This function may perform an expensive log replay operation if there are any domain removals.
     /// The log replay is required to fetch the previous configuration value for the domain to preserve
-    /// in removal tombstones.
+    /// in removal tombstones as mandated by the Delta spec.
     fn generate_domain_metadata_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
