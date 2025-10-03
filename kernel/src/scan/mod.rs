@@ -29,6 +29,7 @@ use crate::schema::{
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
+use crate::transforms::{FieldTransformSpec, TransformSpec};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
@@ -116,23 +117,15 @@ impl ScanBuilder {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
         let state_info = StateInfo::try_new(
-            logical_schema.as_ref(),
-            &self.snapshot.metadata().partition_columns,
+            logical_schema,
+            self.snapshot.metadata().partition_columns(),
             self.snapshot.table_configuration().column_mapping_mode(),
+            self.predicate,
         )?;
-
-        let physical_predicate = match self.predicate {
-            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
-            None => PhysicalPredicate::None,
-        };
 
         Ok(Scan {
             snapshot: self.snapshot,
-            logical_schema,
-            physical_schema: Arc::new(StructType::try_new(state_info.read_fields)?),
-            physical_predicate,
-            all_fields: Arc::new(state_info.all_fields),
-            have_partition_cols: state_info.have_partition_cols,
+            state_info: Arc::new(state_info),
         })
     }
 }
@@ -307,21 +300,6 @@ impl ScanResult {
     }
 }
 
-/// Scan uses this to set up what kinds of top-level columns it is scanning. For `Selected` we just
-/// store the name of the column, as that's all that's needed during the actual query. For
-/// `Partition` we store an index into the logical schema for this query since later we need the
-/// data type as well to materialize the partition column.
-#[derive(PartialEq, Debug)]
-pub(crate) enum ColumnType {
-    // A column, selected from the data, as is
-    Selected(String),
-    // A partition column that needs to be added back in
-    Partition(usize),
-}
-
-/// A list of field transforms that describes a transform expression to be created at scan time.
-type TransformSpec = Vec<FieldTransformSpec>;
-
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row
@@ -330,40 +308,6 @@ pub fn get_transform_for_row(
     transforms: &[Option<ExpressionRef>],
 ) -> Option<ExpressionRef> {
     transforms.get(row).cloned().flatten()
-}
-
-/// Transforms aren't computed all at once. So static ones can just go straight to `Expression`, but
-/// things like partition columns need to filled in. This enum holds an expression that's part of a
-/// [`TransformSpec`].
-pub(crate) enum FieldTransformSpec {
-    /// Insert the given expression after the named input column (None = prepend instead)
-    // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
-    // which would usually be expressed as a drop+insert pair of transforms.
-    #[allow(unused)]
-    StaticInsert {
-        insert_after: Option<String>,
-        expr: ExpressionRef,
-    },
-    /// Replace the named input column with an expression
-    // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
-    // to compute non-materialized row ids and row commit versions.
-    #[allow(unused)]
-    StaticReplace {
-        field_name: String,
-        expr: ExpressionRef,
-    },
-    /// Drops the named input column
-    // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
-    // they should not appear in the query's output.
-    #[allow(unused)]
-    StaticDrop { field_name: String },
-    /// Inserts a partition column after the named input column. The partition column is identified
-    /// by its field index in the logical table schema (the column is not present in the physical
-    /// read schema). Its value varies from file to file and is obtained from file metadata.
-    PartitionColumn {
-        field_index: usize,
-        insert_after: Option<String>,
-    },
 }
 
 /// [`ScanMetadata`] contains (1) a batch of [`FilteredEngineData`] specifying data files to be scanned
@@ -389,24 +333,21 @@ pub struct ScanMetadata {
 }
 
 impl ScanMetadata {
-    fn new(
+    fn try_new(
         data: Box<dyn EngineData>,
         selection_vector: Vec<bool>,
         scan_file_transforms: Vec<Option<ExpressionRef>>,
-    ) -> Self {
-        Self {
-            scan_files: FilteredEngineData {
-                data,
-                selection_vector,
-            },
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            scan_files: FilteredEngineData::try_new(data, selection_vector)?,
             scan_file_transforms,
-        }
+        })
     }
 }
 
 impl HasSelectionVector for ScanMetadata {
     fn has_selected_rows(&self) -> bool {
-        self.scan_files.selection_vector.contains(&true)
+        self.scan_files.selection_vector().contains(&true)
     }
 }
 
@@ -414,18 +355,14 @@ impl HasSelectionVector for ScanMetadata {
 /// scanning the table.
 pub struct Scan {
     snapshot: SnapshotRef,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    physical_predicate: PhysicalPredicate,
-    all_fields: Arc<Vec<ColumnType>>,
-    have_partition_cols: bool,
+    state_info: Arc<StateInfo>,
 }
 
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", &self.logical_schema)
-            .field("predicate", &self.physical_predicate)
+            .field("schema", &self.state_info.logical_schema)
+            .field("predicate", &self.state_info.physical_predicate)
             .finish()
     }
 }
@@ -454,7 +391,7 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
+        &self.state_info.logical_schema
     }
 
     /// Get a shared reference to the physical [`Schema`] of the scan. This represents the schema
@@ -462,45 +399,16 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn physical_schema(&self) -> &SchemaRef {
-        &self.physical_schema
+        &self.state_info.physical_schema
     }
 
     /// Get the predicate [`PredicateRef`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
-        if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
+        if let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate {
             Some(predicate.clone())
         } else {
             None
         }
-    }
-
-    /// Computes the transform spec for this scan. Static (query-level) transforms can already be
-    /// turned into expressions now, but file-level transforms like partition values can only be
-    /// described now; they are converted to expressions during the scan, using file metadata.
-    ///
-    /// NOTE: Transforms are "sparse" in the sense that they only mention fields which actually
-    /// change (added, replaced, dropped); the transform implicitly captures all fields that pass
-    /// from input to output unchanged and in the same relative order.
-    fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
-        let mut transform_spec = TransformSpec::new();
-        let mut last_physical_field: Option<&str> = None;
-
-        for field in all_fields {
-            match field {
-                ColumnType::Selected(physical_name) => {
-                    // Track physical field for calculating partition value insertion points.
-                    last_physical_field = Some(physical_name);
-                }
-                ColumnType::Partition(logical_idx) => {
-                    transform_spec.push(FieldTransformSpec::PartitionColumn {
-                        insert_after: last_physical_field.map(String::from),
-                        field_index: *logical_idx,
-                    });
-                }
-            }
-        }
-
-        transform_spec
     }
 
     /// Get an iterator of [`ScanMetadata`]s that should be used to facilitate a scan. This handles
@@ -666,25 +574,10 @@ impl Scan {
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        // Compute the static part of the transformation. This is `None` if no transformation is
-        // needed. We need transforms for:
-        // - Partition columns: Must be injected from partition values
-        // - Column mapping: Physical field names must be mapped to logical field names via output schema
-        let static_transform = (self.have_partition_cols
-            || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then(|| Arc::new(Scan::get_transform_spec(&self.all_fields)));
-        let physical_predicate = match self.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
-            PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
-            PhysicalPredicate::None => None,
-        };
-        let it = scan_action_iter(
-            engine,
-            action_batch_iter,
-            self.logical_schema.clone(),
-            static_transform,
-            physical_predicate,
-        );
+        if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
+            return Ok(None.into_iter().flatten());
+        }
+        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone());
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -740,7 +633,7 @@ impl Scan {
 
         debug!(
             "Executing scan with logical schema {:#?} and physical schema {:#?}",
-            self.logical_schema, self.physical_schema
+            self.state_info.logical_schema, self.state_info.physical_schema
         );
 
         let table_root = self.snapshot.table_root().clone();
@@ -841,76 +734,65 @@ pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
-pub(crate) fn parse_partition_value(
-    raw: Option<&String>,
-    data_type: &DataType,
-) -> DeltaResult<Scalar> {
-    match (raw, data_type.as_primitive_opt()) {
-        (Some(v), Some(primitive)) => primitive.parse_scalar(v),
-        (Some(_), None) => Err(Error::generic(format!(
-            "Unexpected partition column type: {data_type:?}"
-        ))),
-        _ => Ok(Scalar::Null(data_type.clone())),
-    }
-}
-
 /// All the state needed to process a scan.
-struct StateInfo {
-    /// All fields referenced by the query.
-    all_fields: Vec<ColumnType>,
-    /// The physical (parquet) read schema to use.
-    read_fields: Vec<StructField>,
-    /// True if this query references any partition columns.
-    have_partition_cols: bool,
+pub(crate) struct StateInfo {
+    /// The logical schema for this scan
+    pub(crate) logical_schema: SchemaRef,
+    /// The physical schema to read from parquet files
+    pub(crate) physical_schema: SchemaRef,
+    /// The physical predicate for data skipping
+    pub(crate) physical_predicate: PhysicalPredicate,
+    /// Transform specification for converting physical to logical data
+    pub(crate) transform_spec: Option<Arc<TransformSpec>>,
 }
 
 impl StateInfo {
     /// Get the state needed to process a scan.
-    fn try_new(
-        logical_schema: &Schema,
+    ///
+    /// `logical_schema` - The logical schema of the scan output, which includes partition columns
+    /// `partition_columns` - List of column names that are partition columns in the table
+    /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
+    /// `predicate` - Optional predicate to filter data during the scan
+    pub(crate) fn try_new(
+        logical_schema: SchemaRef,
         partition_columns: &[String],
         column_mapping_mode: ColumnMappingMode,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<Self> {
-        let mut have_partition_cols = false;
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
+        let mut transform_spec = Vec::new();
+        let mut last_physical_field: Option<String> = None;
 
-        // Loop over all selected fields and note if they are columns that will be read from the
-        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-        // be filled in by evaluating an expression ([`ColumnType::Partition`])
-        let all_fields = logical_schema
-            .fields()
-            .enumerate()
-            .map(|(index, logical_field)| -> DeltaResult<_> {
-                if partition_columns.contains(logical_field.name()) {
-                    if logical_field.is_metadata_column() {
-                        return Err(Error::Schema(format!(
-                            "Metadata column names must not match partition columns: {}",
-                            logical_field.name()
-                        )));
-                    }
-
-                    // Store the index into the schema for this field. When we turn it into an
-                    // expression in the inner loop, we will index into the schema and get the name and
-                    // data type, which we need to properly materialize the column.
-                    have_partition_cols = true;
-                    Ok(ColumnType::Partition(index))
-                } else {
-                    // Add to read schema, store field so we can build a `Column` expression later
-                    // if needed (i.e. if we have partition columns)
-                    let physical_field = logical_field.make_physical(column_mapping_mode);
-                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                    let physical_name = physical_field.name.clone();
-                    read_fields.push(physical_field);
-
-                    if !logical_field.is_metadata_column() {
-                        read_field_names.insert(physical_name.clone());
-                    }
-
-                    Ok(ColumnType::Selected(physical_name))
+        // Loop over all selected fields and build both the physical schema and transform spec
+        for (index, logical_field) in logical_schema.fields().enumerate() {
+            if partition_columns.contains(logical_field.name()) {
+                if logical_field.is_metadata_column() {
+                    return Err(Error::Schema(format!(
+                        "Metadata column names must not match partition columns: {}",
+                        logical_field.name()
+                    )));
                 }
-            })
-            .try_collect()?;
+
+                // Partition column: needs to be injected via transform
+                transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
+                    field_index: index,
+                    insert_after: last_physical_field.clone(),
+                });
+            } else {
+                // Regular field: add to physical schema
+                let physical_field = logical_field.make_physical(column_mapping_mode);
+                debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                let physical_name = physical_field.name.clone();
+
+                if !logical_field.is_metadata_column() {
+                    read_field_names.insert(physical_name.clone());
+                }
+
+                last_physical_field = Some(physical_name);
+                read_fields.push(physical_field);
+            }
+        }
 
         // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
         for metadata_column in logical_schema.metadata_columns() {
@@ -922,10 +804,25 @@ impl StateInfo {
             }
         }
 
+        let physical_schema = Arc::new(StructType::try_new(read_fields)?);
+
+        let physical_predicate = match predicate {
+            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema)?,
+            None => PhysicalPredicate::None,
+        };
+
+        let transform_spec =
+            if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
+                Some(Arc::new(transform_spec))
+            } else {
+                None
+            };
+
         Ok(StateInfo {
-            all_fields,
-            read_fields,
-            have_partition_cols,
+            logical_schema,
+            physical_schema,
+            physical_predicate,
+            transform_spec,
         })
     }
 }
@@ -960,7 +857,9 @@ pub(crate) mod test_utils {
         JsonHandler,
     };
 
-    use super::{state::ScanCallback, TransformSpec};
+    use super::state::ScanCallback;
+    use super::{PhysicalPredicate, StateInfo};
+    use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.
     // The schema is provided as null columns affect equality checks.
@@ -1054,19 +953,26 @@ pub(crate) mod test_utils {
     ) {
         let logical_schema = logical_schema
             .unwrap_or_else(|| Arc::new(crate::schema::StructType::new_unchecked(vec![])));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: logical_schema.clone(),
+            physical_schema: logical_schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec,
+        });
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            logical_schema,
-            transform_spec,
-            None,
+            state_info,
         );
         let mut batch_count = 0;
         for res in iter {
             let scan_metadata = res.unwrap();
-            assert_eq!(scan_metadata.scan_files.selection_vector, expected_sel_vec);
+            assert_eq!(
+                scan_metadata.scan_files.selection_vector(),
+                expected_sel_vec
+            );
             scan_metadata
                 .visit_scan_files(context.clone(), validate_callback)
                 .unwrap();
@@ -1338,12 +1244,12 @@ mod tests {
             .scan_metadata(engine.as_ref())
             .unwrap()
             .map_ok(|ScanMetadata { scan_files, .. }| {
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
                 let filtered_batch =
-                    filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
-                        .unwrap();
+                    filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap();
                 Box::new(ArrowEngineData::from(filtered_batch)) as Box<dyn EngineData>
             })
             .try_collect()
@@ -1374,11 +1280,11 @@ mod tests {
             .scan_metadata(engine.as_ref())
             .unwrap()
             .map_ok(|ScanMetadata { scan_files, .. }| {
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
-                filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
-                    .unwrap()
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
             })
             .try_collect()
             .unwrap();
@@ -1398,11 +1304,11 @@ mod tests {
             .scan_metadata_from(engine.as_ref(), 0, files, None)
             .unwrap()
             .map_ok(|ScanMetadata { scan_files, .. }| {
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(scan_files.data)
+                let (underlying_data, selection_vector) = scan_files.into_parts();
+                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(underlying_data)
                     .unwrap()
                     .into();
-                filter_record_batch(&batch, &BooleanArray::from(scan_files.selection_vector))
-                    .unwrap()
+                filter_record_batch(&batch, &BooleanArray::from(selection_vector)).unwrap()
             })
             .try_collect()
             .unwrap();
@@ -1446,7 +1352,7 @@ mod tests {
         ];
 
         for (raw, data_type, expected) in &cases {
-            let value = parse_partition_value(
+            let value = crate::transforms::parse_partition_value_raw(
                 Some(&raw.to_string()),
                 &DataType::Primitive(data_type.clone()),
             )
@@ -1576,5 +1482,183 @@ mod tests {
             vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_state_info_no_partition_columns() {
+        // Test case: No partition columns, no column mapping
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let state_info = StateInfo::try_new(
+            schema.clone(),
+            &[], // No partition columns
+            ColumnMappingMode::None,
+            None, // No predicate
+        )
+        .unwrap();
+
+        // Should have no transform spec (no partitions, no column mapping)
+        assert!(state_info.transform_spec.is_none());
+
+        // Physical schema should match logical schema
+        assert_eq!(state_info.logical_schema, schema);
+        assert_eq!(state_info.physical_schema.fields().len(), 2);
+
+        // No predicate
+        assert_eq!(state_info.physical_predicate, PhysicalPredicate::None);
+    }
+
+    #[test]
+    fn test_state_info_with_partition_columns() {
+        // Test case: With partition columns
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("date", DataType::DATE), // Partition column
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let state_info = StateInfo::try_new(
+            schema.clone(),
+            &["date".to_string()], // date is a partition column
+            ColumnMappingMode::None,
+            None,
+        )
+        .unwrap();
+
+        // Should have a transform spec for the partition column
+        assert!(state_info.transform_spec.is_some());
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_eq!(transform_spec.len(), 1);
+
+        // Check the transform spec for the partition column
+        match &transform_spec[0] {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
+                assert_eq!(*field_index, 1); // Index of "date" in logical schema
+                assert_eq!(insert_after, &Some("id".to_string())); // After "id" which is physical
+            }
+            _ => panic!("Expected MetadataDerivedColumn transform"),
+        }
+
+        // Physical schema should not include partition column
+        assert_eq!(state_info.logical_schema, schema);
+        assert_eq!(state_info.physical_schema.fields().len(), 2); // Only id and value
+    }
+
+    #[test]
+    fn test_state_info_multiple_partition_columns() {
+        // Test case: Multiple partition columns interspersed with regular columns
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("col1", DataType::STRING),
+            StructField::nullable("part1", DataType::STRING), // Partition
+            StructField::nullable("col2", DataType::LONG),
+            StructField::nullable("part2", DataType::INTEGER), // Partition
+        ]));
+
+        let state_info = StateInfo::try_new(
+            schema.clone(),
+            &["part1".to_string(), "part2".to_string()],
+            ColumnMappingMode::None,
+            None,
+        )
+        .unwrap();
+
+        // Should have transforms for both partition columns
+        assert!(state_info.transform_spec.is_some());
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_eq!(transform_spec.len(), 2);
+
+        // Check first partition column transform
+        match &transform_spec[0] {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
+                assert_eq!(*field_index, 1); // Index of "part1"
+                assert_eq!(insert_after, &Some("col1".to_string()));
+            }
+            _ => panic!("Expected MetadataDerivedColumn transform"),
+        }
+
+        // Check second partition column transform
+        match &transform_spec[1] {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
+                assert_eq!(*field_index, 3); // Index of "part2"
+                assert_eq!(insert_after, &Some("col2".to_string()));
+            }
+            _ => panic!("Expected MetadataDerivedColumn transform"),
+        }
+
+        // Physical schema should only have non-partition columns
+        assert_eq!(state_info.physical_schema.fields().len(), 2); // col1 and col2
+    }
+
+    #[test]
+    fn test_state_info_with_predicate() {
+        // Test case: With a valid predicate
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let predicate = Arc::new(column_expr!("value").gt(Expr::literal(10i64)));
+
+        let state_info = StateInfo::try_new(
+            schema.clone(),
+            &[],
+            ColumnMappingMode::None,
+            Some(predicate),
+        )
+        .unwrap();
+
+        // Should have a physical predicate
+        match &state_info.physical_predicate {
+            PhysicalPredicate::Some(_pred, schema) => {
+                // Physical predicate exists
+                assert_eq!(schema.fields().len(), 1); // Only "value" is referenced
+            }
+            _ => panic!("Expected PhysicalPredicate::Some"),
+        }
+    }
+
+    #[test]
+    fn test_state_info_partition_at_beginning() {
+        // Test case: Partition column at the beginning
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("date", DataType::DATE), // Partition column
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("value", DataType::LONG),
+        ]));
+
+        let state_info = StateInfo::try_new(
+            schema.clone(),
+            &["date".to_string()],
+            ColumnMappingMode::None,
+            None,
+        )
+        .unwrap();
+
+        // Should have a transform spec for the partition column
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_eq!(transform_spec.len(), 1);
+
+        match &transform_spec[0] {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
+                assert_eq!(*field_index, 0); // Index of "date"
+                assert_eq!(insert_after, &None); // No physical field before it, so prepend
+            }
+            _ => panic!("Expected MetadataDerivedColumn transform"),
+        }
     }
 }

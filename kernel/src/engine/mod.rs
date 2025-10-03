@@ -37,6 +37,7 @@ mod tests {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine_data::FilteredEngineData;
     use crate::{Engine, EngineData};
 
     use test_utils::delta_path_for_version;
@@ -47,7 +48,11 @@ mod tests {
         engine_data: impl Fn() -> Box<dyn EngineData>,
     ) {
         let json = engine.json_handler();
-        let get_data = || Box::new(std::iter::once(Ok(engine_data())));
+        let get_data = || {
+            let data = engine_data();
+            let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+            Box::new(std::iter::once(Ok(filtered_data)))
+        };
 
         let expected_names: Vec<Path> = (1..4)
             .map(|i| delta_path_for_version(i, "json"))

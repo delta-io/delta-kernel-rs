@@ -130,7 +130,7 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
         use LogPathFileType::*;
         match &part_file.file_type {
             SinglePartCheckpoint
-            | UuidCheckpoint(_)
+            | UuidCheckpoint
             | MultiPartCheckpoint {
                 part_num: 1,
                 num_parts: 1,
@@ -245,11 +245,10 @@ impl ListedLogFiles {
     pub(crate) fn list(
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        // TODO: plumb through a log_tail provided by our caller
-        let log_tail = vec![];
         let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
         log_files.process_results(|iter| {
@@ -271,7 +270,7 @@ impl ListedLogFiles {
                             ascending_compaction_files.push(file);
                         }
                         CompactedCommit { .. } => (), // Failed the bounds check above
-                        SinglePartCheckpoint | UuidCheckpoint(_) | MultiPartCheckpoint { .. } => {
+                        SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
                             new_checkpoint_parts.push(file)
                         }
                         Crc => {
@@ -318,11 +317,13 @@ impl ListedLogFiles {
         checkpoint_metadata: &LastCheckpointHint,
         storage: &dyn StorageHandler,
         log_root: &Url,
+        log_tail: Vec<ParsedLogPath>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let listed_files = Self::list(
             storage,
             log_root,
+            log_tail,
             Some(checkpoint_metadata.version),
             end_version,
         )?;
