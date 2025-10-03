@@ -6,57 +6,16 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
-use crate::scan::{FieldClassifier, PhysicalPredicate, ScanResult, StateInfo};
-use crate::schema::{SchemaRef, StructField};
-use crate::transforms::FieldTransformSpec;
+use crate::scan::field_classifiers::CdfFieldClassifier;
+use crate::scan::{PhysicalPredicate, ScanResult, StateInfo};
+use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
 use super::resolve_dvs::{resolve_scan_file_dv, ResolvedCdfScanFile};
 use super::scan_file::scan_metadata_to_scan_file;
-use super::{
-    TableChanges, CHANGE_TYPE_COL_NAME, COMMIT_TIMESTAMP_COL_NAME, COMMIT_VERSION_COL_NAME,
-};
-
-/// CDF-specific field classifier that handles _change_type as Dynamic and CDF metadata columns
-struct CdfFieldClassifier;
-
-impl FieldClassifier for CdfFieldClassifier {
-    fn classify_field(
-        &self,
-        field: &StructField,
-        field_index: usize,
-        partition_columns: &[String],
-        last_physical_field: &Option<String>,
-    ) -> Option<FieldTransformSpec> {
-        if partition_columns.contains(field.name()) {
-            // Partition column - metadata derived
-            Some(FieldTransformSpec::MetadataDerivedColumn {
-                field_index,
-                insert_after: last_physical_field.clone(),
-            })
-        } else if field.name() == CHANGE_TYPE_COL_NAME {
-            // _change_type is dynamic - physical in CDC files, metadata in Add/Remove files
-            Some(FieldTransformSpec::DynamicColumn {
-                field_index,
-                physical_name: CHANGE_TYPE_COL_NAME.to_string(),
-                insert_after: last_physical_field.clone(),
-            })
-        } else if field.name() == COMMIT_VERSION_COL_NAME
-            || field.name() == COMMIT_TIMESTAMP_COL_NAME
-        {
-            // Other CDF metadata columns are always computed
-            Some(FieldTransformSpec::MetadataDerivedColumn {
-                field_index,
-                insert_after: last_physical_field.clone(),
-            })
-        } else {
-            // Regular data field - read from parquet
-            None
-        }
-    }
-}
+use super::TableChanges;
 
 /// The result of building a [`TableChanges`] scan over a table. This can be used to get the change
 /// data feed from the table.
@@ -154,7 +113,7 @@ impl TableChangesScanBuilder {
             .unwrap_or_else(|| self.table_changes.schema.clone().into());
 
         // Create StateInfo using CDF field classifier
-        let state_info = StateInfo::try_new_with_classifier(
+        let state_info = StateInfo::try_new(
             logical_schema,
             self.table_changes.partition_columns(),
             self.table_changes.end_snapshot.column_mapping_mode(),

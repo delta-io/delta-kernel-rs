@@ -9,6 +9,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::field_classifiers::{FieldClassifier, RegularFieldClassifier};
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -29,12 +30,13 @@ use crate::schema::{
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{FieldTransformSpec, TransformSpec};
+use crate::transforms::TransformSpec;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
+pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
 
@@ -121,6 +123,7 @@ impl ScanBuilder {
             self.snapshot.metadata().partition_columns(),
             self.snapshot.table_configuration().column_mapping_mode(),
             self.predicate,
+            RegularFieldClassifier,
         )?;
 
         Ok(Scan {
@@ -734,21 +737,6 @@ pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
 }
 
-/// Trait for classifying fields during StateInfo construction.
-/// Allows different scan types (regular, CDF) to customize field handling.
-pub(crate) trait FieldClassifier {
-    /// Classify a field and return its transform spec.
-    /// Returns None if the field is physical (should be read from parquet).
-    /// Returns Some(spec) if the field needs transformation (partition, metadata-derived, or dynamic).
-    fn classify_field(
-        &self,
-        field: &StructField,
-        field_index: usize,
-        partition_columns: &[String],
-        last_physical_field: &Option<String>,
-    ) -> Option<FieldTransformSpec>;
-}
-
 /// All the state needed to process a scan.
 #[derive(Debug)]
 pub(crate) struct StateInfo {
@@ -771,7 +759,7 @@ impl StateInfo {
     /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
     /// `predicate` - Optional predicate to filter data during the scan
     /// `classifier` - The classifier to use for different scan types
-    pub(crate) fn try_new_with_classifier<C: FieldClassifier>(
+    pub(crate) fn try_new<C: FieldClassifier>(
         logical_schema: SchemaRef,
         partition_columns: &[String],
         column_mapping_mode: ColumnMappingMode,
@@ -821,7 +809,7 @@ impl StateInfo {
             }
         }
 
-        // Validate metadata columns don't conflict with physical columns
+        // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
         for metadata_column in logical_schema.metadata_columns() {
             if read_field_names.contains(metadata_column.name()) {
                 return Err(Error::Schema(format!(
@@ -851,46 +839,6 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
         })
-    }
-
-    /// Get the state needed to process a scan.
-    pub(crate) fn try_new(
-        logical_schema: SchemaRef,
-        partition_columns: &[String],
-        column_mapping_mode: ColumnMappingMode,
-        predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Self> {
-        // Use the default classifier for regular scans
-        struct RegularFieldClassifier;
-
-        impl FieldClassifier for RegularFieldClassifier {
-            fn classify_field(
-                &self,
-                field: &StructField,
-                field_index: usize,
-                partition_columns: &[String],
-                last_physical_field: &Option<String>,
-            ) -> Option<FieldTransformSpec> {
-                if partition_columns.contains(field.name()) {
-                    // Partition column: needs transform to inject metadata
-                    Some(FieldTransformSpec::MetadataDerivedColumn {
-                        field_index,
-                        insert_after: last_physical_field.clone(),
-                    })
-                } else {
-                    // Regular physical field - no transform needed
-                    None
-                }
-            }
-        }
-
-        Self::try_new_with_classifier(
-            logical_schema,
-            partition_columns,
-            column_mapping_mode,
-            predicate,
-            RegularFieldClassifier,
-        )
     }
 }
 
@@ -1060,6 +1008,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
+    use crate::transforms::FieldTransformSpec;
     use crate::Snapshot;
 
     use super::*;
