@@ -262,7 +262,6 @@ impl ListedLogFiles {
             let mut checkpoint_parts = vec![];
             let mut latest_crc_file: Option<ParsedLogPath> = None;
             let mut latest_commit_file: Option<ParsedLogPath> = None;
-            let mut found_checkpoint = false;
 
             // Group log files by version
             let log_files_per_version = iter.chunk_by(|x| x.version);
@@ -302,9 +301,11 @@ impl ListedLogFiles {
                     .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
                 {
                     checkpoint_parts = complete_checkpoint;
-                    found_checkpoint = true;
-                    // Update latest_commit_file if there's a commit at the same version as the checkpoint, otherwise set to None
-                    // Since ascending_commit_files is sorted, the last element is the latest commit would be the same version as the checkpoint
+                    // Check if there's a commit file at the same version as this checkpoint. We pop
+                    // the last element from ascending_commit_files (which is sorted by version) and
+                    // set latest_commit_file to it only if it matches the checkpoint version. If it
+                    // doesn't match, we set latest_commit_file to None to discard any older commits
+                    // from before the checkpoint
                     latest_commit_file = ascending_commit_files
                         .pop()
                         .filter(|commit| commit.version == version);
@@ -314,10 +315,13 @@ impl ListedLogFiles {
                 }
             }
 
-            // If no checkpoint was found and ascending_commit_files is non-empty, set latest_commit_file to the last element
-            // This captures the latest commit file when there is no checkpoint
-            if !found_checkpoint {
-                latest_commit_file = ascending_commit_files.last().cloned();
+            // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
+            // it contains only commits after the most recent checkpoint. The last element is the
+            // highest version commit overall, so we update latest_commit_file to it. If it's empty,
+            // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
+            // or remains None.
+            if let Some(commit_file) = ascending_commit_files.last() {
+                latest_commit_file = Some(commit_file.clone());
             }
 
             ListedLogFiles::try_new(
@@ -507,7 +511,7 @@ mod list_log_files_with_log_tail_tests {
     }
 
     #[test]
-    fn test_log_tail_as_latest_commit_files() {
+    fn test_log_tail_has_latest_commit_files() {
         // Filesystem has commits 0-2, log_tail has commits 3-5 (the latest)
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
