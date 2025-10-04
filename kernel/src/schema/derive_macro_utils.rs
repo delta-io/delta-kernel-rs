@@ -1,7 +1,6 @@
 //! Utility traits that support the [`delta_kernel_derive::ToSchema`] macro.
 use crate::schema::{ArrayType, DataType, MapType, StructField, ToSchema};
 use bytes::Bytes;
-use serde_bytes::ByteBuf;
 ///
 /// Not intended for use by normal code.
 use std::collections::{HashMap, HashSet};
