@@ -85,6 +85,7 @@ use url::Url;
 use self::schema::{DataType, SchemaRef};
 
 pub mod actions;
+pub mod async_df;
 pub mod checkpoint;
 pub mod engine_data;
 pub mod error;
@@ -150,11 +151,6 @@ use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
 use schema::{SchemaTransform, StructField, StructType};
 
-#[cfg(any(
-    feature = "default-engine-native-tls",
-    feature = "default-engine-rustls",
-    feature = "arrow-conversion"
-))]
 pub mod engine;
 
 /// Delta table version is 8 byte unsigned int

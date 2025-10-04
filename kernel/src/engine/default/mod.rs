@@ -35,11 +35,11 @@ pub mod storage;
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
-    object_store: Arc<DynObjectStore>,
-    storage: Arc<ObjectStoreStorageHandler<E>>,
-    json: Arc<DefaultJsonHandler<E>>,
-    parquet: Arc<DefaultParquetHandler<E>>,
-    evaluation: Arc<ArrowEvaluationHandler>,
+    pub object_store: Arc<DynObjectStore>,
+    pub storage: Arc<ObjectStoreStorageHandler<E>>,
+    pub json: Arc<DefaultJsonHandler<E>>,
+    pub parquet: Arc<DefaultParquetHandler<E>>,
+    pub evaluation: Arc<ArrowEvaluationHandler>,
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
@@ -118,6 +118,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )
             .await
     }
+
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {

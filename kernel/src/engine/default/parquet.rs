@@ -238,7 +238,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 }
 
 /// Implements [`FileOpener`] for a parquet file
-struct ParquetOpener {
+pub struct ParquetOpener {
     // projection: Arc<[usize]>,
     batch_size: usize,
     table_schema: SchemaRef,
@@ -331,7 +331,7 @@ impl FileOpener for ParquetOpener {
 }
 
 /// Implements [`FileOpener`] for a opening a parquet file from a presigned URL
-struct PresignedUrlOpener {
+pub struct PresignedUrlOpener {
     batch_size: usize,
     predicate: Option<PredicateRef>,
     limit: Option<usize>,

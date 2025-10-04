@@ -6,8 +6,6 @@ use std::{
 };
 
 use itertools::Itertools;
-use parquet_56::schema;
-use tracing::debug;
 
 use crate::{
     actions::deletion_vector::DeletionVectorDescriptor,
@@ -25,7 +23,7 @@ use crate::{
     schema::{ColumnNamesAndTypes, MapType},
 };
 
-pub trait RowFilter: RowVisitor {
+pub trait RowFilter: RowVisitor + Send + Sync {
     fn filter_row<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool>;
 }
 
@@ -72,9 +70,9 @@ impl RowFilter for AddRemoveDedupVisitor<'_> {
     }
 }
 
-struct FilterVisitor {
-    filter: Arc<Mutex<dyn RowFilter>>,
-    selection_vector: Vec<bool>,
+pub struct FilterVisitor {
+    pub filter: Arc<Mutex<dyn RowFilter>>,
+    pub selection_vector: Vec<bool>,
 }
 
 impl RowVisitor for FilterVisitor {
@@ -107,27 +105,27 @@ impl RowVisitor for FilterVisitor {
 }
 
 // This would replace enginedata
-struct FilteredEngineData {
-    engine_data: Arc<dyn EngineData>,
-    selection_vector: Vec<bool>,
+pub struct FilteredEngineDataArc {
+    pub engine_data: Arc<dyn EngineData>,
+    pub selection_vector: Vec<bool>,
 }
 
-struct Dataframe {
-    engine_data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>>>,
-    root_schema: Arc<Schema>,
-    plan: LogicalPlanNode,
+pub struct Dataframe {
+    pub engine_data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineDataArc>>>,
+    pub root_schema: Arc<Schema>,
+    pub plan: LogicalPlanNode,
 }
 
 #[derive(Debug)]
-enum FileType {
+pub enum FileType {
     Json,
     Parquet,
 }
 #[derive(Debug)]
-struct ScanNode {
-    file_type: FileType,
-    files: Vec<FileMeta>,
-    schema: SchemaRef,
+pub struct ScanNode {
+    pub file_type: FileType,
+    pub files: Vec<FileMeta>,
+    pub schema: SchemaRef,
 }
 impl std::fmt::Debug for FilterNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -145,26 +143,26 @@ impl std::fmt::Debug for FilterNode {
             .finish()
     }
 }
-struct FilterNode {
-    child: Box<LogicalPlanNode>,
-    filter: Arc<Mutex<dyn RowFilter>>,
-    column_names: &'static [ColumnName],
+pub struct FilterNode {
+    pub child: Box<LogicalPlanNode>,
+    pub filter: Arc<Mutex<dyn RowFilter>>,
+    pub column_names: &'static [ColumnName],
 }
 
 #[derive(Debug)]
-struct SelectNode {
-    child: Box<LogicalPlanNode>,
-    columns: Vec<Arc<Expression>>,
-    input_schema: SchemaRef,
-    output_type: SchemaRef,
+pub struct SelectNode {
+    pub child: Box<LogicalPlanNode>,
+    pub columns: Vec<Arc<Expression>>,
+    pub input_schema: SchemaRef,
+    pub output_type: SchemaRef,
 }
 #[derive(Debug)]
-struct UnionNode {
-    a: Box<LogicalPlanNode>,
-    b: Box<LogicalPlanNode>,
+pub struct UnionNode {
+    pub a: Box<LogicalPlanNode>,
+    pub b: Box<LogicalPlanNode>,
 }
 #[derive(Debug)]
-enum LogicalPlanNode {
+pub enum LogicalPlanNode {
     Scan(ScanNode),
     Filter(FilterNode),
     Select(SelectNode),
@@ -178,12 +176,12 @@ struct CustomNode {
 }
 
 #[derive(Debug)]
-enum CustomImpl {
+pub enum CustomImpl {
     AddRemoveDedup,
     StatsSkipping,
 }
 
-type FallibleFilteredDataIter = Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>>>;
+type FallibleFilteredDataIter = Box<dyn Iterator<Item = DeltaResult<FilteredEngineDataArc>>>;
 
 trait PhysicalPlanExecutor {
     fn execute(&self, plan: LogicalPlanNode) -> DeltaResult<FallibleFilteredDataIter>;
@@ -207,7 +205,7 @@ impl DefaultPlanExecutor {
                 let files = json_handler.read_json_files(files.as_slice(), schema, None)?;
                 Ok(Box::new(files.map_ok(|file| {
                     let engine_data: Arc<dyn EngineData> = file.into();
-                    FilteredEngineData {
+                    FilteredEngineDataArc {
                         selection_vector: vec![true; engine_data.len()],
                         engine_data,
                     }
@@ -218,7 +216,7 @@ impl DefaultPlanExecutor {
                 let files = parquet_handler.read_parquet_files(files.as_slice(), schema, None)?;
                 Ok(Box::new(files.map_ok(|file| {
                     let engine_data: Arc<dyn EngineData> = file.into();
-                    FilteredEngineData {
+                    FilteredEngineDataArc {
                         selection_vector: vec![true; engine_data.len()],
                         engine_data,
                     }
@@ -236,8 +234,7 @@ impl DefaultPlanExecutor {
         let child_iter = self.execute(*child)?;
 
         let filtered_iter = child_iter.map(move |x| {
-            println!("executing filtered iter");
-            let FilteredEngineData {
+            let FilteredEngineDataArc {
                 engine_data,
                 selection_vector,
             } = x?;
@@ -247,7 +244,7 @@ impl DefaultPlanExecutor {
                 selection_vector,
             };
             engine_data.visit_rows(column_names, &mut visitor)?;
-            Ok(FilteredEngineData {
+            Ok(FilteredEngineDataArc {
                 engine_data,
                 selection_vector: visitor.selection_vector,
             })
@@ -277,13 +274,13 @@ impl DefaultPlanExecutor {
 
         let child_iter = self.execute(*child)?;
         let res = child_iter.map(move |x| {
-            let FilteredEngineData {
+            let FilteredEngineDataArc {
                 engine_data,
                 selection_vector,
             } = x?;
             let new_data = evaluator.evaluate(engine_data.as_ref())?;
 
-            Ok(FilteredEngineData {
+            Ok(FilteredEngineDataArc {
                 engine_data: new_data.into(),
                 selection_vector,
             })
@@ -299,7 +296,7 @@ impl PhysicalPlanExecutor for DefaultPlanExecutor {
     fn execute(
         &self,
         plan: LogicalPlanNode,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>>>> {
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FilteredEngineDataArc>>>> {
         match plan {
             LogicalPlanNode::Scan(scan_node) => self.execute_scan(scan_node),
             LogicalPlanNode::Filter(filter_node) => self.execute_filter(filter_node),
@@ -371,7 +368,7 @@ impl LogicalPlanNode {
 }
 
 impl Snapshot {
-    fn get_scan_plan(&self) -> DeltaResult<LogicalPlanNode> {
+    pub fn get_scan_plan(&self) -> DeltaResult<LogicalPlanNode> {
         let mut json_paths = self
             .log_segment()
             .ascending_commit_files
@@ -446,16 +443,16 @@ impl SharedFileActionDeduplicator {
         // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
 
         if self.seen_file_keys.read().unwrap().contains(&key) {
-            println!(
-                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
+            // println!(
+            //     "Ignoring duplicate ({}, {:?}) in scan, is log {}",
+            //     key.path, key.dv_unique_id, self.is_log_batch
+            // );
             true
         } else {
-            println!(
-                "Including ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
+            // println!(
+            //     "Including ({}, {:?}) in scan, is log {}",
+            //     key.path, key.dv_unique_id, self.is_log_batch
+            // );
             if self.is_log_batch {
                 // Remember file actions from this batch so we can ignore duplicates as we process
                 // batches from older commit and/or checkpoint files. We don't track checkpoint
@@ -547,7 +544,7 @@ impl SharedFileActionDeduplicator {
 impl RowFilter for SharedAddRemoveDedupFilter {
     fn filter_row<'a>(&mut self, i: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<bool> {
         let x = self.is_valid_add(i, getters)?;
-        println!(" is valid is {x}");
+        // println!(" is valid is {x}");
         Ok(x)
     }
 }
@@ -653,11 +650,16 @@ impl RowVisitor for SharedAddRemoveDedupFilter {
 mod tests {
     use std::{path::PathBuf, sync::Arc};
 
+    use object_store::local::LocalFileSystem;
     use std::process::ExitCode;
+    use test_utils::{load_test_data, DefaultEngineExtension};
+    use tokio::runtime::Runtime;
 
     use crate::arrow::compute::filter_record_batch;
     use crate::arrow::record_batch::RecordBatch;
     use crate::arrow::util::pretty::print_batches;
+    use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
+    use crate::engine::default::DefaultEngine;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::{DeltaResult, Snapshot};
 
@@ -672,7 +674,9 @@ mod tests {
         let path =
             std::fs::canonicalize(PathBuf::from("/Users/oussama/projects/code/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/with_checkpoint/delta/")).unwrap();
         let url = url::Url::from_directory_path(path).unwrap();
-        let engine = SyncEngine::new();
+        let task_executor = TokioMultiThreadExecutor::new(tokio::runtime::Handle::current());
+        let object_store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngine::new(object_store, task_executor.into());
 
         let snapshot = Snapshot::builder(url).build(&engine).unwrap();
         let plan = snapshot.get_scan_plan().unwrap();
