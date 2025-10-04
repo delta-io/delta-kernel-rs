@@ -147,6 +147,7 @@ pub struct FilterNode {
     pub child: Box<LogicalPlanNode>,
     pub filter: Arc<Mutex<dyn RowFilter>>,
     pub column_names: &'static [ColumnName],
+    pub ordered: bool,
 }
 
 #[derive(Debug)]
@@ -230,6 +231,7 @@ impl DefaultPlanExecutor {
             child,
             filter,
             column_names,
+            ordered,
         } = node;
         let child_iter = self.execute(*child)?;
 
@@ -338,6 +340,17 @@ impl LogicalPlanNode {
             child: Box::new(self),
             filter: Arc::new(Mutex::new(filter)),
             column_names,
+            ordered: false,
+        }))
+    }
+
+    fn filter_ordered(self, filter: impl RowFilter + 'static) -> DeltaResult<Self> {
+        let column_names = filter.selected_column_names_and_types().0;
+        Ok(Self::Filter(FilterNode {
+            child: Box::new(self),
+            filter: Arc::new(Mutex::new(filter)),
+            column_names,
+            ordered: true,
         }))
     }
 
@@ -390,7 +403,7 @@ impl Snapshot {
         let set = Arc::new(RwLock::new(HashSet::new()));
         let x = SharedAddRemoveDedupFilter::new(set.clone(), json_scan.schema(), true);
         let y = SharedAddRemoveDedupFilter::new(set, parquet_scan.schema(), false);
-        json_scan.filter(x)?.union(parquet_scan.filter(y)?)
+        json_scan.filter_ordered(x)?.union(parquet_scan.filter(y)?)
     }
 }
 

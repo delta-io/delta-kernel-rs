@@ -69,6 +69,7 @@ datafusion = "48.0.1"
 async-trait = "0.1"
 async-recursion = "1.1.1"
 async-stream = "0.3.6"
+par-stream = { version = "0.10.2", features = ["runtime-tokio"] }
 
 # arrow 55
 [dependencies.arrow_55]

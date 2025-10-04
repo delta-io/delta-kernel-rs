@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
-use futures::{stream, Stream, StreamExt, TryStreamExt};
+use futures::{future::Either, stream, Stream, StreamExt, TryStreamExt};
 use std::pin::Pin;
+use par_stream::{IndexStreamExt as _, ParParamsConfig, ParStreamExt as _};
+
 
 use crate::{
     engine::{
@@ -168,11 +170,9 @@ impl AsyncPlanExecutor {
 
         // Wrap engine data with full selection vector
         let wrapped = stream.map(|result| {
-            result.map(|engine_data| {
-                FilteredEngineDataArc {
-                    selection_vector: vec![true; engine_data.len()],
-                    engine_data: engine_data.into(),
-                }
+            result.map(|engine_data| FilteredEngineDataArc {
+                selection_vector: vec![true; engine_data.len()],
+                engine_data: engine_data.into(),
             })
         });
 
@@ -184,10 +184,15 @@ impl AsyncPlanExecutor {
         &self,
         node: FilterNode,
     ) -> DeltaResult<BoxStream<DeltaResult<FilteredEngineDataArc>>> {
-        let child_stream = self.execute(*node.child).await?;
-        let filter = node.filter;
+        let FilterNode {
+            child,
+            filter,
+            column_names,
+            ordered,
+        } = node;
+        let child_stream = self.execute(*child).await?;
         // Apply filter asynchronously to each batch
-        let filtered = child_stream.then(move |x| {
+        let then_fn = move |x| {
             println!("executing filtered iter");
 
             let filter_clone = filter.clone();
@@ -206,7 +211,14 @@ impl AsyncPlanExecutor {
                     selection_vector: visitor.selection_vector,
                 })
             }
-        });
+        };
+
+        let filtered = if ordered {
+            Either::Left(child_stream.then(then_fn))
+        } else {
+            let params = ParParamsConfig::FixedWorkers { num_workers: 16 }.to_params();
+            Either::Right(child_stream.par_then_unordered(params, then_fn))
+        };
 
         Ok(Box::pin(filtered) as BoxStream<_>)
     }
@@ -270,7 +282,6 @@ impl AsyncPlanExecutor {
         Ok(Box::pin(stream_a.chain(stream_b_flattened)) as BoxStream<_>)
     }
 }
-
 
 #[cfg(test)]
 mod async_tests {
