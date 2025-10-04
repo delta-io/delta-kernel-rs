@@ -401,20 +401,23 @@ impl Snapshot {
     /// - `Err(...)` - ICT is enabled but commit file cannot be read
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
         // Get ICT enablement info and check if we should read ICT for this version
-        match self
+        let enablement = self
             .table_configuration()
-            .in_commit_timestamp_enablement()?
+            .in_commit_timestamp_enablement()?;
+
+        // Return None if ICT is not enabled at all
+        if matches!(enablement, InCommitTimestampEnablement::NotEnabled) {
+            return Ok(None);
+        }
+
+        // Return None if ICT is enabled but this version is before the enablement version
+        if let InCommitTimestampEnablement::Enabled {
+            enablement: Some((enablement_version, _)),
+        } = enablement
         {
-            // ICT is not enabled at all
-            InCommitTimestampEnablement::NotEnabled => return Ok(None),
-
-            // ICT is enabled but this version is before the enablement version
-            InCommitTimestampEnablement::Enabled {
-                enablement: Some((enablement_version, _)),
-            } if self.version() < enablement_version => return Ok(None),
-
-            // All other cases (ICT enabled and version >= enablement_version, or ICT enabled from table creation)
-            _ => {}
+            if self.version() < enablement_version {
+                return Ok(None);
+            }
         }
 
         // Check if commit file is already in log segment
