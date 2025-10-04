@@ -233,6 +233,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = Lazy
         WriterFeature::AppendOnly,
         WriterFeature::DeletionVectors,
         WriterFeature::DomainMetadata,
+        WriterFeature::InCommitTimestamp,
         WriterFeature::Invariants,
         WriterFeature::RowTracking,
         WriterFeature::TimestampWithoutTimezone,
