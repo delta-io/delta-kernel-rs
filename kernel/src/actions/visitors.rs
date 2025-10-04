@@ -509,9 +509,10 @@ pub(crate) fn visit_deletion_vector_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
 ) -> DeltaResult<Option<DeletionVectorDescriptor>> {
-    if let Some(storage_type) =
-        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?
-    {
+    let storage_type_opt: Option<String> =
+        getters[0].get_opt(row_index, "remove.deletionVector.storageType")?;
+    if let Some(storage_type_str) = storage_type_opt {
+        let storage_type = storage_type_str.parse()?;
         let path_or_inline_dv: String =
             getters[1].get(row_index, "deletionVector.pathOrInlineDv")?;
         let offset: Option<i32> = getters[2].get_opt(row_index, "deletionVector.offset")?;
