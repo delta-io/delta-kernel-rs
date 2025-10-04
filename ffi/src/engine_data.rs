@@ -64,6 +64,15 @@ pub struct ArrowFFIData {
     pub schema: FFI_ArrowSchema,
 }
 
+impl ArrowFFIData {
+    pub fn empty() -> Self {
+        Self {
+            array: FFI_ArrowArray::empty(),
+            schema: FFI_ArrowSchema::empty(),
+        }
+    }
+}
+
 // TODO: This should use a callback to avoid having to have the engine free the struct
 /// Get an [`ArrowFFIData`] to allow binding to the arrow [C Data
 /// Interface](https://arrow.apache.org/docs/format/CDataInterface.html). This includes the data and
