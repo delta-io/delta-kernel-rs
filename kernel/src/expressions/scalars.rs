@@ -546,6 +546,12 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+impl From<bytes::Bytes> for Scalar {
+    fn from(b: bytes::Bytes) -> Self {
+        Self::Binary(b.to_vec())
+    }
+}
+
 impl<T> TryFrom<Vec<T>> for Scalar
 where
     T: Into<Scalar> + ToDataType,
