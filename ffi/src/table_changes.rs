@@ -359,7 +359,7 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
 mod tests {
     use super::*;
     use crate::ffi_test_utils::{allocate_err, allocate_str, ok_or_panic, recover_string};
-    use crate::{engine_to_handle, kernel_string_slice};
+    use crate::{engine_to_handle, kernel_string_slice, free_engine};
 
     use delta_kernel::arrow::array::{ArrayRef, Int32Array, StringArray};
     use delta_kernel::arrow::datatypes::{Field, Schema};
@@ -628,6 +628,7 @@ mod tests {
 
         unsafe {
             free_table_changes_scan(table_changes_scan);
+            free_engine(engine);
         }
         Ok(())
     }
@@ -761,6 +762,7 @@ mod tests {
         unsafe {
             free_table_changes_scan(table_changes_scan);
             free_scan_table_changes_iter(table_changes_scan_iter_result);
+            free_engine(engine);
         }
         Ok(())
     }
