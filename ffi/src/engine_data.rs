@@ -64,6 +64,7 @@ pub struct ArrowFFIData {
     pub schema: FFI_ArrowSchema,
 }
 
+#[cfg(feature = "default-engine-base")]
 impl ArrowFFIData {
     pub fn empty() -> Self {
         Self {
