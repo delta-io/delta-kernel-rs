@@ -690,7 +690,7 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
         CommitResult::ConflictedTransaction(conflicted) => {
             panic!(
                 "First transaction should not conflict, got conflict at version {}",
-                conflicted.conflict_version
+                conflicted.conflict_version()
             );
         }
         CommitResult::RetryableTransaction(_) => {
@@ -709,7 +709,8 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
         }
         CommitResult::ConflictedTransaction(conflicted) => {
             assert_eq!(
-                conflicted.conflict_version, 1,
+                conflicted.conflict_version(),
+                1,
                 "Conflict should be at version 1"
             );
 

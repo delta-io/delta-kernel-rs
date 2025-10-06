@@ -113,7 +113,7 @@ async fn try_main() -> DeltaResult<()> {
         txn = match txn.commit(&engine)? {
             CommitResult::CommittedTransaction(committed) => break committed,
             CommitResult::ConflictedTransaction(conflicted) => {
-                let conflicting_version = conflicted.conflict_version;
+                let conflicting_version = conflicted.conflict_version();
                 println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
                 return Err(Error::generic("Commit failed"));
             }
