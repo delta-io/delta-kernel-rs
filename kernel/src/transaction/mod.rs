@@ -558,21 +558,24 @@ pub struct PostCommitStats {
     pub commits_since_log_compaction: u64,
 }
 
-/// The result of attempting to commit this transaction.
+/// The result of attempting to commit this transaction. If the commit was
+/// successful/conflicted/retryable, the result is Ok(CommitResult), otherwise, if a nonrecoverable
+/// error occurred, the result is Err(Error).
 ///
 /// The commit result can be one of the following:
-/// - CommittedTransaction: the transaction was successfully committed. post-commit stats and
-///   post-commit snapshot can be obtained from the committed transaction.
-/// - ConflictedTransaction: the transaction conflicted with an existing version. This transcation
-///   must be rebased before retrying.
-/// - RetryableTransaction: an IO (retryable) error occurred during the commit. This transaction
+/// - [CommittedTransaction]: the transaction was successfully committed. [PostCommitStats] and
+///   in the future a post-commit snapshot can be obtained from the committed transaction.
+/// - [ConflictedTransaction]: the transaction conflicted with an existing version. This transcation
+///   must be rebased before retrying. (currently no rebase APIs exist, caller must create new txn)
+/// - [RetryableTransaction]: an IO (retryable) error occurred during the commit. This transaction
 ///   can be retried without rebasing.
 #[derive(Debug)]
 #[must_use]
 pub enum CommitResult {
     /// The transaction was successfully committed.
     CommittedTransaction(CommittedTransaction),
-    /// This transaction conflicted with an existing version (at the version given). The transaction
+    /// This transaction conflicted with an existing version (see
+    /// [ConflictedTransaction::conflict_version]). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
@@ -589,6 +592,11 @@ impl CommitResult {
     }
 }
 
+/// This is the result of a successfully committed [Transaction]. One can retrieve the
+/// [PostCommitStats] and [commit version] from this struct. In the future a post-commit snapshot
+/// can be obtained as well.
+///
+/// [commit version]: Self::commit_version
 #[derive(Debug)]
 pub struct CommittedTransaction {
     // TODO: remove after post-commit snapshot
@@ -601,8 +609,8 @@ pub struct CommittedTransaction {
 }
 
 impl CommittedTransaction {
-    /// The version of the table that was just committed
-    pub fn version(&self) -> Version {
+    /// The version of the table that was just sucessfully committed
+    pub fn commit_version(&self) -> Version {
         self.commit_version
     }
 
@@ -614,15 +622,34 @@ impl CommittedTransaction {
     // TODO: post-commit snapshot
 }
 
+/// This is the result of a  [Transaction]. One can retrieve the
+/// [PostCommitStats] and [commit version] from this struct. In the future a post-commit snapshot
+/// can be obtained as well.
+///
+/// [commit version]: Self::commit_version
 #[derive(Debug)]
 pub struct ConflictedTransaction {
-    pub transaction: Transaction,
-    pub conflict_version: Version,
+    // TODO: remove after rebase APIs
+    #[allow(dead_code)]
+    transaction: Transaction,
+    conflict_version: Version,
 }
 
+impl ConflictedTransaction {
+    /// The version attempted commit that yielded a conflict
+    pub fn conflict_version(&self) -> Version {
+        self.conflict_version
+    }
+}
+
+/// A transaction that failed to commit due to a retryable error (e.g. IO error). The transaction
+/// can be recovered with `RetryableTransaction::transaction` and retried without rebasing. The
+/// associated error can be inspected via `RetryableTransaction::error`.
 #[derive(Debug)]
 pub struct RetryableTransaction {
+    /// The transaction that failed to commit due to a retryable error.
     pub transaction: Transaction,
+    /// Transient error that caused the commit to fail.
     pub error: Error,
 }
 

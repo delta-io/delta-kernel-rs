@@ -125,7 +125,7 @@ async fn try_main() -> DeltaResult<()> {
         retries += 1;
     };
 
-    let version = committed.version();
+    let version = committed.commit_version();
     println!("✓ Committed transaction at version {version}");
     println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
 
