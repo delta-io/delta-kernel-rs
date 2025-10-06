@@ -19,7 +19,7 @@ use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Snapshot, Version,
+    RowVisitor, Version,
 };
 
 /// Type alias for an iterator of [`EngineData`] results.
@@ -591,6 +591,8 @@ impl CommitResult {
 
 #[derive(Debug)]
 pub struct CommittedTransaction {
+    // TODO: remove after post-commit snapshot
+    #[allow(dead_code)]
     transaction: Transaction,
     /// the version of the table that was just committed
     commit_version: Version,
@@ -609,13 +611,7 @@ impl CommittedTransaction {
         &self.post_commit_stats
     }
 
-    /// Compute a new snapshot for the table at the commit version. Note this is generally more
-    /// efficient than creating a new snapshot from scratch.
-    pub fn post_commit_snapshot(&self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
-        Snapshot::builder_from(self.transaction.read_snapshot.clone())
-            .at_version(self.commit_version)
-            .build(engine)
-    }
+    // TODO: post-commit snapshot
 }
 
 #[derive(Debug)]
