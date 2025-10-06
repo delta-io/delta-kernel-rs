@@ -1245,4 +1245,35 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_bytes_conversion() {
+        // Test with non-empty bytes
+        let bytes = bytes::Bytes::from(vec![1, 2, 3, 4, 5]);
+        let scalar: Scalar = bytes.into();
+
+        // Verify the scalar is of Binary type
+        assert!(matches!(scalar, Scalar::Binary(_)));
+
+        // Verify the data type
+        assert_eq!(scalar.data_type(), DataType::BINARY);
+
+        // Extract the binary data and verify contents
+        if let Scalar::Binary(data) = scalar {
+            assert_eq!(data, vec![1, 2, 3, 4, 5]);
+        } else {
+            panic!("Expected Binary scalar");
+        }
+
+        // Test with empty bytes
+        let empty_bytes = bytes::Bytes::new();
+        let empty_scalar: Scalar = empty_bytes.into();
+
+        assert!(matches!(empty_scalar, Scalar::Binary(_)));
+        if let Scalar::Binary(data) = empty_scalar {
+            assert!(data.is_empty());
+        } else {
+            panic!("Expected Binary scalar");
+        }
+    }
 }
