@@ -166,8 +166,14 @@ impl TableChanges {
         // TODO: link issue
         #[cfg(feature = "catalog-managed")]
         require!(
-            !start_snapshot.protocol().is_catalog_managed()
-                && !end_snapshot.protocol().is_catalog_managed(),
+            !start_snapshot
+                .table_configuration()
+                .protocol()
+                .is_catalog_managed()
+                && !end_snapshot
+                    .table_configuration()
+                    .protocol()
+                    .is_catalog_managed(),
             Error::unsupported("Change data feed is not supported for catalog-managed tables")
         );
 
@@ -236,7 +242,10 @@ impl TableChanges {
     }
     /// The partition columns that will be read.
     pub(crate) fn partition_columns(&self) -> &Vec<String> {
-        self.end_snapshot.metadata().partition_columns()
+        self.end_snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns()
     }
 
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.

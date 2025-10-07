@@ -6,14 +6,13 @@ use std::sync::Arc;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::LogCompactionWriter;
@@ -50,7 +49,7 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version())
-            .field("metadata", &self.metadata())
+            .field("metadata", &self.table_configuration().metadata())
             .finish()
     }
 }
@@ -311,19 +310,6 @@ impl Snapshot {
         self.table_configuration.schema()
     }
 
-    /// Table [`Metadata`] at this `Snapshot`s version.
-    #[internal_api]
-    pub(crate) fn metadata(&self) -> &Metadata {
-        self.table_configuration.metadata()
-    }
-
-    /// Table [`Protocol`] at this `Snapshot`s version.
-    #[allow(dead_code)]
-    #[internal_api]
-    pub(crate) fn protocol(&self) -> &Protocol {
-        self.table_configuration.protocol()
-    }
-
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
@@ -333,13 +319,6 @@ impl Snapshot {
     #[internal_api]
     pub(crate) fn table_configuration(&self) -> &TableConfiguration {
         &self.table_configuration
-    }
-
-    /// Get the [column mapping
-    /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
-    /// `Snapshot`s version.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.table_configuration.column_mapping_mode()
     }
 
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.
@@ -408,6 +387,7 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::parquet::arrow::ArrowWriter;
 
+    use crate::actions::Protocol;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
@@ -432,7 +412,7 @@ mod tests {
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
-        assert_eq!(snapshot.protocol(), &expected);
+        assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();
@@ -450,7 +430,7 @@ mod tests {
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
-        assert_eq!(snapshot.protocol(), &expected);
+        assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();

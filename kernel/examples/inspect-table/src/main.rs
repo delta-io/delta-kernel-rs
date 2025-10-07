@@ -191,7 +191,7 @@ fn try_main() -> DeltaResult<()> {
             println!("Latest table version: {}", snapshot.version());
         }
         Commands::Metadata => {
-            println!("{:#?}", snapshot.metadata());
+            println!("{:#?}", snapshot.table_configuration().metadata());
         }
         Commands::Schema => {
             println!("{:#?}", snapshot.schema());
