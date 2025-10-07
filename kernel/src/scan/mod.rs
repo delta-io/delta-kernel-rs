@@ -768,6 +768,25 @@ impl StateInfo {
         let mut transform_spec = Vec::new();
         let mut last_physical_field: Option<String> = None;
 
+        // We remember the name of the column that's selecting row indexes, if it's been requested
+        // explicitly. this is so we can reference this column and not re-add it as a requested
+        // column if we're _also_ requesting row-ids
+        let mut selected_row_index_col_name = None;
+
+        // This iteration runs in O(supported_number_of_metadata_columns) time since each metadata
+        // column can appear at most once in the schema
+        for metadata_column in logical_schema.metadata_columns() {
+            if read_field_names.contains(metadata_column.name()) {
+                return Err(Error::Schema(format!(
+                    "Metadata column names must not match physical columns: {}",
+                    metadata_column.name()
+                )));
+            }
+            if let Some(MetadataColumnSpec::RowIndex) = metadata_column.get_metadata_column_spec() {
+                selected_row_index_col_name = Some(metadata_column.name().to_string());
+            }
+        }
+
         // Loop over all selected fields and build both the physical schema and transform spec
         for (index, logical_field) in logical_schema.fields().enumerate() {
             if partition_columns.contains(logical_field.name()) {
@@ -805,18 +824,32 @@ impl StateInfo {
                                 .configuration()
                                 .get("delta.rowTracking.materializedRowIdColumnName")
                                 .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
-                            let index_column_name = "_metadata.row_indexes_for_row_id".to_string();
-                            read_fields.push(StructField::create_metadata_column(
-                                &index_column_name,
-                                MetadataColumnSpec::RowIndex,
-                            ));
+                            // we can `take` as we should only have one RowId col
+                            let index_column_name = match selected_row_index_col_name.take() {
+                                Some(index_column_name) => index_column_name,
+                                None => {
+                                    // ensure we have a column name that isn't already in our schema
+                                    let index_column_name = (0..)
+                                        .map(|i| format!("row_indexes_for_row_id_{}", i))
+                                        .find(|name| logical_schema.field(name).is_none())
+                                        .ok_or(Error::generic(
+                                            "Couldn't generate row index column name",
+                                        ))?;
+                                    read_fields.push(StructField::create_metadata_column(
+                                        &index_column_name,
+                                        MetadataColumnSpec::RowIndex,
+                                    ));
+                                    transform_spec.push(FieldTransformSpec::StaticDrop {
+                                        field_name: index_column_name.clone(),
+                                    });
+                                    index_column_name
+                                }
+                            };
+
                             read_fields.push(StructField::nullable(row_id_col, DataType::LONG));
                             transform_spec.push(FieldTransformSpec::GenerateRowId {
                                 field_name: row_id_col.to_string(),
-                                row_index_field_name: index_column_name.clone(),
-                            });
-                            transform_spec.push(FieldTransformSpec::StaticDrop {
-                                field_name: index_column_name,
+                                row_index_field_name: index_column_name,
                             });
                         } else {
                             return Err(Error::unsupported(
@@ -825,7 +858,7 @@ impl StateInfo {
                         }
                     }
                     Some(MetadataColumnSpec::RowIndex) => {
-                        // handled in parquet reader (TODO: include in output schema?)
+                        // handled in parquet reader
                         select_physical_field()
                     }
                     Some(MetadataColumnSpec::RowCommitVersion) => {
@@ -833,16 +866,6 @@ impl StateInfo {
                     }
                     _ => select_physical_field(),
                 }
-            }
-        }
-
-        // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
-        for metadata_column in logical_schema.metadata_columns() {
-            if read_field_names.contains(metadata_column.name()) {
-                return Err(Error::Schema(format!(
-                    "Metadata column names must not match physical columns: {}",
-                    metadata_column.name()
-                )));
             }
         }
 
