@@ -227,7 +227,7 @@ pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Sc
             } else {
                 schema
             };
-            let schema = if args.with_row_id {
+            if args.with_row_id {
                 Arc::new(
                     schema
                         .add_metadata_column("_metadata.row_id", MetadataColumnSpec::RowId)
@@ -235,8 +235,7 @@ pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Sc
                 )
             } else {
                 schema
-            };
-            schema
+            }
         })
     });
 
