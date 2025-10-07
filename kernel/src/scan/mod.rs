@@ -1627,7 +1627,8 @@ mod tests {
         let state_info = get_simple_state_info(
             schema.clone(),
             vec!["date".to_string()], // date is a partition column
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should have a transform spec for the partition column
         assert!(state_info.transform_spec.is_some());
@@ -1664,7 +1665,8 @@ mod tests {
         let state_info = get_simple_state_info(
             schema.clone(),
             vec!["part1".to_string(), "part2".to_string()],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should have transforms for both partition columns
         assert!(state_info.transform_spec.is_some());
@@ -1715,7 +1717,8 @@ mod tests {
             Some(predicate),
             HashMap::new(), // no extra metadata
             vec![],         // no metadata
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should have a physical predicate
         match &state_info.physical_predicate {
@@ -1765,7 +1768,7 @@ mod tests {
             schema.clone(),
             vec![],
             None,
-            vec![
+            [
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
@@ -1776,16 +1779,15 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect(),
             vec![("row_id", MetadataColumnSpec::RowId)],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should have a transform spec for the row_id column
         let transform_spec = state_info.transform_spec.as_ref().unwrap();
         assert_eq!(transform_spec.len(), 2); // one for rowid col, one to drop indexes
 
         match &transform_spec[0] {
-            FieldTransformSpec::StaticDrop {
-                field_name,
-            } => {
+            FieldTransformSpec::StaticDrop { field_name } => {
                 assert_eq!(field_name, "row_indexes_for_row_id_0");
             }
             _ => panic!("Expected StaticDrop transform"),
@@ -1821,7 +1823,10 @@ mod tests {
                 panic!("Should not have succeeded generating state info without rowids enabled")
             }
             Err(e) => {
-                assert_eq!(e.to_string(), "Unsupported: Row ids are not enabled on this table")
+                assert_eq!(
+                    e.to_string(),
+                    "Unsupported: Row ids are not enabled on this table"
+                )
             }
         }
     }
