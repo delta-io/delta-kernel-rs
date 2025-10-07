@@ -19,7 +19,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
 /// An example program that writes to a Delta table and creates it if necessary.
@@ -102,23 +102,38 @@ async fn try_main() -> DeltaResult<()> {
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
 
-    // Commit the transaction
-    match txn.commit(&engine)? {
-        CommitResult::Committed { version, .. } => {
-            println!("✓ Committed transaction at version {version}");
-            println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
-
-            // Read and display the data
-            read_and_display_data(&url, engine).await?;
-            println!("✓ Successfully read data from the table");
-
-            Ok(())
+    // Commit the transaction (in a simple retry loop)
+    let mut retries = 0;
+    let committed = loop {
+        if retries > 5 {
+            return Err(Error::generic(
+                "Exceeded maximum 5 retries for committing transaction",
+            ));
         }
-        CommitResult::Conflict(_, conflicting_version) => {
-            println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-            Err(Error::generic("Commit failed"))
-        }
-    }
+        txn = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(committed) => break committed,
+            CommitResult::ConflictedTransaction(conflicted) => {
+                let conflicting_version = conflicted.conflict_version();
+                println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
+                return Err(Error::generic("Commit failed"));
+            }
+            CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
+                println!("✗ Failed to commit, retrying... retryable error: {error}");
+                transaction
+            }
+        };
+        retries += 1;
+    };
+
+    let version = committed.commit_version();
+    println!("✓ Committed transaction at version {version}");
+    println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
+
+    // Read and display the data
+    read_and_display_data(&url, engine).await?;
+    println!("✓ Successfully read data from the table");
+
+    Ok(())
 }
 
 /// Creates a new Delta table or gets an existing one.

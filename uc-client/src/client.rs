@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::config::{ClientConfig, ClientConfigBuilder};
 use crate::error::{Error, Result};
-use crate::models::commits::{CommitsRequest, CommitsResponse};
+use crate::models::commits::{CommitRequest, CommitResponse, CommitsRequest, CommitsResponse};
 use crate::models::credentials::{CredentialsRequest, Operation, TemporaryTableCredentials};
 use crate::models::tables::TablesResponse;
 
@@ -56,6 +56,27 @@ impl UCClient {
             .execute_with_retry(|| {
                 self.client
                     .request(reqwest::Method::GET, url.clone())
+                    .json(&request)
+                    .send()
+            })
+            .await?;
+
+        let res = self.handle_response(response).await;
+        println!("\nGet commits response: {:?}\n", res);
+        res
+    }
+
+    #[instrument(skip(self))]
+    pub async fn commit(&self, request: CommitRequest) -> Result<CommitResponse> {
+        let url = self.base_url.join("delta/preview/commits")?;
+
+        let json = serde_json::to_string_pretty(&request).unwrap_or_default();
+        println!("Committing: {json}");
+
+        let response = self
+            .execute_with_retry(|| {
+                self.client
+                    .request(reqwest::Method::POST, url.clone())
                     .json(&request)
                     .send()
             })

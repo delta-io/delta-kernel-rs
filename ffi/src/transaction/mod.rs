@@ -112,13 +112,16 @@ pub unsafe extern "C" fn commit(
     // TODO: for now this removes the enum, which prevents doing any conflict resolution. We should fix
     //       this by making the commit function return the enum somehow.
     match txn.commit(engine.as_ref()) {
-        Ok(CommitResult::Committed {
-            version: v,
-            post_commit_stats: _,
-        }) => Ok(v),
-        Ok(CommitResult::Conflict(_, v)) => Err(delta_kernel::Error::Generic(format!(
-            "commit conflict at version {v}"
-        ))),
+        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
+        Ok(CommitResult::RetryableTransaction(_)) => Err(delta_kernel::Error::unsupported(
+            "commit failed: retryable transaction not supported in FFI (yet)",
+        )),
+        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
+            Err(delta_kernel::Error::Generic(format!(
+                "commit conflict at version {}",
+                conflicted.conflict_version()
+            )))
+        }
         Err(e) => Err(e),
     }
     .into_extern_result(&extern_engine)

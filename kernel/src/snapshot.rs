@@ -8,6 +8,7 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
+use crate::committer::Publisher;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
@@ -329,6 +330,22 @@ impl Snapshot {
     /// Create a [`Transaction`] for this `SnapshotRef`.
     pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
         Transaction::try_new(self)
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    pub fn publish(mut self, engine: &dyn Engine, publisher: &dyn Publisher) -> DeltaResult<Self> {
+        // FIXME: remove clone
+        self.log_segment = self.log_segment.clone().publish(engine)?;
+
+        println!("Published log segment");
+        for commit in &self.log_segment.ascending_commit_files {
+            println!("commit: {:?}", commit);
+        }
+
+        // how to get committer + context?
+        publisher.published(self.version())?;
+
+        Ok(self)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated

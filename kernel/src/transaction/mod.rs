@@ -9,6 +9,7 @@ use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
+use crate::committer::{CommitMetadata, CommitResponse, Committer, FileSystemCommitter};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
@@ -16,15 +17,11 @@ use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, require};
 use crate::{
-    DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version,
+    DataType, DeltaResult, Engine, EngineData, EngineDataResultIterator, Expression, ExpressionRef,
+    IntoEngineData, RowVisitor, Version,
 };
-
-/// Type alias for an iterator of [`EngineData`] results.
-type EngineDataResultIterator<'a> =
-    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The minimal (i.e., mandatory) fields in an add action.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -116,6 +113,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: SnapshotRef,
+    committer: Option<Arc<dyn Committer>>,
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -160,6 +158,7 @@ impl Transaction {
 
         Ok(Transaction {
             read_snapshot,
+            committer: None,
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
@@ -169,9 +168,39 @@ impl Transaction {
         })
     }
 
-    /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
-    /// will include the failed transaction in case of a conflict so the user can retry.
+    /// Set the committer that will be used to commit this transaction. If not set, the default
+    /// filesystem-based committer will be used. Note that the default committer is only allowed
+    /// for non-catalog-managed tables.
+    #[cfg(feature = "catalog-managed")]
+    pub fn with_committer(mut self, committer: impl Into<Arc<dyn Committer>>) -> Self {
+        self.committer = Some(committer.into());
+        self
+    }
+
+    /// Consume the transaction and commit it to the table. The result is a  result of
+    /// [CommitResult] with the following semantics:
+    /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
+    ///   transaction in case of a conflict so the user can retry, etc.)
+    /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+        // Step 0: Determine the committer to use
+        #[cfg(feature = "catalog-managed")]
+        if self.committer.is_none() {
+            require!(
+                !self.read_snapshot.table_configuration().protocol().is_catalog_managed(),
+                Error::generic("Cannot use the default committer for a catalog-managed table. Please provide a committer via Transaction::with_committer.")
+            );
+        }
+
+        let default_committer: Arc<dyn Committer>;
+        let committer = match self.committer.as_ref() {
+            Some(c) => c,
+            None => {
+                default_committer = FileSystemCommitter::new();
+                &default_committer
+            }
+        };
+
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -223,27 +252,17 @@ impl Transaction {
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
-
-        let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
-        {
-            Ok(()) => Ok(CommitResult::Committed {
-                version: commit_version,
-                post_commit_stats: PostCommitStats {
-                    commits_since_checkpoint: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_checkpoint()
-                        + 1,
-                    commits_since_log_compaction: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_log_compaction_or_checkpoint()
-                        + 1,
-                },
-            }),
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
-            Err(e) => Err(e),
+        let commit_metadata =
+            CommitMetadata::new(commit_path, commit_version, self.commit_timestamp);
+        match committer.commit(engine, Box::new(filtered_actions), commit_metadata) {
+            Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(version),
+            )),
+            Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
+                self.into_conflicted(version),
+            )),
+            // TODO: we want to be more selective about what is retryable
+            Err(e) => Ok(CommitResult::RetryableTransaction(self.into_retryable(e))),
         }
     }
 
@@ -489,6 +508,52 @@ impl Transaction {
             Ok((Box::new(add_actions), None))
         }
     }
+
+    // FIXME: remove
+    pub fn hack_actions(&self, engine: &dyn Engine) -> EngineDataResultIterator<'_> {
+        let mut commit_info = CommitInfo::new(
+            self.commit_timestamp,
+            self.operation.clone(),
+            self.engine_info.clone(),
+        );
+        commit_info.in_commit_timestamp = Some(self.commit_timestamp);
+        let commit_info_action =
+            commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
+        let actions = iter::once(commit_info_action);
+        Box::new(actions)
+    }
+
+    fn into_committed(self, version: Version) -> CommittedTransaction {
+        let stats = PostCommitStats {
+            commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
+                + 1,
+            commits_since_log_compaction: self
+                .read_snapshot
+                .log_segment()
+                .commits_since_log_compaction_or_checkpoint()
+                + 1,
+        };
+
+        CommittedTransaction {
+            transaction: self,
+            commit_version: version,
+            post_commit_stats: stats,
+        }
+    }
+
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction {
+        ConflictedTransaction {
+            transaction: self,
+            conflict_version,
+        }
+    }
+
+    fn into_retryable(self, error: Error) -> RetryableTransaction {
+        RetryableTransaction {
+            transaction: self,
+            error,
+        }
+    }
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -536,22 +601,99 @@ pub struct PostCommitStats {
     pub commits_since_log_compaction: u64,
 }
 
-/// Result of committing a transaction.
+/// The result of attempting to commit this transaction. If the commit was
+/// successful/conflicted/retryable, the result is Ok(CommitResult), otherwise, if a nonrecoverable
+/// error occurred, the result is Err(Error).
+///
+/// The commit result can be one of the following:
+/// - [CommittedTransaction]: the transaction was successfully committed. [PostCommitStats] and
+///   in the future a post-commit snapshot can be obtained from the committed transaction.
+/// - [ConflictedTransaction]: the transaction conflicted with an existing version. This transcation
+///   must be rebased before retrying. (currently no rebase APIs exist, caller must create new txn)
+/// - [RetryableTransaction]: an IO (retryable) error occurred during the commit. This transaction
+///   can be retried without rebasing.
 #[derive(Debug)]
+#[must_use]
 pub enum CommitResult {
     /// The transaction was successfully committed.
-    Committed {
-        /// the version of the table that was just committed
-        version: Version,
-        /// The [`PostCommitStats`] for this transaction
-        post_commit_stats: PostCommitStats,
-    },
-    /// This transaction conflicted with an existing version (at the version given). The transaction
+    CommittedTransaction(CommittedTransaction),
+    /// This transaction conflicted with an existing version (see
+    /// [ConflictedTransaction::conflict_version]). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    Conflict(Transaction, Version),
+    ConflictedTransaction(ConflictedTransaction),
+    /// An IO (retryable) error occurred during the commit.
+    RetryableTransaction(RetryableTransaction),
+}
+
+impl CommitResult {
+    /// Returns true if the commit was successful.
+    pub fn is_committed(&self) -> bool {
+        matches!(self, CommitResult::CommittedTransaction(_))
+    }
+}
+
+/// This is the result of a successfully committed [Transaction]. One can retrieve the
+/// [PostCommitStats] and [commit version] from this struct. In the future a post-commit snapshot
+/// can be obtained as well.
+///
+/// [commit version]: Self::commit_version
+#[derive(Debug)]
+pub struct CommittedTransaction {
+    // TODO: remove after post-commit snapshot
+    #[allow(dead_code)]
+    transaction: Transaction,
+    /// the version of the table that was just committed
+    commit_version: Version,
+    /// The [`PostCommitStats`] for this transaction
+    post_commit_stats: PostCommitStats,
+}
+
+impl CommittedTransaction {
+    /// The version of the table that was just sucessfully committed
+    pub fn commit_version(&self) -> Version {
+        self.commit_version
+    }
+
+    /// The [`PostCommitStats`] for this transaction
+    pub fn post_commit_stats(&self) -> &PostCommitStats {
+        &self.post_commit_stats
+    }
+
+    // TODO: post-commit snapshot
+}
+
+/// This is the result of a  [Transaction]. One can retrieve the
+/// [PostCommitStats] and [commit version] from this struct. In the future a post-commit snapshot
+/// can be obtained as well.
+///
+/// [commit version]: Self::commit_version
+#[derive(Debug)]
+pub struct ConflictedTransaction {
+    // TODO: remove after rebase APIs
+    #[allow(dead_code)]
+    transaction: Transaction,
+    conflict_version: Version,
+}
+
+impl ConflictedTransaction {
+    /// The version attempted commit that yielded a conflict
+    pub fn conflict_version(&self) -> Version {
+        self.conflict_version
+    }
+}
+
+/// A transaction that failed to commit due to a retryable error (e.g. IO error). The transaction
+/// can be recovered with `RetryableTransaction::transaction` and retried without rebasing. The
+/// associated error can be inspected via `RetryableTransaction::error`.
+#[derive(Debug)]
+pub struct RetryableTransaction {
+    /// The transaction that failed to commit due to a retryable error.
+    pub transaction: Transaction,
+    /// Transient error that caused the commit to fail.
+    pub error: Error,
 }
 
 #[cfg(test)]
