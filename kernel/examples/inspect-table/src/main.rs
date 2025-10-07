@@ -86,6 +86,7 @@ impl LogVisitor {
         let mut it = NAMES_AND_TYPES.as_ref().0.iter().enumerate().peekable();
         while let Some((start, col)) = it.next() {
             let mut end = start + 1;
+            // move forward while the top level struct has the same name
             while it.next_if(|(_, other)| col[0] == other[0]).is_some() {
                 end += 1;
             }
@@ -104,9 +105,10 @@ impl RowVisitor for LogVisitor {
         NAMES_AND_TYPES.as_ref()
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        if getters.len() != 55 {
+        let expected = NAMES_AND_TYPES.as_ref().0.len();
+        if getters.len() != expected {
             return Err(Error::InternalError(format!(
-                "Wrong number of LogVisitor getters: {}",
+                "Wrong number of LogVisitor getters: {}, expected {expected}",
                 getters.len()
             )));
         }
