@@ -400,7 +400,7 @@ mod tests {
         add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
         run_with_validate_callback,
     };
-    use crate::scan::tests::get_state_info;
+    use crate::scan::tests::get_simple_state_info;
     use crate::scan::{PhysicalPredicate, StateInfo};
     use crate::Expression as Expr;
     use crate::{
@@ -490,7 +490,7 @@ mod tests {
             StructField::new("date", DataType::DATE, true),
         ]));
         let partition_cols = vec!["date".to_string()];
-        let state_info = get_state_info(schema, partition_cols, None);
+        let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),

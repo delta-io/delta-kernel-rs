@@ -1550,31 +1550,48 @@ mod tests {
         Ok(())
     }
 
+    // get a state info with no predicate or extra metadata
+    pub(crate) fn get_simple_state_info(
+        schema: SchemaRef,
+        partition_columns: Vec<String>,
+    ) -> DeltaResult<StateInfo> {
+        get_state_info(schema, partition_columns, None, HashMap::new(), vec![])
+    }
+
     pub(crate) fn get_state_info(
         schema: SchemaRef,
         partition_columns: Vec<String>,
         predicate: Option<PredicateRef>,
-    ) -> StateInfo {
+        metadata_configuration: HashMap<String, String>,
+        metadata_cols: Vec<(&str, MetadataColumnSpec)>,
+    ) -> DeltaResult<StateInfo> {
         let metadata = Metadata::try_new(
             None,
             None,
             schema.as_ref().clone(),
             partition_columns,
             10,
-            HashMap::new(),
-        )
-        .unwrap();
+            metadata_configuration,
+        )?;
         let no_features: Option<Vec<String>> = None; // needed for type annotation
-        let protocol = Protocol::try_new(1, 2, no_features.clone(), no_features).unwrap();
+        let protocol = Protocol::try_new(1, 2, no_features.clone(), no_features)?;
         let table_configuration = TableConfiguration::try_new(
             metadata,
             protocol,
             Url::parse("s3://my-table").unwrap(),
             1,
-        )
-        .unwrap();
+        )?;
 
-        StateInfo::try_new(schema.clone(), &table_configuration, predicate).unwrap()
+        let mut schema = schema;
+        for (name, spec) in metadata_cols.into_iter() {
+            schema = Arc::new(
+                schema
+                    .add_metadata_column(name, spec)
+                    .expect("Couldn't add metadata col"),
+            );
+        }
+
+        StateInfo::try_new(schema.clone(), &table_configuration, predicate)
     }
 
     #[test]
@@ -1585,11 +1602,7 @@ mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let state_info = get_state_info(
-            schema.clone(),
-            vec![], // no partition columns
-            None,   // No predicate
-        );
+        let state_info = get_simple_state_info(schema.clone(), vec![]).unwrap();
 
         // Should have no transform spec (no partitions, no column mapping)
         assert!(state_info.transform_spec.is_none());
@@ -1611,11 +1624,10 @@ mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let state_info = get_state_info(
+        let state_info = get_simple_state_info(
             schema.clone(),
             vec!["date".to_string()], // date is a partition column
-            None,                     // no predicate
-        );
+        ).unwrap();
 
         // Should have a transform spec for the partition column
         assert!(state_info.transform_spec.is_some());
@@ -1649,11 +1661,10 @@ mod tests {
             StructField::nullable("part2", DataType::INTEGER), // Partition
         ]));
 
-        let state_info = get_state_info(
+        let state_info = get_simple_state_info(
             schema.clone(),
             vec!["part1".to_string(), "part2".to_string()],
-            None, // no predicate
-        );
+        ).unwrap();
 
         // Should have transforms for both partition columns
         assert!(state_info.transform_spec.is_some());
@@ -1702,7 +1713,9 @@ mod tests {
             schema.clone(),
             vec![], // no partition columns
             Some(predicate),
-        );
+            HashMap::new(), // no extra metadata
+            vec![],         // no metadata
+        ).unwrap();
 
         // Should have a physical predicate
         match &state_info.physical_predicate {
@@ -1723,7 +1736,7 @@ mod tests {
             StructField::nullable("value", DataType::LONG),
         ]));
 
-        let state_info = get_state_info(schema.clone(), vec!["date".to_string()], None);
+        let state_info = get_simple_state_info(schema.clone(), vec!["date".to_string()]).unwrap();
 
         // Should have a transform spec for the partition column
         let transform_spec = state_info.transform_spec.as_ref().unwrap();
@@ -1738,6 +1751,78 @@ mod tests {
                 assert_eq!(insert_after, &None); // No physical field before it, so prepend
             }
             _ => panic!("Expected MetadataDerivedColumn transform"),
+        }
+    }
+
+    #[test]
+    fn test_state_info_request_row_ids() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]));
+
+        let state_info = get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            vec![
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "some-row-id_col",
+                ),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        ).unwrap();
+
+        // Should have a transform spec for the row_id column
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_eq!(transform_spec.len(), 2); // one for rowid col, one to drop indexes
+
+        match &transform_spec[0] {
+            FieldTransformSpec::StaticDrop {
+                field_name,
+            } => {
+                assert_eq!(field_name, "row_indexes_for_row_id_0");
+            }
+            _ => panic!("Expected StaticDrop transform"),
+        }
+
+        match &transform_spec[1] {
+            FieldTransformSpec::GenerateRowId {
+                field_name,
+                row_index_field_name,
+            } => {
+                assert_eq!(field_name, "some-row-id_col");
+                assert_eq!(row_index_field_name, "row_indexes_for_row_id_0");
+            }
+            _ => panic!("Expected GenerateRowId transform"),
+        }
+    }
+
+    #[test]
+    fn test_state_info_request_row_ids_not_enabled() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]));
+
+        match get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            HashMap::new(),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        ) {
+            Ok(_) => {
+                panic!("Should not have succeeded generating state info without rowids enabled")
+            }
+            Err(e) => {
+                assert_eq!(e.to_string(), "Unsupported: Row ids are not enabled on this table")
+            }
         }
     }
 }
