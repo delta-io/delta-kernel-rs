@@ -584,7 +584,10 @@ impl LogSegment {
 
         // Transform staged commits into published commits
         for i in 0..self.ascending_commit_files.len() {
-            if matches!(self.ascending_commit_files[i].file_type, LogPathFileType::StagedCommit) {
+            if matches!(
+                self.ascending_commit_files[i].file_type,
+                LogPathFileType::StagedCommit
+            ) {
                 // Clone the staged commit to get source location before transforming
                 let source_location = self.ascending_commit_files[i].location.location.clone();
 

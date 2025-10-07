@@ -7,15 +7,17 @@ use url::Url;
 
 #[derive(Debug)]
 pub struct CommitMetadata {
-    pub(crate) commit_path: ParsedLogPath<Url>,
-    pub(crate) version: Version,
+    pub commit_path: ParsedLogPath<Url>,
+    pub version: Version,
+    pub timestamp: i64,
 }
 
 impl CommitMetadata {
-    pub(crate) fn new(commit_path: ParsedLogPath<Url>, version: Version) -> Self {
+    pub(crate) fn new(commit_path: ParsedLogPath<Url>, version: Version, timestamp: i64) -> Self {
         Self {
             commit_path,
             version,
+            timestamp,
         }
     }
 }
@@ -34,7 +36,9 @@ pub trait Committer: Send + Sync {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
+}
 
+pub trait Publisher: Send + Sync {
     fn published(&self, _version: Version) -> DeltaResult<()> {
         Ok(())
     }

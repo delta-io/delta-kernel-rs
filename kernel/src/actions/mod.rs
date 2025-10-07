@@ -645,7 +645,7 @@ impl CommitInfo {
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
-            in_commit_timestamp: None,
+            in_commit_timestamp: Some(timestamp),
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),

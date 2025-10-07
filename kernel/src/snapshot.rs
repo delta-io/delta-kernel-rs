@@ -8,6 +8,7 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
 use crate::checkpoint::CheckpointWriter;
+use crate::committer::Publisher;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
@@ -353,7 +354,7 @@ impl Snapshot {
     }
 
     #[cfg(feature = "catalog-managed")]
-    pub fn publish(mut self, engine: &dyn Engine) -> DeltaResult<Self> {
+    pub fn publish(mut self, engine: &dyn Engine, publisher: &dyn Publisher) -> DeltaResult<Self> {
         // FIXME: remove clone
         self.log_segment = self.log_segment.clone().publish(engine)?;
 
@@ -363,7 +364,7 @@ impl Snapshot {
         }
 
         // how to get committer + context?
-        // committer.published(self.version(), context)?;
+        publisher.published(self.version())?;
 
         Ok(self)
     }

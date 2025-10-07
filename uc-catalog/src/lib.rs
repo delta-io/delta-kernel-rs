@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use delta_kernel::{Engine, LogPath, Snapshot, Version};
+use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, Publisher};
+use delta_kernel::Error as DeltaError;
+use delta_kernel::{DeltaResult, Engine, FilteredEngineData, LogPath, Snapshot, Version};
 
 use uc_client::models::{Commit, CommitRequest};
 use uc_client::prelude::*;
@@ -88,7 +90,11 @@ impl<'a> UCCatalog<'a> {
         };
 
         // consume uc-client's Commit and hand back a delta_kernel LogPath
-        let table_url = Url::parse(&table_uri)?;
+        let mut table_url = Url::parse(&table_uri)?;
+        if !table_url.path().ends_with('/') {
+            let path = format!("{}/", table_url.path());
+            table_url.set_path(&path);
+        }
         let commits: Vec<_> = commits
             .commits
             .unwrap_or_default()
@@ -114,50 +120,100 @@ impl<'a> UCCatalog<'a> {
     }
 }
 
-/// A [UCCommitter] is a Unity Catalog [Committer] implementation for committing to delta tables in
-/// UC.
+/// A [UCCommitter] is a Unity Catalog [Committer] implementation for committing to a specific
+/// delta table in UC.
 pub struct UCCommitter {
     client: Arc<UCClient>,
+    table_id: String,
+    table_uri: String,
 }
 
 impl UCCommitter {
-    pub fn new(client: Arc<UCClient>) -> Self {
-        UCCommitter { client }
+    pub fn new(
+        client: Arc<UCClient>,
+        table_id: impl Into<String>,
+        table_uri: impl Into<String>,
+    ) -> Self {
+        UCCommitter {
+            client,
+            table_id: table_id.into(),
+            table_uri: table_uri.into(),
+        }
     }
 }
 
-use delta_kernel::committer::Committer;
-use delta_kernel::EngineDataResultIterator;
-
 impl Committer for UCCommitter {
-    fn commit<'a>(
+    fn commit(
         &self,
-        engine: &'a dyn Engine,
-        actions: EngineDataResultIterator<'a>,
-        commit_metadata: delta_kernel::committer::CommitMetadata,
-    ) -> delta_kernel::DeltaResult<delta_kernel::committer::CommitResponse> {
-        // let commit_req = CommitRequest::new(
-        //     commit_metadata.table_id,
-        //     commit_metadata.table_uri,
-        //     Commit::new(
-        //         commit_metadata.version as i64,
-        //         commit_metadata.timestamp,
-        //         format!("{}.json", commit_metadata.version),
-        //         123,
-        //         123456789,
-        //     ),
-        // );
-        // self.client.commit(commit_req) // ASYNC!
-        todo!()
-    }
+        engine: &dyn Engine,
+        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let uuid = uuid::Uuid::new_v4();
+        let filename = format!(
+            "{version:020}.{uuid}.json",
+            version = commit_metadata.version
+        );
+        // FIXME use table path from commit_metadata?
+        let mut commit_path = Url::parse(&self.table_uri)?;
+        commit_path.path_segments_mut().unwrap().extend(&[
+            "_delta_log",
+            "_staged_commits",
+            &filename,
+        ]);
 
-    fn published(
-        &self,
-        version: Version,
-        context: &UCCommitterContext,
-    ) -> delta_kernel::DeltaResult<()> {
-        let request =
-            CommitRequest::ack_publish(&context.table_id, &context.table_uri, version as i64);
+        // commit info only
+        engine
+            .json_handler()
+            .write_json_file(&commit_path, Box::new(actions), false)?;
+
+        let mut other = Url::parse(&self.table_uri)?;
+        other.path_segments_mut().unwrap().extend(&[
+            "_delta_log",
+            "_staged_commits",
+            &format!("{:020}", commit_metadata.version),
+        ]);
+        let committed = engine
+            .storage_handler()
+            .list_from(&other)?
+            .next()
+            .unwrap()
+            .unwrap();
+        println!("wrote commit file: {:?}", committed);
+
+        let commit_req = CommitRequest::new(
+            self.table_id.clone(),
+            self.table_uri.clone(),
+            Commit::new(
+                commit_metadata.version.try_into().unwrap(),
+                commit_metadata.timestamp,
+                filename,
+                committed.size as i64,
+                committed.last_modified,
+            ),
+        );
+        // FIXME
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                self.client
+                    .commit(commit_req)
+                    .await
+                    .map_err(|e| DeltaError::Generic(format!("UC commit error: {e}")))
+            })
+        })?;
+        Ok(CommitResponse::Committed {
+            version: commit_metadata.version,
+        })
+    }
+}
+
+impl Publisher for UCCommitter {
+    fn published(&self, version: Version) -> delta_kernel::DeltaResult<()> {
+        let version = version
+            .try_into()
+            .map_err(|e| delta_kernel::Error::Generic(format!("version conversion error: {e}")))?;
+        let request = CommitRequest::ack_publish(&self.table_id, &self.table_uri, version);
         let handle = tokio::runtime::Handle::current();
         tokio::task::block_in_place(move || {
             handle.block_on(async move {
@@ -256,7 +312,7 @@ mod tests {
     // ignored test which you can run manually to play around with writing to a UC table. run with:
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
     #[ignore]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn write_uc_table() -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
@@ -286,11 +342,15 @@ mod tests {
         ];
 
         let table_url = Url::parse(&table_uri)?;
-        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
+        let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
         let store: Arc<dyn ObjectStore> = store.into();
 
         let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-        let committer = Arc::new(UCCommitter::new(client.clone()));
+        let committer = Arc::new(UCCommitter::new(
+            client.clone(),
+            table_id.clone(),
+            table_uri.clone(),
+        ));
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)
             .await?;
@@ -298,99 +358,45 @@ mod tests {
         let txn = snapshot
             .clone()
             .transaction()?
-            .with_committer(committer as Arc<dyn Committer>);
+            .with_committer(committer.clone() as Arc<dyn Committer>);
         let _write_context = txn.get_write_context();
         // do a write.
 
-        let last_modified = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as i64;
-        let size: i64 = 1500;
-        let uuid = uuid::Uuid::new_v4();
-        let version = snapshot.version() + 1;
-        let filename = format!("{version:020}.{uuid}.json");
-        let mut commit_path = table_url.clone();
-        commit_path.path_segments_mut().unwrap().extend(&[
-            "_delta_log",
-            "_staged_commits",
-            &filename,
-        ]);
-
-        // commit info only
-        let actions = txn.hack_actions(&engine);
-        engine
-            .json_handler()
-            .write_json_file(&commit_path, actions, false)?;
-
         // print the log
-        use futures::stream::StreamExt;
-        let mut stream = store.list(Some(&path));
-        while let Some(path) = stream.next().await {
-            println!("object: {:?}", path.unwrap().location);
+        // use futures::stream::StreamExt;
+        // let mut stream = store.list(Some(&path));
+        // while let Some(path) = stream.next().await {
+        //     println!("object: {:?}", path.unwrap());
+        // }
+
+        match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(t) => {
+                println!("🎉 committed version {}", t.commit_version());
+                // FIXME! ideally should use post-commit snapshot (need to make sure to plumb
+                // through log tail)
+                // let snapshot = t.unwrap().post_commit_snapshot(&engine)?;
+                let snapshot = catalog
+                    .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
+                    .await?;
+                let _published = Arc::into_inner(snapshot)
+                    .unwrap()
+                    .publish(&engine, committer.as_ref())?;
+            }
+            CommitResult::ConflictedTransaction(t) => {
+                println!("💥 commit conflicted at version {}", t.conflict_version());
+            }
+            CommitResult::RetryableTransaction(_) => {
+                println!("we should retry...");
+            }
         }
 
-        let commit_req = CommitRequest::new(
-            table_id,
-            table_uri,
-            Commit::new(
-                version.try_into().unwrap(),
-                last_modified,
-                filename,
-                size,
-                last_modified,
-            ),
-        );
-        client.commit(commit_req).await?;
-
-        // match txn.commit(&engine)? {
-        //     CommitResult::CommittedTransaction(t) => {
-        //         println!("🎉 committed version {}", t.version());
-        //     }
-        //     CommitResult::ConflictedTransaction(t) => {
-        //         println!("💥 commit conflicted at version {}", t.conflict_version);
-        //     }
-        //     CommitResult::RetryableTransaction(_) => {
-        //         println!("we should retry...");
-        //     }
-        // }
+        // some debug
         // let commit = store
-        //     .get(&object_store::path::Path::from("19a85dee-54bc-43a2-87ab-023d0ec16013/tables/cdac4b37-fc11-4148-ae02-512e6cc4e1bd/_delta_log/_staged_commits/00000000000000000001.5400fd23-8e08-4f87-8049-7b37431fb826.json"))
+        //     .get(&object_store::path::Path::from("19a85dee-54bc-43a2-87ab-023d0ec16013/tables/3553b6b9-91ce-47d7-b2f9-8eb4ba5e93f5/_delta_log/_staged_commits/00000000000000000001.5cabaf8b-037d-4a84-b493-2e3d8ab899df.json"))
         //     .await
         //     .unwrap();
         // let bytes = commit.bytes().await?;
         // println!("commit file contents:\n{}", String::from_utf8_lossy(&bytes));
-
-        // let ctx = UCCommitterContext {
-        //     table_id: table_id.clone(),
-        //     table_uri: table_uri.clone(),
-        // };
-        // let t = match txn.commit(&engine, ctx)? {
-        //     CommitResult::CommittedTransaction(t) => {
-        //         println!("🎉 committed version {}", t.version());
-        //         Some(t)
-        //     }
-        //     CommitResult::ConflictedTransaction(t) => {
-        //         println!("💥 commit conflicted at version {}", t.conflict_version);
-        //         None
-        //     }
-        //     CommitResult::RetryableTransaction(_) => {
-        //         println!("we should retry...");
-        //         None
-        //     }
-        // };
-
-        // // FIXME! need to plumb log_tail
-        // // let snapshot = t.unwrap().post_commit_snapshot(&engine)?;
-        // let new_version = snapshot.version() + 1;
-        // let snapshot = catalog
-        //     .load_snapshot_at(&table_id, &table_uri, new_version, &engine)
-        //     .await?;
-        // let _published = Arc::into_inner(snapshot).unwrap().publish(&engine)?;
-
-        // // notify UC of publish. since Commmitter is tied to Transaction it's a bit hard to plumb
-        // // this through to Snapshot... TODO
-        // let request = CommitRequest::ack_publish(&table_id, &table_uri, new_version as i64);
-        // client.commit(request).await?;
 
         Ok(())
     }
