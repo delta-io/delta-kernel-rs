@@ -683,4 +683,53 @@ mod tests {
         );
         assert_result_error_with_message(result, "missing partition value for dynamic column");
     }
+
+    #[test]
+    fn test_get_transform_expr_generate_row_ids() {
+        let transform_spec = vec![FieldTransformSpec::GenerateRowId {
+            field_name: "row_id_col".to_string(),
+            row_index_field_name: "row_index_col".to_string(),
+        }];
+
+        // Physical schema contains row index col, but no row-id col
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::not_null("row_index_col", DataType::LONG),
+        ]);
+        let metadata_values = HashMap::new();
+
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            Some(4), /* base_row_id */
+        );
+        let transform_expr = result.expect("Transform expression should be created successfully");
+
+        let Expression::Transform(transform) = transform_expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        assert!(transform.input_path.is_none());
+        let row_id_transform = transform
+            .field_transforms
+            .get("row_id_col")
+            .expect("Should have row_id_col transform");
+        assert!(row_id_transform.is_replace);
+
+        let expeceted_expr = Arc::new(Expression::variadic(
+            crate::expressions::VariadicExpressionOp::Coalesce,
+            vec![
+                Expression::column(["row_id_col"]),
+                Expression::binary(
+                    BinaryExpressionOp::Plus,
+                    Expression::literal(4i64),
+                    Expression::column(["row_index_col"]),
+                ),
+            ],
+        ));
+        assert_eq!(row_id_transform.exprs.len(), 1);
+        let expr = &row_id_transform.exprs[0];
+        assert_eq!(expr, &expeceted_expr);
+    }
 }
