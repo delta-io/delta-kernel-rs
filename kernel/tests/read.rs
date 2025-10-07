@@ -17,7 +17,7 @@ use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterPropertie
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::{Scan, ScanResult};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
-use delta_kernel::{DeltaResult, Engine, FileMeta, Snapshot};
+use delta_kernel::{Engine, FileMeta, Snapshot};
 
 use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -1500,7 +1500,11 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
 
     // Test that unsupported metadata columns fail with appropriate errors
     let test_cases = [
-        ("row_id", MetadataColumnSpec::RowId, "Row ids are not enabled on this table"),
+        (
+            "row_id",
+            MetadataColumnSpec::RowId,
+            "Row ids are not enabled on this table",
+        ),
         (
             "row_commit_version",
             MetadataColumnSpec::RowCommitVersion,
@@ -1519,7 +1523,10 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         match scan {
             Err(e) => {
                 let error_msg = e.to_string();
-                assert!(error_msg.contains(error_text), "Expected {error_msg} to contain {error_text}");
+                assert!(
+                    error_msg.contains(error_text),
+                    "Expected {error_msg} to contain {error_text}"
+                );
             }
             Ok(_) => {
                 panic!(

@@ -278,11 +278,10 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    let file_constant_values =
-        StructType::new_unchecked([
-            StructField::nullable("partitionValues", partition_values),
-            StructField::nullable("baseRowId", DataType::LONG),
-        ]);
+    let file_constant_values = StructType::new_unchecked([
+        StructField::nullable("partitionValues", partition_values),
+        StructField::nullable("baseRowId", DataType::LONG),
+    ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
@@ -307,7 +306,7 @@ fn get_add_transform_expr() -> ExpressionRef {
             column_expr_ref!("add.deletionVector"),
             Arc::new(Expression::Struct(vec![
                 column_expr_ref!("add.partitionValues"),
-                column_expr_ref!("add.baseRowId")
+                column_expr_ref!("add.baseRowId"),
             ])),
         ]))
     });
@@ -401,8 +400,8 @@ mod tests {
         add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
         run_with_validate_callback,
     };
+    use crate::scan::tests::get_state_info;
     use crate::scan::{PhysicalPredicate, StateInfo};
-    use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
         engine::sync::SyncEngine,
@@ -484,26 +483,55 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn test_simple_transform() {
-    //     let schema: SchemaRef = Arc::new(StructType::new_unchecked([
-    //         StructField::new("value", DataType::INTEGER, true),
-    //         StructField::new("date", DataType::DATE, true),
-    //     ]));
-    //     let partition_cols = ["date".to_string()];
-    //     let state_info =
-    //         StateInfo::try_new(schema.as_ref(), &partition_cols, ColumnMappingMode::None).unwrap();
-    //     let static_transform = Some(Arc::new(get_transform_spec(&state_info.all_fields)));
-    //     let batch = vec![add_batch_with_partition_col()];
-    //     let iter = scan_action_iter(
-    //         &SyncEngine::new(),
-    //         batch
-    //             .into_iter()
-    //             .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-    //         schema.clone(),
-    //         schema,
-    //         static_transform,
-    //         None,
-    //     );
-    // }
+    #[test]
+    fn test_simple_transform() {
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ]));
+        let partition_cols = vec!["date".to_string()];
+        let state_info = get_state_info(schema, partition_cols, None);
+        let batch = vec![add_batch_with_partition_col()];
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+        );
+
+        fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
+            assert!(transform.is_some());
+            let Expr::Transform(transform) = transform.unwrap().as_ref() else {
+                panic!("Transform should always be a Transform expr");
+            };
+
+            // With sparse transforms, we expect only one insertion for the partition column
+            assert!(transform.prepended_fields.is_empty());
+            let mut field_transforms = transform.field_transforms.iter();
+            let (field_name, field_transform) = field_transforms.next().unwrap();
+            assert_eq!(field_name, "value");
+            assert!(!field_transform.is_replace);
+            let [expr] = &field_transform.exprs[..] else {
+                panic!("Expected a single insertion");
+            };
+            let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {
+                panic!("Expected a literal date");
+            };
+            assert_eq!(*date_offset, expected_date_offset);
+            assert!(field_transforms.next().is_none());
+        }
+
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            let transforms = scan_metadata.scan_file_transforms;
+            // in this case we have a metadata action first and protocol 3rd, so we expect 4 items,
+            // the first and 3rd being a `None`
+            assert_eq!(transforms.len(), 4, "Should have 4 transforms");
+            assert!(transforms[0].is_none(), "transform at [0] should be None");
+            assert!(transforms[2].is_none(), "transform at [2] should be None");
+            validate_transform(transforms[1].as_ref(), 17511);
+            validate_transform(transforms[3].as_ref(), 17510);
+        }
+    }
 }

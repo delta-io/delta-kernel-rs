@@ -24,12 +24,6 @@ pub(crate) enum ColumnType {
     /// The string contains the physical column name (after any column mapping).
     Selected(String),
 
-    /// Get the rowid column, the usize is the location in the output schema
-    RowId {
-        index_column_name: String, // column name for row indexes
-        physical_name: String,     // column name that contains stable row ids
-    },
-
     /// A metadata-derived column (e.g., partition columns, CDF version and timestamp columns).
     /// The usize is the index of this column in the logical schema.
     MetadataDerivedColumn(usize),
@@ -158,9 +152,9 @@ pub(crate) fn get_transform_expr(
                 field_name,
                 row_index_field_name,
             } => {
-                let base_row_id = base_row_id.ok_or_else(|| Error::Generic(format!(
-                    "Asked to generate RowIds, but no baseRowId found."
-                )))?;
+                let base_row_id = base_row_id.ok_or_else(|| {
+                    Error::generic("Asked to generate RowIds, but no baseRowId found.")
+                })?;
                 let expr = Arc::new(Expression::variadic(
                     crate::expressions::VariadicExpressionOp::Coalesce,
                     vec![
@@ -244,32 +238,6 @@ pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
                 transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
                     insert_after: last_physical_field.map(String::from),
                     field_index: *logical_idx,
-                });
-            }
-            ColumnType::RowId {
-                index_column_name,
-                physical_name,
-            } => {
-                // transform_spec.push(FieldTransformSpec::StaticReplace {
-                //     field_name: physical_name.clone(),
-                //     expr: Arc::new(Expression::variadic(
-                //         crate::expressions::VariadicExpressionOp::Coalesce,
-                //         vec![
-                //             Expression::column([physical_name]),
-                //             Expression::binary(
-                //                 BinaryExpressionOp::Plus,
-                //                 Expression::literal(3i64),
-                //                 Expression::column([index_column_name]),
-                //             ),
-                //         ],
-                //     )),
-                // });
-                transform_spec.push(FieldTransformSpec::GenerateRowId {
-                    field_name: physical_name.clone(),
-                    row_index_field_name: index_column_name.clone(),
-                });
-                transform_spec.push(FieldTransformSpec::StaticDrop {
-                    field_name: index_column_name.clone(),
                 });
             }
             ColumnType::Dynamic {
@@ -507,7 +475,12 @@ mod tests {
 
         // Create a minimal physical schema for test
         let physical_schema = StructType::new_unchecked(vec![]);
-        let result = get_transform_expr(&transform_spec, partition_values, &physical_schema, None /* base_row_id */);
+        let result = get_transform_expr(
+            &transform_spec,
+            partition_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         assert_result_error_with_message(result, "missing partition value");
     }
 
@@ -530,8 +503,13 @@ mod tests {
             StructField::nullable("col1", DataType::STRING),
             StructField::nullable("col2", DataType::LONG),
         ]);
-        let result =
-            get_transform_expr(&transform_spec, metadata_values, &physical_schema, None /* base_row_id */).unwrap();
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        )
+        .unwrap();
 
         let Expression::Transform(transform) = result.as_ref() else {
             panic!("Expected Transform expression");
@@ -568,7 +546,12 @@ mod tests {
         ]);
         let metadata_values = HashMap::new();
 
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema, None /* base_row_id */);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         let transform_expr = result.expect("Transform expression should be created successfully");
 
         let Expression::Transform(transform) = transform_expr.as_ref() else {
@@ -611,7 +594,12 @@ mod tests {
             ),
         );
 
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema, None /* base_row_id */);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         let transform_expr = result.expect("Transform expression should be created successfully");
 
         let Expression::Transform(transform) = transform_expr.as_ref() else {
@@ -643,7 +631,12 @@ mod tests {
         let mut metadata_values = HashMap::new();
         metadata_values.insert(1, ("year".to_string(), Scalar::Integer(2024)));
 
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema, None /* base_row_id */);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         let transform_expr = result.expect("Transform expression should be created successfully");
 
         let Expression::Transform(transform) = transform_expr.as_ref() else {
@@ -682,7 +675,12 @@ mod tests {
         let metadata_values = HashMap::new();
 
         // Should fail with missing data error
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema, None /* base_row_id */);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         assert_result_error_with_message(result, "missing partition value for dynamic column");
     }
 }
