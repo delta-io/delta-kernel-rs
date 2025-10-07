@@ -548,7 +548,7 @@ impl From<&[u8]> for Scalar {
 
 impl From<bytes::Bytes> for Scalar {
     fn from(b: bytes::Bytes) -> Self {
-        Self::Binary(b.to_vec())
+        Self::Binary(b.into())
     }
 }
 
