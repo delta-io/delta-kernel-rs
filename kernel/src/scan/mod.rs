@@ -1806,27 +1806,77 @@ mod tests {
     }
 
     #[test]
-    fn test_state_info_request_row_ids_not_enabled() {
+    fn test_state_info_request_row_ids_and_indexes() {
         let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
         )]));
 
-        match get_state_info(
+        let state_info = get_state_info(
             schema.clone(),
             vec![],
             None,
-            HashMap::new(),
-            vec![("row_id", MetadataColumnSpec::RowId)],
-        ) {
-            Ok(_) => {
-                panic!("Should not have succeeded generating state info without rowids enabled")
+            [
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "some-row-id_col",
+                ),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            vec![
+                ("row_id", MetadataColumnSpec::RowId),
+                ("row_index", MetadataColumnSpec::RowIndex),
+            ],
+        )
+        .unwrap();
+
+        // Should have a transform spec for the row_id column
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_eq!(transform_spec.len(), 1); // just one because we don't want to drop indexes now
+
+        match &transform_spec[0] {
+            FieldTransformSpec::GenerateRowId {
+                field_name,
+                row_index_field_name,
+            } => {
+                assert_eq!(field_name, "some-row-id_col");
+                assert_eq!(row_index_field_name, "row_index");
             }
-            Err(e) => {
-                assert_eq!(
-                    e.to_string(),
-                    "Unsupported: Row ids are not enabled on this table"
-                )
+            _ => panic!("Expected GenerateRowId transform"),
+        }
+    }
+
+    #[test]
+    fn test_state_info_invalid_rowtracking_config() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]));
+
+        for (metadata_config, metadata_cols, expected_error) in [
+            (HashMap::new(), vec![("row_id", MetadataColumnSpec::RowId)], "Unsupported: Row ids are not enabled on this table"),
+            (
+                [("delta.enableRowTracking", "true")]
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                vec![("row_id", MetadataColumnSpec::RowId)],
+                "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
+            ),
+        ] {
+            match get_state_info(schema.clone(), vec![], None, metadata_config, metadata_cols) {
+                Ok(_) => {
+                    panic!("Should not have succeeded generating state info with invalid config")
+                }
+                Err(e) => {
+                    assert_eq!(
+                        e.to_string(),
+                        expected_error,
+                    )
+                }
             }
         }
     }
