@@ -268,7 +268,8 @@ impl Transaction {
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
-        let commit_metadata = CommitMetadata::new(commit_path, commit_version);
+        let commit_metadata =
+            CommitMetadata::new(commit_path, commit_version, self.commit_timestamp);
         match committer.commit(engine, Box::new(filtered_actions), commit_metadata) {
             Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(version),
@@ -578,9 +579,11 @@ impl Transaction {
         }
     }
 
+    // FIXME: remove
     pub fn hack_actions(&self, engine: &dyn Engine) -> EngineDataResultIterator<'_> {
         let mut commit_info = CommitInfo::new(
             self.commit_timestamp,
+            Some(self.commit_timestamp),
             self.operation.clone(),
             self.engine_info.clone(),
         );

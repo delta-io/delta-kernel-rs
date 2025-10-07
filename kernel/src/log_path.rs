@@ -46,6 +46,7 @@ impl LogPath {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
 
         // require table_root ends with '/'
+        println!("table_root: {}", table_root);
         require!(
             table_root.path().ends_with('/'),
             Error::generic("table root must be a directory-like URL ending with '/'")
