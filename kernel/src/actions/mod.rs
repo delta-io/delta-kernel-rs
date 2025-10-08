@@ -13,7 +13,8 @@ use crate::schema::{
     ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::table_features::{
-    ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
+    FeatureType, ReaderFeature, TableFeature, WriterFeature, SUPPORTED_READER_FEATURES,
+    SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -449,6 +450,58 @@ impl Protocol {
     pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
         self.writer_features()
             .is_some_and(|features| features.contains(feature))
+    }
+
+    /// Check if this protocol supports the given table feature.
+    /// This method handles both:
+    /// - Explicit support: feature is listed in reader_features or writer_features
+    /// - Implicit support: feature is supported by legacy protocol versions
+    ///
+    /// For ReaderWriter features, both reader and writer support is required.
+    /// For Writer-only features, only writer support is required.
+    pub(crate) fn supports_feature(&self, feature: TableFeature) -> bool {
+        match feature.feature_type() {
+            FeatureType::Writer => self.supports_writer_feature(feature),
+            FeatureType::ReaderWriter => {
+                self.supports_reader_feature(feature) && self.supports_writer_feature(feature)
+            }
+        }
+    }
+
+    /// Check if this protocol supports a writer feature (explicit or implicit)
+    fn supports_writer_feature(&self, feature: TableFeature) -> bool {
+        // Check explicit support (table features protocol with minWriterVersion=7)
+        if self.min_writer_version == 7 {
+            if let Some(writer_features) = &self.writer_features {
+                return writer_features
+                    .iter()
+                    .any(|wf| wf.to_string() == feature.name());
+            }
+        }
+
+        // Check implicit support (legacy protocol)
+        // Feature is implicitly supported if its min version <= current version
+        feature.min_writer_version() <= self.min_writer_version
+    }
+
+    /// Check if this protocol supports a reader feature (explicit or implicit)
+    fn supports_reader_feature(&self, feature: TableFeature) -> bool {
+        // Writer-only features don't need reader support
+        if feature.feature_type() == FeatureType::Writer {
+            return true;
+        }
+
+        // Check explicit support (table features protocol with minReaderVersion=3)
+        if self.min_reader_version == 3 {
+            if let Some(reader_features) = &self.reader_features {
+                return reader_features
+                    .iter()
+                    .any(|rf| rf.to_string() == feature.name());
+            }
+        }
+
+        // Check implicit support (legacy protocol)
+        feature.min_reader_version() <= self.min_reader_version
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -1972,5 +2025,113 @@ mod tests {
         // reader/writer features are null
         assert!(record_batch.column(2).is_null(0));
         assert!(record_batch.column(3).is_null(0));
+    }
+
+    #[test]
+    fn test_protocol_supports_feature_legacy_writer() {
+        // Test legacy writer feature (AppendOnly) with minWriterVersion=2
+        let protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+
+        // AppendOnly is implicitly supported at minWriterVersion=2
+        assert!(protocol.supports_feature(TableFeature::AppendOnly));
+        assert!(protocol.supports_feature(TableFeature::Invariants));
+
+        // RowTracking requires minWriterVersion=7
+        assert!(!protocol.supports_feature(TableFeature::RowTracking));
+    }
+
+    #[test]
+    fn test_protocol_supports_feature_table_features() {
+        // Test table features protocol with explicit features
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors]),
+            Some([
+                WriterFeature::DeletionVectors,
+                WriterFeature::RowTracking,
+                WriterFeature::DomainMetadata,
+            ]),
+        )
+        .unwrap();
+
+        // Explicitly listed writer feature
+        assert!(protocol.supports_feature(TableFeature::RowTracking));
+        assert!(protocol.supports_feature(TableFeature::DomainMetadata));
+
+        // ReaderWriter feature (needs both reader and writer)
+        assert!(protocol.supports_feature(TableFeature::DeletionVectors));
+
+        // Not explicitly listed
+        assert!(!protocol.supports_feature(TableFeature::AppendOnly));
+    }
+
+    #[test]
+    fn test_protocol_supports_feature_reader_writer() {
+        // Test that ReaderWriter features require both reader and writer support
+
+        // Has writer feature but not reader feature - should fail
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]), // No reader features
+            Some([WriterFeature::DeletionVectors]),
+        )
+        .unwrap();
+        assert!(!protocol.supports_feature(TableFeature::DeletionVectors));
+
+        // Has reader feature but not writer feature - should fail
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors]),
+            Some::<Vec<String>>(vec![]), // No writer features
+        )
+        .unwrap();
+        assert!(!protocol.supports_feature(TableFeature::DeletionVectors));
+
+        // Has both reader and writer features - should succeed
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([ReaderFeature::DeletionVectors]),
+            Some([WriterFeature::DeletionVectors]),
+        )
+        .unwrap();
+        assert!(protocol.supports_feature(TableFeature::DeletionVectors));
+    }
+
+    #[test]
+    fn test_protocol_supports_feature_legacy_reader_writer() {
+        // Test legacy ReaderWriter feature (ColumnMapping) at (2,5)
+        let protocol = Protocol::try_new(2, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+
+        // ColumnMapping is implicitly supported at (2,5)
+        assert!(protocol.supports_feature(TableFeature::ColumnMapping));
+
+        // But not at (1,5) - reader version too low
+        let protocol = Protocol::try_new(1, 5, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        assert!(!protocol.supports_feature(TableFeature::ColumnMapping));
+    }
+
+    #[test]
+    fn test_protocol_supports_feature_mixed_legacy_and_table_features() {
+        // Protocol at version (2,7) with explicit table features
+        let protocol = Protocol::try_new(
+            2,
+            7,
+            None::<Vec<String>>,
+            Some([WriterFeature::RowTracking, WriterFeature::DomainMetadata]),
+        )
+        .unwrap();
+
+        // Explicit table features
+        assert!(protocol.supports_feature(TableFeature::RowTracking));
+        assert!(protocol.supports_feature(TableFeature::DomainMetadata));
+
+        // Legacy features NOT supported because minWriterVersion is now at 7
+        // (when at version 7, features must be explicitly listed)
+        assert!(!protocol.supports_feature(TableFeature::AppendOnly));
+        assert!(!protocol.supports_feature(TableFeature::Invariants));
     }
 }

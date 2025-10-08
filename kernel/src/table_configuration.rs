@@ -17,7 +17,7 @@ use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, ReaderFeature, WriterFeature,
+    ColumnMappingMode, ReaderFeature, TableFeature, WriterFeature,
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
@@ -384,10 +384,7 @@ impl TableConfiguration {
     /// - Have a min_writer_version of 7.
     /// - Have the [`WriterFeature::RowTracking`] writer feature.
     pub(crate) fn is_row_tracking_supported(&self) -> bool {
-        self.protocol().min_writer_version() == 7
-            && self
-                .protocol()
-                .has_writer_feature(&WriterFeature::RowTracking)
+        self.protocol().supports_feature(TableFeature::RowTracking)
     }
 
     /// Returns `true` if row tracking is enabled for this table.
