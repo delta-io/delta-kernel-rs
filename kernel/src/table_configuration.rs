@@ -23,6 +23,19 @@ use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
 
+/// Information about in-commit timestamp enablement state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InCommitTimestampEnablement {
+    /// In-commit timestamps is not enabled
+    NotEnabled,
+    /// In-commit timestamps is enabled
+    Enabled {
+        /// Enablement information, if available. `None` indicates the table was created
+        /// with ICT enabled from the beginning (no enablement properties needed).
+        enablement: Option<(Version, i64)>,
+    },
+}
+
 /// Holds all the configuration for a table at a specific version. This includes the supported
 /// reader and writer features, table properties, schema, version, and table root. This can be used
 /// to check whether a table supports a feature or has it enabled. For example, deletion vector
@@ -317,17 +330,18 @@ impl TableConfiguration {
                 .unwrap_or(false)
     }
 
-    /// If in-commit timestamps is enabled, returns a tuple of the in-commit timestamp enablement
-    /// version and timestamp.
+    /// Returns information about in-commit timestamp enablement state.
     ///
-    /// If in-commit timestamps is not supported, or not enabled, this returns `None`.
-    /// If in-commit timestams is enabled, but the enablement version or timestamp is not present,
-    /// this returns an error.
+    /// Returns an error if only one of the enablement properties is present, as this indicates
+    /// an inconsistent state.
     #[allow(unused)]
-    pub(crate) fn in_commit_timestamp_enablement(&self) -> DeltaResult<Option<(Version, i64)>> {
+    pub(crate) fn in_commit_timestamp_enablement(
+        &self,
+    ) -> DeltaResult<InCommitTimestampEnablement> {
         if !self.is_in_commit_timestamps_enabled() {
-            return Ok(None);
+            return Ok(InCommitTimestampEnablement::NotEnabled);
         }
+
         let enablement_version = self
             .table_properties()
             .in_commit_timestamp_enablement_version;
@@ -335,18 +349,19 @@ impl TableConfiguration {
             .table_properties()
             .in_commit_timestamp_enablement_timestamp;
 
-        let ict_error = |err: &str| {
-            Error::generic(format!(
-                "In-commit timestamp enabled, but missing Enablement version or timestamp. {err}"
-            ))
-        };
         match (enablement_version, enablement_timestamp) {
-            (Some(version), Some(timestamp)) => Ok(Some((version, timestamp))),
-            (Some(_), None) => Err(ict_error("Enablement timestamp is not present")),
-            (None, Some(_)) => Err(ict_error("Enablement version is not present")),
-            (None, None) => Err(ict_error(
-                "Enablement version and timestamp are not present.",
+            (Some(version), Some(timestamp)) => Ok(InCommitTimestampEnablement::Enabled {
+                enablement: Some((version, timestamp)),
+            }),
+            (Some(_), None) => Err(Error::generic(
+                "In-commit timestamp enabled, but enablement timestamp is missing",
             )),
+            (None, Some(_)) => Err(Error::generic(
+                "In-commit timestamp enabled, but enablement version is missing",
+            )),
+            // If InCommitTimestamps was enabled at the beginning of the table's history,
+            // it may have an empty enablement version and timestamp
+            (None, None) => Ok(InCommitTimestampEnablement::Enabled { enablement: None }),
         }
     }
 
@@ -417,23 +432,26 @@ mod test {
     use url::Url;
 
     use crate::actions::{Metadata, Protocol};
+    use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::{ReaderFeature, WriterFeature};
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
 
-    use super::TableConfiguration;
+    use super::{InCommitTimestampEnablement, TableConfiguration};
 
     #[test]
     fn dv_supported_not_enabled() {
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -448,18 +466,22 @@ mod test {
     }
     #[test]
     fn dv_enabled() {
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            ),
-            (
-                "delta.enableDeletionVectors".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([
+                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                (
+                    "delta.enableDeletionVectors".to_string(),
+                    "true".to_string(),
+                ),
+            ]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -473,17 +495,20 @@ mod test {
         assert!(table_config.is_deletion_vector_enabled());
     }
     #[test]
-    fn ict_supported_and_enabled() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            configuration: HashMap::from_iter([(
+    fn ict_enabled_from_table_creation() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0, // Table creation version
+            HashMap::from_iter([(
                 "delta.enableInCommitTimestamps".to_string(),
                 "true".to_string(),
-            ),
-                ("delta.inCommitTimestampEnablementVersion".to_string(), "5".to_string()),
-                ("delta.inCommitTimestampEnablementTimestamp".to_string(), "100".to_string())]),
-            ..Default::default()
-        };
+            )]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -495,19 +520,80 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_in_commit_timestamps_supported());
         assert!(table_config.is_in_commit_timestamps_enabled());
-        let enablement = table_config.in_commit_timestamp_enablement().unwrap();
-        assert_eq!(enablement, Some((5, 100)))
+        // When ICT is enabled from table creation (version 0), it's perfectly normal
+        // for enablement properties to be missing
+        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(
+            info,
+            InCommitTimestampEnablement::Enabled { enablement: None }
+        );
     }
     #[test]
-    fn ict_supported_and_enabled_without_enablement_info() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            configuration: HashMap::from_iter([(
-                "delta.enableInCommitTimestamps".to_string(),
-                "true".to_string(),
-            )]),
-            ..Default::default()
-        };
+    fn ict_supported_and_enabled() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([
+                (
+                    "delta.enableInCommitTimestamps".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "delta.inCommitTimestampEnablementVersion".to_string(),
+                    "5".to_string(),
+                ),
+                (
+                    "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                    "100".to_string(),
+                ),
+            ]),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some([WriterFeature::InCommitTimestamp]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(table_config.is_in_commit_timestamps_supported());
+        assert!(table_config.is_in_commit_timestamps_enabled());
+        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(
+            info,
+            InCommitTimestampEnablement::Enabled {
+                enablement: Some((5, 100))
+            }
+        )
+    }
+    #[test]
+    fn ict_enabled_with_partial_enablement_info() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([
+                (
+                    "delta.enableInCommitTimestamps".to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    "delta.inCommitTimestampEnablementVersion".to_string(),
+                    "5".to_string(),
+                ),
+                // Missing enablement timestamp
+            ]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -520,15 +606,14 @@ mod test {
         assert!(table_config.is_in_commit_timestamps_supported());
         assert!(table_config.is_in_commit_timestamps_enabled());
         assert!(matches!(
-                table_config.in_commit_timestamp_enablement(),
-                Err(Error::Generic(msg)) if msg.contains("Enablement version and timestamp are not present.")));
+            table_config.in_commit_timestamp_enablement(),
+            Err(Error::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
+        ));
     }
     #[test]
     fn ict_supported_and_not_enabled() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -540,13 +625,13 @@ mod test {
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
         assert!(table_config.is_in_commit_timestamps_supported());
         assert!(!table_config.is_in_commit_timestamps_enabled());
+        let info = table_config.in_commit_timestamp_enablement().unwrap();
+        assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
     }
     #[test]
     fn fails_on_unsupported_feature() {
-        let metadata = Metadata {
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         TableConfiguration::try_new(metadata, protocol, table_root, 0)
@@ -554,14 +639,16 @@ mod test {
     }
     #[test]
     fn dv_not_supported() {
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -577,15 +664,16 @@ mod test {
 
     #[test]
     fn test_try_new_from() {
-        let schema_string =r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string();
-        let metadata = Metadata {
-            configuration: HashMap::from_iter([(
-                "delta.enableChangeDataFeed".to_string(),
-                "true".to_string(),
-            )]),
-            schema_string: schema_string.clone(),
-            ..Default::default()
-        };
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            0,
+            HashMap::from_iter([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+        )
+        .unwrap();
         let protocol = Protocol::try_new(
             3,
             7,
@@ -596,8 +684,15 @@ mod test {
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
 
-        let new_metadata = Metadata {
-            configuration: HashMap::from_iter([
+        let new_schema =
+            StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let new_metadata = Metadata::try_new(
+            None,
+            None,
+            new_schema,
+            vec![],
+            0,
+            HashMap::from_iter([
                 (
                     "delta.enableChangeDataFeed".to_string(),
                     "false".to_string(),
@@ -607,9 +702,8 @@ mod test {
                     "true".to_string(),
                 ),
             ]),
-            schema_string,
-            ..Default::default()
-        };
+        )
+        .unwrap();
         let new_protocol = Protocol::try_new(
             3,
             7,
@@ -652,11 +746,9 @@ mod test {
     #[test]
     fn test_timestamp_ntz_validation_integration() {
         // Schema with TIMESTAMP_NTZ column
-        let schema_string = r#"{"type":"struct","fields":[{"name":"ts","type":"timestamp_ntz","nullable":true,"metadata":{}}]}"#.to_string();
-        let metadata = Metadata {
-            schema_string,
-            ..Default::default()
-        };
+        let schema =
+            StructType::new_unchecked([StructField::nullable("ts", DataType::TIMESTAMP_NTZ)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_timestamp_ntz_features = Protocol::try_new(
             3,
@@ -699,11 +791,9 @@ mod test {
     #[test]
     fn test_variant_validation_integration() {
         // Schema with VARIANT column
-        let schema_string = r#"{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}"#.to_string();
-        let metadata = Metadata {
-            schema_string,
-            ..Default::default()
-        };
+        let schema =
+            StructType::new_unchecked([StructField::nullable("v", DataType::unshredded_variant())]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
 
         let protocol_without_variant_features = Protocol::try_new(
             3,

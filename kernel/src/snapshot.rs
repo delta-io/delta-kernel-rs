@@ -6,18 +6,17 @@ use std::sync::Arc;
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
-use crate::actions::{Metadata, Protocol, INTERNAL_DOMAIN_PREFIX};
+use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::LogCompactionWriter;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, Error, ParsedLogPath, Version};
 use delta_kernel_derive::internal_api;
 
 mod builder;
@@ -50,7 +49,7 @@ impl std::fmt::Debug for Snapshot {
         f.debug_struct("Snapshot")
             .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version())
-            .field("metadata", &self.metadata())
+            .field("metadata", &self.table_configuration().metadata())
             .finish()
     }
 }
@@ -98,7 +97,8 @@ impl Snapshot {
     /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
     /// snapshot to a later version.
     fn try_new_from(
-        existing_snapshot: SnapshotRef,
+        existing_snapshot: Arc<Snapshot>,
+        log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
     ) -> DeltaResult<Arc<Self>> {
@@ -128,6 +128,7 @@ impl Snapshot {
         let new_listed_files = ListedLogFiles::list(
             storage.as_ref(),
             &log_root,
+            log_tail,
             Some(listing_start),
             new_version,
         )?;
@@ -154,6 +155,8 @@ impl Snapshot {
 
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
+        // Save the latest_commit before moving new_listed_files
+        let new_latest_commit_file = new_listed_files.latest_commit_file.clone();
         let mut new_log_segment =
             LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
 
@@ -220,6 +223,10 @@ impl Snapshot {
             .latest_crc_file
             .or_else(|| old_log_segment.latest_crc_file.clone());
 
+        // Use the new latest_commit if available, otherwise use the old one
+        // This handles the case where the new listing returned no commits
+        let latest_commit_file =
+            new_latest_commit_file.or_else(|| old_log_segment.latest_commit_file.clone());
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
@@ -228,6 +235,7 @@ impl Snapshot {
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
+                latest_commit_file,
             },
             log_root,
             new_version,
@@ -302,19 +310,6 @@ impl Snapshot {
         self.table_configuration.schema()
     }
 
-    /// Table [`Metadata`] at this `Snapshot`s version.
-    #[internal_api]
-    pub(crate) fn metadata(&self) -> &Metadata {
-        self.table_configuration.metadata()
-    }
-
-    /// Table [`Protocol`] at this `Snapshot`s version.
-    #[allow(dead_code)]
-    #[internal_api]
-    pub(crate) fn protocol(&self) -> &Protocol {
-        self.table_configuration.protocol()
-    }
-
     /// Get the [`TableProperties`] for this [`Snapshot`].
     pub fn table_properties(&self) -> &TableProperties {
         self.table_configuration().table_properties()
@@ -326,20 +321,8 @@ impl Snapshot {
         &self.table_configuration
     }
 
-    /// Get the [column mapping
-    /// mode](https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping) at this
-    /// `Snapshot`s version.
-    pub fn column_mapping_mode(&self) -> ColumnMappingMode {
-        self.table_configuration.column_mapping_mode()
-    }
-
     /// Create a [`ScanBuilder`] for an `SnapshotRef`.
     pub fn scan_builder(self: Arc<Self>) -> ScanBuilder {
-        ScanBuilder::new(self)
-    }
-
-    /// Consume this `Snapshot` to create a [`ScanBuilder`]
-    pub fn into_scan_builder(self) -> ScanBuilder {
         ScanBuilder::new(self)
     }
 
@@ -404,6 +387,7 @@ mod tests {
     use crate::arrow::record_batch::RecordBatch;
     use crate::parquet::arrow::ArrowWriter;
 
+    use crate::actions::Protocol;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
@@ -428,7 +412,7 @@ mod tests {
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
-        assert_eq!(snapshot.protocol(), &expected);
+        assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();
@@ -446,7 +430,7 @@ mod tests {
 
         let expected =
             Protocol::try_new(3, 7, Some(["deletionVectors"]), Some(["deletionVectors"])).unwrap();
-        assert_eq!(snapshot.protocol(), &expected);
+        assert_eq!(snapshot.table_configuration().protocol(), &expected);
 
         let schema_string = r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#;
         let expected: SchemaRef = serde_json::from_str(schema_string).unwrap();
@@ -614,7 +598,7 @@ mod tests {
         writer.write(&checkpoint)?;
         writer.close()?;
 
-        store
+        store_3a
             .put(
                 &delta_path_for_version(1, "checkpoint.parquet"),
                 buffer.into(),
@@ -1057,5 +1041,167 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Invalid version range"));
+    }
+
+    #[tokio::test]
+    async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create initial commit
+        let commit0 = vec![
+            json!({
+                "protocol": {
+                    "minReaderVersion": 1,
+                    "minWriterVersion": 2
+                }
+            }),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+        ];
+        commit(store.as_ref(), 0, commit0).await;
+
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(0)
+            .build(&engine)?;
+
+        // Test with empty log tail - should return same snapshot
+        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None)?;
+        assert_eq!(result, base_snapshot);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_try_new_from_latest_commit_preservation() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create commits 0-2
+        let base_commit = vec![
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+        ];
+
+        commit(store.as_ref(), 0, base_commit.clone()).await;
+        commit(
+            store.as_ref(),
+            1,
+            vec![json!({"commitInfo": {"timestamp": 1234}})],
+        )
+        .await;
+        commit(
+            store.as_ref(),
+            2,
+            vec![json!({"commitInfo": {"timestamp": 5678}})],
+        )
+        .await;
+
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+
+        // Verify base snapshot has latest_commit_file at version 1
+        assert_eq!(
+            base_snapshot
+                .log_segment
+                .latest_commit_file
+                .as_ref()
+                .map(|f| f.version),
+            Some(1)
+        );
+
+        // Create log_tail with FileMeta for version 2
+        let commit_2_url = url.join("_delta_log/")?.join("00000000000000000002.json")?;
+        let file_meta = crate::FileMeta {
+            location: commit_2_url,
+            last_modified: 1234567890,
+            size: 100,
+        };
+        let parsed_path = ParsedLogPath::try_from(file_meta)?
+            .ok_or_else(|| Error::Generic("Failed to parse log path".to_string()))?;
+        let log_tail = vec![parsed_path];
+
+        // Create new snapshot from base to version 2 using try_new_from directly
+        let new_snapshot =
+            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2))?;
+
+        // Latest commit should now be version 2
+        assert_eq!(
+            new_snapshot
+                .log_segment
+                .latest_commit_file
+                .as_ref()
+                .map(|f| f.version),
+            Some(2)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
+        let store = Arc::new(InMemory::new());
+        let url = Url::parse("memory:///")?;
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+        // Create commits
+        let base_commit = vec![
+            json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+            json!({
+                "metaData": {
+                    "id": "test-id",
+                    "format": {"provider": "parquet", "options": {}},
+                    "schemaString": "{\"type\":\"struct\",\"fields\":[]}",
+                    "partitionColumns": [],
+                    "configuration": {},
+                    "createdTime": 1587968585495i64
+                }
+            }),
+        ];
+
+        commit(store.as_ref(), 0, base_commit).await;
+        commit(
+            store.as_ref(),
+            1,
+            vec![json!({"commitInfo": {"timestamp": 1234}})],
+        )
+        .await;
+
+        let base_snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)?;
+
+        // Test requesting same version - should return same snapshot
+        let same_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1))?;
+        assert!(Arc::ptr_eq(&same_version, &base_snapshot));
+
+        // Test requesting older version - should error
+        let older_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0));
+        assert!(matches!(
+            older_version,
+            Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")
+        ));
+
+        Ok(())
     }
 }

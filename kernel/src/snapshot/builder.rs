@@ -1,6 +1,7 @@
 //! Builder for creating [`Snapshot`] instances.
 use crate::log_segment::LogSegment;
 use crate::snapshot::SnapshotRef;
+use crate::LogPath;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use url::Url;
@@ -32,6 +33,7 @@ pub struct SnapshotBuilder {
     table_root: Option<Url>,
     existing_snapshot: Option<SnapshotRef>,
     version: Option<Version>,
+    log_tail: Vec<LogPath>,
 }
 
 impl SnapshotBuilder {
@@ -40,6 +42,7 @@ impl SnapshotBuilder {
             table_root: Some(table_root),
             existing_snapshot: None,
             version: None,
+            log_tail: Vec::new(),
         }
     }
 
@@ -48,6 +51,7 @@ impl SnapshotBuilder {
             table_root: None,
             existing_snapshot: Some(existing_snapshot),
             version: None,
+            log_tail: Vec::new(),
         }
     }
 
@@ -55,6 +59,17 @@ impl SnapshotBuilder {
     /// latest version of the table.
     pub fn at_version(mut self, version: Version) -> Self {
         self.version = Some(version);
+        self
+    }
+
+    /// Set the log tail to use when building the snapshot. This allows catalogs or external
+    /// systems to provide an up-to-date log tail when used to build a snapshot.
+    ///
+    /// Note that the log tail must be a contiguous sequence of commits from M..=N where N is the
+    /// latest version of the table and 0 <= M <= N.
+    #[cfg(feature = "catalog-managed")]
+    pub fn with_log_tail(mut self, log_tail: Vec<LogPath>) -> Self {
+        self.log_tail = log_tail;
         self
     }
 
@@ -66,10 +81,12 @@ impl SnapshotBuilder {
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        let log_tail = self.log_tail.into_iter().map(Into::into).collect();
         if let Some(table_root) = self.table_root {
             let log_segment = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
+                log_tail,
                 self.version,
             )?;
             Ok(Snapshot::try_new_from_log_segment(table_root, log_segment, engine)?.into())
@@ -79,7 +96,7 @@ impl SnapshotBuilder {
                     "SnapshotBuilder should have either table_root or existing_snapshot",
                 )
             })?;
-            Snapshot::try_new_from(existing_snapshot, engine, self.version)
+            Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version)
         }
     }
 }
