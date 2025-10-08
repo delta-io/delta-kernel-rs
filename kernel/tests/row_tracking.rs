@@ -553,7 +553,7 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
     .await?;
 
     // Verify that the table is empty
-    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref()).await?;
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;
 
@@ -615,8 +615,8 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let engine2 = engine;
 
     // Create two snapshots from the same initial state
-    let snapshot1 = Snapshot::builder_for(table_url.clone()).build(engine1.as_ref())?;
-    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
+    let snapshot1 = Snapshot::builder_for(table_url.clone()).build(engine1.as_ref()).await?;
+    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref()).await?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
     let mut txn1 = snapshot1.transaction()?.with_engine_info("transaction 1");

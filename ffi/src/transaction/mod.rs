@@ -374,7 +374,7 @@ mod tests {
 
             // Confirm that the data matches what we appended
             let test_batch = ArrowEngineData::from(batch);
-            test_read(&test_batch, &table_url, unsafe { engine.as_ref().engine() })?;
+            test_read(&test_batch, &table_url, unsafe { engine.as_ref().engine() }).await?;
 
             unsafe { free_schema(write_schema) };
             unsafe { free_write_context(write_context) };

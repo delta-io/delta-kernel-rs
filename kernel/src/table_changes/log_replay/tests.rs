@@ -16,6 +16,7 @@ use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
 
 use itertools::Itertools;
+use futures::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -44,10 +45,11 @@ async fn get_segment(
     Ok(log_segment.ascending_commit_files)
 }
 
-fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>) -> Vec<bool> {
-    iter.map_ok(|scan_metadata| scan_metadata.selection_vector.into_iter())
-        .flatten_ok()
+async fn result_to_sv(stream: impl futures::Stream<Item = DeltaResult<TableChangesScanMetadata>>) -> Vec<bool> {
+    stream.map_ok(|scan_metadata| futures::stream::iter(scan_metadata.selection_vector.into_iter().map(Ok::<_, Error>)))
+        .try_flatten()
         .try_collect()
+        .await
         .unwrap()
 }
 
@@ -87,8 +89,8 @@ async fn metadata_protocol() {
         .into_iter();
 
     let scan_batches =
-        table_changes_action_iter(engine, commits, get_schema().into(), None).unwrap();
-    let sv = result_to_sv(scan_batches);
+        table_changes_action_iter(engine, commits, get_schema().into(), None).await.unwrap();
+    let sv = result_to_sv(scan_batches).await;
     assert_eq!(sv, &[false, false]);
 }
 #[tokio::test]
@@ -113,8 +115,9 @@ async fn cdf_not_enabled() {
 
     let res: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, commits, get_schema().into(), None)
-            .unwrap()
-            .try_collect();
+            .await.unwrap()
+            .try_collect()
+            .await;
 
     assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
 }
@@ -141,8 +144,9 @@ async fn unsupported_reader_feature() {
 
     let res: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, commits, get_schema().into(), None)
-            .unwrap()
-            .try_collect();
+            .await.unwrap()
+            .try_collect()
+            .await;
 
     assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
 }
@@ -172,8 +176,9 @@ async fn column_mapping_should_fail() {
 
     let res: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, commits, get_schema().into(), None)
-            .unwrap()
-            .try_collect();
+            .await.unwrap()
+            .try_collect()
+            .await;
 
     assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
 }
@@ -203,8 +208,9 @@ async fn incompatible_schemas_fail() {
 
         let res: DeltaResult<Vec<_>> =
             table_changes_action_iter(engine, commits, cdf_schema.into(), None)
-                .unwrap()
-                .try_collect();
+                .await.unwrap()
+                .try_collect()
+                .await;
 
         assert!(matches!(
             res,
@@ -292,13 +298,15 @@ async fn add_remove() {
         .into_iter();
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
-        .unwrap()
+        .await.unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
             assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
-            scan_metadata.selection_vector
+            futures::stream::iter(scan_metadata.selection_vector.into_iter().map(Ok::<_, Error>))
         })
-        .collect_vec();
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     assert_eq!(sv, &[true, true]);
 }
@@ -342,13 +350,15 @@ async fn filter_data_change() {
         .into_iter();
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
-        .unwrap()
+        .await.unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
             assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
-            scan_metadata.selection_vector
+            futures::stream::iter(scan_metadata.selection_vector.into_iter().map(Ok::<_, Error>))
         })
-        .collect_vec();
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     assert_eq!(sv, &[false; 5]);
 }
@@ -388,13 +398,15 @@ async fn cdc_selection() {
         .into_iter();
 
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
-        .unwrap()
+        .await.unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
             assert_eq!(scan_metadata.remove_dvs, HashMap::new().into());
-            scan_metadata.selection_vector
+            futures::stream::iter(scan_metadata.selection_vector.into_iter().map(Ok::<_, Error>))
         })
-        .collect_vec();
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     assert_eq!(sv, &[true, false, true, true]);
 }
@@ -454,13 +466,15 @@ async fn dv() {
     )])
     .into();
     let sv = table_changes_action_iter(engine, commits, get_schema().into(), None)
-        .unwrap()
+        .await.unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
             assert_eq!(scan_metadata.remove_dvs, expected_remove_dvs);
-            scan_metadata.selection_vector
+            futures::stream::iter(scan_metadata.selection_vector.into_iter().map(Ok::<_, Error>))
         })
-        .collect_vec();
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     assert_eq!(sv, &[false, true, true]);
 }
@@ -531,12 +545,14 @@ async fn data_skipping_filter() {
         .into_iter();
 
     let sv = table_changes_action_iter(engine, commits, logical_schema.into(), predicate)
-        .unwrap()
+        .await.unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
-            scan_metadata.selection_vector
+            futures::stream::iter(scan_metadata.selection_vector.into_iter().map(Ok::<_, Error>))
         })
-        .collect_vec();
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
 
     // Note: since the first pair is a dv operation, remove action will always be filtered
     assert_eq!(sv, &[false, true, false, false, true]);
@@ -577,8 +593,9 @@ async fn failing_protocol() {
 
     let res: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, commits, get_schema().into(), None)
-            .unwrap()
-            .try_collect();
+            .await.unwrap()
+            .try_collect()
+            .await;
 
     assert_result_error_with_message(
         res,
@@ -605,6 +622,6 @@ async fn file_meta_timestamp() {
 
     let commit = commits.next().unwrap();
     let file_meta_ts = commit.location.last_modified;
-    let scanner = LogReplayScanner::try_new(engine.as_ref(), commit, &get_schema().into()).unwrap();
+    let scanner = LogReplayScanner::try_new(engine.as_ref(), commit, &get_schema().into()).await.unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
 }

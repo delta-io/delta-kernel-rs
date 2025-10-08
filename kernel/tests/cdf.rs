@@ -3,6 +3,7 @@ use std::error;
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
@@ -49,7 +50,7 @@ async fn read_cdf_for_table(
     let scan_schema_as_arrow =
         ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
-        .execute(engine)?
+        .execute(engine).await?
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
@@ -62,7 +63,7 @@ async fn read_cdf_for_table(
                 None => Ok(record_batch),
             }
         })
-        .try_collect()?;
+        .try_collect().await?;
     Ok(batches)
 }
 

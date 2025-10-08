@@ -7,6 +7,7 @@ use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batc
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::DeltaResult;
+use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 
 #[derive(Parser)]
@@ -33,7 +34,7 @@ async fn main() -> DeltaResult<()> {
 
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan
-        .execute(Arc::new(engine))?
+        .execute(Arc::new(engine)).await?
         .map(|scan_result| -> DeltaResult<_> {
             let scan_result = scan_result?;
             let mask = scan_result.full_mask();
@@ -49,7 +50,7 @@ async fn main() -> DeltaResult<()> {
                 Ok(record_batch)
             }
         })
-        .try_collect()?;
+        .try_collect().await?;
     print_batches(&batches)?;
     Ok(())
 }

@@ -244,6 +244,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use futures::TryStreamExt;
     use itertools::Itertools;
 
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};

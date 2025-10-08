@@ -611,7 +611,7 @@ async fn predicate_on_number() -> Result<(), Box<dyn std::error::Error>> {
             Some(&["a_float", "number"]),
             Some(pred),
             expected,
-        )?;
+        ).await?;
     }
     Ok(())
 }
