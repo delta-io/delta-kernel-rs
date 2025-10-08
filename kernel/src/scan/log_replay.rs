@@ -583,7 +583,7 @@ mod tests {
                 assert_eq!(row_id_transform.exprs.len(), 1);
                 let expr = &row_id_transform.exprs[0];
                 let expeceted_expr = Arc::new(Expr::variadic(
-                crate::expressions::VariadicExpressionOp::Coalesce,
+                    crate::expressions::VariadicExpressionOp::Coalesce,
                     vec![
                         Expr::column(["row_id_col"]),
                         Expr::binary(
