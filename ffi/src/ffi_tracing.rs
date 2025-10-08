@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::{fmt, io};
 
 use delta_kernel::{DeltaResult, Error};
+use tracing::{error, warn};
 use tracing::{
     field::{Field as TracingField, Visit},
     Event as TracingEvent, Subscriber,
 };
-
-use tracing::warn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{filter::LevelFilter, layer::Context, registry::LookupSpan, Layer};
 
@@ -270,8 +269,11 @@ where
                 line: metadata.line().unwrap_or(0),
                 file: kernel_string_slice!(file),
             };
-            let cb = self.callback.lock().unwrap();
-            (cb)(event);
+            if let Ok(cb) = self.callback.lock() {
+                (cb)(event);
+            } else {
+                error!("Failed to lock event callback (mutex poisoned).");
+            }
         }
     }
 }
@@ -306,7 +308,11 @@ impl GlobalTracingState {
         }
 
         if let (Some(reload), Some(event_cb)) = (&self.reload_handle, &self.event_callback) {
-            *event_cb.lock().unwrap() = callback;
+            if let Ok(mut event_cb) = event_cb.lock() {
+                *event_cb = callback;
+            } else {
+                error!("Failed to acquire lock for event callback (mutex poisoned).");
+            }
             return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
                 warn!("Failed to reload tracing level: {e}");
                 Error::generic(format!("Unable to reload subscriber: {e}"))
@@ -321,6 +327,7 @@ impl GlobalTracingState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_log_line_callback(
         &mut self,
         callback: TracingLogLineFn,
@@ -336,7 +343,11 @@ impl GlobalTracingState {
         }
 
         if let (Some(reload), Some(log_cb)) = (&self.reload_handle, &self.log_line_callback) {
-            *log_cb.lock().unwrap() = callback;
+            if let Ok(mut log_cb) = log_cb.lock() {
+                *log_cb = callback;
+            } else {
+                error!("Failed to acquire lock for log callback (mutex poisoned).");
+            }
             return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
                 warn!("Failed to reload log level: {e}");
                 Error::generic(format!("Unable to reload subscriber: {e}"))
@@ -412,15 +423,21 @@ where
             Ok(mut buf) => {
                 let message = String::from_utf8_lossy(&buf);
                 let message = kernel_string_slice!(message);
-                let cb = self.callback.lock().unwrap();
-                (cb)(message);
+                if let Ok(cb) = self.callback.lock() {
+                    (cb)(message);
+                } else {
+                    error!("Failed to lock event callback (mutex poisoned).");
+                }
                 buf.clear();
             }
             Err(_) => {
                 let message = "INTERNAL KERNEL ERROR: Could not lock message buffer.";
                 let message = kernel_string_slice!(message);
-                let cb = self.callback.lock().unwrap();
-                (cb)(message);
+                if let Ok(cb) = self.callback.lock() {
+                    (cb)(message);
+                } else {
+                    error!("Failed to lock event callback (mutex poisoned).");
+                }
             }
         }
     }
@@ -561,9 +578,7 @@ mod tests {
         let line_str = line_str.to_string();
         let ok = expected_log_lines.is_empty()
             || expected_log_lines.iter().any(|expected_log_line| {
-                let res = line_str.ends_with(expected_log_line);
-                //println!("Line: {line_str}, expected: {expected_log_line}, res: {res}");
-                res
+                line_str.ends_with(expected_log_line)
             });
         if ok {
             let mut lock = MESSAGES.lock().unwrap();
@@ -780,7 +795,7 @@ mod tests {
                 results.iter().all(|(_msg, lvl)| *lvl == expected_level),
                 "Not all events were {expected_level}"
             );
-            let events_str = events_to_string((&results).to_vec());
+            let events_str = events_to_string(results.to_vec());
             assert!(
                 results
                     .iter()
@@ -826,7 +841,7 @@ mod tests {
             .lock()
             .unwrap()
             .as_ref()
-            .map_or(true, |v| v.is_empty()));
+            .is_none_or(|v| v.is_empty()));
 
         // ensure we can setup again with a new callback and a new tracing level
         unsafe {
