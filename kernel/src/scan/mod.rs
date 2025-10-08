@@ -117,6 +117,7 @@ impl ScanBuilder {
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+
         let state_info = StateInfo::try_new(
             logical_schema,
             self.snapshot.table_configuration(),
