@@ -397,11 +397,12 @@ mod tests {
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::test_utils::{
-        add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
-        run_with_validate_callback,
+        add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
+        add_batch_with_remove, run_with_validate_callback,
     };
-    use crate::scan::tests::get_simple_state_info;
+    use crate::scan::tests::{get_simple_state_info, get_state_info};
     use crate::scan::{PhysicalPredicate, StateInfo};
+    use crate::schema::MetadataColumnSpec;
     use crate::Expression as Expr;
     use crate::{
         engine::sync::SyncEngine,
@@ -532,6 +533,70 @@ mod tests {
             assert!(transforms[2].is_none(), "transform at [2] should be None");
             validate_transform(transforms[1].as_ref(), 17511);
             validate_transform(transforms[3].as_ref(), 17510);
+        }
+    }
+
+    #[test]
+    fn test_row_id_transform() {
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "value",
+            DataType::INTEGER,
+            true,
+        )]));
+        let state_info = get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            [
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "row_id_col",
+                ),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        )
+        .unwrap();
+        let batch = vec![add_batch_for_row_id(get_log_schema().clone())];
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+        );
+
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            let transforms = scan_metadata.scan_file_transforms;
+            assert_eq!(transforms.len(), 1, "Should have 1 transform");
+            if let Some(Expr::Transform(transform_expr)) = transforms[0].as_ref().map(Arc::as_ref) {
+                assert!(transform_expr.input_path.is_none());
+                let row_id_transform = transform_expr
+                    .field_transforms
+                    .get("row_id_col")
+                    .expect("Should have row_id_col transform");
+                assert!(row_id_transform.is_replace);
+                assert_eq!(row_id_transform.exprs.len(), 1);
+                let expr = &row_id_transform.exprs[0];
+                let expeceted_expr = Arc::new(Expr::variadic(
+                crate::expressions::VariadicExpressionOp::Coalesce,
+                    vec![
+                        Expr::column(["row_id_col"]),
+                        Expr::binary(
+                            crate::expressions::BinaryExpressionOp::Plus,
+                            Expr::literal(42i64),
+                            Expr::column(["row_indexes_for_row_id_0"]),
+                        ),
+                    ],
+                ));
+                assert_eq!(expr, &expeceted_expr);
+            } else {
+                panic!("Should have been a transform expression");
+            }
         }
     }
 }
