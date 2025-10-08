@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
@@ -9,6 +9,8 @@ use crate::arrow::datatypes::{DataType, Schema};
 use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+use crate::log_replay::HasSelectionVector;
+use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, Snapshot};
 
@@ -76,13 +78,11 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let writer = snapshot.checkpoint()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
-
-    // Check selection vector has one true value
-    assert_eq!(checkpoint_batch.filtered_data.selection_vector, vec![true]);
+    assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
     // Verify the underlying EngineData contains the expected CheckpointMetadata action
-    let arrow_engine_data =
-        ArrowEngineData::try_from_engine_data(checkpoint_batch.filtered_data.data)?;
+    let (underlying_data, _) = checkpoint_batch.filtered_data.into_parts();
+    let arrow_engine_data = ArrowEngineData::try_from_engine_data(underlying_data)?;
     let record_batch = arrow_engine_data.record_batch();
 
     // Build the expected RecordBatch
@@ -206,11 +206,17 @@ fn create_v2_checkpoint_protocol_action() -> Action {
 
 /// Create a Metadata action
 fn create_metadata_action() -> Action {
-    Action::Metadata(Metadata {
-        id: "test-table".into(),
-        schema_string: "{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}".to_string(),
-        ..Default::default()
-    })
+    Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            StructType::new_unchecked([StructField::nullable("value", KernelDataType::INTEGER)]),
+            vec![],
+            0,
+            HashMap::new(),
+        )
+        .unwrap(),
+    )
 }
 
 /// Create an Add action with the specified path
@@ -307,11 +313,11 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should not be included as the selection vector does not
     // contain any true values, as the file added is removed in a following commit.
@@ -377,7 +383,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // No more data should exist because we only requested version 0
     assert!(data_iter.next().is_none());
@@ -481,15 +487,17 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should be the CheckpointMetaData action.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true]);
+    // According to the new contract, with_all_rows_selected creates an empty selection vector
+    assert_eq!(batch.selection_vector(), &[] as &[bool]);
+    assert!(batch.has_selected_rows());
 
     // No more data should exist
     assert!(data_iter.next().is_none());

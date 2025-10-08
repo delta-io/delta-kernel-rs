@@ -58,6 +58,9 @@ pub(crate) struct LogSegment {
     pub checkpoint_parts: Vec<ParsedLogPath>,
     /// Latest CRC (checksum) file
     pub latest_crc_file: Option<ParsedLogPath>,
+    /// The latest commit file found during listing, which may not be part of the
+    /// contiguous segment but is needed for ICT timestamp reading
+    pub latest_commit_file: Option<ParsedLogPath>,
 }
 
 impl LogSegment {
@@ -72,6 +75,7 @@ impl LogSegment {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
+            latest_commit_file,
         } = listed_files;
 
         // Ensure commit file versions are contiguous
@@ -127,6 +131,7 @@ impl LogSegment {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
+            latest_commit_file,
         })
     }
 
@@ -144,33 +149,42 @@ impl LogSegment {
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
     ) -> DeltaResult<Self> {
         let time_travel_version = time_travel_version.into();
         let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-        Self::for_snapshot_impl(storage, log_root, checkpoint_hint, time_travel_version)
+        Self::for_snapshot_impl(
+            storage,
+            log_root,
+            log_tail,
+            checkpoint_hint,
+            time_travel_version,
+        )
     }
 
     // factored out for testing
     pub(crate) fn for_snapshot_impl(
         storage: &dyn StorageHandler,
         log_root: Url,
+        log_tail: Vec<ParsedLogPath>,
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
         let listed_files = match (checkpoint_hint, time_travel_version) {
             (Some(cp), None) => {
-                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, None)?
+                ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
             }
             (Some(cp), Some(end_version)) if cp.version <= end_version => {
                 ListedLogFiles::list_with_checkpoint_hint(
                     &cp,
                     storage,
                     &log_root,
+                    log_tail,
                     Some(end_version),
                 )?
             }
-            _ => ListedLogFiles::list(storage, &log_root, None, time_travel_version)?,
+            _ => ListedLogFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
         };
 
         LogSegment::try_new(listed_files, log_root, time_travel_version)

@@ -114,10 +114,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         self.seen_protocol = visitor.seen_protocol;
         self.seen_metadata = visitor.seen_metadata;
 
-        let filtered_data = FilteredEngineData {
-            data: actions,
-            selection_vector: visitor.selection_vector,
-        };
+        let filtered_data = FilteredEngineData::try_new(actions, visitor.selection_vector)?;
 
         Ok(ActionReconciliationBatch {
             filtered_data,
@@ -770,8 +767,11 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2, "Expected two batches in results");
-        assert_eq!(results[0].selection_vector, vec![true, true, true],);
-        assert_eq!(results[1].selection_vector, vec![false, false, false, true],);
+        assert_eq!(results[0].selection_vector(), &vec![true, true, true]);
+        assert_eq!(
+            results[1].selection_vector(),
+            &vec![false, false, false, true]
+        );
         assert_eq!(actions_count, 4);
         assert_eq!(add_actions, 0);
 
@@ -809,8 +809,8 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no selected actions
-        assert_eq!(results[0].selection_vector, vec![true]);
-        assert_eq!(results[1].selection_vector, vec![false, true]);
+        assert_eq!(results[0].selection_vector(), &vec![true]);
+        assert_eq!(results[1].selection_vector(), &vec![false, true]);
         assert_eq!(actions_count, 2);
         assert_eq!(add_actions, 1);
 
@@ -845,8 +845,8 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].selection_vector, vec![true, true]);
-        assert_eq!(results[1].selection_vector, vec![false, false, true]);
+        assert_eq!(results[0].selection_vector(), &vec![true, true]);
+        assert_eq!(results[1].selection_vector(), &vec![false, false, true]);
         assert_eq!(actions_count, 3);
         assert_eq!(add_actions, 2);
 
@@ -927,13 +927,16 @@ mod tests {
 
         // First batch: protocol, metadata, and one recent txn (old_app filtered out)
         assert_eq!(
-            results[0].filtered_data.selection_vector,
+            results[0].filtered_data.selection_vector(),
             vec![true, true, false, true]
         );
         assert_eq!(results[0].actions_count, 3);
 
         // Second batch: timeless_app kept, another_old filtered out
-        assert_eq!(results[1].filtered_data.selection_vector, vec![true, false]);
+        assert_eq!(
+            results[1].filtered_data.selection_vector(),
+            vec![true, false]
+        );
         assert_eq!(results[1].actions_count, 1);
 
         Ok(())
