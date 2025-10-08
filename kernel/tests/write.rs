@@ -1539,12 +1539,12 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         let scan_metadata2 = scan2.scan_metadata(engine.as_ref())?.next().unwrap()?;
 
         // Create FilteredEngineData for removal (select all rows for removal)
-        let (data, _) = scan_metadata2.scan_files.into_parts();
-        let data_remove_count = data.len();
-        let remove_metadata = FilteredEngineData::with_all_rows_selected(data);
+        let file_remove_count = (scan_metadata2.scan_files.data().len() - scan_metadata2.scan_files.selection_vector().len()) + 
+        scan_metadata2.scan_files.selection_vector().iter().filter(|&x| *x).count();
+        assert!(file_remove_count > 0);
 
         // Add remove files to transaction
-        txn.remove_files(remove_metadata);
+        txn.remove_files(scan_metadata2.scan_files);
 
         // Commit the transaction
         let result = txn.commit(engine.as_ref());
@@ -1566,7 +1566,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
 
                 // The new file count should be less than the initial count
                 // (or 0 if all files were removed)
-                assert_eq!(new_file_count, initial_file_count - data_remove_count);
+                assert_eq!(new_file_count, initial_file_count - file_remove_count);
 
                 println!(
                     "Successfully verified files were removed: initial={}, new={}",
