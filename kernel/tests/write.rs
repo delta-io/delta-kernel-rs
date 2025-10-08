@@ -90,6 +90,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
                 "operationParameters": {},
                 "engineInfo": "default engine",
                 "txnId": ZERO_UUID,
+                "isBlindAppend": true,
             }
         });
 
@@ -245,7 +246,8 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
                 "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                 "operationParameters": {},
                 "engineInfo": "default engine",
-                "txnId": ZERO_UUID
+                "txnId": ZERO_UUID,
+                "isBlindAppend": true,
             }
         })];
 
@@ -307,7 +309,8 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "operation": "UNKNOWN",
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
-                    "txnId": ZERO_UUID
+                    "txnId": ZERO_UUID,
+                    "isBlindAppend": true,
                 }
             }),
             json!({
@@ -515,7 +518,8 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
-                    "txnId": ZERO_UUID
+                    "txnId": ZERO_UUID,
+                    "isBlindAppend": true,
                 }
             }),
             json!({
@@ -734,7 +738,8 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
                     "kernelVersion": format!("v{}", env!("CARGO_PKG_VERSION")),
                     "operationParameters": {},
                     "engineInfo": "default engine",
-                    "txnId": ZERO_UUID
+                    "txnId": ZERO_UUID,
+                    "isBlindAppend": true,
                 }
             }),
             json!({

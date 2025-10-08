@@ -640,6 +640,9 @@ pub(crate) struct CommitInfo {
     pub(crate) engine_info: Option<String>,
     /// A unique transaction identifier for this commit.
     pub(crate) txn_id: Option<String>,
+    /// Whether this commit is a blind append (only adds files without reading existing data).
+    /// Currently, kernel-rs only supports append operations, so this is always true.
+    pub(crate) is_blind_append: Option<bool>,
 }
 
 impl CommitInfo {
@@ -656,6 +659,10 @@ impl CommitInfo {
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
+            // Currently, kernel-rs only supports adding files without reading existing data,
+            // so all commits are blind appends. When support for remove files or read-then-write
+            // operations is added, this logic will need to be updated.
+            is_blind_append: Some(true),
         }
     }
 }
@@ -675,6 +682,7 @@ impl IntoEngineData for CommitInfo {
             self.kernel_version.into(),
             self.engine_info.into(),
             self.txn_id.into(),
+            self.is_blind_append.into(),
         ];
 
         engine.evaluation_handler().create_one(schema, &values)
@@ -1224,6 +1232,7 @@ mod tests {
                 StructField::nullable("kernelVersion", DataType::STRING),
                 StructField::nullable("engineInfo", DataType::STRING),
                 StructField::nullable("txnId", DataType::STRING),
+                StructField::nullable("isBlindAppend", DataType::BOOLEAN),
             ]),
         )]));
         assert_eq!(schema, expected);
@@ -1539,6 +1548,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
                 Arc::new(StringArray::from(vec![None::<String>])),
                 Arc::new(StringArray::from(vec![commit_info_txn_id])),
+                Arc::new(BooleanArray::from(vec![Some(true)])),
             ],
         )
         .unwrap();
