@@ -576,6 +576,10 @@ impl Transaction {
     ) -> impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a {
         let input_schema = scan_row_schema();
         let target_schema = get_log_remove_schema();
+Arc::new(StructType::new_unchecked([StructField::nullable(
+        Remove::REMOVE_NAME,
+        Remove::to_schema(),
+    )]))
         let evaluation_handler = engine.evaluation_handler();
         
         self.remove_files_metadata
