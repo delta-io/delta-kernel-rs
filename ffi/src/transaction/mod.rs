@@ -326,19 +326,17 @@ mod tests {
                 ),
             ])
             .unwrap();
-
+            let parquet_schema = unsafe {
+                txn_with_engine_info
+                    .shallow_copy()
+                    .as_ref()
+                    .add_files_schema()
+            };
             let file_info = write_parquet_file(
                 table_path_str,
                 "my_file.parquet",
                 &batch,
-                unsafe {
-                    txn_with_engine_info
-                        .shallow_copy()
-                        .as_ref()
-                        .add_files_schema()
-                }
-                .as_ref()
-                .try_into_arrow()?,
+                parquet_schema.as_ref().try_into_arrow()?,
             )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {

@@ -186,8 +186,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
     /// is a generated UUIDv4).
     ///
-    /// Note that the schema does not contain the dataChange column. Users of the default engine
-    /// must add this column by calling [`crate::transaction::Transaction::with_data_change`].
+    /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
+    /// use [`crate::transaction::Transaction::with_data_change`].
     ///
     /// [add file metadata]: crate::transaction::Transaction::add_files_schema
     pub async fn write_parquet_file(
