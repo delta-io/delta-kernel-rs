@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
 use tracing::debug;
 
 use crate::expressions::ArrayData;
@@ -13,7 +14,7 @@ use crate::{AsAny, DeltaResult, Error};
 ///
 /// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
 /// while `false` means the row is logically deleted and should be ignored. If the selection vector is shorter
-/// then the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
+/// than the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
 ///
 /// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
@@ -172,6 +173,7 @@ pub trait GetData<'a> {
         (get_int, i32),
         (get_long, i64),
         (get_str, &'a str),
+        (get_binary, Bytes),
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
@@ -193,6 +195,7 @@ impl<'a> GetData<'a> for () {
         (get_int, i32),
         (get_long, i64),
         (get_str, &'a str),
+        (get_binary, Bytes),
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
@@ -227,6 +230,7 @@ impl_typed_get_data!(
     (get_int, i32),
     (get_long, i64),
     (get_str, &'a str),
+    (get_binary, Bytes),
     (get_list, ListItem<'a>),
     (get_map, MapItem<'a>)
 );
@@ -556,5 +560,86 @@ mod tests {
                 .contains("Selection vector is larger than data length"));
             assert!(e.to_string().contains("3 > 2"));
         }
+    }
+
+    // Mock implementation of GetData that returns binary data
+    struct MockBinaryData {
+        data: Vec<Option<Bytes>>,
+    }
+
+    impl<'a> GetData<'a> for MockBinaryData {
+        fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<Bytes>> {
+            Ok(self.data.get(row_index).and_then(|v| v.clone()))
+        }
+    }
+
+    #[test]
+    fn test_get_binary_some_value() {
+        let mock_data = MockBinaryData {
+            data: vec![
+                Some(Bytes::from_static(b"hello")),
+                Some(Bytes::from_static(b"world")),
+                None,
+            ],
+        };
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &mock_data;
+
+        // Test getting first row
+        let result: Option<Bytes> = getter.get_opt(0, "binary_field").unwrap();
+        assert_eq!(result, Some(Bytes::from_static(b"hello")));
+
+        // Test getting second row
+        let result: Option<Bytes> = getter.get_opt(1, "binary_field").unwrap();
+        assert_eq!(result, Some(Bytes::from_static(b"world")));
+
+        // Test getting None value
+        let result: Option<Bytes> = getter.get_opt(2, "binary_field").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_binary_required() {
+        let mock_data = MockBinaryData {
+            data: vec![Some(Bytes::from_static(b"hello"))],
+        };
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &mock_data;
+
+        // Test using get() for required field
+        let result: Bytes = getter.get(0, "binary_field").unwrap();
+        assert_eq!(result, Bytes::from_static(b"hello"));
+    }
+
+    #[test]
+    fn test_get_binary_required_missing() {
+        let mock_data = MockBinaryData { data: vec![None] };
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &mock_data;
+
+        // Test using get() for missing required field should error
+        let result: DeltaResult<Bytes> = getter.get(0, "binary_field");
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("Data missing for field"));
+        }
+    }
+
+    #[test]
+    fn test_get_binary_empty_bytes() {
+        let mock_data = MockBinaryData {
+            data: vec![Some(Bytes::new())],
+        };
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &mock_data;
+
+        // Test getting empty Bytes
+        let result: Option<Bytes> = getter.get_opt(0, "binary_field").unwrap();
+        assert_eq!(result, Some(Bytes::new()));
+        assert_eq!(result.unwrap().len(), 0);
     }
 }
