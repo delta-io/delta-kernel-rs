@@ -1436,7 +1436,6 @@ async fn generate_and_add_data_file(
             &ArrowEngineData::new(data),
             write_context.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
     txn.add_files(file_meta);
