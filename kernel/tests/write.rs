@@ -1414,8 +1414,7 @@ async fn test_remove_files_basic() -> Result<(), Box<dyn std::error::Error>> {
         let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
 
         // Create FilteredEngineData for removal (select all rows for removal)
-        let (data, _) = scan_metadata.scan_files.into_parts();
-        let selection_vector = vec![true; data.len()]; // Select all rows for removal
+        let (data, selection_vector) = scan_metadata.scan_files.into_parts();
         let remove_metadata = FilteredEngineData::try_new(data, selection_vector)?;
 
         // Add remove files to transaction
@@ -1479,7 +1478,7 @@ async fn test_remove_files_basic() -> Result<(), Box<dyn std::error::Error>> {
                         remove.get("dataChange").is_some(),
                         "Remove action should have dataChange"
                     );
-                    assert_eq!(remove["dataChange"], false);
+                    assert_eq!(remove["dataChange"].as_bool(), Some(true));
                 }
             }
             Ok(CommitResult::Conflict(_, _)) => {
@@ -1518,11 +1517,10 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
         let scan = snapshot.clone().scan_builder().build()?;
         let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
-        let (initial_data, _) = scan_metadata.scan_files.into_parts();
-        let initial_file_count = initial_data.len();
+        let (initial_data, selection_vector) = scan_metadata.scan_files.into_parts();
+        let initial_file_count = selection_vector.iter().filter(|&x| *x).count();
 
         if initial_file_count == 0 {
-            println!("No files to remove in test table, skipping test");
             continue;
         }
 
@@ -1560,18 +1558,14 @@ async fn test_remove_files_verify_files_excluded_from_scan(
                     .build(engine.as_ref())?;
 
                 let new_scan = new_snapshot.scan_builder().build()?;
-                let new_metadata = new_scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
-                let (new_data, _) = new_metadata.scan_files.into_parts();
-                let new_file_count = new_data.len();
+                let mut new_file_count = 0;
+                for new_metadata in new_scan.scan_metadata(engine.as_ref())? {
+                    new_file_count += new_metadata?.scan_files.data().len();
+                }
 
                 // The new file count should be less than the initial count
                 // (or 0 if all files were removed)
                 assert_eq!(new_file_count, initial_file_count - file_remove_count);
-
-                println!(
-                    "Successfully verified files were removed: initial={}, new={}",
-                    initial_file_count, new_file_count
-                );
             }
             CommitResult::Conflict(_, _) => {
                 assert!(
