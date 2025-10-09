@@ -127,7 +127,6 @@ pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
     &LOG_ADD_SCHEMA
 }
 
-#[internal_api]
 pub(crate) fn get_log_remove_schema() -> &'static SchemaRef {
     &LOG_REMOVE_SCHEMA
 }

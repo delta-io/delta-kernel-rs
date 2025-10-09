@@ -574,12 +574,38 @@ impl Transaction {
         &'a self,
         engine: &dyn Engine,
     ) -> impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a {
+        fn make_nullable_recursive(data_type: &DataType) -> DataType {
+            match data_type {
+                DataType::Struct(s) => {
+                    let nullable_fields = s.fields().map(|f| {
+                        StructField::new(f.name(), make_nullable_recursive(f.data_type()), true)
+                    });
+                    StructType::new_unchecked(nullable_fields).into()
+                }
+                DataType::Array(arr) => {
+                    ArrayType::new(make_nullable_recursive(arr.element_type()), true).into()
+                }
+                DataType::Map(map) => {
+                    MapType::new(
+                        make_nullable_recursive(map.key_type()),
+                        make_nullable_recursive(map.value_type()),
+                        true,
+                    )
+                    .into()
+                }
+                DataType::Variant(v) => {
+                    if let DataType::Struct(s) = make_nullable_recursive(&DataType::Struct(v.clone())) {
+                        DataType::Variant(s)
+                    } else {
+                        data_type.clone()
+                    }
+                }
+                _ => data_type.clone(),
+            }
+        }
+
         let input_schema = scan_row_schema();
-        let target_schema = get_log_remove_schema();
-Arc::new(StructType::new_unchecked([StructField::nullable(
-        Remove::REMOVE_NAME,
-        Remove::to_schema(),
-    )]))
+        let target_schema = make_nullable_recursive(&DataType::Struct(Box::new((**get_log_remove_schema()).clone())));
         let evaluation_handler = engine.evaluation_handler();
         
         self.remove_files_metadata
