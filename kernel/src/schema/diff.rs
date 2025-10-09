@@ -559,9 +559,10 @@ fn compute_field_update(
     match changes.len() {
         0 => Ok(None),
         1 => {
-            let change_type = changes.into_iter().next().unwrap_or_else(|| {
-                unreachable!("vec with len 1 should have exactly one element")
-            });
+            let change_type = changes
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| unreachable!("vec with len 1 should have exactly one element"));
             Ok(Some(FieldUpdate {
                 before: before.field.clone(),
                 after: after.field.clone(),
