@@ -9,6 +9,9 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::field_classifiers::{
+    ScanTransformFieldClassifierieldClassifier, TransformFieldClassifier,
+};
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -29,12 +32,13 @@ use crate::schema::{
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{FieldTransformSpec, TransformSpec};
+use crate::transforms::TransformSpec;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
+pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
 
@@ -128,6 +132,7 @@ impl ScanBuilder {
             partition_columns,
             column_mapping_mode,
             self.predicate,
+            ScanTransformFieldClassifierieldClassifier,
         )?;
 
         Ok(Scan {
@@ -743,6 +748,7 @@ pub fn scan_row_schema() -> SchemaRef {
 }
 
 /// All the state needed to process a scan.
+#[derive(Debug)]
 pub(crate) struct StateInfo {
     /// The logical schema for this scan
     pub(crate) logical_schema: SchemaRef,
@@ -755,17 +761,20 @@ pub(crate) struct StateInfo {
 }
 
 impl StateInfo {
+    /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
     /// `partition_columns` - List of column names that are partition columns in the table
     /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
     /// `predicate` - Optional predicate to filter data during the scan
-    pub(crate) fn try_new(
+    /// `classifier` - The classifier to use for different scan types
+    pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_schema: SchemaRef,
         partition_columns: &[String],
         column_mapping_mode: ColumnMappingMode,
         predicate: Option<PredicateRef>,
+        classifier: C,
     ) -> DeltaResult<Self> {
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
@@ -774,21 +783,29 @@ impl StateInfo {
 
         // Loop over all selected fields and build both the physical schema and transform spec
         for (index, logical_field) in logical_schema.fields().enumerate() {
-            if partition_columns.contains(logical_field.name()) {
-                if logical_field.is_metadata_column() {
+            let transform = classifier.classify_field(
+                logical_field,
+                index,
+                partition_columns,
+                &last_physical_field,
+            );
+
+            if let Some(spec) = transform {
+                // Field needs transformation - not in physical schema
+                transform_spec.push(spec);
+            } else {
+                // Physical field - should be read from parquet
+                // Validate metadata column doesn't conflict with partition columns
+                if logical_field.is_metadata_column()
+                    && partition_columns.contains(logical_field.name())
+                {
                     return Err(Error::Schema(format!(
                         "Metadata column names must not match partition columns: {}",
                         logical_field.name()
                     )));
                 }
 
-                // Partition column: needs to be injected via transform
-                transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
-                    field_index: index,
-                    insert_after: last_physical_field.clone(),
-                });
-            } else {
-                // Regular field: add to physical schema
+                // Add to physical schema
                 let physical_field = logical_field.make_physical(column_mapping_mode);
                 debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                 let physical_name = physical_field.name.clone();
@@ -1001,6 +1018,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
+    use crate::transforms::FieldTransformSpec;
     use crate::Snapshot;
 
     use super::*;
@@ -1505,6 +1523,7 @@ mod tests {
             &[], // No partition columns
             ColumnMappingMode::None,
             None, // No predicate
+            ScanTransformFieldClassifierieldClassifier,
         )
         .unwrap();
 
@@ -1533,6 +1552,7 @@ mod tests {
             &["date".to_string()], // date is a partition column
             ColumnMappingMode::None,
             None,
+            ScanTransformFieldClassifierieldClassifier,
         )
         .unwrap();
 
@@ -1573,6 +1593,7 @@ mod tests {
             &["part1".to_string(), "part2".to_string()],
             ColumnMappingMode::None,
             None,
+            ScanTransformFieldClassifierieldClassifier,
         )
         .unwrap();
 
@@ -1624,6 +1645,7 @@ mod tests {
             &[],
             ColumnMappingMode::None,
             Some(predicate),
+            ScanTransformFieldClassifierieldClassifier,
         )
         .unwrap();
 
@@ -1651,6 +1673,7 @@ mod tests {
             &["date".to_string()],
             ColumnMappingMode::None,
             None,
+            ScanTransformFieldClassifierieldClassifier,
         )
         .unwrap();
 
