@@ -11,16 +11,20 @@ use tracing::info;
 use url::Url;
 
 /// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
-/// Catalog.
+/// Catalog. For now this is a lightweight wrapper around a [UCClient].
 pub struct UCCatalog<'a> {
     client: &'a UCClient,
 }
 
 impl<'a> UCCatalog<'a> {
+    /// Create a new [UCCatalog] instance with the provided [UCClient].
     pub fn new(client: &'a UCClient) -> Self {
         UCCatalog { client }
     }
 
+    /// Load the latest snapshot of a Delta Table identified by `table_id` and `table_uri` in Unity
+    /// Catalog. Generally, a separate `get_table` call can be used to resolve the table id/uri from
+    /// the table name.
     pub async fn load_snapshot(
         &self,
         table_id: &str,
@@ -31,6 +35,9 @@ impl<'a> UCCatalog<'a> {
             .await
     }
 
+    /// Load a snapshot of a Delta Table identified by `table_id` and `table_uri` for a specific
+    /// version. Generally, a separate `get_table` call can be used to resolve the table id/uri from
+    /// the table name.
     pub async fn load_snapshot_at(
         &self,
         table_id: &str,
