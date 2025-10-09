@@ -34,7 +34,6 @@ pub use error::{Error, Result};
 #[doc(hidden)]
 pub mod prelude {
     pub use crate::client::UCClient;
-    pub use crate::error::Result;
     pub use crate::models::{
         commits::{Commit, CommitsRequest, CommitsResponse},
         credentials::{Operation, TemporaryTableCredentials},
