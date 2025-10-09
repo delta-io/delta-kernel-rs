@@ -575,4 +575,17 @@ impl LogSegment {
         debug_assert!(to_sub <= self.end_version);
         self.end_version - to_sub
     }
+
+    /// Validates that all commit files in this log segment are not staged commits. We use this in
+    /// places like checkpoint writers, where we require all commits to be published.
+    pub(crate) fn validate_no_staged_commits(&self) -> DeltaResult<()> {
+        require!(
+            !self
+                .ascending_commit_files
+                .iter()
+                .any(|commit| matches!(commit.file_type, LogPathFileType::StagedCommit)),
+            Error::generic("Found staged commit file in log segment")
+        );
+        Ok(())
+    }
 }

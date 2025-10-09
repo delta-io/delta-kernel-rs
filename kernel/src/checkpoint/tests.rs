@@ -12,7 +12,7 @@ use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEn
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, Snapshot};
+use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 use arrow_56::{
     array::{create_array, RecordBatch},
@@ -517,5 +517,49 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // - sizeInBytes: passed to finalize (10)
     assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes)?;
 
+    Ok(())
+}
+
+#[test]
+fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+    // normal commit
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_action(), create_basic_protocol_action()],
+        0,
+    )?;
+
+    // staged commit
+    let staged_commit_path = Path::from(
+        "_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+    );
+    futures::executor::block_on(async {
+        let add_action = Action::Add(Add::default());
+        store
+            .put(
+                &staged_commit_path,
+                serde_json::to_string(&add_action).unwrap().into(),
+            )
+            .await
+            .unwrap()
+    });
+
+    let table_root = Url::parse("memory:///")?;
+    let staged_commit = FileMeta {
+        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")?,
+        last_modified: 0,
+        size: 100,
+    };
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
+        .build(&engine)?;
+
+    assert!(matches!(
+        snapshot.checkpoint().unwrap_err(),
+        crate::Error::Generic(e) if e == "Found staged commit file in log segment"
+    ));
     Ok(())
 }

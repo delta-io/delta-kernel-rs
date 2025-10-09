@@ -227,3 +227,81 @@ fn test_version_filtering() {
         assert!(iterator.total_add_actions() >= 0);
     }
 }
+
+#[test]
+fn test_no_compaction_staged_commits() {
+    use crate::actions::Add;
+    use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use std::sync::Arc;
+
+    // Set up in-memory store
+    let store = Arc::new(InMemory::new());
+    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+    // Create basic commits with proper metadata and protocol
+    use crate::actions::{Metadata, Protocol};
+    use crate::schema::{DataType as KernelDataType, StructField, StructType};
+    use crate::utils::test_utils::Action;
+
+    let metadata = Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            StructType::new_unchecked([StructField::nullable("value", KernelDataType::INTEGER)]),
+            vec![],
+            0,
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
+    );
+    let protocol = Action::Protocol(
+        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+    );
+
+    let metadata_action = serde_json::to_string(&metadata).unwrap();
+    let protocol_action = serde_json::to_string(&protocol).unwrap();
+
+    // Write version 0
+    let commit_0_path = Path::from("_delta_log/00000000000000000000.json");
+    futures::executor::block_on(async {
+        store
+            .put(
+                &commit_0_path,
+                format!("{}\n{}", metadata_action, protocol_action).into(),
+            )
+            .await
+            .unwrap();
+    });
+
+    // Write version 1
+    let add_action = serde_json::to_string(&Action::Add(Add::default())).unwrap();
+    let commit_1_path = Path::from("_delta_log/00000000000000000001.json");
+    futures::executor::block_on(async {
+        store
+            .put(&commit_1_path, add_action.clone().into())
+            .await
+            .unwrap();
+    });
+
+    // Write a staged commit (this would normally be filtered out during listing)
+    let staged_commit_path = Path::from(
+        "_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+    );
+    futures::executor::block_on(async {
+        store
+            .put(&staged_commit_path, add_action.into())
+            .await
+            .unwrap();
+    });
+
+    let table_root = url::Url::parse("memory:///").unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    // Normal compaction should work fine since staged commits are filtered during listing
+    let writer = LogCompactionWriter::try_new(snapshot, 0, 1);
+    assert!(writer.is_ok());
+
+    // The validation in LogCompactionWriter is a safety check for edge cases
+    // where staged commits might slip through the normal filtering
+}
