@@ -370,21 +370,7 @@ fn filter_ancestor_fields(fields: Vec<FieldChange>) -> Vec<FieldChange> {
 fn has_added_ancestor(path: &ColumnName, added_ancestor_paths: &HashSet<ColumnName>) -> bool {
     added_ancestor_paths
         .iter()
-        .any(|ancestor| is_descendant_of(path, ancestor))
-}
-
-/// Checks if `path` is a descendant of `ancestor` (i.e., ancestor is a prefix of path)
-fn is_descendant_of(path: &ColumnName, ancestor: &ColumnName) -> bool {
-    let path_parts = path.path();
-    let ancestor_parts = ancestor.path();
-
-    // Path must be longer than ancestor to be a descendant
-    if path_parts.len() <= ancestor_parts.len() {
-        return false;
-    }
-
-    // Check if ancestor is a prefix of path
-    path_parts.starts_with(ancestor_parts)
+        .any(|ancestor| path.is_descendant_of(ancestor))
 }
 
 /// Gets the physical name of a field if present
