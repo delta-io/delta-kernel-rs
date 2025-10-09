@@ -835,15 +835,14 @@ mod tests {
     #[test]
     fn test_physical_name_validation() {
         // Test: Physical names present and unchanged - valid schema evolution (just a rename)
-        let before =
-            StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-                .add_metadata([
-                    ("delta.columnMapping.id", MetadataValue::Number(1)),
-                    (
-                        "delta.columnMapping.physicalName",
-                        MetadataValue::String("col_1".to_string()),
-                    ),
-                ])]);
+        let before = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+            .add_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(1)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col_1".to_string()),
+                ),
+            ])]);
         let after =
             StructType::new_unchecked([StructField::new("full_name", DataType::STRING, false)
                 .add_metadata([
@@ -865,15 +864,14 @@ mod tests {
         assert!(!diff.has_breaking_changes()); // Rename is not breaking
 
         // Test: Physical name changed - INVALID (returns error)
-        let before =
-            StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-                .add_metadata([
-                    ("delta.columnMapping.id", MetadataValue::Number(1)),
-                    (
-                        "delta.columnMapping.physicalName",
-                        MetadataValue::String("col_001".to_string()),
-                    ),
-                ])]);
+        let before = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+            .add_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(1)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col_001".to_string()),
+                ),
+            ])]);
         let after = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
             .add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
@@ -894,15 +892,14 @@ mod tests {
         ));
 
         // Test: Missing physical name in one schema - INVALID (returns error)
-        let before =
-            StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
-                .add_metadata([
-                    ("delta.columnMapping.id", MetadataValue::Number(1)),
-                    (
-                        "delta.columnMapping.physicalName",
-                        MetadataValue::String("col_1".to_string()),
-                    ),
-                ])]);
+        let before = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+            .add_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(1)),
+                (
+                    "delta.columnMapping.physicalName",
+                    MetadataValue::String("col_1".to_string()),
+                ),
+            ])]);
         let after = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
             .add_metadata([("delta.columnMapping.id", MetadataValue::Number(1))])]);
 
@@ -1911,7 +1908,7 @@ mod tests {
                         "inner",
                         DataType::try_struct_type([
                             create_field_with_id("renamed_a", DataType::INTEGER, false, 3), // Renamed!
-                            create_field_with_id("added", DataType::LONG, true, 6),        // Added!
+                            create_field_with_id("added", DataType::LONG, true, 6), // Added!
                         ])
                         .unwrap(),
                         false,
