@@ -394,11 +394,11 @@ mod tests {
         assert_eq!(protocol.min_writer_version(), 7);
         assert_eq!(
             protocol.reader_features(),
-            Some([ReaderFeature::unknown("rw1")].as_slice())
+            Some([TableFeature::unknown("rw1")].as_slice())
         );
         assert_eq!(
             protocol.writer_features(),
-            Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
+            Some([TableFeature::unknown("rw1"), TableFeature::unknown("w2")].as_slice())
         );
         Ok(())
     }

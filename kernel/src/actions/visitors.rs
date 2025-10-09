@@ -697,8 +697,8 @@ mod tests {
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
-            reader_features: Some(vec![ReaderFeature::DeletionVectors]),
-            writer_features: Some(vec![WriterFeature::DeletionVectors]),
+            reader_features: Some(vec![TableFeature::DeletionVectors]),
+            writer_features: Some(vec![TableFeature::DeletionVectors]),
         };
         assert_eq!(parsed, expected);
         Ok(())

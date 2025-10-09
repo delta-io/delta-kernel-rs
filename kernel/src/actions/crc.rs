@@ -252,8 +252,8 @@ mod tests {
         let expected_protocol = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
-            reader_features: Some(vec![ReaderFeature::ColumnMapping]),
-            writer_features: Some(vec![WriterFeature::ColumnMapping]),
+            reader_features: Some(vec![TableFeature::ColumnMapping]),
+            writer_features: Some(vec![TableFeature::ColumnMapping]),
         };
         let expected_metadata = Metadata {
             id: "testId".to_string(),

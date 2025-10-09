@@ -79,8 +79,8 @@ async fn metadata_protocol() {
                 Protocol::try_new(
                     3,
                     7,
-                    Some([ReaderFeature::DeletionVectors]),
-                    Some([ReaderFeature::ColumnMapping]),
+                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::ColumnMapping]),
                 )
                 .unwrap(),
             ),
@@ -138,7 +138,7 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([ReaderFeature::DeletionVectors, ReaderFeature::ColumnMapping]),
+                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
                 Some([""; 0]),
             )
             .unwrap(),
