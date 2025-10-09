@@ -236,8 +236,12 @@ impl Transaction {
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(commit_version),
             )),
-            // TODO: we may want to be more selective about what is retryable
-            Err(e) => Ok(CommitResult::RetryableTransaction(self.into_retryable(e))),
+            // TODO: we may want to be more or less selective about what is retryable (this is tied
+            // to the idea of "what kind of Errors should write_json_file return?")
+            Err(e @ Error::IOError(_)) => {
+                Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -622,11 +626,10 @@ impl CommittedTransaction {
     // TODO: post-commit snapshot
 }
 
-/// This is the result of a  [Transaction]. One can retrieve the
-/// [PostCommitStats] and [commit version] from this struct. In the future a post-commit snapshot
-/// can be obtained as well.
+/// This is the result of a conflicted [Transaction]. One can retrieve the [conflict version] from
+/// this struct. In the future a rebase API will be provided.
 ///
-/// [commit version]: Self::commit_version
+/// [conflict version]: Self::conflict_version
 #[derive(Debug)]
 pub struct ConflictedTransaction {
     // TODO: remove after rebase APIs
