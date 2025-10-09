@@ -24,7 +24,7 @@ use super::ScanMetadata;
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct DvInfo {
-    deletion_vector: Option<DeletionVectorDescriptor>,
+    pub deletion_vector: Option<DeletionVectorDescriptor>,
 }
 
 impl From<DeletionVectorDescriptor> for DvInfo {
