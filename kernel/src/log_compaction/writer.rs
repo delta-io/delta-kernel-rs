@@ -53,6 +53,10 @@ impl LogCompactionWriter {
             )));
         }
 
+        // We disallow compaction if the LogSegment contains any unpublished commits. (could create
+        // gaps in the version history, thereby breaking old readers)
+        snapshot.log_segment().validate_no_staged_commits()?;
+
         // Compute the compaction path once during construction
         let compaction_path =
             ParsedLogPath::new_log_compaction(snapshot.table_root(), start_version, end_version)?;

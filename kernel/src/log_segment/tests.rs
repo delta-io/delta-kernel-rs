@@ -2284,3 +2284,55 @@ fn test_log_segment_contiguous_commit_files() {
         file_type: Commit }]",
     );
 }
+
+#[test]
+fn test_publish_validation() {
+    use crate::Error;
+
+    // Test with only regular committed files - should pass validation
+    let regular_commits = vec![
+        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
+        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
+        create_log_path("file:///path/_delta_log/00000000000000000002.json"),
+    ];
+
+    let log_segment = LogSegment {
+        ascending_commit_files: regular_commits,
+        ascending_compaction_files: vec![],
+        checkpoint_parts: vec![],
+        checkpoint_version: None,
+        log_root: Url::parse("file:///path/").unwrap(),
+        end_version: 2,
+        latest_crc_file: None,
+        latest_commit_file: None,
+    };
+
+    assert!(log_segment.validate_no_staged_commits().is_ok());
+
+    // Test with a staged commit - should fail validation
+    let with_staged = vec![
+        create_log_path("file:///path/_delta_log/00000000000000000000.json"),
+        create_log_path("file:///path/_delta_log/00000000000000000001.json"),
+        create_log_path("file:///path/_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"),
+    ];
+
+    let log_segment_with_staged = LogSegment {
+        ascending_commit_files: with_staged,
+        ascending_compaction_files: vec![],
+        checkpoint_parts: vec![],
+        checkpoint_version: None,
+        log_root: Url::parse("file:///path/").unwrap(),
+        end_version: 2,
+        latest_crc_file: None,
+        latest_commit_file: None,
+    };
+
+    // Should fail with staged commits
+    let result = log_segment_with_staged.validate_no_staged_commits();
+    assert!(result.is_err());
+    if let Err(Error::Generic(msg)) = result {
+        assert_eq!(msg, "Found staged commit file in log segment");
+    } else {
+        panic!("Expected Error::Generic");
+    }
+}
