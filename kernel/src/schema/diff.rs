@@ -294,7 +294,8 @@ fn compute_schema_diff(
     }
 
     // Compute whether there are breaking changes
-    let has_breaking_changes = compute_has_breaking_changes(&removed_fields, &updated_fields);
+    let has_breaking_changes =
+        compute_has_breaking_changes(&added_fields, &removed_fields, &updated_fields);
 
     Ok(SchemaDiff {
         added_fields,
@@ -320,10 +321,15 @@ fn is_breaking_change_type(change_type: &FieldChangeType) -> bool {
 
 /// Computes whether the diff contains breaking changes
 fn compute_has_breaking_changes(
+    added_fields: &[FieldChange],
     removed_fields: &[FieldChange],
     updated_fields: &[FieldUpdate],
 ) -> bool {
+    // Removed fields are always breaking
     !removed_fields.is_empty()
+        // Adding a non-nullable (required) field is breaking - existing data won't have values
+        || added_fields.iter().any(|add| !add.field.nullable)
+        // Certain update types are breaking (type changes, nullability tightening, etc.)
         || updated_fields
             .iter()
             .any(|update| is_breaking_change_type(&update.change_type))
@@ -686,6 +692,48 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["name"]));
         assert_eq!(diff.added_fields[0].field.name(), "name");
+    }
+
+    #[test]
+    fn test_added_required_field_is_breaking() {
+        // Adding a non-nullable (required) field is breaking
+        let current =
+            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
+
+        let new = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, false, 1),
+            create_field_with_id("required_field", DataType::STRING, false, 2), // Non-nullable
+        ]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+        assert_eq!(diff.added_fields.len(), 1);
+        assert!(diff.has_breaking_changes());
+    }
+
+    #[test]
+    fn test_added_nullable_field_is_not_breaking() {
+        // Adding a nullable (optional) field is NOT breaking
+        let current =
+            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
+
+        let new = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, false, 1),
+            create_field_with_id("optional_field", DataType::STRING, true, 2), // Nullable
+        ]);
+
+        let diff = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff()
+        .unwrap();
+        assert_eq!(diff.added_fields.len(), 1);
+        assert!(!diff.has_breaking_changes()); // Not breaking
     }
 
     #[test]
