@@ -47,7 +47,7 @@ pub unsafe extern "C" fn visit_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(
+    visitor: extern "C" fn(
         engine_context: NullableCvoid,
         key: KernelStringSlice,
         value: KernelStringSlice,
@@ -56,7 +56,7 @@ pub unsafe extern "C" fn visit_domain_metadata(
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
 
-    visit_domain_metadata_impl(snapshot, engine, engine_context, engine_visitor)
+    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
         .into_extern_result(&engine)
 }
 
@@ -64,7 +64,7 @@ fn visit_domain_metadata_impl(
     snapshot: &Snapshot,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
-    engine_visitor: extern "C" fn(
+    visitor: extern "C" fn(
         engine_context: NullableCvoid,
         key: KernelStringSlice,
         value: KernelStringSlice,
@@ -72,7 +72,7 @@ fn visit_domain_metadata_impl(
 ) -> DeltaResult<bool> {
     let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref());
     res?.iter().for_each(|(key, value)| {
-        engine_visitor(
+        visitor(
             engine_context,
             kernel_string_slice!(key),
             kernel_string_slice!(value),
@@ -212,8 +212,7 @@ mod tests {
         // Secondly, we visit the entire domain metadata
 
         // Create visitor state
-        let visitor_state: Box<HashMap<String, String>> =
-            Box::new(std::collections::HashMap::new());
+        let visitor_state: Box<HashMap<String, String>> = Box::default();
         let visitor_state_ptr = Box::into_raw(visitor_state);
 
         // Test visitor function
