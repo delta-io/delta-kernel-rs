@@ -413,6 +413,10 @@ fn collect_all_fields_with_paths(
                 fields.extend(nested_fields);
             }
             DataType::Array(array_type) => {
+                // TODO: Add IcebergCompatV2 support - check that array nested field IDs remain stable
+                // For IcebergCompatV2, arrays should have a field ID on the array itself and nested
+                // field IDs must not be added or removed (they must stay the same across versions).
+                // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
                 if let DataType::Struct(element_struct) = array_type.element_type() {
                     // For arrays of structs, we use "element" as the path segment
                     let element_path = field_path.join(&ColumnName::new(["element"]));
@@ -422,6 +426,11 @@ fn collect_all_fields_with_paths(
                 }
             }
             DataType::Map(map_type) => {
+                // TODO: Add IcebergCompatV2 support - check that map nested field IDs remain stable
+                // For IcebergCompatV2, maps should have field IDs on key/value and nested field IDs
+                // must not be added or removed (they must stay the same across versions).
+                // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
+
                 // Handle map key structs
                 if let DataType::Struct(key_struct) = map_type.key_type() {
                     let key_path = field_path.join(&ColumnName::new(["key"]));
