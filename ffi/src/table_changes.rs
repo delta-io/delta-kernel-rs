@@ -1,22 +1,15 @@
 //! TableChanges related ffi code
 
 use std::sync::Arc;
-#[cfg(feature = "default-engine-base")]
 use std::sync::Mutex;
 
-#[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow::array::{Array, ArrayData, RecordBatch, StructArray};
-#[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow::compute::filter_record_batch;
-#[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow::ffi::to_ffi;
-#[cfg(feature = "default-engine-base")]
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-#[cfg(feature = "default-engine-base")]
 use delta_kernel::scan::ScanResult;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
-#[cfg(feature = "default-engine-base")]
 use delta_kernel::Error;
 use delta_kernel::{DeltaResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -25,7 +18,6 @@ use tracing::debug;
 use super::handle::Handle;
 use url::Url;
 
-#[cfg(feature = "default-engine-base")]
 use crate::engine_data::ArrowFFIData;
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::scan::EnginePredicate;
@@ -246,17 +238,14 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
-#[cfg(feature = "default-engine-base")]
 pub struct ScanTableChangesIterator {
     data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanResult>> + Send>>,
     engine: Arc<dyn ExternEngine>,
 }
 
-#[cfg(feature = "default-engine-base")]
 #[handle_descriptor(target=ScanTableChangesIterator, mutable=false, sized=true)]
 pub struct SharedScanTableChangesIterator;
 
-#[cfg(feature = "default-engine-base")]
 impl Drop for ScanTableChangesIterator {
     fn drop(&mut self) {
         debug!("dropping ScanTableChangesIterator");
@@ -270,7 +259,6 @@ impl Drop for ScanTableChangesIterator {
 /// # Safety
 ///
 /// Engine is responsible for passing a valid [`SharedExternEngine`] and [`SharedTableChangesScan`]
-#[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn table_changes_scan_execute(
     table_changes_scan: Handle<SharedTableChangesScan>,
@@ -282,7 +270,6 @@ pub unsafe extern "C" fn table_changes_scan_execute(
         .into_extern_result(&engine.as_ref())
 }
 
-#[cfg(feature = "default-engine-base")]
 fn table_changes_scan_execute_impl(
     table_changes_scan: &TableChangesScan,
     engine: Arc<dyn ExternEngine>,
@@ -300,7 +287,6 @@ fn table_changes_scan_execute_impl(
 /// Drops table changes iterator.
 /// Caller is responsible for (at most once) passing a valid pointer returned by a call to
 /// [`table_changes_scan_execute`].
-#[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn free_scan_table_changes_iter(
     data: Handle<SharedScanTableChangesIterator>,
@@ -314,7 +300,6 @@ pub unsafe extern "C" fn free_scan_table_changes_iter(
 ///
 /// The iterator must be valid (returned by [table_changes_scan_execute]) and not yet freed by
 /// [`free_scan_table_changes_iter`].
-#[cfg(feature = "default-engine-base")]
 #[no_mangle]
 pub unsafe extern "C" fn scan_table_changes_next(
     data: Handle<SharedScanTableChangesIterator>,
@@ -323,7 +308,6 @@ pub unsafe extern "C" fn scan_table_changes_next(
     scan_table_changes_next_impl(data).into_extern_result(&data.engine.as_ref())
 }
 
-#[cfg(feature = "default-engine-base")]
 fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<ArrowFFIData> {
     let mut data = data
         .data
