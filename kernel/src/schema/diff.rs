@@ -13,16 +13,16 @@ use std::collections::{HashMap, HashSet};
 /// Arguments for computing a schema diff
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaDiffArgs<'a> {
-    /// The current/original schema
-    pub current: &'a StructType,
-    /// The new schema to compare against
-    pub new: &'a StructType,
+    /// The before/original schema
+    pub before: &'a StructType,
+    /// The after/new schema to compare against
+    pub after: &'a StructType,
 }
 
 impl<'a> SchemaDiffArgs<'a> {
     /// Compute the difference between the two schemas
     pub(crate) fn compute_diff(self) -> Result<SchemaDiff, SchemaDiffError> {
-        compute_schema_diff(self.current, self.new)
+        compute_schema_diff(self.before, self.after)
     }
 }
 
@@ -189,45 +189,45 @@ struct FieldWithPath {
 ///
 /// ```rust,ignore
 /// let diff = SchemaDiffArgs {
-///     current: &old_schema,
-///     new: &new_schema,
+///     before: &old_schema,
+///     after: &new_schema,
 /// }.compute_diff()?;
 /// ```
 ///
 /// # Arguments
-/// * `current` - The current/original schema
-/// * `new` - The new schema to compare against
+/// * `before` - The before/original schema
+/// * `after` - The after/new schema to compare against
 ///
 /// # Returns
 /// A `SchemaDiff` describing all changes including nested fields, or an error if the schemas are invalid
 fn compute_schema_diff(
-    current: &StructType,
-    new: &StructType,
+    before: &StructType,
+    after: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
     // Collect all fields with their paths from both schemas
     let empty_path: Vec<String> = vec![];
-    let current_fields =
-        collect_all_fields_with_paths(current, &ColumnName::new(empty_path.clone()))?;
-    let new_fields = collect_all_fields_with_paths(new, &ColumnName::new(empty_path))?;
+    let before_fields =
+        collect_all_fields_with_paths(before, &ColumnName::new(empty_path.clone()))?;
+    let after_fields = collect_all_fields_with_paths(after, &ColumnName::new(empty_path))?;
 
     // Build maps by field ID
-    let current_by_id = build_field_map_by_id(&current_fields)?;
-    let new_by_id = build_field_map_by_id(&new_fields)?;
+    let before_by_id = build_field_map_by_id(&before_fields)?;
+    let after_by_id = build_field_map_by_id(&after_fields)?;
 
-    let current_field_ids: HashSet<i64> = current_by_id.keys().cloned().collect();
-    let new_field_ids: HashSet<i64> = new_by_id.keys().cloned().collect();
+    let before_field_ids: HashSet<i64> = before_by_id.keys().cloned().collect();
+    let after_field_ids: HashSet<i64> = after_by_id.keys().cloned().collect();
 
     // Find added, removed, and potentially updated fields
-    let added_ids: Vec<i64> = new_field_ids
-        .difference(&current_field_ids)
+    let added_ids: Vec<i64> = after_field_ids
+        .difference(&before_field_ids)
         .cloned()
         .collect();
-    let removed_ids: Vec<i64> = current_field_ids
-        .difference(&new_field_ids)
+    let removed_ids: Vec<i64> = before_field_ids
+        .difference(&after_field_ids)
         .cloned()
         .collect();
-    let common_ids: Vec<i64> = current_field_ids
-        .intersection(&new_field_ids)
+    let common_ids: Vec<i64> = before_field_ids
+        .intersection(&after_field_ids)
         .cloned()
         .collect();
 
@@ -235,7 +235,7 @@ fn compute_schema_diff(
     let added_fields: Vec<FieldChange> = added_ids
         .into_iter()
         .map(|id| {
-            let field_with_path = &new_by_id[&id];
+            let field_with_path = &after_by_id[&id];
             FieldChange {
                 field: field_with_path.field.clone(),
                 path: field_with_path.path.clone(),
@@ -251,7 +251,7 @@ fn compute_schema_diff(
     let removed_fields: Vec<FieldChange> = removed_ids
         .into_iter()
         .map(|id| {
-            let field_with_path = &current_by_id[&id];
+            let field_with_path = &before_by_id[&id];
             FieldChange {
                 field: field_with_path.field.clone(),
                 path: field_with_path.path.clone(),
@@ -266,8 +266,8 @@ fn compute_schema_diff(
     // Check for updates in common fields
     let mut updated_fields = Vec::new();
     for id in common_ids {
-        let current_field_with_path = &current_by_id[&id];
-        let new_field_with_path = &new_by_id[&id];
+        let before_field_with_path = &before_by_id[&id];
+        let after_field_with_path = &after_by_id[&id];
 
         // Invariant: A field in common_ids must have existed in both schemas, which means
         // its parent path must also have existed in both schemas. Therefore, neither an
@@ -280,23 +280,23 @@ fn compute_schema_diff(
                 removed_fields.iter().map(|f| f.path.clone()).collect();
 
             debug_assert!(
-                !has_added_ancestor(&new_field_with_path.path, &added_paths),
+                !has_added_ancestor(&after_field_with_path.path, &added_paths),
                 "Field with ID {} at path '{}' is in common_ids but has an added ancestor. \
                  This violates the invariant that common fields must have existed in both schemas.",
                 id,
-                new_field_with_path.path
+                after_field_with_path.path
             );
             debug_assert!(
-                !has_added_ancestor(&new_field_with_path.path, &removed_paths),
+                !has_added_ancestor(&after_field_with_path.path, &removed_paths),
                 "Field with ID {} at path '{}' is in common_ids but has a removed ancestor. \
                  This violates the invariant that common fields must have existed in both schemas.",
                 id,
-                new_field_with_path.path
+                after_field_with_path.path
             );
         }
 
         if let Some(field_update) =
-            compute_field_update(current_field_with_path, new_field_with_path)?
+            compute_field_update(before_field_with_path, after_field_with_path)?
         {
             updated_fields.push(field_update);
         }
@@ -700,8 +700,8 @@ mod tests {
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &schema,
-            new: &schema,
+            before: &schema,
+            after: &schema,
         }
         .compute_diff()
         .unwrap();
@@ -710,17 +710,17 @@ mod tests {
 
     #[test]
     fn test_top_level_added_field() {
-        let current =
+        let before =
             StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id("name", DataType::STRING, false, 2),
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -732,17 +732,17 @@ mod tests {
     #[test]
     fn test_added_required_field_is_breaking() {
         // Adding a non-nullable (required) field is breaking
-        let current =
+        let before =
             StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id("required_field", DataType::STRING, false, 2), // Non-nullable
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -753,17 +753,17 @@ mod tests {
     #[test]
     fn test_added_nullable_field_is_not_breaking() {
         // Adding a nullable (optional) field is NOT breaking
-        let current =
+        let before =
             StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id("optional_field", DataType::STRING, true, 2), // Nullable
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn test_removed_ancestor_filtering() {
         // Test that when a parent struct is removed, its children aren't reported separately
-        let current = StructType::new_unchecked([
+        let before = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id(
                 "user",
@@ -798,11 +798,11 @@ mod tests {
             ),
         ]);
 
-        let new = StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
+        let after = StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn test_physical_name_validation() {
         // Test: Physical names present and unchanged - valid schema evolution (just a rename)
-        let current =
+        let before =
             StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
                 .add_metadata([
                     ("delta.columnMapping.id", MetadataValue::Number(1)),
@@ -828,7 +828,7 @@ mod tests {
                         MetadataValue::String("col_1".to_string()),
                     ),
                 ])]);
-        let new =
+        let after =
             StructType::new_unchecked([StructField::new("full_name", DataType::STRING, false)
                 .add_metadata([
                     ("delta.columnMapping.id", MetadataValue::Number(1)),
@@ -839,8 +839,8 @@ mod tests {
                 ])]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -848,7 +848,7 @@ mod tests {
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 
         // Test: Physical name changed - INVALID (returns error)
-        let current =
+        let before =
             StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
                 .add_metadata([
                     ("delta.columnMapping.id", MetadataValue::Number(1)),
@@ -857,7 +857,7 @@ mod tests {
                         MetadataValue::String("col_001".to_string()),
                     ),
                 ])]);
-        let new = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+        let after = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
             .add_metadata([
                 ("delta.columnMapping.id", MetadataValue::Number(1)),
                 (
@@ -867,8 +867,8 @@ mod tests {
             ])]);
 
         let result = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff();
         assert!(matches!(
@@ -877,7 +877,7 @@ mod tests {
         ));
 
         // Test: Missing physical name in one schema - INVALID (returns error)
-        let current =
+        let before =
             StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
                 .add_metadata([
                     ("delta.columnMapping.id", MetadataValue::Number(1)),
@@ -886,12 +886,12 @@ mod tests {
                         MetadataValue::String("col_1".to_string()),
                     ),
                 ])]);
-        let new = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+        let after = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
             .add_metadata([("delta.columnMapping.id", MetadataValue::Number(1))])]);
 
         let result = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff();
         assert!(matches!(
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn test_container_with_nested_changes_not_reported_as_type_change() {
         // Test that when a struct's nested fields change, the struct itself isn't reported as TypeChanged
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "user",
             DataType::try_struct_type([
                 create_field_with_id("name", DataType::STRING, false, 2),
@@ -914,7 +914,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "user",
             DataType::try_struct_type([
                 create_field_with_id("full_name", DataType::STRING, false, 2), // Renamed
@@ -927,8 +927,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -960,10 +960,10 @@ mod tests {
     #[test]
     fn test_actual_struct_type_change_still_reported() {
         // Test that actual type changes (not just nested content changes) are still reported
-        let current =
+        let before =
             StructType::new_unchecked([create_field_with_id("data", DataType::STRING, false, 1)]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id(
                 "data",
                 DataType::try_struct_type([create_field_with_id(
@@ -979,8 +979,8 @@ mod tests {
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1005,7 +1005,7 @@ mod tests {
     #[test]
     fn test_array_with_struct_element_changes() {
         // Test that array containers aren't reported as changed when their struct elements change
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(
                 DataType::try_struct_type([create_field_with_id(
@@ -1021,7 +1021,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(
                 DataType::try_struct_type([
@@ -1035,8 +1035,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1061,10 +1061,10 @@ mod tests {
     #[test]
     fn test_ancestor_filtering() {
         // Test that when a parent struct is added, its children aren't reported separately
-        let current =
+        let before =
             StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id(
                 "user",
@@ -1089,8 +1089,8 @@ mod tests {
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1107,7 +1107,7 @@ mod tests {
 
     #[test]
     fn test_ancestor_filtering_with_mixed_changes() {
-        let current = StructType::new_unchecked([
+        let before = StructType::new_unchecked([
             create_field_with_id("existing", DataType::STRING, false, 1),
             create_field_with_id(
                 "existing_struct",
@@ -1123,7 +1123,7 @@ mod tests {
             ),
         ]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("existing", DataType::STRING, true, 1), // Changed nullability
             create_field_with_id(
                 "existing_struct",
@@ -1149,8 +1149,8 @@ mod tests {
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1170,7 +1170,7 @@ mod tests {
 
     #[test]
     fn test_nested_field_rename() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "user",
             DataType::try_struct_type([create_field_with_id("name", DataType::STRING, false, 2)])
                 .unwrap(),
@@ -1178,7 +1178,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "user",
             DataType::try_struct_type([
                 create_field_with_id("full_name", DataType::STRING, false, 2), // Renamed!
@@ -1189,8 +1189,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_nested_field_added() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "user",
             DataType::try_struct_type([create_field_with_id("name", DataType::STRING, false, 2)])
                 .unwrap(),
@@ -1211,7 +1211,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "user",
             DataType::try_struct_type([
                 create_field_with_id("name", DataType::STRING, false, 2),
@@ -1223,8 +1223,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn test_array_element_struct_field_changes() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(
                 DataType::try_struct_type([create_field_with_id(
@@ -1253,7 +1253,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(
                 DataType::try_struct_type([
@@ -1267,8 +1267,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1281,7 +1281,7 @@ mod tests {
 
     #[test]
     fn test_map_value_struct_field_changes() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
@@ -1298,7 +1298,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
@@ -1313,8 +1313,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1327,7 +1327,7 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_changes() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "level1",
             DataType::try_struct_type([create_field_with_id(
                 "level2",
@@ -1346,7 +1346,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "level1",
             DataType::try_struct_type([create_field_with_id(
                 "level2",
@@ -1363,8 +1363,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn test_top_level_vs_nested_filtering() {
-        let current = StructType::new_unchecked([
+        let before = StructType::new_unchecked([
             create_field_with_id("top_field", DataType::STRING, false, 1),
             create_field_with_id(
                 "user",
@@ -1396,7 +1396,7 @@ mod tests {
             ),
         ]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("renamed_top", DataType::STRING, false, 1), // Renamed top-level
             create_field_with_id(
                 "user",
@@ -1411,8 +1411,8 @@ mod tests {
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1435,7 +1435,7 @@ mod tests {
 
     #[test]
     fn test_mixed_changes() {
-        let current = StructType::new_unchecked([
+        let before = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id(
                 "user",
@@ -1449,7 +1449,7 @@ mod tests {
             ),
         ]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("identifier", DataType::LONG, false, 1), // Renamed top-level
             create_field_with_id(
                 "user",
@@ -1466,8 +1466,8 @@ mod tests {
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1495,19 +1495,19 @@ mod tests {
 
     #[test]
     fn test_change_count() {
-        let current = StructType::new_unchecked([
+        let before = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id("name", DataType::STRING, false, 2),
         ]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, true, 1), // Changed
             create_field_with_id("email", DataType::STRING, false, 3), // Added
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1522,7 +1522,7 @@ mod tests {
     #[test]
     fn test_multiple_change_types() {
         // Test that a field with multiple simultaneous changes produces FieldChangeType::Multiple
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "user_name",
             DataType::STRING,
             false,
@@ -1530,14 +1530,14 @@ mod tests {
         )
         .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("userName", DataType::STRING, true, 1) // Renamed + nullability loosened
                 .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1566,7 +1566,7 @@ mod tests {
     #[test]
     fn test_multiple_with_breaking_change() {
         // Test that Multiple changes are correctly identified as breaking when they contain breaking changes
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "user_name",
             DataType::STRING,
             true,
@@ -1574,14 +1574,14 @@ mod tests {
         )
         .add_metadata([("custom", MetadataValue::String("old_value".to_string()))])]);
 
-        let new = StructType::new_unchecked([
+        let after = StructType::new_unchecked([
             create_field_with_id("userName", DataType::STRING, false, 1) // Renamed + nullability TIGHTENED
                 .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
         ]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1615,8 +1615,8 @@ mod tests {
         ]);
 
         let result = SchemaDiffArgs {
-            current: &schema_with_duplicates,
-            new: &schema_with_duplicates,
+            before: &schema_with_duplicates,
+            after: &schema_with_duplicates,
         }
         .compute_diff();
 
@@ -1633,14 +1633,14 @@ mod tests {
 
     #[test]
     fn test_array_nullability_loosened() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable elements
             false,
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), // Nullable elements now
             false,
@@ -1648,8 +1648,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1664,14 +1664,14 @@ mod tests {
 
     #[test]
     fn test_array_nullability_tightened() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), // Nullable elements
             false,
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable now
             false,
@@ -1679,8 +1679,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1695,7 +1695,7 @@ mod tests {
 
     #[test]
     fn test_map_nullability_loosened() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
@@ -1706,7 +1706,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
@@ -1718,8 +1718,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1734,7 +1734,7 @@ mod tests {
 
     #[test]
     fn test_map_nullability_tightened() {
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
@@ -1745,7 +1745,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
@@ -1757,8 +1757,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
@@ -1774,7 +1774,7 @@ mod tests {
     #[test]
     fn test_map_with_struct_key() {
         // Test that maps with struct keys can be diffed
-        let current = StructType::new_unchecked([create_field_with_id(
+        let before = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::try_struct_type([create_field_with_id(
@@ -1791,7 +1791,7 @@ mod tests {
             1,
         )]);
 
-        let new = StructType::new_unchecked([create_field_with_id(
+        let after = StructType::new_unchecked([create_field_with_id(
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::try_struct_type([create_field_with_id(
@@ -1809,8 +1809,8 @@ mod tests {
         )]);
 
         let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
+            before: &before,
+            after: &after,
         }
         .compute_diff()
         .unwrap();
