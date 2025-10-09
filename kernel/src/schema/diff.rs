@@ -74,8 +74,6 @@ pub(crate) enum FieldChangeType {
     TypeChanged,
     /// Field metadata was changed (excluding column mapping metadata)
     MetadataChanged,
-    /// Field physical name changed (breaking - causes parquet read issues)
-    PhysicalNameChanged,
     /// Multiple aspects of the field changed
     Multiple(Vec<FieldChangeType>),
     /// The container nullability was loosened (safe change)
@@ -321,7 +319,6 @@ fn is_breaking_change_type(change_type: &FieldChangeType) -> bool {
     match change_type {
         FieldChangeType::TypeChanged
         | FieldChangeType::NullabilityTightened
-        | FieldChangeType::PhysicalNameChanged
         | FieldChangeType::ContainerNullabilityTightened => true,
         FieldChangeType::Multiple(multiple_changes) => {
             multiple_changes.iter().any(is_breaking_change_type)
