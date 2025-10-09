@@ -556,22 +556,25 @@ fn compute_field_update(
         changes.push(FieldChangeType::MetadataChanged);
     }
 
-    if changes.is_empty() {
-        Ok(None)
-    } else {
-        let change_type = match changes.len() {
-            1 => changes
-                .pop()
-                .expect("changes vector should have exactly one element"),
-            _ => FieldChangeType::Multiple(changes),
-        };
-
-        Ok(Some(FieldUpdate {
+    match changes.len() {
+        0 => Ok(None),
+        1 => {
+            let change_type = changes.into_iter().next().unwrap_or_else(|| {
+                unreachable!("vec with len 1 should have exactly one element")
+            });
+            Ok(Some(FieldUpdate {
+                before: before.field.clone(),
+                after: after.field.clone(),
+                path: after.path.clone(), // Use the new path in case of renames
+                change_type,
+            }))
+        }
+        _ => Ok(Some(FieldUpdate {
             before: before.field.clone(),
             after: after.field.clone(),
             path: after.path.clone(), // Use the new path in case of renames
-            change_type,
-        }))
+            change_type: FieldChangeType::Multiple(changes),
+        })),
     }
 }
 
