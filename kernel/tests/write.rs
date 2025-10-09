@@ -1537,8 +1537,14 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         let scan_metadata2 = scan2.scan_metadata(engine.as_ref())?.next().unwrap()?;
 
         // Create FilteredEngineData for removal (select all rows for removal)
-        let file_remove_count = (scan_metadata2.scan_files.data().len() - scan_metadata2.scan_files.selection_vector().len()) + 
-        scan_metadata2.scan_files.selection_vector().iter().filter(|&x| *x).count();
+        let file_remove_count = (scan_metadata2.scan_files.data().len()
+            - scan_metadata2.scan_files.selection_vector().len())
+            + scan_metadata2
+                .scan_files
+                .selection_vector()
+                .iter()
+                .filter(|&x| *x)
+                .count();
         assert!(file_remove_count > 0);
 
         // Add remove files to transaction

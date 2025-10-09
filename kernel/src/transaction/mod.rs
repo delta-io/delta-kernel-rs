@@ -585,16 +585,16 @@ impl Transaction {
                 DataType::Array(arr) => {
                     ArrayType::new(make_nullable_recursive(arr.element_type()), true).into()
                 }
-                DataType::Map(map) => {
-                    MapType::new(
-                        make_nullable_recursive(map.key_type()),
-                        make_nullable_recursive(map.value_type()),
-                        true,
-                    )
-                    .into()
-                }
+                DataType::Map(map) => MapType::new(
+                    make_nullable_recursive(map.key_type()),
+                    make_nullable_recursive(map.value_type()),
+                    true,
+                )
+                .into(),
                 DataType::Variant(v) => {
-                    if let DataType::Struct(s) = make_nullable_recursive(&DataType::Struct(v.clone())) {
+                    if let DataType::Struct(s) =
+                        make_nullable_recursive(&DataType::Struct(v.clone()))
+                    {
                         DataType::Variant(s)
                     } else {
                         data_type.clone()
@@ -605,13 +605,15 @@ impl Transaction {
         }
 
         let input_schema = scan_row_schema();
-        let target_schema = make_nullable_recursive(&DataType::Struct(Box::new((**get_log_remove_schema()).clone())));
+        let target_schema = make_nullable_recursive(&DataType::Struct(Box::new(
+            (**get_log_remove_schema()).clone(),
+        )));
         let evaluation_handler = engine.evaluation_handler();
-        
+
         self.remove_files_metadata
             .iter()
             .map(move |file_metadata_batch| {
-                 let transform = Expression::transform(
+                let transform = Expression::transform(
                     Transform::new_top_level()
                         .with_inserted_field(
                             Some("path"),
@@ -621,21 +623,40 @@ impl Transaction {
                             Some("path"),
                             Expression::literal(self.data_change).into(),
                         )
-                        .with_inserted_field( // extended_file_metadata
+                        .with_inserted_field(
+                            // extended_file_metadata
                             Some("path"),
                             Expression::literal(true).into(),
                         )
                         .with_inserted_field(
                             Some("path"),
-                            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into()
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"])
+                                .into(),
                         )
                         // tags
-                        .with_inserted_field(Some("size"), Expression::null_literal(MapType::new(DataType::STRING, DataType::STRING, true).into()).into())
-                        .with_inserted_field(Some("deletionVector"), Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into()) 
-                        .with_inserted_field(Some("deletionVector"), Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME]).into()) 
+                        .with_inserted_field(
+                            Some("size"),
+                            Expression::null_literal(
+                                MapType::new(DataType::STRING, DataType::STRING, true).into(),
+                            )
+                            .into(),
+                        )
+                        .with_inserted_field(
+                            Some("deletionVector"),
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
+                                .into(),
+                        )
+                        .with_inserted_field(
+                            Some("deletionVector"),
+                            Expression::column([
+                                FILE_CONSTANT_VALUES_NAME,
+                                DEFAULT_ROW_COMMIT_VERSION_NAME,
+                            ])
+                            .into(),
+                        )
                         .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
                         .with_dropped_field("modificationTime")
-                        .with_dropped_field("stats")
+                        .with_dropped_field("stats"),
                 );
                 let expr = Expression::struct_from([transform]);
                 let file_action_eval = evaluation_handler.new_expression_evaluator(
