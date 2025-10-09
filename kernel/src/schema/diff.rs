@@ -95,6 +95,17 @@ pub(crate) enum SchemaDiffError {
         path1: ColumnName,
         path2: ColumnName,
     },
+    #[error(
+        "Field at path '{path}' is missing physical name (required when column mapping is enabled)"
+    )]
+    MissingPhysicalName { path: ColumnName },
+    #[error("Field with ID {field_id} at path '{path}' has inconsistent physical names: '{before}' -> '{after}'. Physical names must not change for the same field ID.")]
+    PhysicalNameChanged {
+        field_id: i64,
+        path: ColumnName,
+        before: String,
+        after: String,
+    },
 }
 
 impl SchemaDiff {
@@ -287,7 +298,7 @@ fn compute_schema_diff(
         }
 
         if let Some(field_update) =
-            compute_field_update(current_field_with_path, new_field_with_path)
+            compute_field_update(current_field_with_path, new_field_with_path)?
         {
             updated_fields.push(field_update);
         }
@@ -483,7 +494,10 @@ fn get_field_id_for_path(field: &StructField, path: &ColumnName) -> Result<i64, 
 }
 
 /// Computes the update for two fields with the same ID, if they differ
-fn compute_field_update(before: &FieldWithPath, after: &FieldWithPath) -> Option<FieldUpdate> {
+fn compute_field_update(
+    before: &FieldWithPath,
+    after: &FieldWithPath,
+) -> Result<Option<FieldUpdate>, SchemaDiffError> {
     let mut changes = Vec::new();
 
     // Check for name change (rename)
@@ -498,12 +512,34 @@ fn compute_field_update(before: &FieldWithPath, after: &FieldWithPath) -> Option
         _ => {}                                                               // No change
     }
 
-    // Check for physical name change - only compare if both are present
+    // Validate physical name consistency
+    // Since we require column mapping (field IDs) for schema diffing, physical names must be present
     let bp = physical_name(&before.field);
     let ap = physical_name(&after.field);
-    if let (Some(b), Some(a)) = (bp, ap) {
-        if b != a {
-            changes.push(FieldChangeType::PhysicalNameChanged);
+    match (bp, ap) {
+        (Some(b), Some(a)) if b == a => {
+            // Valid: physical name is present and unchanged
+        }
+        (Some(b), Some(a)) => {
+            // Invalid: physical name changed for the same field ID
+            return Err(SchemaDiffError::PhysicalNameChanged {
+                field_id: before.field_id,
+                path: after.path.clone(),
+                before: b.to_string(),
+                after: a.to_string(),
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            // Invalid: physical name was added or removed
+            return Err(SchemaDiffError::MissingPhysicalName {
+                path: after.path.clone(),
+            });
+        }
+        (None, None) => {
+            // Invalid: physical name must be present when column mapping is enabled
+            return Err(SchemaDiffError::MissingPhysicalName {
+                path: after.path.clone(),
+            });
         }
     }
 
@@ -524,19 +560,19 @@ fn compute_field_update(before: &FieldWithPath, after: &FieldWithPath) -> Option
     }
 
     if changes.is_empty() {
-        None
+        Ok(None)
     } else {
         let change_type = match changes.len() {
             1 => changes.pop().unwrap(), // Safe: we know len is 1
             _ => FieldChangeType::Multiple(changes),
         };
 
-        Some(FieldUpdate {
+        Ok(Some(FieldUpdate {
             before: before.field.clone(),
             after: after.field.clone(),
             path: after.path.clone(), // Use the new path in case of renames
             change_type,
-        })
+        }))
     }
 }
 
@@ -650,8 +686,13 @@ mod tests {
         nullable: bool,
         id: i64,
     ) -> StructField {
-        StructField::new(name, data_type, nullable)
-            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(id))])
+        StructField::new(name, data_type, nullable).add_metadata([
+            ("delta.columnMapping.id", MetadataValue::Number(id)),
+            (
+                "delta.columnMapping.physicalName",
+                MetadataValue::String(format!("col_{}", id)),
+            ),
+        ])
     }
 
     #[test]
@@ -779,13 +820,26 @@ mod tests {
     }
 
     #[test]
-    fn test_physical_name_only_when_both_present() {
-        // Test: no physical name metadata - should not report change
+    fn test_physical_name_validation() {
+        // Test: Physical names present and unchanged - valid schema evolution (just a rename)
         let current =
-            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)]);
-        let new = StructType::new_unchecked([
-            create_field_with_id("full_name", DataType::STRING, false, 1), // Renamed
-        ]);
+            StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+                .add_metadata([
+                    ("delta.columnMapping.id", MetadataValue::Number(1)),
+                    (
+                        "delta.columnMapping.physicalName",
+                        MetadataValue::String("col_1".to_string()),
+                    ),
+                ])]);
+        let new =
+            StructType::new_unchecked([StructField::new("full_name", DataType::STRING, false)
+                .add_metadata([
+                    ("delta.columnMapping.id", MetadataValue::Number(1)),
+                    (
+                        "delta.columnMapping.physicalName",
+                        MetadataValue::String("col_1".to_string()),
+                    ),
+                ])]);
 
         let diff = SchemaDiffArgs {
             current: &current,
@@ -796,52 +850,57 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
 
-        // Test: one has physical name, other doesn't - should not report physical name change
+        // Test: Physical name changed - INVALID (returns error)
         let current =
-            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)
-                .add_metadata([(
-                    "delta.columnMapping.physicalName",
-                    MetadataValue::String("col_001".to_string()),
-                )])]);
-        let new = StructType::new_unchecked([
-            create_field_with_id("name", DataType::STRING, false, 1), // No physical name
-        ]);
-
-        let diff = SchemaDiffArgs {
-            current: &current,
-            new: &new,
-        }
-        .compute_diff()
-        .unwrap();
-        // Should report no changes since we only compare physical names when both are present
-        assert!(diff.is_empty());
-
-        // Test: both have physical names and they differ - should report change
-        let current =
-            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)
-                .add_metadata([(
-                    "delta.columnMapping.physicalName",
-                    MetadataValue::String("col_001".to_string()),
-                )])]);
-        let new =
-            StructType::new_unchecked([create_field_with_id("name", DataType::STRING, false, 1)
-                .add_metadata([(
+            StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+                .add_metadata([
+                    ("delta.columnMapping.id", MetadataValue::Number(1)),
+                    (
+                        "delta.columnMapping.physicalName",
+                        MetadataValue::String("col_001".to_string()),
+                    ),
+                ])]);
+        let new = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+            .add_metadata([
+                ("delta.columnMapping.id", MetadataValue::Number(1)),
+                (
                     "delta.columnMapping.physicalName",
                     MetadataValue::String("col_002".to_string()),
-                )])]);
+                ),
+            ])]);
 
-        let diff = SchemaDiffArgs {
+        let result = SchemaDiffArgs {
             current: &current,
             new: &new,
         }
-        .compute_diff()
-        .unwrap();
-        assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::PhysicalNameChanged
-        );
-        assert!(diff.has_breaking_changes());
+        .compute_diff();
+        assert!(matches!(
+            result,
+            Err(SchemaDiffError::PhysicalNameChanged { .. })
+        ));
+
+        // Test: Missing physical name in one schema - INVALID (returns error)
+        let current =
+            StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+                .add_metadata([
+                    ("delta.columnMapping.id", MetadataValue::Number(1)),
+                    (
+                        "delta.columnMapping.physicalName",
+                        MetadataValue::String("col_1".to_string()),
+                    ),
+                ])]);
+        let new = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
+            .add_metadata([("delta.columnMapping.id", MetadataValue::Number(1))])]);
+
+        let result = SchemaDiffArgs {
+            current: &current,
+            new: &new,
+        }
+        .compute_diff();
+        assert!(matches!(
+            result,
+            Err(SchemaDiffError::MissingPhysicalName { .. })
+        ));
     }
 
     #[test]
