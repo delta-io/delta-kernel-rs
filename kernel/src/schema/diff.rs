@@ -773,9 +773,12 @@ mod tests {
     }
 
     #[test]
-    fn test_removed_ancestor_filtering() {
-        // Test that when a parent struct is removed, its children aren't reported separately
-        let before = StructType::new_unchecked([
+    fn test_ancestor_filtering() {
+        // Test that when a parent struct is added/removed, its children aren't reported separately
+        let without_user =
+            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
+
+        let with_user = StructType::new_unchecked([
             create_field_with_id("id", DataType::LONG, false, 1),
             create_field_with_id(
                 "user",
@@ -799,22 +802,33 @@ mod tests {
             ),
         ]);
 
-        let after = StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
-
+        // CASE 1: Adding a parent struct - only parent should be reported, not nested fields
         let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
+            before: &without_user,
+            after: &with_user,
         }
         .compute_diff()
         .unwrap();
 
-        // Only the top-level "user" field should be reported as removed
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.added_fields[0].path, ColumnName::new(["user"]));
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
+        // The filtered paths would have been: user.name, user.email, user.address, user.address.street, user.address.city
+        assert!(diff.has_breaking_changes()); // Adding non-nullable struct field is breaking
+
+        // CASE 2: Removing a parent struct - only parent should be reported, not nested fields
+        let diff = SchemaDiffArgs {
+            before: &with_user,
+            after: &without_user,
+        }
+        .compute_diff()
+        .unwrap();
+
         assert_eq!(diff.removed_fields.len(), 1);
         assert_eq!(diff.removed_fields[0].path, ColumnName::new(["user"]));
-
-        // No nested fields should be reported as removed
-        assert_eq!(diff.updated_fields.len(), 0);
         assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
         assert!(diff.has_breaking_changes()); // Removing fields is breaking
     }
 
@@ -1062,54 +1076,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ancestor_filtering() {
-        // Test that when a parent struct is added, its children aren't reported separately
-        let before =
-            StructType::new_unchecked([create_field_with_id("id", DataType::LONG, false, 1)]);
-
-        let after = StructType::new_unchecked([
-            create_field_with_id("id", DataType::LONG, false, 1),
-            create_field_with_id(
-                "user",
-                DataType::try_struct_type([
-                    create_field_with_id("name", DataType::STRING, false, 3),
-                    create_field_with_id("email", DataType::STRING, true, 4),
-                    create_field_with_id(
-                        "address",
-                        DataType::try_struct_type([
-                            create_field_with_id("street", DataType::STRING, false, 6),
-                            create_field_with_id("city", DataType::STRING, false, 7),
-                        ])
-                        .unwrap(),
-                        true,
-                        5,
-                    ),
-                ])
-                .unwrap(),
-                false,
-                2,
-            ),
-        ]);
-
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
-
-        // Only the top-level "user" field should be reported as added
-        assert_eq!(diff.added_fields.len(), 1);
-        assert_eq!(diff.added_fields[0].path, ColumnName::new(["user"]));
-
-        // No nested fields should be reported as added or updated
-        assert_eq!(diff.updated_fields.len(), 0);
-
-        // The filtered paths would have been: user.name, user.email, user.address, user.address.street, user.address.city
-        assert!(diff.has_breaking_changes()); // Adding non-nullable struct field is breaking
-    }
-
-    #[test]
     fn test_ancestor_filtering_with_mixed_changes() {
         let before = StructType::new_unchecked([
             create_field_with_id("existing", DataType::STRING, false, 1),
@@ -1135,7 +1101,7 @@ mod tests {
                     create_field_with_id("new_name", DataType::STRING, false, 3), // Renamed
                 ])
                 .unwrap(),
-                false,
+                true, // Changed nullability
                 2,
             ),
             create_field_with_id(
@@ -1159,14 +1125,15 @@ mod tests {
         .compute_diff()
         .unwrap();
 
-        // Should see: existing changed, existing_struct.old_name->new_name renamed, new_struct added
+        // Should see: existing changed, existing_struct changed, existing_struct.old_name->new_name renamed, new_struct added
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["new_struct"]));
 
-        assert_eq!(diff.updated_fields.len(), 2);
+        assert_eq!(diff.updated_fields.len(), 3);
         let paths: HashSet<ColumnName> =
             diff.updated_fields.iter().map(|u| u.path.clone()).collect();
         assert!(paths.contains(&ColumnName::new(["existing"])));
+        assert!(paths.contains(&ColumnName::new(["existing_struct"])));
         assert!(paths.contains(&ColumnName::new(["existing_struct", "new_name"])));
 
         // nested_field should NOT appear as added since new_struct is its ancestor
@@ -1246,12 +1213,10 @@ mod tests {
         let before = StructType::new_unchecked([create_field_with_id(
             "items",
             DataType::Array(Box::new(ArrayType::new(
-                DataType::try_struct_type([create_field_with_id(
-                    "name",
-                    DataType::STRING,
-                    false,
-                    2,
-                )])
+                DataType::try_struct_type([
+                    create_field_with_id("name", DataType::STRING, false, 2),
+                    create_field_with_id("removed_field", DataType::INTEGER, true, 3),
+                ])
                 .unwrap(),
                 true,
             ))),
@@ -1264,6 +1229,7 @@ mod tests {
             DataType::Array(Box::new(ArrayType::new(
                 DataType::try_struct_type([
                     create_field_with_id("title", DataType::STRING, false, 2), // Renamed!
+                    create_field_with_id("added_field", DataType::STRING, true, 4), // Added!
                 ])
                 .unwrap(),
                 true,
@@ -1278,12 +1244,28 @@ mod tests {
         }
         .compute_diff()
         .unwrap();
-        assert_eq!(diff.updated_fields.len(), 1);
 
+        // Check added field
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(
+            diff.added_fields[0].path,
+            ColumnName::new(["items", "element", "added_field"])
+        );
+
+        // Check removed field
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(
+            diff.removed_fields[0].path,
+            ColumnName::new(["items", "element", "removed_field"])
+        );
+
+        // Check updated field (rename)
+        assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
-        assert!(!diff.has_breaking_changes()); // Rename is not breaking
+
+        assert!(diff.has_breaking_changes()); // Removal is breaking
     }
 
     #[test]
@@ -1292,12 +1274,10 @@ mod tests {
             "lookup",
             DataType::Map(Box::new(MapType::new(
                 DataType::STRING,
-                DataType::try_struct_type([create_field_with_id(
-                    "value",
-                    DataType::INTEGER,
-                    false,
-                    2,
-                )])
+                DataType::try_struct_type([
+                    create_field_with_id("value", DataType::INTEGER, false, 2),
+                    create_field_with_id("removed_field", DataType::STRING, true, 3),
+                ])
                 .unwrap(),
                 true,
             ))),
@@ -1311,6 +1291,7 @@ mod tests {
                 DataType::STRING,
                 DataType::try_struct_type([
                     create_field_with_id("count", DataType::INTEGER, false, 2), // Renamed!
+                    create_field_with_id("added_field", DataType::STRING, true, 4), // Added!
                 ])
                 .unwrap(),
                 true,
@@ -1325,11 +1306,28 @@ mod tests {
         }
         .compute_diff()
         .unwrap();
-        assert_eq!(diff.updated_fields.len(), 1);
 
+        // Check added field
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(
+            diff.added_fields[0].path,
+            ColumnName::new(["lookup", "value", "added_field"])
+        );
+
+        // Check removed field
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(
+            diff.removed_fields[0].path,
+            ColumnName::new(["lookup", "value", "removed_field"])
+        );
+
+        // Check updated field (rename)
+        assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["lookup", "value", "count"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
+
+        assert!(diff.has_breaking_changes()); // Removal is breaking
     }
 
     #[test]
@@ -1829,5 +1827,166 @@ mod tests {
             ColumnName::new(["lookup", "key", "identifier"])
         );
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+    }
+
+    #[test]
+    fn test_cursed_deeply_nested_complex_types() {
+        // Test frightening nested cases with multiple levels of complex types
+
+        // Case 1: struct<items: array<struct<inner: struct<a int, b string>>>>
+        let before1 = StructType::new_unchecked([create_field_with_id(
+            "data",
+            DataType::try_struct_type([create_field_with_id(
+                "items",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "inner",
+                        DataType::try_struct_type([
+                            create_field_with_id("a", DataType::INTEGER, false, 3),
+                            create_field_with_id("removed", DataType::STRING, true, 4),
+                        ])
+                        .unwrap(),
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+                5,
+            )])
+            .unwrap(),
+            false,
+            1,
+        )]);
+
+        let after1 = StructType::new_unchecked([create_field_with_id(
+            "data",
+            DataType::try_struct_type([create_field_with_id(
+                "items",
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "inner",
+                        DataType::try_struct_type([
+                            create_field_with_id("renamed_a", DataType::INTEGER, false, 3), // Renamed!
+                            create_field_with_id("added", DataType::LONG, true, 6),        // Added!
+                        ])
+                        .unwrap(),
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+                5,
+            )])
+            .unwrap(),
+            false,
+            1,
+        )]);
+
+        let diff1 = SchemaDiffArgs {
+            before: &before1,
+            after: &after1,
+        }
+        .compute_diff()
+        .unwrap();
+
+        // Verify deeply nested changes are detected
+        assert_eq!(diff1.added_fields.len(), 1);
+        assert_eq!(
+            diff1.added_fields[0].path,
+            ColumnName::new(["data", "items", "element", "inner", "added"])
+        );
+
+        assert_eq!(diff1.removed_fields.len(), 1);
+        assert_eq!(
+            diff1.removed_fields[0].path,
+            ColumnName::new(["data", "items", "element", "inner", "removed"])
+        );
+
+        assert_eq!(diff1.updated_fields.len(), 1);
+        assert_eq!(
+            diff1.updated_fields[0].path,
+            ColumnName::new(["data", "items", "element", "inner", "renamed_a"])
+        );
+        assert_eq!(
+            diff1.updated_fields[0].change_type,
+            FieldChangeType::Renamed
+        );
+
+        assert!(diff1.has_breaking_changes()); // Removal is breaking
+
+        // Case 2: map<string, struct<nested: map<int, struct<x int>>>>
+        let before2 = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([create_field_with_id(
+                    "nested",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::INTEGER,
+                        DataType::try_struct_type([create_field_with_id(
+                            "x",
+                            DataType::INTEGER,
+                            false,
+                            3,
+                        )])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after2 = StructType::new_unchecked([create_field_with_id(
+            "lookup",
+            DataType::Map(Box::new(MapType::new(
+                DataType::STRING,
+                DataType::try_struct_type([create_field_with_id(
+                    "nested",
+                    DataType::Map(Box::new(MapType::new(
+                        DataType::INTEGER,
+                        DataType::try_struct_type([
+                            create_field_with_id("renamed_x", DataType::INTEGER, false, 3), // Renamed!
+                        ])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff2 = SchemaDiffArgs {
+            before: &before2,
+            after: &after2,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff2.updated_fields.len(), 1);
+        assert_eq!(
+            diff2.updated_fields[0].path,
+            ColumnName::new(["lookup", "value", "nested", "value", "renamed_x"])
+        );
+        assert_eq!(
+            diff2.updated_fields[0].change_type,
+            FieldChangeType::Renamed
+        );
+
+        assert!(!diff2.has_breaking_changes()); // Just a rename
     }
 }
