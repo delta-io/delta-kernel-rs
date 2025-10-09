@@ -1134,6 +1134,8 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
+        // Test get_domain_metadata
+
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
             snapshot.get_domain_metadata("domain2", &engine)?,
@@ -1148,6 +1150,17 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+
+        // Test get_all_domain_metadata
+
+        let metadata = snapshot.get_all_domain_metadata(&engine)?;
+
+        let mut expected = HashMap::new();
+        expected.insert("domain2".to_string(), "domain2_commit1".to_string());
+        expected.insert("domain3".to_string(), "domain3_commit0".to_string());
+
+        assert_eq!(metadata, expected);
+
         Ok(())
     }
 
