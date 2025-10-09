@@ -517,8 +517,8 @@ fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> O
     if changes.is_empty() {
         None
     } else {
-        let change_type = match changes.as_slice() {
-            [single_change] => single_change.clone(),
+        let change_type = match changes.len() {
+            1 => changes.pop().unwrap(), // Safe: we know len is 1
             _ => FieldChangeType::Multiple(changes),
         };
 
