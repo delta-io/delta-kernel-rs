@@ -479,6 +479,7 @@ mod tests {
             &partition_cols,
             ColumnMappingMode::None,
             None,
+            crate::scan::field_classifiers::ScanTransformFieldClassifierieldClassifier,
         )
         .unwrap();
         let batch = vec![add_batch_with_partition_col()];
