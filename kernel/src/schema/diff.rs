@@ -287,7 +287,7 @@ fn compute_schema_diff(
         }
 
         if let Some(field_update) =
-            compare_fields_with_paths(current_field_with_path, new_field_with_path)
+            compute_field_update(current_field_with_path, new_field_with_path)
         {
             updated_fields.push(field_update);
         }
@@ -482,8 +482,8 @@ fn get_field_id_for_path(field: &StructField, path: &ColumnName) -> Result<i64, 
     }
 }
 
-/// Compares two fields with the same ID and returns a FieldUpdate if they differ
-fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> Option<FieldUpdate> {
+/// Computes the update for two fields with the same ID, if they differ
+fn compute_field_update(before: &FieldWithPath, after: &FieldWithPath) -> Option<FieldUpdate> {
     let mut changes = Vec::new();
 
     // Check for name change (rename)
