@@ -500,17 +500,13 @@ fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> O
 
     // Check for type change (including container changes)
     if before.field.data_type() != after.field.data_type() {
-        // Don't report type changes for containers when only nested content changed
-        if are_same_container_type(before.field.data_type(), after.field.data_type()) {
-            // This is a container with the same structure but different nested content
-            // The nested changes are already captured via field IDs, so don't report container change
-        } else if let Some(container_change) =
-            classify_container_change(before.field.data_type(), after.field.data_type())
+        if let Some(change_type) =
+            classify_type_change(before.field.data_type(), after.field.data_type())
         {
-            changes.push(container_change);
-        } else {
-            changes.push(FieldChangeType::TypeChanged);
+            changes.push(change_type);
         }
+        // If None is returned, the container structure is the same and nested changes
+        // are already captured via field IDs, so we don't report a change here
     }
 
     // Check for metadata changes (excluding column mapping metadata)
@@ -535,86 +531,78 @@ fn compare_fields_with_paths(before: &FieldWithPath, after: &FieldWithPath) -> O
     }
 }
 
-/// Checks if two data types are the same container type (struct/array/map) but with different content
-fn are_same_container_type(before: &DataType, after: &DataType) -> bool {
+/// Classifies a type change between two data types.
+///
+/// Returns:
+/// - `Some(FieldChangeType)` if there's a reportable change (type changed or container nullability changed)
+/// - `None` if the types are the same container with nested changes handled elsewhere
+///
+/// This function handles the following cases:
+/// 1. **Struct containers**: Changes to nested fields are captured via field IDs, so return None
+/// 2. **Array containers**:
+///    - If element types match and only nullability changed, return the specific nullability change
+///    - If element types are both structs with same nullability, nested changes handled via field IDs (return None)
+///    - Otherwise, it's a type change
+/// 3. **Map containers**: Similar logic to arrays, but for both key and value types
+/// 4. **Different container types or primitives**: Type change
+fn classify_type_change(before: &DataType, after: &DataType) -> Option<FieldChangeType> {
     match (before, after) {
-        // Both are structs - the nested field changes are handled separately via field IDs
-        (DataType::Struct(_), DataType::Struct(_)) => true,
+        // Struct-to-struct: nested field changes are handled separately via field IDs
+        (DataType::Struct(_), DataType::Struct(_)) => None,
 
-        // Both are arrays - check if they're the same array type regardless of element content
+        // Array-to-array: check element types and nullability
         (DataType::Array(before_array), DataType::Array(after_array)) => {
-            // Check if both element types are the same kind of type (both structs, both primitives, etc)
-            match (before_array.element_type(), after_array.element_type()) {
-                (DataType::Struct(_), DataType::Struct(_)) => {
+            let element_types_match =
+                match (before_array.element_type(), after_array.element_type()) {
                     // Both have struct elements - nested changes handled via field IDs
-                    before_array.contains_null() == after_array.contains_null()
+                    (DataType::Struct(_), DataType::Struct(_)) => true,
+                    // Non-struct elements must match exactly
+                    (e1, e2) => e1 == e2,
+                };
+
+            if element_types_match {
+                // Element types match, check container nullability
+                match (before_array.contains_null(), after_array.contains_null()) {
+                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
+                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
+                    (true, true) | (false, false) => None, // Same container, nested changes handled elsewhere
                 }
-                _ => {
-                    // For non-struct elements, require exact type match
-                    before_array.element_type() == after_array.element_type()
-                        && before_array.contains_null() == after_array.contains_null()
-                }
+            } else {
+                // Element type changed - this is a breaking type change
+                Some(FieldChangeType::TypeChanged)
             }
         }
 
-        // Both are maps - check if they're the same map type regardless of nested struct content
+        // Map-to-map: check key types, value types, and nullability
         (DataType::Map(before_map), DataType::Map(after_map)) => {
-            // Check key types (must match exactly)
             let keys_match = match (before_map.key_type(), after_map.key_type()) {
                 (DataType::Struct(_), DataType::Struct(_)) => true, // Struct keys, changes handled via field IDs
                 (k1, k2) => k1 == k2, // Non-struct keys must match exactly
             };
 
-            // Check value types
             let values_match = match (before_map.value_type(), after_map.value_type()) {
                 (DataType::Struct(_), DataType::Struct(_)) => true, // Struct values, changes handled via field IDs
                 (v1, v2) => v1 == v2, // Non-struct values must match exactly
             };
 
-            keys_match
-                && values_match
-                && before_map.value_contains_null() == after_map.value_contains_null()
-        }
-
-        _ => false,
-    }
-}
-
-/// Classifies container changes as loosened, tightened, or incompatible
-fn classify_container_change(before: &DataType, after: &DataType) -> Option<FieldChangeType> {
-    match (before, after) {
-        // Array nullability changes
-        (DataType::Array(before_array), DataType::Array(after_array)) => {
-            if before_array.element_type() == after_array.element_type() {
-                match (before_array.contains_null(), after_array.contains_null()) {
-                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened), // Safe
-                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened), // Breaking
-                    _ => None, // No nullability change
-                }
-            } else {
-                None // Element type changed - this is a type change, not container change
-            }
-        }
-        // Map nullability changes
-        (DataType::Map(before_map), DataType::Map(after_map)) => {
-            if before_map.key_type() == after_map.key_type()
-                && before_map.value_type() == after_map.value_type()
-            {
+            if keys_match && values_match {
+                // Key and value types match, check container nullability
                 match (
                     before_map.value_contains_null(),
                     after_map.value_contains_null(),
                 ) {
-                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened), // Safe
-                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened), // Breaking
-                    _ => None, // No nullability change
+                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
+                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
+                    (true, true) | (false, false) => None, // Same container, nested changes handled elsewhere
                 }
             } else {
-                None // Key/value type changed - this is a type change, not container change
+                // Key or value type changed - this is a breaking type change
+                Some(FieldChangeType::TypeChanged)
             }
         }
-        // Struct changes where fields are added/removed are handled at field level
-        (DataType::Struct(_), DataType::Struct(_)) => None,
-        _ => None, // Incompatible types
+
+        // Different container types or primitive type changes
+        _ => Some(FieldChangeType::TypeChanged),
     }
 }
 
