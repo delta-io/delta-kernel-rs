@@ -727,6 +727,7 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["name"]));
         assert_eq!(diff.added_fields[0].field.name(), "name");
+        assert!(diff.has_breaking_changes()); // Adding non-nullable field is breaking
     }
 
     #[test]
@@ -814,6 +815,7 @@ mod tests {
         // No nested fields should be reported as removed
         assert_eq!(diff.updated_fields.len(), 0);
         assert_eq!(diff.added_fields.len(), 0);
+        assert!(diff.has_breaking_changes()); // Removing fields is breaking
     }
 
     #[test]
@@ -846,6 +848,7 @@ mod tests {
         .unwrap();
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+        assert!(!diff.has_breaking_changes()); // Rename is not breaking
 
         // Test: Physical name changed - INVALID (returns error)
         let before =
@@ -1103,6 +1106,7 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 0);
 
         // The filtered paths would have been: user.name, user.email, user.address, user.address.street, user.address.city
+        assert!(diff.has_breaking_changes()); // Adding non-nullable struct field is breaking
     }
 
     #[test]
@@ -1199,6 +1203,7 @@ mod tests {
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["user", "full_name"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
+        assert!(!diff.has_breaking_changes()); // Rename is not breaking
     }
 
     #[test]
@@ -1233,6 +1238,7 @@ mod tests {
         let added = &diff.added_fields[0];
         assert_eq!(added.path, ColumnName::new(["user", "age"]));
         assert_eq!(added.field.name(), "age");
+        assert!(!diff.has_breaking_changes()); // Adding nullable field is not breaking
     }
 
     #[test]
@@ -1277,6 +1283,7 @@ mod tests {
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
+        assert!(!diff.has_breaking_changes()); // Rename is not breaking
     }
 
     #[test]
