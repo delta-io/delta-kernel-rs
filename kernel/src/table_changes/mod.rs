@@ -52,9 +52,9 @@ mod resolve_dvs;
 pub mod scan;
 mod scan_file;
 
-static CHANGE_TYPE_COL_NAME: &str = "_change_type";
-static COMMIT_VERSION_COL_NAME: &str = "_commit_version";
-static COMMIT_TIMESTAMP_COL_NAME: &str = "_commit_timestamp";
+pub(crate) const CHANGE_TYPE_COL_NAME: &str = "_change_type";
+pub(crate) const COMMIT_VERSION_COL_NAME: &str = "_commit_version";
+pub(crate) const COMMIT_TIMESTAMP_COL_NAME: &str = "_commit_timestamp";
 static ADD_CHANGE_TYPE: &str = "insert";
 static REMOVE_CHANGE_TYPE: &str = "delete";
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
