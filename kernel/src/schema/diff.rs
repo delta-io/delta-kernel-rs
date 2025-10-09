@@ -1269,6 +1269,48 @@ mod tests {
     }
 
     #[test]
+    fn test_doubly_nested_array_type_change() {
+        // Test that we can detect type changes in doubly nested arrays: array<array<int>> -> array<array<double>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::DOUBLE, false))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            before: &before,
+            after: &after,
+        }
+        .compute_diff()
+        .unwrap();
+
+        // The entire field should be reported as TypeChanged since we can't recurse into
+        // non-struct array elements (no field IDs at intermediate levels)
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::TypeChanged
+        );
+
+        assert!(diff.has_breaking_changes()); // Type change is breaking
+    }
+
+    #[test]
     fn test_map_value_struct_field_changes() {
         let before = StructType::new_unchecked([create_field_with_id(
             "lookup",
