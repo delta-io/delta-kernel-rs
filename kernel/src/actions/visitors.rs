@@ -178,7 +178,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 14,
+            getters.len() == 15,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -194,10 +194,10 @@ impl RemoveVisitor {
             getters[4].get_opt(row_index, "remove.partitionValues")?;
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
+        let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
+        // TODO(nick) tags are skipped in getters[7]
 
-        // TODO(nick) tags are skipped in getters[6]
-
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
 
         let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
@@ -210,6 +210,7 @@ impl RemoveVisitor {
             extended_file_metadata,
             partition_values,
             size,
+            stats: stats,
             tags: None,
             deletion_vector,
             base_row_id,
@@ -834,7 +835,7 @@ mod tests {
         let json_strings: StringArray = vec![
             r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
-            r#"{"remove":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452}}"#,
+            r#"{"remove":{"path":"c1=4/c2=c/part-00003-f525f459-34f9-46f5-82d6-d42121d883fd.c000.snappy.parquet","deletionTimestamp":1670892998135,"dataChange":true,"partitionValues":{"c1":"4","c2":"c"},"size":452,"stats":"{\"numRecords\":1}"}}"#,
         ]
         .into();
         let batch = parse_json_batch(json_strings);
@@ -850,6 +851,7 @@ mod tests {
                 ("c2".to_string(), "c".to_string()),
             ])),
             size: Some(452),
+            stats: Some(r#"{"numRecords":1}"#.to_string()),
             ..Default::default()
         };
         assert_eq!(
