@@ -21,6 +21,7 @@ use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
     RowVisitor, Version,
 };
+use delta_kernel_derive::internal_api;
 
 /// Type alias for an iterator of [`EngineData`] results.
 type EngineDataResultIterator<'a> =
@@ -253,6 +254,9 @@ impl Transaction {
 
     /// Set the data change flag.
     ///
+    /// True indicates this commit is a "data changing" commit. False indicates table data was
+    /// reorganized but not materially modified.
+    ///
     /// Data change might be set to false in the following scenarios:
     /// 1. Operations that only change metadata (e.g. backfilling statistics)
     /// 2. Operations that make no logical changes to the contents of the table (i.e. rows are only moved
@@ -264,7 +268,8 @@ impl Transaction {
 
     /// Same as [`Transaction::with_data_change`] but set the value directly instead of
     /// using a fluent API.
-    pub fn set_data_change(&mut self, data_change: bool) {
+    #[internal_api]
+    pub(crate)fn set_data_change(&mut self, data_change: bool) {
         self.data_change = data_change;
     }
 
@@ -358,7 +363,7 @@ impl Transaction {
     /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
     /// for constructing an add_file. Each row represents metadata about a
     /// file to be added to the table. Kernel takes this information and extends it to the full add_file
-    /// action schema, adding additional fields (e.g., baseRowID) as necessary.
+    /// action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
     /// For now, Kernel only supports the number of records as a file statistic.
     /// This will change in a future release.
