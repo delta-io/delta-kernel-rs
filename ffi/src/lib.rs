@@ -343,6 +343,9 @@ pub unsafe extern "C" fn free_row_indexes(slice: KernelRowIndexArray) {
 #[handle_descriptor(target=dyn EngineData, mutable=true)]
 pub struct ExclusiveEngineData;
 
+#[handle_descriptor(target=dyn EngineData, mutable=false)]
+pub struct SharedEngineData;
+
 /// Drop an `ExclusiveEngineData`.
 ///
 /// # Safety

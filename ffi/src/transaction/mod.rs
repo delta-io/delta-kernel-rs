@@ -6,7 +6,7 @@ use crate::handle::Handle;
 use crate::KernelStringSlice;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
-use crate::{ExclusiveEngineData, SharedExternEngine};
+use crate::{SharedEngineData, SharedExternEngine};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -87,7 +87,7 @@ fn with_engine_info_impl(
 #[no_mangle]
 pub unsafe extern "C" fn add_files(
     mut txn: Handle<ExclusiveTransaction>,
-    write_metadata: Handle<ExclusiveEngineData>,
+    write_metadata: Handle<SharedEngineData>,
 ) {
     let txn = unsafe { txn.as_mut() };
     let write_metadata = unsafe { write_metadata.into_inner() };
