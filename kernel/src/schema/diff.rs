@@ -560,7 +560,9 @@ fn compute_field_update(
         Ok(None)
     } else {
         let change_type = match changes.len() {
-            1 => changes.pop().unwrap(), // Safe: we know len is 1
+            1 => changes
+                .pop()
+                .expect("changes vector should have exactly one element"),
             _ => FieldChangeType::Multiple(changes),
         };
 
