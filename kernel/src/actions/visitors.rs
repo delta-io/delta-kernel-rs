@@ -210,7 +210,7 @@ impl RemoveVisitor {
             extended_file_metadata,
             partition_values,
             size,
-            stats: stats,
+            stats,
             tags: None,
             deletion_vector,
             base_row_id,
