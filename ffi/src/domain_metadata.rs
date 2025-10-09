@@ -43,7 +43,7 @@ fn get_domain_metadata_impl(
 ///
 /// Caller is responsible for passing in a valid handle
 #[no_mangle]
-pub unsafe extern "C" fn get_all_domain_metadata(
+pub unsafe extern "C" fn visit_domain_metadata(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
@@ -56,11 +56,11 @@ pub unsafe extern "C" fn get_all_domain_metadata(
     let snapshot = unsafe { snapshot.as_ref() };
     let engine = unsafe { engine.as_ref() };
 
-    get_all_domain_metadata_impl(snapshot, engine, engine_context, engine_visitor)
+    visit_domain_metadata_impl(snapshot, engine, engine_context, engine_visitor)
         .into_extern_result(&engine)
 }
 
-fn get_all_domain_metadata_impl(
+fn visit_domain_metadata_impl(
     snapshot: &Snapshot,
     extern_engine: &dyn ExternEngine,
     engine_context: NullableCvoid,
@@ -196,6 +196,7 @@ mod tests {
         };
 
         // First, we test fetching the domain metadata one-by-one
+
         let domain1 = "domain1";
         let res = ok_or_panic(get_domain_metadata_helper(domain1));
         assert!(res.is_none());
@@ -208,11 +209,14 @@ mod tests {
         let res = get_domain_metadata_helper(domain3);
         assert_extern_result_error_with_message(res, KernelError::GenericError, "Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain");
 
-        // Secondly, we scan the entire domain metadata
+        // Secondly, we visit the entire domain metadata
+
+        // Create visitor state
         let visitor_state: Box<HashMap<String, String>> =
             Box::new(std::collections::HashMap::new());
         let visitor_state_ptr = Box::into_raw(visitor_state);
 
+        // Test visitor function
         extern "C" fn visitor(
             state: NullableCvoid,
             key: KernelStringSlice,
@@ -229,8 +233,9 @@ mod tests {
             Box::leak(collected_metadata);
         }
 
+        // Visit all (user) domain metadata
         let res = unsafe {
-            ok_or_panic(get_all_domain_metadata(
+            ok_or_panic(visit_domain_metadata(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
                 Some(NonNull::new_unchecked(visitor_state_ptr).cast()),
