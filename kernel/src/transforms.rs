@@ -13,35 +13,6 @@ use crate::expressions::{Expression, ExpressionRef, Scalar, Transform};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::{DeltaResult, Error};
 
-// TODO(#1337): Remove ColumnType when CDF is unified with StateInfo pattern
-/// Categorizes columns in a scan based on their data source and processing requirements.
-///
-/// This enum determines how each column in the logical schema maps to the physical data
-/// and what transformations are needed during query execution.
-#[derive(PartialEq, Debug)]
-pub(crate) enum ColumnType {
-    /// A column that exists in the physical parquet files and is read directly.
-    /// The string contains the physical column name (after any column mapping).
-    Selected(String),
-
-    /// A metadata-derived column (e.g., partition columns, CDF version and timestamp columns).
-    /// The usize is the index of this column in the logical schema.
-    MetadataDerivedColumn(usize),
-
-    /// A column whose source varies by context (physical vs. metadata-derived).
-    /// If the column exists in the physical schema, this reorders it to the correct index.
-    /// Otherwise, this is treated as a MetadataDerivedColumn.
-    ///
-    /// This is used for CDF's _change_type which may exist physically in `.cdc` files but
-    /// is metadata derived Add/Remove files.
-    Dynamic {
-        /// Index of this column in the logical schema
-        logical_index: usize,
-        /// Name to look for in the physical schema
-        physical_name: String,
-    },
-}
-
 /// A list of field transforms that describes a transform expression to be created at scan time.
 pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 
@@ -201,45 +172,6 @@ pub(crate) fn get_transform_expr(
     Ok(Arc::new(Expression::Transform(transform)))
 }
 
-// TODO(#1337): Remove get_transform_spec when CDF is unified with StateInfo pattern
-/// Generate a transform specification that describes how to convert physical data to logical schema.
-///
-/// The transform spec captures only the fields that need to be added, replaced, or reordered.
-/// Unchanged fields pass through implicitly in their original order (sparse transform).
-pub(crate) fn get_transform_spec(all_fields: &[ColumnType]) -> TransformSpec {
-    let mut transform_spec = TransformSpec::new();
-    let mut last_physical_field: Option<&str> = None;
-
-    for field in all_fields {
-        match field {
-            ColumnType::Selected(physical_name) => {
-                // Track the last physical field for calculating insertion points
-                last_physical_field = Some(physical_name);
-            }
-            ColumnType::MetadataDerivedColumn(logical_idx) => {
-                // Partition columns are inserted after the last physical field
-                transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
-                    insert_after: last_physical_field.map(String::from),
-                    field_index: *logical_idx,
-                });
-            }
-            ColumnType::Dynamic {
-                logical_index,
-                physical_name,
-            } => {
-                // Dynamic columns may need reordering or insertion depending on physical schema
-                transform_spec.push(FieldTransformSpec::DynamicColumn {
-                    field_index: *logical_index,
-                    physical_name: physical_name.clone(),
-                    insert_after: last_physical_field.map(String::from),
-                });
-            }
-        }
-    }
-
-    transform_spec
-}
-
 /// Parse a partition value from the raw string representation
 pub(crate) fn parse_partition_value_raw(
     raw: Option<&String>,
@@ -369,82 +301,6 @@ mod tests {
             &DataType::Primitive(PrimitiveType::Integer),
         );
         assert_result_error_with_message(result, "Failed to parse value");
-    }
-
-    // Tests for get_transform_spec function
-    #[test]
-    fn test_get_transform_spec_selected_only() {
-        let all_fields = vec![
-            ColumnType::Selected("col1".to_string()),
-            ColumnType::Selected("col2".to_string()),
-        ];
-
-        let result = get_transform_spec(&all_fields);
-        assert!(result.is_empty()); // No metadata columns = empty transform spec
-    }
-
-    #[test]
-    fn test_get_transform_spec_dynamic_column() {
-        let all_fields = vec![
-            ColumnType::Selected("id".to_string()),
-            ColumnType::Dynamic {
-                logical_index: 1,
-                physical_name: "_change_type".to_string(),
-            },
-        ];
-
-        let transform_spec = get_transform_spec(&all_fields);
-        assert_eq!(transform_spec.len(), 1);
-
-        match &transform_spec[0] {
-            FieldTransformSpec::DynamicColumn {
-                field_index,
-                physical_name,
-                insert_after,
-            } => {
-                assert_eq!(*field_index, 1);
-                assert_eq!(physical_name, "_change_type");
-                assert_eq!(insert_after, &Some("id".to_string()));
-            }
-            _ => panic!("Expected DynamicColumn transform"),
-        }
-    }
-
-    #[test]
-    fn test_get_transform_spec_with_metadata() {
-        let all_fields = vec![
-            ColumnType::Selected("col1".to_string()),
-            ColumnType::MetadataDerivedColumn(1),
-            ColumnType::Selected("col2".to_string()),
-            ColumnType::MetadataDerivedColumn(2),
-        ];
-
-        let result = get_transform_spec(&all_fields);
-        assert_eq!(result.len(), 2);
-
-        // Check first metadata column
-        if let FieldTransformSpec::MetadataDerivedColumn {
-            field_index,
-            insert_after,
-        } = &result[0]
-        {
-            assert_eq!(*field_index, 1);
-            assert_eq!(insert_after.as_ref().unwrap(), "col1");
-        } else {
-            panic!("Expected MetadataDerivedColumn transform");
-        }
-
-        // Check second metadata column
-        if let FieldTransformSpec::MetadataDerivedColumn {
-            field_index,
-            insert_after,
-        } = &result[1]
-        {
-            assert_eq!(*field_index, 2);
-            assert_eq!(insert_after.as_ref().unwrap(), "col2");
-        } else {
-            panic!("Expected MetadataDerivedColumn transform");
-        }
     }
 
     // Tests for get_transform_expr function
@@ -630,15 +486,11 @@ mod tests {
     #[test]
     fn test_dynamic_column_missing_metadata_error() {
         // Test that we get an error when a Dynamic column needs metadata but it's not provided
-        let all_fields = vec![
-            ColumnType::Selected("id".to_string()),
-            ColumnType::Dynamic {
-                logical_index: 1,
-                physical_name: "_change_type".to_string(),
-            },
-        ];
-
-        let transform_spec = get_transform_spec(&all_fields);
+        let transform_spec = vec![FieldTransformSpec::DynamicColumn {
+            field_index: 1,
+            physical_name: "_change_type".to_string(),
+            insert_after: Some("id".to_string()),
+        }];
 
         // Physical schema without _change_type (so it needs to come from metadata)
         let physical_schema =
