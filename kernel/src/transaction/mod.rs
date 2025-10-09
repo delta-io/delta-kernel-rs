@@ -169,7 +169,7 @@ impl Transaction {
         })
     }
 
-    /// Consume the transaction and commit it to the table. The result is a  result of
+    /// Consume the transaction and commit it to the table. The result is a result of
     /// [CommitResult] with the following semantics:
     /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
     ///   transaction in case of a conflict so the user can retry, etc.)
@@ -623,11 +623,11 @@ impl CommittedTransaction {
         &self.post_commit_stats
     }
 
-    // TODO: post-commit snapshot
+    // TODO(#916): post-commit snapshot
 }
 
 /// This is the result of a conflicted [Transaction]. One can retrieve the [conflict version] from
-/// this struct. In the future a rebase API will be provided.
+/// this struct. In the future a rebase API will be provided (issue #1389).
 ///
 /// [conflict version]: Self::conflict_version
 #[derive(Debug)]
