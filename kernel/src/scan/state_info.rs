@@ -68,93 +68,92 @@ impl StateInfo {
             if let Some(spec) =
                 classifier.classify_field(logical_field, index, &last_physical_field)
             {
-                // Field needs transformation - not in physical schema
+                // Classifier has handled this field via a transformation, just push it and move on
                 transform_spec.push(spec);
             } else if partition_columns.contains(logical_field.name()) {
-                // this is a partition column, add the transform
+                // This is a partition column: needs to be injected via transform
+
+                // First ensure we don't have a metadata column with same name as a partition column
                 if logical_field.is_metadata_column() {
                     return Err(Error::Schema(format!(
                         "Metadata column names must not match partition columns: {}",
                         logical_field.name()
                     )));
                 }
-
-                // Partition column: needs to be injected via transform
+                // push the transform for this partition column
                 transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
                     field_index: index,
                     insert_after: last_physical_field.clone(),
                 });
             } else {
-                // Regular field field or a metadata column
-                let mut select_physical_field = || {
-                    let physical_field = logical_field.make_physical(column_mapping_mode);
-                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                    let physical_name = physical_field.name.clone();
-
-                    if logical_field.is_metadata_column()
-                        && partition_columns.contains(logical_field.name())
-                    {
-                        return Err(Error::Schema(format!(
-                            "Metadata column names must not match partition columns: {}",
-                            logical_field.name()
-                        )));
-                    }
-                    last_physical_field = Some(physical_name);
-                    read_fields.push(physical_field);
-                    Ok(())
-                };
-
+                // Regular field field or a metadata column, figure out which and handle it
                 match logical_field.get_metadata_column_spec() {
                     Some(MetadataColumnSpec::RowId) => {
-                        if table_configuration.table_properties().enable_row_tracking == Some(true)
+                        if table_configuration.table_properties().enable_row_tracking != Some(true)
                         {
-                            let row_id_col = table_configuration
-                                    .metadata()
-                                    .configuration()
-                                    .get("delta.rowTracking.materializedRowIdColumnName")
-                                    .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
-                            // we can `take` as we should only have one RowId col
-                            let index_column_name = match selected_row_index_col_name.take() {
-                                Some(index_column_name) => index_column_name,
-                                None => {
-                                    // ensure we have a column name that isn't already in our schema
-                                    let index_column_name = (0..)
-                                        .map(|i| format!("row_indexes_for_row_id_{}", i))
-                                        .find(|name| logical_schema.field(name).is_none())
-                                        .ok_or(Error::generic(
-                                            "Couldn't generate row index column name",
-                                        ))?;
-                                    read_fields.push(StructField::create_metadata_column(
-                                        &index_column_name,
-                                        MetadataColumnSpec::RowIndex,
-                                    ));
-                                    transform_spec.push(FieldTransformSpec::StaticDrop {
-                                        field_name: index_column_name.clone(),
-                                    });
-                                    index_column_name
-                                }
-                            };
-
-                            read_fields.push(StructField::nullable(row_id_col, DataType::LONG));
-                            transform_spec.push(FieldTransformSpec::GenerateRowId {
-                                field_name: row_id_col.to_string(),
-                                row_index_field_name: index_column_name,
-                            });
-                        } else {
                             return Err(Error::unsupported(
                                 "Row ids are not enabled on this table",
                             ));
                         }
-                    }
-                    Some(MetadataColumnSpec::RowIndex) => {
-                        // handled in parquet reader
-                        select_physical_field()?;
+
+                        let row_id_col = table_configuration
+                            .metadata()
+                            .configuration()
+                            .get("delta.rowTracking.materializedRowIdColumnName")
+                            .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
+
+                        // we can `take` as we should only have one RowId col
+                        let index_column_name = match selected_row_index_col_name.take() {
+                            Some(index_column_name) => index_column_name,
+                            None => {
+                                // the index column isn't being explicitly requested, so add it to
+                                // `read_fields` so the parquet_reader will generate it, and add a
+                                // transform to drop it before returning logical data
+
+                                // ensure we have a column name that isn't already in our schema
+                                let index_column_name = (0..)
+                                    .map(|i| format!("row_indexes_for_row_id_{}", i))
+                                    .find(|name| logical_schema.field(name).is_none())
+                                    .ok_or(Error::generic(
+                                        "Couldn't generate row index column name",
+                                    ))?;
+                                read_fields.push(StructField::create_metadata_column(
+                                    &index_column_name,
+                                    MetadataColumnSpec::RowIndex,
+                                ));
+                                transform_spec.push(FieldTransformSpec::StaticDrop {
+                                    field_name: index_column_name.clone(),
+                                });
+                                index_column_name
+                            }
+                        };
+
+                        read_fields.push(StructField::nullable(row_id_col, DataType::LONG));
+                        transform_spec.push(FieldTransformSpec::GenerateRowId {
+                            field_name: row_id_col.to_string(),
+                            row_index_field_name: index_column_name,
+                        });
                     }
                     Some(MetadataColumnSpec::RowCommitVersion) => {
                         return Err(Error::unsupported("Row commit versions not supported"));
                     }
-                    _ => {
-                        select_physical_field()?;
+                    Some(MetadataColumnSpec::RowIndex) | None => {
+                        // note that RowIndex is handled in the parquet reader so we just add it as
+                        // if it's a normal physical column
+                        let physical_field = logical_field.make_physical(column_mapping_mode);
+                        debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                        let physical_name = physical_field.name.clone();
+
+                        if logical_field.is_metadata_column()
+                            && partition_columns.contains(logical_field.name())
+                        {
+                            return Err(Error::Schema(format!(
+                                "Metadata column names must not match partition columns: {}",
+                                logical_field.name()
+                            )));
+                        }
+                        last_physical_field = Some(physical_name);
+                        read_fields.push(physical_field);
                     }
                 }
             }
