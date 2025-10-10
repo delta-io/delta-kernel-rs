@@ -1,10 +1,13 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::domain_metadata::domain_metadata_configuration;
+use crate::actions::domain_metadata::{
+    all_domain_metadata_configuration, domain_metadata_configuration,
+};
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
@@ -368,6 +371,16 @@ impl Snapshot {
         }
 
         domain_metadata_configuration(self.log_segment(), domain, engine)
+    }
+    pub fn get_all_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<HashMap<String, String>> {
+        let all_metadata = all_domain_metadata_configuration(self.log_segment(), engine)?;
+        Ok(all_metadata
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(INTERNAL_DOMAIN_PREFIX))
+            .collect())
     }
 
     /// Get the In-Commit Timestamp (ICT) for this snapshot.

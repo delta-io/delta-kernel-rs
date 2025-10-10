@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
+use crate::CStringMap;
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
@@ -308,17 +309,6 @@ type CScanCallback = extern "C" fn(
     transform: Option<&Expression>,
     partition_map: &CStringMap,
 );
-
-#[derive(Default)]
-pub struct CStringMap {
-    values: HashMap<String, String>,
-}
-
-impl From<HashMap<String, String>> for CStringMap {
-    fn from(val: HashMap<String, String>) -> Self {
-        Self { values: val }
-    }
-}
 
 #[no_mangle]
 /// allow probing into a CStringMap. If the specified key is in the map, kernel will call

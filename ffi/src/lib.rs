@@ -52,6 +52,17 @@ pub mod transaction;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
+#[derive(Default)]
+pub struct CStringMap {
+    values: HashMap<String, String>,
+}
+
+impl From<HashMap<String, String>> for CStringMap {
+    fn from(val: HashMap<String, String>) -> Self {
+        Self { values: val }
+    }
+}
+
 /// Model iterators. This allows an engine to specify iteration however it likes, and we simply wrap
 /// the engine functions. The engine retains ownership of the iterator.
 #[repr(C)]
