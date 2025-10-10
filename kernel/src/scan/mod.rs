@@ -9,7 +9,6 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::field_classifiers::ScanTransformFieldClassifierieldClassifier;
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -119,7 +118,7 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            ScanTransformFieldClassifierieldClassifier,
+            None::<()>, // No classifer, default is for scans
         )?;
 
         Ok(Scan {
@@ -752,6 +751,8 @@ pub fn selection_vector(
 #[cfg(test)]
 pub(crate) mod test_utils {
     use crate::arrow::array::StringArray;
+    use crate::scan::state_info::StateInfo;
+    use crate::schema::StructType;
     use crate::utils::test_utils::string_array_to_engine_data;
     use itertools::Itertools;
     use std::sync::Arc;
@@ -769,7 +770,7 @@ pub(crate) mod test_utils {
     };
 
     use super::state::ScanCallback;
-    use super::{PhysicalPredicate, StateInfo};
+    use super::PhysicalPredicate;
     use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.
@@ -877,8 +878,8 @@ pub(crate) mod test_utils {
         context: T,
         validate_callback: ScanCallback<T>,
     ) {
-        let logical_schema = logical_schema
-            .unwrap_or_else(|| Arc::new(crate::schema::StructType::new_unchecked(vec![])));
+        let logical_schema =
+            logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
             physical_schema: logical_schema,
@@ -912,15 +913,13 @@ pub(crate) mod test_utils {
 mod tests {
     use std::path::PathBuf;
 
-    use crate::actions::{Metadata, Protocol};
     use crate::arrow::array::BooleanArray;
     use crate::arrow::compute::filter_record_batch;
     use crate::arrow::record_batch::RecordBatch;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
-    use crate::schema::{ColumnMetadataKey, PrimitiveType};
-    use crate::transforms::FieldTransformSpec;
+    use crate::schema::{ColumnMetadataKey, PrimitiveType, StructType};
     use crate::Snapshot;
 
     use super::*;

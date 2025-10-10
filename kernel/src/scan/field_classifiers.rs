@@ -30,6 +30,19 @@ pub(crate) trait TransformFieldClassifier {
     ) -> DeltaResult<Option<FieldRequirements>>;
 }
 
+// Empty classifier, always returns None
+impl TransformFieldClassifier for () {
+    fn classify_field(
+        &self,
+        _: &StructField,
+        _: usize,
+        _: &TableConfiguration,
+        _: &Option<String>,
+    ) -> DeltaResult<Option<FieldRequirements>> {
+        Ok(None)
+    }
+}
+
 /// Regular scan field classifier for standard Delta table scans.
 /// Handles partition columns as metadata-derived fields.
 pub(crate) struct ScanTransformFieldClassifierieldClassifier;

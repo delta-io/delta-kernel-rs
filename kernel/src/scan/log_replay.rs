@@ -397,12 +397,13 @@ mod tests {
     use crate::expressions::Scalar;
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
+    use crate::scan::state_info::tests::{get_simple_state_info, get_state_info};
+    use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
         add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
         add_batch_with_remove, run_with_validate_callback,
     };
-    use crate::scan::tests::{get_simple_state_info, get_state_info};
-    use crate::scan::{PhysicalPredicate, StateInfo};
+    use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
     use crate::Expression as Expr;
     use crate::{

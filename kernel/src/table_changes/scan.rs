@@ -118,7 +118,7 @@ impl TableChangesScanBuilder {
             logical_schema,
             self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
-            CdfTransformFieldClassifier,
+            Some(CdfTransformFieldClassifier),
         )?;
 
         Ok(TableChangesScan {
