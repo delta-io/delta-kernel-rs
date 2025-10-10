@@ -44,8 +44,14 @@ jobs:
               elif [ "$example_dir" = "inspect-table" ]; then
                 for operation in table-version metadata schema scan-metadata actions; do
                   echo "  Running inspect-table with operation: $operation"
-                  cargo run --manifest-path $example_dir/Cargo.toml --release -- $operation ../tests/data/table-without-dv-small
+                  cargo run --manifest-path $example_dir/Cargo.toml --release -- ../tests/data/table-without-dv-small $operation
                 done
+              # Special case for read-table-changes: skip running it in CI as it needs a specific CDF-enabled table
+              # but still verify it compiles
+              # TODO: Add a suitable test table for CDF
+              elif [ "$example_dir" = "read-table-changes" ]; then
+                echo "Building read-table-changes (skipping run - requires CDF-enabled table)"
+                cargo build --manifest-path $example_dir/Cargo.toml --release
               else
                 # All other examples run with the test table path
                 cargo run --manifest-path $example_dir/Cargo.toml --release -- ../tests/data/table-without-dv-small
