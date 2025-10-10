@@ -778,7 +778,8 @@ mod tests {
                 let getter = getters[0];
 
                 for i in 0..row_count {
-                    self.values.push(getter.get_binary(i, "data")?.map(|b| b.to_vec()));
+                    self.values
+                        .push(getter.get_binary(i, "data")?.map(|b| b.to_vec()));
                 }
                 Ok(())
             }

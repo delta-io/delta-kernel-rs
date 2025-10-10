@@ -566,11 +566,7 @@ mod tests {
         use crate::arrow::array::BinaryArray;
 
         // Use Arrow's BinaryArray implementation
-        let binary_data: Vec<Option<&[u8]>> = vec![
-            Some(b"hello"),
-            Some(b"world"),
-            None,
-        ];
+        let binary_data: Vec<Option<&[u8]>> = vec![Some(b"hello"), Some(b"world"), None];
         let binary_array = BinaryArray::from(binary_data);
 
         // Cast to dyn GetData to use TypedGetData trait
