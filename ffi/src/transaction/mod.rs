@@ -1,4 +1,5 @@
 //! This module holds functionality for managing transactions.
+mod transaction_id;
 mod write_context;
 
 use crate::error::{ExternResult, IntoExternResult};
