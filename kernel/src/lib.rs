@@ -685,6 +685,21 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Write data to a Parquet file at the specified URL.
+    ///
+    /// This method writes the provided `data` to a Parquet file at the given `url`.
+    ///
+    /// # Parameters
+    ///
+    /// - `url` - The full URL path where the Parquet file should be written
+    ///   (e.g., `s3://bucket/path/file.parquet`).
+    /// - `data` - The data to write to the Parquet file, as EngineData.
+    ///
+    /// # Returns
+    ///
+    /// A [`DeltaResult`] indicating success or failure.
+    fn write_parquet_file(&self, url: url::Url, data: Box<dyn EngineData>) -> DeltaResult<()>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

@@ -1,7 +1,8 @@
-use std::fs::File;
-
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
+use crate::parquet::arrow::arrow_writer::ArrowWriter;
+use std::fs::File;
+use url::Url;
 
 use super::read_files;
 use crate::engine::arrow_data::ArrowEngineData;
@@ -11,7 +12,9 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
+use crate::{
+    DeltaResult, EngineData, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef,
+};
 
 pub(crate) struct SyncParquetHandler;
 
@@ -51,5 +54,109 @@ impl ParquetHandler for SyncParquetHandler {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_parquet)
+    }
+
+    fn write_parquet_file(&self, url: Url, data: Box<dyn EngineData>) -> DeltaResult<()> {
+        let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
+        let record_batch = batch.record_batch();
+
+        // Convert URL to file path
+        let path = url
+            .to_file_path()
+            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", url)))?;
+        let mut file = File::create(&path)?;
+
+        let mut writer = ArrowWriter::try_new(&mut file, record_batch.schema(), None)?;
+        writer.write(record_batch)?;
+        writer.close()?; // writer must be closed to write footer
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use crate::engine::arrow_conversion::TryIntoKernel as _;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_sync_write_parquet_file() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        // Create test data
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "id",
+                    Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+                ),
+                (
+                    "name",
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Write the file
+        handler.write_parquet_file(url.clone(), data).unwrap();
+
+        // Verify the file exists
+        assert!(file_path.exists());
+
+        // Read it back to verify
+        let file = File::open(&file_path).unwrap();
+        let reader =
+            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap();
+        let schema = reader.schema().clone();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let mut result = handler
+            .read_parquet_files(
+                &[file_meta],
+                Arc::new(schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap();
+
+        let engine_data = result.next().unwrap().unwrap();
+        let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
+        let record_batch = batch.record_batch();
+
+        // Verify shape
+        assert_eq!(record_batch.num_rows(), 3);
+        assert_eq!(record_batch.num_columns(), 2);
+
+        // Verify content - id column
+        let id_col = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.values(), &[1, 2, 3]);
+
+        // Verify content - name column
+        let name_col = record_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "a");
+        assert_eq!(name_col.value(1), "b");
+        assert_eq!(name_col.value(2), "c");
+
+        assert!(result.next().is_none());
     }
 }

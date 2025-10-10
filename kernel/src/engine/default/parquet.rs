@@ -246,6 +246,25 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.readahead,
         )
     }
+
+    fn write_parquet_file(&self, url: url::Url, data: Box<dyn EngineData>) -> DeltaResult<()> {
+        let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
+        let record_batch = batch.record_batch();
+
+        let mut buffer = vec![];
+        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
+        writer.write(record_batch)?;
+        writer.close()?; // writer must be closed to write footer
+
+        let store = self.store.clone();
+        let path = Path::from_url_path(url.path())?;
+
+        // Block on the async put operation
+        self.task_executor
+            .block_on(async move { store.put(&path, buffer.into()).await })?;
+
+        Ok(())
+    }
 }
 
 /// Implements [`FileOpener`] for a parquet file
@@ -643,5 +662,154 @@ mod tests {
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "x",
+                    Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
+                ),
+                (
+                    "y",
+                    Arc::new(Int64Array::from(vec![100, 200, 300])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Test writing through the trait method
+        let file_url = Url::parse("memory:///test/data.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data)
+            .unwrap();
+
+        // Verify we can read the file back
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 3);
+        assert_eq!(data[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write_and_read_roundtrip() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create test data with multiple types
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "int_col",
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as Arc<dyn Array>,
+                ),
+                (
+                    "string_col",
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as Arc<dyn Array>,
+                ),
+                (
+                    "bool_col",
+                    Arc::new(BooleanArray::from(vec![true, false, true, false, true]))
+                        as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Write the data
+        let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data)
+            .unwrap();
+
+        // Read it back
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url.clone(),
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify the data
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 5);
+        assert_eq!(data[0].num_columns(), 3);
+
+        // Verify column values
+        let int_col = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(int_col.values(), &[1, 2, 3, 4, 5]);
+
+        let string_col = data[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(string_col.value(0), "a");
+        assert_eq!(string_col.value(4), "e");
+
+        let bool_col = data[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(bool_col.value(0));
+        assert!(!bool_col.value(1));
     }
 }
