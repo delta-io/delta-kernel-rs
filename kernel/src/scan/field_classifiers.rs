@@ -41,23 +41,26 @@ impl TransformFieldClassifier for ScanTransformFieldClassifierieldClassifier {
         table_configuration: &TableConfiguration,
         last_physical_field: &Option<String>,
     ) -> DeltaResult<Option<FieldRequirements>> {
-        if table_configuration.metadata().partition_columns().contains(field.name()) {
+        if table_configuration
+            .metadata()
+            .partition_columns()
+            .contains(field.name())
+        {
             // Partition column: needs transform to inject metadata
-            let transform_specs = vec!(FieldTransformSpec::MetadataDerivedColumn {
+            let transform_specs = vec![FieldTransformSpec::MetadataDerivedColumn {
                 field_index,
                 insert_after: last_physical_field.clone(),
-            });
+            }];
             Ok(Some(FieldRequirements {
                 transform_specs,
-                extra_read_fields: vec!(),
+                extra_read_fields: vec![],
             }))
         } else {
             match field.get_metadata_column_spec() {
                 Some(MetadataColumnSpec::RowId) => {
-                    if table_configuration.table_properties().enable_row_tracking == Some(true)
-                    {
-                        let mut transform_specs = vec!();
-                        let mut extra_read_fields = vec!();
+                    if table_configuration.table_properties().enable_row_tracking == Some(true) {
+                        let mut transform_specs = vec![];
+                        let mut extra_read_fields = vec![];
                         let row_id_col = table_configuration
                             .metadata()
                             .configuration()
@@ -93,12 +96,10 @@ impl TransformFieldClassifier for ScanTransformFieldClassifierieldClassifier {
                         });
                         Ok(Some(FieldRequirements {
                             transform_specs,
-                            extra_read_fields
+                            extra_read_fields,
                         }))
                     } else {
-                        Err(Error::unsupported(
-                            "Row ids are not enabled on this table",
-                        ))
+                        Err(Error::unsupported("Row ids are not enabled on this table"))
                     }
                 }
                 Some(MetadataColumnSpec::RowIndex) => {
@@ -143,16 +144,18 @@ impl TransformFieldClassifier for CdfTransformFieldClassifier {
                 }
             }
             // Defer to default classifier for partition columns and physical fields
-            _ => return ScanTransformFieldClassifierieldClassifier.classify_field(
-                field,
-                field_index,
-                table_configuration,
-                last_physical_field,
-            ),
+            _ => {
+                return ScanTransformFieldClassifierieldClassifier.classify_field(
+                    field,
+                    field_index,
+                    table_configuration,
+                    last_physical_field,
+                )
+            }
         };
         Ok(Some(FieldRequirements {
             transform_specs: vec![transform_spec],
-            extra_read_fields: vec!(),
+            extra_read_fields: vec![],
         }))
     }
 }

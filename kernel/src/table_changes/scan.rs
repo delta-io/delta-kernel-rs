@@ -7,7 +7,8 @@ use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
-use crate::scan::{PhysicalPredicate, ScanResult, StateInfo};
+use crate::scan::state_info::StateInfo;
+use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 

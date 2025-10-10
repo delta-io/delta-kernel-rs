@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use super::data_skipping::DataSkippingFilter;
-use super::{PhysicalPredicate, ScanMetadata, StateInfo};
+use super::state_info::StateInfo;
+use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
