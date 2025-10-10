@@ -40,6 +40,12 @@ jobs:
                 tmp_dir=$(mktemp -d)
                 cargo run --manifest-path $example_dir/Cargo.toml --release -- $tmp_dir
                 rm -rf $tmp_dir
+              # Special case for inspect-table: it needs an operation/subcommand, run each one
+              elif [ "$example_dir" = "inspect-table" ]; then
+                for operation in table-version metadata schema scan-metadata actions; do
+                  echo "  Running inspect-table with operation: $operation"
+                  cargo run --manifest-path $example_dir/Cargo.toml --release -- $operation ../tests/data/table-without-dv-small
+                done
               else
                 # All other examples run with the test table path
                 cargo run --manifest-path $example_dir/Cargo.toml --release -- ../tests/data/table-without-dv-small
