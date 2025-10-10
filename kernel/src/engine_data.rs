@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
 use tracing::debug;
 
 use crate::expressions::ArrayData;
@@ -173,7 +172,7 @@ pub trait GetData<'a> {
         (get_int, i32),
         (get_long, i64),
         (get_str, &'a str),
-        (get_binary, Bytes),
+        (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
@@ -195,7 +194,7 @@ impl<'a> GetData<'a> for () {
         (get_int, i32),
         (get_long, i64),
         (get_str, &'a str),
-        (get_binary, Bytes),
+        (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
@@ -230,7 +229,7 @@ impl_typed_get_data!(
     (get_int, i32),
     (get_long, i64),
     (get_str, &'a str),
-    (get_binary, Bytes),
+    (get_binary, &'a [u8]),
     (get_list, ListItem<'a>),
     (get_map, MapItem<'a>)
 );
@@ -562,66 +561,61 @@ mod tests {
         }
     }
 
-    // Mock implementation of GetData that returns binary data
-    struct MockBinaryData {
-        data: Vec<Option<Bytes>>,
-    }
-
-    impl<'a> GetData<'a> for MockBinaryData {
-        fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<Bytes>> {
-            Ok(self.data.get(row_index).and_then(|v| v.clone()))
-        }
-    }
-
     #[test]
     fn test_get_binary_some_value() {
-        let mock_data = MockBinaryData {
-            data: vec![
-                Some(Bytes::from_static(b"hello")),
-                Some(Bytes::from_static(b"world")),
-                None,
-            ],
-        };
+        use crate::arrow::array::BinaryArray;
+
+        // Use Arrow's BinaryArray implementation
+        let binary_data: Vec<Option<&[u8]>> = vec![
+            Some(b"hello"),
+            Some(b"world"),
+            None,
+        ];
+        let binary_array = BinaryArray::from(binary_data);
 
         // Cast to dyn GetData to use TypedGetData trait
-        let getter: &dyn GetData<'_> = &mock_data;
+        let getter: &dyn GetData<'_> = &binary_array;
 
         // Test getting first row
-        let result: Option<Bytes> = getter.get_opt(0, "binary_field").unwrap();
-        assert_eq!(result, Some(Bytes::from_static(b"hello")));
+        let result: Option<&[u8]> = getter.get_opt(0, "binary_field").unwrap();
+        assert_eq!(result, Some(b"hello".as_ref()));
 
         // Test getting second row
-        let result: Option<Bytes> = getter.get_opt(1, "binary_field").unwrap();
-        assert_eq!(result, Some(Bytes::from_static(b"world")));
+        let result: Option<&[u8]> = getter.get_opt(1, "binary_field").unwrap();
+        assert_eq!(result, Some(b"world".as_ref()));
 
         // Test getting None value
-        let result: Option<Bytes> = getter.get_opt(2, "binary_field").unwrap();
+        let result: Option<&[u8]> = getter.get_opt(2, "binary_field").unwrap();
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_get_binary_required() {
-        let mock_data = MockBinaryData {
-            data: vec![Some(Bytes::from_static(b"hello"))],
-        };
+        use crate::arrow::array::BinaryArray;
+
+        let binary_data: Vec<Option<&[u8]>> = vec![Some(b"hello")];
+        let binary_array = BinaryArray::from(binary_data);
 
         // Cast to dyn GetData to use TypedGetData trait
-        let getter: &dyn GetData<'_> = &mock_data;
+        let getter: &dyn GetData<'_> = &binary_array;
 
         // Test using get() for required field
-        let result: Bytes = getter.get(0, "binary_field").unwrap();
-        assert_eq!(result, Bytes::from_static(b"hello"));
+        let result: &[u8] = getter.get(0, "binary_field").unwrap();
+        assert_eq!(result, b"hello");
     }
 
     #[test]
     fn test_get_binary_required_missing() {
-        let mock_data = MockBinaryData { data: vec![None] };
+        use crate::arrow::array::BinaryArray;
+
+        let binary_data: Vec<Option<&[u8]>> = vec![None];
+        let binary_array = BinaryArray::from(binary_data);
 
         // Cast to dyn GetData to use TypedGetData trait
-        let getter: &dyn GetData<'_> = &mock_data;
+        let getter: &dyn GetData<'_> = &binary_array;
 
         // Test using get() for missing required field should error
-        let result: DeltaResult<Bytes> = getter.get(0, "binary_field");
+        let result: DeltaResult<&[u8]> = getter.get(0, "binary_field");
         assert!(result.is_err());
         if let Err(e) = result {
             assert!(e.to_string().contains("Data missing for field"));
@@ -630,16 +624,17 @@ mod tests {
 
     #[test]
     fn test_get_binary_empty_bytes() {
-        let mock_data = MockBinaryData {
-            data: vec![Some(Bytes::new())],
-        };
+        use crate::arrow::array::BinaryArray;
+
+        let binary_data: Vec<Option<&[u8]>> = vec![Some(b"")];
+        let binary_array = BinaryArray::from(binary_data);
 
         // Cast to dyn GetData to use TypedGetData trait
-        let getter: &dyn GetData<'_> = &mock_data;
+        let getter: &dyn GetData<'_> = &binary_array;
 
-        // Test getting empty Bytes
-        let result: Option<Bytes> = getter.get_opt(0, "binary_field").unwrap();
-        assert_eq!(result, Some(Bytes::new()));
+        // Test getting empty bytes
+        let result: Option<&[u8]> = getter.get_opt(0, "binary_field").unwrap();
+        assert_eq!(result, Some([].as_ref()));
         assert_eq!(result.unwrap().len(), 0);
     }
 }
