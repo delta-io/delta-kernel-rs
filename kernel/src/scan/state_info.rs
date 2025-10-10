@@ -35,12 +35,12 @@ impl StateInfo {
     /// `partition_columns` - List of column names that are partition columns in the table
     /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
     /// `predicate` - Optional predicate to filter data during the scan
-    /// `classifier` - The classifier to use for different scan types
+    /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
-        classifier_opt: Option<C>,
+        classifier: C,
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.metadata().partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
@@ -65,24 +65,11 @@ impl StateInfo {
 
         // Loop over all selected fields and build both the physical schema and transform spec
         for (index, logical_field) in logical_schema.fields().enumerate() {
-            let requirements = classifier_opt
-                .as_ref()
-                .map(|classifier| {
-                    classifier.classify_field(
-                        logical_field,
-                        index,
-                        table_configuration,
-                        &last_physical_field,
-                    )
-                })
-                .transpose()?
-                .flatten();
-
-            if let Some(requirements) = requirements {
+            if let Some(spec) =
+                classifier.classify_field(logical_field, index, &last_physical_field)
+            {
                 // Field needs transformation - not in physical schema
-                for spec in requirements.transform_specs.into_iter() {
-                    transform_spec.push(spec);
-                }
+                transform_spec.push(spec);
             } else if partition_columns.contains(logical_field.name()) {
                 // this is a partition column, add the transform
                 if logical_field.is_metadata_column() {
@@ -248,7 +235,7 @@ pub(crate) mod tests {
             );
         }
 
-        StateInfo::try_new(schema.clone(), &table_configuration, predicate, None::<()>)
+        StateInfo::try_new(schema.clone(), &table_configuration, predicate, ())
     }
 
     #[test]

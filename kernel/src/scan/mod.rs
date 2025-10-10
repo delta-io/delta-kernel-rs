@@ -22,6 +22,7 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
 use crate::scan::state::{DvInfo, Stats};
+use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
 };
@@ -114,11 +115,11 @@ impl ScanBuilder {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
-        let state_info = state_info::StateInfo::try_new(
+        let state_info = StateInfo::try_new(
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
-            None::<()>, // No classifer, default is for scans
+            (), // No classifer, default is for scans
         )?;
 
         Ok(Scan {
