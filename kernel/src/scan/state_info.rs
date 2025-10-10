@@ -32,8 +32,7 @@ impl StateInfo {
     /// Get the state needed to process a scan.
     ///
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
-    /// `partition_columns` - List of column names that are partition columns in the table
-    /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
+    /// `table_configuration` - The TableConfiguration for this table
     /// `predicate` - Optional predicate to filter data during the scan
     /// `classifier` - The classifier to use for different scan types. Use `()` if not needed
     pub(crate) fn try_new<C: TransformFieldClassifier>(
@@ -144,12 +143,12 @@ impl StateInfo {
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
 
-                        if logical_field.is_metadata_column()
-                            && partition_columns.contains(logical_field.name())
+                        if !logical_field.is_metadata_column()
+                            && metadata_field_names.contains(&physical_name)
                         {
                             return Err(Error::Schema(format!(
-                                "Metadata column names must not match partition columns: {}",
-                                logical_field.name()
+                                "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
+                                logical_field.name(), physical_name,
                             )));
                         }
                         last_physical_field = Some(physical_name);
@@ -190,6 +189,7 @@ pub(crate) mod tests {
 
     use crate::actions::{Metadata, Protocol};
     use crate::expressions::{column_expr, Expression as Expr};
+    use crate::schema::{ColumnMetadataKey, MetadataValue};
 
     use super::*;
 
@@ -217,7 +217,7 @@ pub(crate) mod tests {
             metadata_configuration,
         )?;
         let no_features: Option<Vec<String>> = None; // needed for type annotation
-        let protocol = Protocol::try_new(1, 2, no_features.clone(), no_features)?;
+        let protocol = Protocol::try_new(2, 2, no_features.clone(), no_features)?;
         let table_configuration = TableConfiguration::try_new(
             metadata,
             protocol,
@@ -238,7 +238,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_state_info_no_partition_columns() {
+    fn no_partition_columns() {
         // Test case: No partition columns, no column mapping
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
@@ -259,7 +259,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_state_info_with_partition_columns() {
+    fn with_partition_columns() {
         // Test case: With partition columns
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
@@ -296,7 +296,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_state_info_multiple_partition_columns() {
+    fn multiple_partition_columns() {
         // Test case: Multiple partition columns interspersed with regular columns
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("col1", DataType::STRING),
@@ -345,7 +345,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_state_info_with_predicate() {
+    fn with_predicate() {
         // Test case: With a valid predicate
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
@@ -374,7 +374,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_state_info_partition_at_beginning() {
+    fn partition_at_beginning() {
         // Test case: Partition column at the beginning
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("date", DataType::DATE), // Partition column
@@ -400,8 +400,15 @@ pub(crate) mod tests {
         }
     }
 
+    fn get_string_map(slice: &[(&str, &str)]) -> HashMap<String, String> {
+        slice
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn test_state_info_request_row_ids() {
+    fn request_row_ids() {
         let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
@@ -411,16 +418,13 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
-            [
+            get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some-row-id_col",
                 ),
-            ]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
+            ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
         )
         .unwrap();
@@ -449,7 +453,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_state_info_request_row_ids_and_indexes() {
+    fn request_row_ids_and_indexes() {
         let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
@@ -459,16 +463,13 @@ pub(crate) mod tests {
             schema.clone(),
             vec![],
             None,
-            [
+            get_string_map(&[
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
                     "some-row-id_col",
                 ),
-            ]
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
+            ]),
             vec![
                 ("row_id", MetadataColumnSpec::RowId),
                 ("row_index", MetadataColumnSpec::RowIndex),
@@ -493,7 +494,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_state_info_invalid_rowtracking_config() {
+    fn invalid_rowtracking_config() {
         let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
             "id",
             DataType::STRING,
@@ -502,10 +503,7 @@ pub(crate) mod tests {
         for (metadata_config, metadata_cols, expected_error) in [
             (HashMap::new(), vec![("row_id", MetadataColumnSpec::RowId)], "Unsupported: Row ids are not enabled on this table"),
             (
-                [("delta.enableRowTracking", "true")]
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
+                get_string_map(&[("delta.enableRowTracking", "true")]),
                 vec![("row_id", MetadataColumnSpec::RowId)],
                 "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
             ),
@@ -520,6 +518,64 @@ pub(crate) mod tests {
                         expected_error,
                     )
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_column_matches_partition_column() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]));
+        match get_state_info(
+            schema.clone(),
+            vec!["part_col".to_string()],
+            None,
+            HashMap::new(),
+            vec![("part_col", MetadataColumnSpec::RowId)],
+        ) {
+            Ok(_) => {
+                panic!("Should not have succeeded generating state info with invalid config")
+            }
+            Err(e) => {
+                assert_eq!(e.to_string(),
+                           "Schema error: Metadata column names must not match partition columns: part_col")
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_column_matches_read_field() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )
+        .with_metadata(HashMap::<String, MetadataValue>::from([
+            (
+                ColumnMetadataKey::ColumnMappingId.as_ref().to_string(),
+                1.into(),
+            ),
+            (
+                ColumnMetadataKey::ColumnMappingPhysicalName
+                    .as_ref()
+                    .to_string(),
+                "other".into(),
+            ),
+        ]))]));
+        match get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            get_string_map(&[("delta.columnMapping.mode", "name")]),
+            vec![("other", MetadataColumnSpec::RowId)],
+        ) {
+            Ok(_) => {
+                panic!("Should not have succeeded generating state info with invalid config")
+            }
+            Err(e) => {
+                assert_eq!(e.to_string(),
+                           "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'");
             }
         }
     }
