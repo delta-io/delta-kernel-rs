@@ -291,6 +291,17 @@ pub async fn create_table(
                 json!("another_dummy_column_name"),
             );
         }
+        if writer_features.contains(&"inCommitTimestamp") {
+            config.insert("delta.enableInCommitTimestamps".to_string(), json!("true"));
+            config.insert(
+                "delta.inCommitTimestampEnablementVersion".to_string(),
+                json!("0"),
+            );
+            config.insert(
+                "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                json!("1612345678"),
+            );
+        }
 
         config
     };
@@ -309,12 +320,40 @@ pub async fn create_table(
         }
     });
 
-    let data = [
-        to_vec(&protocol).unwrap(),
-        b"\n".to_vec(),
-        to_vec(&metadata).unwrap(),
-    ]
-    .concat();
+    // Add commitInfo with ICT if ICT is enabled
+    let commit_info = if writer_features.contains(&"inCommitTimestamp") {
+        // When ICT is enabled from version 0, we need to include it in the initial commit
+        let timestamp = 1612345678i64; // Use a fixed timestamp for testing
+        Some(json!({
+            "commitInfo": {
+                "timestamp": timestamp,
+                "inCommitTimestamp": timestamp,
+                "operation": "CREATE TABLE",
+                "operationParameters": {},
+                "isBlindAppend": true
+            }
+        }))
+    } else {
+        None
+    };
+
+    let data = if let Some(commit_info) = commit_info {
+        [
+            to_vec(&commit_info).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&protocol).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&metadata).unwrap(),
+        ]
+        .concat()
+    } else {
+        [
+            to_vec(&protocol).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&metadata).unwrap(),
+        ]
+        .concat()
+    };
 
     // put 0.json with protocol + metadata
     let path = table_path.join("_delta_log/00000000000000000000.json")?;

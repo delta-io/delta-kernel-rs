@@ -191,15 +191,26 @@ impl Transaction {
                 dup.app_id
             )));
         }
+        // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
             .clone()
             .into_iter()
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
-        // Step 2: Construct commit info and initialize the action iterator
+        // Step 2: Construct commit info with ICT if enabled
+        let in_commit_timestamp =
+            self.read_snapshot
+                .get_in_commit_timestamp(engine)?
+                .map(|prev_ict| {
+                    // The Delta protocol requires the timestamp to be "the larger of two values":
+                    // - The time at which the writer attempted the commit (current_time)
+                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
+                    self.commit_timestamp.max(prev_ict + 1)
+                });
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
+            in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
         );
