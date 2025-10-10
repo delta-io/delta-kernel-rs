@@ -58,6 +58,9 @@ pub(crate) struct LogSegment {
     pub checkpoint_parts: Vec<ParsedLogPath>,
     /// Latest CRC (checksum) file
     pub latest_crc_file: Option<ParsedLogPath>,
+    /// The latest commit file found during listing, which may not be part of the
+    /// contiguous segment but is needed for ICT timestamp reading
+    pub latest_commit_file: Option<ParsedLogPath>,
 }
 
 impl LogSegment {
@@ -72,6 +75,7 @@ impl LogSegment {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
+            latest_commit_file,
         } = listed_files;
 
         // Ensure commit file versions are contiguous
@@ -127,6 +131,7 @@ impl LogSegment {
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
+            latest_commit_file,
         })
     }
 
@@ -573,5 +578,18 @@ impl LogSegment {
         let to_sub = Version::max(self.checkpoint_version.unwrap_or(0), max_compaction_end);
         debug_assert!(to_sub <= self.end_version);
         self.end_version - to_sub
+    }
+
+    /// Validates that all commit files in this log segment are not staged commits. We use this in
+    /// places like checkpoint writers, where we require all commits to be published.
+    pub(crate) fn validate_no_staged_commits(&self) -> DeltaResult<()> {
+        require!(
+            !self
+                .ascending_commit_files
+                .iter()
+                .any(|commit| matches!(commit.file_type, LogPathFileType::StagedCommit)),
+            Error::generic("Found staged commit file in log segment")
+        );
+        Ok(())
     }
 }

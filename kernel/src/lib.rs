@@ -82,8 +82,6 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
-use crate::path::ParsedLogPath;
-
 use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
@@ -149,6 +147,7 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
+pub use crate::engine_data::FilteredEngineData;
 pub use delta_kernel_derive;
 pub use engine_data::{EngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
@@ -602,7 +601,7 @@ pub trait JsonHandler: AsAny {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()>;
 }

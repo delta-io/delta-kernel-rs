@@ -9,9 +9,10 @@ use crate::arrow::datatypes::{DataType, Schema};
 use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, Snapshot};
+use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 use arrow_56::{
     array::{create_array, RecordBatch},
@@ -77,13 +78,11 @@ fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let writer = snapshot.checkpoint()?;
 
     let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
-
-    // Check selection vector has one true value
-    assert_eq!(checkpoint_batch.filtered_data.selection_vector, vec![true]);
+    assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
     // Verify the underlying EngineData contains the expected CheckpointMetadata action
-    let arrow_engine_data =
-        ArrowEngineData::try_from_engine_data(checkpoint_batch.filtered_data.data)?;
+    let (underlying_data, _) = checkpoint_batch.filtered_data.into_parts();
+    let arrow_engine_data = ArrowEngineData::try_from_engine_data(underlying_data)?;
     let record_batch = arrow_engine_data.record_batch();
 
     // Build the expected RecordBatch
@@ -314,11 +313,11 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should not be included as the selection vector does not
     // contain any true values, as the file added is removed in a following commit.
@@ -384,7 +383,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // No more data should exist because we only requested version 0
     assert!(data_iter.next().is_none());
@@ -488,15 +487,17 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let mut data_iter = writer.checkpoint_data(&engine)?;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The second batch should include both the add action and the remove action
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true, true]);
+    assert_eq!(batch.selection_vector(), &[true, true]);
 
     // The third batch should be the CheckpointMetaData action.
     let batch = data_iter.next().unwrap()?;
-    assert_eq!(batch.selection_vector, [true]);
+    // According to the new contract, with_all_rows_selected creates an empty selection vector
+    assert_eq!(batch.selection_vector(), &[] as &[bool]);
+    assert!(batch.has_selected_rows());
 
     // No more data should exist
     assert!(data_iter.next().is_none());
@@ -516,5 +517,49 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // - sizeInBytes: passed to finalize (10)
     assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes)?;
 
+    Ok(())
+}
+
+#[test]
+fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+
+    // normal commit
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_action(), create_basic_protocol_action()],
+        0,
+    )?;
+
+    // staged commit
+    let staged_commit_path = Path::from(
+        "_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+    );
+    futures::executor::block_on(async {
+        let add_action = Action::Add(Add::default());
+        store
+            .put(
+                &staged_commit_path,
+                serde_json::to_string(&add_action).unwrap().into(),
+            )
+            .await
+            .unwrap()
+    });
+
+    let table_root = Url::parse("memory:///")?;
+    let staged_commit = FileMeta {
+        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")?,
+        last_modified: 0,
+        size: 100,
+    };
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
+        .build(&engine)?;
+
+    assert!(matches!(
+        snapshot.checkpoint().unwrap_err(),
+        crate::Error::Generic(e) if e == "Found staged commit file in log segment"
+    ));
     Ok(())
 }

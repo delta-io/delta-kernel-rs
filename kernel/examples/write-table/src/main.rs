@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow::array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow::util::pretty::print_batches;
 use clap::Parser;
+use common::{LocationArgs, ParseWithExamples};
 use itertools::Itertools;
 use serde_json::{json, to_vec};
 use url::Url;
@@ -18,7 +19,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
 /// An example program that writes to a Delta table and creates it if necessary.
@@ -26,9 +27,8 @@ use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Path to the table
-    #[arg(long, short = 'p')]
-    path: String,
+    #[command(flatten)]
+    location_args: LocationArgs,
 
     /// Comma-separated schema specification of the form `field_name:data_type`
     #[arg(
@@ -59,16 +59,19 @@ async fn main() -> ExitCode {
 
 // TODO: Update the example once official write APIs are introduced (issue#1123)
 async fn try_main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Write", "write", "");
 
     // Check if path is a directory and if not, create it
-    if !Path::new(&cli.path).exists() {
-        create_dir_all(&cli.path).map_err(|e| {
-            Error::generic(format!("Failed to create directory {}: {e}", &cli.path))
+    if !Path::new(&cli.location_args.path).exists() {
+        create_dir_all(&cli.location_args.path).map_err(|e| {
+            Error::generic(format!(
+                "Failed to create directory {}: {e}",
+                &cli.location_args.path
+            ))
         })?;
     }
 
-    let url = delta_kernel::try_parse_uri(&cli.path)?;
+    let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
@@ -99,23 +102,38 @@ async fn try_main() -> DeltaResult<()> {
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
 
-    // Commit the transaction
-    match txn.commit(&engine)? {
-        CommitResult::Committed { version, .. } => {
-            println!("✓ Committed transaction at version {version}");
-            println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
-
-            // Read and display the data
-            read_and_display_data(&url, engine).await?;
-            println!("✓ Successfully read data from the table");
-
-            Ok(())
+    // Commit the transaction (in a simple retry loop)
+    let mut retries = 0;
+    let committed = loop {
+        if retries > 5 {
+            return Err(Error::generic(
+                "Exceeded maximum 5 retries for committing transaction",
+            ));
         }
-        CommitResult::Conflict(_, conflicting_version) => {
-            println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-            Err(Error::generic("Commit failed"))
-        }
-    }
+        txn = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(committed) => break committed,
+            CommitResult::ConflictedTransaction(conflicted) => {
+                let conflicting_version = conflicted.conflict_version();
+                println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
+                return Err(Error::generic("Commit failed"));
+            }
+            CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
+                println!("✗ Failed to commit, retrying... retryable error: {error}");
+                transaction
+            }
+        };
+        retries += 1;
+    };
+
+    let version = committed.commit_version();
+    println!("✓ Committed transaction at version {version}");
+    println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
+
+    // Read and display the data
+    read_and_display_data(&url, engine).await?;
+    println!("✓ Successfully read data from the table");
+
+    Ok(())
 }
 
 /// Creates a new Delta table or gets an existing one.
