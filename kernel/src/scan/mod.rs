@@ -9,6 +9,9 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
+use self::field_classifiers::{
+    ScanTransformFieldClassifierieldClassifier, TransformFieldClassifier,
+};
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -30,12 +33,13 @@ use crate::schema::{MetadataColumnSpec, ToSchema as _};
 use crate::snapshot::SnapshotRef;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{FieldTransformSpec, TransformSpec};
+use crate::transforms::TransformSpec;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
+pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
 
@@ -122,6 +126,7 @@ impl ScanBuilder {
             logical_schema,
             self.snapshot.table_configuration(),
             self.predicate,
+            ScanTransformFieldClassifierieldClassifier,
         )?;
 
         Ok(Scan {
@@ -739,6 +744,7 @@ pub fn scan_row_schema() -> SchemaRef {
 }
 
 /// All the state needed to process a scan.
+#[derive(Debug)]
 pub(crate) struct StateInfo {
     /// The logical schema for this scan
     pub(crate) logical_schema: SchemaRef,
@@ -751,16 +757,19 @@ pub(crate) struct StateInfo {
 }
 
 impl StateInfo {
+    /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
     ///
     /// `logical_schema` - The logical schema of the scan output, which includes partition columns
     /// `partition_columns` - List of column names that are partition columns in the table
     /// `column_mapping_mode` - The column mapping mode used by the table for physical to logical mapping
     /// `predicate` - Optional predicate to filter data during the scan
-    pub(crate) fn try_new(
+    /// `classifier` - The classifier to use for different scan types
+    pub(crate) fn try_new<C: TransformFieldClassifier>(
         logical_schema: SchemaRef,
         table_configuration: &TableConfiguration,
         predicate: Option<PredicateRef>,
+        classifier: C,
     ) -> DeltaResult<Self> {
         let partition_columns = table_configuration.metadata().partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
@@ -790,84 +799,118 @@ impl StateInfo {
 
         // Loop over all selected fields and build both the physical schema and transform spec
         for (index, logical_field) in logical_schema.fields().enumerate() {
-            if partition_columns.contains(logical_field.name()) {
-                if logical_field.is_metadata_column() {
+            let requirements = classifier.classify_field(
+                logical_field,
+                index,
+                table_configuration,
+                &last_physical_field,
+            )?;
+
+            if let Some(requirements) = requirements {
+                // Field needs transformation - not in physical schema
+                for spec in requirements.transform_specs.into_iter() {
+                    transform_spec.push(spec);
+                }
+            } else {
+                // Physical field - should be read from parquet
+                // Validate metadata column doesn't conflict with partition columns
+                if logical_field.is_metadata_column()
+                    && partition_columns.contains(logical_field.name())
+                {
                     return Err(Error::Schema(format!(
                         "Metadata column names must not match partition columns: {}",
                         logical_field.name()
                     )));
                 }
 
-                // Partition column: needs to be injected via transform
-                transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
-                    field_index: index,
-                    insert_after: last_physical_field.clone(),
-                });
-            } else {
-                // Regular field field, or metadata columns: add to physical schema
-                let mut select_physical_field = || {
-                    let physical_field = logical_field.make_physical(column_mapping_mode);
-                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                    let physical_name = physical_field.name.clone();
+// <<<<<<< HEAD
+//                 // Partition column: needs to be injected via transform
+//                 transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
+//                     field_index: index,
+//                     insert_after: last_physical_field.clone(),
+//                 });
+//             } else {
+//                 // Regular field field, or metadata columns: add to physical schema
+//                 let mut select_physical_field = || {
+//                     let physical_field = logical_field.make_physical(column_mapping_mode);
+//                     debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+//                     let physical_name = physical_field.name.clone();
+// ||||||| f431de0c
+//                 // Partition column: needs to be injected via transform
+//                 transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
+//                     field_index: index,
+//                     insert_after: last_physical_field.clone(),
+//                 });
+//             } else {
+//                 // Regular field: add to physical schema
+//                 let physical_field = logical_field.make_physical(column_mapping_mode);
+//                 debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+//                 let physical_name = physical_field.name.clone();
+// =======
+                // Add to physical schema
+                let physical_field = logical_field.make_physical(column_mapping_mode);
+                debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                let physical_name = physical_field.name.clone();
 
-                    if !logical_field.is_metadata_column() {
-                        read_field_names.insert(physical_name.clone());
-                    }
-                    last_physical_field = Some(physical_name);
-                    read_fields.push(physical_field);
-                };
-                match logical_field.get_metadata_column_spec() {
-                    Some(MetadataColumnSpec::RowId) => {
-                        if table_configuration.table_properties().enable_row_tracking == Some(true)
-                        {
-                            let row_id_col = table_configuration
-                                .metadata()
-                                .configuration()
-                                .get("delta.rowTracking.materializedRowIdColumnName")
-                                .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
-                            // we can `take` as we should only have one RowId col
-                            let index_column_name = match selected_row_index_col_name.take() {
-                                Some(index_column_name) => index_column_name,
-                                None => {
-                                    // ensure we have a column name that isn't already in our schema
-                                    let index_column_name = (0..)
-                                        .map(|i| format!("row_indexes_for_row_id_{}", i))
-                                        .find(|name| logical_schema.field(name).is_none())
-                                        .ok_or(Error::generic(
-                                            "Couldn't generate row index column name",
-                                        ))?;
-                                    read_fields.push(StructField::create_metadata_column(
-                                        &index_column_name,
-                                        MetadataColumnSpec::RowIndex,
-                                    ));
-                                    transform_spec.push(FieldTransformSpec::StaticDrop {
-                                        field_name: index_column_name.clone(),
-                                    });
-                                    index_column_name
-                                }
-                            };
 
-                            read_fields.push(StructField::nullable(row_id_col, DataType::LONG));
-                            transform_spec.push(FieldTransformSpec::GenerateRowId {
-                                field_name: row_id_col.to_string(),
-                                row_index_field_name: index_column_name,
-                            });
-                        } else {
-                            return Err(Error::unsupported(
-                                "Row ids are not enabled on this table",
-                            ));
-                        }
-                    }
-                    Some(MetadataColumnSpec::RowIndex) => {
-                        // handled in parquet reader
-                        select_physical_field()
-                    }
-                    Some(MetadataColumnSpec::RowCommitVersion) => {
-                        return Err(Error::unsupported("Row commit versions not supported"));
-                    }
-                    _ => select_physical_field(),
+                if !logical_field.is_metadata_column() {
+                    read_field_names.insert(physical_name.clone());
                 }
+                last_physical_field = Some(physical_name);
+                read_fields.push(physical_field);
             }
+            //     match logical_field.get_metadata_column_spec() {
+            //         Some(MetadataColumnSpec::RowId) => {
+            //             if table_configuration.table_properties().enable_row_tracking == Some(true)
+            //             {
+            //                 let row_id_col = table_configuration
+            //                     .metadata()
+            //                     .configuration()
+            //                     .get("delta.rowTracking.materializedRowIdColumnName")
+            //                     .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
+            //                 // we can `take` as we should only have one RowId col
+            //                 let index_column_name = match selected_row_index_col_name.take() {
+            //                     Some(index_column_name) => index_column_name,
+            //                     None => {
+            //                         // ensure we have a column name that isn't already in our schema
+            //                         let index_column_name = (0..)
+            //                             .map(|i| format!("row_indexes_for_row_id_{}", i))
+            //                             .find(|name| logical_schema.field(name).is_none())
+            //                             .ok_or(Error::generic(
+            //                                 "Couldn't generate row index column name",
+            //                             ))?;
+            //                         read_fields.push(StructField::create_metadata_column(
+            //                             &index_column_name,
+            //                             MetadataColumnSpec::RowIndex,
+            //                         ));
+            //                         transform_spec.push(FieldTransformSpec::StaticDrop {
+            //                             field_name: index_column_name.clone(),
+            //                         });
+            //                         index_column_name
+            //                     }
+            //                 };
+
+            //                 read_fields.push(StructField::nullable(row_id_col, DataType::LONG));
+            //                 transform_spec.push(FieldTransformSpec::GenerateRowId {
+            //                     field_name: row_id_col.to_string(),
+            //                     row_index_field_name: index_column_name,
+            //                 });
+            //             } else {
+            //                 return Err(Error::unsupported(
+            //                     "Row ids are not enabled on this table",
+            //                 ));
+            //             }
+            //         }
+            //         Some(MetadataColumnSpec::RowIndex) => {
+            //             // handled in parquet reader
+            //             select_physical_field()
+            //         }
+            //         Some(MetadataColumnSpec::RowCommitVersion) => {
+            //             return Err(Error::unsupported("Row commit versions not supported"));
+            //         }
+            //         _ => select_physical_field(),
+            //     }
+            // }
         }
 
         let physical_schema = Arc::new(StructType::try_new(read_fields)?);
@@ -1075,6 +1118,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
     use crate::schema::{ColumnMetadataKey, PrimitiveType};
+    use crate::transforms::FieldTransformSpec;
     use crate::Snapshot;
 
     use super::*;
@@ -1607,7 +1651,7 @@ mod tests {
             );
         }
 
-        StateInfo::try_new(schema.clone(), &table_configuration, predicate)
+        StateInfo::try_new(schema.clone(), &table_configuration, predicate, ScanTransformFieldClassifierieldClassifier)
     }
 
     #[test]
