@@ -179,7 +179,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 10,
+            getters.len() == 11,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
