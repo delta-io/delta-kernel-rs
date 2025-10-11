@@ -595,13 +595,6 @@ fn get_indices(
                             Arc::new(field.try_into_arrow()?),
                         ));
                     }
-                    Some(MetadataColumnSpec::RowId) => {
-                        debug!("Inserting a row index column for row ids: {}", field.name());
-                        reorder_indices.push(ReorderIndex::row_index(
-                            requested_position,
-                            Arc::new(field.try_into_arrow()?),
-                        ));
-                    }
                     Some(metadata_spec) => {
                         return Err(Error::Generic(format!(
                             "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
