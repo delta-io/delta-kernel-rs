@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_transform_expr_generate_row_ids() {
+    fn get_transform_expr_generate_row_ids() {
         let transform_spec = vec![FieldTransformSpec::GenerateRowId {
             field_name: "row_id_col".to_string(),
             row_index_field_name: "row_index_col".to_string(),
@@ -585,5 +585,28 @@ mod tests {
         assert_eq!(row_id_transform.exprs.len(), 1);
         let expr = &row_id_transform.exprs[0];
         assert_eq!(expr, &expeceted_expr);
+    }
+
+    #[test]
+    fn get_transform_expr_generate_row_ids_no_base_id() {
+        let transform_spec = vec![FieldTransformSpec::GenerateRowId {
+            field_name: "row_id_col".to_string(),
+            row_index_field_name: "row_index_col".to_string(),
+        }];
+
+        // Physical schema contains row index col, but no row-id col
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::not_null("row_index_col", DataType::LONG),
+        ]);
+        let metadata_values = HashMap::new();
+
+        assert!(get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        )
+        .is_err());
     }
 }
