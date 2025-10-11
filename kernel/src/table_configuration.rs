@@ -16,8 +16,8 @@ use crate::actions::{ensure_supported_features, Metadata, Protocol};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
-    column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, ReaderFeature, WriterFeature,
+    self, column_mapping_mode, validate_schema_column_mapping,
+    validate_timestamp_ntz_feature_support, ColumnMappingMode, TableFeature,
 };
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Error, Version};
@@ -184,7 +184,7 @@ impl TableConfiguration {
 
         // for now we don't allow invariants so although we support writer version 2 and the
         // ColumnInvariant TableFeature we _must_ check here that they are not actually in use
-        if self.is_invariants_supported()
+        if table_features::is_invariants_supported(&self.protocol)
             && InvariantChecker::has_invariants(self.schema().as_ref())
         {
             return Err(Error::unsupported(
@@ -193,7 +193,9 @@ impl TableConfiguration {
         }
 
         // Fail if row tracking is both enabled and suspended
-        if self.is_row_tracking_enabled() && self.is_row_tracking_suspended() {
+        if table_features::is_row_tracking_enabled(&self.protocol, &self.table_properties)
+            && self.is_row_tracking_suspended()
+        {
             return Err(Error::unsupported(
                 "Row tracking cannot be both enabled and suspended",
             ));
@@ -208,12 +210,12 @@ impl TableConfiguration {
     /// [`TableChanges`]: crate::table_changes::TableChanges
     #[internal_api]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
-            LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
+        static CDF_SUPPORTED_TABLE_FEATURES: LazyLock<Vec<TableFeature>> =
+            LazyLock::new(|| vec![TableFeature::DeletionVectors]);
         let protocol_supported = match self.protocol.reader_features() {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.protocol.min_reader_version() == 3 => {
-                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
+                ensure_supported_features(reader_features, &CDF_SUPPORTED_TABLE_FEATURES).is_ok()
             }
             // if min_reader_version = 1 and there are no reader features => OK
             None => self.protocol.min_reader_version() == 1,
@@ -231,105 +233,6 @@ impl TableConfiguration {
         protocol_supported && cdf_enabled && column_mapping_disabled
     }
 
-    /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
-    /// a table must support reader version 3, writer version 7, and the deletionVectors feature in
-    /// both the protocol's readerFeatures and writerFeatures.
-    ///
-    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[internal_api]
-    #[allow(unused)] // needed to compile w/o default features
-    pub(crate) fn is_deletion_vector_supported(&self) -> bool {
-        let read_supported = self
-            .protocol()
-            .has_reader_feature(&ReaderFeature::DeletionVectors)
-            && self.protocol.min_reader_version() == 3;
-        let write_supported = self
-            .protocol()
-            .has_writer_feature(&WriterFeature::DeletionVectors)
-            && self.protocol.min_writer_version() == 7;
-        read_supported && write_supported
-    }
-
-    /// Returns `true` if writing deletion vectors is enabled for this table. This is the case
-    /// when the deletion vectors is supported on this table and the `delta.enableDeletionVectors`
-    /// table property is set to `true`.
-    ///
-    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vectors>
-    #[internal_api]
-    #[allow(unused)] // needed to compile w/o default features
-    pub(crate) fn is_deletion_vector_enabled(&self) -> bool {
-        self.is_deletion_vector_supported()
-            && self
-                .table_properties
-                .enable_deletion_vectors
-                .unwrap_or(false)
-    }
-
-    /// Returns `true` if the table supports the appendOnly table feature. To support this feature:
-    /// - The table must have a writer version between 2 and 7 (inclusive)
-    /// - If the table is on writer version 7, it must have the [`WriterFeature::AppendOnly`]
-    ///   writer feature.
-    pub(crate) fn is_append_only_supported(&self) -> bool {
-        let protocol = &self.protocol;
-        match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeature::AppendOnly) => true,
-            version => (2..=6).contains(&version),
-        }
-    }
-
-    #[allow(unused)]
-    pub(crate) fn is_append_only_enabled(&self) -> bool {
-        self.is_append_only_supported() && self.table_properties.append_only.unwrap_or(false)
-    }
-
-    /// Returns `true` if the table supports the column invariant table feature.
-    pub(crate) fn is_invariants_supported(&self) -> bool {
-        let protocol = &self.protocol;
-        match protocol.min_writer_version() {
-            7 if protocol.has_writer_feature(&WriterFeature::Invariants) => true,
-            version => (2..=6).contains(&version),
-        }
-    }
-
-    /// Returns `true` if V2 checkpoint is supported on this table. To support V2 checkpoint,
-    /// a table must support reader version 3, writer version 7, and the v2Checkpoint feature in
-    /// both the protocol's readerFeatures and writerFeatures.
-    ///
-    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-checkpoint-table-feature>
-    pub(crate) fn is_v2_checkpoint_write_supported(&self) -> bool {
-        let read_supported = self
-            .protocol()
-            .has_reader_feature(&ReaderFeature::V2Checkpoint);
-        let write_supported = self
-            .protocol()
-            .has_writer_feature(&WriterFeature::V2Checkpoint);
-        read_supported && write_supported
-    }
-
-    /// Returns `true` if the table supports writing in-commit timestamps.
-    ///
-    /// To support this feature the table must:
-    /// - Have a min_writer_version of 7
-    /// - Have the [`WriterFeature::InCommitTimestamp`] writer feature.
-    #[allow(unused)]
-    pub(crate) fn is_in_commit_timestamps_supported(&self) -> bool {
-        self.protocol().min_writer_version() == 7
-            && self
-                .protocol()
-                .has_writer_feature(&WriterFeature::InCommitTimestamp)
-    }
-
-    /// Returns `true` if in-commit timestamps is supported and it is enabled. In-commit timestamps
-    /// is enabled when the `delta.enableInCommitTimestamps` configuration is set to `true`.
-    #[allow(unused)]
-    pub(crate) fn is_in_commit_timestamps_enabled(&self) -> bool {
-        self.is_in_commit_timestamps_supported()
-            && self
-                .table_properties()
-                .enable_in_commit_timestamps
-                .unwrap_or(false)
-    }
-
     /// Returns information about in-commit timestamp enablement state.
     ///
     /// Returns an error if only one of the enablement properties is present, as this indicates
@@ -338,7 +241,8 @@ impl TableConfiguration {
     pub(crate) fn in_commit_timestamp_enablement(
         &self,
     ) -> DeltaResult<InCommitTimestampEnablement> {
-        if !self.is_in_commit_timestamps_enabled() {
+        if !table_features::is_in_commit_timestamps_enabled(&self.protocol, &self.table_properties)
+        {
             return Ok(InCommitTimestampEnablement::NotEnabled);
         }
 
@@ -365,41 +269,6 @@ impl TableConfiguration {
         }
     }
 
-    /// Returns `true` if the table supports writing domain metadata.
-    ///
-    /// To support this feature the table must:
-    /// - Have a min_writer_version of 7.
-    /// - Have the [`WriterFeature::DomainMetadata`] writer feature.
-    #[allow(unused)]
-    pub(crate) fn is_domain_metadata_supported(&self) -> bool {
-        self.protocol().min_writer_version() == 7
-            && self
-                .protocol()
-                .has_writer_feature(&WriterFeature::DomainMetadata)
-    }
-
-    /// Returns `true` if the table supports writing row tracking metadata.
-    ///
-    /// To support this feature the table must:
-    /// - Have a min_writer_version of 7.
-    /// - Have the [`WriterFeature::RowTracking`] writer feature.
-    pub(crate) fn is_row_tracking_supported(&self) -> bool {
-        self.protocol().min_writer_version() == 7
-            && self
-                .protocol()
-                .has_writer_feature(&WriterFeature::RowTracking)
-    }
-
-    /// Returns `true` if row tracking is enabled for this table.
-    ///
-    /// In order to enable row tracking the table must:
-    /// - Support row tracking (see [`Self::is_row_tracking_supported`]).
-    /// - Have the `delta.enableRowTracking` table property set to `true`.
-    pub(crate) fn is_row_tracking_enabled(&self) -> bool {
-        self.is_row_tracking_supported()
-            && self.table_properties().enable_row_tracking.unwrap_or(false)
-    }
-
     /// Returns `true` if row tracking is suspended for this table.
     ///
     /// Row tracking is suspended when the `delta.rowTrackingSuspended` table property is set to `true`.
@@ -411,18 +280,6 @@ impl TableConfiguration {
             .row_tracking_suspended
             .unwrap_or(false)
     }
-
-    /// Returns `true` if row tracking information should be written for this table.
-    ///
-    /// Row tracking information should be written when:
-    /// - Row tracking is supported
-    /// - Row tracking is not suspended
-    ///
-    /// Note: We ignore [`is_row_tracking_enabled`] at this point because Kernel does not
-    /// preserve row IDs and row commit versions yet.
-    pub(crate) fn should_write_row_tracking(&self) -> bool {
-        self.is_row_tracking_supported() && !self.is_row_tracking_suspended()
-    }
 }
 
 #[cfg(test)]
@@ -433,7 +290,7 @@ mod test {
 
     use crate::actions::{Metadata, Protocol};
     use crate::schema::{DataType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::{self, TableFeature};
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Error;
@@ -455,14 +312,19 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
-            Some([WriterFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_deletion_vector_supported());
-        assert!(!table_config.is_deletion_vector_enabled());
+        assert!(table_features::is_deletion_vector_supported(
+            table_config.protocol()
+        ));
+        assert!(!table_features::is_deletion_vector_enabled(
+            table_config.protocol(),
+            table_config.table_properties()
+        ));
     }
     #[test]
     fn dv_enabled() {
@@ -485,14 +347,19 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
-            Some([WriterFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_deletion_vector_supported());
-        assert!(table_config.is_deletion_vector_enabled());
+        assert!(table_features::is_deletion_vector_supported(
+            table_config.protocol()
+        ));
+        assert!(table_features::is_deletion_vector_enabled(
+            table_config.protocol(),
+            table_config.table_properties()
+        ));
     }
     #[test]
     fn ict_enabled_from_table_creation() {
@@ -513,13 +380,18 @@ mod test {
             3,
             7,
             Some::<Vec<String>>(vec![]),
-            Some([WriterFeature::InCommitTimestamp]),
+            Some([TableFeature::InCommitTimestamp]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(table_features::is_in_commit_timestamps_supported(
+            table_config.protocol()
+        ));
+        assert!(table_features::is_in_commit_timestamps_enabled(
+            table_config.protocol(),
+            table_config.table_properties()
+        ));
         // When ICT is enabled from table creation (version 0), it's perfectly normal
         // for enablement properties to be missing
         let info = table_config.in_commit_timestamp_enablement().unwrap();
@@ -557,13 +429,18 @@ mod test {
             3,
             7,
             Some::<Vec<String>>(vec![]),
-            Some([WriterFeature::InCommitTimestamp]),
+            Some([TableFeature::InCommitTimestamp]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(table_features::is_in_commit_timestamps_supported(
+            table_config.protocol()
+        ));
+        assert!(table_features::is_in_commit_timestamps_enabled(
+            table_config.protocol(),
+            table_config.table_properties()
+        ));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
         assert_eq!(
             info,
@@ -598,13 +475,18 @@ mod test {
             3,
             7,
             Some::<Vec<String>>(vec![]),
-            Some([WriterFeature::InCommitTimestamp]),
+            Some([TableFeature::InCommitTimestamp]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(table_features::is_in_commit_timestamps_supported(
+            table_config.protocol()
+        ));
+        assert!(table_features::is_in_commit_timestamps_enabled(
+            table_config.protocol(),
+            table_config.table_properties()
+        ));
         assert!(matches!(
             table_config.in_commit_timestamp_enablement(),
             Err(Error::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
@@ -618,13 +500,18 @@ mod test {
             3,
             7,
             Some::<Vec<String>>(vec![]),
-            Some([WriterFeature::InCommitTimestamp]),
+            Some([TableFeature::InCommitTimestamp]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(!table_config.is_in_commit_timestamps_enabled());
+        assert!(table_features::is_in_commit_timestamps_supported(
+            table_config.protocol()
+        ));
+        assert!(!table_features::is_in_commit_timestamps_enabled(
+            table_config.protocol(),
+            table_config.table_properties()
+        ));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
         assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
     }
@@ -652,14 +539,19 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::TimestampWithoutTimezone]),
-            Some([WriterFeature::TimestampWithoutTimezone]),
+            Some([TableFeature::TimestampNtz]),
+            Some([TableFeature::TimestampNtz]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(!table_config.is_deletion_vector_supported());
-        assert!(!table_config.is_deletion_vector_enabled());
+        assert!(!table_features::is_deletion_vector_supported(
+            table_config.protocol()
+        ));
+        assert!(!table_features::is_deletion_vector_enabled(
+            table_config.protocol(),
+            table_config.table_properties()
+        ));
     }
 
     #[test]
@@ -677,8 +569,8 @@ mod test {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
-            Some([WriterFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -707,11 +599,11 @@ mod test {
         let new_protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors, ReaderFeature::V2Checkpoint]),
+            Some([TableFeature::DeletionVectors, TableFeature::V2Checkpoint]),
             Some([
-                WriterFeature::DeletionVectors,
-                WriterFeature::V2Checkpoint,
-                WriterFeature::AppendOnly,
+                TableFeature::DeletionVectors,
+                TableFeature::V2Checkpoint,
+                TableFeature::AppendOnly,
             ]),
         )
         .unwrap();
@@ -761,8 +653,8 @@ mod test {
         let protocol_with_timestamp_ntz_features = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::TimestampWithoutTimezone]),
-            Some([WriterFeature::TimestampWithoutTimezone]),
+            Some([TableFeature::TimestampNtz]),
+            Some([TableFeature::TimestampNtz]),
         )
         .unwrap();
 
@@ -806,8 +698,8 @@ mod test {
         let protocol_with_variant_features = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::VariantType]),
-            Some([WriterFeature::VariantType]),
+            Some([TableFeature::VariantType]),
+            Some([TableFeature::VariantType]),
         )
         .unwrap();
 

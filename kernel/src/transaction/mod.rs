@@ -16,6 +16,7 @@ use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
+use crate::table_features;
 use crate::utils::current_time_ms;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -291,10 +292,9 @@ impl Transaction {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
         // if there are domain metadata actions, the table must support it
         if !self.domain_metadatas.is_empty()
-            && !self
-                .read_snapshot
-                .table_configuration()
-                .is_domain_metadata_supported()
+            && !table_features::is_domain_metadata_supported(
+                self.read_snapshot.table_configuration().protocol(),
+            )
         {
             return Err(Error::unsupported(
                 "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"
@@ -419,10 +419,10 @@ impl Transaction {
         let commit_version = i64::try_from(commit_version)
             .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
 
-        let needs_row_tracking = self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking();
+        let needs_row_tracking = table_features::should_write_row_tracking(
+            self.read_snapshot.table_configuration().protocol(),
+            self.read_snapshot.table_configuration().table_properties(),
+        );
 
         if needs_row_tracking {
             // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata

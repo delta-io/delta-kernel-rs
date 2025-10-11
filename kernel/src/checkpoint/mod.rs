@@ -101,6 +101,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
+use crate::table_features;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
@@ -258,10 +259,9 @@ impl CheckpointWriter {
     //    (i.e., if `v2Checkpoints` feature is supported by table)
     // 5. Generates the appropriate checkpoint path
     pub fn checkpoint_data(&self, engine: &dyn Engine) -> DeltaResult<CheckpointDataIterator> {
-        let is_v2_checkpoints_supported = self
-            .snapshot
-            .table_configuration()
-            .is_v2_checkpoint_write_supported();
+        let is_v2_checkpoints_supported = table_features::is_v2_checkpoint_write_supported(
+            self.snapshot.table_configuration().protocol(),
+        );
 
         let actions = self.snapshot.log_segment().read_actions(
             engine,
