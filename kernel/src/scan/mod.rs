@@ -25,6 +25,7 @@ use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
+    ToSchema as _,
 };
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
@@ -487,8 +488,6 @@ impl Scan {
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            use crate::schema::ToSchema as _;
-
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
             DataType::struct_type_unchecked(vec![StructField::nullable(
                 "add",

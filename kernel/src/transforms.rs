@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use crate::expressions::{BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform};
+use crate::expressions::{
+    BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform, VariadicExpressionOp,
+};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::{DeltaResult, Error};
 
@@ -127,7 +129,7 @@ pub(crate) fn get_transform_expr(
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
                 let expr = Arc::new(Expression::variadic(
-                    crate::expressions::VariadicExpressionOp::Coalesce,
+                    VariadicExpressionOp::Coalesce,
                     vec![
                         Expression::column([field_name]),
                         Expression::binary(
