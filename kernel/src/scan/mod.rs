@@ -354,7 +354,7 @@ impl HasSelectionVector for ScanMetadata {
 /// scanning the table.
 pub struct Scan {
     snapshot: SnapshotRef,
-    state_info: Arc<state_info::StateInfo>,
+    state_info: Arc<StateInfo>,
 }
 
 impl std::fmt::Debug for Scan {
