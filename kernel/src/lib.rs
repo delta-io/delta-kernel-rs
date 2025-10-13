@@ -699,7 +699,11 @@ pub trait ParquetHandler: AsAny {
     /// # Returns
     ///
     /// A [`DeltaResult`] indicating success or failure.
-    fn write_parquet_file(&self, url: url::Url, data: Box<dyn EngineData>) -> DeltaResult<()>;
+    fn write_parquet_file(
+        &self,
+        url: url::Url,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+    ) -> DeltaResult<()>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

@@ -12,9 +12,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
-use crate::{
-    DeltaResult, EngineData, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef,
-};
+use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
 
 pub(crate) struct SyncParquetHandler;
 
@@ -56,9 +54,24 @@ impl ParquetHandler for SyncParquetHandler {
         read_files(files, schema, predicate, try_create_from_parquet)
     }
 
-    fn write_parquet_file(&self, url: Url, data: Box<dyn EngineData>) -> DeltaResult<()> {
-        let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
-        let record_batch = batch.record_batch();
+    fn write_parquet_file(
+        &self,
+        url: Url,
+        data: Box<dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send + '_>,
+    ) -> DeltaResult<()> {
+        // Collect all ArrowEngineData batches first
+        let mut batches = Vec::new();
+        for filtered_batch in data {
+            let filtered_batch = filtered_batch?;
+            let (engine_data, _selection_vector) = filtered_batch.into_parts();
+            let batch: Box<ArrowEngineData> = ArrowEngineData::try_from_engine_data(engine_data)?;
+            batches.push(batch);
+        }
+
+        // If there are no batches, return early
+        if batches.is_empty() {
+            return Ok(());
+        }
 
         // Convert URL to file path
         let path = url
@@ -66,8 +79,12 @@ impl ParquetHandler for SyncParquetHandler {
             .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", url)))?;
         let mut file = File::create(&path)?;
 
-        let mut writer = ArrowWriter::try_new(&mut file, record_batch.schema(), None)?;
-        writer.write(record_batch)?;
+        let mut writer = ArrowWriter::try_new(&mut file, batches[0].record_batch().schema(), None)?;
+
+        for batch in &batches {
+            writer.write(batch.record_batch())?;
+        }
+
         writer.close()?; // writer must be closed to write footer
 
         Ok(())
@@ -90,7 +107,7 @@ mod tests {
         let url = Url::from_file_path(&file_path).unwrap();
 
         // Create test data
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
                 (
                     "id",
@@ -104,8 +121,14 @@ mod tests {
             .unwrap(),
         ));
 
+        // Wrap in FilteredEngineData with all rows selected
+        let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
+        let data_iter: Box<
+            dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send,
+        > = Box::new(std::iter::once(Ok(filtered_data)));
+
         // Write the file
-        handler.write_parquet_file(url.clone(), data).unwrap();
+        handler.write_parquet_file(url.clone(), data_iter).unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());

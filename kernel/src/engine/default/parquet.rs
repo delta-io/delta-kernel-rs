@@ -30,8 +30,8 @@ use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::transaction::add_files_schema;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
-    PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilteredEngineData,
+    ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -247,21 +247,47 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         )
     }
 
-    fn write_parquet_file(&self, url: url::Url, data: Box<dyn EngineData>) -> DeltaResult<()> {
-        let batch: Box<_> = ArrowEngineData::try_from_engine_data(data)?;
-        let record_batch = batch.record_batch();
+    fn write_parquet_file(
+        &self,
+        url: url::Url,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+    ) -> DeltaResult<()> {
+        // Collect all ArrowEngineData batches first
+        let mut batches = Vec::new();
+        for filtered_batch in data {
+            let filtered_batch = filtered_batch?;
+            let (engine_data, _selection_vector) = filtered_batch.into_parts();
+            let batch: Box<ArrowEngineData> = ArrowEngineData::try_from_engine_data(engine_data)?;
+            batches.push(batch);
+        }
+
+        // If there are no batches, return early
+        if batches.is_empty() {
+            return Ok(());
+        }
 
         let mut buffer = vec![];
-        let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
-        writer.write(record_batch)?;
-        writer.close()?; // writer must be closed to write footer
 
-        let store = self.store.clone();
-        let path = Path::from_url_path(url.path())?;
+        // Scope to ensure writer is dropped before we use buffer
+        {
+            let mut writer =
+                ArrowWriter::try_new(&mut buffer, batches[0].record_batch().schema(), None)?;
 
-        // Block on the async put operation
-        self.task_executor
-            .block_on(async move { store.put(&path, buffer.into()).await })?;
+            for batch in &batches {
+                writer.write(batch.record_batch())?;
+            }
+
+            writer.close()?; // writer must be closed to write footer
+        }
+
+        if !buffer.is_empty() {
+            let store = self.store.clone();
+            let path = Path::from_url_path(url.path())?;
+
+            // Block on the async put operation
+            self.task_executor
+                .block_on(async move { store.put(&path, buffer.into()).await })?;
+        }
 
         Ok(())
     }
@@ -672,7 +698,7 @@ mod tests {
             Arc::new(TokioBackgroundExecutor::new()),
         ));
 
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
                 (
                     "x",
@@ -686,10 +712,15 @@ mod tests {
             .unwrap(),
         ));
 
+        // Wrap in FilteredEngineData with all rows selected
+        let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<crate::FilteredEngineData>> + Send> =
+            Box::new(std::iter::once(Ok(filtered_data)));
+
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data)
+            .write_parquet_file(file_url.clone(), data_iter)
             .unwrap();
 
         // Verify we can read the file back
@@ -732,7 +763,7 @@ mod tests {
         ));
 
         // Create test data with multiple types
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
                 (
                     "int_col",
@@ -751,10 +782,15 @@ mod tests {
             .unwrap(),
         ));
 
+        // Wrap in FilteredEngineData with all rows selected
+        let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<crate::FilteredEngineData>> + Send> =
+            Box::new(std::iter::once(Ok(filtered_data)));
+
         // Write the data
         let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data)
+            .write_parquet_file(file_url.clone(), data_iter)
             .unwrap();
 
         // Read it back
