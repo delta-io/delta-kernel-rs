@@ -9,9 +9,7 @@ use itertools::Itertools;
 use tracing::debug;
 use url::Url;
 
-use self::field_classifiers::{
-    ScanTransformFieldClassifierieldClassifier, TransformFieldClassifier,
-};
+use self::field_classifiers::{ScanTransformFieldClassifier, TransformFieldClassifier};
 use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
@@ -132,7 +130,7 @@ impl ScanBuilder {
             partition_columns,
             column_mapping_mode,
             self.predicate,
-            ScanTransformFieldClassifierieldClassifier,
+            ScanTransformFieldClassifier,
         )?;
 
         Ok(Scan {
@@ -1523,7 +1521,7 @@ mod tests {
             &[], // No partition columns
             ColumnMappingMode::None,
             None, // No predicate
-            ScanTransformFieldClassifierieldClassifier,
+            ScanTransformFieldClassifier,
         )
         .unwrap();
 
@@ -1552,7 +1550,7 @@ mod tests {
             &["date".to_string()], // date is a partition column
             ColumnMappingMode::None,
             None,
-            ScanTransformFieldClassifierieldClassifier,
+            ScanTransformFieldClassifier,
         )
         .unwrap();
 
@@ -1593,7 +1591,7 @@ mod tests {
             &["part1".to_string(), "part2".to_string()],
             ColumnMappingMode::None,
             None,
-            ScanTransformFieldClassifierieldClassifier,
+            ScanTransformFieldClassifier,
         )
         .unwrap();
 
@@ -1645,7 +1643,7 @@ mod tests {
             &[],
             ColumnMappingMode::None,
             Some(predicate),
-            ScanTransformFieldClassifierieldClassifier,
+            ScanTransformFieldClassifier,
         )
         .unwrap();
 
@@ -1673,7 +1671,7 @@ mod tests {
             &["date".to_string()],
             ColumnMappingMode::None,
             None,
-            ScanTransformFieldClassifierieldClassifier,
+            ScanTransformFieldClassifier,
         )
         .unwrap();
 

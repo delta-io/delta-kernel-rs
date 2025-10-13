@@ -23,8 +23,8 @@ pub(crate) trait TransformFieldClassifier {
 
 /// Regular scan field classifier for standard Delta table scans.
 /// Handles partition columns as metadata-derived fields.
-pub(crate) struct ScanTransformFieldClassifierieldClassifier;
-impl TransformFieldClassifier for ScanTransformFieldClassifierieldClassifier {
+pub(crate) struct ScanTransformFieldClassifier;
+impl TransformFieldClassifier for ScanTransformFieldClassifier {
     fn classify_field(
         &self,
         field: &StructField,
@@ -71,7 +71,7 @@ impl TransformFieldClassifier for CdfTransformFieldClassifier {
                 })
             }
             // Defer to default classifier for partition columns and physical fields
-            _ => ScanTransformFieldClassifierieldClassifier.classify_field(
+            _ => ScanTransformFieldClassifier.classify_field(
                 field,
                 field_index,
                 partition_columns,
