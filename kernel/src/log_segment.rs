@@ -1,4 +1,4 @@
-//! Represents a segment of a delta log. [`LogSegment`] wraps a set of  checkpoint and commit
+//! Represents a segment of a delta log. [`LogSegment`] wraps a set of checkpoint and commit
 //! files.
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
@@ -41,7 +41,7 @@ mod tests;
 ///        version. Multi-part checkpoints must have all their parts.
 ///
 /// [`LogSegment`] is used in [`Snapshot`] when built with [`LogSegment::for_snapshot`], and
-/// and in `TableChanges` when built with [`LogSegment::for_table_changes`].
+/// in `TableChanges` when built with [`LogSegment::for_table_changes`].
 ///
 /// [`Snapshot`]: crate::snapshot::Snapshot
 #[derive(Debug, Clone, PartialEq, Eq)]
