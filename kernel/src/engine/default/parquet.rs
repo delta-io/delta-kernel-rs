@@ -252,8 +252,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         url: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
     ) -> DeltaResult<()> {
-        // Collect all ArrowEngineData batches first
-        let mut batches = Vec::new();
+        let mut batches = if let (_, Some(upper)) = data.size_hint() {
+            Vec::with_capacity(upper)
+        } else {
+            Vec::new()
+        };
+
         for filtered_batch in data {
             let filtered_batch = filtered_batch?;
             let (engine_data, _selection_vector) = filtered_batch.into_parts();
@@ -266,7 +270,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             return Ok(());
         }
 
-        let mut buffer = vec![];
+        let mut buffer = Vec::new();
 
         // Scope to ensure writer is dropped before we use buffer
         {
