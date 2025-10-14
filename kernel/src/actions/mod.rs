@@ -744,7 +744,7 @@ pub(crate) struct Add {
 
     /// Map containing metadata about this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub tags: Option<HashMap<String, String>>,
+    pub tags: Option<HashMap<String, Option<String>>>,
 
     /// Information about deletion vector (DV) associated with this add action
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -1111,7 +1111,7 @@ mod tests {
                 StructField::nullable("stats", DataType::STRING),
                 StructField::nullable(
                     "tags",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    MapType::new(DataType::STRING, DataType::STRING, true),
                 ),
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
