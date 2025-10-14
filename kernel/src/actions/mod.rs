@@ -706,7 +706,11 @@ impl IntoEngineData for CommitInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -2048,5 +2052,51 @@ mod tests {
     fn test_schema_contains_file_actions_empty_schema() {
         let schema = Arc::new(StructType::new_unchecked([]));
         assert!(!schema_contains_file_actions(&schema));
+    }
+
+    fn test_add_tags_deserialization() {
+        // Test different cases for the tags field:
+        // 1. tags field is null (entire field is None)
+        // 2. tags map contains nullable values (some keys map to null)
+        // 3. tags map contains non-null string values only
+
+        // Note about nullable values inside the tags map:
+        // The tags field type is Option<HashMap<String, Option<String>>>, which means:
+        // - The outer Option makes the entire field nullable (field can be absent or null)
+        // - The inner Option<String> makes individual map values nullable (value can be null)
+        // This preserves null values in the map, unlike #[allow_null_container_values]
+        // which would drop them during materialization.
+
+        // Case 1: tags field is null
+        let json1 = r#"{"path":"file1.parquet","partitionValues":{},"size":100,"modificationTime":1234567890,"dataChange":true,"tags":null}"#;
+        let add1: Add = serde_json::from_str(json1).unwrap();
+        assert_eq!(add1.tags, None);
+
+        // Case 2: tags map contains nullable values (some keys map to null)
+        let json2 = r#"{"path":"file2.parquet","partitionValues":{},"size":200,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","NULLABLE_TAG":null}}"#;
+        let add2: Add = serde_json::from_str(json2).unwrap();
+        assert!(add2.tags.is_some());
+        let tags = add2.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(tags.get("NULLABLE_TAG"), Some(&None));
+
+        // Case 3: tags map contains non-null string values only
+        let json3 = r#"{"path":"file3.parquet","partitionValues":{},"size":300,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000"}}"#;
+        let add3: Add = serde_json::from_str(json3).unwrap();
+        assert!(add3.tags.is_some());
+        let tags = add3.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(
+            tags.get("MIN_INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
     }
 }
