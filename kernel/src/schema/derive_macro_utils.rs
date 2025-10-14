@@ -66,6 +66,13 @@ impl<K: ToDataType, V: ToDataType> ToDataType for HashMap<K, V> {
     }
 }
 
+// ToDataType impl for maps with nullable values
+impl<K: ToDataType, V: ToDataType> ToDataType for HashMap<K, Option<V>> {
+    fn to_data_type() -> DataType {
+        MapType::new(K::to_data_type(), V::to_data_type(), true).into()
+    }
+}
+
 /// The [`delta_kernel_derive::ToSchema`] macro uses this to convert a struct field's name + type
 /// into a `StructField` definition. A blanket impl for `Option<T: ToDataType>` supports nullable
 /// struct fields, which otherwise default to non-nullable.
