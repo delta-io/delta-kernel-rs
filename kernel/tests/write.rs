@@ -1818,7 +1818,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that Remove actions generated from scan metadata contain all expected fields
-    // from the Remove struct (defined in kernel/src/actions/mod.rs:767-818).
+    // from the Remove struct (defined in kernel/src/actions/mod.rs).
     //
     // This test uses the table-with-dv-small dataset which contains files with tags and deletion vectors.
     //
@@ -1985,6 +1985,8 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 #[tokio::test]
 async fn test_remove_files_verify_files_excluded_from_scan(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Adds and then removes files and then verifies they don't appear in the scan.
+
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
