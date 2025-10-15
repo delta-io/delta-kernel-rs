@@ -264,7 +264,6 @@ impl Transaction {
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
         // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
-
         let commit_version = self.read_snapshot.version() + 1;
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
@@ -273,13 +272,18 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Chain all our actions to be handed off to the Committer
+        // Step 5: Generate remove actions
+        let remove_actions = self.generate_remove_actions(engine)?;
+
+        // Step 6: Commit the actions as a JSON file to the Delta log
+        let commit_path =
+            ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
+
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
-        let remove_actions = self.generate_remove_actions(engine)?;
 
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
@@ -817,10 +821,6 @@ impl Transaction {
             }))
     }
 }
-
-// Convert files_metadata (either add_files_metadata or remove_files_metadata) into add/remove file
-// actions using an expression to transform the data (in a single pass) from [`input_schema`] into
-// [`target_schema`].
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
 /// write table data.
