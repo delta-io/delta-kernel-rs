@@ -101,12 +101,13 @@ impl CommitRequest {
         table_id: impl Into<String>,
         table_uri: impl Into<String>,
         commit_info: Commit,
+        latest_backfilled_version: Option<i64>,
     ) -> Self {
         Self {
             table_id: table_id.into(),
             table_uri: table_uri.into(),
             commit_info: Some(commit_info),
-            latest_backfilled_version: None,
+            latest_backfilled_version,
             metadata: None,
             protocol: None,
         }

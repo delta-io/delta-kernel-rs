@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, Publisher};
+use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer};
 use delta_kernel::Error as DeltaError;
 use delta_kernel::{DeltaResult, Engine, FilteredEngineData, LogPath, Snapshot, Version};
 
@@ -59,7 +59,6 @@ impl<'a> UCCatalog<'a> {
             start_version: Some(0),
             end_version: version.and_then(|v| v.try_into().ok()),
         };
-        // TODO: does it paginate?
         let commits = self.client.get_commits(req).await?;
 
         // sort them
@@ -122,6 +121,7 @@ impl<'a> UCCatalog<'a> {
 
 /// A [UCCommitter] is a Unity Catalog [Committer] implementation for committing to a specific
 /// delta table in UC.
+#[derive(Debug, Clone)]
 pub struct UCCommitter {
     client: Arc<UCClient>,
     table_id: String,
@@ -162,7 +162,6 @@ impl Committer for UCCommitter {
             &filename,
         ]);
 
-        // commit info only
         engine
             .json_handler()
             .write_json_file(&commit_path, Box::new(actions), false)?;
@@ -191,6 +190,9 @@ impl Committer for UCCommitter {
                 committed.size as i64,
                 committed.last_modified,
             ),
+            commit_metadata
+                .latest_published_version
+                .map(|v| v.try_into().unwrap()), // FIXME
         );
         // FIXME
         let handle = tokio::runtime::Handle::current();
@@ -204,26 +206,6 @@ impl Committer for UCCommitter {
         })?;
         Ok(CommitResponse::Committed {
             version: commit_metadata.version,
-        })
-    }
-}
-
-impl Publisher for UCCommitter {
-    fn published(&self, version: Version) -> delta_kernel::DeltaResult<()> {
-        let version = version
-            .try_into()
-            .map_err(|e| delta_kernel::Error::Generic(format!("version conversion error: {e}")))?;
-        let request = CommitRequest::ack_publish(&self.table_id, &self.table_uri, version);
-        let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(move || {
-            handle.block_on(async move {
-                match self.client.commit(request).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(delta_kernel::Error::Generic(format!(
-                        "publish_commit failed: {e}"
-                    ))),
-                }
-            })
         })
     }
 }
@@ -378,9 +360,8 @@ mod tests {
                 let snapshot = catalog
                     .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
                     .await?;
-                let _published = Arc::into_inner(snapshot)
-                    .unwrap()
-                    .publish(&engine, committer.as_ref())?;
+                let published = Arc::into_inner(snapshot).unwrap().publish(&engine)?;
+                println!("published snapshot: {published:?}");
             }
             CommitResult::ConflictedTransaction(t) => {
                 println!("💥 commit conflicted at version {}", t.conflict_version());

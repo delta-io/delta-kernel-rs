@@ -10,14 +10,21 @@ pub struct CommitMetadata {
     pub commit_path: ParsedLogPath<Url>,
     pub version: Version,
     pub timestamp: i64,
+    pub latest_published_version: Option<Version>,
 }
 
 impl CommitMetadata {
-    pub(crate) fn new(commit_path: ParsedLogPath<Url>, version: Version, timestamp: i64) -> Self {
+    pub(crate) fn new(
+        commit_path: ParsedLogPath<Url>,
+        version: Version,
+        timestamp: i64,
+        latest_published_version: Option<Version>,
+    ) -> Self {
         Self {
             commit_path,
             version,
             timestamp,
+            latest_published_version,
         }
     }
 }
@@ -36,12 +43,6 @@ pub trait Committer: Send + Sync {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
-}
-
-pub trait Publisher: Send + Sync {
-    fn published(&self, _version: Version) -> DeltaResult<()> {
-        Ok(())
-    }
 }
 
 pub(crate) struct FileSystemCommitter;

@@ -61,6 +61,8 @@ pub(crate) struct LogSegment {
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
     pub latest_commit_file: Option<ParsedLogPath>,
+    /// The latest published commit version. If there are no published commits, this is None.
+    pub latest_published_version: Option<Version>,
 }
 
 impl LogSegment {
@@ -123,6 +125,15 @@ impl LogSegment {
             );
         }
 
+        // FIXME: this 'misses' published commits that currently overlap with log_tail (staged
+        // commits)
+        // get the latest published version from the commit files
+        let latest_published_version = ascending_commit_files
+            .partition_point(|c| matches!(c.file_type, LogPathFileType::Commit))
+            .checked_sub(1)
+            .and_then(|idx| ascending_commit_files.get(idx))
+            .map(|c| c.version);
+
         Ok(LogSegment {
             end_version: effective_version,
             checkpoint_version,
@@ -132,6 +143,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            latest_published_version,
         })
     }
 

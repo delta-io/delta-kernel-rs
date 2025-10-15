@@ -2336,3 +2336,9 @@ fn test_publish_validation() {
         panic!("Expected Error::Generic");
     }
 }
+
+fn test_log_segment_latest_published_version() {
+    // log segment with commits commits 0,1,2,3, / staged 4,5 -> expect 3
+    // log segment with commits commits 0,1,2 -> expect 2
+    // log segment with staged commits 2, 3 -> expect None
+}

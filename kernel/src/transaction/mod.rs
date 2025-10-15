@@ -268,8 +268,12 @@ impl Transaction {
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
-        let commit_metadata =
-            CommitMetadata::new(commit_path, commit_version, self.commit_timestamp);
+        let commit_metadata = CommitMetadata::new(
+            commit_path,
+            commit_version,
+            self.commit_timestamp,
+            self.read_snapshot.log_segment().latest_published_version,
+        );
         match committer.commit(engine, Box::new(filtered_actions), commit_metadata) {
             Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
                 self.into_committed(version),
