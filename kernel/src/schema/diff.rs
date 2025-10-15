@@ -395,6 +395,61 @@ fn physical_name(field: &StructField) -> Option<&str> {
     }
 }
 
+/// Recursively collects all struct fields from a data type with their paths
+///
+/// This helper function handles deep nesting like `array<array<struct<...>>>` or
+/// `map<array<struct<...>>, array<struct<...>>>` by recursing through container layers.
+fn collect_fields_from_datatype(
+    data_type: &DataType,
+    parent_path: &ColumnName,
+) -> Result<Vec<FieldWithPath>, SchemaDiffError> {
+    let mut fields = Vec::new();
+
+    match data_type {
+        DataType::Struct(struct_type) => {
+            // Collect fields from this struct
+            fields.extend(collect_all_fields_with_paths(struct_type, parent_path)?);
+        }
+        DataType::Array(array_type) => {
+            // TODO: Add IcebergCompatV2 support - check that array nested field IDs remain stable
+            // For IcebergCompatV2, arrays should have a field ID on the array itself and nested
+            // field IDs must not be added or removed (they must stay the same across versions).
+            // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
+
+            // For arrays, we use "element" as the path segment and recurse into element type
+            let element_path = parent_path.join(&ColumnName::new(["element"]));
+            fields.extend(collect_fields_from_datatype(
+                array_type.element_type(),
+                &element_path,
+            )?);
+        }
+        DataType::Map(map_type) => {
+            // TODO: Add IcebergCompatV2 support - check that map nested field IDs remain stable
+            // For IcebergCompatV2, maps should have field IDs on key/value and nested field IDs
+            // must not be added or removed (they must stay the same across versions).
+            // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
+
+            // For maps, we use "key" and "value" as path segments and recurse into both types
+            let key_path = parent_path.join(&ColumnName::new(["key"]));
+            fields.extend(collect_fields_from_datatype(
+                map_type.key_type(),
+                &key_path,
+            )?);
+
+            let value_path = parent_path.join(&ColumnName::new(["value"]));
+            fields.extend(collect_fields_from_datatype(
+                map_type.value_type(),
+                &value_path,
+            )?);
+        }
+        _ => {
+            // Primitive types don't have nested fields
+        }
+    }
+
+    Ok(fields)
+}
+
 /// Recursively collects all struct fields with their paths from a schema
 fn collect_all_fields_with_paths(
     schema: &StructType,
@@ -414,48 +469,11 @@ fn collect_all_fields_with_paths(
             field_id,
         });
 
-        // Recursively collect nested struct fields
-        match field.data_type() {
-            DataType::Struct(nested_struct) => {
-                let nested_fields = collect_all_fields_with_paths(nested_struct, &field_path)?;
-                fields.extend(nested_fields);
-            }
-            DataType::Array(array_type) => {
-                // TODO: Add IcebergCompatV2 support - check that array nested field IDs remain stable
-                // For IcebergCompatV2, arrays should have a field ID on the array itself and nested
-                // field IDs must not be added or removed (they must stay the same across versions).
-                // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
-                if let DataType::Struct(element_struct) = array_type.element_type() {
-                    // For arrays of structs, we use "element" as the path segment
-                    let element_path = field_path.join(&ColumnName::new(["element"]));
-                    let nested_fields =
-                        collect_all_fields_with_paths(element_struct, &element_path)?;
-                    fields.extend(nested_fields);
-                }
-            }
-            DataType::Map(map_type) => {
-                // TODO: Add IcebergCompatV2 support - check that map nested field IDs remain stable
-                // For IcebergCompatV2, maps should have field IDs on key/value and nested field IDs
-                // must not be added or removed (they must stay the same across versions).
-                // See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#writer-requirements-for-icebergcompatv2
-
-                // Handle map key structs
-                if let DataType::Struct(key_struct) = map_type.key_type() {
-                    let key_path = field_path.join(&ColumnName::new(["key"]));
-                    let key_fields = collect_all_fields_with_paths(key_struct, &key_path)?;
-                    fields.extend(key_fields);
-                }
-                // Handle map value structs
-                if let DataType::Struct(value_struct) = map_type.value_type() {
-                    let value_path = field_path.join(&ColumnName::new(["value"]));
-                    let value_fields = collect_all_fields_with_paths(value_struct, &value_path)?;
-                    fields.extend(value_fields);
-                }
-            }
-            _ => {
-                // Primitive types don't have nested fields
-            }
-        }
+        // Recursively collect nested struct fields from the field's data type
+        fields.extend(collect_fields_from_datatype(
+            field.data_type(),
+            &field_path,
+        )?);
     }
 
     Ok(fields)
