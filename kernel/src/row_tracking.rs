@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn test_visit_wrong_getter_count() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(0), None);
-        let wrong_getters: Vec<&dyn GetData<'_>> = vec![]; // Only one getter instead of expected count
+        let wrong_getters: Vec<&dyn GetData<'_>> = vec![]; // No getters instead of expected count
 
         let result = visitor.visit(1, &wrong_getters);
         assert_result_error_with_message(result, "Wrong number of RowTrackingVisitor getters");

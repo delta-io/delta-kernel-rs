@@ -780,10 +780,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot
-        .transaction()?
-        .with_engine_info("default engine")
-        .with_data_change(true);
+    let mut txn = snapshot.transaction()?.with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -834,6 +831,14 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check that the add action exists
     assert!(parsed_commits[1].get("add").is_some());
+    // Ensure default of data change is true.
+    assert!(parsed_commits[1]
+        .get("add")
+        .unwrap()
+        .get("dataChange")
+        .unwrap()
+        .as_bool()
+        .unwrap());
 
     // Verify the data can be read back correctly
     test_read(&ArrowEngineData::new(data), &table_url, engine)?;
