@@ -570,6 +570,23 @@ fn compute_field_update(
     }))
 }
 
+/// Checks for container nullability changes.
+///
+/// Returns:
+/// - `Some(FieldChangeType::ContainerNullabilityLoosened)` if nullability was relaxed (false -> true)
+/// - `Some(FieldChangeType::ContainerNullabilityTightened)` if nullability was restricted (true -> false)
+/// - `None` if nullability didn't change
+fn check_container_nullability_change(
+    before_nullable: bool,
+    after_nullable: bool,
+) -> Option<FieldChangeType> {
+    match (before_nullable, after_nullable) {
+        (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
+        (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
+        (true, true) | (false, false) => None,
+    }
+}
+
 /// Classifies a type change between two data types.
 ///
 /// Returns:
@@ -602,12 +619,10 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
                 };
 
             // Check container nullability change
-            let nullability_change =
-                match (before_array.contains_null(), after_array.contains_null()) {
-                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
-                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
-                    (true, true) | (false, false) => None,
-                };
+            let nullability_change = check_container_nullability_change(
+                before_array.contains_null(),
+                after_array.contains_null(),
+            );
 
             // Combine both changes if present
             match (element_type_change, nullability_change) {
@@ -636,14 +651,10 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
             };
 
             // Check container nullability change
-            let nullability_change = match (
+            let nullability_change = check_container_nullability_change(
                 before_map.value_contains_null(),
                 after_map.value_contains_null(),
-            ) {
-                (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
-                (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
-                (true, true) | (false, false) => None,
-            };
+            );
 
             // Combine all changes if present
             let mut changes = Vec::new();
