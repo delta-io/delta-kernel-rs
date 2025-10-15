@@ -781,6 +781,8 @@ mod tests {
         .compute_diff()
         .unwrap();
         assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["name"]));
         assert_eq!(diff.added_fields[0].field.name(), "name");
         assert!(diff.has_breaking_changes()); // Adding non-nullable field is breaking
@@ -804,6 +806,8 @@ mod tests {
         .compute_diff()
         .unwrap();
         assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
         assert!(diff.has_breaking_changes());
     }
 
@@ -825,6 +829,8 @@ mod tests {
         .compute_diff()
         .unwrap();
         assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
         assert!(!diff.has_breaking_changes()); // Not breaking
     }
 
@@ -915,6 +921,8 @@ mod tests {
         }
         .compute_diff()
         .unwrap();
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
         assert!(!diff.has_breaking_changes()); // Rename is not breaking
@@ -1006,7 +1014,7 @@ mod tests {
         // Should see the nested field changes but NOT a type change on the parent struct
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.added_fields[0].path, ColumnName::new(["user", "age"]));
-
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
@@ -1056,6 +1064,8 @@ mod tests {
         .unwrap();
 
         // This IS a real type change from primitive to struct
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["data"]));
         assert_eq!(
@@ -1112,6 +1122,8 @@ mod tests {
         .unwrap();
 
         // Should only see the nested field rename, not a change to the array container
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
@@ -1218,6 +1230,8 @@ mod tests {
         }
         .compute_diff()
         .unwrap();
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
@@ -1254,6 +1268,8 @@ mod tests {
         .compute_diff()
         .unwrap();
         assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 0);
 
         let added = &diff.added_fields[0];
         assert_eq!(added.path, ColumnName::new(["user", "age"]));
@@ -1298,22 +1314,23 @@ mod tests {
         .compute_diff()
         .unwrap();
 
-        // Check added field
         assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        // Check added field
         assert_eq!(
             diff.added_fields[0].path,
             ColumnName::new(["items", "element", "added_field"])
         );
 
         // Check removed field
-        assert_eq!(diff.removed_fields.len(), 1);
         assert_eq!(
             diff.removed_fields[0].path,
             ColumnName::new(["items", "element", "removed_field"])
         );
 
         // Check updated field (rename)
-        assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
@@ -1353,6 +1370,8 @@ mod tests {
 
         // The entire field should be reported as TypeChanged since we can't recurse into
         // non-struct array elements (no field IDs at intermediate levels)
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
         assert_eq!(
@@ -1402,22 +1421,23 @@ mod tests {
         .compute_diff()
         .unwrap();
 
-        // Check added field
         assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        // Check added field
         assert_eq!(
             diff.added_fields[0].path,
             ColumnName::new(["lookup", "value", "added_field"])
         );
 
         // Check removed field
-        assert_eq!(diff.removed_fields.len(), 1);
         assert_eq!(
             diff.removed_fields[0].path,
             ColumnName::new(["lookup", "value", "removed_field"])
         );
 
         // Check updated field (rename)
-        assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["lookup", "value", "count"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
@@ -1468,6 +1488,8 @@ mod tests {
         }
         .compute_diff()
         .unwrap();
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
 
         let update = &diff.updated_fields[0];
@@ -1642,6 +1664,8 @@ mod tests {
         .compute_diff()
         .unwrap();
 
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
 
@@ -1686,6 +1710,8 @@ mod tests {
         .compute_diff()
         .unwrap();
 
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
 
@@ -1754,6 +1780,8 @@ mod tests {
         .compute_diff()
         .unwrap();
 
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].change_type,
@@ -1785,6 +1813,8 @@ mod tests {
         .compute_diff()
         .unwrap();
 
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].change_type,
@@ -1824,6 +1854,8 @@ mod tests {
         .compute_diff()
         .unwrap();
 
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].change_type,
@@ -1863,6 +1895,8 @@ mod tests {
         .compute_diff()
         .unwrap();
 
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].change_type,
@@ -1916,6 +1950,8 @@ mod tests {
         .unwrap();
 
         // Should see the nested key field renamed
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
             diff.updated_fields[0].path,
@@ -1990,18 +2026,18 @@ mod tests {
 
         // Verify deeply nested changes are detected
         assert_eq!(diff1.added_fields.len(), 1);
+        assert_eq!(diff1.removed_fields.len(), 1);
+        assert_eq!(diff1.updated_fields.len(), 1);
+
         assert_eq!(
             diff1.added_fields[0].path,
             ColumnName::new(["data", "items", "element", "inner", "added"])
         );
 
-        assert_eq!(diff1.removed_fields.len(), 1);
         assert_eq!(
             diff1.removed_fields[0].path,
             ColumnName::new(["data", "items", "element", "inner", "removed"])
         );
-
-        assert_eq!(diff1.updated_fields.len(), 1);
         assert_eq!(
             diff1.updated_fields[0].path,
             ColumnName::new(["data", "items", "element", "inner", "renamed_a"])
@@ -2072,6 +2108,8 @@ mod tests {
         .compute_diff()
         .unwrap();
 
+        assert_eq!(diff2.added_fields.len(), 0);
+        assert_eq!(diff2.removed_fields.len(), 0);
         assert_eq!(diff2.updated_fields.len(), 1);
         assert_eq!(
             diff2.updated_fields[0].path,
