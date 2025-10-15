@@ -556,27 +556,18 @@ fn compute_field_update(
         changes.push(FieldChangeType::MetadataChanged);
     }
 
-    match changes.len() {
-        0 => Ok(None),
-        1 => {
-            let change_type = changes
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| unreachable!("vec with len 1 should have exactly one element"));
-            Ok(Some(FieldUpdate {
-                before: before.field.clone(),
-                after: after.field.clone(),
-                path: after.path.clone(), // Use the new path in case of renames
-                change_type,
-            }))
-        }
-        _ => Ok(Some(FieldUpdate {
-            before: before.field.clone(),
-            after: after.field.clone(),
-            path: after.path.clone(), // Use the new path in case of renames
-            change_type: FieldChangeType::Multiple(changes),
-        })),
-    }
+    let change_type = match changes.as_slice() {
+        [] => return Ok(None),
+        [single] => single.clone(),
+        _ => FieldChangeType::Multiple(changes),
+    };
+
+    Ok(Some(FieldUpdate {
+        before: before.field.clone(),
+        after: after.field.clone(),
+        path: after.path.clone(), // Use the new path in case of renames
+        change_type,
+    }))
 }
 
 /// Classifies a type change between two data types.
