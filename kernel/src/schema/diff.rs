@@ -543,7 +543,7 @@ fn compute_field_update(
     // Check for type change (including container changes)
     if before.field.data_type() != after.field.data_type() {
         if let Some(change_type) =
-            classify_type_change(before.field.data_type(), after.field.data_type())
+            classify_data_type_change(before.field.data_type(), after.field.data_type())
         {
             changes.push(change_type);
         }
@@ -584,7 +584,7 @@ fn compute_field_update(
 ///    - Otherwise, it's a type change
 /// 3. **Map containers**: Similar logic to arrays, but for both key and value types
 /// 4. **Different container types or primitives**: Type change
-fn classify_type_change(before: &DataType, after: &DataType) -> Option<FieldChangeType> {
+fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<FieldChangeType> {
     match (before, after) {
         // Struct-to-struct: nested field changes are handled separately via field IDs
         (DataType::Struct(_), DataType::Struct(_)) => None,
