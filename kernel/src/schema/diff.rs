@@ -1079,6 +1079,7 @@ mod tests {
             diff.added_fields[0].path,
             ColumnName::new(["data", "nested"])
         );
+        assert!(diff.has_breaking_changes());
     }
 
     #[test]
