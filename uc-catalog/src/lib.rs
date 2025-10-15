@@ -1,0 +1,384 @@
+//! UCCatalog implements a high-level interface for interacting with Delta Tables in Unity Catalog.
+
+use std::sync::Arc;
+
+use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer};
+use delta_kernel::Error as DeltaError;
+use delta_kernel::{DeltaResult, Engine, FilteredEngineData, LogPath, Snapshot, Version};
+
+use uc_client::models::{Commit, CommitRequest};
+use uc_client::prelude::*;
+
+use itertools::Itertools;
+use tracing::info;
+use url::Url;
+
+/// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
+/// Catalog.
+pub struct UCCatalog<'a> {
+    client: &'a UCClient,
+}
+
+impl<'a> UCCatalog<'a> {
+    pub fn new(client: &'a UCClient) -> Self {
+        UCCatalog { client }
+    }
+
+    pub async fn load_snapshot(
+        &self,
+        table_id: &str,
+        table_uri: &str,
+        engine: &dyn Engine,
+    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+        self.load_snapshot_inner(table_id, table_uri, None, engine)
+            .await
+    }
+
+    pub async fn load_snapshot_at(
+        &self,
+        table_id: &str,
+        table_uri: &str,
+        version: Version,
+        engine: &dyn Engine,
+    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+        self.load_snapshot_inner(table_id, table_uri, Some(version), engine)
+            .await
+    }
+
+    pub(crate) async fn load_snapshot_inner(
+        &self,
+        table_id: &str,
+        table_uri: &str,
+        version: Option<Version>,
+        engine: &dyn Engine,
+    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+        let table_uri = table_uri.to_string();
+        let req = CommitsRequest {
+            table_id: table_id.to_string(),
+            table_uri: table_uri.clone(),
+            start_version: Some(0),
+            end_version: version.and_then(|v| v.try_into().ok()),
+        };
+        let commits = self.client.get_commits(req).await?;
+
+        // sort them
+        let mut commits = commits;
+        if let Some(c) = commits.commits.as_mut() {
+            c.sort_by_key(|c| c.version)
+        }
+
+        // if commits are present, we ensure they are sorted+contiguous
+        if let Some(commits) = &commits.commits {
+            if !commits.windows(2).all(|w| w[1].version == w[0].version + 1) {
+                return Err("Received non-contiguous commit versions".into());
+            }
+        }
+
+        // we always get back the latest version from commits response, and pass that in to
+        // kernel's Snapshot builder. basically, load_table for the latest version always looks
+        // like a time travel query since we know the latest version ahead of time.
+        //
+        // note there is a weird edge case: if the table was just created it will return
+        // latest_table_version = -1, but the 0.json will exist in the _delta_log.
+        let version: Version = match version {
+            Some(v) => v,
+            None => match commits.latest_table_version {
+                -1 => 0,
+                i => i.try_into()?,
+            },
+        };
+
+        // consume uc-client's Commit and hand back a delta_kernel LogPath
+        let mut table_url = Url::parse(&table_uri)?;
+        if !table_url.path().ends_with('/') {
+            let path = format!("{}/", table_url.path());
+            table_url.set_path(&path);
+        }
+        let commits: Vec<_> = commits
+            .commits
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| -> Result<LogPath, Box<dyn std::error::Error>> {
+                LogPath::staged_commit(
+                    table_url.clone(),
+                    &c.file_name,
+                    c.file_modification_timestamp,
+                    c.file_size.try_into()?,
+                )
+                .map_err(|e| e.into())
+            })
+            .try_collect()?;
+
+        info!("commits for kernel: {:?}\n", commits);
+
+        Snapshot::builder_for(Url::parse(&(table_uri + "/"))?)
+            .at_version(version)
+            .with_log_tail(commits)
+            .build(engine)
+            .map_err(|e| e.into())
+    }
+}
+
+/// A [UCCommitter] is a Unity Catalog [Committer] implementation for committing to a specific
+/// delta table in UC.
+#[derive(Debug, Clone)]
+pub struct UCCommitter {
+    client: Arc<UCClient>,
+    table_id: String,
+    table_uri: String,
+}
+
+impl UCCommitter {
+    pub fn new(
+        client: Arc<UCClient>,
+        table_id: impl Into<String>,
+        table_uri: impl Into<String>,
+    ) -> Self {
+        UCCommitter {
+            client,
+            table_id: table_id.into(),
+            table_uri: table_uri.into(),
+        }
+    }
+}
+
+impl Committer for UCCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let uuid = uuid::Uuid::new_v4();
+        let filename = format!(
+            "{version:020}.{uuid}.json",
+            version = commit_metadata.version
+        );
+        // FIXME use table path from commit_metadata?
+        let mut commit_path = Url::parse(&self.table_uri)?;
+        commit_path.path_segments_mut().unwrap().extend(&[
+            "_delta_log",
+            "_staged_commits",
+            &filename,
+        ]);
+
+        engine
+            .json_handler()
+            .write_json_file(&commit_path, Box::new(actions), false)?;
+
+        let mut other = Url::parse(&self.table_uri)?;
+        other.path_segments_mut().unwrap().extend(&[
+            "_delta_log",
+            "_staged_commits",
+            &format!("{:020}", commit_metadata.version),
+        ]);
+        let committed = engine
+            .storage_handler()
+            .list_from(&other)?
+            .next()
+            .unwrap()
+            .unwrap();
+        println!("wrote commit file: {:?}", committed);
+
+        let commit_req = CommitRequest::new(
+            self.table_id.clone(),
+            self.table_uri.clone(),
+            Commit::new(
+                commit_metadata.version.try_into().unwrap(),
+                commit_metadata.timestamp,
+                filename,
+                committed.size as i64,
+                committed.last_modified,
+            ),
+            commit_metadata
+                .latest_published_version
+                .map(|v| v.try_into().unwrap()), // FIXME
+        );
+        // FIXME
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                self.client
+                    .commit(commit_req)
+                    .await
+                    .map_err(|e| DeltaError::Generic(format!("UC commit error: {e}")))
+            })
+        })?;
+        Ok(CommitResponse::Committed {
+            version: commit_metadata.version,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::transaction::CommitResult;
+    use object_store::ObjectStore;
+
+    use super::*;
+
+    // We could just re-export UCClient's get_table to not require consumers to directly import
+    // uc_client themselves.
+    async fn get_table(
+        client: &UCClient,
+        table_name: &str,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        let res = client.get_table(table_name).await?;
+        let table_id = res.table_id;
+        let table_uri = res.storage_location;
+
+        info!(
+            "[GET TABLE] got table_id: {}, table_uri: {}\n",
+            table_id, table_uri
+        );
+
+        Ok((table_id, table_uri))
+    }
+
+    // ignored test which you can run manually to play around with reading a UC table. run with:
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t read_uc_table --nocapture -- --ignored`
+    #[ignore]
+    #[tokio::test]
+    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
+        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
+        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
+
+        // build UC client, get table info and credentials
+        let client = UCClient::builder(endpoint, &token).build()?;
+        let (table_id, table_uri) = get_table(&client, &table_name).await?;
+        let creds = client
+            .get_credentials(&table_id, Operation::Read)
+            .await
+            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+
+        // build catalog
+        let catalog = UCCatalog::new(&client);
+
+        // TODO: support non-AWS
+        let creds = creds
+            .aws_temp_credentials
+            .ok_or("No AWS temporary credentials found")?;
+
+        let options = [
+            ("region", "us-west-2"),
+            ("access_key_id", &creds.access_key_id),
+            ("secret_access_key", &creds.secret_access_key),
+            ("session_token", &creds.session_token),
+        ];
+
+        let table_url = Url::parse(&table_uri)?;
+        let (store, path) = object_store::parse_url_opts(&table_url, options)?;
+        let store: Arc<_> = store.into();
+
+        info!("created object store: {:?}\npath: {:?}\n", store, path);
+
+        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        // read table
+        let snapshot = catalog
+            .load_snapshot(&table_id, &table_uri, &engine)
+            .await?;
+        // or time travel
+        // let snapshot = catalog.load_snapshot_at(&table, 2).await?;
+
+        println!("🎉 loaded snapshot: {snapshot:?}");
+
+        Ok(())
+    }
+
+    // ignored test which you can run manually to play around with writing to a UC table. run with:
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
+        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
+        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
+
+        // build UC client, get table info and credentials
+        let client = Arc::new(UCClient::builder(endpoint, &token).build()?);
+        let (table_id, table_uri) = get_table(&client, &table_name).await?;
+        let creds = client
+            .get_credentials(&table_id, Operation::ReadWrite)
+            .await
+            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+
+        // build catalog
+        let catalog = UCCatalog::new(&client);
+
+        // TODO: support non-AWS
+        let creds = creds
+            .aws_temp_credentials
+            .ok_or("No AWS temporary credentials found")?;
+
+        let options = [
+            ("region", "us-west-2"),
+            ("access_key_id", &creds.access_key_id),
+            ("secret_access_key", &creds.secret_access_key),
+            ("session_token", &creds.session_token),
+        ];
+
+        let table_url = Url::parse(&table_uri)?;
+        let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
+        let store: Arc<dyn ObjectStore> = store.into();
+
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let committer = Arc::new(UCCommitter::new(
+            client.clone(),
+            table_id.clone(),
+            table_uri.clone(),
+        ));
+        let snapshot = catalog
+            .load_snapshot(&table_id, &table_uri, &engine)
+            .await?;
+        println!("latest snapshot version: {:?}", snapshot.version());
+        let txn = snapshot
+            .clone()
+            .transaction()?
+            .with_committer(committer.clone() as Arc<dyn Committer>);
+        let _write_context = txn.get_write_context();
+        // do a write.
+
+        // print the log
+        // use futures::stream::StreamExt;
+        // let mut stream = store.list(Some(&path));
+        // while let Some(path) = stream.next().await {
+        //     println!("object: {:?}", path.unwrap());
+        // }
+
+        match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(t) => {
+                println!("🎉 committed version {}", t.commit_version());
+                // FIXME! ideally should use post-commit snapshot (need to make sure to plumb
+                // through log tail)
+                // let snapshot = t.unwrap().post_commit_snapshot(&engine)?;
+                let snapshot = catalog
+                    .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
+                    .await?;
+                let published = Arc::into_inner(snapshot).unwrap().publish(&engine)?;
+                println!("published snapshot: {published:?}");
+            }
+            CommitResult::ConflictedTransaction(t) => {
+                println!("💥 commit conflicted at version {}", t.conflict_version());
+            }
+            CommitResult::RetryableTransaction(_) => {
+                println!("we should retry...");
+            }
+        }
+
+        // some debug
+        // let commit = store
+        //     .get(&object_store::path::Path::from("19a85dee-54bc-43a2-87ab-023d0ec16013/tables/3553b6b9-91ce-47d7-b2f9-8eb4ba5e93f5/_delta_log/_staged_commits/00000000000000000001.5cabaf8b-037d-4a84-b493-2e3d8ab899df.json"))
+        //     .await
+        //     .unwrap();
+        // let bytes = commit.bytes().await?;
+        // println!("commit file contents:\n{}", String::from_utf8_lossy(&bytes));
+
+        Ok(())
+    }
+}

@@ -61,6 +61,8 @@ pub(crate) struct LogSegment {
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
     pub latest_commit_file: Option<ParsedLogPath>,
+    /// The latest published commit version. If there are no published commits, this is None.
+    pub latest_published_version: Option<Version>,
 }
 
 impl LogSegment {
@@ -123,6 +125,15 @@ impl LogSegment {
             );
         }
 
+        // FIXME: this 'misses' published commits that currently overlap with log_tail (staged
+        // commits)
+        // get the latest published version from the commit files
+        let latest_published_version = ascending_commit_files
+            .partition_point(|c| matches!(c.file_type, LogPathFileType::Commit))
+            .checked_sub(1)
+            .and_then(|idx| ascending_commit_files.get(idx))
+            .map(|c| c.version);
+
         Ok(LogSegment {
             end_version: effective_version,
             checkpoint_version,
@@ -132,6 +143,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            latest_published_version,
         })
     }
 
@@ -587,5 +599,34 @@ impl LogSegment {
             Error::generic("Found staged commit file in log segment")
         );
         Ok(())
+    }
+
+    // TODO: decide on API:
+    // 1. should this mutate? should it consume self and hand back a new one?
+    // 2. should we take finer-grained args like which version to publish up to?
+    pub(crate) fn publish(mut self, engine: &dyn Engine) -> DeltaResult<Self> {
+        let storage = engine.storage_handler();
+
+        // Transform staged commits into published commits
+        for i in 0..self.ascending_commit_files.len() {
+            if matches!(
+                self.ascending_commit_files[i].file_type,
+                LogPathFileType::StagedCommit
+            ) {
+                // Clone the staged commit to get source location before transforming
+                let source_location = self.ascending_commit_files[i].location.location.clone();
+
+                // Take ownership of the commit to transform it
+                let staged_commit = self.ascending_commit_files.remove(i);
+                let published_commit = staged_commit.into_published()?;
+
+                // Copy the actual file from staged to published location
+                storage.copy(&source_location, &published_commit.location.location)?;
+
+                // Insert the published commit back
+                self.ascending_commit_files.insert(i, published_commit);
+            }
+        }
+        Ok(self)
     }
 }

@@ -70,6 +70,12 @@ impl StorageHandler for SyncStorageHandler {
         });
         Ok(Box::new(iter))
     }
+
+    fn copy(&self, _from: &Url, _to: &Url) -> DeltaResult<()> {
+        Err(Error::unsupported(
+            "Copy not yet implemented for SyncStorageHandler",
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -102,6 +102,11 @@ pub mod table_properties;
 pub mod transaction;
 pub(crate) mod transforms;
 
+#[cfg(not(feature = "catalog-managed"))]
+mod committer;
+#[cfg(feature = "catalog-managed")]
+pub mod committer;
+
 pub use log_path::LogPath;
 
 mod row_tracking;
@@ -181,6 +186,10 @@ pub type FileDataReadResult = (FileMeta, Box<dyn EngineData>);
 /// An iterator of data read from specified files
 pub type FileDataReadResultIterator =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>;
+
+/// Type alias for an iterator of [`EngineData`] results.
+pub type EngineDataResultIterator<'a> =
+    Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The metadata that describes an object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,6 +542,9 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    /// Performs a copy. Must not overwrite.
+    fn copy(&self, from: &Url, to: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
