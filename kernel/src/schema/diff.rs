@@ -319,7 +319,8 @@ fn is_breaking_change_type(change_type: &FieldChangeType) -> bool {
     match change_type {
         FieldChangeType::TypeChanged
         | FieldChangeType::NullabilityTightened
-        | FieldChangeType::ContainerNullabilityTightened => true,
+        | FieldChangeType::ContainerNullabilityTightened
+        | FieldChangeType::MetadataChanged => true,
         FieldChangeType::Multiple(multiple_changes) => {
             multiple_changes.iter().any(is_breaking_change_type)
         }
@@ -1657,8 +1658,8 @@ mod tests {
             ),
         }
 
-        // Not breaking since nullability was loosened (not tightened)
-        assert!(!diff.has_breaking_changes());
+        // Breaking because metadata changed (metadata changes can be unsafe, e.g., row tracking)
+        assert!(diff.has_breaking_changes());
     }
 
     #[test]
