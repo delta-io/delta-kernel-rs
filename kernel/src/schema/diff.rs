@@ -2293,5 +2293,257 @@ mod tests {
         );
 
         assert!(!diff2.has_breaking_changes()); // Just a rename
+
+        // Case 3: array<array<struct<x int>>> - doubly nested array with struct
+        let before3 = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "x",
+                        DataType::INTEGER,
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after3 = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_x", DataType::INTEGER, false, 2), // Renamed!
+                        create_field_with_id("y", DataType::INTEGER, true, 3),          // Added!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff3 = SchemaDiffArgs {
+            before: &before3,
+            after: &after3,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff3.added_fields.len(), 1);
+        assert_eq!(diff3.removed_fields.len(), 0);
+        assert_eq!(diff3.updated_fields.len(), 1);
+        assert_eq!(
+            diff3.added_fields[0].path,
+            ColumnName::new(["matrix", "element", "element", "y"])
+        );
+        assert_eq!(
+            diff3.updated_fields[0].path,
+            ColumnName::new(["matrix", "element", "element", "renamed_x"])
+        );
+        assert_eq!(
+            diff3.updated_fields[0].change_type,
+            FieldChangeType::Renamed
+        );
+        assert!(!diff3.has_breaking_changes()); // Rename and added nullable field
+
+        // Case 4: map<array<struct<a int>>, array<struct<b int>>> - map with arrays of structs
+        let before4 = StructType::new_unchecked([create_field_with_id(
+            "complex_map",
+            DataType::Map(Box::new(MapType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "key_field",
+                        DataType::INTEGER,
+                        false,
+                        2,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "value_field",
+                        DataType::STRING,
+                        false,
+                        3,
+                    )])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after4 = StructType::new_unchecked([create_field_with_id(
+            "complex_map",
+            DataType::Map(Box::new(MapType::new(
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_key_field", DataType::INTEGER, false, 2), // Renamed!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                DataType::Array(Box::new(ArrayType::new(
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_value_field", DataType::STRING, false, 3), // Renamed!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff4 = SchemaDiffArgs {
+            before: &before4,
+            after: &after4,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff4.added_fields.len(), 0);
+        assert_eq!(diff4.removed_fields.len(), 0);
+        assert_eq!(diff4.updated_fields.len(), 2);
+
+        let paths: HashSet<ColumnName> = diff4
+            .updated_fields
+            .iter()
+            .map(|u| u.path.clone())
+            .collect();
+        assert!(paths.contains(&ColumnName::new([
+            "complex_map",
+            "key",
+            "element",
+            "renamed_key_field"
+        ])));
+        assert!(paths.contains(&ColumnName::new([
+            "complex_map",
+            "value",
+            "element",
+            "renamed_value_field"
+        ])));
+        assert!(!diff4.has_breaking_changes()); // Just renames
+
+        // Case 5: map<struct<id int>, map<struct<key int>, struct<data string>>> - map with nested map and structs
+        let before5 = StructType::new_unchecked([create_field_with_id(
+            "nested_maps",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "outer_key",
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::Map(Box::new(MapType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "inner_key",
+                        DataType::INTEGER,
+                        false,
+                        3,
+                    )])
+                    .unwrap(),
+                    DataType::try_struct_type([
+                        create_field_with_id("data", DataType::STRING, false, 4),
+                        create_field_with_id("removed", DataType::INTEGER, true, 5),
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after5 = StructType::new_unchecked([create_field_with_id(
+            "nested_maps",
+            DataType::Map(Box::new(MapType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "renamed_outer_key", // Renamed!
+                    DataType::INTEGER,
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                DataType::Map(Box::new(MapType::new(
+                    DataType::try_struct_type([create_field_with_id(
+                        "renamed_inner_key", // Renamed!
+                        DataType::INTEGER,
+                        false,
+                        3,
+                    )])
+                    .unwrap(),
+                    DataType::try_struct_type([
+                        create_field_with_id("renamed_data", DataType::STRING, false, 4), // Renamed!
+                        create_field_with_id("added", DataType::LONG, true, 6),           // Added!
+                    ])
+                    .unwrap(),
+                    false,
+                ))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff5 = SchemaDiffArgs {
+            before: &before5,
+            after: &after5,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff5.added_fields.len(), 1);
+        assert_eq!(diff5.removed_fields.len(), 1);
+        assert_eq!(diff5.updated_fields.len(), 3);
+
+        assert_eq!(
+            diff5.added_fields[0].path,
+            ColumnName::new(["nested_maps", "value", "value", "added"])
+        );
+        assert_eq!(
+            diff5.removed_fields[0].path,
+            ColumnName::new(["nested_maps", "value", "value", "removed"])
+        );
+
+        let paths: HashSet<ColumnName> = diff5
+            .updated_fields
+            .iter()
+            .map(|u| u.path.clone())
+            .collect();
+        assert!(paths.contains(&ColumnName::new([
+            "nested_maps",
+            "key",
+            "renamed_outer_key"
+        ])));
+        assert!(paths.contains(&ColumnName::new([
+            "nested_maps",
+            "value",
+            "key",
+            "renamed_inner_key"
+        ])));
+        assert!(paths.contains(&ColumnName::new([
+            "nested_maps",
+            "value",
+            "value",
+            "renamed_data"
+        ])));
+
+        assert!(diff5.has_breaking_changes()); // Removal is breaking
     }
 }
