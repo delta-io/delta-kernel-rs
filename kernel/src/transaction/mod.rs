@@ -811,8 +811,7 @@ impl Transaction {
                     target_schema.clone().into(),
                 );
 
-                let updated_engine_data =
-                    file_action_eval.evaluate(&*file_metadata_batch.data())?;
+                let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
                 FilteredEngineData::try_new(
                     updated_engine_data,
                     file_metadata_batch.selection_vector().to_vec(),
