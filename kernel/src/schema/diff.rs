@@ -638,15 +638,19 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
         (DataType::Map(before_map), DataType::Map(after_map)) => {
             // Recursively check for key type changes
             let key_type_change = match (before_map.key_type(), after_map.key_type()) {
-                (DataType::Struct(_), DataType::Struct(_)) => None, // Struct keys, changes handled via field IDs
-                (k1, k2) if k1 != k2 => classify_data_type_change(k1, k2), // Only if types differ
+                // Both have struct keys - nested changes handled via field IDs
+                (DataType::Struct(_), DataType::Struct(_)) => None,
+                // For non-struct keys (including arrays/maps containing structs), recurse (but only if types differ)
+                (k1, k2) if k1 != k2 => classify_data_type_change(k1, k2),
                 _ => None,
             };
 
             // Recursively check for value type changes
             let value_type_change = match (before_map.value_type(), after_map.value_type()) {
-                (DataType::Struct(_), DataType::Struct(_)) => None, // Struct values, changes handled via field IDs
-                (v1, v2) if v1 != v2 => classify_data_type_change(v1, v2), // Only if types differ
+                // Both have struct values - nested changes handled via field IDs
+                (DataType::Struct(_), DataType::Struct(_)) => None,
+                // For non-struct values (including arrays/maps containing structs), recurse (but only if types differ)
+                (v1, v2) if v1 != v2 => classify_data_type_change(v1, v2),
                 _ => None,
             };
 
