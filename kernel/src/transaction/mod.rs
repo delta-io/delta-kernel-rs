@@ -21,12 +21,13 @@ use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
     RowVisitor, Version,
 };
+use delta_kernel_derive::internal_api;
 
 /// Type alias for an iterator of [`EngineData`] results.
 type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
-/// The minimal (i.e., mandatory) fields in an add action.
+/// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange column.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
         StructField::not_null("path", DataType::STRING),
@@ -36,17 +37,20 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
         ),
         StructField::not_null("size", DataType::LONG),
         StructField::not_null("modificationTime", DataType::LONG),
-        StructField::not_null("dataChange", DataType::BOOLEAN),
     ]))
 });
 
 /// Returns a reference to the mandatory fields in an add action.
+///
+/// Note this does not include "dataChange" which is a required field but
+/// but should be set on the transactoin level. Getting the full schema
+/// can be done with [`Transaction::add_files_schema`].
 pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
     &MANDATORY_ADD_FILE_SCHEMA
 }
 
 /// The static instance referenced by [`add_files_schema`].
-pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
@@ -57,22 +61,20 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ))
 });
 
-/// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
-/// a Parquet write operation back to Kernel.
-///
-/// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
-/// for constructing an add_file (and soon remove_file) action. Each row represents metadata about a
-/// file to be added to the table. Kernel takes this information and extends it to the full add_file
-/// action schema, adding additional fields (e.g., baseRowID) as necessary.
-///
-/// For now, Kernel only supports the number of records as a file statistic.
-/// This will change in a future release.
-///
-/// [`add_files`]: crate::transaction::Transaction::add_files
-/// [`ParquetHandler`]: crate::ParquetHandler
-pub fn add_files_schema() -> &'static SchemaRef {
-    &ADD_FILES_SCHEMA
-}
+static DATA_CHANGE_COLUMN: LazyLock<StructField> =
+    LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
+
+/// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
+static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
+    let len = fields.len();
+    let insert_position = fields
+        .iter()
+        .position(|f| f.name() == "modificationTime")
+        .unwrap_or(len);
+    fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
+    Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
+});
 
 // NOTE: The following two methods are a workaround for the fact that we do not have a proper SchemaBuilder yet.
 // See https://github.com/delta-io/delta-kernel-rs/issues/1284
@@ -129,6 +131,8 @@ pub struct Transaction {
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
     domain_metadatas: Vec<DomainMetadata>,
+    // Whether this transaction contains any logical data changes.
+    data_change: bool,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -166,6 +170,7 @@ impl Transaction {
             set_transactions: vec![],
             commit_timestamp,
             domain_metadatas: vec![],
+            data_change: true,
         })
     }
 
@@ -256,6 +261,28 @@ impl Transaction {
         }
     }
 
+    /// Set the data change flag.
+    ///
+    /// True indicates this commit is a "data changing" commit. False indicates table data was
+    /// reorganized but not materially modified.
+    ///
+    /// Data change might be set to false in the following scenarios:
+    /// 1. Operations that only change metadata (e.g. backfilling statistics)
+    /// 2. Operations that make no logical changes to the contents of the table (i.e. rows are only moved
+    ///    from old files to new ones.  OPTIMIZE commands is one example of this type of optimizaton).
+    pub fn with_data_change(mut self, data_change: bool) -> Self {
+        self.data_change = data_change;
+        self
+    }
+
+    /// Same as [`Transaction::with_data_change`] but set the value directly instead of
+    /// using a fluent API.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn set_data_change(&mut self, data_change: bool) {
+        self.data_change = data_change;
+    }
+
     /// Set the operation that this transaction is performing. This string will be persisted in the
     /// commit and visible to anyone who describes the table history.
     pub fn with_operation(mut self, operation: String) -> Self {
@@ -340,6 +367,26 @@ impl Transaction {
             .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
     }
 
+    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
+    /// a Parquet write operation back to Kernel.
+    ///
+    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
+    /// for constructing an add_file. Each row represents metadata about a
+    /// file to be added to the table. Kernel takes this information and extends it to the full add_file
+    /// action schema, adding internal fields (e.g., baseRowID) as necessary.
+    ///
+    /// For now, Kernel only supports the number of records as a file statistic.
+    /// This will change in a future release.
+    ///
+    /// Note: While currently static, in the future the schema might change depending on
+    /// options set on the transaction or features enabled on the table.
+    ///
+    /// [`add_files`]: crate::transaction::Transaction::add_files
+    /// [`ParquetHandler`]: crate::ParquetHandler
+    pub fn add_files_schema(&self) -> &'static SchemaRef {
+        &BASE_ADD_FILES_SCHEMA
+    }
+
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
@@ -378,7 +425,7 @@ impl Transaction {
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
     ///
-    /// The expected schema for `add_metadata` is given by [`add_files_schema`].
+    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
@@ -397,6 +444,7 @@ impl Transaction {
             add_files_metadata: I,
             input_schema: SchemaRef,
             output_schema: SchemaRef,
+            data_change: bool,
         ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
         where
             I: Iterator<Item = DeltaResult<T>> + Send + 'a,
@@ -406,16 +454,22 @@ impl Transaction {
 
             add_files_metadata.map(move |add_files_batch| {
                 // Convert stats to a JSON string and nest the add action in a top-level struct
-                let adds_expr = Expression::struct_from([Expression::transform(
-                    Transform::new_top_level().with_replaced_field(
-                        "stats",
-                        Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                    ),
-                )]);
+                let transform = Expression::transform(
+                    Transform::new_top_level()
+                        .with_inserted_field(
+                            Some("modificationTime"),
+                            Expression::literal(data_change).into(),
+                        )
+                        .with_replaced_field(
+                            "stats",
+                            Expression::unary(ToJson, Expression::column(["stats"])).into(),
+                        ),
+                );
+                let adds_expr = Expression::struct_from([transform]);
                 let adds_evaluator = evaluation_handler.new_expression_evaluator(
                     input_schema.clone(),
                     Arc::new(adds_expr),
-                    output_schema.clone().into(),
+                    as_log_add_schema(output_schema.clone()).into(),
                 );
                 adds_evaluator.evaluate(add_files_batch?.deref())
             })
@@ -472,13 +526,13 @@ impl Transaction {
                 },
             );
 
+            // Generate add actions including row tracking metadata
             let add_actions = build_add_actions(
                 engine,
                 extended_add_files,
-                with_row_tracking_cols(add_files_schema()),
-                as_log_add_schema(with_row_tracking_cols(&with_stats_col(
-                    mandatory_add_file_schema(),
-                ))),
+                with_row_tracking_cols(self.add_files_schema()),
+                with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+                self.data_change,
             );
 
             // Generate a row tracking domain metadata based on the final high water mark
@@ -491,8 +545,9 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
-                add_files_schema().clone(),
-                as_log_add_schema(with_stats_col(mandatory_add_file_schema())),
+                self.add_files_schema().clone(),
+                with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
+                self.data_change,
             );
 
             Ok((Box::new(add_actions), None))
@@ -674,13 +729,27 @@ pub struct RetryableTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
+    use crate::Snapshot;
+    use std::path::PathBuf;
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
-    fn test_add_files_schema() {
-        let schema = add_files_schema();
+
+    fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let txn = snapshot.transaction()?.with_engine_info("default engine");
+
+        let schema = txn.add_files_schema();
         let expected = StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
@@ -689,7 +758,6 @@ mod tests {
             ),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
-            StructField::not_null("dataChange", DataType::BOOLEAN),
             StructField::nullable(
                 "stats",
                 DataType::struct_type_unchecked(vec![StructField::nullable(
@@ -699,5 +767,6 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
     }
 }
