@@ -747,6 +747,7 @@ impl Scan {
 ///    },
 ///    fileConstantValues: {
 ///      partitionValues: map<string, string>,
+///      tags: map<string, string>,
 ///      baseRowId: long,
 ///      defaultRowCommitVersion: long,
 ///    }
