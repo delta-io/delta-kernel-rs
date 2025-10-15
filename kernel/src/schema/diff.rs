@@ -1202,6 +1202,9 @@ mod tests {
         assert!(paths.contains(&ColumnName::new(["existing_struct"])));
         assert!(paths.contains(&ColumnName::new(["existing_struct", "new_name"])));
 
+        // Added a non-nullable struct "new_struct"
+        assert!(diff.has_breaking_changes());
+
         // nested_field should NOT appear as added since new_struct is its ancestor
     }
 
