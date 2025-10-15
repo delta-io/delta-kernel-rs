@@ -284,7 +284,6 @@ impl Transaction {
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
-
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
             .chain(remove_actions);
