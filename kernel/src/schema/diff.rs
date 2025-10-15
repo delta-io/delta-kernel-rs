@@ -1138,6 +1138,7 @@ mod tests {
             .filter(|u| u.path == ColumnName::new(["items"]))
             .collect();
         assert_eq!(array_updates.len(), 0);
+        assert!(!diff.has_breaking_changes());
     }
 
     #[test]
