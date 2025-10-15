@@ -331,13 +331,13 @@ fn is_breaking_change_type(change_type: &FieldChangeType) -> bool {
 /// Computes whether the diff contains breaking changes
 fn compute_has_breaking_changes(
     added_fields: &[FieldChange],
-    removed_fields: &[FieldChange],
+    _removed_fields: &[FieldChange],
     updated_fields: &[FieldUpdate],
 ) -> bool {
-    // Removed fields are always breaking
-    !removed_fields.is_empty()
-        // Adding a non-nullable (required) field is breaking - existing data won't have values
-        || added_fields.iter().any(|add| !add.field.nullable)
+    // Removed fields are safe - existing data files remain valid, queries referencing
+    // removed fields will fail at query time but data integrity is maintained
+    // Adding a non-nullable (required) field is breaking - existing data won't have values
+    added_fields.iter().any(|add| !add.field.nullable)
         // Certain update types are breaking (type changes, nullability tightening, etc.)
         || updated_fields
             .iter()
@@ -891,7 +891,7 @@ mod tests {
         assert_eq!(diff.removed_fields[0].path, ColumnName::new(["user"]));
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
-        assert!(diff.has_breaking_changes()); // Removing fields is breaking
+        assert!(!diff.has_breaking_changes()); // Removing fields is safe
     }
 
     #[test]
@@ -1339,7 +1339,7 @@ mod tests {
         assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
 
-        assert!(diff.has_breaking_changes()); // Removal is breaking
+        assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
     }
 
     #[test]
@@ -1614,7 +1614,7 @@ mod tests {
         assert_eq!(update.path, ColumnName::new(["lookup", "value", "count"]));
         assert_eq!(update.change_type, FieldChangeType::Renamed);
 
-        assert!(diff.has_breaking_changes()); // Removal is breaking
+        assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
     }
 
     #[test]
@@ -2219,7 +2219,7 @@ mod tests {
             FieldChangeType::Renamed
         );
 
-        assert!(diff1.has_breaking_changes()); // Removal is breaking
+        assert!(!diff1.has_breaking_changes()); // Removal is safe, rename is safe
 
         // Case 2: map<string, struct<nested: map<int, struct<x int>>>>
         let before2 = StructType::new_unchecked([create_field_with_id(
@@ -2544,6 +2544,6 @@ mod tests {
             "renamed_data"
         ])));
 
-        assert!(diff5.has_breaking_changes()); // Removal is breaking
+        assert!(!diff5.has_breaking_changes()); // Removal is safe, renames are safe
     }
 }
