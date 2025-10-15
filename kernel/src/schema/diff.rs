@@ -591,52 +591,76 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
 
         // Array-to-array: check element types and nullability
         (DataType::Array(before_array), DataType::Array(after_array)) => {
-            let element_types_match =
+            // Recursively check for element type changes
+            let element_type_change =
                 match (before_array.element_type(), after_array.element_type()) {
                     // Both have struct elements - nested changes handled via field IDs
-                    (DataType::Struct(_), DataType::Struct(_)) => true,
-                    // Non-struct elements must match exactly
-                    (e1, e2) => e1 == e2,
+                    (DataType::Struct(_), DataType::Struct(_)) => None,
+                    // For non-struct elements, recurse to check for changes (but only if types differ)
+                    (e1, e2) if e1 != e2 => classify_data_type_change(e1, e2),
+                    _ => None,
                 };
 
-            if element_types_match {
-                // Element types match, check container nullability
+            // Check container nullability change
+            let nullability_change =
                 match (before_array.contains_null(), after_array.contains_null()) {
                     (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
                     (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
-                    (true, true) | (false, false) => None, // Same container, nested changes handled elsewhere
+                    (true, true) | (false, false) => None,
+                };
+
+            // Combine both changes if present
+            match (element_type_change, nullability_change) {
+                (Some(type_change), Some(null_change)) => {
+                    Some(FieldChangeType::Multiple(vec![type_change, null_change]))
                 }
-            } else {
-                // Element type changed - this is a breaking type change
-                Some(FieldChangeType::TypeChanged)
+                (Some(change), None) | (None, Some(change)) => Some(change),
+                (None, None) => None,
             }
         }
 
         // Map-to-map: check key types, value types, and nullability
         (DataType::Map(before_map), DataType::Map(after_map)) => {
-            let keys_match = match (before_map.key_type(), after_map.key_type()) {
-                (DataType::Struct(_), DataType::Struct(_)) => true, // Struct keys, changes handled via field IDs
-                (k1, k2) => k1 == k2, // Non-struct keys must match exactly
+            // Recursively check for key type changes
+            let key_type_change = match (before_map.key_type(), after_map.key_type()) {
+                (DataType::Struct(_), DataType::Struct(_)) => None, // Struct keys, changes handled via field IDs
+                (k1, k2) if k1 != k2 => classify_data_type_change(k1, k2), // Only if types differ
+                _ => None,
             };
 
-            let values_match = match (before_map.value_type(), after_map.value_type()) {
-                (DataType::Struct(_), DataType::Struct(_)) => true, // Struct values, changes handled via field IDs
-                (v1, v2) => v1 == v2, // Non-struct values must match exactly
+            // Recursively check for value type changes
+            let value_type_change = match (before_map.value_type(), after_map.value_type()) {
+                (DataType::Struct(_), DataType::Struct(_)) => None, // Struct values, changes handled via field IDs
+                (v1, v2) if v1 != v2 => classify_data_type_change(v1, v2), // Only if types differ
+                _ => None,
             };
 
-            if keys_match && values_match {
-                // Key and value types match, check container nullability
-                match (
-                    before_map.value_contains_null(),
-                    after_map.value_contains_null(),
-                ) {
-                    (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
-                    (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
-                    (true, true) | (false, false) => None, // Same container, nested changes handled elsewhere
-                }
-            } else {
-                // Key or value type changed - this is a breaking type change
-                Some(FieldChangeType::TypeChanged)
+            // Check container nullability change
+            let nullability_change = match (
+                before_map.value_contains_null(),
+                after_map.value_contains_null(),
+            ) {
+                (false, true) => Some(FieldChangeType::ContainerNullabilityLoosened),
+                (true, false) => Some(FieldChangeType::ContainerNullabilityTightened),
+                (true, true) | (false, false) => None,
+            };
+
+            // Combine all changes if present
+            let mut changes = Vec::new();
+            if let Some(change) = key_type_change {
+                changes.push(change);
+            }
+            if let Some(change) = value_type_change {
+                changes.push(change);
+            }
+            if let Some(change) = nullability_change {
+                changes.push(change);
+            }
+
+            match changes.as_slice() {
+                [] => None,
+                [single] => Some(single.clone()),
+                _ => Some(FieldChangeType::Multiple(changes)),
             }
         }
 
