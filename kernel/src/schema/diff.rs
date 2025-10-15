@@ -761,6 +761,7 @@ mod tests {
         .compute_diff()
         .unwrap();
         assert!(diff.is_empty());
+        assert!(!diff.has_breaking_changes());
     }
 
     #[test]
