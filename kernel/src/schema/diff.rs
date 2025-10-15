@@ -1387,6 +1387,174 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_array_nullability_loosened() {
+        // Test: array<array<int> not null> -> array<array<int>>
+        // Outer array element nullability loosened (safe change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                false, // Outer array elements are non-nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                true, // Outer array elements now nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            before: &before,
+            after: &after,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityLoosened
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_nested_array_nullability_tightened() {
+        // Test: array<array<int>> -> array<array<int> not null>
+        // Outer array element nullability tightened (breaking change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                true, // Outer array elements are nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                false, // Outer array elements now non-nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            before: &before,
+            after: &after,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityTightened
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_nested_array_inner_nullability_loosened() {
+        // Test: array<array<int not null>> -> array<array<int>>
+        // Inner array element nullability loosened (safe change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), // Inner elements non-nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Inner elements now nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            before: &before,
+            after: &after,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityLoosened
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_nested_array_inner_nullability_tightened() {
+        // Test: array<array<int>> -> array<array<int not null>>
+        // Inner array element nullability tightened (breaking change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Inner elements nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), // Inner elements now non-nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiffArgs {
+            before: &before,
+            after: &after,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityTightened
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
     fn test_map_value_struct_field_changes() {
         let before = StructType::new_unchecked([create_field_with_id(
             "lookup",
