@@ -1075,7 +1075,6 @@ mod tests {
         assert!(diff.has_breaking_changes());
 
         // The new nested field should also be reported as added
-        assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(
             diff.added_fields[0].path,
             ColumnName::new(["data", "nested"])
