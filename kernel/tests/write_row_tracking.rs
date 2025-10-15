@@ -23,7 +23,7 @@ use delta_kernel::schema::{DataType, StructField, StructType};
 use test_utils::{create_table, engine_store_setup};
 
 /// Test that verifies baseRowId and defaultRowCommitVersion are correctly populated
-/// when row tracking is enabled on the table when a remove action is generated for a 
+/// when row tracking is enabled on the table when a remove action is generated for a
 /// a file that had row tracking enabled.
 ///
 /// This test creates a table with row tracking enabled, writes data to it, and then
