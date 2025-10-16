@@ -1,0 +1,28 @@
+[package]
+name = "uc-catalog"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+# for cargo-release
+[package.metadata.release]
+release = false
+
+[dependencies]
+delta_kernel = { path = "../kernel", features = ["catalog-managed"] }
+uc-client = { path = "../uc-client" }
+itertools = "0.14"
+object_store = "0.12.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+delta_kernel = { path = "../kernel", features = ["arrow-56", "default-engine-rustls", "catalog-managed"] }
