@@ -70,6 +70,10 @@ impl StorageHandler for SyncStorageHandler {
         });
         Ok(Box::new(iter))
     }
+
+    fn copy(&self, _src: &Url, _dest: &Url) -> Result<(), crate::error::CopyError> {
+        unimplemented!("SyncStorageHandler does not implement copy");
+    }
 }
 
 #[cfg(test)]
