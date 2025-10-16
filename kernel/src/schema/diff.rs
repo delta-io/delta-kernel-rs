@@ -382,10 +382,19 @@ fn filter_ancestor_fields(fields: Vec<FieldChange>) -> Vec<FieldChange> {
 ///
 /// Returns true if any path in `added_ancestor_paths` is a prefix of `path`.
 /// For example, "user" is an ancestor of "user.name" and "user.address.street".
+///
+/// This implementation walks up the parent chain of `path`, checking at each level
+/// if that parent exists in the set. This is O(depth) instead of O(N * depth) where
+/// N is the number of ancestor paths.
 fn has_added_ancestor(path: &ColumnName, added_ancestor_paths: &HashSet<ColumnName>) -> bool {
-    added_ancestor_paths
-        .iter()
-        .any(|ancestor| path.is_descendant_of(ancestor))
+    let mut curr = path.parent();
+    while let Some(parent) = curr {
+        if added_ancestor_paths.contains(&parent) {
+            return true;
+        }
+        curr = parent.parent();
+    }
+    false
 }
 
 /// Gets the physical name of a field if present
@@ -393,6 +402,50 @@ fn physical_name(field: &StructField) -> Option<&str> {
     match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
         Some(MetadataValue::String(s)) => Some(s.as_str()),
         _ => None,
+    }
+}
+
+/// Validates that physical names are consistent between two versions of the same field.
+///
+/// Since schema diffing requires column mapping (field IDs), physical names must be present
+/// and must not change for the same field ID across schema versions.
+///
+/// # Errors
+/// - `PhysicalNameChanged`: Physical name differs between before and after
+/// - `MissingPhysicalName`: Physical name is missing in either version
+fn validate_physical_name(
+    before: &FieldWithPath,
+    after: &FieldWithPath,
+) -> Result<(), SchemaDiffError> {
+    let before_physical = physical_name(&before.field);
+    let after_physical = physical_name(&after.field);
+
+    match (before_physical, after_physical) {
+        (Some(b), Some(a)) if b == a => {
+            // Valid: physical name is present and unchanged
+            Ok(())
+        }
+        (Some(b), Some(a)) => {
+            // Invalid: physical name changed for the same field ID
+            Err(SchemaDiffError::PhysicalNameChanged {
+                field_id: before.field_id,
+                path: after.path.clone(),
+                before: b.to_string(),
+                after: a.to_string(),
+            })
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            // Invalid: physical name was added or removed
+            Err(SchemaDiffError::MissingPhysicalName {
+                path: after.path.clone(),
+            })
+        }
+        (None, None) => {
+            // Invalid: physical name must be present when column mapping is enabled
+            Err(SchemaDiffError::MissingPhysicalName {
+                path: after.path.clone(),
+            })
+        }
     }
 }
 
@@ -522,40 +575,12 @@ fn compute_field_update(
     }
 
     // Check for nullability change - distinguish between tightening and loosening
-    if let Some(change) = check_container_nullability_change(before.field.nullable, after.field.nullable) {
+    if let Some(change) = check_field_nullability_change(before.field.nullable, after.field.nullable) {
         changes.push(change);
     }
 
     // Validate physical name consistency
-    // Since we require column mapping (field IDs) for schema diffing, physical names must be present
-    let bp = physical_name(&before.field);
-    let ap = physical_name(&after.field);
-    match (bp, ap) {
-        (Some(b), Some(a)) if b == a => {
-            // Valid: physical name is present and unchanged
-        }
-        (Some(b), Some(a)) => {
-            // Invalid: physical name changed for the same field ID
-            return Err(SchemaDiffError::PhysicalNameChanged {
-                field_id: before.field_id,
-                path: after.path.clone(),
-                before: b.to_string(),
-                after: a.to_string(),
-            });
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            // Invalid: physical name was added or removed
-            return Err(SchemaDiffError::MissingPhysicalName {
-                path: after.path.clone(),
-            });
-        }
-        (None, None) => {
-            // Invalid: physical name must be present when column mapping is enabled
-            return Err(SchemaDiffError::MissingPhysicalName {
-                path: after.path.clone(),
-            });
-        }
-    }
+    validate_physical_name(before, after)?;
 
     // Check for type change (including container changes)
     if let Some(change_type) =
@@ -563,8 +588,8 @@ fn compute_field_update(
     {
         changes.push(change_type);
     }
-    // If None is returned, the container structure is the same and nested changes
-    // are already captured via field IDs, so we don't report a change here
+    // If None is returned, the types are identical or the container structure is the same
+    // and nested changes are already captured via field IDs, so we don't report a change here
 
     // Check for metadata changes (excluding column mapping metadata)
     if has_metadata_changes(&before.field, &after.field) {
@@ -583,6 +608,23 @@ fn compute_field_update(
         path: after.path.clone(), // Use the new path in case of renames
         change_type,
     }))
+}
+
+/// Checks for field nullability changes.
+///
+/// Returns:
+/// - `Some(FieldChangeType::NullabilityLoosened)` if nullability was relaxed (false -> true)
+/// - `Some(FieldChangeType::NullabilityTightened)` if nullability was restricted (true -> false)
+/// - `None` if nullability didn't change
+fn check_field_nullability_change(
+    before_nullable: bool,
+    after_nullable: bool,
+) -> Option<FieldChangeType> {
+    match (before_nullable, after_nullable) {
+        (false, true) => Some(FieldChangeType::NullabilityLoosened),
+        (true, false) => Some(FieldChangeType::NullabilityTightened),
+        (true, true) | (false, false) => None,
+    }
 }
 
 /// Checks for container nullability changes.
@@ -617,6 +659,11 @@ fn check_container_nullability_change(
 /// 3. **Map containers**: Similar logic to arrays, but for both key and value types
 /// 4. **Different container types or primitives**: Type change
 fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<FieldChangeType> {
+    // Early return if types are identical - no change to report
+    if before == after {
+        return None;
+    }
+
     match (before, after) {
         // Struct-to-struct: nested field changes are handled separately via field IDs
         (DataType::Struct(_), DataType::Struct(_)) => None,
@@ -628,7 +675,7 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
                 match (before_array.element_type(), after_array.element_type()) {
                     // Both have struct elements - nested changes handled via field IDs
                     (DataType::Struct(_), DataType::Struct(_)) => None,
-                    // For non-struct elements, recurse to check for changes (but only if types differ)
+                    // For non-struct elements, recurse to check for changes
                     (e1, e2) => classify_data_type_change(e1, e2),
                 };
 
@@ -654,18 +701,16 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
             let key_type_change = match (before_map.key_type(), after_map.key_type()) {
                 // Both have struct keys - nested changes handled via field IDs
                 (DataType::Struct(_), DataType::Struct(_)) => None,
-                // For non-struct keys (including arrays/maps containing structs), recurse (but only if types differ)
-                (k1, k2) if k1 != k2 => classify_data_type_change(k1, k2),
-                _ => None,
+                // For non-struct keys (including arrays/maps containing structs), recurse
+                (k1, k2) => classify_data_type_change(k1, k2),
             };
 
             // Recursively check for value type changes
             let value_type_change = match (before_map.value_type(), after_map.value_type()) {
                 // Both have struct values - nested changes handled via field IDs
                 (DataType::Struct(_), DataType::Struct(_)) => None,
-                // For non-struct values (including arrays/maps containing structs), recurse (but only if types differ)
-                (v1, v2) if v1 != v2 => classify_data_type_change(v1, v2),
-                _ => None,
+                // For non-struct values (including arrays/maps containing structs), recurse
+                (v1, v2) => classify_data_type_change(v1, v2),
             };
 
             // Check container nullability change
@@ -2540,5 +2585,137 @@ mod tests {
         ])));
 
         assert!(!diff5.has_breaking_changes()); // Removal is safe, renames are safe
+
+        // Case 6: Nullability tightening in deeply nested structure - should be breaking
+        // Test: array<struct<items: array<struct<value int nullable>>>> -> array<struct<items: array<struct<value int not null>>>>
+        let before6 = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([
+                            create_field_with_id("value", DataType::INTEGER, true, 3), // Nullable
+                        ])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after6 = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([
+                            create_field_with_id("value", DataType::INTEGER, false, 3), // Non-nullable now - BREAKING!
+                        ])
+                        .unwrap(),
+                        false,
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff6 = SchemaDiffArgs {
+            before: &before6,
+            after: &after6,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff6.added_fields.len(), 0);
+        assert_eq!(diff6.removed_fields.len(), 0);
+        assert_eq!(diff6.updated_fields.len(), 1);
+        assert_eq!(
+            diff6.updated_fields[0].path,
+            ColumnName::new(["wrapper", "element", "items", "element", "value"])
+        );
+        assert_eq!(
+            diff6.updated_fields[0].change_type,
+            FieldChangeType::NullabilityTightened
+        );
+        assert!(diff6.has_breaking_changes()); // Nullability tightening is breaking
+
+        // Case 7: Array container nullability tightening in nested structure - should be breaking
+        // Test: array<struct<items: array<struct<value int> nullable>>> -> array<struct<items: array<struct<value int> not null>>>
+        let before7 = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([
+                            create_field_with_id("value", DataType::INTEGER, false, 3),
+                        ])
+                        .unwrap(),
+                        true, // Array elements are nullable
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after7 = StructType::new_unchecked([create_field_with_id(
+            "wrapper",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([create_field_with_id(
+                    "items",
+                    DataType::Array(Box::new(ArrayType::new(
+                        DataType::try_struct_type([
+                            create_field_with_id("value", DataType::INTEGER, false, 3),
+                        ])
+                        .unwrap(),
+                        false, // Array elements now non-nullable - BREAKING!
+                    ))),
+                    false,
+                    2,
+                )])
+                .unwrap(),
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff7 = SchemaDiffArgs {
+            before: &before7,
+            after: &after7,
+        }
+        .compute_diff()
+        .unwrap();
+
+        assert_eq!(diff7.added_fields.len(), 0);
+        assert_eq!(diff7.removed_fields.len(), 0);
+        assert_eq!(diff7.updated_fields.len(), 1);
+        assert_eq!(
+            diff7.updated_fields[0].path,
+            ColumnName::new(["wrapper", "element", "items"])
+        );
+        assert_eq!(
+            diff7.updated_fields[0].change_type,
+            FieldChangeType::ContainerNullabilityTightened
+        );
+        assert!(diff7.has_breaking_changes()); // Container nullability tightening is breaking
     }
 }

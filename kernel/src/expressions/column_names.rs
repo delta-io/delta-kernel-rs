@@ -98,37 +98,24 @@ impl ColumnName {
         self.path
     }
 
-    /// Checks if this column name is a descendant of another column name.
-    ///
-    /// Returns `true` if `ancestor` is a prefix of `self`, meaning `self` is nested
-    /// within `ancestor`. For example, `user.address.street` is a descendant of `user`
-    /// and `user.address`, but not of `user.address.street` (same path) or `profile`.
+    /// Returns the parent of this column name, or `None` if this is a top-level column.
     ///
     /// # Examples
     ///
     /// ```
     /// # use delta_kernel::expressions::ColumnName;
     /// let path = ColumnName::new(["user", "address", "street"]);
-    /// let ancestor = ColumnName::new(["user"]);
-    /// assert!(path.is_descendant_of(&ancestor));
+    /// assert_eq!(path.parent(), Some(ColumnName::new(["user", "address"])));
     ///
-    /// let not_ancestor = ColumnName::new(["profile"]);
-    /// assert!(!path.is_descendant_of(&not_ancestor));
-    ///
-    /// // Same path is not a descendant
-    /// assert!(!path.is_descendant_of(&path));
+    /// let path = ColumnName::new(["user"]);
+    /// assert_eq!(path.parent(), None);
     /// ```
-    pub fn is_descendant_of(&self, ancestor: &ColumnName) -> bool {
-        let path_parts = self.path();
-        let ancestor_parts = ancestor.path();
-
-        // Path must be longer than ancestor to be a descendant
-        if path_parts.len() <= ancestor_parts.len() {
-            return false;
+    pub fn parent(&self) -> Option<ColumnName> {
+        if self.path.len() > 1 {
+            Some(ColumnName::new(&self.path[..self.path.len() - 1]))
+        } else {
+            None
         }
-
-        // Check if ancestor is a prefix of path
-        path_parts.starts_with(ancestor_parts)
     }
 }
 
