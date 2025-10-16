@@ -1,5 +1,5 @@
 use crate::arrow::array::{
-    types::{GenericStringType, Int32Type, Int64Type},
+    types::{GenericBinaryType, GenericStringType, Int32Type, Int64Type},
     Array, BooleanArray, GenericByteArray, GenericListArray, MapArray, OffsetSizeTrait,
     PrimitiveArray,
 };
@@ -43,6 +43,16 @@ impl GetData<'_> for PrimitiveArray<Int64Type> {
 
 impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i32>> {
     fn get_str(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a str>> {
+        if self.is_valid(row_index) {
+            Ok(Some(self.value(row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl<'a> GetData<'a> for GenericByteArray<GenericBinaryType<i32>> {
+    fn get_binary(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a [u8]>> {
         if self.is_valid(row_index) {
             Ok(Some(self.value(row_index)))
         } else {
