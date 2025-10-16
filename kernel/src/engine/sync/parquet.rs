@@ -5,10 +5,11 @@ use std::fs::File;
 use url::Url;
 
 use super::read_files;
+use crate::arrow::array::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    filter_to_record_batch, fixup_parquet_read, generate_mask, get_requested_indices,
+    ordering_needs_row_indexes, RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
@@ -59,14 +60,10 @@ impl ParquetHandler for SyncParquetHandler {
         url: Url,
         data: Box<dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send + '_>,
     ) -> DeltaResult<()> {
-        // Collect all ArrowEngineData batches first
-        let mut batches = Vec::new();
-        for filtered_batch in data {
-            let filtered_batch = filtered_batch?;
-            let (engine_data, _selection_vector) = filtered_batch.into_parts();
-            let batch: Box<ArrowEngineData> = ArrowEngineData::try_from_engine_data(engine_data)?;
-            batches.push(batch);
-        }
+        // Collect all ArrowEngineData batches first, applying selection filters
+        let batches: Vec<RecordBatch> = data
+            .map(|filtered| filter_to_record_batch(filtered?))
+            .collect::<DeltaResult<_>>()?;
 
         // If there are no batches, return early
         if batches.is_empty() {
@@ -79,10 +76,10 @@ impl ParquetHandler for SyncParquetHandler {
             .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", url)))?;
         let mut file = File::create(&path)?;
 
-        let mut writer = ArrowWriter::try_new(&mut file, batches[0].record_batch().schema(), None)?;
+        let mut writer = ArrowWriter::try_new(&mut file, batches[0].schema(), None)?;
 
         for batch in &batches {
-            writer.write(batch.record_batch())?;
+            writer.write(batch)?;
         }
 
         writer.close()?; // writer must be closed to write footer
@@ -179,6 +176,94 @@ mod tests {
         assert_eq!(name_col.value(0), "a");
         assert_eq!(name_col.value(1), "b");
         assert_eq!(name_col.value(2), "c");
+
+        assert!(result.next().is_none());
+    }
+
+    #[test]
+    fn test_sync_write_parquet_file_with_filter() {
+        let handler = SyncParquetHandler;
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_filtered.parquet");
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        // Create test data with 5 rows
+        let engine_data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "id",
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as Arc<dyn Array>,
+                ),
+                (
+                    "name",
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Create selection vector that filters out rows 1 and 3 (0-indexed)
+        // Keep rows: 0 (id=1, name=a), 2 (id=3, name=c), 4 (id=5, name=e)
+        let selection_vector = vec![true, false, true, false, true];
+        let filtered_data =
+            crate::FilteredEngineData::try_new(engine_data, selection_vector).unwrap();
+
+        let data_iter: Box<
+            dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send,
+        > = Box::new(std::iter::once(Ok(filtered_data)));
+
+        // Write the file with filter applied
+        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+
+        // Verify the file exists
+        assert!(file_path.exists());
+
+        // Read it back to verify only filtered rows are present
+        let file = File::open(&file_path).unwrap();
+        let reader =
+            crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap();
+        let schema = reader.schema().clone();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let mut result = handler
+            .read_parquet_files(
+                &[file_meta],
+                Arc::new(schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap();
+
+        let engine_data = result.next().unwrap().unwrap();
+        let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
+        let record_batch = batch.record_batch();
+
+        // Verify shape - should only have 3 rows (filtered from 5)
+        assert_eq!(record_batch.num_rows(), 3);
+        assert_eq!(record_batch.num_columns(), 2);
+
+        // Verify content - id column should have values 1, 3, 5
+        let id_col = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(id_col.values(), &[1, 3, 5]);
+
+        // Verify content - name column should have values "a", "c", "e"
+        let name_col = record_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "a");
+        assert_eq!(name_col.value(1), "c");
+        assert_eq!(name_col.value(2), "e");
 
         assert!(result.next().is_none());
     }
