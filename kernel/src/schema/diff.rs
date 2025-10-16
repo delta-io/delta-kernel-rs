@@ -522,10 +522,8 @@ fn compute_field_update(
     }
 
     // Check for nullability change - distinguish between tightening and loosening
-    match (before.field.nullable, after.field.nullable) {
-        (true, false) => changes.push(FieldChangeType::NullabilityTightened), // Breaking
-        (false, true) => changes.push(FieldChangeType::NullabilityLoosened),  // Safe
-        _ => {}                                                               // No change
+    if let Some(change) = check_container_nullability_change(before.field.nullable, after.field.nullable) {
+        changes.push(change);
     }
 
     // Validate physical name consistency
