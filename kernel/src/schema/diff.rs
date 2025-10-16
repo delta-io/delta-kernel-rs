@@ -575,7 +575,9 @@ fn compute_field_update(
     }
 
     // Check for nullability change - distinguish between tightening and loosening
-    if let Some(change) = check_field_nullability_change(before.field.nullable, after.field.nullable) {
+    if let Some(change) =
+        check_field_nullability_change(before.field.nullable, after.field.nullable)
+    {
         changes.push(change);
     }
 
@@ -2660,9 +2662,12 @@ mod tests {
                 DataType::try_struct_type([create_field_with_id(
                     "items",
                     DataType::Array(Box::new(ArrayType::new(
-                        DataType::try_struct_type([
-                            create_field_with_id("value", DataType::INTEGER, false, 3),
-                        ])
+                        DataType::try_struct_type([create_field_with_id(
+                            "value",
+                            DataType::INTEGER,
+                            false,
+                            3,
+                        )])
                         .unwrap(),
                         true, // Array elements are nullable
                     ))),
@@ -2682,9 +2687,12 @@ mod tests {
                 DataType::try_struct_type([create_field_with_id(
                     "items",
                     DataType::Array(Box::new(ArrayType::new(
-                        DataType::try_struct_type([
-                            create_field_with_id("value", DataType::INTEGER, false, 3),
-                        ])
+                        DataType::try_struct_type([create_field_with_id(
+                            "value",
+                            DataType::INTEGER,
+                            false,
+                            3,
+                        )])
                         .unwrap(),
                         false, // Array elements now non-nullable - BREAKING!
                     ))),
