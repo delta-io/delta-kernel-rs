@@ -266,6 +266,9 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             return Ok(());
         }
 
+        // We buffer it in the application first, and then push everything to the object-store.
+        // The storage API does not seem to allow for streaming to the store, which is okay
+        // since often the object stores allocate their own buffers.
         let mut buffer = Vec::new();
 
         // Scope to ensure writer is dropped before we use buffer
@@ -280,14 +283,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             writer.close()?; // writer must be closed to write footer
         }
 
-        if !buffer.is_empty() {
-            let store = self.store.clone();
-            let path = Path::from_url_path(url.path())?;
+        let store = self.store.clone();
+        let path = Path::from_url_path(url.path())?;
 
-            // Block on the async put operation
-            self.task_executor
-                .block_on(async move { store.put(&path, buffer.into()).await })?;
-        }
+        // Block on the async put operation
+        self.task_executor
+            .block_on(async move { store.put(&path, buffer.into()).await })?;
 
         Ok(())
     }
@@ -476,7 +477,7 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
-    use crate::arrow::array::{Array, RecordBatch};
+    use crate::arrow::array::{Array, BooleanArray, RecordBatch};
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
