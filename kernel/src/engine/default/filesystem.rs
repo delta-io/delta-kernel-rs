@@ -5,11 +5,12 @@ use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore};
+use object_store::{DynObjectStore, ObjectStore, PutMode};
 use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
+use crate::error::CopyError;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 #[derive(Debug)]
@@ -175,6 +176,39 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
         Ok(Box::new(receiver.into_iter()))
     }
+
+    fn copy(&self, src: &Url, dest: &Url) -> Result<(), CopyError> {
+        let src_path =
+            Path::from_url_path(src.path()).map_err(|e| CopyError::Other(Box::new(e)))?;
+        let dest_path =
+            Path::from_url_path(dest.path()).map_err(|e| CopyError::Other(Box::new(e)))?;
+        let dest_path_str = dest_path.to_string();
+        let store = self.inner.clone();
+
+        // object_store has a copy_if_not_exists method, but it doesn't work with all cloud stores
+        // (namely S3). for now we just do the 'dumb' manual way of get/put. note we could do a
+        // HEAD then the non-atomic copy but that still has a race condition.
+        self.task_executor.block_on(async move {
+            let data = store
+                .get(&src_path)
+                .await
+                .map_err(|e| CopyError::Other(Box::new(e)))?
+                .bytes()
+                .await
+                .map_err(|e| CopyError::Other(Box::new(e)))?;
+
+            store
+                .put_opts(&dest_path, data.into(), PutMode::Create.into())
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::AlreadyExists { .. } => {
+                        CopyError::DestinationAlreadyExists(dest_path_str)
+                    }
+                    e => CopyError::Other(Box::new(e)),
+                })?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +333,40 @@ mod tests {
             len += 1;
         }
         assert_eq!(len, 10, "list_from should have returned 10 files");
+    }
+
+    #[tokio::test]
+    async fn test_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+
+        // basic
+        let data = Bytes::from("test-data");
+        let src_path = Path::from_absolute_path(tmp.path().join("src.txt")).unwrap();
+        store.put(&src_path, data.clone().into()).await.unwrap();
+        let src_url = Url::from_file_path(tmp.path().join("src.txt")).unwrap();
+        let dest_url = Url::from_file_path(tmp.path().join("dest.txt")).unwrap();
+        assert!(handler.copy(&src_url, &dest_url).is_ok());
+        let dest_path = Path::from_absolute_path(tmp.path().join("dest.txt")).unwrap();
+        assert_eq!(
+            store.get(&dest_path).await.unwrap().bytes().await.unwrap(),
+            data
+        );
+
+        // copy to existing fails
+        assert!(matches!(
+            handler.copy(&src_url, &dest_url),
+            Err(CopyError::DestinationAlreadyExists(_))
+        ));
+
+        // copy from non-existing fails
+        let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
+        let new_dest_url = Url::from_file_path(tmp.path().join("new_dest.txt")).unwrap();
+        assert!(matches!(
+            handler.copy(&missing_url, &new_dest_url),
+            Err(CopyError::Other(_))
+        ));
     }
 }
