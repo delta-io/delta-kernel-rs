@@ -68,7 +68,7 @@ pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
 }
 
-fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
+pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
     actions
         .into_iter()
         .map(|test_action| match test_action {
