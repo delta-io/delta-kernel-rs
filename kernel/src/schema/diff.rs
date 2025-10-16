@@ -631,8 +631,7 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
                     // Both have struct elements - nested changes handled via field IDs
                     (DataType::Struct(_), DataType::Struct(_)) => None,
                     // For non-struct elements, recurse to check for changes (but only if types differ)
-                    (e1, e2) if e1 != e2 => classify_data_type_change(e1, e2),
-                    _ => None,
+                    (e1, e2) => classify_data_type_change(e1, e2),
                 };
 
             // Check container nullability change
