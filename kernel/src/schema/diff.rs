@@ -560,15 +560,13 @@ fn compute_field_update(
     }
 
     // Check for type change (including container changes)
-    if before.field.data_type() != after.field.data_type() {
-        if let Some(change_type) =
-            classify_data_type_change(before.field.data_type(), after.field.data_type())
-        {
-            changes.push(change_type);
-        }
-        // If None is returned, the container structure is the same and nested changes
-        // are already captured via field IDs, so we don't report a change here
+    if let Some(change_type) =
+        classify_data_type_change(before.field.data_type(), after.field.data_type())
+    {
+        changes.push(change_type);
     }
+    // If None is returned, the container structure is the same and nested changes
+    // are already captured via field IDs, so we don't report a change here
 
     // Check for metadata changes (excluding column mapping metadata)
     if has_metadata_changes(&before.field, &after.field) {
