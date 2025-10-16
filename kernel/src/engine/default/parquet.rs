@@ -280,14 +280,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             writer.close()?; // writer must be closed to write footer
         }
 
-        if !buffer.is_empty() {
-            let store = self.store.clone();
-            let path = Path::from_url_path(url.path())?;
+        let store = self.store.clone();
+        let path = Path::from_url_path(url.path())?;
 
-            // Block on the async put operation
-            self.task_executor
-                .block_on(async move { store.put(&path, buffer.into()).await })?;
-        }
+        // Block on the async put operation
+        self.task_executor
+            .block_on(async move { store.put(&path, buffer.into()).await })?;
 
         Ok(())
     }
@@ -476,7 +474,7 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
-    use crate::arrow::array::{Array, RecordBatch};
+    use crate::arrow::array::{Array, BooleanArray, RecordBatch};
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
