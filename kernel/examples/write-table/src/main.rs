@@ -91,12 +91,13 @@ async fn try_main() -> DeltaResult<()> {
     let mut txn = snapshot
         .transaction()?
         .with_operation("INSERT".to_string())
-        .with_engine_info("default_engine/write-table-example");
+        .with_engine_info("default_engine/write-table-example")
+        .with_data_change(true);
 
     // Write the data using the engine
     let write_context = Arc::new(txn.get_write_context());
     let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new(), true)
+        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new())
         .await?;
 
     // Add the file metadata to the transaction
