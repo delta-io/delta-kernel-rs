@@ -22,8 +22,8 @@ use super::UrlExt;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    filter_to_record_batch, fixup_parquet_read, generate_mask, get_requested_indices,
+    ordering_needs_row_indexes, RowIndexBuilder,
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
@@ -248,18 +248,10 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         url: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
     ) -> DeltaResult<()> {
-        let mut batches = if let (_, Some(upper)) = data.size_hint() {
-            Vec::with_capacity(upper)
-        } else {
-            Vec::new()
-        };
-
-        for filtered_batch in data {
-            let filtered_batch = filtered_batch?;
-            let (engine_data, _selection_vector) = filtered_batch.into_parts();
-            let batch: Box<ArrowEngineData> = ArrowEngineData::try_from_engine_data(engine_data)?;
-            batches.push(batch);
-        }
+        // Collect all ArrowEngineData batches first, applying selection filters
+        let batches: Vec<RecordBatch> = data
+            .map(|filtered| filter_to_record_batch(filtered?))
+            .collect::<DeltaResult<_>>()?;
 
         // If there are no batches, return early
         if batches.is_empty() {
@@ -273,11 +265,10 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         // Scope to ensure writer is dropped before we use buffer
         {
-            let mut writer =
-                ArrowWriter::try_new(&mut buffer, batches[0].record_batch().schema(), None)?;
+            let mut writer = ArrowWriter::try_new(&mut buffer, batches[0].schema(), None)?;
 
             for batch in &batches {
-                writer.write(batch.record_batch())?;
+                writer.write(batch)?;
             }
 
             writer.close()?; // writer must be closed to write footer
