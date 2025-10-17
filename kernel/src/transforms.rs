@@ -572,7 +572,7 @@ mod tests {
         assert!(row_id_transform.is_replace);
 
         let expeceted_expr = Arc::new(Expression::variadic(
-            crate::expressions::VariadicExpressionOp::Coalesce,
+            VariadicExpressionOp::Coalesce,
             vec![
                 Expression::column(["row_id_col"]),
                 Expression::binary(
@@ -601,12 +601,14 @@ mod tests {
         ]);
         let metadata_values = HashMap::new();
 
-        assert!(get_transform_expr(
-            &transform_spec,
-            metadata_values,
-            &physical_schema,
-            None, /* base_row_id */
-        )
-        .is_err());
+        assert_result_error_with_message(
+            get_transform_expr(
+                &transform_spec,
+                metadata_values,
+                &physical_schema,
+                None, /* base_row_id */
+            ),
+            "Asked to generate RowIds, but no baseRowId found",
+        );
     }
 }

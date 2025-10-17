@@ -394,7 +394,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::actions::get_log_schema;
-    use crate::expressions::Scalar;
+    use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::state_info::tests::{
@@ -596,11 +596,11 @@ mod tests {
                 assert_eq!(row_id_transform.exprs.len(), 1);
                 let expr = &row_id_transform.exprs[0];
                 let expeceted_expr = Arc::new(Expr::variadic(
-                    crate::expressions::VariadicExpressionOp::Coalesce,
+                    VariadicExpressionOp::Coalesce,
                     vec![
                         Expr::column(["row_id_col"]),
                         Expr::binary(
-                            crate::expressions::BinaryExpressionOp::Plus,
+                            BinaryExpressionOp::Plus,
                             Expr::literal(42i64),
                             Expr::column(["row_indexes_for_row_id_0"]),
                         ),
