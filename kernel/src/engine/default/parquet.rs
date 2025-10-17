@@ -245,18 +245,11 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
     fn write_parquet_file(
         &self,
-        url: url::Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
-    ) -> DeltaResult<()> {
-        // Collect all ArrowEngineData batches first, applying selection filters
-        let batches: Vec<RecordBatch> = data
-            .map(|filtered| filter_to_record_batch(filtered?))
-            .collect::<DeltaResult<_>>()?;
-
-        // If there are no batches, return early
-        if batches.is_empty() {
-            return Ok(());
-        }
+        location: url::Url,
+        data: FilteredEngineData,
+    ) -> DeltaResult<FileMeta> {
+        // Convert FilteredEngineData to RecordBatch, applying selection filter
+        let batch = filter_to_record_batch(data)?;
 
         // We buffer it in the application first, and then push everything to the object-store.
         // The storage API does not seem to allow for streaming to the store, which is okay
@@ -265,23 +258,28 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
         // Scope to ensure writer is dropped before we use buffer
         {
-            let mut writer = ArrowWriter::try_new(&mut buffer, batches[0].schema(), None)?;
-
-            for batch in &batches {
-                writer.write(batch)?;
-            }
-
+            let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)?;
+            writer.write(&batch)?;
             writer.close()?; // writer must be closed to write footer
         }
 
         let store = self.store.clone();
-        let path = Path::from_url_path(url.path())?;
+        let path = Path::from_url_path(location.path())?;
+
+        let size: u64 = buffer
+            .len()
+            .try_into()
+            .map_err(|_| Error::generic("unable to convert usize to u64"))?;
 
         // Block on the async put operation
         self.task_executor
             .block_on(async move { store.put(&path, buffer.into()).await })?;
 
-        Ok(())
+        Ok(FileMeta {
+            location,
+            last_modified: 0,
+            size,
+        })
     }
 }
 
@@ -704,13 +702,11 @@ mod tests {
 
         // Wrap in FilteredEngineData with all rows selected
         let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<crate::FilteredEngineData>> + Send> =
-            Box::new(std::iter::once(Ok(filtered_data)));
 
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter)
+            .write_parquet_file(file_url.clone(), filtered_data)
             .unwrap();
 
         // Verify we can read the file back
@@ -774,13 +770,11 @@ mod tests {
 
         // Wrap in FilteredEngineData with all rows selected
         let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
-        let data_iter: Box<dyn Iterator<Item = DeltaResult<crate::FilteredEngineData>> + Send> =
-            Box::new(std::iter::once(Ok(filtered_data)));
 
         // Write the data
         let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter)
+            .write_parquet_file(file_url.clone(), filtered_data)
             .unwrap();
 
         // Read it back

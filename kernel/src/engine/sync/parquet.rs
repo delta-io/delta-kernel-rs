@@ -2,10 +2,10 @@ use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use std::fs::File;
+use std::time::SystemTime;
 use url::Url;
 
 use super::read_files;
-use crate::arrow::array::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     filter_to_record_batch, fixup_parquet_read, generate_mask, get_requested_indices,
@@ -57,34 +57,34 @@ impl ParquetHandler for SyncParquetHandler {
 
     fn write_parquet_file(
         &self,
-        url: Url,
-        data: Box<dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send + '_>,
-    ) -> DeltaResult<()> {
-        // Collect all ArrowEngineData batches first, applying selection filters
-        let batches: Vec<RecordBatch> = data
-            .map(|filtered| filter_to_record_batch(filtered?))
-            .collect::<DeltaResult<_>>()?;
-
-        // If there are no batches, return early
-        if batches.is_empty() {
-            return Ok(());
-        }
+        location: Url,
+        data: crate::FilteredEngineData,
+    ) -> DeltaResult<FileMeta> {
+        // Convert FilteredEngineData to RecordBatch, applying selection filter
+        let batch = filter_to_record_batch(data)?;
 
         // Convert URL to file path
-        let path = url
+        let path = location
             .to_file_path()
-            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", url)))?;
+            .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", location)))?;
         let mut file = File::create(&path)?;
 
-        let mut writer = ArrowWriter::try_new(&mut file, batches[0].schema(), None)?;
-
-        for batch in &batches {
-            writer.write(batch)?;
-        }
-
+        let mut writer = ArrowWriter::try_new(&mut file, batch.schema(), None)?;
+        writer.write(&batch)?;
         writer.close()?; // writer must be closed to write footer
 
-        Ok(())
+        let meta = file.metadata()?;
+        let last_modified = meta
+            .modified()?
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| crate::Error::generic(format!("Invalid file timestamp: {}", e)))?
+            .as_millis() as i64;
+
+        Ok(FileMeta {
+            location,
+            last_modified,
+            size: meta.len(),
+        })
     }
 }
 
@@ -120,12 +120,11 @@ mod tests {
 
         // Wrap in FilteredEngineData with all rows selected
         let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
-        let data_iter: Box<
-            dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send,
-        > = Box::new(std::iter::once(Ok(filtered_data)));
 
         // Write the file
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), filtered_data)
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());
@@ -208,12 +207,10 @@ mod tests {
         let filtered_data =
             crate::FilteredEngineData::try_new(engine_data, selection_vector).unwrap();
 
-        let data_iter: Box<
-            dyn Iterator<Item = crate::DeltaResult<crate::FilteredEngineData>> + Send,
-        > = Box::new(std::iter::once(Ok(filtered_data)));
-
         // Write the file with filter applied
-        handler.write_parquet_file(url.clone(), data_iter).unwrap();
+        handler
+            .write_parquet_file(url.clone(), filtered_data)
+            .unwrap();
 
         // Verify the file exists
         assert!(file_path.exists());

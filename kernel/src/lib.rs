@@ -694,16 +694,16 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `url` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
-    /// - `data` - The data to write to the Parquet file, as EngineData.
+    /// - `data` - The data to write to the Parquet file, as FilteredEngineData.
     ///
     /// # Returns
     ///
     /// A [`DeltaResult`] indicating success or failure.
     fn write_parquet_file(
         &self,
-        url: url::Url,
-        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
-    ) -> DeltaResult<()>;
+        location: url::Url,
+        data: FilteredEngineData,
+    ) -> DeltaResult<FileMeta>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
