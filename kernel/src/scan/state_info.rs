@@ -41,6 +41,7 @@ impl StateInfo {
         predicate: Option<PredicateRef>,
         classifier: C,
     ) -> DeltaResult<Self> {
+        let partition_columns = table_configuration.metadata().partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut metadata_field_names = HashSet::new();
@@ -55,6 +56,13 @@ impl StateInfo {
         // This iteration runs in O(supported_number_of_metadata_columns) time since each metadata
         // column can appear at most once in the schema
         for metadata_column in logical_schema.metadata_columns() {
+            // Ensure we don't have a metadata column with same name as a partition column
+            if partition_columns.contains(metadata_column.name()) {
+                return Err(Error::Schema(format!(
+                    "Metadata column names must not match partition columns: {}",
+                    metadata_column.name()
+                )));
+            }
             if let Some(MetadataColumnSpec::RowIndex) = metadata_column.get_metadata_column_spec() {
                 selected_row_index_col_name = Some(metadata_column.name().to_string());
             }
@@ -68,20 +76,7 @@ impl StateInfo {
             {
                 // Classifier has handled this field via a transformation, just push it and move on
                 transform_spec.push(spec);
-            } else if table_configuration
-                .metadata()
-                .partition_columns()
-                .contains(logical_field.name())
-            {
-                // This is a partition column: needs to be injected via transform
-
-                // First ensure we don't have a metadata column with same name as a partition column
-                if logical_field.is_metadata_column() {
-                    return Err(Error::Schema(format!(
-                        "Metadata column names must not match partition columns: {}",
-                        logical_field.name()
-                    )));
-                }
+            } else if partition_columns.contains(logical_field.name()) {
                 // push the transform for this partition column
                 transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
                     field_index: index,
