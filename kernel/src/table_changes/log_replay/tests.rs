@@ -10,7 +10,7 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
-use crate::table_features::TableFeature;
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -539,7 +539,7 @@ async fn data_skipping_filter() {
         Scalar::from(4),
     );
     let logical_schema = get_schema();
-    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
+    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
         Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
         other => panic!("Unexpected result: {other:?}"),
     };
