@@ -189,26 +189,26 @@ pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Sc
         return Ok(None);
     }
 
-    let mut table_schema = snapshot.schema();
+    let mut scan_schema = snapshot.schema();
     if let Some(cols) = args.columns.as_ref() {
         let cols: Vec<&str> = cols.split(",").map(str::trim).collect();
-        table_schema = table_schema.project_as_struct(&cols)?.into();
+        scan_schema = scan_schema.project_as_struct(&cols)?.into();
     }
 
     if args.with_row_index {
-        table_schema = table_schema
+        scan_schema = scan_schema
             .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
             .into();
     }
 
     if args.with_row_id {
-        table_schema = table_schema
+        scan_schema = scan_schema
             .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
             .into();
     }
 
     Ok(Some(
-        snapshot.scan_builder().with_schema(table_schema).build()?,
+        snapshot.scan_builder().with_schema(scan_schema).build()?,
     ))
 }
 
