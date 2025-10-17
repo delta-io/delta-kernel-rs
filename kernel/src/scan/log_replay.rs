@@ -397,7 +397,9 @@ mod tests {
     use crate::expressions::Scalar;
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
-    use crate::scan::state_info::tests::{get_simple_state_info, get_state_info};
+    use crate::scan::state_info::tests::{
+        assert_transform_spec, get_simple_state_info, get_state_info,
+    };
     use crate::scan::state_info::StateInfo;
     use crate::scan::test_utils::{
         add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
@@ -562,6 +564,15 @@ mod tests {
             vec![("row_id", MetadataColumnSpec::RowId)],
         )
         .unwrap();
+
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_transform_spec(
+            transform_spec,
+            false,
+            "row_id_col",
+            "row_indexes_for_row_id_0",
+        );
+
         let batch = vec![add_batch_for_row_id(get_log_schema().clone())];
         let iter = scan_action_iter(
             &SyncEngine::new(),

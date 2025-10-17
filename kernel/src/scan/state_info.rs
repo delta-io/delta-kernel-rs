@@ -235,6 +235,41 @@ pub(crate) mod tests {
         StateInfo::try_new(schema.clone(), &table_configuration, predicate, ())
     }
 
+    pub(crate) fn assert_transform_spec(
+        transform_spec: &TransformSpec,
+        requested_row_indexes: bool,
+        expected_row_id_name: &str,
+        expected_row_index_name: &str,
+    ) {
+        // if we requested row indexes, there's only one transform for the row id col, otherwise the
+        // first transform drops the row index column, and the second one adds the row ids
+        let expected_transform_count = if requested_row_indexes { 1 } else { 2 };
+        let generate_offset = if requested_row_indexes { 0 } else { 1 };
+
+        assert_eq!(transform_spec.len(), expected_transform_count);
+
+        if !requested_row_indexes {
+            // ensure we have a drop transform if we didn't request row indexes
+            match &transform_spec[0] {
+                FieldTransformSpec::StaticDrop { field_name } => {
+                    assert_eq!(field_name, expected_row_index_name);
+                }
+                _ => panic!("Expected StaticDrop transform"),
+            }
+        }
+
+        match &transform_spec[generate_offset] {
+            FieldTransformSpec::GenerateRowId {
+                field_name,
+                row_index_field_name,
+            } => {
+                assert_eq!(field_name, expected_row_id_name);
+                assert_eq!(row_index_field_name, expected_row_index_name);
+            }
+            _ => panic!("Expected GenerateRowId transform"),
+        }
+    }
+
     #[test]
     fn no_partition_columns() {
         // Test case: No partition columns, no column mapping
@@ -420,7 +455,7 @@ pub(crate) mod tests {
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
-                    "some-row-id_col",
+                    "some_row_id_col",
                 ),
             ]),
             vec![("row_id", MetadataColumnSpec::RowId)],
@@ -429,25 +464,44 @@ pub(crate) mod tests {
 
         // Should have a transform spec for the row_id column
         let transform_spec = state_info.transform_spec.as_ref().unwrap();
-        assert_eq!(transform_spec.len(), 2); // one for rowid col, one to drop indexes
+        assert_transform_spec(
+            transform_spec,
+            false, // we did not request row indexes
+            "some_row_id_col",
+            "row_indexes_for_row_id_0",
+        );
+    }
 
-        match &transform_spec[0] {
-            FieldTransformSpec::StaticDrop { field_name } => {
-                assert_eq!(field_name, "row_indexes_for_row_id_0");
-            }
-            _ => panic!("Expected StaticDrop transform"),
-        }
+    #[test]
+    fn request_row_ids_conflicting_row_index_col_name() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::nullable(
+            "row_indexes_for_row_id_0", // this will conflict with the first generated name for row indexes
+            DataType::STRING,
+        )]));
 
-        match &transform_spec[1] {
-            FieldTransformSpec::GenerateRowId {
-                field_name,
-                row_index_field_name,
-            } => {
-                assert_eq!(field_name, "some-row-id_col");
-                assert_eq!(row_index_field_name, "row_indexes_for_row_id_0");
-            }
-            _ => panic!("Expected GenerateRowId transform"),
-        }
+        let state_info = get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            get_string_map(&[
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "some_row_id_col",
+                ),
+            ]),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        )
+        .unwrap();
+
+        // Should have a transform spec for the row_id column
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_transform_spec(
+            transform_spec,
+            false, // we did not request row indexes
+            "some_row_id_col",
+            "row_indexes_for_row_id_1", // ensure we didn't conflict with the col in the schema
+        );
     }
 
     #[test]
@@ -465,7 +519,7 @@ pub(crate) mod tests {
                 ("delta.enableRowTracking", "true"),
                 (
                     "delta.rowTracking.materializedRowIdColumnName",
-                    "some-row-id_col",
+                    "some_row_id_col",
                 ),
             ]),
             vec![
@@ -477,18 +531,12 @@ pub(crate) mod tests {
 
         // Should have a transform spec for the row_id column
         let transform_spec = state_info.transform_spec.as_ref().unwrap();
-        assert_eq!(transform_spec.len(), 1); // just one because we don't want to drop indexes now
-
-        match &transform_spec[0] {
-            FieldTransformSpec::GenerateRowId {
-                field_name,
-                row_index_field_name,
-            } => {
-                assert_eq!(field_name, "some-row-id_col");
-                assert_eq!(row_index_field_name, "row_index");
-            }
-            _ => panic!("Expected GenerateRowId transform"),
-        }
+        assert_transform_spec(
+            transform_spec,
+            true, // we did request row indexes
+            "some_row_id_col",
+            "row_index",
+        );
     }
 
     #[test]
