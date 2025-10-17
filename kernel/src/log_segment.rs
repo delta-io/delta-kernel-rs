@@ -393,18 +393,12 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
-        // Nothing to do if there are no checkpoint parts
-        if self.checkpoint_parts.is_empty() {
-            return Ok(std::iter::empty::<DeltaResult<ActionsBatch>>());
-        }
-
-        let checkpoint_read_schema = if !need_file_actions || action_schema.contains(SIDECAR_NAME) {
-            action_schema.clone()
-        } else {
-            Arc::new(
-                action_schema.add([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])?,
-            )
-        };
+        let checkpoint_read_schema = 
+            if !need_file_actions || action_schema.contains(SIDECAR_NAME) {
+                action_schema.clone()
+            } else {
+                Arc::new(action_schema.add([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])?)
+            };
 
         let checkpoint_file_meta: Vec<_> = self
             .checkpoint_parts
