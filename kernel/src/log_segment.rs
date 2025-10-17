@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    get_log_schema, schema_contains_file_actions, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME,
     SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
@@ -369,8 +369,7 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
-            || checkpoint_read_schema.contains(REMOVE_NAME);
+        let need_file_actions = schema_contains_file_actions(&checkpoint_read_schema);
 
         // Only validate sidecar requirement if we actually have checkpoint files
         if !self.checkpoint_parts.is_empty() {

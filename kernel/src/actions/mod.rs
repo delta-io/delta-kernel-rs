@@ -132,6 +132,13 @@ pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
 }
 
+/// Returns true if the schema contains file actions (add or remove)
+/// columns.
+#[internal_api]
+pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
+    schema.contains(ADD_NAME) || schema.contains(REMOVE_NAME)
+}
+
 /// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
 ///
 /// This is useful for JSON conversion, as it allows us to wrap a dynamically maintained add action
@@ -1973,5 +1980,37 @@ mod tests {
         // reader/writer features are null
         assert!(record_batch.column(2).is_null(0));
         assert!(record_batch.column(3).is_null(0));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_add() {
+        let schema = get_log_schema().project(&[ADD_NAME]).unwrap();
+        assert!(schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_remove() {
+        let schema = get_log_schema().project(&[REMOVE_NAME]).unwrap();
+        assert!(schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_both() {
+        let schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap();
+        assert!(schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_neither() {
+        let schema = get_log_schema()
+            .project(&[PROTOCOL_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_empty_schema() {
+        let schema = Arc::new(StructType::new_unchecked([]));
+        assert!(!schema_contains_file_actions(&schema));
     }
 }
