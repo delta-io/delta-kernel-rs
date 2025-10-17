@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::expressions::Scalar;
+use crate::expressions::{Expression, Scalar};
 use crate::scan::StateInfo;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
@@ -72,6 +72,8 @@ pub(crate) fn scan_file_physical_schema(
 
 // Get the transform expression for a CDF scan file
 //
+// Returns None when no transformation is needed (identity transform), otherwise returns Some(expr).
+//
 // Note: parse_partition_values returns null values for missing partition columns,
 // and CDF metadata columns (commit_timestamp, commit_version, change_type) are then
 // added to overwrite any conflicting values. This behavior can be made more strict by changing
@@ -81,7 +83,7 @@ pub(crate) fn get_cdf_transform_expr(
     scan_file: &CdfScanFile,
     state_info: &StateInfo,
     physical_schema: &StructType,
-) -> DeltaResult<ExpressionRef> {
+) -> DeltaResult<Option<ExpressionRef>> {
     let mut partition_values = HashMap::new();
 
     // Get the transform spec from StateInfo (if present)
@@ -104,7 +106,16 @@ pub(crate) fn get_cdf_transform_expr(
     let cdf_values = get_cdf_columns(&state_info.logical_schema, scan_file)?;
     partition_values.extend(cdf_values);
 
-    get_transform_expr(transform_spec, partition_values, physical_schema)
+    let expr = get_transform_expr(transform_spec, partition_values, physical_schema)?;
+
+    // Return None for identity transforms to avoid unnecessary expression evaluation
+    if let Expression::Transform(ref transform) = *expr {
+        if transform.is_identity() {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(expr))
 }
 
 #[cfg(test)]
@@ -192,7 +203,9 @@ mod tests {
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
         assert!(result.is_ok());
 
-        let expr = result.unwrap();
+        let expr_opt = result.unwrap();
+        assert!(expr_opt.is_some(), "Expected Some(expr) but got None");
+        let expr = expr_opt.unwrap();
         let Expression::Transform(transform) = expr.as_ref() else {
             panic!("Expected Transform expression");
         };
@@ -236,7 +249,9 @@ mod tests {
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
         assert!(result.is_ok());
 
-        let expr = result.unwrap();
+        let expr_opt = result.unwrap();
+        assert!(expr_opt.is_some(), "Expected Some(expr) but got None");
+        let expr = expr_opt.unwrap();
         let Expression::Transform(transform) = expr.as_ref() else {
             panic!("Expected Transform expression");
         };
@@ -283,7 +298,9 @@ mod tests {
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
         assert!(result.is_ok());
 
-        let expr = result.unwrap();
+        let expr_opt = result.unwrap();
+        assert!(expr_opt.is_some(), "Expected Some(expr) but got None");
+        let expr = expr_opt.unwrap();
         let Expression::Transform(transform) = expr.as_ref() else {
             panic!("Expected Transform expression");
         };
@@ -339,5 +356,50 @@ mod tests {
         remove_file.scan_type = CdfScanFileType::Remove;
         let result = scan_file_physical_schema(&remove_file, &physical_schema);
         assert_eq!(result.fields().len(), 2); // No change
+    }
+
+    #[test]
+    fn test_get_cdf_transform_expr_returns_none_for_identity() {
+        // When there's no transform spec and no CDF metadata columns in the schema,
+        // the function should return None (identity transform)
+        let scan_file = CdfScanFile {
+            path: "test/file.parquet".to_string(),
+            partition_values: HashMap::new(),
+            scan_type: CdfScanFileType::Add,
+            commit_version: 100,
+            commit_timestamp: 1000000000000,
+            dv_info: DvInfo::default(),
+            remove_dv: None,
+        };
+
+        // Create a simple schema without CDF metadata columns
+        let logical_schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("name", DataType::STRING),
+        ]));
+
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::nullable("name", DataType::STRING),
+        ]);
+
+        // Empty transform spec - no transformations needed
+        let transform_spec = vec![];
+
+        let state_info = StateInfo {
+            logical_schema,
+            physical_schema: physical_schema.clone().into(),
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: Some(Arc::new(transform_spec)),
+        };
+
+        let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
+        assert!(result.is_ok());
+
+        let expr_opt = result.unwrap();
+        assert!(
+            expr_opt.is_none(),
+            "Expected None for identity transform but got Some(expr)"
+        );
     }
 }

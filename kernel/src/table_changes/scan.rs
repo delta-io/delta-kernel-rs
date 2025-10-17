@@ -239,11 +239,14 @@ fn read_scan_file(
         scan_file_physical_schema(&scan_file, state_info.physical_schema.as_ref());
     let transform_expr = get_cdf_transform_expr(&scan_file, state_info, physical_schema.as_ref())?;
 
-    let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
-        physical_schema.clone(),
-        transform_expr,
-        state_info.logical_schema.clone().into(),
-    );
+    // Only create an evaluator if transformation is needed
+    let phys_to_logical_eval = transform_expr.map(|expr| {
+        engine.evaluation_handler().new_expression_evaluator(
+            physical_schema.clone(),
+            expr,
+            state_info.logical_schema.clone().into(),
+        )
+    });
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
@@ -261,8 +264,13 @@ fn read_scan_file(
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
-        // to transform the physical data into the correct logical form
-        let logical = phys_to_logical_eval.evaluate(batch.as_ref());
+        // Transform the physical data into the correct logical form, or pass through unchanged
+        let logical = if let Some(ref eval) = phys_to_logical_eval {
+            eval.evaluate(batch.as_ref())
+        } else {
+            // No transformation needed - pass through the batch as-is
+            Ok(batch)
+        };
         let len = logical.as_ref().map_or(0, |res| res.len());
         // need to split the dv_mask. what's left in dv_mask covers this result, and rest
         // will cover the following results. we `take()` out of `selection_vector` to avoid
