@@ -1108,7 +1108,9 @@ mod tests {
         ];
 
         for (predicate, expected) in test_cases {
-            let result = PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::Name).ok();
+            let result =
+                PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::Name)
+                    .ok();
             assert_eq!(
                 result, expected,
                 "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"

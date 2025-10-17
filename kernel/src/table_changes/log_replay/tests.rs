@@ -539,10 +539,11 @@ async fn data_skipping_filter() {
         Scalar::from(4),
     );
     let logical_schema = get_schema();
-    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
-        Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
-        other => panic!("Unexpected result: {other:?}"),
-    };
+    let predicate =
+        match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
+            Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+            other => panic!("Unexpected result: {other:?}"),
+        };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
         .into_iter();
