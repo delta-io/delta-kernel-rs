@@ -7,7 +7,7 @@ use delta_kernel::{
     arrow::array::RecordBatch,
     engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
     scan::Scan,
-    schema::{MetadataColumnSpec, Schema},
+    schema::MetadataColumnSpec,
     DeltaResult, SnapshotRef,
 };
 
@@ -189,61 +189,26 @@ pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Sc
         return Ok(None);
     }
 
-    let read_schema_opt = args
-        .columns
-        .as_ref()
-        .map(|cols| -> DeltaResult<_> {
-            let table_schema = snapshot.schema();
-            let cols: Vec<&str> = cols.split(",").map(str::trim).collect();
-            let selected_fields = cols.iter().map(|col| {
-                table_schema
-                    .field(col)
-                    .cloned()
-                    .ok_or(delta_kernel::Error::Generic(format!(
-                        "Table has no such column: {col}"
-                    )))
-            });
-            let schema = Schema::try_from_results(selected_fields);
-            let schema = if args.with_row_index {
-                schema.and_then(|schema| {
-                    schema.add_metadata_column("row_index", MetadataColumnSpec::RowIndex)
-                })
-            } else {
-                schema
-            };
-            schema.map(Arc::new)
-        })
-        .transpose()?;
+    let mut table_schema = snapshot.schema();
+    if let Some(cols) = args.columns.as_ref() {
+        let cols: Vec<&str> = cols.split(",").map(str::trim).collect();
+        table_schema = table_schema.project_as_struct(&cols)?.into();
+    }
 
-    let read_schema_opt = read_schema_opt.or_else(|| {
-        (args.with_row_index || args.with_row_id).then(|| {
-            let schema = snapshot.schema();
-            let schema = if args.with_row_index {
-                Arc::new(
-                    schema
-                        .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)
-                        .unwrap(),
-                )
-            } else {
-                schema
-            };
-            if args.with_row_id {
-                Arc::new(
-                    schema
-                        .add_metadata_column("_metadata.row_id", MetadataColumnSpec::RowId)
-                        .unwrap(),
-                )
-            } else {
-                schema
-            }
-        })
-    });
+    if args.with_row_index {
+        table_schema = table_schema
+            .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
+            .into();
+    }
+
+    if args.with_row_id {
+        table_schema = table_schema
+            .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
+            .into();
+    }
 
     Ok(Some(
-        snapshot
-            .scan_builder()
-            .with_schema_opt(read_schema_opt)
-            .build()?,
+        snapshot.scan_builder().with_schema(table_schema).build()?,
     ))
 }
 
