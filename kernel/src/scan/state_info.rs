@@ -41,7 +41,6 @@ impl StateInfo {
         predicate: Option<PredicateRef>,
         classifier: C,
     ) -> DeltaResult<Self> {
-        let partition_columns = table_configuration.metadata().partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut metadata_field_names = HashSet::new();
@@ -69,7 +68,11 @@ impl StateInfo {
             {
                 // Classifier has handled this field via a transformation, just push it and move on
                 transform_spec.push(spec);
-            } else if partition_columns.contains(logical_field.name()) {
+            } else if table_configuration
+                .metadata()
+                .partition_columns()
+                .contains(logical_field.name())
+            {
                 // This is a partition column: needs to be injected via transform
 
                 // First ensure we don't have a metadata column with same name as a partition column
