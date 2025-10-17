@@ -175,8 +175,12 @@ impl AddRemoveDedupVisitor<'_> {
             Some(transform) if is_add => {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values =
-                    parse_partition_values(&self.state_info.logical_schema, transform, &partition_values, self.state_info.column_mapping_mode)?;
+                let partition_values = parse_partition_values(
+                    &self.state_info.logical_schema,
+                    transform,
+                    &partition_values,
+                    self.state_info.column_mapping_mode,
+                )?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -193,7 +197,13 @@ impl AddRemoveDedupVisitor<'_> {
             .state_info
             .transform_spec
             .as_ref()
-            .map(|transform| get_transform_expr(transform, partition_values, &self.state_info.physical_schema))
+            .map(|transform| {
+                get_transform_expr(
+                    transform,
+                    partition_values,
+                    &self.state_info.physical_schema,
+                )
+            })
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
