@@ -27,6 +27,67 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
 }
 
+/// Validating the metadata columns also extracts information needed to properly construct the full
+/// `StateInfo`. We use this struct to group this information so it can be cleanly passed back from
+/// `validate_metadata_columns`
+#[derive(Default)]
+struct MetadataInfo<'a> {
+    /// What are the names of the requested metadata fields
+    metadata_field_names: HashSet<&'a String>,
+    /// The name of the column that's selecting row indexes if that's been requested or None if they
+    /// are not requested .  We remember this if it's been requested explicitly. this is so we can
+    /// reference this column and not re-add it as a requested column if we're _also_ requesting
+    /// row-ids.
+    selected_row_index_col_name: Option<&'a String>,
+    /// the materializedRowIdColumnName extracted from the table config if row ids are requested, or
+    /// None if they are not requested
+    materialized_row_id_column_name: Option<&'a String>,
+}
+
+/// This validates that we have sensible metadata columns, and that the requested metadata is
+/// supported by the table. Also computes and returns any extra info needed to build the transform
+/// for the requested columns.
+// Runs in O(supported_number_of_metadata_columns) time since each metadata
+// column can appear at most once in the schema
+fn validate_metadata_columns<'a>(
+    logical_schema: &'a SchemaRef,
+    table_configuration: &'a TableConfiguration,
+) -> DeltaResult<MetadataInfo<'a>> {
+    let mut metadata_info = MetadataInfo::default();
+    let partition_columns = table_configuration.metadata().partition_columns();
+    for metadata_column in logical_schema.metadata_columns() {
+        // Ensure we don't have a metadata column with same name as a partition column
+        if partition_columns.contains(metadata_column.name()) {
+            return Err(Error::Schema(format!(
+                "Metadata column names must not match partition columns: {}",
+                metadata_column.name()
+            )));
+        }
+        match metadata_column.get_metadata_column_spec() {
+            Some(MetadataColumnSpec::RowIndex) => {
+                metadata_info.selected_row_index_col_name = Some(metadata_column.name());
+            }
+            Some(MetadataColumnSpec::RowId) => {
+                if table_configuration.table_properties().enable_row_tracking != Some(true) {
+                    return Err(Error::unsupported("Row ids are not enabled on this table"));
+                }
+                let row_id_col = table_configuration
+                    .metadata()
+                    .configuration()
+                    .get("delta.rowTracking.materializedRowIdColumnName")
+                    .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
+                metadata_info.materialized_row_id_column_name = Some(row_id_col);
+            }
+            Some(MetadataColumnSpec::RowCommitVersion) => {}
+            None => {}
+        }
+        metadata_info
+            .metadata_field_names
+            .insert(metadata_column.name());
+    }
+    Ok(metadata_info)
+}
+
 impl StateInfo {
     /// Create StateInfo with a custom field classifier for different scan types.
     /// Get the state needed to process a scan.
@@ -44,30 +105,10 @@ impl StateInfo {
         let partition_columns = table_configuration.metadata().partition_columns();
         let column_mapping_mode = table_configuration.column_mapping_mode();
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut metadata_field_names = HashSet::new();
         let mut transform_spec = Vec::new();
         let mut last_physical_field: Option<String> = None;
 
-        // We remember the name of the column that's selecting row indexes, if it's been requested
-        // explicitly. this is so we can reference this column and not re-add it as a requested
-        // column if we're _also_ requesting row-ids
-        let mut selected_row_index_col_name = None;
-
-        // This iteration runs in O(supported_number_of_metadata_columns) time since each metadata
-        // column can appear at most once in the schema
-        for metadata_column in logical_schema.metadata_columns() {
-            // Ensure we don't have a metadata column with same name as a partition column
-            if partition_columns.contains(metadata_column.name()) {
-                return Err(Error::Schema(format!(
-                    "Metadata column names must not match partition columns: {}",
-                    metadata_column.name()
-                )));
-            }
-            if let Some(MetadataColumnSpec::RowIndex) = metadata_column.get_metadata_column_spec() {
-                selected_row_index_col_name = Some(metadata_column.name().to_string());
-            }
-            metadata_field_names.insert(metadata_column.name());
-        }
+        let metadata_info = validate_metadata_columns(&logical_schema, table_configuration)?;
 
         // Loop over all selected fields and build both the physical schema and transform spec
         for (index, logical_field) in logical_schema.fields().enumerate() {
@@ -86,22 +127,8 @@ impl StateInfo {
                 // Regular field field or a metadata column, figure out which and handle it
                 match logical_field.get_metadata_column_spec() {
                     Some(MetadataColumnSpec::RowId) => {
-                        if table_configuration.table_properties().enable_row_tracking != Some(true)
-                        {
-                            return Err(Error::unsupported(
-                                "Row ids are not enabled on this table",
-                            ));
-                        }
-
-                        let row_id_col = table_configuration
-                            .metadata()
-                            .configuration()
-                            .get("delta.rowTracking.materializedRowIdColumnName")
-                            .ok_or(Error::generic("No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration"))?;
-
-                        // we can `take` as we should only have one RowId col
-                        let index_column_name = match selected_row_index_col_name.take() {
-                            Some(index_column_name) => index_column_name,
+                        let index_column_name = match metadata_info.selected_row_index_col_name {
+                            Some(index_column_name) => index_column_name.to_string(),
                             None => {
                                 // the index column isn't being explicitly requested, so add it to
                                 // `read_fields` so the parquet_reader will generate it, and add a
@@ -124,10 +151,16 @@ impl StateInfo {
                                 index_column_name
                             }
                         };
+                        let Some(row_id_col_name) = metadata_info.materialized_row_id_column_name
+                        else {
+                            return Err(Error::internal_error(
+                                "Should always return a materialized_row_id_column_name if selecting row ids"
+                            ));
+                        };
 
-                        read_fields.push(StructField::nullable(row_id_col, DataType::LONG));
+                        read_fields.push(StructField::nullable(row_id_col_name, DataType::LONG));
                         transform_spec.push(FieldTransformSpec::GenerateRowId {
-                            field_name: row_id_col.to_string(),
+                            field_name: row_id_col_name.to_string(),
                             row_index_field_name: index_column_name,
                         });
                     }
@@ -142,7 +175,7 @@ impl StateInfo {
                         let physical_name = physical_field.name.clone();
 
                         if !logical_field.is_metadata_column()
-                            && metadata_field_names.contains(&physical_name)
+                            && metadata_info.metadata_field_names.contains(&physical_name)
                         {
                             return Err(Error::Schema(format!(
                                 "Metadata column names must not match physical columns, but logical column '{}' has physical name '{}'",
@@ -614,7 +647,7 @@ pub(crate) mod tests {
             vec![],
             None,
             get_string_map(&[("delta.columnMapping.mode", "name")]),
-            vec![("other", MetadataColumnSpec::RowId)],
+            vec![("other", MetadataColumnSpec::RowIndex)],
         ) {
             Ok(_) => {
                 panic!("Should not have succeeded generating state info with invalid config")
