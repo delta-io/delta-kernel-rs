@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
@@ -28,7 +28,6 @@ use crate::engine::arrow_utils::{
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
-use crate::transaction::add_files_schema;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -67,7 +66,6 @@ impl DataFileMetadata {
     fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
-        data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
@@ -99,7 +97,6 @@ impl DataFileMetadata {
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
-        let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
         let stats = Arc::new(StructArray::try_new_with_length(
             vec![Field::new("numRecords", DataType::Int64, true)].into(),
@@ -109,15 +106,12 @@ impl DataFileMetadata {
         )?);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(add_files_schema().as_ref().try_into_arrow()?),
-            vec![
-                path,
-                partitions,
-                size,
-                modification_time,
-                data_change,
-                stats,
-            ],
+            Arc::new(
+                crate::transaction::BASE_ADD_FILES_SCHEMA
+                    .as_ref()
+                    .try_into_arrow()?,
+            ),
+            vec![path, partitions, size, modification_time, stats],
         )?)))
     }
 }
@@ -192,16 +186,18 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
     /// is a generated UUIDv4).
     ///
-    /// [add file metadata]: crate::transaction::add_files_schema
+    /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
+    /// use [`crate::transaction::Transaction::with_data_change`].
+    ///
+    /// [add file metadata]: crate::transaction::Transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
-        data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self.write_parquet(path, data).await?;
-        parquet_metadata.as_record_batch(&partition_values, data_change)
+        parquet_metadata.as_record_batch(&partition_values)
     }
 }
 
@@ -504,14 +500,13 @@ mod tests {
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
         let data_file_metadata = DataFileMetadata::new(file_metadata, num_records);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
-        let data_change = true;
         let actual = data_file_metadata
-            .as_record_batch(&partition_values, data_change)
+            .as_record_batch(&partition_values)
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::add_files_schema()
+            crate::transaction::BASE_ADD_FILES_SCHEMA
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),
@@ -544,7 +539,6 @@ mod tests {
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
-                Arc::new(BooleanArray::from(vec![data_change])),
                 Arc::new(stats_struct),
             ],
         )

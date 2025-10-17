@@ -6,7 +6,6 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::DomainMetadata;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
-use crate::transaction::add_files_schema;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Snapshot};
 
@@ -70,7 +69,8 @@ impl TryFrom<RowTrackingDomainMetadata> for DomainMetadata {
 
 /// A row visitor that iterates over preliminary [`Add`] actions as returned by the engine and
 /// computes a base row ID for each action.
-/// It expects to visit engine data conforming to the schema returned by [`add_files_schema()`].
+/// It expects to visit engine data with a nested field 'stats.numRecords' which is
+/// part of a Delta add action.
 ///
 /// This visitor is only required for the row tracking write path. The read path will be completely
 /// implemented via expressions.
@@ -88,11 +88,6 @@ impl RowTrackingVisitor {
     /// Default value for an absent high water mark
     const DEFAULT_HIGH_WATER_MARK: i64 = -1;
 
-    /// Field index of "numRecords" in the [`add_files_schema()`]
-    ///
-    /// We verify this hard-coded index in a test.
-    const NUM_RECORDS_FIELD_INDEX: usize = 5;
-
     pub(crate) fn new(row_id_high_water_mark: Option<i64>, num_batches: Option<usize>) -> Self {
         // A table might not have a row ID high water mark yet, so we model the input as an Option<i64>
         Self {
@@ -104,14 +99,19 @@ impl RowTrackingVisitor {
 
 impl RowVisitor for RowTrackingVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| add_files_schema().leaves(None));
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
+            (
+                vec![ColumnName::new(["stats", "numRecords"])],
+                vec![DataType::LONG],
+            )
+                .into()
+        });
         NAMES_AND_TYPES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == add_files_schema().num_fields(),
+            getters.len() == 1,
             Error::generic(format!(
                 "Wrong number of RowTrackingVisitor getters: {}",
                 getters.len()
@@ -123,14 +123,12 @@ impl RowVisitor for RowTrackingVisitor {
 
         let mut current_hwm = self.row_id_high_water_mark;
         for i in 0..row_count {
-            let num_records: i64 = getters[Self::NUM_RECORDS_FIELD_INDEX]
-                .get_opt(i, "numRecords")?
-                .ok_or_else(|| {
-                    Error::InternalError(
-                        "numRecords must be present in Add actions when row tracking is enabled."
-                            .to_string(),
-                    )
-                })?;
+            let num_records: i64 = getters[0].get_opt(i, "numRecords")?.ok_or_else(|| {
+                Error::InternalError(
+                    "numRecords must be present in Add actions when row tracking is enabled."
+                        .to_string(),
+                )
+            })?;
             batch_base_row_ids.push(current_hwm + 1);
             current_hwm += num_records;
         }
@@ -168,46 +166,15 @@ mod tests {
         }
     }
 
-    fn create_getters<'a>(
-        num_records_mock: &'a MockGetData,
-        unit_mock: &'a (),
-    ) -> Vec<&'a dyn GetData<'a>> {
-        let schema = add_files_schema();
-        let mut getters: Vec<&'a dyn GetData<'a>> = Vec::new();
-
-        for i in 0..schema.num_fields() {
-            if i == RowTrackingVisitor::NUM_RECORDS_FIELD_INDEX {
-                getters.push(num_records_mock);
-            } else {
-                getters.push(unit_mock);
-            }
-        }
-        getters
-    }
-
-    #[test]
-    fn test_num_records_field_index() {
-        // Verify that the correct numRecords field index is hard-coded in the RowTrackingVisitor
-        let num_records_field_index = add_files_schema()
-            .leaves(None)
-            .as_ref()
-            .0
-            .iter()
-            .position(|name| name.path().last() == Some(&"numRecords".to_string()))
-            .expect("numRecords field not found");
-
-        assert_eq!(
-            num_records_field_index,
-            RowTrackingVisitor::NUM_RECORDS_FIELD_INDEX
-        );
+    fn create_getters<'a>(num_records_mock: &'a MockGetData) -> Vec<&'a dyn GetData<'a>> {
+        vec![num_records_mock]
     }
 
     #[test]
     fn test_visit_basic_functionality() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(None, Some(1));
         let num_records_mock = MockGetData::new(vec![Some(10), Some(5), Some(20)]);
-        let unit_mock = ();
-        let getters = create_getters(&num_records_mock, &unit_mock);
+        let getters = create_getters(&num_records_mock);
 
         visitor.visit(3, &getters)?;
 
@@ -225,8 +192,7 @@ mod tests {
     fn test_visit_with_negative_high_water_mark() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(-5), Some(1));
         let num_records_mock = MockGetData::new(vec![Some(3), Some(2)]);
-        let unit_mock = ();
-        let getters = create_getters(&num_records_mock, &unit_mock);
+        let getters = create_getters(&num_records_mock);
 
         visitor.visit(2, &getters)?;
 
@@ -244,8 +210,7 @@ mod tests {
     fn test_visit_with_zero_records() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(10), Some(1));
         let num_records_mock = MockGetData::new(vec![Some(0), Some(0), Some(5)]);
-        let unit_mock = ();
-        let getters = create_getters(&num_records_mock, &unit_mock);
+        let getters = create_getters(&num_records_mock);
 
         visitor.visit(3, &getters)?;
 
@@ -263,8 +228,7 @@ mod tests {
     fn test_visit_empty_batch() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(42), None);
         let num_records_mock = MockGetData::new(vec![]);
-        let unit_mock = ();
-        let getters = create_getters(&num_records_mock, &unit_mock);
+        let getters = create_getters(&num_records_mock);
 
         visitor.visit(0, &getters)?;
 
@@ -279,16 +243,15 @@ mod tests {
     #[test]
     fn test_visit_multiple_batches() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(0), Some(2));
-        let unit_mock = ();
 
         // First batch
         let num_records_mock1 = MockGetData::new(vec![Some(10), Some(5)]);
-        let getters1 = create_getters(&num_records_mock1, &unit_mock);
+        let getters1 = create_getters(&num_records_mock1);
         visitor.visit(2, &getters1)?;
 
         // Second batch
         let num_records_mock2 = MockGetData::new(vec![Some(3), Some(7), Some(2)]);
-        let getters2 = create_getters(&num_records_mock2, &unit_mock);
+        let getters2 = create_getters(&num_records_mock2);
         visitor.visit(3, &getters2)?;
 
         // Check that we have two batches
@@ -309,8 +272,7 @@ mod tests {
     #[test]
     fn test_visit_wrong_getter_count() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(0), None);
-        let unit_mock = ();
-        let wrong_getters: Vec<&dyn GetData<'_>> = vec![&unit_mock]; // Only one getter instead of expected count
+        let wrong_getters: Vec<&dyn GetData<'_>> = vec![]; // No getters instead of expected count
 
         let result = visitor.visit(1, &wrong_getters);
         assert_result_error_with_message(result, "Wrong number of RowTrackingVisitor getters");
@@ -322,8 +284,7 @@ mod tests {
     fn test_visit_missing_num_records() -> DeltaResult<()> {
         let mut visitor = RowTrackingVisitor::new(Some(0), None);
         let num_records_mock = MockGetData::new(vec![None]); // Missing numRecords
-        let unit_mock = ();
-        let getters = create_getters(&num_records_mock, &unit_mock);
+        let getters = create_getters(&num_records_mock);
 
         let result = visitor.visit(1, &getters);
         assert_result_error_with_message(
@@ -339,10 +300,8 @@ mod tests {
         let visitor = RowTrackingVisitor::new(Some(0), None);
         let (names, types) = visitor.selected_column_names_and_types();
 
-        // Should return the same as add_files_schema().leaves(None)
-        let expected = add_files_schema().leaves(None);
-        assert_eq!(names, expected.as_ref().0);
-        assert_eq!(types, expected.as_ref().1);
+        assert_eq!(names, (vec![ColumnName::new(["stats", "numRecords"])]));
+        assert_eq!(types, vec![DataType::LONG]);
     }
 
     #[test]

@@ -36,7 +36,8 @@ impl LogPath {
         Ok(Self(parsed))
     }
 
-    /// Create a new staged commit log path given the table root and filename and metadata.
+    /// Create a new staged commit log path given the table root and filename and metadata. The
+    /// table_root must point to the root of the table and end with a '/'.
     pub fn staged_commit(
         table_root: Url,
         filename: &str,
@@ -44,18 +45,18 @@ impl LogPath {
         size: FileSize,
     ) -> DeltaResult<LogPath> {
         // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
+        if !table_root.path().ends_with('/') {
+            return Err(Error::invalid_table_location(table_root));
+        }
 
-        // require table_root ends with '/'
-        require!(
-            table_root.path().ends_with('/'),
-            Error::generic("table root must be a directory-like URL ending with '/'")
-        );
-        let location = table_root
-            .join("_delta_log/")?
-            .join("_staged_commits/")?
-            .join(filename)?;
+        let commit_path = table_root
+            .join("_delta_log/")
+            .and_then(|url| url.join("_staged_commits/"))
+            .and_then(|url| url.join(filename))
+            .map_err(|_| Error::invalid_table_location(table_root))?;
+
         let file_meta = FileMeta {
-            location,
+            location: commit_path,
             last_modified,
             size,
         };
@@ -100,7 +101,9 @@ mod test {
         // table root not ending with '/'
         let table_root = Url::from_str("s3://my-bucket/my-table").unwrap();
         let filename = "00000000000000000010.3a0d65cd-4a56-49a8-937b-95f9e3ee90e5.json";
-        LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
+        let err =
+            LogPath::staged_commit(table_root.clone(), filename, last_modified, size).unwrap_err();
+        assert!(matches!(err, Error::InvalidTableLocation(_)));
 
         // filename with path separators
         let table_root = Url::from_str("s3://my-bucket/my-table/").unwrap();
