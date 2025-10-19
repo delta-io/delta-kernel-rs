@@ -93,10 +93,9 @@ mod tests {
         let tmp_dir_local_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
 
         // create a simple table: one int column named 'number'
-        let schema = Arc::new(StructType::new(vec![StructField::nullable(
-            "number",
-            DataType::INTEGER,
-        )]));
+        let schema = Arc::new(
+            StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap(),
+        );
 
         for (table_url, engine, _store, _table_name) in
             setup_test_tables(schema, &[], Some(&tmp_dir_local_url), "test_table").await?
@@ -136,8 +135,11 @@ mod tests {
             // commit!
             ok_or_panic(unsafe { commit(txn, default_engine_handle.shallow_copy()) });
 
+            let snapshot: Arc<Snapshot> = Snapshot::builder_for(table_url.clone())
+                .at_version(1)
+                .build(&engine)?;
+
             // Check versions
-            let snapshot = Arc::new(Snapshot::try_new(table_url.clone(), &engine, Some(1))?);
             assert_eq!(
                 snapshot.clone().get_app_id_version("app_id1", &engine)?,
                 Some(1)
