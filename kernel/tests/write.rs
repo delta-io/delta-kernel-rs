@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use delta_kernel::Error as KernelError;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
+use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
@@ -19,6 +20,7 @@ use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::transaction::CommitResult;
+use tempfile::TempDir;
 
 use test_utils::set_json_value;
 
@@ -31,10 +33,12 @@ use tempfile::tempdir;
 
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
-use test_utils::{create_table, engine_store_setup, setup_test_tables, test_read};
+use test_utils::{
+    assert_result_error_with_message, create_table, engine_store_setup, setup_test_tables,
+    test_read,
+};
 
 mod common;
-use url::Url;
 
 fn validate_txn_id(commit_info: &serde_json::Value) {
     let txn_id = commit_info["txnId"]
@@ -64,7 +68,7 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // commit!
-        txn.commit(&engine)?;
+        let _ = txn.commit(&engine)?;
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -144,7 +148,7 @@ async fn write_data_and_check_result_and_stats(
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -167,7 +171,6 @@ async fn write_data_and_check_result_and_stats(
                     data.as_ref().unwrap(),
                     write_context.as_ref(),
                     HashMap::new(),
-                    true,
                 )
                 .await
         })
@@ -180,17 +183,14 @@ async fn write_data_and_check_result_and_stats(
 
     // commit!
     match txn.commit(engine.as_ref())? {
-        CommitResult::Committed {
-            version,
-            post_commit_stats,
-        } => {
-            assert_eq!(version, expected_since_commit as Version);
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), expected_since_commit as Version);
             assert_eq!(
-                post_commit_stats.commits_since_checkpoint,
+                committed.post_commit_stats().commits_since_checkpoint,
                 expected_since_commit
             );
             assert_eq!(
-                post_commit_stats.commits_since_log_compaction,
+                committed.post_commit_stats().commits_since_log_compaction,
                 expected_since_commit
             );
         }
@@ -216,7 +216,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
-        txn.commit(&engine)?;
+        let _ = txn.commit(&engine)?;
 
         let commit = store
             .get(&Path::from(format!(
@@ -360,7 +360,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
         let txn = snapshot.transaction()?.with_engine_info("default engine");
 
         // Commit without adding any add files
-        txn.commit(&engine)?;
+        assert!(txn.commit(&engine)?.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -434,7 +434,10 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(table_schema.clone(), &[partition_col], None, "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let mut txn = snapshot.transaction()?.with_engine_info("default engine");
+        let mut txn = snapshot
+            .transaction()?
+            .with_engine_info("default engine")
+            .with_data_change(false);
 
         // create two new arrow record batches to append
         let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -462,7 +465,6 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                             data.as_ref().unwrap(),
                             write_context.as_ref(),
                             HashMap::from([(partition_col.to_string(), partition_val.to_string())]),
-                            true,
                         )
                         .await
                 })
@@ -474,7 +476,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // commit!
-        txn.commit(engine.as_ref())?;
+        assert!(txn.commit(engine.as_ref())?.is_committed());
 
         let commit1 = store
             .get(&Path::from(format!(
@@ -523,7 +525,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true,
+                    "dataChange": false,
                     "stats": "{\"numRecords\":3}"
                 }
             }),
@@ -535,7 +537,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     "size": size,
                     "modificationTime": 0,
-                    "dataChange": true,
+                    "dataChange": false,
                     "stats": "{\"numRecords\":3}"
                 }
             }),
@@ -601,7 +603,6 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
                         data.as_ref().unwrap(),
                         write_context.as_ref(),
                         HashMap::new(),
-                        true,
                     )
                     .await
             })
@@ -652,7 +653,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
             .with_transaction_id("app_id2".to_string(), 2);
 
         // commit!
-        txn.commit(&engine)?;
+        assert!(txn.commit(&engine)?.is_committed());
 
         let snapshot = Snapshot::builder_for(table_url.clone())
             .at_version(1)
@@ -806,14 +807,13 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
             &ArrowEngineData::new(data.clone()),
             write_context.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
 
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Verify the commit was written correctly
     let commit1 = store
@@ -831,6 +831,14 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check that the add action exists
     assert!(parsed_commits[1].get("add").is_some());
+    // Ensure default of data change is true.
+    assert!(parsed_commits[1]
+        .get("add")
+        .unwrap()
+        .get("dataChange")
+        .unwrap()
+        .as_bool()
+        .unwrap());
 
     // Verify the data can be read back correctly
     test_read(&ArrowEngineData::new(data), &table_url, engine)?;
@@ -914,7 +922,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1013,14 +1021,13 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
-            true,
         )
         .await?;
 
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -1124,7 +1131,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1185,14 +1192,13 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
-            true,
         )
         .await?;
 
     txn.add_files(add_files_metadata);
 
     // Commit the transaction
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Verify the commit was written correctly
     let commit1_url = tmp_test_dir_url
@@ -1215,6 +1221,347 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let res = test_read(&ArrowEngineData::new(data), &table_url, engine);
     assert!(matches!(res,
         Err(e) if e.to_string().contains("The default engine does not support shredded reads")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let table_name = "test_domain_metadata_basic";
+
+    let (store, engine, table_location) = engine_store_setup(table_name, None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec![],
+        vec!["domainMetadata"],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+    let txn = snapshot.transaction()?;
+
+    // write context does not conflict with domain metadata
+    let _write_context = txn.get_write_context();
+
+    // set multiple domain metadata
+    let domain1 = "app.config";
+    let config1 = r#"{"version": 1}"#;
+    let domain2 = "spark.settings";
+    let config2 = r#"{"cores": 4}"#;
+
+    assert!(txn
+        .with_domain_metadata(domain1.to_string(), config1.to_string())
+        .with_domain_metadata(domain2.to_string(), config2.to_string())
+        .commit(&engine)?
+        .is_committed());
+
+    let commit_data = store
+        .get(&Path::from(format!(
+            "/{table_name}/_delta_log/00000000000000000001.json"
+        )))
+        .await?
+        .bytes()
+        .await?;
+
+    let actions: Vec<serde_json::Value> = Deserializer::from_slice(&commit_data)
+        .into_iter()
+        .try_collect()?;
+
+    let domain_actions: Vec<_> = actions
+        .iter()
+        .filter(|v| v.get("domainMetadata").is_some())
+        .collect();
+
+    for action in &domain_actions {
+        let domain = action["domainMetadata"]["domain"].as_str().unwrap();
+        let config = action["domainMetadata"]["configuration"].as_str().unwrap();
+        assert!(!action["domainMetadata"]["removed"].as_bool().unwrap());
+
+        match domain {
+            d if d == domain1 => assert_eq!(config, config1),
+            d if d == domain2 => assert_eq!(config, config2),
+            _ => panic!("Unexpected domain: {}", domain),
+        }
+    }
+
+    let final_snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let domain1_config = final_snapshot.get_domain_metadata(domain1, &engine)?;
+    assert_eq!(domain1_config, Some(config1.to_string()));
+    let domain2_config = final_snapshot.get_domain_metadata(domain2, &engine)?;
+    assert_eq!(domain2_config, Some(config2.to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let table_name = "test_domain_metadata_errors";
+    let (store, engine, table_location) = engine_store_setup(table_name, None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec![],
+        vec!["domainMetadata"],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+
+    // System domain rejection
+    let txn = snapshot.clone().transaction()?;
+    let res = txn
+        .with_domain_metadata("delta.system".to_string(), "config".to_string())
+        .commit(&engine);
+    assert_result_error_with_message(
+        res,
+        "Cannot modify domains that start with 'delta.' as those are system controlled",
+    );
+
+    // Duplicate domain rejection
+    let txn2 = snapshot.clone().transaction()?;
+    let res = txn2
+        .with_domain_metadata("app.config".to_string(), "v1".to_string())
+        .with_domain_metadata("app.config".to_string(), "v2".to_string())
+        .commit(&engine);
+    assert_result_error_with_message(
+        res,
+        "Metadata for domain app.config already specified in this transaction",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_set_domain_metadata_unsupported_writer_feature(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let table_name = "test_domain_metadata_unsupported";
+
+    // Create table WITHOUT domain metadata writer feature support
+    let (store, engine, table_location) = engine_store_setup(table_name, None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let res = snapshot
+        .transaction()?
+        .with_domain_metadata("app.config".to_string(), "test_config".to_string())
+        .commit(&engine);
+
+    assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
+
+    Ok(())
+}
+
+async fn get_ict_at_version(
+    store: Arc<dyn ObjectStore>,
+    table_url: &Url,
+    version: u64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let commit_path = table_url.join(&format!("_delta_log/{:020}.json", version))?;
+    let commit = store.get(&Path::from_url_path(commit_path.path())?).await?;
+    let commit_content = String::from_utf8(commit.bytes().await?.to_vec())?;
+
+    // Parse each line of the commit log (NDJSON format)
+    // CommitInfo MUST be the first action when ICT is enabled
+    let lines: Vec<_> = commit_content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "Commit log at version {} should not be empty",
+        version
+    );
+
+    // First line should contain commitInfo with inCommitTimestamp
+    let first_action: serde_json::Value = serde_json::from_str(lines[0])?;
+    let commit_info = first_action
+        .get("commitInfo")
+        .expect("First action must be commitInfo when ICT is enabled");
+    let ict = commit_info
+        .get("inCommitTimestamp")
+        .expect("commitInfo must have inCommitTimestamp when ICT is enabled")
+        .as_i64()
+        .unwrap();
+    Ok(ict)
+}
+
+/// Helper function to generate a simple data file and add it to the transaction
+/// This simplifies repetitive data generation in tests
+async fn generate_and_add_data_file(
+    txn: &mut delta_kernel::transaction::Transaction,
+    engine: &DefaultEngine<TokioBackgroundExecutor>,
+    schema: SchemaRef,
+    values: Vec<i32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(values))],
+    )?;
+
+    let write_context = Arc::new(txn.get_write_context());
+    let file_meta = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(file_meta);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a simple table: one int column named 'number' with ICT enabled
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let tmp_dir = TempDir::new()?;
+    let tmp_test_dir_url = Url::from_file_path(&tmp_dir).unwrap();
+
+    let (store, engine, table_location) =
+        engine_store_setup("test_ict_first_commit", Some(&tmp_test_dir_url));
+
+    // Create table with ICT enabled (writer version 7)
+    let table_url = test_utils::create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],                       // no partition columns
+        true,                      // use protocol 3.7
+        vec![],                    // no reader features
+        vec!["inCommitTimestamp"], // Enable ICT! Note: table feature is also set.
+    )
+    .await?;
+
+    // FIRST COMMIT: This exercises version() == 0 branch and generates ICT
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(
+        snapshot.version(),
+        0,
+        "Initial snapshot should be version 0"
+    );
+
+    let mut txn = snapshot.transaction()?.with_engine_info("ict test");
+
+    // Add some data
+    generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
+
+    // First commit
+    let commit_result = txn.commit(&engine)?;
+    match commit_result {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(
+                committed.commit_version(),
+                1,
+                "First commit should result in version 1"
+            );
+        }
+        CommitResult::ConflictedTransaction(conflicted) => {
+            panic!(
+                "First commit should not conflict, got conflict at version {}",
+                conflicted.conflict_version()
+            );
+        }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("First commit should not be retryable error");
+        }
+    }
+
+    // VERIFY: Check that the commit log contains inCommitTimestamp
+    let first_ict = get_ict_at_version(store.clone(), &table_url, 1).await?;
+
+    assert!(
+        first_ict > 1612345678,
+        "First commit ICT ({}) should be greater than enablement timestamp (1612345678)",
+        first_ict
+    );
+
+    // Second commit
+    let snapshot2 = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    assert_eq!(
+        snapshot2.version(),
+        1,
+        "Second snapshot should be version 1"
+    );
+
+    let mut txn2 = snapshot2.transaction()?.with_engine_info("ict test 2");
+
+    // Add more data
+    generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
+
+    // Second commit
+    let commit_result2 = txn2.commit(&engine)?;
+    match commit_result2 {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(
+                committed.commit_version(),
+                2,
+                "Second commit should result in version 2"
+            );
+        }
+        CommitResult::ConflictedTransaction(conflicted) => {
+            panic!(
+                "Second commit should not conflict, got conflict at version {}",
+                conflicted.conflict_version()
+            );
+        }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("Second commit should not be retryable error");
+        }
+    }
+
+    // VERIFY: Check that second commit has proper monotonic ICT
+    let second_ict = get_ict_at_version(store, &table_url, 2).await?;
+
+    // Verify monotonic property: second_ict > first_ict
+    assert!(
+        second_ict > first_ict,
+        "Second ICT ({}) should be greater than first ICT ({})",
+        second_ict,
+        first_ict
+    );
 
     Ok(())
 }

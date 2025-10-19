@@ -7,7 +7,9 @@ members = [
     "kernel/examples/*",
     "test-utils",
     "feature-tests",
+    "mem-test",
     "uc-client", # WIP: this is an experimental UC client for catalog-managed table work
+    "uc-catalog", # WIP: this is an experimental UC catalog implementation
 ]
 # note that in addition to the members above, the workspace includes examples:
 # - inspect-table
@@ -25,4 +27,4 @@ license = "Apache-2.0"
 repository = "https://github.com/delta-io/delta-kernel-rs"
 readme = "README.md"
 rust-version = "1.84"
-version = "0.15.2"
+version = "0.16.0"

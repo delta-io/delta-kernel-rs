@@ -57,7 +57,7 @@ async fn write_data_to_table(
     data: Vec<ArrowEngineData>,
 ) -> DeltaResult<CommitResult> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot.transaction()?;
+    let mut txn = snapshot.transaction()?.with_data_change(true);
 
     // Write data out by spawning async tasks to simulate executors
     let write_context = Arc::new(txn.get_write_context());
@@ -66,7 +66,7 @@ async fn write_data_to_table(
         let write_context = write_context.clone();
         tokio::task::spawn(async move {
             engine
-                .write_parquet(&data, write_context.as_ref(), HashMap::new(), true)
+                .write_parquet(&data, write_context.as_ref(), HashMap::new())
                 .await
         })
     });
@@ -217,7 +217,9 @@ async fn test_row_tracking_append() -> DeltaResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -264,7 +266,9 @@ async fn test_row_tracking_single_record_batches() -> DeltaResult<()> {
             vec![int32_array(vec![3])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -295,7 +299,9 @@ async fn test_row_tracking_large_batch() -> DeltaResult<()> {
     // Write a large batch with 1000 records
     let large_batch: Vec<i32> = (1..=1000).collect();
     let data = generate_data(schema.clone(), [vec![int32_array(large_batch.clone())]])?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -342,7 +348,9 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_1).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
+        .await?
+        .is_committed());
 
     // Verify first commit
     verify_row_tracking_in_commit(
@@ -357,7 +365,9 @@ async fn test_row_tracking_consecutive_transactions() -> DeltaResult<()> {
     // Second transaction: write one batch with 2 records
     // This should read the existing row tracking domain metadata and assign base row IDs starting from 6
     let data_2 = generate_data(schema.clone(), [vec![int32_array(vec![7, 8])]])?;
-    write_data_to_table(&table_url, engine.clone(), data_2).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
+        .await?
+        .is_committed());
 
     // Verify second commit
     verify_row_tracking_in_commit(
@@ -410,7 +420,9 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
             ],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_1).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_1)
+        .await?
+        .is_committed());
 
     verify_row_tracking_in_commit(
         &store,
@@ -429,7 +441,9 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
             string_array(vec!["g".to_string(), "h".to_string()]),
         ]],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_2).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_2)
+        .await?
+        .is_committed());
 
     verify_row_tracking_in_commit(
         &store,
@@ -454,7 +468,9 @@ async fn test_row_tracking_three_consecutive_transactions() -> DeltaResult<()> {
             ],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data_3).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data_3)
+        .await?
+        .is_committed());
 
     verify_row_tracking_in_commit(
         &store,
@@ -490,7 +506,9 @@ async fn test_row_tracking_with_regular_and_empty_adds() -> DeltaResult<()> {
             vec![int32_array(vec![4, 5, 6])],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     verify_row_tracking_in_commit(
@@ -536,7 +554,9 @@ async fn test_row_tracking_with_empty_adds() -> DeltaResult<()> {
             vec![int32_array(Vec::<i32>::new())],
         ],
     )?;
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify the commit was written correctly
     // NB: The expected high water mark is a bit unintuitive here, as we are appending empty batches.
@@ -579,7 +599,7 @@ async fn test_row_tracking_without_adds() -> DeltaResult<()> {
     let txn = snapshot.transaction()?;
 
     // Commit without adding any add files
-    txn.commit(engine.as_ref())?;
+    assert!(txn.commit(engine.as_ref())?.is_committed());
 
     // Fetch and parse the commit
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;
@@ -619,8 +639,14 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     let snapshot2 = Snapshot::builder_for(table_url.clone()).build(engine2.as_ref())?;
 
     // Create two transactions from the same snapshot (simulating parallel transactions)
-    let mut txn1 = snapshot1.transaction()?.with_engine_info("transaction 1");
-    let mut txn2 = snapshot2.transaction()?.with_engine_info("transaction 2");
+    let mut txn1 = snapshot1
+        .transaction()?
+        .with_engine_info("transaction 1")
+        .with_data_change(true);
+    let mut txn2 = snapshot2
+        .transaction()?
+        .with_engine_info("transaction 2")
+        .with_data_change(true);
 
     // Prepare data for both transactions
     let data1 = RecordBatch::try_new(
@@ -641,7 +667,6 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
             &ArrowEngineData::new(data1),
             write_context1.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
 
@@ -650,7 +675,6 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
             &ArrowEngineData::new(data2),
             write_context2.as_ref(),
             HashMap::new(),
-            true,
         )
         .await?;
 
@@ -660,25 +684,45 @@ async fn test_row_tracking_parallel_transactions_conflict() -> DeltaResult<()> {
     // Commit the first transaction - this should succeed
     let result1 = txn1.commit(engine1.as_ref())?;
     match result1 {
-        CommitResult::Committed { version, .. } => {
-            assert_eq!(version, 1, "First transaction should commit at version 1");
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(
+                committed.commit_version(),
+                1,
+                "First transaction should commit at version 1"
+            );
         }
-        CommitResult::Conflict(_, version) => {
-            panic!("First transaction should not conflict, got conflict at version {version}");
+        CommitResult::ConflictedTransaction(conflicted) => {
+            panic!(
+                "First transaction should not conflict, got conflict at version {}",
+                conflicted.conflict_version()
+            );
+        }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("First transaction should not be retryable error");
         }
     }
 
     // Commit the second transaction - this should result in a conflict
     let result2 = txn2.commit(engine2.as_ref())?;
     match result2 {
-        CommitResult::Committed { version, .. } => {
-            panic!("Second transaction should conflict, but got committed at version {version}");
+        CommitResult::CommittedTransaction(committed) => {
+            panic!(
+                "Second transaction should conflict, but got committed at version {}",
+                committed.commit_version()
+            );
         }
-        CommitResult::Conflict(_conflicted_txn, version) => {
-            assert_eq!(version, 1, "Conflict should be at version 1");
+        CommitResult::ConflictedTransaction(conflicted) => {
+            assert_eq!(
+                conflicted.conflict_version(),
+                1,
+                "Conflict should be at version 1"
+            );
 
             // TODO: In the future, we need to resolve conflicts and retry the commit
             // For now, we just verify that we got the conflict as expected
+        }
+        CommitResult::RetryableTransaction(_) => {
+            panic!("Second transaction should not be retryable error");
         }
     }
 
@@ -745,7 +789,9 @@ async fn test_no_row_tracking_fields_without_feature() -> DeltaResult<()> {
     )?;
 
     // Write data to the table
-    write_data_to_table(&table_url, engine.clone(), data).await?;
+    assert!(write_data_to_table(&table_url, engine.clone(), data)
+        .await?
+        .is_committed());
 
     // Verify that the commit does NOT contain row tracking fields
     let commit_url = table_url.join(&format!("_delta_log/{:020}.json", 1))?;

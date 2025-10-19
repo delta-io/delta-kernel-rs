@@ -83,8 +83,8 @@ impl TestCaseInfo {
         assert_eq!(snapshot.version(), case.version);
 
         // assert correct metadata is read
-        let metadata = snapshot.metadata();
-        let protocol = snapshot.protocol();
+        let metadata = snapshot.table_configuration().metadata();
+        let protocol = snapshot.table_configuration().protocol();
         let tvm = TableVersionMetaData {
             version: snapshot.version(),
             properties: metadata

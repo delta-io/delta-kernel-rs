@@ -95,6 +95,18 @@ pub unsafe extern "C" fn add_files(
     txn.add_files(write_metadata);
 }
 
+///
+/// Mark the transaction as having data changes or not (these are recorded at the file level).
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn set_data_change(mut txn: Handle<ExclusiveTransaction>, data_change: bool) {
+    let underlying_txn = unsafe { txn.as_mut() };
+    underlying_txn.set_data_change(data_change);
+}
+
 /// Attempt to commit a transaction to the table. Returns version number if successful.
 /// Returns error if the commit fails.
 ///
@@ -113,13 +125,16 @@ pub unsafe extern "C" fn commit(
     // TODO: for now this removes the enum, which prevents doing any conflict resolution. We should fix
     //       this by making the commit function return the enum somehow.
     match txn.commit(engine.as_ref()) {
-        Ok(CommitResult::Committed {
-            version: v,
-            post_commit_stats: _,
-        }) => Ok(v),
-        Ok(CommitResult::Conflict(_, v)) => Err(delta_kernel::Error::Generic(format!(
-            "commit conflict at version {v}"
-        ))),
+        Ok(CommitResult::CommittedTransaction(committed)) => Ok(committed.commit_version()),
+        Ok(CommitResult::RetryableTransaction(_)) => Err(delta_kernel::Error::unsupported(
+            "commit failed: retryable transaction not supported in FFI (yet)",
+        )),
+        Ok(CommitResult::ConflictedTransaction(conflicted)) => {
+            Err(delta_kernel::Error::Generic(format!(
+                "commit conflict at version {}",
+                conflicted.conflict_version()
+            )))
+        }
         Err(e) => Err(e),
     }
     .into_extern_result(&extern_engine)
@@ -134,11 +149,11 @@ mod tests {
     use delta_kernel::arrow::ffi::to_ffi;
     use delta_kernel::arrow::json::reader::ReaderBuilder;
     use delta_kernel::arrow::record_batch::RecordBatch;
-    use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
     use delta_kernel::parquet::file::properties::WriterProperties;
-    use delta_kernel::transaction::add_files_schema;
 
     use delta_kernel_ffi::engine_data::get_engine_data;
     use delta_kernel_ffi::engine_data::ArrowFFIData;
@@ -192,25 +207,25 @@ mod tests {
     fn create_file_metadata(
         path: &str,
         num_rows: i64,
+        metadata_schema: ArrowSchema,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
-        let schema: ArrowSchema = add_files_schema().as_ref().try_into_arrow()?;
-
         let current_time: i64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
 
         let file_metadata = format!(
-            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "dataChange": true, "stats": {{"numRecords": {num_rows}}}}}"#,
+            r#"{{"path":"{path}", "partitionValues": {{}}, "size": {num_rows}, "modificationTime": {current_time}, "stats": {{"numRecords": {num_rows}}}}}"#,
         );
 
-        create_arrow_ffi_from_json(schema, file_metadata.as_str())
+        create_arrow_ffi_from_json(metadata_schema, file_metadata.as_str())
     }
 
     fn write_parquet_file(
         delta_path: &str,
         file_path: &str,
         batch: &RecordBatch,
+        metadata_schema: ArrowSchema,
     ) -> Result<ArrowFFIData, Box<dyn std::error::Error>> {
         // WriterProperties can be used to set Parquet file options
         let props = WriterProperties::builder().build();
@@ -224,7 +239,7 @@ mod tests {
         // writer must be closed to write footer
         let res = writer.close().unwrap();
 
-        create_file_metadata(file_path, res.num_rows)
+        create_file_metadata(file_path, res.num_rows, metadata_schema)
     }
 
     #[tokio::test]
@@ -258,6 +273,7 @@ mod tests {
             let txn = ok_or_panic(unsafe {
                 transaction(kernel_string_slice!(table_path_str), engine.shallow_copy())
             });
+            unsafe { set_data_change(txn.shallow_copy(), false) };
 
             // Add engine info
             let engine_info = "default_engine";
@@ -311,8 +327,18 @@ mod tests {
                 ),
             ])
             .unwrap();
-
-            let file_info = write_parquet_file(table_path_str, "my_file.parquet", &batch)?;
+            let parquet_schema = unsafe {
+                txn_with_engine_info
+                    .shallow_copy()
+                    .as_ref()
+                    .add_files_schema()
+            };
+            let file_info = write_parquet_file(
+                table_path_str,
+                "my_file.parquet",
+                &batch,
+                parquet_schema.as_ref().try_into_arrow()?,
+            )?;
 
             let file_info_engine_data = ok_or_panic(unsafe {
                 get_engine_data(
@@ -363,7 +389,7 @@ mod tests {
                         "partitionValues": {},
                         "size": 0,
                         "modificationTime": 0,
-                        "dataChange": true,
+                        "dataChange": false,
                         "stats": "{\"numRecords\":5}"
                     }
                 }),
