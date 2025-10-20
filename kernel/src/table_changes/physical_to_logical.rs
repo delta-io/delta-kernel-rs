@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::expressions::{Expression, Scalar};
+use crate::expressions::Scalar;
 use crate::scan::StateInfo;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
@@ -94,6 +94,11 @@ pub(crate) fn get_cdf_transform_expr(
         .map(|ts| ts.as_ref())
         .unwrap_or(&empty_spec);
 
+    // Return None for identity transforms to avoid unnecessary expression evaluation
+    if transform_spec.is_empty() {
+        return Ok(None);
+    }
+
     // Handle regular partition values using parse_partition_values
     let parsed_values = parse_partition_values(
         &state_info.logical_schema,
@@ -107,13 +112,6 @@ pub(crate) fn get_cdf_transform_expr(
     partition_values.extend(cdf_values);
 
     let expr = get_transform_expr(transform_spec, partition_values, physical_schema)?;
-
-    // Return None for identity transforms to avoid unnecessary expression evaluation
-    if let Expression::Transform(ref transform) = *expr {
-        if transform.is_identity() {
-            return Ok(None);
-        }
-    }
 
     Ok(Some(expr))
 }
