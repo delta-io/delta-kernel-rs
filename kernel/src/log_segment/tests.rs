@@ -938,7 +938,7 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
 fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let (_, log_root) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new());
-    let checkpoint_batch = add_batch_simple(get_log_schema().clone());
+    let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
 
     let mut iter = LogSegment::process_sidecars(
         engine.parquet_handler(),
@@ -1003,7 +1003,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-        get_log_schema().clone(),
+        get_all_actions_schema().clone(),
     );
 
     let mut iter = LogSegment::process_sidecars(
@@ -1126,12 +1126,12 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
 
     add_checkpoint_to_store(
         &store,
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_1,
     )?;
     add_checkpoint_to_store(
         &store,
-        sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_2,
     )?;
 
@@ -1193,7 +1193,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1240,7 +1240,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 
     let checkpoint_one_file = log_root.join(filename)?.to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1308,7 +1308,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(

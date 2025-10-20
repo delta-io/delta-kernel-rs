@@ -82,11 +82,13 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(get_log_schema().fields().cloned().chain([
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-    ])))
+    Arc::new(StructType::new_unchecked(
+        get_log_schema()
+            .fields()
+            .cloned()
+            .chain([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())]),
+    ))
 });
-
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -117,12 +119,14 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 #[internal_api]
-/// Gets the schema for all actions that can appear in transaction
+/// Gets the schema for all actions that can appear in commits
 /// logs.  This excludes actions that can only appear in checkpoints.
 pub(crate) fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
 }
 
+#[internal_api]
+#[allow(dead_code)]
 /// Gets a schema for all actions defined by the delta spec.
 pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
     &ALL_ACTIONS_SCHEMA
