@@ -9,7 +9,9 @@ use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
-use crate::committer::{CommitMetadata, CommitResponse, Committer, FileSystemCommitter};
+use crate::committer::{CommitMetadata, CommitResponse, Committer};
+#[cfg(feature = "catalog-managed")]
+use crate::committer::FileSystemCommitter;
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
@@ -154,7 +156,10 @@ impl Transaction {
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
     /// a snapshot.
-    pub(crate) fn try_new(snapshot: impl Into<SnapshotRef>) -> DeltaResult<Self> {
+    pub(crate) fn try_new(
+        snapshot: impl Into<SnapshotRef>,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
@@ -166,7 +171,7 @@ impl Transaction {
 
         Ok(Transaction {
             read_snapshot: read_snapshot.clone(),
-            committer: Box::new(FileSystemCommitter::new(read_snapshot)),
+            committer,
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
@@ -258,6 +263,16 @@ impl Transaction {
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
 
         // Step 6: Commit via the committer
+        #[cfg(feature = "catalog-managed")]
+        if self.committer.any_ref().is::<FileSystemCommitter>()
+            && self
+                .read_snapshot
+                .table_configuration()
+                .protocol()
+                .is_catalog_managed()
+        {
+            return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
+        }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
         let commit_metadata = CommitMetadata::new(log_root, commit_version);
         match self

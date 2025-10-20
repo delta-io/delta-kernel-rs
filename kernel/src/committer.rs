@@ -29,7 +29,7 @@
 //! [`EngineData`]: crate::EngineData
 
 use crate::path::LogRoot;
-use crate::{DeltaResult, Engine, Error, FilteredEngineData, SnapshotRef, Version};
+use crate::{AsAny, DeltaResult, Engine, Error, FilteredEngineData, SnapshotRef, Version};
 
 use url::Url;
 
@@ -105,8 +105,12 @@ pub enum CommitResponse {
 ///
 /// [`commit`]: Committer::commit
 /// [`EngineData`]: crate::EngineData
-// Note: Send so we can put it in a Box and send it between threads.
-pub trait Committer: Send {
+//
+// Note: While we could omit the Send bound, we keep it here for simplicity - so usage can be
+// Arc<dyn Committer> (instead of Arc<dyn Committer + Send>). If there is a strong case for a !Send
+// Committer then we can remove this bound and possibly just do an alias like CommitterRef =
+// Arc<dyn Committer + Send>.
+pub trait Committer: Send + AsAny {
     fn commit(
         &self,
         engine: &dyn Engine,
@@ -117,18 +121,14 @@ pub trait Committer: Send {
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
 /// commits to a file system directly via `Engine::json_handler().write_json_file` for
-/// non-catalog-managed tables. Note it is _incorrect_ to use this committer for catalog-managed
-/// tables.
+/// non-catalog-managed tables.
 ///
-/// The `FileSystemCommitter` hangs on to a read snapshot to validate the table isn't a
-/// catalog-managed table prior to committing.
-pub(crate) struct FileSystemCommitter {
-    read_snapshot: SnapshotRef,
-}
+/// SAFETY: it is _incorrect_ to use this committer for catalog-managed tables.
+pub struct FileSystemCommitter;
 
 impl FileSystemCommitter {
-    pub(crate) fn new(read_snapshot: SnapshotRef) -> Self {
-        Self { read_snapshot }
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
@@ -139,11 +139,6 @@ impl Committer for FileSystemCommitter {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
-        #[cfg(feature = "catalog-managed")]
-        crate::utils::require!(
-            !self.read_snapshot.table_configuration().protocol().is_catalog_managed(),
-            Error::generic("Cannot use the default committer for a catalog-managed table. Please provide a committer via Transaction::with_committer.")
-        );
         match engine.json_handler().write_json_file(
             &commit_metadata.published_commit_path()?,
             Box::new(actions),
