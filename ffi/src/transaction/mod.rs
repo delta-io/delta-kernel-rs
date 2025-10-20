@@ -7,6 +7,7 @@ use crate::KernelStringSlice;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -38,7 +39,8 @@ fn transaction_impl(
     extern_engine: &dyn ExternEngine,
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
-    let transaction = snapshot.transaction();
+    let committer = Box::new(FileSystemCommitter::new());
+    let transaction = snapshot.transaction(committer);
     Ok(Box::new(transaction?).into())
 }
 

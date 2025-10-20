@@ -9,9 +9,9 @@ use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
-use crate::committer::{CommitMetadata, CommitResponse, Committer};
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
+use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
@@ -768,9 +768,7 @@ mod tests {
     use std::path::PathBuf;
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
-
     #[test]
-
     fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
@@ -780,7 +778,9 @@ mod tests {
             .at_version(1)
             .build(&engine)
             .unwrap();
-        let txn = snapshot.transaction()?.with_engine_info("default engine");
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
         let expected = StructType::new_unchecked(vec![

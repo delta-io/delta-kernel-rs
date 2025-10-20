@@ -228,7 +228,9 @@ mod tests {
         let snapshot = crate::snapshot::SnapshotBuilder::new_for(table_root)
             .build(&engine)
             .unwrap();
-        let err = snapshot.transaction().unwrap_err();
+        // Try to create a transaction with FileSystemCommitter
+        let committer = Box::new(FileSystemCommitter::new());
+        let err = snapshot.transaction(committer).unwrap_err();
         assert!(matches!(
             err,
             crate::Error::Unsupported(e) if e.contains("Writes are not yet supported for catalog-managed tables")

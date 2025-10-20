@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::Error as KernelError;
 use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use url::Url;
@@ -65,7 +66,10 @@ async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     {
         // create a transaction
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction()?.with_engine_info("default engine");
+        let committer = Box::new(FileSystemCommitter::new());
+        let txn = snapshot
+            .transaction(committer)?
+            .with_engine_info("default engine");
 
         // commit!
         let _ = txn.commit(&engine)?;
@@ -148,7 +152,8 @@ async fn write_data_and_check_result_and_stats(
     expected_since_commit: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
-    let mut txn = snapshot.transaction()?.with_data_change(true);
+    let committer = Box::new(FileSystemCommitter::new());
+    let mut txn = snapshot.transaction(committer)?.with_data_change(true);
 
     // create two new arrow record batches to append
     let append_data = [[1, 2, 3], [4, 5, 6]].map(|data| -> DeltaResult<_> {
@@ -214,7 +219,9 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction()?.with_engine_info("default engine");
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
 
         let _ = txn.commit(&engine)?;
 
@@ -357,7 +364,9 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction()?.with_engine_info("default engine");
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
 
         // Commit without adding any add files
         assert!(txn.commit(&engine)?.is_committed());
@@ -435,7 +444,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let mut txn = snapshot
-            .transaction()?
+            .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine")
             .with_data_change(false);
 
@@ -579,7 +588,9 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
         setup_test_tables(table_schema, &[], None, "test_table").await?
     {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-        let txn = snapshot.transaction()?.with_engine_info("default engine");
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
 
         // create two new arrow record batches to append
         let append_data = [["a", "b"], ["c", "d"]].map(|data| -> DeltaResult<_> {
@@ -638,7 +649,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         assert!(matches!(
             snapshot
-                .transaction()?
+                .transaction(Box::new(FileSystemCommitter::new()))?
                 .with_transaction_id("app_id1".to_string(), 0)
                 .with_transaction_id("app_id1".to_string(), 1)
                 .commit(&engine),
@@ -647,7 +658,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
 
         let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
         let txn = snapshot
-            .transaction()?
+            .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine")
             .with_transaction_id("app_id1".to_string(), 1)
             .with_transaction_id("app_id2".to_string(), 2);
@@ -780,7 +791,9 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?.with_engine_info("default engine");
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("default engine");
 
     // Create Arrow data with TIMESTAMP_NTZ values including edge cases
     // These are microseconds since Unix epoch
@@ -922,7 +935,9 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?.with_data_change(true);
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1131,7 +1146,9 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .await?;
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
-    let mut txn = snapshot.transaction()?.with_data_change(true);
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_data_change(true);
 
     // First value corresponds to the variant value "1". Third value corresponds to the variant
     // representing the JSON Object {"a":2}.
@@ -1250,7 +1267,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
-    let txn = snapshot.transaction()?;
+    let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
 
     // write context does not conflict with domain metadata
     let _write_context = txn.get_write_context();
@@ -1329,7 +1346,9 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
 
     // System domain rejection
-    let txn = snapshot.clone().transaction()?;
+    let txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?;
     let res = txn
         .with_domain_metadata("delta.system".to_string(), "config".to_string())
         .commit(&engine);
@@ -1339,7 +1358,9 @@ async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Err
     );
 
     // Duplicate domain rejection
-    let txn2 = snapshot.clone().transaction()?;
+    let txn2 = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?;
     let res = txn2
         .with_domain_metadata("app.config".to_string(), "v1".to_string())
         .with_domain_metadata("app.config".to_string(), "v2".to_string())
@@ -1379,7 +1400,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 
     let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
     let res = snapshot
-        .transaction()?
+        .transaction(Box::new(FileSystemCommitter::new()))?
         .with_domain_metadata("app.config".to_string(), "test_config".to_string())
         .commit(&engine);
 
@@ -1483,7 +1504,9 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         "Initial snapshot should be version 0"
     );
 
-    let mut txn = snapshot.transaction()?.with_engine_info("ict test");
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("ict test");
 
     // Add some data
     generate_and_add_data_file(&mut txn, &engine, schema.clone(), vec![1, 2, 3]).await?;
@@ -1526,7 +1549,9 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         "Second snapshot should be version 1"
     );
 
-    let mut txn2 = snapshot2.transaction()?.with_engine_info("ict test 2");
+    let mut txn2 = snapshot2
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("ict test 2");
 
     // Add more data
     generate_and_add_data_file(&mut txn2, &engine, schema, vec![4, 5, 6]).await?;
