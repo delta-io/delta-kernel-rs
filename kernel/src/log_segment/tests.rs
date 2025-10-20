@@ -1288,7 +1288,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         &store,
         sidecar_batch_with_given_paths(
             vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-            get_log_schema().clone(),
+            get_all_actions_schema().clone(),
         ),
         "00000000000000000001.checkpoint.parquet",
     )?;
@@ -1308,7 +1308,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1330,11 +1330,13 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         is_log_batch,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
+    // TODO: per contract this batch is not required to have sidecars, but leaving this test in to
+    // verify no behavior change.
     assert_batch_matches(
         first_batch,
         sidecar_batch_with_given_paths(
             vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-            get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+            get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
         ),
     );
     // Assert that the second batch returned is from reading sidecarfile1
