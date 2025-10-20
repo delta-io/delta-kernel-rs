@@ -5,8 +5,8 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_schema, schema_contains_file_actions, Metadata, Protocol, METADATA_NAME,
-    PROTOCOL_NAME, SIDECAR_NAME,
+    get_log_schema, schema_contains_file_actions, Metadata, Protocol, METADATA_NAME, PROTOCOL_NAME,
+    SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
