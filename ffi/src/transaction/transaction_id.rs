@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::error::ExternResult;
 use crate::handle::Handle;
 use crate::transaction::ExclusiveTransaction;
@@ -5,9 +7,9 @@ use crate::{
     ExternEngine, IntoExternResult, KernelStringSlice, OptionalValue, SharedExternEngine,
     SharedSnapshot, TryFromStringSlice,
 };
+
 use delta_kernel::transaction::Transaction;
 use delta_kernel::{DeltaResult, Snapshot};
-use std::sync::Arc;
 
 /// Associates an app_id and version with a transaction. These will be applied to the table on commit.
 ///
