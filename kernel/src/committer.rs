@@ -1,21 +1,18 @@
-// we have some pub/dead code due to feature flags, remove after we delete catalog-managed feature
-#![allow(unreachable_pub)]
-#![allow(unused)]
-
 //! The `committer` module provides a [`Committer`] trait which allows different implementations to
-//! define how to commit transactions to a catalog. This is only applicable to catalog-managed
-//! tables. For non-catalog-managed tables, the kernel commits directly to the object-store (via
+//! define how to commit transactions to a catalog or filesystem. For catalog-managed tables, a
+//! [`Committer`] specific to the managing catalog should be provided. For non-catalog-managed
+//! tables, the [`FileSystemCommitter`] should be used to commit directly to the object store (via
 //! put-if-absent call to storage to atomically write new commit files).
 //!
-//! By implementing this trait, different catalogs can define what happens when the kernel needs to
-//! commit a transaction to a table. The goal terminal state of every [`Transaction`] is to be
-//! committed to the table. This means writing the changes (we call these actions) in the
-//! transaction as a new version of the table. The [`Committer`] trait exposes a single method,
-//! [`commit`] which takes an engine, an iterator of actions (as [`EngineData`] batches), and
-//! [`CommitMetadata`] (which includes critical commit metadata like the version to commit) to
-//! allow different catalogs to define what it means to 'commit' the actions to a table. For some,
-//! this may mean writing staged commits to object storage and retaining an in-memory list (server
-//! side) of commits. For others, this may mean writing new (version, actions) tuples to a
+//! By implementing the [`Committer`] trait, different catalogs can define what happens when the
+//! kernel needs to commit a transaction to a table. The goal terminal state of every
+//! [`Transaction`] is to be committed to the table. This means writing the changes (we call these
+//! actions) in the transaction as a new version of the table. The [`Committer`] trait exposes a
+//! single method, [`commit`] which takes an engine, an iterator of actions (as [`EngineData`]
+//! batches), and [`CommitMetadata`] (which includes critical commit metadata like the version to
+//! commit) to allow different catalogs to define what it means to 'commit' the actions to a table.
+//! For some, this may mean writing staged commits to object storage and retaining an in-memory list
+//! (server side) of commits. For others, this may mean writing new (version, actions) tuples to a
 //! database.
 //!
 //! The implementation of [`commit`] must ensure that the actions are committed atomically to the
@@ -29,7 +26,7 @@
 //! [`EngineData`]: crate::EngineData
 
 use crate::path::LogRoot;
-use crate::{AsAny, DeltaResult, Engine, Error, FilteredEngineData, SnapshotRef, Version};
+use crate::{AsAny, DeltaResult, Engine, Error, FilteredEngineData, Version};
 
 use url::Url;
 

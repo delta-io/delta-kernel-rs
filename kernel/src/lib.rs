@@ -87,10 +87,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
-#[cfg(feature = "catalog-managed")]
 pub mod committer;
-#[cfg(not(feature = "catalog-managed"))]
-mod committer;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
