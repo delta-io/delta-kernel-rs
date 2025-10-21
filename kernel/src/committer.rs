@@ -124,6 +124,7 @@ pub trait Committer: Send + AsAny {
 /// non-catalog-managed tables.
 ///
 /// SAFETY: it is _incorrect_ to use this committer for catalog-managed tables.
+#[derive(Debug, Default)]
 pub struct FileSystemCommitter;
 
 impl FileSystemCommitter {
