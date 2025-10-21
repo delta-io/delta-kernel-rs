@@ -33,6 +33,7 @@ const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
+pub mod deletion_vector_writer;
 pub mod set_transaction;
 
 pub(crate) mod crc;
