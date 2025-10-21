@@ -1988,6 +1988,9 @@ mod tests {
             .project(&[ADD_NAME, PROTOCOL_NAME])
             .unwrap();
         assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[ADD_NAME]).unwrap()
+        ));
     }
 
     #[test]
@@ -1996,6 +1999,9 @@ mod tests {
             .project(&[REMOVE_NAME, METADATA_NAME])
             .unwrap();
         assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[REMOVE_NAME]).unwrap()
+        ));
     }
 
     #[test]
