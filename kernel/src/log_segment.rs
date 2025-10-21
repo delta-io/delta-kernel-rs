@@ -304,7 +304,7 @@ impl LogSegment {
             .json_handler()
             .read_json_files(
                 &commits_and_compactions,
-                commit_read_schema.clone(),
+                commit_read_schema,
                 meta_predicate.clone(),
             )?
             .map_ok(|batch| ActionsBatch::new(batch, true));
@@ -393,11 +393,11 @@ impl LogSegment {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
-        // Side-cars only contain file actions so don't add it to the schema if uneeded
+        // Sidecars only contain file actions so don't add it to the schema if not needed
         let checkpoint_read_schema = if !need_file_actions ||
         // Don't duplicate the column if it exists
         action_schema.contains(SIDECAR_NAME) ||
-        // Can't be v2 checkpoint so side case in't needed
+        // With multiple parts the checkpoint can't be v2, so sidecars aren't needed
         self.checkpoint_parts.len() > 1
         {
             action_schema.clone()
