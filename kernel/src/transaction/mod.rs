@@ -13,16 +13,25 @@ use crate::actions::{
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
+    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
+    get_log_remove_schema, get_log_txn_schema,
+    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema, ADD_NAME
+    get_log_remove_schema, get_log_txn_schema,CommitiNfo, DomainMetadata, REMOVE_NAME, SetTransaction
+};
+use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::LogRoot;
+use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
+use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
@@ -143,6 +152,10 @@ pub struct Transaction {
     domain_metadatas: Vec<DomainMetadata>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // Cached matched file metadata and DV results for generating remove/add actions
+    dv_matched_files: Vec<FilteredEngineData>,
+    // Flag indicating if this transaction will update deletion vectors
+    will_update_dvs: bool,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -186,6 +199,8 @@ impl Transaction {
             commit_timestamp,
             domain_metadatas: vec![],
             data_change: true,
+            dv_matched_files: vec![],
+            will_update_dvs: false,
         })
     }
 
@@ -256,6 +271,9 @@ impl Transaction {
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
 
+        // Step 3b: Generate DV update actions (remove/add pairs) if any DV updates are present
+        let dv_update_actions = self.generate_dv_update_actions(engine)?;
+
         // Step 4: Generate all domain metadata actions (user and system domains)
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
@@ -265,6 +283,7 @@ impl Transaction {
 
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
+            .chain(dv_update_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
@@ -376,6 +395,190 @@ impl Transaction {
         self.domain_metadatas
             .push(DomainMetadata::remove(domain, String::new()));
         self
+    }
+
+    /// Indicate that this transaction will update deletion vectors.
+    ///
+    /// This method must be called before retrieving a scan builder if the transaction
+    /// will add or update deletion vectors. It ensures that scans retrieve all necessary
+    /// statistics to maintain them when generating new add actions.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let mut txn = snapshot.transaction()?
+    ///     .with_dv_update()
+    ///     .with_operation("DELETE");
+    ///
+    /// // Now scan the table to find files to update
+    /// let scan = txn.get_write_context().scan_builder().build()?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
+    pub fn with_dv_update(mut self) -> Self {
+        self.will_update_dvs = true;
+        self
+    }
+
+    // Helper function to create the ArrayType for deletion vector structs
+    fn struct_deletion_vector_schema() -> ArrayType {
+        ArrayType::new(DeletionVectorDescriptor::to_schema().into(), true)
+    }
+
+    // Helper function to create the schema for the intermediate DV column
+    fn intermediate_dv_schema() -> SchemaRef {
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+        ]))
+    }
+
+    /// Update deletion vectors for files in the table.
+    ///
+    /// This method takes a map of file paths to new deletion vector descriptors and an iterator
+    /// of scan file data. It joins the two together internally and will generate appropriate
+    /// remove/add actions on commit to update the deletion vectors.
+    ///
+    /// The transaction must have been created with [`with_dv_update`](Self::with_dv_update) called
+    /// before scanning, otherwise statistics may not be properly maintained.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to
+    ///   the new deletion vector write result for that file.
+    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
+    ///   selected elements of each FilteredEngineData must be a superset of the paths that key
+    ///   `new_dv_descriptors`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A file path in `new_dv_descriptors` is not found in `existing_data_files`
+    /// - [`with_dv_update`](Self::with_dv_update) was not called before scanning
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use std::collections::HashMap;
+    /// use delta_kernel::actions::deletion_vector_writer::DeletionVectorWriteResult;
+    ///
+    /// let mut txn = snapshot.transaction()?
+    ///     .with_dv_update()
+    ///     .with_operation("DELETE");
+    ///
+    /// let scan = txn.scan_builder().build()?;
+    /// let files: Vec<FilteredEngineData> = scan.scan_metadata().collect()?;
+    ///
+    /// // Write deletion vectors and collect results
+    /// let mut dv_map = HashMap::new();
+    /// for file in &files {
+    ///     // ... write DVs and get descriptors ...
+    ///     let descriptor = DeletionVectorWriteResult { /* ... */ };
+    ///     dv_map.insert(file_path.to_string(), descriptor);
+    /// }
+    ///
+    /// txn.update_deletion_vectors(&engine, dv_map, files.into_iter())?;
+    /// txn.commit(&engine)?;
+    /// # Ok::<(), delta_kernel::Error>(())
+    /// ```
+    pub fn update_deletion_vectors(
+        &mut self,
+        new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
+        existing_data_files: impl Iterator<Item = FilteredEngineData>,
+    ) -> DeltaResult<()> {
+        use crate::engine_data::{GetData, TypedGetData};
+        use crate::expressions::column_name;
+        use crate::schema::ColumnName;
+        use crate::RowVisitor;
+
+        if !self.will_update_dvs {
+            return Err(Error::generic(
+                "Must call with_dv_update() before update_deletion_vectors(). \
+                 This ensures statistics are properly retrieved during scanning.",
+            ));
+        }
+
+        // Visitor to extract file metadata and match with DV updates
+        struct DvMatchVisitor<'a> {
+            dv_updates: &'a HashMap<String, DeletionVectorDescriptor>,
+            new_dv_entries: Vec<Scalar>,
+            matched_file_indexes: Vec<usize>,
+        }
+
+        impl<'a> DvMatchVisitor<'a> {
+            const PATH_INDEX: usize = 0;
+
+            fn new(dv_updates: &'a HashMap<String, DeletionVectorDescriptor>) -> Self {
+                Self {
+                    dv_updates,
+                    new_dv_entries: Vec::new(),
+                    matched_file_indexes: Vec::new(),
+                }
+            }
+        }
+
+        impl RowVisitor for DvMatchVisitor<'_> {
+            fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
+                    let names = vec![
+                        column_name!("path"),
+                    ];
+                    let types = vec![
+                        DataType::STRING,
+                    ];
+                    (names, types)
+                });
+                (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+            }
+
+            fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let path: String = getters[Self::PATH_INDEX].get(i, "path")?;
+
+                    // Check if this file has a DV update
+                    if let Some(dv_result) = self.dv_updates.get(&path) {
+                     self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
+                        DeletionVectorDescriptor::to_schema().into_fields().collect(),
+                        vec![
+                            Scalar::from(dv_result.storage_type.to_string()),
+                            Scalar::from(dv_result.path_or_inline_dv.clone()),
+                            Scalar::from(dv_result.offset),
+                            Scalar::from(dv_result.size_in_bytes),
+                            Scalar::from(dv_result.cardinality),
+                        ],
+                     )?));
+                     self.matched_file_indexes.push(i);
+                    } else {
+                      self.new_dv_entries.push(Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = DvMatchVisitor::new(&new_dv_descriptors);
+
+        // Process each scan file to find matches
+        for scan_file in existing_data_files {
+            visitor.new_dv_entries.clear();
+            visitor.matched_file_indexes.clear();
+            let (data, mut selection_vector) = scan_file.into_parts();
+            visitor.visit_rows_of(data.as_ref())?;
+            let mut first_unmatched_index = 0;
+            for matched_index in &visitor.matched_file_indexes {
+                for i in first_unmatched_index..*matched_index {
+                    selection_vector[i] = false;
+                }
+                first_unmatched_index = matched_index + 1;
+            }
+            
+            let new_columns = vec![
+                ArrayData::try_new(Self::struct_deletion_vector_schema(), visitor.new_dv_entries.clone())?,
+            ];
+            self.dv_matched_files.push(FilteredEngineData::try_new(data.append_columns(Self::intermediate_dv_schema(), new_columns)?, selection_vector)?);
+        }
+
+        // Store the matched files
+
+        Ok(())
     }
 
     /// Generate domain metadata actions with validation. Handle both user and system domains.
@@ -674,6 +877,7 @@ impl Transaction {
             error,
         }
     }
+
     /// Remove files from the table in this transaction. This API generally enables the engine to
     /// delete data (at file-level granularity) from the table. Note that this API can be called
     /// multiple times to remove multiple batches.
@@ -780,6 +984,21 @@ impl Transaction {
                 )
             }))
     }
+
+    /// Generate remove/add action pairs for files with DV updates.
+    ///
+    /// This method processes the cached matched files, generating the necessary Remove and Add actions.
+    /// For each file:
+    /// 1. A Remove action is generated for the old file
+    /// 2. An Add action is generated with the new DV descriptor
+    fn generate_dv_update_actions<'a>(
+        &'a self,
+        engine: &'a dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a> {
+        self.dv_matched_files.iter().map(|file| {
+
+        }.flatten()
+    } 
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
