@@ -536,8 +536,8 @@ pub trait StorageHandler: AsAny {
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
 
     /// Copy a file atomically from source to destination. If the destination file already exists,
-    /// it must return Err(CopyError::DestinationAlreadyExists).
-    fn copy(&self, src: &Url, dest: &Url) -> Result<(), error::CopyError>;
+    /// it must return Err(Error::FileAlreadyExists).
+    fn copy(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

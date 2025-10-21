@@ -388,7 +388,6 @@ mod list_log_files_with_log_tail_tests {
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-    use crate::error::CopyError;
     use crate::FileMeta;
 
     use super::*;
@@ -635,7 +634,7 @@ mod list_log_files_with_log_tail_tests {
             ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
                 panic!("read_files used");
             }
-            fn copy(&self, src: &Url, dest: &Url) -> Result<(), CopyError> {
+            fn copy(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
                 panic!("copy used from {src} to {dest}");
             }
         }

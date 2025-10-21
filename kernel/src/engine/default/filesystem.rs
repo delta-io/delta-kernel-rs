@@ -10,7 +10,6 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::error::CopyError;
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 #[derive(Debug)]
@@ -177,34 +176,29 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         Ok(Box::new(receiver.into_iter()))
     }
 
-    fn copy(&self, src: &Url, dest: &Url) -> Result<(), CopyError> {
-        let src_path =
-            Path::from_url_path(src.path()).map_err(|e| CopyError::Other(Box::new(e)))?;
-        let dest_path =
-            Path::from_url_path(dest.path()).map_err(|e| CopyError::Other(Box::new(e)))?;
+    fn copy(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+        let src_path = Path::from_url_path(src.path())?;
+        let dest_path = Path::from_url_path(dest.path())?;
         let dest_path_str = dest_path.to_string();
         let store = self.inner.clone();
 
-        // object_store has a copy_if_not_exists method, but it doesn't work with all cloud stores
-        // (namely S3). for now we just do the 'dumb' manual way of get/put. note we could do a
-        // HEAD then the non-atomic copy but that still has a race condition.
+        // Read source file then write atomically with PutMode::Create
+        // This ensures: 1) atomicity 2) fails if destination exists
         self.task_executor.block_on(async move {
             let data = store
                 .get(&src_path)
-                .await
-                .map_err(|e| CopyError::Other(Box::new(e)))?
+                .await?
                 .bytes()
-                .await
-                .map_err(|e| CopyError::Other(Box::new(e)))?;
+                .await?;
 
             store
                 .put_opts(&dest_path, data.into(), PutMode::Create.into())
                 .await
                 .map_err(|e| match e {
                     object_store::Error::AlreadyExists { .. } => {
-                        CopyError::DestinationAlreadyExists(dest_path_str)
+                        Error::FileAlreadyExists(dest_path_str)
                     }
-                    e => CopyError::Other(Box::new(e)),
+                    e => e.into(),
                 })?;
             Ok(())
         })
@@ -358,15 +352,12 @@ mod tests {
         // copy to existing fails
         assert!(matches!(
             handler.copy(&src_url, &dest_url),
-            Err(CopyError::DestinationAlreadyExists(_))
+            Err(Error::FileAlreadyExists(_))
         ));
 
         // copy from non-existing fails
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         let new_dest_url = Url::from_file_path(tmp.path().join("new_dest.txt")).unwrap();
-        assert!(matches!(
-            handler.copy(&missing_url, &new_dest_url),
-            Err(CopyError::Other(_))
-        ));
+        assert!(handler.copy(&missing_url, &new_dest_url).is_err());
     }
 }

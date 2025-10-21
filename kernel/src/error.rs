@@ -210,10 +210,6 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
-
-    /// Error during Engine's storage handler copy operation
-    #[error(transparent)]
-    CopyError(#[from] CopyError),
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -345,12 +341,4 @@ impl From<object_store::Error> for Error {
             err => Self::ObjectStore(err),
         }
     }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum CopyError {
-    #[error("Destination file already exists: {0}")]
-    DestinationAlreadyExists(String),
-    #[error(transparent)]
-    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
