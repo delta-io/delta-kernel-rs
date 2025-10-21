@@ -12,9 +12,7 @@ use crate::expressions::{ArrayData, MapData, Scalar, StructData};
 use crate::schema::{
     ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
 };
-use crate::table_features::{
-    FeatureType, TableFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
-};
+use crate::table_features::{FeatureType, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
@@ -530,7 +528,24 @@ impl Protocol {
         match &self.reader_features {
             // if min_reader_version = 3 and all reader features are subset of supported => OK
             Some(reader_features) if self.min_reader_version == 3 => {
-                ensure_supported_features(reader_features, &SUPPORTED_READER_FEATURES)
+                // Check that all reader features have read support in the kernel
+                for feature in reader_features {
+                    if let Some(info) = feature.info() {
+                        if !info.has_read_support {
+                            return Err(Error::unsupported(format!(
+                                "Table feature '{}' is not supported for reading",
+                                feature
+                            )));
+                        }
+                    } else {
+                        // Unknown features are not supported
+                        return Err(Error::unsupported(format!(
+                            "Unknown table feature '{}' is not supported",
+                            feature
+                        )));
+                    }
+                }
+                Ok(())
             }
             // if min_reader_version = 3 and no reader features => ERROR
             // NOTE this is caught by the protocol parsing.
@@ -564,19 +579,33 @@ impl Protocol {
         );
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
-                // if we're on version 7, make sure we support all the specified features
-                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)?;
-
-                // ensure that there is no illegal combination of features
-                if writer_features.contains(&TableFeature::RowTracking)
-                    && !writer_features.contains(&TableFeature::DomainMetadata)
-                {
-                    Err(Error::invalid_protocol(
-                        "rowTracking feature requires domainMetadata to also be enabled",
-                    ))
-                } else {
-                    Ok(())
+                // Check that all writer features have write support in the kernel
+                for feature in writer_features {
+                    if let Some(info) = feature.info() {
+                        // Check write support for both Writer and ReaderWriter features
+                        if matches!(
+                            info.feature_type,
+                            FeatureType::Writer | FeatureType::ReaderWriter
+                        ) && !info.has_write_support
+                        {
+                            return Err(Error::unsupported(format!(
+                                "Table feature '{}' is not supported for writing",
+                                feature
+                            )));
+                        }
+                    } else {
+                        // Unknown features are not supported
+                        return Err(Error::unsupported(format!(
+                            "Unknown table feature '{}' is not supported",
+                            feature
+                        )));
+                    }
                 }
+
+                // Generic dependency validation
+                self.validate_feature_dependencies()?;
+
+                Ok(())
             }
             Some(_) => {
                 // there are features, but we're not on 7, so the protocol is actually broken
@@ -595,6 +624,38 @@ impl Protocol {
                 Ok(())
             }
         }
+    }
+
+    /// Validates that all feature dependencies are satisfied.
+    ///
+    /// For each feature in the protocol, checks that all its required features
+    /// are also present in the protocol.
+    fn validate_feature_dependencies(&self) -> DeltaResult<()> {
+        let all_features: Vec<&TableFeature> = self
+            .writer_features()
+            .iter()
+            .flat_map(|features| features.iter())
+            .chain(
+                self.reader_features()
+                    .iter()
+                    .flat_map(|features| features.iter()),
+            )
+            .collect();
+
+        for feature in &all_features {
+            if let Some(info) = feature.info() {
+                for required_feature in info.required_features {
+                    if !all_features.contains(&required_feature) {
+                        return Err(Error::invalid_protocol(format!(
+                            "Feature '{}' requires '{}' but it is not present in the protocol",
+                            feature, required_feature
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(feature = "catalog-managed")]
@@ -1714,7 +1775,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown TableFeatures: "identityColumns". Supported TableFeatures: "appendOnly", "columnMapping", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            "Table feature 'identityColumns' is not supported for writing",
         );
 
         // Unknown writer features should cause an error
@@ -1727,7 +1788,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown TableFeatures: "unsupported writer". Supported TableFeatures: "appendOnly", "columnMapping", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            "Unknown table feature 'unsupported writer' is not supported",
         );
     }
 
@@ -1746,7 +1807,7 @@ mod tests {
 
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            "rowTracking feature requires domainMetadata to also be enabled",
+            "Feature 'rowTracking' requires 'domainMetadata' but it is not present in the protocol",
         );
     }
 
