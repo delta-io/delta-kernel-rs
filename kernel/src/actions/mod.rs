@@ -89,6 +89,13 @@ static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        REMOVE_NAME,
+        Remove::to_schema(),
+    )]))
+});
+
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         COMMIT_INFO_NAME,
@@ -118,6 +125,10 @@ pub(crate) fn get_log_schema() -> &'static SchemaRef {
 #[internal_api]
 pub(crate) fn get_log_add_schema() -> &'static SchemaRef {
     &LOG_ADD_SCHEMA
+}
+
+pub(crate) fn get_log_remove_schema() -> &'static SchemaRef {
+    &LOG_REMOVE_SCHEMA
 }
 
 pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
@@ -781,6 +792,12 @@ pub(crate) struct Remove {
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) size: Option<i64>,
 
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
+    ///
+    /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub stats: Option<String>,
+
     /// Map containing metadata about this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) tags: Option<HashMap<String, String>>,
@@ -1127,6 +1144,7 @@ mod tests {
                 StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
                 partition_values_field(),
                 StructField::nullable("size", DataType::LONG),
+                StructField::nullable("stats", DataType::STRING),
                 tags_field(),
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),

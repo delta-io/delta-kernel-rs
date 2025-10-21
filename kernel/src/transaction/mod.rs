@@ -1,19 +1,24 @@
+use crate::SchemaTransform;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
-use url::Url;
-
 use crate::actions::{
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
+    get_log_remove_schema, get_log_txn_schema,
 };
+use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
+};
+use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
@@ -22,6 +27,7 @@ use crate::{
     RowVisitor, Version,
 };
 use delta_kernel_derive::internal_api;
+use url::Url;
 
 /// Type alias for an iterator of [`EngineData`] results.
 type EngineDataResultIterator<'a> =
@@ -40,7 +46,6 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
     ]))
 });
 
-/// Returns a reference to the mandatory fields in an add action.
 ///
 /// Note this does not include "dataChange" which is a required field but
 /// but should be set on the transactoin level. Getting the full schema
@@ -121,6 +126,7 @@ pub struct Transaction {
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
+    remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -167,6 +173,7 @@ impl Transaction {
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
+            remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
             domain_metadatas: vec![],
@@ -231,7 +238,10 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Commit the actions as a JSON file to the Delta log
+        // Step 5: Generate remove actions
+        let remove_actions = self.generate_remove_actions(engine)?;
+
+        // Step 6: Commit the actions as a JSON file to the Delta log
         let commit_path =
             ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
         let actions = iter::once(commit_info_action)
@@ -239,9 +249,9 @@ impl Transaction {
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
-        // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .chain(remove_actions);
 
         let json_handler = engine.json_handler();
         match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
@@ -585,6 +595,112 @@ impl Transaction {
             error,
         }
     }
+    /// Remove files from the table in this transaction. This API generally enables the engine to
+    /// delete data (at file-level granularity) from the table. Note that this API can be called
+    /// multiple times to remove multiple batches.
+    ///
+    /// the expected schema for `remove_metadata` is given by [`scan_row_schema`] it, is expected
+    /// this will be the result of passing [`FilteredEngineData`] returned from a scan
+    /// with rows modified for removal (selected rows in FilteredEngineData are the ones to be removed).
+    pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
+        self.remove_files_metadata.push(remove_metadata);
+    }
+
+    fn generate_remove_actions<'a>(
+        &'a self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+        // This is a workaround due to the fact that expression evaluation happens
+        // on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
+        // required fields.
+        // TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
+        // on FilteredEngineData directly.
+        struct NullableStatsTransform;
+        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                use Cow::*;
+                let field = match self.transform(&field.data_type)? {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
+                        name: field.name.clone(),
+                        data_type: data_type.into_owned(),
+                        nullable: true,
+                        metadata: field.metadata.clone(),
+                    }),
+                };
+                Some(field)
+            }
+        }
+
+        let input_schema = scan_row_schema();
+        let target_schema = NullableStatsTransform
+            .transform_struct(get_log_remove_schema())
+            .ok_or_else(|| Error::generic("Failed to transform remove schema"))?
+            .into_owned();
+        let evaluation_handler = engine.evaluation_handler();
+
+        Ok(self
+            .remove_files_metadata
+            .iter()
+            .map(move |file_metadata_batch| {
+                let transform = Expression::transform(
+                    Transform::new_top_level()
+                        .with_inserted_field(
+                            Some("path"),
+                            Expression::literal(self.commit_timestamp).into(),
+                        )
+                        .with_inserted_field(
+                            Some("path"),
+                            Expression::literal(self.data_change).into(),
+                        )
+                        .with_inserted_field(
+                            // extended_file_metadata
+                            Some("path"),
+                            Expression::literal(true).into(),
+                        )
+                        .with_inserted_field(
+                            Some("path"),
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"])
+                                .into(),
+                        )
+                        // tags
+                        .with_inserted_field(
+                            Some("stats"),
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+                        )
+                        .with_inserted_field(
+                            Some("deletionVector"),
+                            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
+                                .into(),
+                        )
+                        .with_inserted_field(
+                            Some("deletionVector"),
+                            Expression::column([
+                                FILE_CONSTANT_VALUES_NAME,
+                                DEFAULT_ROW_COMMIT_VERSION_NAME,
+                            ])
+                            .into(),
+                        )
+                        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+                        .with_dropped_field("modificationTime"),
+                );
+                let expr = Expression::struct_from([transform]);
+                let file_action_eval = evaluation_handler.new_expression_evaluator(
+                    input_schema.clone(),
+                    Arc::new(expr),
+                    target_schema.clone().into(),
+                );
+
+                let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
+                FilteredEngineData::try_new(
+                    updated_engine_data,
+                    file_metadata_batch.selection_vector().to_vec(),
+                )
+            }))
+    }
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -737,7 +853,6 @@ mod tests {
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
 
     #[test]
-
     fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
