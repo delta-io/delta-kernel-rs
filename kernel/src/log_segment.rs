@@ -5,13 +5,13 @@ use std::sync::{Arc, LazyLock};
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_log_schema, Metadata, Protocol, ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SIDECAR_NAME,
+    get_log_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
+    PROTOCOL_NAME, SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructField, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
@@ -280,12 +280,18 @@ impl LogSegment {
     ///
     /// `commit_read_schema` is the (physical) schema to read the commit files with, and
     /// `checkpoint_read_schema` is the (physical) schema to read checkpoint files with. This can be
-    /// used to project the log files to a subset of the columns.
+    /// used to project the log files to a subset of the columns. Having two different
+    /// schemas can be useful as a cheap way of doing additional filtering on the checkpoint files
+    /// (e.g. filtering out remove actions).
+    ///
+    ///  The engine data returned might have extra non-log actions (e.g. sidecar
+    ///  actions) that are not part of the schema but this is an implementation
+    ///  detail that should not be relied on and will likely change.
     ///
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
     #[internal_api]
-    pub(crate) fn read_actions(
+    pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
@@ -307,6 +313,22 @@ impl LogSegment {
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
 
         Ok(commit_stream.chain(checkpoint_stream))
+    }
+
+    // Same as above, but uses the same schema for reading checkpoints and commits.
+    #[internal_api]
+    pub(crate) fn read_actions(
+        &self,
+        engine: &dyn Engine,
+        action_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        self.read_actions_with_projected_checkpoint_actions(
+            engine,
+            action_schema.clone(),
+            action_schema,
+            meta_predicate,
+        )
     }
 
     /// find a minimal set to cover the range of commits we want. This is greedy so not always
@@ -366,21 +388,24 @@ impl LogSegment {
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
-        checkpoint_read_schema: SchemaRef,
+        action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let need_file_actions = checkpoint_read_schema.contains(ADD_NAME)
-            || checkpoint_read_schema.contains(REMOVE_NAME);
+        let need_file_actions = schema_contains_file_actions(&action_schema);
 
-        // Only validate sidecar requirement if we actually have checkpoint files
-        if !self.checkpoint_parts.is_empty() {
-            require!(
-                !need_file_actions || checkpoint_read_schema.contains(SIDECAR_NAME),
-                Error::invalid_checkpoint(
-                    "If the checkpoint read schema contains file actions, it must contain the sidecar column"
-                )
-            );
-        }
+        // Sidecars only contain file actions so don't add it to the schema if not needed
+        let checkpoint_read_schema = if !need_file_actions ||
+        // Don't duplicate the column if it exists
+        action_schema.contains(SIDECAR_NAME) ||
+        // With multiple parts the checkpoint can't be v2, so sidecars aren't needed
+        self.checkpoint_parts.len() > 1
+        {
+            action_schema.clone()
+        } else {
+            Arc::new(
+                action_schema.add([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())])?,
+            )
+        };
 
         let checkpoint_file_meta: Vec<_> = self
             .checkpoint_parts
@@ -437,7 +462,7 @@ impl LogSegment {
                         parquet_handler.clone(), // cheap Arc clone
                         log_root.clone(),
                         checkpoint_batch.as_ref(),
-                        checkpoint_read_schema.clone(),
+                        action_schema.clone(),
                         meta_predicate.clone(),
                     )?
                 } else {
@@ -540,7 +565,7 @@ impl LogSegment {
             )))
         });
         // read the same protocol and metadata schema for both commits and checkpoints
-        self.read_actions(engine, schema.clone(), schema, META_PREDICATE.clone())
+        self.read_actions(engine, schema, META_PREDICATE.clone())
     }
 
     /// How many commits since a checkpoint, according to this log segment

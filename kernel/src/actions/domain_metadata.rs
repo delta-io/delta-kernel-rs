@@ -74,7 +74,6 @@ fn replay_for_domain_metadatas(
     log_segment.read_actions(
         engine,
         schema.clone(), // Arc clone
-        schema.clone(), // Arc clone
         META_PREDICATE.clone(),
     )
 }

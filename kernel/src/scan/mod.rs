@@ -14,7 +14,7 @@ use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -47,7 +47,7 @@ static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
 // safety: we define get_log_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_log_schema().project(&[ADD_NAME, SIDECAR_NAME]).unwrap());
+    LazyLock::new(|| get_log_schema().project(&[ADD_NAME]).unwrap());
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -569,7 +569,7 @@ impl Scan {
         )?;
 
         let it = new_log_segment
-            .read_actions(
+            .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
@@ -599,12 +599,14 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
-        self.snapshot.log_segment().read_actions(
-            engine,
-            COMMIT_READ_SCHEMA.clone(),
-            CHECKPOINT_READ_SCHEMA.clone(),
-            None,
-        )
+        self.snapshot
+            .log_segment()
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                COMMIT_READ_SCHEMA.clone(),
+                CHECKPOINT_READ_SCHEMA.clone(),
+                None,
+            )
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
