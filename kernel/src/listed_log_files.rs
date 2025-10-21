@@ -634,7 +634,7 @@ mod list_log_files_with_log_tail_tests {
             ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
                 panic!("read_files used");
             }
-            fn copy(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+            fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
                 panic!("copy used from {src} to {dest}");
             }
         }

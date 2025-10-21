@@ -176,7 +176,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         Ok(Box::new(receiver.into_iter()))
     }
 
-    fn copy(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
         let dest_path_str = dest_path.to_string();
@@ -185,11 +185,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // Read source file then write atomically with PutMode::Create
         // This ensures: 1) atomicity 2) fails if destination exists
         self.task_executor.block_on(async move {
-            let data = store
-                .get(&src_path)
-                .await?
-                .bytes()
-                .await?;
+            let data = store.get(&src_path).await?.bytes().await?;
 
             store
                 .put_opts(&dest_path, data.into(), PutMode::Create.into())
@@ -342,7 +338,7 @@ mod tests {
         store.put(&src_path, data.clone().into()).await.unwrap();
         let src_url = Url::from_file_path(tmp.path().join("src.txt")).unwrap();
         let dest_url = Url::from_file_path(tmp.path().join("dest.txt")).unwrap();
-        assert!(handler.copy(&src_url, &dest_url).is_ok());
+        assert!(handler.copy_atomic(&src_url, &dest_url).is_ok());
         let dest_path = Path::from_absolute_path(tmp.path().join("dest.txt")).unwrap();
         assert_eq!(
             store.get(&dest_path).await.unwrap().bytes().await.unwrap(),
@@ -351,13 +347,13 @@ mod tests {
 
         // copy to existing fails
         assert!(matches!(
-            handler.copy(&src_url, &dest_url),
+            handler.copy_atomic(&src_url, &dest_url),
             Err(Error::FileAlreadyExists(_))
         ));
 
         // copy from non-existing fails
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         let new_dest_url = Url::from_file_path(tmp.path().join("new_dest.txt")).unwrap();
-        assert!(handler.copy(&missing_url, &new_dest_url).is_err());
+        assert!(handler.copy_atomic(&missing_url, &new_dest_url).is_err());
     }
 }
