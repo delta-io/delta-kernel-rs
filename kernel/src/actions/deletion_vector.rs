@@ -10,6 +10,8 @@ use delta_kernel_derive::ToSchema;
 use roaring::RoaringTreemap;
 use url::Url;
 
+use crc::{Crc, CRC_32_ISO_HDLC};
+
 use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
@@ -54,6 +56,53 @@ impl std::fmt::Display for DeletionVectorStorageType {
 impl ToDataType for DeletionVectorStorageType {
     fn to_data_type() -> DataType {
         DataType::STRING
+    }
+}
+
+pub struct DeletionVectorPath {
+    table_path: Url,
+    uuid: uuid::Uuid,
+    prefix: String,
+}
+
+impl DeletionVectorPath {
+    pub(crate) fn new(table_path: Url, prefix: String) -> Self {
+        Self {
+            table_path,
+            uuid: uuid::Uuid::new_v4(),
+            prefix,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_uuid(table_path: Url, prefix: String, uuid: uuid::Uuid) -> Self {
+        Self {
+            table_path,
+            uuid,
+            prefix,
+        }
+    }
+
+    fn relative_path(prefix: &str, uuid: &uuid::Uuid) -> String {
+        let uuid_as_string = uuid::Uuid::to_string(uuid);
+        if !prefix.is_empty() {
+            format!("{prefix}/deletion_vector_{uuid_as_string}.bin")
+        } else {
+            format!("deletion_vector_{uuid_as_string}.bin")
+        }
+    }
+
+    pub fn absolute_path(&self) -> DeltaResult<Url> {
+        let dv_suffix = Self::relative_path(&self.prefix, &self.uuid);
+        let dv_path = self
+            .table_path
+            .join(&dv_suffix)
+            .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
+        Ok(dv_path)
+    }
+
+    pub(crate) fn encoded_relative_path(&self) -> String {
+        format!("{}{}", self.prefix, z85::encode(self.uuid.as_bytes()))
     }
 }
 
@@ -126,14 +175,8 @@ impl DeletionVectorDescriptor {
                     .map_err(|_| Error::deletion_vector("Failed to decode DV uuid"))?;
                 let uuid = uuid::Uuid::from_slice(&decoded)
                     .map_err(|err| Error::DeletionVector(err.to_string()))?;
-                let dv_suffix = if prefix_len > 0 {
-                    format!(
-                        "{}/deletion_vector_{uuid}.bin",
-                        &self.path_or_inline_dv[..prefix_len]
-                    )
-                } else {
-                    format!("deletion_vector_{uuid}.bin")
-                };
+                let dv_suffix =
+                    DeletionVectorPath::relative_path(&self.path_or_inline_dv[..prefix_len], &uuid);
                 let dv_path = parent
                     .join(&dv_suffix)
                     .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
@@ -158,6 +201,16 @@ impl DeletionVectorDescriptor {
         &self,
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
+    ) -> DeltaResult<RoaringTreemap> {
+        self.read_with_possible_validation(storage, parent, false)
+    }
+
+    /// Same as above, but optionally validate the CRC32 checksum in the file.
+    pub(crate) fn read_with_possible_validation(
+        &self,
+        storage: Arc<dyn StorageHandler>,
+        parent: &Url,
+        validate_crc: bool,
     ) -> DeltaResult<RoaringTreemap> {
         match self.absolute_path(parent)? {
             None => {
@@ -210,16 +263,35 @@ impl DeletionVectorDescriptor {
                 );
 
                 // get the Bytes back out and limit it to dv_size
-                let position = cursor.position();
-                let mut bytes = cursor.into_inner();
-                let truncate_pos = position + dv_size as u64;
-                assert!(
-                    truncate_pos <= usize::MAX as u64,
-                    "Can't truncate as truncate_pos is > usize::MAX"
-                );
-                bytes.truncate(truncate_pos as usize);
-                let mut cursor = Cursor::new(bytes);
-                cursor.set_position(position);
+                let position = cursor.position() as usize;
+                let bytes = cursor.into_inner();
+                // -4 to remove CRC portion.
+                let truncate_pos = position + dv_size as usize - 4;
+
+                if validate_crc {
+                    require!(
+                        bytes.len() >= truncate_pos + 4,
+                        Error::DeletionVector(format!(
+                            "Can't validate CRC as there are not enough bytes {} < {}",
+                            bytes.len(),
+                            truncate_pos + 4
+                        ))
+                    );
+                    let mut crc_cursor: Cursor<Bytes> =
+                        Cursor::new(bytes.slice(truncate_pos..truncate_pos + 4));
+                    let crc = read_u32(&mut crc_cursor, Endian::Big)?;
+                    let crc32 = create_dv_crc32();
+                    // -4 to include magic portion of the CRC
+                    let expected_crc = crc32.checksum(&bytes.slice(position - 4..truncate_pos));
+                    require!(
+                        crc == expected_crc,
+                        Error::DeletionVector(format!(
+                            "CRC32 checksum mismatch: {crc} != {expected_crc}"
+                        ))
+                    );
+                }
+                let dv_bytes = bytes.slice(position..truncate_pos);
+                let cursor = Cursor::new(dv_bytes.clone());
                 RoaringTreemap::deserialize_from(cursor)
                     .map_err(|err| Error::DeletionVector(err.to_string()))
             }
@@ -240,6 +312,12 @@ impl DeletionVectorDescriptor {
 enum Endian {
     Big,
     Little,
+}
+
+/// Factory function to create a CRC-32 instance using the ISO HDLC algorithm.
+/// This ensures consistent CRC algorithm usage for deletion vectors.
+pub(crate) fn create_dv_crc32() -> Crc<u32> {
+    Crc::<u32>::new(&CRC_32_ISO_HDLC)
 }
 
 /// small helper to read a big or little endian u32 from a cursor
@@ -441,7 +519,11 @@ mod tests {
         let storage = sync_engine.storage_handler();
 
         let example = dv_example();
-        let tree_map = example.read(storage, &parent).unwrap();
+        let tree_map = example.read(storage.clone(), &parent).unwrap();
+        let validated_treemap = example
+            .read_with_possible_validation(storage.clone(), &parent, true)
+            .unwrap();
+        assert_eq!(tree_map, validated_treemap);
 
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();
@@ -565,5 +647,191 @@ mod tests {
             let parsed = string_repr.parse::<DeletionVectorStorageType>().unwrap();
             assert_eq!(variant, parsed);
         }
+    }
+
+    #[test]
+    fn test_deletion_vector_path_absolute_path_uniqueness() {
+        // Verify that two DeletionVectorPath instances created with the same arguments
+        // produce different absolute paths due to unique UUIDs
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("deletion_vectors");
+
+        let dv_path1 = DeletionVectorPath::new(table_path.clone(), prefix.clone());
+        let dv_path2 = DeletionVectorPath::new(table_path.clone(), prefix.clone());
+
+        let abs_path1 = dv_path1.absolute_path().unwrap();
+        let abs_path2 = dv_path2.absolute_path().unwrap();
+
+        // The absolute paths should be different because each DeletionVectorPath
+        // gets a unique UUID
+        assert_ne!(abs_path1, abs_path2);
+
+        // But they should share the same parent path
+        assert_eq!(abs_path1.join("..").unwrap(), abs_path2.join("..").unwrap());
+    }
+
+    #[test]
+    fn test_deletion_vector_path_absolute_path_with_prefix() {
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("dv");
+        let known_uuid = uuid::Uuid::parse_str("abcdef01-2345-6789-abcd-ef0123456789").unwrap();
+
+        let dv_path = DeletionVectorPath::new_with_uuid(table_path.clone(), prefix, known_uuid);
+        let abs_path = dv_path.absolute_path().unwrap();
+
+        // Verify the exact path with known UUID
+        let expected =
+            "file:///tmp/test_table/dv/deletion_vector_abcdef01-2345-6789-abcd-ef0123456789.bin";
+        assert_eq!(abs_path.as_str(), expected);
+    }
+
+    #[test]
+    fn test_deletion_vector_path_absolute_path_with_known_uuid() {
+        // Test with a known UUID to verify exact path construction
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("dv");
+        let known_uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let dv_path = DeletionVectorPath::new_with_uuid(table_path, prefix, known_uuid);
+        let abs_path = dv_path.absolute_path().unwrap();
+
+        // Verify the exact path is constructed correctly
+        let expected_path =
+            "file:///tmp/test_table/dv/deletion_vector_550e8400-e29b-41d4-a716-446655440000.bin";
+        assert_eq!(abs_path.as_str(), expected_path);
+    }
+
+    #[test]
+    fn test_deletion_vector_path_absolute_path_with_known_uuid_empty_prefix() {
+        // Test with a known UUID and empty prefix
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("");
+        let known_uuid = uuid::Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+
+        let dv_path = DeletionVectorPath::new_with_uuid(table_path, prefix, known_uuid);
+        let abs_path = dv_path.absolute_path().unwrap();
+
+        // Verify the exact path is constructed correctly without prefix directory
+        let expected_path =
+            "file:///tmp/test_table/deletion_vector_123e4567-e89b-12d3-a456-426614174000.bin";
+        assert_eq!(abs_path.as_str(), expected_path);
+    }
+
+    #[test]
+    fn test_deletion_vector_path_encoded_with_known_uuid() {
+        // Test encoded relative path with a known UUID
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("prefix");
+        let known_uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let dv_path = DeletionVectorPath::new_with_uuid(table_path, prefix.clone(), known_uuid);
+        let encoded = dv_path.encoded_relative_path();
+
+        // The encoded path should start with the prefix
+        assert!(encoded.starts_with(&prefix));
+
+        // Verify it has the correct length (prefix + 20 for z85 encoded UUID)
+        assert_eq!(encoded.len(), prefix.len() + 20);
+
+        // Verify the z85 encoding of the UUID (550e8400-e29b-41d4-a716-446655440000 -> rsTVZ&*Sl-RXRWjryu/!)
+        assert_eq!(encoded, "prefixrsTVZ&*Sl-RXRWjryu/!");
+    }
+
+    #[test]
+    fn test_deletion_vector_path_absolute_path_empty_prefix() {
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("");
+
+        let dv_path = DeletionVectorPath::new(table_path.clone(), prefix);
+        let abs_path = dv_path.absolute_path().unwrap();
+
+        // With empty prefix, the deletion vector file should be directly under table_path
+        let path_str = abs_path.as_str();
+        assert!(path_str.starts_with("file:///tmp/test_table/deletion_vector_"));
+        assert!(path_str.ends_with(".bin"));
+    }
+
+    #[test]
+    fn test_deletion_vector_path_encoded_relative_path() {
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("dv");
+
+        let dv_path = DeletionVectorPath::new(table_path, prefix.clone());
+        let encoded = dv_path.encoded_relative_path();
+
+        // The encoded path should start with the prefix
+        assert!(encoded.starts_with(&prefix));
+
+        // The encoded path should be at least prefix length + 20 (z85 encoded UUID)
+        assert!(encoded.len() >= prefix.len() + 20);
+
+        // The part after the prefix should be exactly 20 characters (z85 encoded 16-byte UUID)
+        assert_eq!(encoded.len() - prefix.len(), 20);
+    }
+
+    #[test]
+    fn test_deletion_vector_path_encoded_relative_path_empty_prefix() {
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("");
+
+        let dv_path = DeletionVectorPath::new(table_path, prefix);
+        let encoded = dv_path.encoded_relative_path();
+
+        // With empty prefix, the encoded path should be exactly 20 characters
+        assert_eq!(encoded.len(), 20);
+    }
+
+    #[test]
+    fn test_deletion_vector_path_with_s3_url() {
+        let table_path = Url::parse("s3://my-bucket/warehouse/delta_table/").unwrap();
+        let prefix = String::from("deletion_vectors");
+
+        let dv_path = DeletionVectorPath::new(table_path, prefix);
+        let abs_path = dv_path.absolute_path().unwrap();
+
+        // Should maintain the s3 scheme
+        assert!(abs_path.as_str().starts_with("s3://"));
+        assert!(abs_path.as_str().contains("my-bucket"));
+        assert!(abs_path
+            .as_str()
+            .contains("/deletion_vectors/deletion_vector_"));
+    }
+
+    #[test]
+    fn test_deletion_vector_path_with_nested_prefix() {
+        let table_path = Url::parse("file:///data/warehouse/my_table/").unwrap();
+        let prefix = String::from("_delta_log/deletion_vectors");
+
+        let dv_path = DeletionVectorPath::new(table_path, prefix.clone());
+        let abs_path = dv_path.absolute_path().unwrap();
+
+        // Should contain the nested path structure
+        assert!(abs_path
+            .as_str()
+            .contains("/_delta_log/deletion_vectors/deletion_vector_"));
+
+        let encoded = dv_path.encoded_relative_path();
+        // The encoded path should start with the full prefix
+        assert!(encoded.starts_with(&prefix));
+    }
+
+    #[test]
+    fn test_deletion_vector_path_encoded_uniqueness() {
+        // Verify that encoded relative paths are unique for different instances
+        let table_path = Url::parse("file:///tmp/test_table/").unwrap();
+        let prefix = String::from("dv");
+
+        let dv_path1 = DeletionVectorPath::new(table_path.clone(), prefix.clone());
+        let dv_path2 = DeletionVectorPath::new(table_path.clone(), prefix.clone());
+
+        let encoded1 = dv_path1.encoded_relative_path();
+        let encoded2 = dv_path2.encoded_relative_path();
+
+        // Each instance should have a different encoded path due to unique UUIDs
+        assert_ne!(encoded1, encoded2);
+
+        // But they should both start with the same prefix
+        assert!(encoded1.starts_with("dv"));
+        assert!(encoded2.starts_with("dv"));
     }
 }
