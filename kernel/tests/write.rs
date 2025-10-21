@@ -907,9 +907,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // We can add shredding features as well as we are allowed to write unshredded variants
     // into shredded tables and shredded reads are explicitly blocked in the default
     // engine's parquet reader.
-    // TODO: (#1124) we don't actually support column mapping writes yet, but have some
-    // tests that do column mapping on writes. For now omit the writer feature to let tests
-    // run, but after actual support this should be enabled.
+    // columnMapping is a ReaderWriter feature and must be in both reader and writer features
     let table_url = create_table(
         store.clone(),
         table_location,
@@ -917,7 +915,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         &[],
         true,
         vec!["variantType", "variantShredding-preview", "columnMapping"],
-        vec!["variantType", "variantShredding-preview"],
+        vec!["variantType", "variantShredding-preview", "columnMapping"],
     )
     .await?;
 

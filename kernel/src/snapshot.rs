@@ -463,20 +463,18 @@ mod tests {
         let reader_version = min_reader_version.unwrap_or(1);
 
         if ict_enabled {
-            let mut protocol = json!({
+            // When ICT is enabled, we need minReaderVersion >= 3 and minWriterVersion = 7
+            // inCommitTimestamp is a Writer-only feature, so it only goes in writerFeatures
+            // When using table features (writer version 7), reader version must be at least 3
+            let reader_version = reader_version.max(3);
+            json!({
                 "protocol": {
                     "minReaderVersion": reader_version,
                     "minWriterVersion": 7,
+                    "readerFeatures": [],
                     "writerFeatures": ["inCommitTimestamp"]
                 }
-            });
-
-            // Only include readerFeatures if minReaderVersion >= 3
-            if reader_version >= 3 {
-                protocol["protocol"]["readerFeatures"] = json!([]);
-            }
-
-            protocol
+            })
         } else {
             json!({
                 "protocol": {
