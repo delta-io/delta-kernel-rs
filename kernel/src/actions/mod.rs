@@ -1984,13 +1984,17 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_with_add() {
-        let schema = get_log_schema().project(&[ADD_NAME]).unwrap();
+        let schema = get_log_schema()
+            .project(&[ADD_NAME, PROTOCOL_NAME])
+            .unwrap();
         assert!(schema_contains_file_actions(&schema));
     }
 
     #[test]
     fn test_schema_contains_file_actions_with_remove() {
-        let schema = get_log_schema().project(&[REMOVE_NAME]).unwrap();
+        let schema = get_log_schema()
+            .project(&[REMOVE_NAME, METADATA_NAME])
+            .unwrap();
         assert!(schema_contains_file_actions(&schema));
     }
 
