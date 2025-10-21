@@ -206,12 +206,9 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::Actions { oldest_first } => {
             let log_schema = get_log_schema();
-            let actions = snapshot.log_segment().read_actions(
-                &engine,
-                log_schema.clone(),
-                log_schema.clone(),
-                None,
-            )?;
+            let actions = snapshot
+                .log_segment()
+                .read_actions(&engine, log_schema.clone(), None)?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {
