@@ -82,13 +82,10 @@ static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(
-        get_commit_schema()
-            .fields()
-            .cloned()
-            .chain([
-                StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
-                StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-            ]),
+        get_commit_schema().fields().cloned().chain([
+            StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
+            StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        ]),
     ))
 });
 
@@ -2020,7 +2017,9 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_with_both() {
-        let schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap();
+        let schema = get_commit_schema()
+            .project(&[ADD_NAME, REMOVE_NAME])
+            .unwrap();
         assert!(schema_contains_file_actions(&schema));
     }
 

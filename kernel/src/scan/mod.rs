@@ -39,8 +39,11 @@ pub(crate) mod state_info;
 
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]
-static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_commit_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap());
+static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    get_commit_schema()
+        .project(&[ADD_NAME, REMOVE_NAME])
+        .unwrap()
+});
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =

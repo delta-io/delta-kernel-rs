@@ -206,9 +206,10 @@ fn try_main() -> DeltaResult<()> {
         }
         Commands::Actions { oldest_first } => {
             let commit_schema = get_commit_schema();
-            let actions = snapshot
-                .log_segment()
-                .read_actions(&engine, commit_schema.clone(), None)?;
+            let actions =
+                snapshot
+                    .log_segment()
+                    .read_actions(&engine, commit_schema.clone(), None)?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {
