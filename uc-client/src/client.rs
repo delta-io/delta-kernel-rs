@@ -7,10 +7,11 @@ use url::Url;
 
 use crate::config::{ClientConfig, ClientConfigBuilder};
 use crate::error::{Error, Result};
-use crate::models::commits::{CommitsRequest, CommitsResponse};
+use crate::models::commits::{CommitRequest, CommitsRequest, CommitsResponse};
 use crate::models::credentials::{CredentialsRequest, Operation, TemporaryTableCredentials};
 use crate::models::tables::TablesResponse;
 
+/// An HTTP client for interacting with the Unity Catalog API.
 #[derive(Debug, Clone)]
 pub struct UCClient {
     client: Client,
@@ -19,6 +20,7 @@ pub struct UCClient {
 }
 
 impl UCClient {
+    /// Create a new client from [ClientConfig].
     pub fn new(config: ClientConfig) -> Result<Self> {
         // default headers with authorization and content type
         let mut headers = header::HeaderMap::new();
@@ -44,14 +46,15 @@ impl UCClient {
         })
     }
 
+    /// Create a new [UCClientBuilder] to configure and build a [UCClient].
     pub fn builder(workspace: impl Into<String>, token: impl Into<String>) -> UCClientBuilder {
         UCClientBuilder::new(workspace, token)
     }
 
+    /// Get the latest commits for the table.
     #[instrument(skip(self))]
     pub async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
         let url = self.base_url.join("delta/preview/commits")?;
-
         let response = self
             .execute_with_retry(|| {
                 self.client
@@ -64,6 +67,23 @@ impl UCClient {
         self.handle_response(response).await
     }
 
+    /// Commit a new version to the table.
+    #[instrument(skip(self))]
+    pub async fn commit(&self, request: CommitRequest) -> Result<()> {
+        let url = self.base_url.join("delta/preview/commits")?;
+        let response = self
+            .execute_with_retry(|| {
+                self.client
+                    .request(reqwest::Method::POST, url.clone())
+                    .json(&request)
+                    .send()
+            })
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Resolve the table by name.
     #[instrument(skip(self))]
     pub async fn get_table(&self, table_name: &str) -> Result<TablesResponse> {
         let url = self.base_url.join(&format!("tables/{}", table_name))?;
@@ -78,6 +98,7 @@ impl UCClient {
         }
     }
 
+    /// Get temporary cloud storage credentials for accessing a table.
     #[instrument(skip(self))]
     pub async fn get_credentials(
         &self,
@@ -163,6 +184,7 @@ impl UCClient {
     }
 }
 
+/// A builder for configuring and creating a [UCClient].
 pub struct UCClientBuilder {
     config_builder: ClientConfigBuilder,
 }
