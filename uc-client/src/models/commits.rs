@@ -45,13 +45,10 @@ pub struct Commit {
     pub file_name: String,
     pub file_size: i64,
     pub file_modification_timestamp: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_disown_commit: Option<bool>,
 }
 
 impl Commit {
-    /// Create a new commit to send to UC. By default, `is_disown_commit` is set to false (set with
-    /// [`Self::with_disown_commit`]).
+    /// Create a new commit to send to UC with the specified version and timestamp.
     pub fn new(
         version: i64,
         timestamp: i64,
@@ -65,13 +62,7 @@ impl Commit {
             file_name: file_name.into(),
             file_size,
             file_modification_timestamp,
-            is_disown_commit: Some(false),
         }
-    }
-
-    pub fn with_disown_commit(mut self, disown: bool) -> Self {
-        self.is_disown_commit = Some(disown);
-        self
     }
 
     pub fn timestamp_as_datetime(&self) -> Option<chrono::DateTime<chrono::Utc>> {
