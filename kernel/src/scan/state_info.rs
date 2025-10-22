@@ -35,7 +35,7 @@ struct MetadataInfo<'a> {
     /// What are the names of the requested metadata fields
     metadata_field_names: HashSet<&'a String>,
     /// The name of the column that's selecting row indexes if that's been requested or None if they
-    /// are not requested .  We remember this if it's been requested explicitly. this is so we can
+    /// are not requested. We remember this if it's been requested explicitly. this is so we can
     /// reference this column and not re-add it as a requested column if we're _also_ requesting
     /// row-ids.
     selected_row_index_col_name: Option<&'a String>,
@@ -221,6 +221,7 @@ pub(crate) mod tests {
     use crate::actions::{Metadata, Protocol};
     use crate::expressions::{column_expr, Expression as Expr};
     use crate::schema::{ColumnMetadataKey, MetadataValue};
+    use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
 
@@ -587,17 +588,8 @@ pub(crate) mod tests {
                 "Generic delta kernel error: No delta.rowTracking.materializedRowIdColumnName key found in metadata configuration",
             ),
         ] {
-            match get_state_info(schema.clone(), vec![], None, metadata_config, metadata_cols) {
-                Ok(_) => {
-                    panic!("Should not have succeeded generating state info with invalid config")
-                }
-                Err(e) => {
-                    assert_eq!(
-                        e.to_string(),
-                        expected_error,
-                    )
-                }
-            }
+            let res = get_state_info(schema.clone(), vec![], None, metadata_config, metadata_cols);
+            assert_result_error_with_message(res, expected_error);
         }
     }
 
@@ -607,21 +599,17 @@ pub(crate) mod tests {
             "id",
             DataType::STRING,
         )]));
-        match get_state_info(
+        let res = get_state_info(
             schema.clone(),
             vec!["part_col".to_string()],
             None,
             HashMap::new(),
             vec![("part_col", MetadataColumnSpec::RowId)],
-        ) {
-            Ok(_) => {
-                panic!("Should not have succeeded generating state info with invalid config")
-            }
-            Err(e) => {
-                assert_eq!(e.to_string(),
-                           "Schema error: Metadata column names must not match partition columns: part_col")
-            }
-        }
+        );
+        assert_result_error_with_message(
+            res,
+            "Schema error: Metadata column names must not match partition columns: part_col",
+        );
     }
 
     #[test]
@@ -642,20 +630,16 @@ pub(crate) mod tests {
                 "other".into(),
             ),
         ]))]));
-        match get_state_info(
+        let res = get_state_info(
             schema.clone(),
             vec![],
             None,
             get_string_map(&[("delta.columnMapping.mode", "name")]),
             vec![("other", MetadataColumnSpec::RowIndex)],
-        ) {
-            Ok(_) => {
-                panic!("Should not have succeeded generating state info with invalid config")
-            }
-            Err(e) => {
-                assert_eq!(e.to_string(),
-                           "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'");
-            }
-        }
+        );
+        assert_result_error_with_message(
+            res,
+            "Schema error: Metadata column names must not match physical columns, but logical column 'id' has physical name 'other'"
+        );
     }
 }

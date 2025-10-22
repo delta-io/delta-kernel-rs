@@ -79,6 +79,9 @@ pub(crate) fn scan_file_physical_schema(
 // added to overwrite any conflicting values. This behavior can be made more strict by changing
 // the parse_partition_values function to return an error for missing partition values,
 // and adding cdf values to the partition_values map
+
+// Note: Delta doesn't support row-tracking for CDF (see:
+// https://docs.databricks.com/aws/en/delta/row-tracking#limitations)
 pub(crate) fn get_cdf_transform_expr(
     scan_file: &CdfScanFile,
     state_info: &StateInfo,

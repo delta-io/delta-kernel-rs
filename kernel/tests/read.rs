@@ -1519,22 +1519,16 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
             StructField::create_metadata_column(column_name, metadata_spec),
         ])?);
 
-        let scan = snapshot.scan_builder().with_schema(schema).build();
-        match scan {
-            Err(e) => {
-                let error_msg = e.to_string();
-                assert!(
-                    error_msg.contains(error_text),
-                    "Expected {error_msg} to contain {error_text}"
-                );
-            }
-            Ok(_) => {
-                panic!(
-                    "Expected error for {} metadata column, but scan succeeded",
-                    error_text
-                );
-            }
-        }
+        let scan_err = snapshot
+            .scan_builder()
+            .with_schema(schema)
+            .build()
+            .unwrap_err();
+        let error_msg = scan_err.to_string();
+        assert!(
+            error_msg.contains(error_text),
+            "Expected {error_msg} to contain {error_text}"
+        );
     }
 
     Ok(())
