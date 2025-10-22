@@ -961,20 +961,11 @@ pub(crate) struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
-    pub(crate) fn new(domain: String, configuration: String) -> Self {
+    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
         Self {
             domain,
             configuration,
-            removed: false,
-        }
-    }
-
-    // Create a new DomainMetadata action to remove a domain.
-    pub(crate) fn remove(domain: String, configuration: String) -> Self {
-        Self {
-            domain,
-            configuration,
-            removed: true,
+            removed,
         }
     }
 
@@ -991,10 +982,6 @@ impl DomainMetadata {
 
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
-    }
-
-    pub(crate) fn is_removed(&self) -> bool {
-        self.removed
     }
 }
 

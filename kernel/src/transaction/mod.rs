@@ -136,10 +136,9 @@ pub struct Transaction {
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
     // Domain metadata additions for this transaction.
-    domain_metadatas: Vec<DomainMetadata>,
+    domain_metadatas_to_add: Vec<DomainMetadata>,
     // Domain names to remove in this transaction. The configuration values are fetched during
-    // commit from the log to preserve the pre-image in tombstones. We use Vec to preserve
-    // duplicate detection during validation (duplicates are a user error).
+    // commit from the log to preserve the pre-image in tombstones.
     domains_to_remove: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
@@ -183,7 +182,7 @@ impl Transaction {
             add_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
-            domain_metadatas: vec![],
+            domain_metadatas_to_add: vec![],
             domains_to_remove: vec![],
             data_change: true,
         })
@@ -354,8 +353,8 @@ impl Transaction {
     /// fail (that is, we don't eagerly check domain validity here).
     /// Setting metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
-        self.domain_metadatas
-            .push(DomainMetadata::new(domain, configuration));
+        self.domain_metadatas_to_add
+            .push(DomainMetadata::new(domain, configuration, false));
         self
     }
 
@@ -384,7 +383,7 @@ impl Transaction {
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
         // if there are domain metadata actions (additions or removals), the table must support it
-        if (!self.domain_metadatas.is_empty() || !self.domains_to_remove.is_empty())
+        if (!self.domain_metadatas_to_add.is_empty() || !self.domains_to_remove.is_empty())
             && !self
                 .read_snapshot
                 .table_configuration()
@@ -395,26 +394,17 @@ impl Transaction {
             ));
         }
 
-        // validate domain metadata additions
+        // validate all domain metadata operations (additions and removals)
         let mut seen_domains = HashSet::new();
-        for dm in &self.domain_metadatas {
-            if dm.is_internal() {
-                return Err(Error::Generic(
-                    "Cannot modify domains that start with 'delta.' as those are system controlled"
-                        .to_string(),
-                ));
-            }
 
-            if !seen_domains.insert(dm.domain()) {
-                return Err(Error::Generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    dm.domain()
-                )));
-            }
-        }
+        // chain both additions and removals into a single iterator of domain names
+        let all_domains = self
+            .domain_metadatas_to_add
+            .iter()
+            .map(|dm| dm.domain())
+            .chain(self.domains_to_remove.iter().map(String::as_str));
 
-        // validate domain metadata removals
-        for domain in &self.domains_to_remove {
+        for domain in all_domains {
             if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
                 return Err(Error::Generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled"
@@ -437,14 +427,14 @@ impl Transaction {
             HashMap::new()
         };
 
-        // process domain additions - clone directly since domain_metadatas now only contains additions
-        let domain_additions = self.domain_metadatas.iter().cloned();
+        // process domain additions - clone directly since domain_metadatas_to_add only contains additions
+        let domain_additions = self.domain_metadatas_to_add.iter().cloned();
 
         // process domain removals - fetch configuration from existing domains and create tombstones
         let domain_removals = self.domains_to_remove.iter().filter_map(move |domain| {
             // if domain doesn't exist in the log, this is a no-op (filter it out)
             existing_domains.get(domain).map(|existing| {
-                DomainMetadata::remove(domain.clone(), existing.configuration().to_string())
+                DomainMetadata::new(domain.clone(), existing.configuration().to_owned(), true)
             })
         });
 
