@@ -6,8 +6,10 @@ use crate::table_changes::{
 };
 use crate::transforms::FieldTransformSpec;
 
-/// Trait for classifying fields during StateInfo construction.
-/// Allows different scan types (regular, CDF) to customize field handling.
+/// Trait for classifying fields during StateInfo construction.  Allows different scan types
+/// (regular, CDF) to customize field handling. Note that the default set of field handling occurs
+/// in [`StateInfo::try_new`](crate::scan::state_info::StateInfo::try_new). A
+/// `TransformFieldClassifier` can be used to override the behavior implemented in that method.
 pub(crate) trait TransformFieldClassifier {
     /// Classify a field and return its transform spec.
     /// Returns None if the field is physical (should be read from parquet).
@@ -16,32 +18,19 @@ pub(crate) trait TransformFieldClassifier {
         &self,
         field: &StructField,
         field_index: usize,
-        partition_columns: &[String],
         last_physical_field: &Option<String>,
     ) -> Option<FieldTransformSpec>;
 }
 
-/// Regular scan field classifier for standard Delta table scans.
-/// Handles partition columns as metadata-derived fields.
-pub(crate) struct ScanTransformFieldClassifier;
-impl TransformFieldClassifier for ScanTransformFieldClassifier {
+// Empty classifier, always returns None
+impl TransformFieldClassifier for () {
     fn classify_field(
         &self,
-        field: &StructField,
-        field_index: usize,
-        partition_columns: &[String],
-        last_physical_field: &Option<String>,
+        _: &StructField,
+        _: usize,
+        _: &Option<String>,
     ) -> Option<FieldTransformSpec> {
-        if partition_columns.contains(field.name()) {
-            // Partition column: needs transform to inject metadata
-            Some(FieldTransformSpec::MetadataDerivedColumn {
-                field_index,
-                insert_after: last_physical_field.clone(),
-            })
-        } else {
-            // Regular physical field - no transform needed
-            None
-        }
+        None
     }
 }
 
@@ -53,7 +42,6 @@ impl TransformFieldClassifier for CdfTransformFieldClassifier {
         &self,
         field: &StructField,
         field_index: usize,
-        partition_columns: &[String],
         last_physical_field: &Option<String>,
     ) -> Option<FieldTransformSpec> {
         match field.name().as_str() {
@@ -70,13 +58,7 @@ impl TransformFieldClassifier for CdfTransformFieldClassifier {
                     insert_after: last_physical_field.clone(),
                 })
             }
-            // Defer to default classifier for partition columns and physical fields
-            _ => ScanTransformFieldClassifier.classify_field(
-                field,
-                field_index,
-                partition_columns,
-                last_physical_field,
-            ),
+            _ => None,
         }
     }
 }

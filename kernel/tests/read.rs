@@ -1500,44 +1500,34 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
 
     // Test that unsupported metadata columns fail with appropriate errors
     let test_cases = [
-        ("row_id", MetadataColumnSpec::RowId, "RowId"),
+        (
+            "row_id",
+            MetadataColumnSpec::RowId,
+            "Row ids are not enabled on this table",
+        ),
         (
             "row_commit_version",
             MetadataColumnSpec::RowCommitVersion,
-            "RowCommitVersion",
+            "Row commit versions not supported",
         ),
     ];
+
     for (column_name, metadata_spec, error_text) in test_cases {
         let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
         let schema = Arc::new(StructType::try_new([
             StructField::nullable("id", DataType::INTEGER),
             StructField::create_metadata_column(column_name, metadata_spec),
         ])?);
-        let scan = snapshot.scan_builder().with_schema(schema).build()?;
-        let stream = scan.execute(engine.clone())?;
 
-        let mut found_error = false;
-        for scan_result in stream {
-            match scan_result {
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    if error_msg.contains(error_text) && error_msg.contains("not supported") {
-                        found_error = true;
-                        break;
-                    }
-                }
-                Ok(_) => {
-                    panic!(
-                        "Expected error for {} metadata column, but scan succeeded",
-                        error_text
-                    );
-                }
-            }
-        }
+        let scan_err = snapshot
+            .scan_builder()
+            .with_schema(schema)
+            .build()
+            .unwrap_err();
+        let error_msg = scan_err.to_string();
         assert!(
-            found_error,
-            "Expected error about {} not being supported",
-            error_text
+            error_msg.contains(error_text),
+            "Expected {error_msg} to contain {error_text}"
         );
     }
 

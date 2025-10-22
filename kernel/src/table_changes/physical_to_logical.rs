@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::expressions::Scalar;
-use crate::scan::StateInfo;
+use crate::scan::state_info::StateInfo;
 use crate::schema::{DataType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::{DeltaResult, Error, ExpressionRef};
@@ -79,6 +79,9 @@ pub(crate) fn scan_file_physical_schema(
 // added to overwrite any conflicting values. This behavior can be made more strict by changing
 // the parse_partition_values function to return an error for missing partition values,
 // and adding cdf values to the partition_values map
+
+// Note: Delta doesn't support row-tracking for CDF (see:
+// https://docs.databricks.com/aws/en/delta/row-tracking#limitations)
 pub(crate) fn get_cdf_transform_expr(
     scan_file: &CdfScanFile,
     state_info: &StateInfo,
@@ -111,9 +114,13 @@ pub(crate) fn get_cdf_transform_expr(
     let cdf_values = get_cdf_columns(&state_info.logical_schema, scan_file)?;
     partition_values.extend(cdf_values);
 
-    let expr = get_transform_expr(transform_spec, partition_values, physical_schema)?;
-
-    Ok(Some(expr))
+    get_transform_expr(
+        transform_spec,
+        partition_values,
+        physical_schema,
+        None, /* base_row_id */
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -121,7 +128,8 @@ mod tests {
     use super::*;
     use crate::expressions::Expression;
     use crate::scan::state::DvInfo;
-    use crate::scan::{PhysicalPredicate, StateInfo};
+    use crate::scan::state_info::StateInfo;
+    use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, StructField, StructType};
     use crate::transforms::FieldTransformSpec;
     use std::collections::HashMap;
