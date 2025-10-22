@@ -222,7 +222,7 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
     CDF_SCAN_ROW_SCHEMA.clone()
 }
 
-/// Expression to convert an action with `log_schema` into one with
+/// Expression to convert an action with `commit_schema` into one with
 /// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanMetadata`].
 pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64) -> Expression {
     Expression::struct_from([

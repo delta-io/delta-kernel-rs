@@ -4,7 +4,7 @@ use delta_kernel::actions::visitors::{
     SetTransactionVisitor,
 };
 use delta_kernel::actions::{
-    get_log_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    get_commit_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
     SET_TRANSACTION_NAME,
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
@@ -70,7 +70,7 @@ enum Action {
 }
 
 static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-    LazyLock::new(|| get_log_schema().leaves(None));
+    LazyLock::new(|| get_commit_schema().leaves(None));
 
 struct LogVisitor {
     actions: Vec<(Action, usize)>,
@@ -205,10 +205,11 @@ fn try_main() -> DeltaResult<()> {
             }
         }
         Commands::Actions { oldest_first } => {
-            let log_schema = get_log_schema();
-            let actions = snapshot
-                .log_segment()
-                .read_actions(&engine, log_schema.clone(), None)?;
+            let commit_schema = get_commit_schema();
+            let actions =
+                snapshot
+                    .log_segment()
+                    .read_actions(&engine, commit_schema.clone(), None)?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {

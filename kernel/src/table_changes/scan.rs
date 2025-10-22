@@ -7,7 +7,8 @@ use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
-use crate::scan::{PhysicalPredicate, ScanResult, StateInfo};
+use crate::scan::state_info::StateInfo;
+use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
@@ -115,11 +116,7 @@ impl TableChangesScanBuilder {
         // Create StateInfo using CDF field classifier
         let state_info = StateInfo::try_new(
             logical_schema,
-            self.table_changes.partition_columns(),
-            self.table_changes
-                .end_snapshot
-                .table_configuration()
-                .column_mapping_mode(),
+            self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
             CdfTransformFieldClassifier,
         )?;
