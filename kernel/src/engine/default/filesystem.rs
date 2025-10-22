@@ -182,8 +182,9 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         let dest_path_str = dest_path.to_string();
         let store = self.inner.clone();
 
-        // Read source file then write atomically with PutMode::Create
-        // This ensures: 1) atomicity 2) fails if destination exists
+        // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
+        // necessarily atomic, but since the source file is immutable, we aren't exposed to the
+        // possiblilty of source file changing while we do the PUT.
         self.task_executor.block_on(async move {
             let data = store.get(&src_path).await?.bytes().await?;
 
