@@ -76,10 +76,18 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
         StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
         StructField::nullable(CDC_NAME, Cdc::to_schema()),
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
         StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
     ]))
+});
+
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(
+        get_log_schema()
+            .fields()
+            .cloned()
+            .chain([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())]),
+    ))
 });
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -111,8 +119,17 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 #[internal_api]
+/// Gets the schema for all actions that can appear in commits
+/// logs.  This excludes actions that can only appear in checkpoints.
 pub(crate) fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
+}
+
+#[internal_api]
+#[allow(dead_code)]
+/// Gets a schema for all actions defined by the delta spec.
+pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
+    &ALL_ACTIONS_SCHEMA
 }
 
 #[internal_api]
@@ -130,6 +147,13 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+/// Returns true if the schema contains file actions (add or remove)
+/// columns.
+#[internal_api]
+pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
+    schema.contains(ADD_NAME) || schema.contains(REMOVE_NAME)
 }
 
 /// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
@@ -1159,18 +1183,13 @@ mod tests {
 
     #[test]
     fn test_sidecar_schema() {
-        let schema = get_log_schema()
-            .project(&[SIDECAR_NAME])
-            .expect("Couldn't get sidecar field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "sidecar",
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::not_null("sizeInBytes", DataType::LONG),
-                StructField::not_null("modificationTime", DataType::LONG),
-                tags_field(),
-            ]),
-        )]));
+        let schema = Sidecar::to_schema();
+        let expected = StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("sizeInBytes", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            tags_field(),
+        ]);
         assert_eq!(schema, expected);
     }
 
@@ -1973,5 +1992,47 @@ mod tests {
         // reader/writer features are null
         assert!(record_batch.column(2).is_null(0));
         assert!(record_batch.column(3).is_null(0));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_add() {
+        let schema = get_log_schema()
+            .project(&[ADD_NAME, PROTOCOL_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[ADD_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_remove() {
+        let schema = get_log_schema()
+            .project(&[REMOVE_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[REMOVE_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_both() {
+        let schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap();
+        assert!(schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_neither() {
+        let schema = get_log_schema()
+            .project(&[PROTOCOL_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_empty_schema() {
+        let schema = Arc::new(StructType::new_unchecked([]));
+        assert!(!schema_contains_file_actions(&schema));
     }
 }
