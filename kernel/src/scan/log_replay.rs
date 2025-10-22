@@ -393,7 +393,7 @@ pub(crate) fn scan_action_iter(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::actions::get_log_schema;
+    use crate::actions::get_commit_schema;
     use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter() {
         run_with_validate_callback(
-            vec![add_batch_simple(get_log_schema().clone())],
+            vec![add_batch_simple(get_commit_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter_with_remove() {
         run_with_validate_callback(
-            vec![add_batch_with_remove(get_log_schema().clone())],
+            vec![add_batch_with_remove(get_commit_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[false, false, true, false],
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_no_transforms() {
-        let batch = vec![add_batch_simple(get_log_schema().clone())];
+        let batch = vec![add_batch_simple(get_commit_schema().clone())];
         let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
         let state_info = Arc::new(StateInfo {
             logical_schema: logical_schema.clone(),
@@ -573,7 +573,7 @@ mod tests {
             "row_indexes_for_row_id_0",
         );
 
-        let batch = vec![add_batch_for_row_id(get_log_schema().clone())];
+        let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch

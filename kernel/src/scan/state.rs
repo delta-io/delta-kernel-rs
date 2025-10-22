@@ -229,7 +229,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::actions::get_log_schema;
+    use crate::actions::get_commit_schema;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
     use crate::ExpressionRef;
 
@@ -269,7 +269,7 @@ mod tests {
     fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
-            vec![add_batch_simple(get_log_schema().clone())],
+            vec![add_batch_simple(get_commit_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
