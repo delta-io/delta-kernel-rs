@@ -969,6 +969,15 @@ impl DomainMetadata {
         }
     }
 
+    // Create a new DomainMetadata action to remove a domain.
+    pub(crate) fn remove(domain: String, configuration: String) -> Self {
+        Self {
+            domain,
+            configuration,
+            removed: true,
+        }
+    }
+
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
@@ -978,6 +987,14 @@ impl DomainMetadata {
 
     pub(crate) fn domain(&self) -> &str {
         &self.domain
+    }
+
+    pub(crate) fn configuration(&self) -> &str {
+        &self.configuration
+    }
+
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
     }
 }
 
