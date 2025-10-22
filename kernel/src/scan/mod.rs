@@ -21,7 +21,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
-use crate::scan::log_replay::BASE_ROW_ID_NAME;
+use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -276,6 +276,35 @@ pub struct ScanResult {
     pub(crate) raw_mask: Option<Vec<bool>>,
 }
 
+static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+            use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
+
+            let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
+            DataType::struct_type_unchecked(vec![StructField::nullable(
+                "add",
+                DataType::struct_type_unchecked(vec![
+                    StructField::not_null("path", DataType::STRING),
+                    StructField::not_null("partitionValues", partition_values),
+                    StructField::not_null("size", DataType::LONG),
+                    StructField::nullable("modificationTime", DataType::LONG),
+                    StructField::nullable("stats", DataType::STRING),
+                    StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+                    StructField::nullable(
+                        "tags",
+                        MapType::new(DataType::STRING, DataType::STRING, true),
+                    ),
+                    StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+                    StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+                    StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
+                ]),
+            )])
+        });
+
+
+pub(crate) fn restored_add_schema() -> &'static DataType {
+    &RESTORED_ADD_SCHEMA
+}
+
 impl ScanResult {
     /// Returns the raw row mask. If an item at `raw_mask()[i]` is true, row `i` is
     /// valid. Otherwise, row `i` is invalid and should be ignored.
@@ -491,29 +520,7 @@ impl Scan {
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
-        static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
-
-            let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-            DataType::struct_type_unchecked(vec![StructField::nullable(
-                "add",
-                DataType::struct_type_unchecked(vec![
-                    StructField::not_null("path", DataType::STRING),
-                    StructField::not_null("partitionValues", partition_values),
-                    StructField::not_null("size", DataType::LONG),
-                    StructField::nullable("modificationTime", DataType::LONG),
-                    StructField::nullable("stats", DataType::STRING),
-                    StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-                    StructField::nullable(
-                        "tags",
-                        MapType::new(DataType::STRING, DataType::STRING, true),
-                    ),
-                    StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-                    StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-                ]),
-            )])
-        });
-
+        
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
@@ -530,7 +537,7 @@ impl Scan {
         let transform = engine.evaluation_handler().new_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
-            RESTORED_ADD_SCHEMA.clone(),
+            restored_add_schema().clone(),
         );
         let apply_transform = move |data: Box<dyn EngineData>| {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))

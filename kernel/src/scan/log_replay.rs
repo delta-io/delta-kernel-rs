@@ -276,6 +276,7 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
 pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
 pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
 pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
+pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
 pub(crate) static TAGS_NAME: &str = "tags";
 
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
@@ -296,6 +297,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
                 /*valueContainsNull*/ true,
             ),
         ),
+        StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -330,7 +332,8 @@ fn get_add_transform_expr() -> ExpressionRef {
     EXPR.clone()
 }
 
-// TODO: remove once `scan_metadata_from` is pub.
+// TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
+// deletion vector update transformations.
 #[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
@@ -346,6 +349,7 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("fileConstantValues.tags"),
                 column_expr_ref!("fileConstantValues.baseRowId"),
                 column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+                column_expr_ref!("fileConstantValues.clusteringProvider"),
             ],
         ))]))
     });

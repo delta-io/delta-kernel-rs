@@ -16,9 +16,9 @@ use crate::committer::{CommitMetadata, CommitResponse, Committer};
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
     get_log_remove_schema, get_log_txn_schema,
     as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema, ADD_NAME
-    get_log_remove_schema, get_log_txn_schema,CommitiNfo, DomainMetadata, REMOVE_NAME, SetTransaction
+    get_log_remove_schema, get_log_txn_schema,CommitInfo, DomainMetadata, REMOVE_NAME, SetTransaction
+
 };
-use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
@@ -28,10 +28,13 @@ use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressi
 use crate::path::ParsedLogPath;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::log_replay::{
-    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
+    get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, 
+    FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
-use crate::scan::scan_row_schema;
+use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, ToSchema};
+use crate::engine_data::GetData;
+use crate::expressions::{column_name, ColumnName};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
@@ -40,6 +43,32 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 use url::Url;
+
+// This is a workaround due to the fact that expression evaluation happens
+        // on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
+        // required fields.
+        // TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
+        // on FilteredEngineData directly.
+        struct NullableStatsTransform;
+        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                use Cow::*;
+                let field = match self.transform(&field.data_type)? {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
+                        name: field.name.clone(),
+                        data_type: data_type.into_owned(),
+                        nullable: true,
+                        metadata: field.metadata.clone(),
+                    }),
+                };
+                Some(field)
+            }
+        }
+
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -58,6 +87,7 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
     ]))
 });
 
+/// Returns a reference to the mandatory fields in an add action.
 ///
 /// Note this does not include "dataChange" which is a required field but
 /// but should be set on the transactoin level. Getting the full schema
@@ -80,6 +110,8 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
     LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
+
+static NEW_DELETION_VECTOR_NAME: LazyLock<String> = LazyLock::new(|| "newDeletionVector".to_string());
 
 /// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
 static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -117,6 +149,49 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
         StructField::nullable("defaultRowCommitVersion", DataType::LONG),
     ]);
     Arc::new(StructType::new_unchecked(fields))
+}
+
+static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(scan_row_schema().fields().cloned().chain([
+        StructField::nullable(NEW_DELETION_VECTOR_NAME.to_string(), DeletionVectorDescriptor::to_schema()),
+    ])))
+});
+
+fn intermediate_dv_schema() -> SchemaRef {
+    &INTERMEDIATE_DV_SCHEMA
+}
+
+static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+    NullableStatsTransform
+        .transform_struct(scan_row_schema())
+        .expect("Failed to transform scan_row_schema")
+        .into_owned()
+});
+
+fn nullable_scan_rows_schema() -> &'static DataType {
+    &NULLABLE_SCAN_ROWS_SCHEMA
+}
+
+static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+    NullableStatsTransform
+        .transform(restored_add_schema())
+        .expect("Failed to transform restored_add_schema")
+        .into_owned()
+});
+
+fn nullable_restored_add_schema() -> &'static DataType {
+    &NULLABLE_RESTORED_ADD_SCHEMA
+}
+
+static NULLABLE_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+    NullableStatsTransform
+        .transform_struct(as_log_add_schema())
+        .expect("Failed to transform as_log_add_schema")
+        .into_owned()
+});
+
+fn nullable_add_schema() -> &'static DataType {
+    &NULLABLE_ADD_SCHEMA
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -167,6 +242,8 @@ impl std::fmt::Debug for Transaction {
         ))
     }
 }
+
+
 
 impl Transaction {
     /// Create a new transaction from a snapshot. The snapshot will be used to read the current
@@ -279,7 +356,7 @@ impl Transaction {
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Step 5: Generate remove actions
-        let remove_actions = self.generate_remove_actions(engine)?;
+        let remove_actions = self.generate_remove_actions(engine, self.remove_files_metadata.iter().map(|a| Ok(a.deref())))?;
 
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
@@ -287,9 +364,9 @@ impl Transaction {
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
 
+        // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
-            .chain(remove_actions);
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
@@ -484,9 +561,6 @@ impl Transaction {
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
         existing_data_files: impl Iterator<Item = FilteredEngineData>,
     ) -> DeltaResult<()> {
-        use crate::engine_data::{GetData, TypedGetData};
-        use crate::expressions::column_name;
-        use crate::schema::ColumnName;
         use crate::RowVisitor;
 
         if !self.will_update_dvs {
@@ -496,64 +570,9 @@ impl Transaction {
             ));
         }
 
+        let mut matched_dv_files = 0;
         // Visitor to extract file metadata and match with DV updates
-        struct DvMatchVisitor<'a> {
-            dv_updates: &'a HashMap<String, DeletionVectorDescriptor>,
-            new_dv_entries: Vec<Scalar>,
-            matched_file_indexes: Vec<usize>,
-        }
-
-        impl<'a> DvMatchVisitor<'a> {
-            const PATH_INDEX: usize = 0;
-
-            fn new(dv_updates: &'a HashMap<String, DeletionVectorDescriptor>) -> Self {
-                Self {
-                    dv_updates,
-                    new_dv_entries: Vec::new(),
-                    matched_file_indexes: Vec::new(),
-                }
-            }
-        }
-
-        impl RowVisitor for DvMatchVisitor<'_> {
-            fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
-                    let names = vec![
-                        column_name!("path"),
-                    ];
-                    let types = vec![
-                        DataType::STRING,
-                    ];
-                    (names, types)
-                });
-                (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
-            }
-
-            fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-                for i in 0..row_count {
-                    let path: String = getters[Self::PATH_INDEX].get(i, "path")?;
-
-                    // Check if this file has a DV update
-                    if let Some(dv_result) = self.dv_updates.get(&path) {
-                     self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
-                        DeletionVectorDescriptor::to_schema().into_fields().collect(),
-                        vec![
-                            Scalar::from(dv_result.storage_type.to_string()),
-                            Scalar::from(dv_result.path_or_inline_dv.clone()),
-                            Scalar::from(dv_result.offset),
-                            Scalar::from(dv_result.size_in_bytes),
-                            Scalar::from(dv_result.cardinality),
-                        ],
-                     )?));
-                     self.matched_file_indexes.push(i);
-                    } else {
-                      self.new_dv_entries.push(Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
-                    }
-                }
-                Ok(())
-            }
-        }
-
+        
         let mut visitor = DvMatchVisitor::new(&new_dv_descriptors);
 
         // Process each scan file to find matches
@@ -562,12 +581,17 @@ impl Transaction {
             visitor.matched_file_indexes.clear();
             let (data, mut selection_vector) = scan_file.into_parts();
             visitor.visit_rows_of(data.as_ref())?;
-            let mut first_unmatched_index = 0;
-            for matched_index in &visitor.matched_file_indexes {
-                for i in first_unmatched_index..*matched_index {
-                    selection_vector[i] = false;
-                }
-                first_unmatched_index = matched_index + 1;
+            let mut current_matched_index = 0;
+            for i in 0..existing_data_files.len() {
+                if current_matched_index < visitor.matched_file_indexes.len() {
+                 if visitor.matched_file_indexes[current_matched_index] != i {
+                      selection_vector[i] = false;
+                  } else {
+                      // Advance to the next match when we find the index. 
+                      current_matched_index += 1;
+                      matched_dv_files += if selection_vector[i] { 1 } else  {0};
+                  }
+              }
             }
             
             let new_columns = vec![
@@ -576,7 +600,11 @@ impl Transaction {
             self.dv_matched_files.push(FilteredEngineData::try_new(data.append_columns(Self::intermediate_dv_schema(), new_columns)?, selection_vector)?);
         }
 
-        // Store the matched files
+        if matched_dv_files != new_dv_descriptors.len() {
+            return Err(Error::generic(
+                format!("Number of matched DV files does not match number of new DV descriptors: {} != {}", matched_dv_files, new_dv_descriptors.len()),
+            ));
+        }
 
         Ok(())
     }
@@ -892,32 +920,9 @@ impl Transaction {
     fn generate_remove_actions<'a>(
         &'a self,
         engine: &dyn Engine,
+        remove_files_metadata: impl Iterator<Item = FilteredEngineData> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
-        // This is a workaround due to the fact that expression evaluation happens
-        // on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
-        // required fields.
-        // TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
-        // on FilteredEngineData directly.
-        struct NullableStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-            fn transform_struct_field(
-                &mut self,
-                field: &'a StructField,
-            ) -> Option<Cow<'a, StructField>> {
-                use Cow::*;
-                let field = match self.transform(&field.data_type)? {
-                    Borrowed(_) if field.is_nullable() => Borrowed(field),
-                    data_type => Owned(StructField {
-                        name: field.name.clone(),
-                        data_type: data_type.into_owned(),
-                        nullable: true,
-                        metadata: field.metadata.clone(),
-                    }),
-                };
-                Some(field)
-            }
-        }
-
+        
         let input_schema = scan_row_schema();
         let target_schema = NullableStatsTransform
             .transform_struct(get_log_remove_schema())
@@ -925,8 +930,8 @@ impl Transaction {
             .into_owned();
         let evaluation_handler = engine.evaluation_handler();
 
-        Ok(self
-            .remove_files_metadata
+        Ok(
+            remove_files_metadata
             .iter()
             .map(move |file_metadata_batch| {
                 let transform = Expression::transform(
@@ -995,11 +1000,129 @@ impl Transaction {
         &'a self,
         engine: &'a dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a> {
-        self.dv_matched_files.iter().map(|file| {
+        let remove_actions = 
+          self.generate_remove_actions(engine, self.dv_matched_files.iter().map(|a| Ok(a.deref())))?;
+          let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter().map(|a| Ok(a.deref())))?;
+          Ok(remove_actions.chain(add_actions))
+    }
 
-        }.flatten()
+    fn generate_adds_for_dv_update<'a>(
+        &'a self,
+        engine: &'a dyn Engine,
+        file_metadata_batch: impl Iterator<Item = FilteredEngineData> + Send + 'a,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+        
+        let evaluation_handler = engine.evaluation_handler();
+
+        Ok(
+            self.dv_matched_files
+            .iter()
+            .map(move |file_metadata_batch| {
+                let with_new_dv_transform = Expression::transform(
+                    Transform::new_top_level()
+                        .with_replaced_field(
+                            "deletionVector",
+                            Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
+                        )
+                );
+                let expr = Expression::struct_from([with_new_dv_transform]);
+                let with_new_dv_eval= evaluation_handler.new_expression_evaluator(
+                    intermediate_dv_schema(),
+                    Arc::new(expr),
+                    nullable_scan_rows_schema().into(),
+                );
+
+                let (data, selection_vector) = file_metadata_batch.into_parts();
+                let with_new_dv_data = with_new_dv_eval.evaluate(data)?;
+
+                let restored_add_eval= evaluation_handler.new_expression_evaluator(
+                    intermediate_dv_schema(),
+                    get_scan_metadata_transform_expr(),
+                    nullable_restored_add_schema().into(),
+                );
+                let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data)?;
+
+                let with_data_change_transform = Expression::transform(
+                    Transform::new_top_level()
+                        .with_inserted_field(
+                            Some("modificationTime"),
+                            Expression::literal(self.data_change).into(),
+                        )
+                );
+                let expr = Expression::struct_from([with_data_change_transform]);
+                let with_data_change_eval= evaluation_handler.new_expression_evaluator(
+                    nullable_restored_add_schema().into(),
+                    Arc::new(expr),
+                    nullable_add_schema().into(),
+                );
+                let with_data_change_data = with_data_change_eval.evaluate(as_partial_add_data)?;
+
+                FilteredEngineData::try_new(
+                    with_data_change_data,
+                    selection_vector,
+                )
+            }))
+
     } 
 }
+
+struct DvMatchVisitor<'a> {
+            dv_updates: &'a HashMap<String, DeletionVectorDescriptor>,
+            new_dv_entries: Vec<Scalar>,
+            matched_file_indexes: Vec<usize>,
+        }
+
+        impl<'a> DvMatchVisitor<'a> {
+            const PATH_INDEX: usize = 0;
+
+            fn new(dv_updates: &'a HashMap<String, DeletionVectorDescriptor>) -> Self {
+                Self {
+                    dv_updates,
+                    new_dv_entries: Vec::new(),
+                    matched_file_indexes: Vec::new(),
+                }
+            }
+        }
+
+        impl RowVisitor for DvMatchVisitor<'_> {
+            fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DataType>)> = LazyLock::new(|| {
+                    let names = vec![
+                        column_name!("path"),
+                    ];
+                    let types = vec![
+                        DataType::STRING,
+                    ];
+                    (names, types)
+                });
+                (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+            }
+
+            fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+                for i in 0..row_count {
+                    let path: String = getters[Self::PATH_INDEX].get(i, "path")?;
+
+                    // Check if this file has a DV update
+                    if let Some(dv_result) = self.dv_updates.get(&path) {
+                     self.new_dv_entries.push(Scalar::Struct(StructData::try_new(
+                        DeletionVectorDescriptor::to_schema().into_fields().collect(),
+                        vec![
+                            Scalar::from(dv_result.storage_type.to_string()),
+                            Scalar::from(dv_result.path_or_inline_dv.clone()),
+                            Scalar::from(dv_result.offset),
+                            Scalar::from(dv_result.size_in_bytes),
+                            Scalar::from(dv_result.cardinality),
+                        ],
+                     )?));
+                     self.matched_file_indexes.push(i);
+                    } else {
+                      self.new_dv_entries.push(Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+                    }
+                }
+                Ok(())
+            }
+        }
+
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
 /// write table data.
