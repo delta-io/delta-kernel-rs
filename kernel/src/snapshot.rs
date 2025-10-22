@@ -716,7 +716,7 @@ mod tests {
         let parsed = handler
             .parse_json(
                 string_array_to_engine_data(json_strings),
-                crate::actions::get_log_schema().clone(),
+                crate::actions::get_commit_schema().clone(),
             )
             .unwrap();
         let checkpoint = ArrowEngineData::try_from_engine_data(parsed).unwrap();
@@ -1402,7 +1402,7 @@ mod tests {
             .into();
         let parsed = handler.parse_json(
             string_array_to_engine_data(json_strings),
-            crate::actions::get_log_schema().clone(),
+            crate::actions::get_commit_schema().clone(),
         )?;
         let checkpoint = ArrowEngineData::try_from_engine_data(parsed)?;
         let checkpoint: RecordBatch = checkpoint.into();

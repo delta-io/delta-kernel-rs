@@ -13,7 +13,7 @@ use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -37,14 +37,17 @@ pub mod log_replay;
 pub mod state;
 pub(crate) mod state_info;
 
-// safety: we define get_log_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
+// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]
-static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap());
-// safety: we define get_log_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
+static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    get_commit_schema()
+        .project(&[ADD_NAME, REMOVE_NAME])
+        .unwrap()
+});
+// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_log_schema().project(&[ADD_NAME]).unwrap());
+    LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -761,7 +764,7 @@ pub(crate) mod test_utils {
 
     use crate::log_replay::ActionsBatch;
     use crate::{
-        actions::get_log_schema,
+        actions::get_commit_schema,
         engine::{
             arrow_data::ArrowEngineData,
             sync::{json::SyncJsonHandler, SyncEngine},
@@ -862,7 +865,7 @@ pub(crate) mod test_utils {
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();

@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::actions::visitors::AddVisitor;
 use crate::actions::{
-    get_all_actions_schema, get_log_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
+    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
 use crate::engine::arrow_data::ArrowEngineData;
@@ -1070,7 +1070,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )?;
 
@@ -1078,7 +1078,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
+    let v2_checkpoint_read_schema = get_commit_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1138,7 +1138,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME])?;
+    let v2_checkpoint_read_schema = get_commit_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1185,7 +1185,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
 
     add_checkpoint_to_store(
         &store,
-        add_batch_simple(get_log_schema().clone()),
+        add_batch_simple(get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )?;
 
@@ -1295,12 +1295,12 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
 
     add_sidecar_to_store(
         &store,
-        add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
     )?;
 

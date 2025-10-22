@@ -343,7 +343,7 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::Arc;
 
-    use crate::actions::{get_log_schema, Metadata, Protocol};
+    use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::Int32Type;
     use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{
@@ -366,7 +366,7 @@ mod tests {
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -385,7 +385,7 @@ mod tests {
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().project(&["protocol"])?;
+        let output_schema = get_commit_schema().project(&["protocol"])?;
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
