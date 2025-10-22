@@ -2,6 +2,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use reqwest::{header, Client, Response, StatusCode};
+use serde::Deserialize;
 use tracing::{instrument, warn};
 use url::Url;
 
@@ -71,6 +72,7 @@ impl UCClient {
     #[instrument(skip(self))]
     pub async fn commit(&self, request: CommitRequest) -> Result<()> {
         let url = self.base_url.join("delta/preview/commits")?;
+        println!("Committing {request:?}");
         let response = self
             .execute_with_retry(|| {
                 self.client
@@ -80,7 +82,12 @@ impl UCClient {
             })
             .await?;
 
-        self.handle_response(response).await
+        // Note: can't just deserialize to () directly so we make an empty struct to deserialize
+        // the `{}` into. Externally we still return unit type for ease of use/understanding.
+        #[derive(Deserialize)]
+        struct EmptyResponse {}
+        let _: EmptyResponse = self.handle_response(response).await?;
+        Ok(())
     }
 
     /// Resolve the table by name.
