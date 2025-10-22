@@ -271,7 +271,6 @@ impl CheckpointWriter {
         let actions = self.snapshot.log_segment().read_actions(
             engine,
             CHECKPOINT_ACTIONS_SCHEMA.clone(),
-            CHECKPOINT_ACTIONS_SCHEMA.clone(),
             None,
         )?;
 
