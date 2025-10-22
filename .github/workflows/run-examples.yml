@@ -1,0 +1,62 @@
+name: run-examples
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  run-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimal stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run all examples
+        run: |
+          set -e  # Exit immediately if any command fails
+          cd kernel/examples
+
+          # Find all example directories that have a src/main.rs file
+          for example_dir in */; do
+            example_dir=${example_dir%/}  # Remove trailing slash
+
+            # Skip the common directory (it's a library, not an example)
+            if [ "$example_dir" = "common" ]; then
+              continue
+            fi
+
+            # Check if this directory has a src/main.rs file
+            if [ -f "$example_dir/src/main.rs" ]; then
+              echo "========================================"
+              echo "Running example: $example_dir"
+              echo "========================================"
+
+              # Special case for write-table: it needs a temp directory
+              if [ "$example_dir" = "write-table" ]; then
+                tmp_dir=$(mktemp -d)
+                cargo run --manifest-path "$example_dir/Cargo.toml" --release -- "$tmp_dir"
+                rm -r "$tmp_dir"
+              # Special case for inspect-table: it needs an operation/subcommand, run each one
+              elif [ "$example_dir" = "inspect-table" ]; then
+                for operation in table-version metadata schema scan-metadata actions; do
+                  echo "  Running inspect-table with operation: $operation"
+                  cargo run --manifest-path "$example_dir/Cargo.toml" --release -- ../tests/data/table-without-dv-small $operation
+                done
+              # Special case for read-table-changes: skip running it in CI as it needs a specific CDF-enabled table
+              # but still verify it compiles
+              # TODO: Add a suitable test table for CDF
+              elif [ "$example_dir" = "read-table-changes" ]; then
+                echo "Building read-table-changes (skipping run - requires CDF-enabled table)"
+                cargo build --manifest-path "$example_dir/Cargo.toml" --release
+              else
+                # All other examples run with the test table path
+                cargo run --manifest-path "$example_dir/Cargo.toml" --release -- ../tests/data/table-without-dv-small
+              fi
+
+              echo ""
+            fi
+          done

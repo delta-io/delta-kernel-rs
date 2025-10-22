@@ -76,10 +76,18 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
         StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
         StructField::nullable(CDC_NAME, Cdc::to_schema()),
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
         StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
     ]))
+});
+
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(
+        get_log_schema()
+            .fields()
+            .cloned()
+            .chain([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())]),
+    ))
 });
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -111,8 +119,17 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 #[internal_api]
+/// Gets the schema for all actions that can appear in commits
+/// logs.  This excludes actions that can only appear in checkpoints.
 pub(crate) fn get_log_schema() -> &'static SchemaRef {
     &LOG_SCHEMA
+}
+
+#[internal_api]
+#[allow(dead_code)]
+/// Gets a schema for all actions defined by the delta spec.
+pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
+    &ALL_ACTIONS_SCHEMA
 }
 
 #[internal_api]
@@ -130,6 +147,13 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+/// Returns true if the schema contains file actions (add or remove)
+/// columns.
+#[internal_api]
+pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
+    schema.contains(ADD_NAME) || schema.contains(REMOVE_NAME)
 }
 
 /// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
@@ -190,27 +214,32 @@ impl TryFrom<Format> for Scalar {
 )]
 #[internal_api]
 pub(crate) struct Metadata {
-    // TODO: Make the struct fields private to force using the try_new function.
     /// Unique identifier for this table
-    pub(crate) id: String,
+    id: String,
     /// User-provided identifier for this table
-    pub(crate) name: Option<String>,
+    name: Option<String>,
     /// User-provided description for this table
-    pub(crate) description: Option<String>,
+    description: Option<String>,
     /// Specification of the encoding for the files stored in the table
-    pub(crate) format: Format,
+    format: Format,
     /// Schema of the table
-    pub(crate) schema_string: String,
+    schema_string: String,
     /// Column names by which the data should be partitioned
-    pub(crate) partition_columns: Vec<String>,
+    partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
-    pub(crate) created_time: Option<i64>,
+    created_time: Option<i64>,
     /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
-    pub(crate) configuration: HashMap<String, String>,
+    configuration: HashMap<String, String>,
 }
 
 impl Metadata {
+    /// Create a new [`Metadata`] instances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are any metadata columns in the schema.
     // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
+    #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
@@ -246,6 +275,13 @@ impl Metadata {
         })
     }
 
+    #[internal_api]
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+        let mut visitor = MetadataVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.metadata)
+    }
+
     // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
     #[internal_api]
     #[allow(dead_code)]
@@ -269,12 +305,6 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn created_time(&self) -> Option<i64> {
         self.created_time
-    }
-
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
-        let mut visitor = MetadataVisitor::default();
-        visitor.visit_rows_of(data)?;
-        Ok(visitor.metadata)
     }
 
     #[internal_api]
@@ -639,12 +669,13 @@ pub(crate) struct CommitInfo {
 impl CommitInfo {
     pub(crate) fn new(
         timestamp: i64,
+        in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
-            in_commit_timestamp: None,
+            in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
@@ -1169,18 +1200,13 @@ mod tests {
 
     #[test]
     fn test_sidecar_schema() {
-        let schema = get_log_schema()
-            .project(&[SIDECAR_NAME])
-            .expect("Couldn't get sidecar field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "sidecar",
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::not_null("sizeInBytes", DataType::LONG),
-                StructField::not_null("modificationTime", DataType::LONG),
-                tags_field(),
-            ]),
-        )]));
+        let schema = Sidecar::to_schema();
+        let expected = StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("sizeInBytes", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            tags_field(),
+        ]);
         assert_eq!(schema, expected);
     }
 
@@ -1392,7 +1418,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
         // Unknown writer features should cause an error
@@ -1405,7 +1431,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
     }
 
@@ -1524,7 +1550,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
@@ -1983,5 +2009,47 @@ mod tests {
         // reader/writer features are null
         assert!(record_batch.column(2).is_null(0));
         assert!(record_batch.column(3).is_null(0));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_add() {
+        let schema = get_log_schema()
+            .project(&[ADD_NAME, PROTOCOL_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[ADD_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_remove() {
+        let schema = get_log_schema()
+            .project(&[REMOVE_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[REMOVE_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_both() {
+        let schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap();
+        assert!(schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_neither() {
+        let schema = get_log_schema()
+            .project(&[PROTOCOL_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_empty_schema() {
+        let schema = Arc::new(StructType::new_unchecked([]));
+        assert!(!schema_contains_file_actions(&schema));
     }
 }

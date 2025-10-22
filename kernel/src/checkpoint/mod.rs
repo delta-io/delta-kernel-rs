@@ -194,6 +194,7 @@ impl Iterator for CheckpointDataIterator {
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow
+#[derive(Debug, Clone)]
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
     pub(crate) snapshot: SnapshotRef,
@@ -220,6 +221,10 @@ impl CheckpointWriter {
                 e
             ))
         })?;
+
+        // We disallow checkpointing if the LogSegment contains any unpublished commits. (could
+        // create gaps in the version history, thereby breaking old readers)
+        snapshot.log_segment().validate_no_staged_commits()?;
 
         Ok(Self { snapshot, version })
     }
@@ -265,7 +270,6 @@ impl CheckpointWriter {
 
         let actions = self.snapshot.log_segment().read_actions(
             engine,
-            CHECKPOINT_ACTIONS_SCHEMA.clone(),
             CHECKPOINT_ACTIONS_SCHEMA.clone(),
             None,
         )?;
@@ -336,9 +340,10 @@ impl CheckpointWriter {
         let last_checkpoint_path = LastCheckpointHint::path(&self.snapshot.log_segment().log_root)?;
 
         // Write the `_last_checkpoint` file to `table/_delta_log/_last_checkpoint`
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data?);
         engine.json_handler().write_json_file(
             &last_checkpoint_path,
-            Box::new(std::iter::once(data)),
+            Box::new(std::iter::once(Ok(filtered_data))),
             true,
         )?;
 
@@ -370,10 +375,7 @@ impl CheckpointWriter {
             &[Scalar::from(self.version)],
         )?;
 
-        let filtered_data = FilteredEngineData {
-            data: checkpoint_metadata_batch,
-            selection_vector: vec![true], // Include the action in the checkpoint
-        };
+        let filtered_data = FilteredEngineData::with_all_rows_selected(checkpoint_metadata_batch);
 
         Ok(ActionReconciliationBatch {
             filtered_data,

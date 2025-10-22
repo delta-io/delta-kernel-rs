@@ -9,9 +9,13 @@ use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
     get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
+#[cfg(feature = "catalog-managed")]
+use crate::committer::FileSystemCommitter;
+use crate::committer::{CommitMetadata, CommitResponse, Committer};
+use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
-use crate::path::ParsedLogPath;
+use crate::path::LogRoot;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
@@ -20,12 +24,13 @@ use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
     RowVisitor, Version,
 };
+use delta_kernel_derive::internal_api;
 
 /// Type alias for an iterator of [`EngineData`] results.
-type EngineDataResultIterator<'a> =
+pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
-/// The minimal (i.e., mandatory) fields in an add action.
+/// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange column.
 pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![
         StructField::not_null("path", DataType::STRING),
@@ -35,17 +40,20 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
         ),
         StructField::not_null("size", DataType::LONG),
         StructField::not_null("modificationTime", DataType::LONG),
-        StructField::not_null("dataChange", DataType::BOOLEAN),
     ]))
 });
 
 /// Returns a reference to the mandatory fields in an add action.
+///
+/// Note this does not include "dataChange" which is a required field but
+/// but should be set on the transactoin level. Getting the full schema
+/// can be done with [`Transaction::add_files_schema`].
 pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
     &MANDATORY_ADD_FILE_SCHEMA
 }
 
 /// The static instance referenced by [`add_files_schema`].
-pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
@@ -56,22 +64,20 @@ pub(crate) static ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ))
 });
 
-/// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
-/// a Parquet write operation back to Kernel.
-///
-/// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
-/// for constructing an add_file (and soon remove_file) action. Each row represents metadata about a
-/// file to be added to the table. Kernel takes this information and extends it to the full add_file
-/// action schema, adding additional fields (e.g., baseRowID) as necessary.
-///
-/// For now, Kernel only supports the number of records as a file statistic.
-/// This will change in a future release.
-///
-/// [`add_files`]: crate::transaction::Transaction::add_files
-/// [`ParquetHandler`]: crate::ParquetHandler
-pub fn add_files_schema() -> &'static SchemaRef {
-    &ADD_FILES_SCHEMA
-}
+static DATA_CHANGE_COLUMN: LazyLock<StructField> =
+    LazyLock::new(|| StructField::not_null("dataChange", DataType::BOOLEAN));
+
+/// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
+static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
+    let len = fields.len();
+    let insert_position = fields
+        .iter()
+        .position(|f| f.name() == "modificationTime")
+        .unwrap_or(len);
+    fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
+    Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
+});
 
 // NOTE: The following two methods are a workaround for the fact that we do not have a proper SchemaBuilder yet.
 // See https://github.com/delta-io/delta-kernel-rs/issues/1284
@@ -115,6 +121,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: SnapshotRef,
+    committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -128,6 +135,8 @@ pub struct Transaction {
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
     domain_metadatas: Vec<DomainMetadata>,
+    // Whether this transaction contains any logical data changes.
+    data_change: bool,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -147,7 +156,10 @@ impl Transaction {
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
     /// a snapshot.
-    pub(crate) fn try_new(snapshot: impl Into<SnapshotRef>) -> DeltaResult<Self> {
+    pub(crate) fn try_new(
+        snapshot: impl Into<SnapshotRef>,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
@@ -158,18 +170,37 @@ impl Transaction {
         let commit_timestamp = current_time_ms()?;
 
         Ok(Transaction {
-            read_snapshot,
+            read_snapshot: read_snapshot.clone(),
+            committer,
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
             domain_metadatas: vec![],
+            data_change: true,
         })
     }
 
-    /// Consume the transaction and commit it to the table. The result is a [CommitResult] which
-    /// will include the failed transaction in case of a conflict so the user can retry.
+    /// Set the committer that will be used to commit this transaction. If not set, the default
+    /// filesystem-based committer will be used. Note that the default committer is only allowed
+    /// for non-catalog-managed tables. That is, you _must_ provide a committer via this API in
+    /// order to write to catalog-managed tables.
+    ///
+    /// See [`committer`] module for more details.
+    ///
+    /// [`committer`]: crate::committer
+    #[cfg(feature = "catalog-managed")]
+    pub fn with_committer(mut self, committer: Box<dyn Committer>) -> Self {
+        self.committer = committer;
+        self
+    }
+
+    /// Consume the transaction and commit it to the table. The result is a result of
+    /// [CommitResult] with the following semantics:
+    /// - Ok(CommitResult) for either success or a recoverable error (includes the failed
+    ///   transaction in case of a conflict so the user can retry, etc.)
+    /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
@@ -187,15 +218,26 @@ impl Transaction {
                 dup.app_id
             )));
         }
+        // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
             .clone()
             .into_iter()
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
-        // Step 2: Construct commit info and initialize the action iterator
+        // Step 2: Construct commit info with ICT if enabled
+        let in_commit_timestamp =
+            self.read_snapshot
+                .get_in_commit_timestamp(engine)?
+                .map(|prev_ict| {
+                    // The Delta protocol requires the timestamp to be "the larger of two values":
+                    // - The time at which the writer attempted the commit (current_time)
+                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
+                    self.commit_timestamp.max(prev_ict + 1)
+                });
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
+            in_commit_timestamp,
             self.operation.clone(),
             self.engine_info.clone(),
         );
@@ -211,34 +253,67 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Commit the actions as a JSON file to the Delta log
-        let commit_path =
-            ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
+        // Step 5: Chain all our actions to be handed off to the Committer
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
+        // Convert EngineData to FilteredEngineData with all rows selected
+        let filtered_actions = actions
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
 
-        let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(actions), false) {
-            Ok(()) => Ok(CommitResult::Committed {
-                version: commit_version,
-                post_commit_stats: PostCommitStats {
-                    commits_since_checkpoint: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_checkpoint()
-                        + 1,
-                    commits_since_log_compaction: self
-                        .read_snapshot
-                        .log_segment()
-                        .commits_since_log_compaction_or_checkpoint()
-                        + 1,
-                },
-            }),
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::Conflict(self, commit_version)),
+        // Step 6: Commit via the committer
+        #[cfg(feature = "catalog-managed")]
+        if self.committer.any_ref().is::<FileSystemCommitter>()
+            && self
+                .read_snapshot
+                .table_configuration()
+                .protocol()
+                .is_catalog_managed()
+        {
+            return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
+        }
+        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
+        let commit_metadata = CommitMetadata::new(log_root, commit_version);
+        match self
+            .committer
+            .commit(engine, Box::new(filtered_actions), commit_metadata)
+        {
+            Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(version),
+            )),
+            Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
+                self.into_conflicted(version),
+            )),
+            // TODO: we may want to be more or less selective about what is retryable (this is tied
+            // to the idea of "what kind of Errors should write_json_file return?")
+            Err(e @ Error::IOError(_)) => {
+                Ok(CommitResult::RetryableTransaction(self.into_retryable(e)))
+            }
             Err(e) => Err(e),
         }
+    }
+
+    /// Set the data change flag.
+    ///
+    /// True indicates this commit is a "data changing" commit. False indicates table data was
+    /// reorganized but not materially modified.
+    ///
+    /// Data change might be set to false in the following scenarios:
+    /// 1. Operations that only change metadata (e.g. backfilling statistics)
+    /// 2. Operations that make no logical changes to the contents of the table (i.e. rows are only moved
+    ///    from old files to new ones.  OPTIMIZE commands is one example of this type of optimizaton).
+    pub fn with_data_change(mut self, data_change: bool) -> Self {
+        self.data_change = data_change;
+        self
+    }
+
+    /// Same as [`Transaction::with_data_change`] but set the value directly instead of
+    /// using a fluent API.
+    #[internal_api]
+    #[allow(dead_code)] // used in FFI
+    pub(crate) fn set_data_change(&mut self, data_change: bool) {
+        self.data_change = data_change;
     }
 
     /// Set the operation that this transaction is performing. This string will be persisted in the
@@ -371,12 +446,36 @@ impl Transaction {
             .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
     }
 
+    /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
+    /// a Parquet write operation back to Kernel.
+    ///
+    /// Concretely, it is the expected schema for [`EngineData`] passed to [`add_files`], as it is the base
+    /// for constructing an add_file. Each row represents metadata about a
+    /// file to be added to the table. Kernel takes this information and extends it to the full add_file
+    /// action schema, adding internal fields (e.g., baseRowID) as necessary.
+    ///
+    /// For now, Kernel only supports the number of records as a file statistic.
+    /// This will change in a future release.
+    ///
+    /// Note: While currently static, in the future the schema might change depending on
+    /// options set on the transaction or features enabled on the table.
+    ///
+    /// [`add_files`]: crate::transaction::Transaction::add_files
+    /// [`ParquetHandler`]: crate::ParquetHandler
+    pub fn add_files_schema(&self) -> &'static SchemaRef {
+        &BASE_ADD_FILES_SCHEMA
+    }
+
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
         // for now, we just pass through all the columns except partition columns.
         // note this is _incorrect_ if table config deems we need partition columns.
-        let partition_columns = &self.read_snapshot.metadata().partition_columns;
+        let partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
         let schema = self.read_snapshot.schema();
         let fields = schema
             .fields()
@@ -405,7 +504,7 @@ impl Transaction {
     /// add/append/insert data (files) to the table. Note that this API can be called multiple times
     /// to add multiple batches.
     ///
-    /// The expected schema for `add_metadata` is given by [`add_files_schema`].
+    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
     }
@@ -424,6 +523,7 @@ impl Transaction {
             add_files_metadata: I,
             input_schema: SchemaRef,
             output_schema: SchemaRef,
+            data_change: bool,
         ) -> impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a
         where
             I: Iterator<Item = DeltaResult<T>> + Send + 'a,
@@ -433,16 +533,22 @@ impl Transaction {
 
             add_files_metadata.map(move |add_files_batch| {
                 // Convert stats to a JSON string and nest the add action in a top-level struct
-                let adds_expr = Expression::struct_from([Expression::transform(
-                    Transform::new_top_level().with_replaced_field(
-                        "stats",
-                        Expression::unary(ToJson, Expression::column(["stats"])).into(),
-                    ),
-                )]);
+                let transform = Expression::transform(
+                    Transform::new_top_level()
+                        .with_inserted_field(
+                            Some("modificationTime"),
+                            Expression::literal(data_change).into(),
+                        )
+                        .with_replaced_field(
+                            "stats",
+                            Expression::unary(ToJson, Expression::column(["stats"])).into(),
+                        ),
+                );
+                let adds_expr = Expression::struct_from([transform]);
                 let adds_evaluator = evaluation_handler.new_expression_evaluator(
                     input_schema.clone(),
                     Arc::new(adds_expr),
-                    output_schema.clone().into(),
+                    as_log_add_schema(output_schema.clone()).into(),
                 );
                 adds_evaluator.evaluate(add_files_batch?.deref())
             })
@@ -499,13 +605,13 @@ impl Transaction {
                 },
             );
 
+            // Generate add actions including row tracking metadata
             let add_actions = build_add_actions(
                 engine,
                 extended_add_files,
-                with_row_tracking_cols(add_files_schema()),
-                as_log_add_schema(with_row_tracking_cols(&with_stats_col(
-                    mandatory_add_file_schema(),
-                ))),
+                with_row_tracking_cols(self.add_files_schema()),
+                with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+                self.data_change,
             );
 
             // Generate a row tracking domain metadata based on the final high water mark
@@ -518,11 +624,44 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
-                add_files_schema().clone(),
-                as_log_add_schema(with_stats_col(mandatory_add_file_schema())),
+                self.add_files_schema().clone(),
+                with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
+                self.data_change,
             );
 
             Ok((Box::new(add_actions), None))
+        }
+    }
+
+    fn into_committed(self, version: Version) -> CommittedTransaction {
+        let stats = PostCommitStats {
+            commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
+                + 1,
+            commits_since_log_compaction: self
+                .read_snapshot
+                .log_segment()
+                .commits_since_log_compaction_or_checkpoint()
+                + 1,
+        };
+
+        CommittedTransaction {
+            transaction: self,
+            commit_version: version,
+            post_commit_stats: stats,
+        }
+    }
+
+    fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction {
+        ConflictedTransaction {
+            transaction: self,
+            conflict_version,
+        }
+    }
+
+    fn into_retryable(self, error: Error) -> RetryableTransaction {
+        RetryableTransaction {
+            transaction: self,
+            error,
         }
     }
 }
@@ -572,34 +711,124 @@ pub struct PostCommitStats {
     pub commits_since_log_compaction: u64,
 }
 
-/// Result of committing a transaction.
+/// The result of attempting to commit this transaction. If the commit was
+/// successful/conflicted/retryable, the result is Ok(CommitResult), otherwise, if a nonrecoverable
+/// error occurred, the result is Err(Error).
+///
+/// The commit result can be one of the following:
+/// - [CommittedTransaction]: the transaction was successfully committed. [PostCommitStats] and
+///   in the future a post-commit snapshot can be obtained from the committed transaction.
+/// - [ConflictedTransaction]: the transaction conflicted with an existing version. This transcation
+///   must be rebased before retrying. (currently no rebase APIs exist, caller must create new txn)
+/// - [RetryableTransaction]: an IO (retryable) error occurred during the commit. This transaction
+///   can be retried without rebasing.
 #[derive(Debug)]
+#[must_use]
 pub enum CommitResult {
     /// The transaction was successfully committed.
-    Committed {
-        /// the version of the table that was just committed
-        version: Version,
-        /// The [`PostCommitStats`] for this transaction
-        post_commit_stats: PostCommitStats,
-    },
-    /// This transaction conflicted with an existing version (at the version given). The transaction
+    CommittedTransaction(CommittedTransaction),
+    /// This transaction conflicted with an existing version (see
+    /// [ConflictedTransaction::conflict_version]). The transaction
     /// is returned so the caller can resolve the conflict (along with the version which
     /// conflicted).
     // TODO(zach): in order to make the returning of a transaction useful, we need to add APIs to
     // update the transaction to a new version etc.
-    Conflict(Transaction, Version),
+    ConflictedTransaction(ConflictedTransaction),
+    /// An IO (retryable) error occurred during the commit.
+    RetryableTransaction(RetryableTransaction),
+}
+
+impl CommitResult {
+    /// Returns true if the commit was successful.
+    pub fn is_committed(&self) -> bool {
+        matches!(self, CommitResult::CommittedTransaction(_))
+    }
+}
+
+/// This is the result of a successfully committed [Transaction]. One can retrieve the
+/// [PostCommitStats] and [commit version] from this struct. In the future a post-commit snapshot
+/// can be obtained as well.
+///
+/// [commit version]: Self::commit_version
+#[derive(Debug)]
+pub struct CommittedTransaction {
+    // TODO: remove after post-commit snapshot
+    #[allow(dead_code)]
+    transaction: Transaction,
+    /// the version of the table that was just committed
+    commit_version: Version,
+    /// The [`PostCommitStats`] for this transaction
+    post_commit_stats: PostCommitStats,
+}
+
+impl CommittedTransaction {
+    /// The version of the table that was just sucessfully committed
+    pub fn commit_version(&self) -> Version {
+        self.commit_version
+    }
+
+    /// The [`PostCommitStats`] for this transaction
+    pub fn post_commit_stats(&self) -> &PostCommitStats {
+        &self.post_commit_stats
+    }
+
+    // TODO(#916): post-commit snapshot
+}
+
+/// This is the result of a conflicted [Transaction]. One can retrieve the [conflict version] from
+/// this struct. In the future a rebase API will be provided (issue #1389).
+///
+/// [conflict version]: Self::conflict_version
+#[derive(Debug)]
+pub struct ConflictedTransaction {
+    // TODO: remove after rebase APIs
+    #[allow(dead_code)]
+    transaction: Transaction,
+    conflict_version: Version,
+}
+
+impl ConflictedTransaction {
+    /// The version attempted commit that yielded a conflict
+    pub fn conflict_version(&self) -> Version {
+        self.conflict_version
+    }
+}
+
+/// A transaction that failed to commit due to a retryable error (e.g. IO error). The transaction
+/// can be recovered with `RetryableTransaction::transaction` and retried without rebasing. The
+/// associated error can be inspected via `RetryableTransaction::error`.
+#[derive(Debug)]
+pub struct RetryableTransaction {
+    /// The transaction that failed to commit due to a retryable error.
+    pub transaction: Transaction,
+    /// Transient error that caused the commit to fail.
+    pub error: Error,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
+    use crate::Snapshot;
+    use std::path::PathBuf;
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
-
     #[test]
-    fn test_add_files_schema() {
-        let schema = add_files_schema();
+    fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
+
+        let schema = txn.add_files_schema();
         let expected = StructType::new_unchecked(vec![
             StructField::not_null("path", DataType::STRING),
             StructField::not_null(
@@ -608,7 +837,6 @@ mod tests {
             ),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
-            StructField::not_null("dataChange", DataType::BOOLEAN),
             StructField::nullable(
                 "stats",
                 DataType::struct_type_unchecked(vec![StructField::nullable(
@@ -618,5 +846,6 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
     }
 }
