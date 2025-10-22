@@ -6,8 +6,10 @@ use crate::table_changes::{
 };
 use crate::transforms::FieldTransformSpec;
 
-/// Trait for classifying fields during StateInfo construction.
-/// Allows different scan types (regular, CDF) to customize field handling.
+/// Trait for classifying fields during StateInfo construction.  Allows different scan types
+/// (regular, CDF) to customize field handling. Note that the default set of field handling occurs
+/// in [`StateInfo::try_new`](crate::scan::state_info::StateInfo::try_new). A
+/// `TransformFieldClassifier` can be used to override the behavior implemented in that method.
 pub(crate) trait TransformFieldClassifier {
     /// Classify a field and return its transform spec.
     /// Returns None if the field is physical (should be read from parquet).
