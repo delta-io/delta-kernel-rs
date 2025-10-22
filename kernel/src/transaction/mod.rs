@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
@@ -6,8 +6,8 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{
-    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
+    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
+    get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -352,7 +352,27 @@ impl Transaction {
         self
     }
 
+    /// Remove domain metadata from the Delta log.
+    /// If the domain exists in the Delta log, this creates a tombstone to logically delete
+    /// the domain. The tombstone preserves the previous configuration value.
+    /// If the domain does not exist in the Delta log, this is a no-op.
+    /// Note that each domain can only appear once per transaction. That is, multiple operations
+    /// on the same domain are disallowed in a single transaction, as well as setting and removing
+    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
+    /// fail (that is, we don't eagerly check domain validity here).
+    /// Removing metadata for multiple distinct domains is allowed.
+    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+        // actual configuration value determined during commit
+        self.domain_metadatas
+            .push(DomainMetadata::remove(domain, String::new()));
+        self
+    }
+
     /// Generate domain metadata actions with validation. Handle both user and system domains.
+    ///
+    /// This function may perform an expensive log replay operation if there are any domain removals.
+    /// The log replay is required to fetch the previous configuration value for the domain to preserve
+    /// in removal tombstones as mandated by the Delta spec.
     fn generate_domain_metadata_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
@@ -370,32 +390,58 @@ impl Transaction {
             ));
         }
 
-        // validate domain metadata
-        let mut domains = HashSet::new();
-        for domain_metadata in &self.domain_metadatas {
-            if domain_metadata.is_internal() {
+        // validate user domain metadata and check if we have removals
+        let mut seen_domains = HashSet::new();
+        let mut has_removals = false;
+        for dm in &self.domain_metadatas {
+            if dm.is_internal() {
                 return Err(Error::Generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled"
                         .to_string(),
                 ));
             }
-            if !domains.insert(domain_metadata.domain()) {
+
+            if !seen_domains.insert(dm.domain()) {
                 return Err(Error::Generic(format!(
                     "Metadata for domain {} already specified in this transaction",
-                    domain_metadata.domain()
+                    dm.domain()
                 )));
             }
+
+            if dm.is_removed() {
+                has_removals = true;
+            }
         }
+
+        // fetch previous configuration values (requires log replay)
+        let existing_domains = if has_removals {
+            scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?
+        } else {
+            HashMap::new()
+        };
+
+        let user_domains = self
+            .domain_metadatas
+            .iter()
+            .filter_map(move |dm: &DomainMetadata| {
+                if dm.is_removed() {
+                    existing_domains.get(dm.domain()).map(|existing| {
+                        DomainMetadata::remove(
+                            dm.domain().to_string(),
+                            existing.configuration().to_string(),
+                        )
+                    })
+                } else {
+                    Some(dm.clone())
+                }
+            });
 
         let system_domains = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?
             .into_iter();
 
-        Ok(self
-            .domain_metadatas
-            .iter()
-            .cloned()
+        Ok(user_domains
             .chain(system_domains)
             .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
     }
