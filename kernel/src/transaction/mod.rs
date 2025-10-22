@@ -33,7 +33,7 @@ use crate::scan::log_replay::{
 };
 use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, ToSchema};
-use crate::engine_data::GetData;
+use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
@@ -163,9 +163,10 @@ fn intermediate_dv_schema() -> SchemaRef {
 
 static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
     NullableStatsTransform
-        .transform_struct(scan_row_schema())
+        .transform_struct(scan_row_schema().as_ref())
         .expect("Failed to transform scan_row_schema")
         .into_owned()
+        .into()
 });
 
 fn nullable_scan_rows_schema() -> &'static DataType {
@@ -183,15 +184,19 @@ fn nullable_restored_add_schema() -> &'static DataType {
     &NULLABLE_RESTORED_ADD_SCHEMA
 }
 
-static NULLABLE_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-    NullableStatsTransform
-        .transform_struct(as_log_add_schema())
-        .expect("Failed to transform as_log_add_schema")
-        .into_owned()
+static NULLABLE_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    let table_schema = BASE_ADD_FILES_SCHEMA.clone();
+    let wrapped_schema = as_log_add_schema(table_schema);
+    Arc::new(
+        NullableStatsTransform
+            .transform_struct(wrapped_schema.as_ref())
+            .expect("Failed to transform as_log_add_schema")
+            .into_owned()
+    )
 });
 
-fn nullable_add_schema() -> &'static DataType {
-    &NULLABLE_ADD_SCHEMA
+fn nullable_add_schema() -> SchemaRef {
+    NULLABLE_ADD_SCHEMA.clone()
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -355,14 +360,16 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Generate remove actions
-        let remove_actions = self.generate_remove_actions(engine, self.remove_files_metadata.iter().map(|a| Ok(a.deref())))?;
+        // Step 5: Generate remove actions (collect to avoid borrowing self)
+        let remove_actions: Vec<_> = self.generate_remove_actions(engine, self.remove_files_metadata.iter())?
+            .collect::<DeltaResult<Vec<_>>>()?;
 
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
             .chain(dv_update_actions)
             .chain(set_transaction_actions)
-            .chain(domain_metadata_actions);
+            .chain(domain_metadata_actions)
+            .chain(remove_actions.into_iter().map(Ok));
 
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
@@ -561,8 +568,6 @@ impl Transaction {
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
         existing_data_files: impl Iterator<Item = FilteredEngineData>,
     ) -> DeltaResult<()> {
-        use crate::RowVisitor;
-
         if !self.will_update_dvs {
             return Err(Error::generic(
                 "Must call with_dv_update() before update_deletion_vectors(). \
@@ -582,7 +587,7 @@ impl Transaction {
             let (data, mut selection_vector) = scan_file.into_parts();
             visitor.visit_rows_of(data.as_ref())?;
             let mut current_matched_index = 0;
-            for i in 0..existing_data_files.len() {
+            for i in 0..selection_vector.len() {
                 if current_matched_index < visitor.matched_file_indexes.len() {
                  if visitor.matched_file_indexes[current_matched_index] != i {
                       selection_vector[i] = false;
@@ -932,8 +937,7 @@ impl Transaction {
 
         Ok(
             remove_files_metadata
-            .iter()
-            .map(move |file_metadata_batch| {
+            .map(move |file_metadata_batch| -> DeltaResult<FilteredEngineData> {
                 let transform = Expression::transform(
                     Transform::new_top_level()
                         .with_inserted_field(
@@ -999,10 +1003,10 @@ impl Transaction {
     fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>>> + Send + 'a> {
         let remove_actions = 
-          self.generate_remove_actions(engine, self.dv_matched_files.iter().map(|a| Ok(a.deref())))?;
-          let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter().map(|a| Ok(a.deref())))?;
+          self.generate_remove_actions(engine, self.dv_matched_files.iter())?;
+          let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
           Ok(remove_actions.chain(add_actions))
     }
 
@@ -1015,21 +1019,20 @@ impl Transaction {
         let evaluation_handler = engine.evaluation_handler();
 
         Ok(
-            self.dv_matched_files
-            .iter()
-            .map(move |file_metadata_batch| {
+            file_metadata_batch
+            .map(move |file_metadata_batch| -> DeltaResult<FilteredEngineData> {
                 let with_new_dv_transform = Expression::transform(
                     Transform::new_top_level()
                         .with_replaced_field(
                             "deletionVector",
-                            Expression::column([NEW_DELETION_VECTOR_NAME]).into(),
+                            Expression::column([NEW_DELETION_VECTOR_NAME.as_str()]).into(),
                         )
                 );
                 let expr = Expression::struct_from([with_new_dv_transform]);
                 let with_new_dv_eval= evaluation_handler.new_expression_evaluator(
                     intermediate_dv_schema(),
                     Arc::new(expr),
-                    nullable_scan_rows_schema().into(),
+                    nullable_scan_rows_schema().clone().into(),
                 );
 
                 let (data, selection_vector) = file_metadata_batch.into_parts();
@@ -1038,9 +1041,9 @@ impl Transaction {
                 let restored_add_eval= evaluation_handler.new_expression_evaluator(
                     intermediate_dv_schema(),
                     get_scan_metadata_transform_expr(),
-                    nullable_restored_add_schema().into(),
+                    nullable_restored_add_schema().clone(),
                 );
-                let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data)?;
+                let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
 
                 let with_data_change_transform = Expression::transform(
                     Transform::new_top_level()
@@ -1055,7 +1058,7 @@ impl Transaction {
                     Arc::new(expr),
                     nullable_add_schema().into(),
                 );
-                let with_data_change_data = with_data_change_eval.evaluate(as_partial_add_data)?;
+                let with_data_change_data = with_data_change_eval.evaluate(as_partial_add_data.as_ref())?;
 
                 FilteredEngineData::try_new(
                     with_data_change_data,
