@@ -7,7 +7,7 @@ use delta_kernel::{
     arrow::array::RecordBatch,
     engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine},
     scan::Scan,
-    schema::Schema,
+    schema::MetadataColumnSpec,
     DeltaResult, SnapshotRef,
 };
 
@@ -61,9 +61,18 @@ pub struct ScanArgs {
     #[arg(long)]
     pub schema_only: bool,
 
-    /// Comma separated list of columns to select
-    #[arg(long, value_delimiter=',', num_args(0..))]
-    pub columns: Option<Vec<String>>,
+    /// Comma separated list of columns to select. Must be passed as a single string, leading and
+    /// trailing spaces for each column name will be trimmed
+    #[arg(long)]
+    pub columns: Option<String>,
+
+    /// Include a _metadata.row_index field
+    #[arg(long)]
+    pub with_row_index: bool,
+
+    /// Include a _metadata.row_id field if row-tracking is enabled
+    #[arg(long)]
+    pub with_row_id: bool,
 }
 
 pub trait ParseWithExamples<T> {
@@ -180,27 +189,26 @@ pub fn get_scan(snapshot: SnapshotRef, args: &ScanArgs) -> DeltaResult<Option<Sc
         return Ok(None);
     }
 
-    let read_schema_opt = args
-        .columns
-        .clone()
-        .map(|cols| -> DeltaResult<_> {
-            let table_schema = snapshot.schema();
-            let selected_fields = cols.iter().map(|col| {
-                table_schema
-                    .field(col)
-                    .cloned()
-                    .ok_or(delta_kernel::Error::Generic(format!(
-                        "Table has no such column: {col}"
-                    )))
-            });
-            Schema::try_from_results(selected_fields).map(Arc::new)
-        })
-        .transpose()?;
+    let mut scan_schema = snapshot.schema();
+    if let Some(cols) = args.columns.as_ref() {
+        let cols: Vec<&str> = cols.split(",").map(str::trim).collect();
+        scan_schema = scan_schema.project_as_struct(&cols)?.into();
+    }
+
+    if args.with_row_index {
+        scan_schema = scan_schema
+            .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
+            .into();
+    }
+
+    if args.with_row_id {
+        scan_schema = scan_schema
+            .add_metadata_column("_metadata.row_index", MetadataColumnSpec::RowIndex)?
+            .into();
+    }
+
     Ok(Some(
-        snapshot
-            .scan_builder()
-            .with_schema_opt(read_schema_opt)
-            .build()?,
+        snapshot.scan_builder().with_schema(scan_schema).build()?,
     ))
 }
 
