@@ -67,7 +67,7 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
-static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
@@ -83,7 +83,7 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 
 static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(
-        get_log_schema()
+        get_commit_schema()
             .fields()
             .cloned()
             .chain([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())]),
@@ -121,8 +121,8 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits
 /// logs.  This excludes actions that can only appear in checkpoints.
-pub(crate) fn get_log_schema() -> &'static SchemaRef {
-    &LOG_SCHEMA
+pub(crate) fn get_commit_schema() -> &'static SchemaRef {
+    &COMMIT_SCHEMA
 }
 
 #[internal_api]
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_metadata_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[METADATA_NAME])
             .expect("Couldn't get metaData field");
 
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[test]
     fn test_add_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
@@ -1139,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_remove_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1162,7 +1162,7 @@ mod tests {
 
     #[test]
     fn test_cdc_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[CDC_NAME])
             .expect("Couldn't get cdc field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1195,7 +1195,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_metadata_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[CHECKPOINT_METADATA_NAME])
             .expect("Couldn't get checkpointMetadata field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1210,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_transaction_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn test_commit_info_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
@@ -1251,7 +1251,7 @@ mod tests {
 
     #[test]
     fn test_domain_metadata_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[DOMAIN_METADATA_NAME])
             .expect("Couldn't get domainMetadata field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1789,9 +1789,9 @@ mod tests {
         let metadata_id = metadata.id.clone();
 
         // test with the full log schema that wraps metadata in a "metaData" field
-        let log_schema = get_log_schema().project(&[METADATA_NAME]).unwrap();
+        let commit_schema = get_commit_schema().project(&[METADATA_NAME]).unwrap();
         let actual: RecordBatch = metadata
-            .into_engine_data(log_schema, &engine)
+            .into_engine_data(commit_schema, &engine)
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -1886,8 +1886,8 @@ mod tests {
         assert_eq!(record_batch, expected);
 
         // test with the full log schema that wraps protocol in a "protocol" field
-        let log_schema = get_log_schema().project(&[PROTOCOL_NAME]).unwrap();
-        let engine_data = protocol.into_engine_data(log_schema, &engine);
+        let commit_schema = get_commit_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let engine_data = protocol.into_engine_data(commit_schema, &engine);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "protocol",
@@ -1996,7 +1996,7 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_with_add() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[ADD_NAME, PROTOCOL_NAME])
             .unwrap();
         assert!(schema_contains_file_actions(&schema));
@@ -2007,7 +2007,7 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_with_remove() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[REMOVE_NAME, METADATA_NAME])
             .unwrap();
         assert!(schema_contains_file_actions(&schema));
@@ -2018,13 +2018,13 @@ mod tests {
 
     #[test]
     fn test_schema_contains_file_actions_with_both() {
-        let schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap();
+        let schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap();
         assert!(schema_contains_file_actions(&schema));
     }
 
     #[test]
     fn test_schema_contains_file_actions_with_neither() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[PROTOCOL_NAME, METADATA_NAME])
             .unwrap();
         assert!(!schema_contains_file_actions(&schema));
