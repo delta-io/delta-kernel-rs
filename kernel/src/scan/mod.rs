@@ -276,13 +276,13 @@ pub struct ScanResult {
     pub(crate) raw_mask: Option<Vec<bool>>,
 }
 
-static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
             use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
 
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-            DataType::struct_type_unchecked(vec![StructField::nullable(
+            StructType::new_unchecked(vec![StructField::nullable(
                 "add",
-                DataType::struct_type_unchecked(vec![
+                StructType::new_unchecked(vec![
                     StructField::not_null("path", DataType::STRING),
                     StructField::not_null("partitionValues", partition_values),
                     StructField::not_null("size", DataType::LONG),
@@ -297,11 +297,11 @@ static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
                     StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
                     StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
                 ]),
-            )])
+            )]).into()
         });
 
 
-pub(crate) fn restored_add_schema() -> &'static DataType {
+pub(crate) fn restored_add_schema() -> &'static SchemaRef {
     &RESTORED_ADD_SCHEMA
 }
 
@@ -537,7 +537,7 @@ impl Scan {
         let transform = engine.evaluation_handler().new_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
-            restored_add_schema().clone(),
+            restored_add_schema().clone().into(),
         );
         let apply_transform = move |data: Box<dyn EngineData>| {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))

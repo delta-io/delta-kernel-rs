@@ -157,11 +157,11 @@ static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ])))
 });
 
-fn intermediate_dv_schema() -> SchemaRef {
+fn intermediate_dv_schema() -> &'static SchemaRef {
     &INTERMEDIATE_DV_SCHEMA
 }
 
-static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     NullableStatsTransform
         .transform_struct(scan_row_schema().as_ref())
         .expect("Failed to transform scan_row_schema")
@@ -169,18 +169,19 @@ static NULLABLE_SCAN_ROWS_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
         .into()
 });
 
-fn nullable_scan_rows_schema() -> &'static DataType {
+fn nullable_scan_rows_schema() -> &'static SchemaRef {
     &NULLABLE_SCAN_ROWS_SCHEMA
 }
 
-static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+static NULLABLE_RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     NullableStatsTransform
-        .transform(restored_add_schema())
+        .transform_struct(restored_add_schema())
         .expect("Failed to transform restored_add_schema")
         .into_owned()
+        .into()
 });
 
-fn nullable_restored_add_schema() -> &'static DataType {
+fn nullable_restored_add_schema() -> &'static SchemaRef {
     &NULLABLE_RESTORED_ADD_SCHEMA
 }
 
@@ -361,19 +362,18 @@ impl Transaction {
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
         // Step 5: Generate remove actions (collect to avoid borrowing self)
-        let remove_actions: Vec<_> = self.generate_remove_actions(engine, self.remove_files_metadata.iter())?
-            .collect::<DeltaResult<Vec<_>>>()?;
+        let remove_actions = self.generate_remove_actions(engine, self.remove_files_metadata.iter())?;
 
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
-            .chain(dv_update_actions)
             .chain(set_transaction_actions)
-            .chain(domain_metadata_actions)
-            .chain(remove_actions.into_iter().map(Ok));
+            .chain(domain_metadata_actions);
 
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .chain(remove_actions)
+            .chain(dv_update_actions);
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
@@ -925,7 +925,7 @@ impl Transaction {
     fn generate_remove_actions<'a>(
         &'a self,
         engine: &dyn Engine,
-        remove_files_metadata: impl Iterator<Item = FilteredEngineData> + Send + 'a,
+        remove_files_metadata: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         
         let input_schema = scan_row_schema();
@@ -1003,7 +1003,7 @@ impl Transaction {
     fn generate_dv_update_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>>> + Send + 'a> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         let remove_actions = 
           self.generate_remove_actions(engine, self.dv_matched_files.iter())?;
           let add_actions = self.generate_adds_for_dv_update(engine, self.dv_matched_files.iter())?;
@@ -1013,7 +1013,7 @@ impl Transaction {
     fn generate_adds_for_dv_update<'a>(
         &'a self,
         engine: &'a dyn Engine,
-        file_metadata_batch: impl Iterator<Item = FilteredEngineData> + Send + 'a,
+        file_metadata_batch: impl Iterator<Item = &'a FilteredEngineData> + Send + 'a,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
         
         let evaluation_handler = engine.evaluation_handler();
@@ -1030,18 +1030,17 @@ impl Transaction {
                 );
                 let expr = Expression::struct_from([with_new_dv_transform]);
                 let with_new_dv_eval= evaluation_handler.new_expression_evaluator(
-                    intermediate_dv_schema(),
+                    intermediate_dv_schema().clone(),
                     Arc::new(expr),
                     nullable_scan_rows_schema().clone().into(),
                 );
 
-                let (data, selection_vector) = file_metadata_batch.into_parts();
-                let with_new_dv_data = with_new_dv_eval.evaluate(data)?;
+                let with_new_dv_data = with_new_dv_eval.evaluate(file_metadata_batch.data())?;
 
                 let restored_add_eval= evaluation_handler.new_expression_evaluator(
-                    intermediate_dv_schema(),
+                    intermediate_dv_schema().clone(),
                     get_scan_metadata_transform_expr(),
-                    nullable_restored_add_schema().clone(),
+                    nullable_restored_add_schema().clone().into(),
                 );
                 let as_partial_add_data = restored_add_eval.evaluate(with_new_dv_data.as_ref())?;
 
@@ -1054,7 +1053,7 @@ impl Transaction {
                 );
                 let expr = Expression::struct_from([with_data_change_transform]);
                 let with_data_change_eval= evaluation_handler.new_expression_evaluator(
-                    nullable_restored_add_schema().into(),
+                    nullable_restored_add_schema().clone(),
                     Arc::new(expr),
                     nullable_add_schema().into(),
                 );
@@ -1062,7 +1061,7 @@ impl Transaction {
 
                 FilteredEngineData::try_new(
                     with_data_change_data,
-                    selection_vector,
+                    file_metadata_batch.selection_vector().to_vec(),
                 )
             }))
 
