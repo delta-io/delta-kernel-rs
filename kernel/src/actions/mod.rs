@@ -76,7 +76,6 @@ static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
         StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
         StructField::nullable(CDC_NAME, Cdc::to_schema()),
-        StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
     ]))
 });
@@ -86,7 +85,10 @@ static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         get_commit_schema()
             .fields()
             .cloned()
-            .chain([StructField::nullable(SIDECAR_NAME, Sidecar::to_schema())]),
+            .chain([
+                StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
+                StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+            ]),
     ))
 });
 
@@ -1195,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_metadata_schema() {
-        let schema = get_commit_schema()
+        let schema = get_all_actions_schema()
             .project(&[CHECKPOINT_METADATA_NAME])
             .expect("Couldn't get checkpointMetadata field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(

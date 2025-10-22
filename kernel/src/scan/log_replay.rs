@@ -573,7 +573,7 @@ mod tests {
             "row_indexes_for_row_id_0",
         );
 
-        let batch = vec![add_batch_for_row_id(get_log_schema().clone())];
+        let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
