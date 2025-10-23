@@ -189,13 +189,16 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let table_root = self.table_changes.table_root().clone();
         let state_info = self.state_info.clone();
         let dv_engine_ref = engine.clone();
+
+        let table_root_copy = self.table_changes.table_root().clone();
+        let physical_predicate = self.physical_predicate().clone();
 
         let result = scan_files
             .map(move |scan_file| {
@@ -206,9 +209,9 @@ impl TableChangesScan {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
-                    self.table_root(),
+                    &table_root_copy,
                     state_info.as_ref(),
-                    self.physical_predicate(),
+                    physical_predicate.clone(),
                 )
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result

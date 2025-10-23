@@ -411,7 +411,7 @@ fn invalid_range_end_before_start() {
 #[test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
-    let expected_msg = "Expected the first commit to have version 3";
+    let expected_msg = "Expected the first commit to have version 3, got None";
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
 }
 
