@@ -951,7 +951,9 @@ mod tests {
             .at_version(1)
             .build(&engine)
             .unwrap();
-        let txn = snapshot.transaction()?.with_engine_info("default engine");
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
         let write_context = txn.get_write_context();
 
         // Test with empty prefix
