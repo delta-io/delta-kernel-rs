@@ -352,7 +352,7 @@ mod tests {
                 &incorrect_variant_arrow_type(),
                 true,
             ),
-            "Invalid argument error: Incorrect datatype. Expected Struct(metadata Binary, value Binary), got Struct(field_1 Binary, field_2 Binary)",
+            "Invalid argument error: Incorrect datatype. Expected Struct(\"metadata\": Binary, \"value\": Binary), got Struct(\"field_1\": nullable Binary, \"field_2\": nullable Binary)",
         )
     }
 

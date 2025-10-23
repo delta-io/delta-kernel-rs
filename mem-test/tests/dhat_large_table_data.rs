@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
+use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -16,7 +17,6 @@ use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::Snapshot;
 
-use arrow::compute::filter_record_batch;
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
@@ -46,9 +46,9 @@ fn write_large_parquet_to(path: &Path) -> Result<(), Box<dyn std::error::Error>>
     let metadata = std::fs::metadata(&path)?;
     let file_size = metadata.len();
     let total_row_group_size: i64 = parquet_metadata
-        .row_groups
+        .row_groups()
         .iter()
-        .map(|rg| rg.total_byte_size)
+        .map(|rg| rg.total_byte_size())
         .sum();
     println!("File size (compressed file size):    {} bytes", file_size);
     println!(
