@@ -59,6 +59,8 @@ impl ToDataType for DeletionVectorStorageType {
     }
 }
 
+/// Represents and abstract path to a deltion vector. This is used to construct the path to a deletion vector file
+/// and translate it to the relative path the delta spec requires (this is only exposed via [`to_deletion_vector_descriptor`]).
 pub struct DeletionVectorPath {
     table_path: Url,
     uuid: uuid::Uuid,
@@ -83,6 +85,8 @@ impl DeletionVectorPath {
         }
     }
 
+    /// Helper method to cosntruct the relative path to a deletion vector file,
+    /// the prefix and the UUID suffix.
     fn relative_path(prefix: &str, uuid: &uuid::Uuid) -> String {
         let uuid_as_string = uuid::Uuid::to_string(uuid);
         if !prefix.is_empty() {
@@ -92,6 +96,7 @@ impl DeletionVectorPath {
         }
     }
 
+    /// Returns the absolute path to the deletion vector file.
     pub fn absolute_path(&self) -> DeltaResult<Url> {
         let dv_suffix = Self::relative_path(&self.prefix, &self.uuid);
         let dv_path = self
@@ -101,6 +106,7 @@ impl DeletionVectorPath {
         Ok(dv_path)
     }
 
+    /// Returns the compressed encoded path for use in descriptor (prefix + z85 encoded UUID).
     pub(crate) fn encoded_relative_path(&self) -> String {
         format!("{}{}", self.prefix, z85::encode(self.uuid.as_bytes()))
     }

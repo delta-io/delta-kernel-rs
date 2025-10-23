@@ -156,7 +156,7 @@ impl DeletionVector for KernelDeletionVector {
 /// - The first byte of the file is a version byte (currently 1)
 /// - Each DV is prefixed with a 4-byte size (big-endian) of the serialized data
 /// - Followed by a 4-byte magic number (0x64485871, little-endian)
-/// - Followed by the serialized RoaringTreemap
+/// - Followed by the serialized 64-bit Roaring Bitmap
 /// - Followed by a 4-byte CRC32 checksum (big-endian) of the serialized data
 ///
 /// # Examples
@@ -186,7 +186,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     ///
     /// # Arguments
     ///
-    /// * `writer` - A mutable reference to any type implementing [`std::io::Write`]
+    /// * `writer` - A mutable reference to any type implementing [`std::io::Write`].
     ///
     /// # Examples
     ///
@@ -205,7 +205,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     /// Write a deletion vector to the underlying writer.
     ///
     /// This method can be called multiple times to write multiple deletion vectors to the same
-    /// file. The caller is responsible for keeping track of which deletion vector corresponds to
+    /// writer. The caller is responsible for keeping track of which deletion vector corresponds to
     /// which data file.
     ///
     /// # Arguments
@@ -276,7 +276,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
             .write_all(&size_bytes)
             .map_err(|e| Error::generic(format!("Failed to write size: {}", e)))?;
 
-        // Write magic number (little-endian, 0x64485856 = 1681511510)
+        // Write magic number (little-endian)
         // This is the RoaringBitmapArray format magic
         let magic: u32 = 1681511377;
         self.writer
