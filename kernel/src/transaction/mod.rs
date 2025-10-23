@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
@@ -6,13 +6,16 @@ use std::sync::{Arc, LazyLock};
 use url::Url;
 
 use crate::actions::{
-    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
+    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
+    get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
 };
+#[cfg(feature = "catalog-managed")]
+use crate::committer::FileSystemCommitter;
+use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
-use crate::path::ParsedLogPath;
+use crate::path::LogRoot;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
@@ -24,7 +27,7 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 /// Type alias for an iterator of [`EngineData`] results.
-type EngineDataResultIterator<'a> =
+pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
 
 /// The static instance referenced by [`add_files_schema`] that doesn't contain the dataChange column.
@@ -118,6 +121,7 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// ```
 pub struct Transaction {
     read_snapshot: SnapshotRef,
+    committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
@@ -152,7 +156,10 @@ impl Transaction {
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
     /// a snapshot.
-    pub(crate) fn try_new(snapshot: impl Into<SnapshotRef>) -> DeltaResult<Self> {
+    pub(crate) fn try_new(
+        snapshot: impl Into<SnapshotRef>,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
         // important! before a read/write to the table we must check it is supported
@@ -163,7 +170,8 @@ impl Transaction {
         let commit_timestamp = current_time_ms()?;
 
         Ok(Transaction {
-            read_snapshot,
+            read_snapshot: read_snapshot.clone(),
+            committer,
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
@@ -172,6 +180,20 @@ impl Transaction {
             domain_metadatas: vec![],
             data_change: true,
         })
+    }
+
+    /// Set the committer that will be used to commit this transaction. If not set, the default
+    /// filesystem-based committer will be used. Note that the default committer is only allowed
+    /// for non-catalog-managed tables. That is, you _must_ provide a committer via this API in
+    /// order to write to catalog-managed tables.
+    ///
+    /// See [`committer`] module for more details.
+    ///
+    /// [`committer`]: crate::committer
+    #[cfg(feature = "catalog-managed")]
+    pub fn with_committer(mut self, committer: Box<dyn Committer>) -> Self {
+        self.committer = committer;
+        self
     }
 
     /// Consume the transaction and commit it to the table. The result is a result of
@@ -231,26 +253,37 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Commit the actions as a JSON file to the Delta log
-        let commit_path =
-            ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
+        // Step 5: Chain all our actions to be handed off to the Committer
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
-
         // Convert EngineData to FilteredEngineData with all rows selected
         let filtered_actions = actions
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
 
-        let json_handler = engine.json_handler();
-        match json_handler.write_json_file(&commit_path.location, Box::new(filtered_actions), false)
+        // Step 6: Commit via the committer
+        #[cfg(feature = "catalog-managed")]
+        if self.committer.any_ref().is::<FileSystemCommitter>()
+            && self
+                .read_snapshot
+                .table_configuration()
+                .protocol()
+                .is_catalog_managed()
         {
-            Ok(()) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(commit_version),
+            return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
+        }
+        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
+        let commit_metadata = CommitMetadata::new(log_root, commit_version);
+        match self
+            .committer
+            .commit(engine, Box::new(filtered_actions), commit_metadata)
+        {
+            Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(version),
             )),
-            Err(Error::FileAlreadyExists(_)) => Ok(CommitResult::ConflictedTransaction(
-                self.into_conflicted(commit_version),
+            Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
+                self.into_conflicted(version),
             )),
             // TODO: we may want to be more or less selective about what is retryable (this is tied
             // to the idea of "what kind of Errors should write_json_file return?")
@@ -319,7 +352,27 @@ impl Transaction {
         self
     }
 
+    /// Remove domain metadata from the Delta log.
+    /// If the domain exists in the Delta log, this creates a tombstone to logically delete
+    /// the domain. The tombstone preserves the previous configuration value.
+    /// If the domain does not exist in the Delta log, this is a no-op.
+    /// Note that each domain can only appear once per transaction. That is, multiple operations
+    /// on the same domain are disallowed in a single transaction, as well as setting and removing
+    /// the same domain in a single transaction. If a duplicate domain is included, the `commit` will
+    /// fail (that is, we don't eagerly check domain validity here).
+    /// Removing metadata for multiple distinct domains is allowed.
+    pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
+        // actual configuration value determined during commit
+        self.domain_metadatas
+            .push(DomainMetadata::remove(domain, String::new()));
+        self
+    }
+
     /// Generate domain metadata actions with validation. Handle both user and system domains.
+    ///
+    /// This function may perform an expensive log replay operation if there are any domain removals.
+    /// The log replay is required to fetch the previous configuration value for the domain to preserve
+    /// in removal tombstones as mandated by the Delta spec.
     fn generate_domain_metadata_actions<'a>(
         &'a self,
         engine: &'a dyn Engine,
@@ -337,32 +390,58 @@ impl Transaction {
             ));
         }
 
-        // validate domain metadata
-        let mut domains = HashSet::new();
-        for domain_metadata in &self.domain_metadatas {
-            if domain_metadata.is_internal() {
+        // validate user domain metadata and check if we have removals
+        let mut seen_domains = HashSet::new();
+        let mut has_removals = false;
+        for dm in &self.domain_metadatas {
+            if dm.is_internal() {
                 return Err(Error::Generic(
                     "Cannot modify domains that start with 'delta.' as those are system controlled"
                         .to_string(),
                 ));
             }
-            if !domains.insert(domain_metadata.domain()) {
+
+            if !seen_domains.insert(dm.domain()) {
                 return Err(Error::Generic(format!(
                     "Metadata for domain {} already specified in this transaction",
-                    domain_metadata.domain()
+                    dm.domain()
                 )));
             }
+
+            if dm.is_removed() {
+                has_removals = true;
+            }
         }
+
+        // fetch previous configuration values (requires log replay)
+        let existing_domains = if has_removals {
+            scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?
+        } else {
+            HashMap::new()
+        };
+
+        let user_domains = self
+            .domain_metadatas
+            .iter()
+            .filter_map(move |dm: &DomainMetadata| {
+                if dm.is_removed() {
+                    existing_domains.get(dm.domain()).map(|existing| {
+                        DomainMetadata::remove(
+                            dm.domain().to_string(),
+                            existing.configuration().to_string(),
+                        )
+                    })
+                } else {
+                    Some(dm.clone())
+                }
+            });
 
         let system_domains = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?
             .into_iter();
 
-        Ok(self
-            .domain_metadatas
-            .iter()
-            .cloned()
+        Ok(user_domains
             .chain(system_domains)
             .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
     }
@@ -735,9 +814,7 @@ mod tests {
     use std::path::PathBuf;
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
-
     #[test]
-
     fn test_add_files_schema() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
@@ -747,7 +824,9 @@ mod tests {
             .at_version(1)
             .build(&engine)
             .unwrap();
-        let txn = snapshot.transaction()?.with_engine_info("default engine");
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
         let expected = StructType::new_unchecked(vec![

@@ -240,13 +240,6 @@ impl TableChanges {
     pub fn table_root(&self) -> &Url {
         &self.table_root
     }
-    /// The partition columns that will be read.
-    pub(crate) fn partition_columns(&self) -> &Vec<String> {
-        self.end_snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns()
-    }
 
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.
     pub fn scan_builder(self: Arc<Self>) -> TableChangesScanBuilder {
