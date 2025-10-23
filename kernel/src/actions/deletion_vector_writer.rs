@@ -5,6 +5,7 @@
 
 use std::io::Write;
 
+use bytes::Bytes;
 use roaring::RoaringTreemap;
 
 use crate::actions::deletion_vector::{
@@ -41,12 +42,20 @@ pub trait DeletionVector: Sized {
     /// Consume the deletion vector and return an iterator over deleted row indexes.
     fn into_iter(self) -> Self::IndexIterator;
 
-    /// Convert the deletion vector into a RoaringTreemap.
+    /// Serialize the deletion vector into bytes.
     ///
-    /// This method has a default implementation that collects from the iterator,
-    /// but types can override it for more efficient conversion.
-    fn into_roaring_treemap(self) -> RoaringTreemap {
-        self.into_iter().collect()
+    /// This method has a default implementation that collects the iterator into a
+    /// RoaringTreemap and serializes it. Types can override this for more efficient
+    /// serialization if they already have the data in a suitable format.
+    ///
+    /// Returns a `Bytes` object which is reference-counted and FFI-friendly.
+    fn serialize(self) -> DeltaResult<Bytes> {
+        let treemap: RoaringTreemap = self.into_iter().collect();
+        let mut serialized = Vec::new();
+        treemap
+            .serialize_into(&mut serialized)
+            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
+        Ok(Bytes::from(serialized))
     }
 }
 
@@ -138,9 +147,13 @@ impl DeletionVector for KernelDeletionVector {
         self.dv.into_iter()
     }
 
-    /// Optimized conversion that returns the internal RoaringTreemap directly.
-    fn into_roaring_treemap(self) -> RoaringTreemap {
+    /// Optimized serialization that directly serializes the internal RoaringTreemap.
+    fn serialize(self) -> DeltaResult<Bytes> {
+        let mut serialized = Vec::new();
         self.dv
+            .serialize_into(&mut serialized)
+            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
+        Ok(Bytes::from(serialized))
     }
 }
 
@@ -247,15 +260,13 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
             self.has_written_version = true;
         }
 
-        // Convert deletion vector to RoaringTreemap
-        let treemap: RoaringTreemap = deletion_vector.into_roaring_treemap();
-        let cardinality = treemap.len();
+        // Serialize the deletion vector to bytes
+        let serialized = deletion_vector.serialize()?;
 
-        // Serialize the treemap to bytes
-        let mut serialized = Vec::new();
-        treemap
-            .serialize_into(&mut serialized)
-            .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
+        // Deserialize to get cardinality (we need this for the metadata)
+        let treemap = RoaringTreemap::deserialize_from(&serialized[..])
+            .map_err(|e| Error::generic(format!("Failed to deserialize deletion vector for cardinality: {}", e)))?;
+        let cardinality = treemap.len();
 
         // Calculate sizes
 
