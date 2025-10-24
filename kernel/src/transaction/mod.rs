@@ -749,45 +749,6 @@ impl WriteContext {
     pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
         DeletionVectorPath::new(self.target_dir.clone(), random_prefix)
     }
-
-    /// Relativize a URL with respect to the table root.
-    ///
-    /// This converts an absolute URL to a relative path suitable for storage in
-    /// deletion vector descriptors. The path is made relative to the table root.
-    ///
-    /// # Arguments
-    ///
-    /// * `url` - The absolute URL to relativize
-    ///
-    /// # Returns
-    ///
-    /// A relative path string, or an error if the URL cannot be made relative to the table root.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,ignore
-    /// let write_context = transaction.get_write_context();
-    /// let absolute_url = Url::parse("s3://bucket/table/deletion_vector_abc.bin")?;
-    /// let relative = write_context.relativize_url(&absolute_url)?;
-    /// // relative might be: "deletion_vector_abc.bin"
-    /// # Ok::<(), delta_kernel::Error>(())
-    /// ```
-    pub fn relativize_url(&self, url: &Url) -> DeltaResult<String> {
-        // Get the path component of both URLs
-        let table_path = self.target_dir.path();
-        let file_path = url.path();
-
-        // Check if the file path starts with the table path
-        if let Some(relative_path) = file_path.strip_prefix(table_path) {
-            // Remove leading slash if present
-            Ok(relative_path.trim_start_matches('/').to_string())
-        } else {
-            Err(Error::generic(format!(
-                "Cannot relativize URL {} with respect to table root {}",
-                url, self.target_dir
-            )))
-        }
-    }
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to
