@@ -22,15 +22,15 @@ use super::UrlExt;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
+    filter_to_record_batch, fixup_parquet_read, generate_mask, get_requested_indices,
+    ordering_needs_row_indexes, RowIndexBuilder,
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
-    PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilteredEngineData,
+    ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -242,6 +242,45 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.readahead,
         )
     }
+
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        data: FilteredEngineData,
+    ) -> DeltaResult<FileMeta> {
+        // Convert FilteredEngineData to RecordBatch, applying selection filter
+        let batch = filter_to_record_batch(data)?;
+
+        // We buffer it in the application first, and then push everything to the object-store.
+        // The storage API does not seem to allow for streaming to the store, which is okay
+        // since often the object stores allocate their own buffers.
+        let mut buffer = Vec::new();
+
+        // Scope to ensure writer is dropped before we use buffer
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)?;
+            writer.write(&batch)?;
+            writer.close()?; // writer must be closed to write footer
+        }
+
+        let store = self.store.clone();
+        let path = Path::from_url_path(location.path())?;
+
+        let size: u64 = buffer
+            .len()
+            .try_into()
+            .map_err(|_| Error::generic("unable to convert usize to u64"))?;
+
+        // Block on the async put operation
+        self.task_executor
+            .block_on(async move { store.put(&path, buffer.into()).await })?;
+
+        Ok(FileMeta {
+            location,
+            last_modified: 0,
+            size,
+        })
+    }
 }
 
 /// Implements [`FileOpener`] for a parquet file
@@ -427,7 +466,7 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
-    use crate::arrow::array::{Array, RecordBatch};
+    use crate::arrow::array::{Array, BooleanArray, RecordBatch};
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -637,5 +676,160 @@ mod tests {
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "x",
+                    Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
+                ),
+                (
+                    "y",
+                    Arc::new(Int64Array::from(vec![100, 200, 300])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Wrap in FilteredEngineData with all rows selected
+        let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
+
+        // Test writing through the trait method
+        let file_url = Url::parse("memory:///test/data.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), filtered_data)
+            .unwrap();
+
+        // Verify we can read the file back
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 3);
+        assert_eq!(data[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write_and_read_roundtrip() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create test data with multiple types
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "int_col",
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as Arc<dyn Array>,
+                ),
+                (
+                    "string_col",
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as Arc<dyn Array>,
+                ),
+                (
+                    "bool_col",
+                    Arc::new(BooleanArray::from(vec![true, false, true, false, true]))
+                        as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Wrap in FilteredEngineData with all rows selected
+        let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
+
+        // Write the data
+        let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), filtered_data)
+            .unwrap();
+
+        // Read it back
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url.clone(),
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify the data
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 5);
+        assert_eq!(data[0].num_columns(), 3);
+
+        // Verify column values
+        let int_col = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(int_col.values(), &[1, 2, 3, 4, 5]);
+
+        let string_col = data[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(string_col.value(0), "a");
+        assert_eq!(string_col.value(4), "e");
+
+        let bool_col = data[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(bool_col.value(0));
+        assert!(!bool_col.value(1));
     }
 }
