@@ -194,6 +194,7 @@ impl Iterator for CheckpointDataIterator {
 ///
 /// # See Also
 /// See the [module-level documentation](self) for the complete checkpoint workflow
+#[derive(Debug, Clone)]
 pub struct CheckpointWriter {
     /// Reference to the snapshot (i.e. version) of the table being checkpointed
     pub(crate) snapshot: SnapshotRef,
@@ -220,6 +221,10 @@ impl CheckpointWriter {
                 e
             ))
         })?;
+
+        // We disallow checkpointing if the LogSegment contains any unpublished commits. (could
+        // create gaps in the version history, thereby breaking old readers)
+        snapshot.log_segment().validate_no_staged_commits()?;
 
         Ok(Self { snapshot, version })
     }
@@ -265,7 +270,6 @@ impl CheckpointWriter {
 
         let actions = self.snapshot.log_segment().read_actions(
             engine,
-            CHECKPOINT_ACTIONS_SCHEMA.clone(),
             CHECKPOINT_ACTIONS_SCHEMA.clone(),
             None,
         )?;

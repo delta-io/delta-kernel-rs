@@ -52,9 +52,9 @@ mod resolve_dvs;
 pub mod scan;
 mod scan_file;
 
-static CHANGE_TYPE_COL_NAME: &str = "_change_type";
-static COMMIT_VERSION_COL_NAME: &str = "_commit_version";
-static COMMIT_TIMESTAMP_COL_NAME: &str = "_commit_timestamp";
+pub(crate) const CHANGE_TYPE_COL_NAME: &str = "_change_type";
+pub(crate) const COMMIT_VERSION_COL_NAME: &str = "_commit_version";
+pub(crate) const COMMIT_TIMESTAMP_COL_NAME: &str = "_commit_timestamp";
 static ADD_CHANGE_TYPE: &str = "insert";
 static REMOVE_CHANGE_TYPE: &str = "delete";
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
@@ -166,8 +166,14 @@ impl TableChanges {
         // TODO: link issue
         #[cfg(feature = "catalog-managed")]
         require!(
-            !start_snapshot.protocol().is_catalog_managed()
-                && !end_snapshot.protocol().is_catalog_managed(),
+            !start_snapshot
+                .table_configuration()
+                .protocol()
+                .is_catalog_managed()
+                && !end_snapshot
+                    .table_configuration()
+                    .protocol()
+                    .is_catalog_managed(),
             Error::unsupported("Change data feed is not supported for catalog-managed tables")
         );
 
@@ -233,10 +239,6 @@ impl TableChanges {
     /// Path to the root of the table that is being read.
     pub fn table_root(&self) -> &Url {
         &self.table_root
-    }
-    /// The partition columns that will be read.
-    pub(crate) fn partition_columns(&self) -> &Vec<String> {
-        self.end_snapshot.metadata().partition_columns()
     }
 
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.

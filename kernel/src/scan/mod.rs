@@ -13,7 +13,7 @@ use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_log_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
+use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -22,30 +22,32 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
 use crate::scan::state::{DvInfo, Stats};
-use crate::schema::ToSchema as _;
+use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    StructType,
+    ToSchema as _,
 };
-use crate::snapshot::SnapshotRef;
-use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_spec, ColumnType};
-use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
+pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
+pub(crate) mod state_info;
 
-// safety: we define get_log_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
+// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]
-static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_log_schema().project(&[ADD_NAME, REMOVE_NAME]).unwrap());
-// safety: we define get_log_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
+static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    get_commit_schema()
+        .project(&[ADD_NAME, REMOVE_NAME])
+        .unwrap()
+});
+// safety: we define get_commit_schema() and _know_ it contains ADD_NAME and SIDECAR_NAME
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| get_log_schema().project(&[ADD_NAME, SIDECAR_NAME]).unwrap());
+    LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -116,24 +118,17 @@ impl ScanBuilder {
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
-        let state_info = StateInfo::try_new(
-            logical_schema.as_ref(),
-            self.snapshot.metadata().partition_columns(),
-            self.snapshot.table_configuration().column_mapping_mode(),
-        )?;
 
-        let physical_predicate = match self.predicate {
-            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
-            None => PhysicalPredicate::None,
-        };
+        let state_info = StateInfo::try_new(
+            logical_schema,
+            self.snapshot.table_configuration(),
+            self.predicate,
+            (), // No classifer, default is for scans
+        )?;
 
         Ok(Scan {
             snapshot: self.snapshot,
-            logical_schema,
-            physical_schema: Arc::new(StructType::try_new(state_info.read_fields)?),
-            physical_predicate,
-            all_fields: Arc::new(state_info.all_fields),
-            have_partition_cols: state_info.have_partition_cols,
+            state_info: Arc::new(state_info),
         })
     }
 }
@@ -363,18 +358,14 @@ impl HasSelectionVector for ScanMetadata {
 /// scanning the table.
 pub struct Scan {
     snapshot: SnapshotRef,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    physical_predicate: PhysicalPredicate,
-    all_fields: Arc<Vec<ColumnType>>,
-    have_partition_cols: bool,
+    state_info: Arc<StateInfo>,
 }
 
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", &self.logical_schema)
-            .field("predicate", &self.physical_predicate)
+            .field("schema", &self.state_info.logical_schema)
+            .field("predicate", &self.state_info.physical_predicate)
             .finish()
     }
 }
@@ -403,7 +394,7 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
+        &self.state_info.logical_schema
     }
 
     /// Get a shared reference to the physical [`Schema`] of the scan. This represents the schema
@@ -411,12 +402,12 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn physical_schema(&self) -> &SchemaRef {
-        &self.physical_schema
+        &self.state_info.physical_schema
     }
 
     /// Get the predicate [`PredicateRef`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
-        if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
+        if let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate {
             Some(predicate.clone())
         } else {
             None
@@ -510,6 +501,7 @@ impl Scan {
                     StructField::nullable("modificationTime", DataType::LONG),
                     StructField::nullable("stats", DataType::STRING),
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+                    StructField::nullable("baseRowId", DataType::LONG),
                 ]),
             )])
         });
@@ -562,6 +554,7 @@ impl Scan {
             ascending_compaction_files: vec![],
             checkpoint_parts: vec![],
             latest_crc_file: None,
+            latest_commit_file: log_segment.latest_commit_file.clone(),
         };
         let new_log_segment = LogSegment::try_new(
             listed_log_files,
@@ -570,7 +563,7 @@ impl Scan {
         )?;
 
         let it = new_log_segment
-            .read_actions(
+            .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
@@ -586,26 +579,10 @@ impl Scan {
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        // Compute the static part of the transformation. This is `None` if no transformation is
-        // needed. We need transforms for:
-        // - Partition columns: Must be injected from partition values
-        // - Column mapping: Physical field names must be mapped to logical field names via output schema
-        let static_transform = (self.have_partition_cols
-            || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then(|| Arc::new(get_transform_spec(&self.all_fields)));
-        let physical_predicate = match self.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
-            PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
-            PhysicalPredicate::None => None,
-        };
-        let it = scan_action_iter(
-            engine,
-            action_batch_iter,
-            self.logical_schema.clone(),
-            self.physical_schema.clone(),
-            static_transform,
-            physical_predicate,
-        );
+        if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
+            return Ok(None.into_iter().flatten());
+        }
+        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone());
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -616,12 +593,14 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
-        self.snapshot.log_segment().read_actions(
-            engine,
-            COMMIT_READ_SCHEMA.clone(),
-            CHECKPOINT_READ_SCHEMA.clone(),
-            None,
-        )
+        self.snapshot
+            .log_segment()
+            .read_actions_with_projected_checkpoint_actions(
+                engine,
+                COMMIT_READ_SCHEMA.clone(),
+                CHECKPOINT_READ_SCHEMA.clone(),
+                None,
+            )
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
@@ -661,7 +640,7 @@ impl Scan {
 
         debug!(
             "Executing scan with logical schema {:#?} and physical schema {:#?}",
-            self.logical_schema, self.physical_schema
+            self.state_info.logical_schema, self.state_info.physical_schema
         );
 
         let table_root = self.snapshot.table_root().clone();
@@ -754,88 +733,13 @@ impl Scan {
 ///      cardinality: long,
 ///    },
 ///    fileConstantValues: {
-///      partitionValues: map<string, string>
+///      partitionValues: map<string, string>,
+///      baseRowId: long
 ///    }
 /// }
 /// ```
 pub fn scan_row_schema() -> SchemaRef {
     log_replay::SCAN_ROW_SCHEMA.clone()
-}
-
-/// All the state needed to process a scan.
-struct StateInfo {
-    /// All fields referenced by the query.
-    all_fields: Vec<ColumnType>,
-    /// The physical (parquet) read schema to use.
-    read_fields: Vec<StructField>,
-    /// True if this query references any partition columns.
-    have_partition_cols: bool,
-}
-
-impl StateInfo {
-    /// Get the state needed to process a scan.
-    fn try_new(
-        logical_schema: &Schema,
-        partition_columns: &[String],
-        column_mapping_mode: ColumnMappingMode,
-    ) -> DeltaResult<Self> {
-        let mut have_partition_cols = false;
-        let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
-        let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
-
-        // Loop over all selected fields and note if they are columns that will be read from the
-        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-        // be filled in by evaluating an expression ([`ColumnType::MetadataDerivedColumn`])
-        let all_fields = logical_schema
-            .fields()
-            .enumerate()
-            .map(|(index, logical_field)| -> DeltaResult<_> {
-                if partition_columns.contains(logical_field.name()) {
-                    if logical_field.is_metadata_column() {
-                        return Err(Error::Schema(format!(
-                            "Metadata column names must not match partition columns: {}",
-                            logical_field.name()
-                        )));
-                    }
-
-                    // Store the index into the schema for this field. When we turn it into an
-                    // expression in the inner loop, we will index into the schema and get the name and
-                    // data type, which we need to properly materialize the column.
-                    have_partition_cols = true;
-                    Ok(ColumnType::MetadataDerivedColumn(index))
-                } else {
-                    // Add to read schema, store field so we can build a `Column` expression later
-                    // if needed (i.e. if we have partition columns)
-                    let physical_field = logical_field.make_physical(column_mapping_mode);
-                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                    let physical_name = physical_field.name.clone();
-                    read_fields.push(physical_field);
-
-                    if !logical_field.is_metadata_column() {
-                        read_field_names.insert(physical_name.clone());
-                    }
-
-                    Ok(ColumnType::Selected(physical_name))
-                }
-            })
-            .try_collect()?;
-
-        // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
-        for metadata_column in logical_schema.metadata_columns() {
-            if read_field_names.contains(metadata_column.name()) {
-                return Err(Error::Schema(format!(
-                    "Metadata column names must not match physical columns: {}",
-                    metadata_column.name()
-                )));
-            }
-        }
-
-        Ok(StateInfo {
-            all_fields,
-            read_fields,
-            have_partition_cols,
-        })
-    }
 }
 
 pub fn selection_vector(
@@ -852,13 +756,15 @@ pub fn selection_vector(
 #[cfg(test)]
 pub(crate) mod test_utils {
     use crate::arrow::array::StringArray;
+    use crate::scan::state_info::StateInfo;
+    use crate::schema::StructType;
     use crate::utils::test_utils::string_array_to_engine_data;
     use itertools::Itertools;
     use std::sync::Arc;
 
     use crate::log_replay::ActionsBatch;
     use crate::{
-        actions::get_log_schema,
+        actions::get_commit_schema,
         engine::{
             arrow_data::ArrowEngineData,
             sync::{json::SyncJsonHandler, SyncEngine},
@@ -869,6 +775,7 @@ pub(crate) mod test_utils {
     };
 
     use super::state::ScanCallback;
+    use super::PhysicalPredicate;
     use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.
@@ -917,6 +824,21 @@ pub(crate) mod test_utils {
         ArrowEngineData::try_from_engine_data(parsed).unwrap()
     }
 
+    // Generates a batch with an add action.
+    // The schema is provided as null columns affect equality checks.
+    pub(crate) fn add_batch_for_row_id(output_schema: SchemaRef) -> Box<ArrowEngineData> {
+        let handler = SyncJsonHandler {};
+        let json_strings: StringArray = vec![
+            r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","baseRowId": 42, "tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
+            r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none", "delta.enableRowTracking": "true", "delta.rowTracking.materializedRowIdColumnName":"row_id_col"},"createdTime":1677811175819}}"#,
+        ]
+        .into();
+        let parsed = handler
+            .parse_json(string_array_to_engine_data(json_strings), output_schema)
+            .unwrap();
+        ArrowEngineData::try_from_engine_data(parsed).unwrap()
+    }
+
     // An add batch with a removed file parsed with the schema provided
     pub(crate) fn add_batch_with_remove(output_schema: SchemaRef) -> Box<ArrowEngineData> {
         let handler = SyncJsonHandler {};
@@ -943,7 +865,7 @@ pub(crate) mod test_utils {
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues": {"date": "2017-12-10"},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":true}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2}}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -961,17 +883,20 @@ pub(crate) mod test_utils {
         context: T,
         validate_callback: ScanCallback<T>,
     ) {
-        let logical_schema = logical_schema
-            .unwrap_or_else(|| Arc::new(crate::schema::StructType::new_unchecked(vec![])));
+        let logical_schema =
+            logical_schema.unwrap_or_else(|| Arc::new(StructType::new_unchecked(vec![])));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: logical_schema.clone(),
+            physical_schema: logical_schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec,
+        });
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            logical_schema.clone(),
-            logical_schema,
-            transform_spec,
-            None,
+            state_info,
         );
         let mut batch_count = 0;
         for res in iter {
@@ -999,7 +924,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
-    use crate::schema::{ColumnMetadataKey, PrimitiveType};
+    use crate::schema::{ColumnMetadataKey, PrimitiveType, StructType};
     use crate::Snapshot;
 
     use super::*;

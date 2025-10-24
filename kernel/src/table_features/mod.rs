@@ -198,6 +198,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyL
         TableFeature::AppendOnly,
         TableFeature::DeletionVectors,
         TableFeature::DomainMetadata,
+        TableFeature::InCommitTimestamp,
         TableFeature::Invariants,
         TableFeature::RowTracking,
         TableFeature::TimestampWithoutTimezone,

@@ -78,6 +78,23 @@ impl HasSelectionVector for FilteredEngineData {
     }
 }
 
+impl From<Box<dyn EngineData>> for FilteredEngineData {
+    /// Converts `EngineData` into `FilteredEngineData` with all rows selected.
+    ///
+    /// This is a convenience conversion that wraps the provided engine data
+    /// in a `FilteredEngineData` with an empty selection vector, meaning all
+    /// rows are logically selected.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let engine_data: Box<dyn EngineData> = ...;
+    /// let filtered: FilteredEngineData = engine_data.into();
+    /// ```
+    fn from(data: Box<dyn EngineData>) -> Self {
+        Self::with_all_rows_selected(data)
+    }
+}
+
 /// a trait that an engine exposes to give access to a list
 pub trait EngineList {
     /// Return the length of the list at the specified row_index in the raw data
@@ -556,5 +573,30 @@ mod tests {
                 .contains("Selection vector is larger than data length"));
             assert!(e.to_string().contains("3 > 2"));
         }
+    }
+
+    #[test]
+    fn test_from_engine_data() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let record_batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["test1", "test2", "test3"]))],
+        )
+        .unwrap();
+        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+        let data_len = data.len(); // Save length before move
+
+        // Use the From trait to convert
+        let filtered_data: FilteredEngineData = data.into();
+
+        // Verify all rows are selected (empty selection vector)
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), data_len);
+        assert_eq!(filtered_data.data().len(), 3);
+        assert!(filtered_data.has_selected_rows());
     }
 }
