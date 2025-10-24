@@ -20,6 +20,24 @@ use crate::{DeltaResult, Error};
 
 pub use crate::engine::arrow_utils::fix_nested_null_masks;
 
+/// Helper function to get a string value from an array that could be either Utf8 or LargeUtf8
+fn get_string_value(array: &dyn Array, index: usize) -> String {
+    match array.data_type() {
+        ArrowDataType::Utf8 => array.as_string::<i32>().value(index).to_string(),
+        ArrowDataType::LargeUtf8 => array.as_string::<i64>().value(index).to_string(),
+        _ => panic!("Expected string array, got {:?}", array.data_type()),
+    }
+}
+
+/// Helper function to get a string slice from an array that could be either Utf8 or LargeUtf8
+fn get_string_slice<'a>(array: &'a dyn Array, index: usize) -> &'a str {
+    match array.data_type() {
+        ArrowDataType::Utf8 => array.as_string::<i32>().value(index),
+        ArrowDataType::LargeUtf8 => array.as_string::<i64>().value(index),
+        _ => panic!("Expected string array, got {:?}", array.data_type()),
+    }
+}
+
 /// ArrowEngineData holds an Arrow `RecordBatch`, implements `EngineData` so the kernel can extract from it.
 ///
 /// WARNING: Row visitors require that all leaf columns of the record batch have correctly computed
@@ -100,8 +118,7 @@ where
 
     fn get(&self, row_index: usize, index: usize) -> String {
         let arry = self.value(row_index);
-        let sarry = arry.as_string::<i32>();
-        sarry.value(index).to_string()
+        get_string_value(arry.as_ref(), index)
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
@@ -118,14 +135,13 @@ impl EngineMap for MapArray {
         let offsets = self.offsets();
         let start_offset = offsets[row_index] as usize;
         let count = offsets[row_index + 1] as usize - start_offset;
-        let keys = self.keys().as_string::<i32>();
-        for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
-            if let Some(map_key) = map_key {
-                if key == map_key {
-                    // found the item
-                    let vals = self.values().as_string::<i32>();
-                    return Some(vals.value(idx));
-                }
+        let keys = self.keys();
+
+        for idx in start_offset..(start_offset + count) {
+            let map_key = get_string_slice(keys.as_ref(), idx);
+            if key == map_key {
+                // found the item
+                return Some(get_string_slice(self.values().as_ref(), idx));
             }
         }
         None
@@ -134,12 +150,13 @@ impl EngineMap for MapArray {
     fn materialize(&self, row_index: usize) -> HashMap<String, String> {
         let mut ret = HashMap::new();
         let map_val = self.value(row_index);
-        let keys = map_val.column(0).as_string::<i32>();
-        let values = map_val.column(1).as_string::<i32>();
-        for (key, value) in keys.iter().zip(values.iter()) {
-            if let (Some(key), Some(value)) = (key, value) {
-                ret.insert(key.into(), value.into());
-            }
+        let keys_array = map_val.column(0);
+        let values_array = map_val.column(1);
+
+        for idx in 0..keys_array.len() {
+            let key = get_string_value(keys_array.as_ref(), idx);
+            let value = get_string_value(values_array.as_ref(), idx);
+            ret.insert(key, value);
         }
         ret
     }
@@ -277,19 +294,21 @@ impl ArrowEngineData {
         data_type: &DataType,
         col: &'a dyn Array,
     ) -> DeltaResult<&'a dyn GetData<'a>> {
-        use ArrowDataType::Utf8;
+        use ArrowDataType::{LargeUtf8, Utf8};
+        let is_string_type = |dt: &ArrowDataType| matches!(dt, Utf8 | LargeUtf8);
         let col_as_list = || {
             if let Some(array) = col.as_list_opt::<i32>() {
-                (array.value_type() == Utf8).then_some(array as _)
+                is_string_type(&array.value_type()).then_some(array as _)
             } else if let Some(array) = col.as_list_opt::<i64>() {
-                (array.value_type() == Utf8).then_some(array as _)
+                is_string_type(&array.value_type()).then_some(array as _)
             } else {
                 None
             }
         };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
-                (array.key_type() == &Utf8 && array.value_type() == &Utf8).then_some(array as _)
+                (is_string_type(array.key_type()) && is_string_type(array.value_type()))
+                    .then_some(array as _)
             })
         };
         let result: Result<&'a dyn GetData<'a>, _> = match data_type {
@@ -299,7 +318,11 @@ impl ArrowEngineData {
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt().map(|a| a as _).ok_or("string")
+                // Try both Utf8 (i32) and LargeUtf8 (i64) string types
+                col.as_string_opt::<i32>()
+                    .map(|a| a as _)
+                    .or_else(|| col.as_string_opt::<i64>().map(|a| a as _))
+                    .ok_or("string")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));

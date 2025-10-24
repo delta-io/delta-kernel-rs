@@ -86,7 +86,7 @@ impl Scalar {
             Byte(val) => append_val_as!(array::Int8Builder, *val),
             Float(val) => append_val_as!(array::Float32Builder, *val),
             Double(val) => append_val_as!(array::Float64Builder, *val),
-            String(val) => append_val_as!(array::StringBuilder, val),
+            String(val) => append_val_as!(array::LargeStringBuilder, val),
             Boolean(val) => append_val_as!(array::BooleanBuilder, *val),
             Timestamp(val) | TimestampNtz(val) => {
                 // timezone was already set at builder construction time
@@ -167,7 +167,7 @@ impl Scalar {
             DataType::BYTE => append_null_as!(array::Int8Builder),
             DataType::FLOAT => append_null_as!(array::Float32Builder),
             DataType::DOUBLE => append_null_as!(array::Float64Builder),
-            DataType::STRING => append_null_as!(array::StringBuilder),
+            DataType::STRING => append_null_as!(array::LargeStringBuilder),
             DataType::BOOLEAN => append_null_as!(array::BooleanBuilder),
             DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
                 append_null_as!(array::TimestampMicrosecondBuilder)

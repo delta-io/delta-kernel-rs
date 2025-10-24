@@ -51,6 +51,16 @@ impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i32>> {
     }
 }
 
+impl<'a> GetData<'a> for GenericByteArray<GenericStringType<i64>> {
+    fn get_str(&'a self, row_index: usize, _field_name: &str) -> DeltaResult<Option<&'a str>> {
+        if self.is_valid(row_index) {
+            Ok(Some(self.value(row_index)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 impl<'a, OffsetSize> GetData<'a> for GenericListArray<OffsetSize>
 where
     OffsetSize: OffsetSizeTrait,
