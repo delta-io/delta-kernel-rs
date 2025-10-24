@@ -1004,8 +1004,7 @@ mod tests {
     use crate::{
         arrow::array::{
             Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, LargeStringBuilder,
-            ListArray, ListBuilder, MapBuilder, MapFieldNames, RecordBatch, StringArray,
-            StringBuilder, StructArray,
+            ListArray, ListBuilder, MapBuilder, MapFieldNames, RecordBatch, StructArray,
         },
         arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
         arrow::json::ReaderBuilder,

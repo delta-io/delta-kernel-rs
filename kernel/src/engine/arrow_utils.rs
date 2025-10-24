@@ -169,6 +169,52 @@ impl RowIndexBuilder {
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
+/// Recursively cast Utf8 columns to LargeUtf8 in a StructArray.
+/// This ensures that downstream operations can work with large string arrays
+/// without hitting i32 offset limits during aggregation/sorting operations.
+fn cast_strings_to_large(array: StructArray) -> DeltaResult<StructArray> {
+    let (fields, columns, nulls) = array.into_parts();
+
+    let new_fields_and_columns: DeltaResult<Vec<_>> = fields
+        .iter()
+        .zip(columns.iter())
+        .map(|(field, column)| {
+            let new_column = match column.data_type() {
+                ArrowDataType::Utf8 => {
+                    // Cast Utf8 to LargeUtf8
+                    Arc::new(crate::arrow::compute::cast(
+                        column.as_ref(),
+                        &ArrowDataType::LargeUtf8,
+                    )?)
+                }
+                ArrowDataType::Struct(_) => {
+                    // Recursively process nested structs
+                    let struct_array = column.as_struct().clone();
+                    Arc::new(cast_strings_to_large(struct_array)?) as Arc<dyn ArrowArray>
+                }
+                _ => column.clone(),
+            };
+
+            let new_field = if new_column.data_type() != field.data_type() {
+                Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(new_column.data_type().clone()),
+                )
+            } else {
+                field.clone()
+            };
+
+            Ok((new_field, new_column))
+        })
+        .collect();
+
+    let (new_fields, new_columns): (Vec<_>, Vec<_>) = new_fields_and_columns?.into_iter().unzip();
+
+    Ok(StructArray::try_new(new_fields.into(), new_columns, nulls)?)
+}
+
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
@@ -179,6 +225,7 @@ where
 {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes)?;
     let data = fix_nested_null_masks(data);
+    let data = cast_strings_to_large(data)?;
     Ok(data.into())
 }
 
