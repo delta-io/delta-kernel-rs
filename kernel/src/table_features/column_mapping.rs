@@ -38,8 +38,7 @@ pub(crate) fn column_mapping_mode(
         // (but should be ignored) even when the feature is not supported. For details see
         // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
         (Some(mode), 2) => mode,
-        // TODO: replace with `has_table_feature` whenever column mapping for write is supported
-        (Some(mode), 3) if protocol.has_reader_feature(&TableFeature::ColumnMapping) => mode,
+        (Some(mode), 3) if protocol.has_table_feature(&TableFeature::ColumnMapping) => mode,
         _ => ColumnMappingMode::None,
     }
 }
@@ -206,7 +205,7 @@ mod tests {
             3,
             7,
             Some([TableFeature::ColumnMapping]),
-            empty_features.clone(),
+            Some([TableFeature::ColumnMapping]),
         )
         .unwrap();
 
@@ -242,7 +241,7 @@ mod tests {
             3,
             7,
             Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
         )
         .unwrap();
 

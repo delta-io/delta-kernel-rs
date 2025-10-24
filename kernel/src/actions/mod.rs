@@ -442,14 +442,9 @@ impl Protocol {
         self.writer_features.as_deref()
     }
 
-    /// True if this protocol has the requested reader feature
-    pub(crate) fn has_reader_feature(&self, feature: &TableFeature) -> bool {
-        self.reader_features()
-            .is_some_and(|features| features.contains(feature))
-    }
-
-    /// True if this protocol has the requested writer feature
-    pub(crate) fn has_writer_feature(&self, feature: &TableFeature) -> bool {
+    /// True if this protocol has the requested feature
+    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
+        // Since each reader features is a subset of writer features, we only check writer feature
         self.writer_features()
             .is_some_and(|features| features.contains(feature))
     }
@@ -460,15 +455,10 @@ impl Protocol {
             (Some(reader_features), Some(writer_features)) => {
                 // Check all reader features are ReaderWriter and present in writer features.
                 let check_r = reader_features.iter().all(|feature| {
-                    // TODO: we relax the condition until column mapping write(#1124) is supported
-                    if matches!(feature, TableFeature::ColumnMapping) {
-                        true
-                    } else {
-                        matches!(
-                            feature.feature_type(),
-                            FeatureType::ReaderWriter | FeatureType::Unknown
-                        ) && writer_features.contains(feature)
-                    }
+                    matches!(
+                        feature.feature_type(),
+                        FeatureType::ReaderWriter | FeatureType::Unknown
+                    ) && writer_features.contains(feature)
                 });
                 require!(
                     check_r,
@@ -505,15 +495,9 @@ impl Protocol {
                 );
                 Ok(())
             }
-            (Some(reader_features), None) => {
-                if *reader_features == vec![TableFeature::ColumnMapping] {
-                    Ok(())
-                } else {
-                    Err(Error::invalid_protocol(
-                        "Reader features should be present in writer features",
-                    ))
-                }
-            }
+            (Some(_), None) => Err(Error::invalid_protocol(
+                "Reader features should be present in writer features",
+            )),
         }
     }
 
@@ -593,8 +577,8 @@ impl Protocol {
 
     #[cfg(feature = "catalog-managed")]
     pub(crate) fn is_catalog_managed(&self) -> bool {
-        self.has_writer_feature(&TableFeature::CatalogManaged)
-            || self.has_writer_feature(&TableFeature::CatalogOwnedPreview)
+        self.has_table_feature(&TableFeature::CatalogManaged)
+            || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
 }
 
@@ -1355,30 +1339,34 @@ mod tests {
             (
                 Some(vec![TableFeature::DeletionVectors]),
                 Some(vec![TableFeature::AppendOnly]),
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
-            (Some(vec![TableFeature::DeletionVectors]), None),
+            (Some(vec![TableFeature::DeletionVectors]), None, "Reader features should be present in writer features"),
             // ReaderWriter feature not present in reader features
-            (None, Some(vec![TableFeature::DeletionVectors])),
+            (None, Some(vec![TableFeature::DeletionVectors]), "Writer features must be Writer-only or also listed in reader features"),
             (
                 Some(vec![TableFeature::VariantType]),
                 Some(vec![
                     TableFeature::VariantType,
                     TableFeature::DeletionVectors,
                 ]),
+                "Writer features must be Writer-only or also listed in reader features",
             ),
             // Writer only feature present in reader features
             (
                 Some(vec![TableFeature::AppendOnly]),
                 Some(vec![TableFeature::AppendOnly]),
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
             // Reader only feature is not allowed
             (
                 Some(vec![TableFeature::Unknown("r".to_string())]),
                 Some(vec![TableFeature::Unknown("w".to_string())]),
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
         ];
 
-        for (reader_features, writer_features) in invalid_features {
+        for (reader_features, writer_features, error_msg) in invalid_features {
             let protocol = Protocol {
                 min_reader_version: 3,
                 min_writer_version: 7,
@@ -1386,10 +1374,14 @@ mod tests {
                 writer_features,
             };
 
-            assert!(matches!(
-                protocol.validate_table_features(),
-                Err(Error::InvalidProtocol(_)),
-            ));
+            let res = protocol.validate_table_features();
+            assert!(
+                matches!(
+                    protocol.validate_table_features(),
+                    Err(Error::InvalidProtocol(error)) if error.to_string().eq(error_msg)
+                ),
+                "Expected:\t{error_msg}\nBut got:{res:?}\n"
+            );
         }
     }
 
@@ -1418,9 +1410,6 @@ mod tests {
             ),
             // Empty feature set is valid
             (None, None),
-            // Ideally this is invalid combination but we allowed it as an exception
-            // TODO: remove this casae after column mapping write(#1124) is supported
-            (Some(vec![TableFeature::ColumnMapping]), None),
         ];
 
         for (reader_features, writer_features) in valid_features {
@@ -1938,7 +1927,7 @@ mod tests {
             3,
             7,
             Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
         )
         .unwrap();
 
@@ -1979,6 +1968,7 @@ mod tests {
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
         list_builder.values().append_value("deletionVectors");
+        list_builder.values().append_value("columnMapping");
         list_builder.append(true);
         let writer_features_array = list_builder.finish();
 

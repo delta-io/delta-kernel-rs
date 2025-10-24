@@ -139,7 +139,7 @@ async fn unsupported_reader_feature() {
                 3,
                 7,
                 Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-                Some([TableFeature::DeletionVectors]),
+                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
             )
             .unwrap(),
         )])
