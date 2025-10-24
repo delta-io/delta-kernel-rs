@@ -122,7 +122,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
         match t {
             DataType::Primitive(p) => {
                 match p {
-                    PrimitiveType::String => Ok(ArrowDataType::Utf8),
+                    PrimitiveType::String => Ok(ArrowDataType::LargeUtf8),
                     PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
                     PrimitiveType::Integer => Ok(ArrowDataType::Int32),
                     PrimitiveType::Short => Ok(ArrowDataType::Int16),
@@ -339,6 +339,20 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Incorrect Variant Schema"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_string_uses_large_type() -> DeltaResult<()> {
+        // Verify that STRING type converts to LargeUtf8 to avoid 2GB overflow panics
+        let string_type = DataType::STRING;
+        let arrow_type = ArrowDataType::try_from_kernel(&string_type)?;
+        assert_eq!(arrow_type, ArrowDataType::LargeUtf8);
+
+        // Verify that LargeUtf8 can be converted back to STRING
+        let kernel_type = DataType::try_from_arrow(&ArrowDataType::LargeUtf8)?;
+        assert_eq!(kernel_type, DataType::STRING);
+
         Ok(())
     }
 }

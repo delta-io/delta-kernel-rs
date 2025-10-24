@@ -337,7 +337,14 @@ pub fn evaluate_predicate(
                 (Expression::Literal(_), Expression::Column(_)) => {
                     let left = evaluate_expression(left, batch, None)?;
                     let right = evaluate_expression(right, batch, None)?;
+                    // Handle both Utf8 (i32) and LargeUtf8 (i64) string types
                     if let Some(string_arr) = left.as_string_opt::<i32>() {
+                        if let Some(list_arr) = right.as_list_opt::<i32>() {
+                            let result = in_list_utf8(string_arr, list_arr)?;
+                            return Ok(result);
+                        }
+                    }
+                    if let Some(string_arr) = left.as_string_opt::<i64>() {
                         if let Some(list_arr) = right.as_list_opt::<i32>() {
                             let result = in_list_utf8(string_arr, list_arr)?;
                             return Ok(result);
@@ -1041,7 +1048,7 @@ mod tests {
         let result2 = coalesce_arrays(&[arr1, arr2], Some(&DataType::STRING));
         assert_result_error_with_message(
             result2,
-            "Requested result type Utf8 does not match arrays' data type Int32",
+            "Requested result type LargeUtf8 does not match arrays' data type Int32",
         );
     }
 

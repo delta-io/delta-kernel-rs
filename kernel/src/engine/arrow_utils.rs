@@ -18,7 +18,8 @@ use crate::{
 
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    LargeStringArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
+    StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
@@ -168,6 +169,52 @@ impl RowIndexBuilder {
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
+/// Recursively cast Utf8 columns to LargeUtf8 in a StructArray.
+/// This ensures that downstream operations can work with large string arrays
+/// without hitting i32 offset limits during aggregation/sorting operations.
+fn cast_strings_to_large(array: StructArray) -> DeltaResult<StructArray> {
+    let (fields, columns, nulls) = array.into_parts();
+
+    let new_fields_and_columns: DeltaResult<Vec<_>> = fields
+        .iter()
+        .zip(columns.iter())
+        .map(|(field, column)| {
+            let new_column = match column.data_type() {
+                ArrowDataType::Utf8 => {
+                    // Cast Utf8 to LargeUtf8
+                    Arc::new(crate::arrow::compute::cast(
+                        column.as_ref(),
+                        &ArrowDataType::LargeUtf8,
+                    )?)
+                }
+                ArrowDataType::Struct(_) => {
+                    // Recursively process nested structs
+                    let struct_array = column.as_struct().clone();
+                    Arc::new(cast_strings_to_large(struct_array)?) as Arc<dyn ArrowArray>
+                }
+                _ => column.clone(),
+            };
+
+            let new_field = if new_column.data_type() != field.data_type() {
+                Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(new_column.data_type().clone()),
+                )
+            } else {
+                field.clone()
+            };
+
+            Ok((new_field, new_column))
+        })
+        .collect();
+
+    let (new_fields, new_columns): (Vec<_>, Vec<_>) = new_fields_and_columns?.into_iter().unzip();
+
+    Ok(StructArray::try_new(new_fields.into(), new_columns, nulls)?)
+}
+
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
@@ -178,6 +225,7 @@ where
 {
     let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes)?;
     let data = fix_nested_null_masks(data);
+    let data = cast_strings_to_large(data)?;
     Ok(data.into())
 }
 
@@ -1015,27 +1063,91 @@ pub(crate) fn parse_json(
     let json_strings = json_strings
         .column(0)
         .as_any()
-        .downcast_ref::<StringArray>()
+        .downcast_ref::<LargeStringArray>()
         .ok_or_else(|| {
-            Error::generic("Expected json_strings to be a StringArray, found something else")
+            Error::generic("Expected json_strings to be a LargeStringArray, found something else")
         })?;
     let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
     let result = parse_json_impl(json_strings, schema)?;
     Ok(Box::new(ArrowEngineData::new(result)))
 }
 
+/// Helper to convert Large types to regular types for JSON parsing
+/// Arrow's JSON reader doesn't support Large types, so we convert schema to use Utf8
+fn convert_schema_for_json(schema: &ArrowSchema) -> ArrowSchema {
+    let fields: ArrowFields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let new_type = match field.data_type() {
+                ArrowDataType::LargeUtf8 => ArrowDataType::Utf8,
+                ArrowDataType::LargeBinary => ArrowDataType::Binary,
+                ArrowDataType::LargeList(inner_field) => {
+                    ArrowDataType::List(Arc::new(convert_field_for_json(inner_field)))
+                }
+                ArrowDataType::Struct(fields) => {
+                    let converted_fields: ArrowFields = fields
+                        .iter()
+                        .map(|f| Arc::new(convert_field_for_json(f)))
+                        .collect();
+                    ArrowDataType::Struct(converted_fields)
+                }
+                ArrowDataType::Map(entry_field, sorted) => {
+                    ArrowDataType::Map(Arc::new(convert_field_for_json(entry_field)), *sorted)
+                }
+                other => other.clone(),
+            };
+            Arc::new(
+                ArrowField::new(field.name(), new_type, field.is_nullable())
+                    .with_metadata(field.metadata().clone()),
+            )
+        })
+        .collect();
+    ArrowSchema::new_with_metadata(fields, schema.metadata().clone())
+}
+
+fn convert_field_for_json(field: &ArrowField) -> ArrowField {
+    let new_type = match field.data_type() {
+        ArrowDataType::LargeUtf8 => ArrowDataType::Utf8,
+        ArrowDataType::LargeBinary => ArrowDataType::Binary,
+        ArrowDataType::LargeList(inner_field) => {
+            ArrowDataType::List(Arc::new(convert_field_for_json(inner_field)))
+        }
+        ArrowDataType::Struct(fields) => {
+            let converted_fields: ArrowFields = fields
+                .iter()
+                .map(|f| Arc::new(convert_field_for_json(f)))
+                .collect();
+            ArrowDataType::Struct(converted_fields)
+        }
+        ArrowDataType::Map(entry_field, sorted) => {
+            ArrowDataType::Map(Arc::new(convert_field_for_json(entry_field)), *sorted)
+        }
+        other => other.clone(),
+    };
+    ArrowField::new(field.name(), new_type, field.is_nullable())
+        .with_metadata(field.metadata().clone())
+}
+
 // Raw arrow implementation of the json parsing. Separate from the public function for testing.
 //
 // NOTE: This code is really inefficient because arrow lacks the native capability to perform robust
-// StringArray -> StructArray JSON parsing. See https://github.com/apache/arrow-rs/issues/6522. If
+// LargeStringArray -> StructArray JSON parsing. See https://github.com/apache/arrow-rs/issues/6522. If
 // that shortcoming gets fixed upstream, this method can simplify or hopefully even disappear.
-fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+fn parse_json_impl(
+    json_strings: &LargeStringArray,
+    schema: ArrowSchemaRef,
+) -> DeltaResult<RecordBatch> {
     if json_strings.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
 
+    // Convert schema to use Utf8 instead of LargeUtf8 for JSON parsing
+    // Arrow's JSON reader doesn't support Large types
+    let json_schema = Arc::new(convert_schema_for_json(&schema));
+
     // Use batch size of 1 to force one record per string input
-    let mut decoder = ReaderBuilder::new(schema.clone())
+    let mut decoder = ReaderBuilder::new(json_schema.clone())
         .with_batch_size(1)
         .build_decoder()?;
     let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
@@ -1071,7 +1183,17 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         Ok(batch)
     };
     let output: Vec<_> = json_strings.iter().map(parse_one).try_collect()?;
-    Ok(concat_batches(&schema, output.iter())?)
+    let result = concat_batches(&json_schema, output.iter())?;
+
+    // Convert the result back to the original schema with Large types using Arrow's cast
+    use crate::arrow::compute::cast;
+    let converted_columns: Vec<_> = result
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(col, field)| cast(col, field.data_type()))
+        .try_collect()?;
+    Ok(RecordBatch::try_new(schema, converted_columns)?)
 }
 
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
@@ -1310,7 +1432,7 @@ mod tests {
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
-                ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
                     .with_metadata(arrow_fid(1)),
                 ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
                     .with_metadata(arrow_fid(2)),
@@ -1485,13 +1607,13 @@ mod tests {
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
-                ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
                     .with_metadata(arrow_fid(1)),
             ]));
             let res = get_requested_indices(&requested_schema, &parquet_schema);
             assert_result_error_with_message(
                 res,
-                "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
+                "Invalid argument error: Incorrect datatype. Expected integer, got LargeUtf8",
             );
 
             let requested_schema = StructType::new_unchecked([
@@ -1509,7 +1631,7 @@ mod tests {
             let res = get_requested_indices(&requested_schema, &parquet_schema);
             assert_result_error_with_message(
                 res,
-                "Invalid argument error: Incorrect datatype. Expected Utf8, got Int32",
+                "Invalid argument error: Incorrect datatype. Expected LargeUtf8, got Int32",
             );
         })
     }
@@ -1562,7 +1684,7 @@ mod tests {
                     .with_metadata(arrow_fid(2)),
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
-                ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
                     .with_metadata(arrow_fid(1)),
             ]));
             let (mask_indices, reorder_indices) =
@@ -1610,7 +1732,7 @@ mod tests {
                 ReorderIndex::missing(
                     1,
                     Arc::new(
-                        ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                        ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
                             .with_metadata(expected_arrow_metadata),
                     ),
                 ),
@@ -1649,7 +1771,7 @@ mod tests {
             ReorderIndex::missing(
                 1,
                 Arc::new(
-                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
+                    ArrowField::new("s_physical", ArrowDataType::LargeUtf8, true)
                         .with_metadata(expected_arrow_metadata),
                 ),
             ),
@@ -1687,7 +1809,7 @@ mod tests {
             ReorderIndex::missing(
                 1,
                 Arc::new(
-                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
+                    ArrowField::new("s_physical", ArrowDataType::LargeUtf8, true)
                         .with_metadata(expected_arrow_metadata),
                 ),
             ),
@@ -1706,7 +1828,7 @@ mod tests {
                     vec![
                         ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
                             .with_metadata(arrow_fid(4)),
-                        ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
+                        ArrowField::new(parquet_name(5, mode), ArrowDataType::LargeUtf8, false)
                             .with_metadata(arrow_fid(5)),
                     ]
                     .into(),
@@ -1762,7 +1884,7 @@ mod tests {
             ReorderIndex::cast(1, ArrowDataType::Int64),
             ReorderIndex::missing(
                 2,
-                Arc::new(ArrowField::new("missing", ArrowDataType::Utf8, true)),
+                Arc::new(ArrowField::new("missing", ArrowDataType::LargeUtf8, true)),
             ),
         ];
         assert!(!ordering_needs_row_indexes(&ordering_no_row_index));
@@ -2169,8 +2291,12 @@ mod tests {
                             vec![
                                 ArrowField::new(parquet_name(3, mode), ArrowDataType::Int32, false)
                                     .with_metadata(arrow_fid(3)),
-                                ArrowField::new(parquet_name(4, mode), ArrowDataType::Utf8, false)
-                                    .with_metadata(arrow_fid(4)),
+                                ArrowField::new(
+                                    parquet_name(4, mode),
+                                    ArrowDataType::LargeUtf8,
+                                    false,
+                                )
+                                .with_metadata(arrow_fid(4)),
                             ]
                             .into(),
                         ),
@@ -2220,8 +2346,12 @@ mod tests {
                             vec![
                                 ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
                                     .with_metadata(arrow_fid(4)),
-                                ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
-                                    .with_metadata(arrow_fid(5)),
+                                ArrowField::new(
+                                    parquet_name(5, mode),
+                                    ArrowDataType::LargeUtf8,
+                                    false,
+                                )
+                                .with_metadata(arrow_fid(5)),
                             ]
                             .into(),
                         ),
@@ -2277,8 +2407,12 @@ mod tests {
                             vec![
                                 ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
                                     .with_metadata(arrow_fid(4)),
-                                ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
-                                    .with_metadata(arrow_fid(5)),
+                                ArrowField::new(
+                                    parquet_name(5, mode),
+                                    ArrowDataType::LargeUtf8,
+                                    false,
+                                )
+                                .with_metadata(arrow_fid(5)),
                             ]
                             .into(),
                         ),
@@ -2341,8 +2475,12 @@ mod tests {
                                     .with_metadata(arrow_fid(4)),
                                 ArrowField::new(parquet_name(5, mode), ArrowDataType::Int32, false)
                                     .with_metadata(arrow_fid(5)),
-                                ArrowField::new(parquet_name(6, mode), ArrowDataType::Utf8, false)
-                                    .with_metadata(arrow_fid(6)),
+                                ArrowField::new(
+                                    parquet_name(6, mode),
+                                    ArrowDataType::LargeUtf8,
+                                    false,
+                                )
+                                .with_metadata(arrow_fid(6)),
                             ]
                             .into(),
                         ),
@@ -2398,7 +2536,7 @@ mod tests {
                         vec![
                             ArrowField::new(parquet_name(7, mode), ArrowDataType::Int32, false)
                                 .with_metadata(arrow_fid(7)),
-                            ArrowField::new(parquet_name(8, mode), ArrowDataType::Utf8, false)
+                            ArrowField::new(parquet_name(8, mode), ArrowDataType::LargeUtf8, false)
                                 .with_metadata(arrow_fid(8)),
                         ]
                         .into(),
@@ -2414,7 +2552,7 @@ mod tests {
                         vec![
                             ArrowField::new(parquet_name(4, mode), ArrowDataType::Int32, false)
                                 .with_metadata(arrow_fid(4)),
-                            ArrowField::new(parquet_name(5, mode), ArrowDataType::Utf8, false)
+                            ArrowField::new(parquet_name(5, mode), ArrowDataType::LargeUtf8, false)
                                 .with_metadata(arrow_fid(5)),
                         ]
                         .into(),
@@ -2741,9 +2879,10 @@ mod tests {
             let mut fields = requested_schema.fields();
             let metadata1 = fields.next().unwrap().metadata_with_string_values();
             let metadata2 = fields.next().unwrap().metadata_with_string_values();
-            let expected_field1 = ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
-                .with_metadata(metadata1)
-                .into();
+            let expected_field1 =
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
+                    .with_metadata(metadata1)
+                    .into();
             let expected_field2 =
                 ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
                     .with_metadata(metadata2)

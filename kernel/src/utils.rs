@@ -149,7 +149,7 @@ pub(crate) mod test_utils {
     use crate::actions::{
         get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
     };
-    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::array::{LargeStringArray, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
@@ -235,9 +235,11 @@ pub(crate) mod test_utils {
     }
 
     pub(crate) fn string_array_to_engine_data(string_array: StringArray) -> Box<dyn EngineData> {
-        let string_field = Arc::new(Field::new("a", DataType::Utf8, true));
+        let string_field = Arc::new(Field::new("a", DataType::LargeUtf8, true));
         let schema = Arc::new(ArrowSchema::new(vec![string_field]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(string_array)])
+        // Convert StringArray to LargeStringArray for consistency with our Large types
+        let large_string_array: LargeStringArray = string_array.iter().collect();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(large_string_array)])
             .expect("Can't convert to record batch");
         Box::new(ArrowEngineData::new(batch))
     }
