@@ -1,10 +1,13 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::domain_metadata::domain_metadata_configuration;
+use crate::actions::domain_metadata::{
+    all_domain_metadata_configuration, domain_metadata_configuration,
+};
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
@@ -369,6 +372,16 @@ impl Snapshot {
         }
 
         domain_metadata_configuration(self.log_segment(), domain, engine)
+    }
+    pub fn get_all_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<HashMap<String, String>> {
+        let all_metadata = all_domain_metadata_configuration(self.log_segment(), engine)?;
+        Ok(all_metadata
+            .into_iter()
+            .filter(|(key, _)| !key.starts_with(INTERNAL_DOMAIN_PREFIX))
+            .collect())
     }
 
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
@@ -1122,6 +1135,8 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
+        // Test get_domain_metadata
+
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
             snapshot.get_domain_metadata("domain2", &engine)?,
@@ -1136,6 +1151,17 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+
+        // Test get_all_domain_metadata
+
+        let metadata = snapshot.get_all_domain_metadata(&engine)?;
+
+        let mut expected = HashMap::new();
+        expected.insert("domain2".to_string(), "domain2_commit1".to_string());
+        expected.insert("domain3".to_string(), "domain3_commit0".to_string());
+
+        assert_eq!(metadata, expected);
+
         Ok(())
     }
 

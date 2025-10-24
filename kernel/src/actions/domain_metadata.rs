@@ -34,6 +34,17 @@ pub(crate) fn domain_metadata_configuration(
         .remove(domain)
         .map(|domain_metadata| domain_metadata.configuration))
 }
+pub(crate) fn all_domain_metadata_configuration(
+    log_segment: &LogSegment,
+    engine: &dyn Engine,
+) -> DeltaResult<HashMap<String, String>> {
+    let domain_metadatas = scan_domain_metadatas(log_segment, None, engine)?;
+
+    Ok(domain_metadatas
+        .into_iter()
+        .map(|(key, domain_metadata)| (key, domain_metadata.configuration))
+        .collect())
+}
 
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
 /// is provided. Note that this returns the latest domain metadata for each domain, accounting for
