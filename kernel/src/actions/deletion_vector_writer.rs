@@ -63,7 +63,7 @@ pub trait DeletionVector: Sized {
 /// Metadata about a written deletion vector, excluding the storage path.
 ///
 /// This structure contains the information needed to construct a full
-/// [`DeletionVectorDescriptor`](crate::actions::deletion_vector::DeletionVectorDescriptor)
+/// [`DeletionVectorDescriptor`]
 /// after writing the DV to storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletionVectorWriteResult {
@@ -108,7 +108,7 @@ impl DeletionVectorWriteResult {
 /// use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 ///
 /// let mut dv = KernelDeletionVector::new();
-/// dv.add_deleted_row_indexes([0, 5, 10];
+/// dv.add_deleted_row_indexes([0, 5, 10]);
 /// ```
 #[derive(Debug, Clone)]
 pub struct KernelDeletionVector {
