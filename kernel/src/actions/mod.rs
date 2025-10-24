@@ -969,7 +969,7 @@ impl DomainMetadata {
         }
     }
 
-    // Create a new DomainMetadata action to remove a domain.
+    /// Create a new DomainMetadata action to remove a domain.
     pub(crate) fn remove(domain: String, configuration: String) -> Self {
         Self {
             domain,
@@ -991,10 +991,6 @@ impl DomainMetadata {
 
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
-    }
-
-    pub(crate) fn is_removed(&self) -> bool {
-        self.removed
     }
 }
 
