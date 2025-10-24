@@ -39,16 +39,17 @@ pub trait DeletionVector: Sized {
     /// Iterator type that yields deleted row indexes.
     type IndexIterator: Iterator<Item = u64>;
 
-    /// Consume the deletion vector and return an iterator over deleted row indexes.
+    /// Return an iterator over deleted row indexes.
     fn into_iter(self) -> Self::IndexIterator;
+
+    /// Return the number of deleted rows in the deletion vector.
+    fn cardinality(&self) -> u64;
 
     /// Serialize the deletion vector into bytes.
     ///
-    /// This method has a default implementation that collects the iterator into a
-    /// RoaringTreemap and serializes it. Types can override this for more efficient
-    /// serialization if they already have the data in a suitable format.
-    ///
-    /// Returns a `Bytes` object which is reference-counted and FFI-friendly.
+    /// This serializes the deletion vector in the format expected by the Delta Lake protocol.
+    /// it may be overridden for more efficient serialization if the implementation already has the data in a suitable format.
+    /// But generally, only do this if you fully understand the the format requirements.
     fn serialize(self) -> DeltaResult<Bytes> {
         let treemap: RoaringTreemap = self.into_iter().collect();
         let mut serialized = Vec::new();
@@ -155,6 +156,10 @@ impl DeletionVector for KernelDeletionVector {
             .map_err(|e| Error::generic(format!("Failed to serialize deletion vector: {}", e)))?;
         Ok(Bytes::from(serialized))
     }
+
+    fn cardinality(&self) -> u64 {
+        self.dv.len()
+    }
 }
 
 /// A streaming writer for deletion vectors.
@@ -260,13 +265,11 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
             self.has_written_version = true;
         }
 
+        let cardinality = deletion_vector.cardinality();
         // Serialize the deletion vector to bytes
         let serialized = deletion_vector.serialize()?;
 
         // Deserialize to get cardinality (we need this for the metadata)
-        let treemap = RoaringTreemap::deserialize_from(&serialized[..])
-            .map_err(|e| Error::generic(format!("Failed to deserialize deletion vector for cardinality: {}", e)))?;
-        let cardinality = treemap.len();
 
         // Calculate sizes
 
@@ -484,6 +487,10 @@ mod tests {
             fn into_iter(self) -> Self::IndexIterator {
                 self.indexes.into_iter()
             }
+
+            fn cardinality(&self) -> u64 {
+                self.indexes.len() as u64
+            }
         }
 
         let test_dv = TestDV {
@@ -520,6 +527,10 @@ mod tests {
 
             fn into_iter(self) -> Self::IndexIterator {
                 self.deleted_rows.into_iter()
+            }
+
+            fn cardinality(&self) -> u64 {
+                self.deleted_rows.len() as u64
             }
         }
 
