@@ -33,17 +33,13 @@ pub trait FileOpener: Send + Unpin {
 
 /// Describes the behavior of the `FileStream` if file opening or scanning fails
 #[allow(missing_debug_implementations)]
+#[derive(Default)]
 pub enum OnError {
     /// Fail the entire stream and return the underlying error
+    #[default]
     Fail,
     /// Continue scanning, ignoring the failed file
     Skip,
-}
-
-impl Default for OnError {
-    fn default() -> Self {
-        Self::Fail
-    }
 }
 
 /// Represents the state of the next `FileOpenFuture`. Since we need to poll
