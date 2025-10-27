@@ -1410,6 +1410,42 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 }
 
 #[tokio::test]
+async fn test_remove_domain_metadata_unsupported_writer_feature(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let table_name = "test_remove_domain_metadata_unsupported";
+
+    // Create table WITHOUT domain metadata writer feature support
+    let (store, engine, table_location) = engine_store_setup(table_name, None);
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true,
+        vec![],
+        vec![],
+    )
+    .await?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(&engine)?;
+    let res = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_domain_metadata_removed("app.config".to_string())
+        .commit(&engine);
+
+    assert_result_error_with_message(res, "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn std::error::Error>>
 {
     let _ = tracing_subscriber::fmt::try_init();

@@ -429,7 +429,7 @@ impl Transaction {
                 .table_configuration()
                 .is_domain_metadata_supported()
         {
-            return Err(Error::generic("Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"));
+            return Err(Error::unsupported("Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"));
         }
 
         // Validate user domain operations
