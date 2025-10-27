@@ -223,7 +223,11 @@ impl LogSegment {
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
             Error::generic(format!(
-                "Expected the first commit to have version {start_version}"
+                "Expected the first commit to have version {start_version}, got {:?}",
+                listed_files
+                    .ascending_commit_files
+                    .first()
+                    .map(|c| c.version)
             ))
         );
         LogSegment::try_new(listed_files, log_root, end_version)
