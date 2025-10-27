@@ -308,11 +308,10 @@ impl GlobalTracingState {
         }
 
         if let (Some(reload), Some(event_cb)) = (&self.reload_handle, &self.event_callback) {
-            if let Ok(mut event_cb) = event_cb.lock() {
-                *event_cb = callback;
-            } else {
-                error!("Failed to acquire lock for event callback (mutex poisoned).");
-            }
+            let mut event_cb = event_cb.lock().map_err(|_e| {
+                Error::generic("Failed to acquire lock for event callback (mutex poisoned).")
+            })?;
+            *event_cb = callback;
             return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
                 warn!("Failed to reload tracing level: {e}");
                 Error::generic(format!("Unable to reload subscriber: {e}"))
@@ -343,11 +342,10 @@ impl GlobalTracingState {
         }
 
         if let (Some(reload), Some(log_cb)) = (&self.reload_handle, &self.log_line_callback) {
-            if let Ok(mut log_cb) = log_cb.lock() {
-                *log_cb = callback;
-            } else {
-                error!("Failed to acquire lock for log callback (mutex poisoned).");
-            }
+            let mut log_cb = log_cb.lock().map_err(|_e| {
+                Error::generic("Failed to acquire lock for log callback (mutex poisoned).")
+            })?;
+            *log_cb = callback;
             return reload.reload(LevelFilter::from(max_level)).map_err(|e| {
                 warn!("Failed to reload log level: {e}");
                 Error::generic(format!("Unable to reload subscriber: {e}"))
@@ -401,7 +399,9 @@ fn create_event_dispatch(
 }
 
 fn setup_event_subscriber(callback: TracingEventFn, max_level: Level) -> DeltaResult<()> {
-    let mut state = TRACING_STATE.lock().unwrap();
+    let mut state = TRACING_STATE
+        .lock()
+        .map_err(|_e| Error::generic("Poisoned mutex while setting up event subscriber"))?;
     state.register_event_callback(callback, max_level)
 }
 
@@ -543,7 +543,9 @@ fn setup_log_line_subscriber(
     with_level: bool,
     with_target: bool,
 ) -> DeltaResult<()> {
-    let mut state = TRACING_STATE.lock().unwrap();
+    let mut state = TRACING_STATE
+        .lock()
+        .map_err(|_e| Error::generic("Poisoned mutex while setting up log_line_subscriber"))?;
     state.register_log_line_callback(
         callback,
         max_level,
@@ -577,9 +579,9 @@ mod tests {
         let line_str: &str = unsafe { TryFromStringSlice::try_from_slice(&line).unwrap() };
         let line_str = line_str.to_string();
         let ok = expected_log_lines.is_empty()
-            || expected_log_lines.iter().any(|expected_log_line| {
-                line_str.ends_with(expected_log_line)
-            });
+            || expected_log_lines
+                .iter()
+                .any(|expected_log_line| line_str.ends_with(expected_log_line));
         if ok {
             let mut lock = MESSAGES.lock().unwrap();
             if let Some(ref mut msgs) = *lock {
@@ -638,19 +640,18 @@ mod tests {
         expected_level_str: &str,
     ) {
         let lock = MESSAGES.lock().unwrap();
-        if let Some(ref msgs) = *lock {
-            assert_eq!(msgs.len(), expected_lines.len());
-            for (got, expect) in msgs.iter().zip(expected_lines) {
-                println!("Got: {got}");
-                assert!(got.ends_with(expect));
-                assert!(got.contains(expected_level_str));
-                assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
-                if let Some(ref tstr) = expected_time_str {
-                    assert!(got.contains(tstr));
-                }
-            }
-        } else {
+        let Some(ref msgs) = *lock else {
             panic!("Messages wasn't Some");
+        };
+        assert_eq!(msgs.len(), expected_lines.len());
+        for (got, expect) in msgs.iter().zip(expected_lines) {
+            println!("Got: {got}");
+            assert!(got.ends_with(expect));
+            assert!(got.contains(expected_level_str));
+            assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
+            if let Some(ref tstr) = expected_time_str {
+                assert!(got.contains(tstr));
+            }
         }
     }
 
