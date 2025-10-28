@@ -182,10 +182,9 @@ impl TableChangesScan {
         }
     }
 
-    /// Perform an "all in one" scan to get the change data feed. This will use the provided `engine`
-    /// to read and process all the data for the query. Each [`ScanResult`] in the resultant iterator
-    /// encapsulates the raw data and an optional boolean vector built from the deletion vector if it
-    /// was present. See the documentation for [`ScanResult`] for more details.
+    /// Perform an "all in one" scan to get the change data feed. This will use the provided
+    /// `engine` to read and process all the data for the query. Each [`EngineData`] in the
+    /// resultant iterator is a portion of the final set of data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
@@ -222,7 +221,7 @@ impl TableChangesScan {
 }
 
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
-/// The result is a fallible iterator of [`ScanResult`] containing the logical data.
+/// The result is a fallible iterator of [`Box<dyn EngineData>`] containing the logical data.
 fn read_scan_file(
     engine: &dyn Engine,
     resolved_scan_file: ResolvedCdfScanFile,

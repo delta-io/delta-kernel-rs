@@ -559,11 +559,9 @@ impl Scan {
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
-    /// the data for the query. Each [`ScanResult`] in the resultant iterator encapsulates the raw
-    /// data and an optional boolean vector built from the deletion vector if it was present. See
-    /// the documentation for [`ScanResult`] for more details. Generally connectors/engines will
-    /// want to use [`Scan::scan_metadata`] so they can have more control over the execution of the
-    /// scan.
+    /// the data for the query. Each [`EngineData`] in the resultant iterator is a portion of the
+    /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
+    /// they can have more control over the execution of the scan.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
@@ -663,9 +661,9 @@ impl Scan {
                     result
                 }))
             })
-            // Iterator<DeltaResult<Iterator<DeltaResult<ScanResult>>>> to Iterator<DeltaResult<DeltaResult<ScanResult>>>
+            // Iterator<DeltaResult<Iterator<DeltaResult<Box<dyn EngineData>>>>> to Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>>
             .flatten_ok()
-            // Iterator<DeltaResult<DeltaResult<ScanResult>>> to Iterator<DeltaResult<ScanResult>>
+            // Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>> to Iterator<DeltaResult<Box<dyn EngineData>>>
             .map(|x| x?);
         Ok(result)
     }
