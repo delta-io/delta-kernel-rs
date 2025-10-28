@@ -342,6 +342,9 @@ pub trait RowVisitor {
 ///   fn append_columns(&self, schema: SchemaRef, columns: Vec<ArrayData>) -> DeltaResult<Box<dyn EngineData>> {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
+///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
+///     todo!() // filter out unselected rows and return the new set of data
+///   }
 /// }
 /// ```
 pub trait EngineData: AsAny {
