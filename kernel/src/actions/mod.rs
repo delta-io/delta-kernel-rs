@@ -748,8 +748,10 @@ pub(crate) struct Add {
 
     /// Map containing metadata about this logical file.
     /// Note: map values can be null.
-    /// We don't use #[allow_null_container_values] here because it drops null values
-    /// during materialization
+    /// We don't use `#[allow_null_container_values]` here because [`EngineMap::materialize`]
+    /// drops null values when that attribute is present.
+    ///
+    /// [`EngineMap::materialize`]: crate::engine_data::EngineMap::materialize
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub tags: Option<HashMap<String, Option<String>>>,
 
