@@ -16,10 +16,6 @@ use crate::actions::{
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
-    as_log_add_schema, get_log_commit_info_schema, get_log_domain_metadata_schema,
-    get_log_remove_schema, get_log_txn_schema,
-};
-use crate::actions::{CommitInfo, DomainMetadata, SetTransaction};
 use crate::engine_data::FilteredEngineData;
 use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
@@ -274,10 +270,6 @@ impl Transaction {
 
         // Step 5: Generate remove actions
         let remove_actions = self.generate_remove_actions(engine)?;
-
-        // Step 6: Commit the actions as a JSON file to the Delta log
-        let commit_path =
-            ParsedLogPath::new_commit(self.read_snapshot.table_root(), commit_version)?;
 
         let actions = iter::once(commit_info_action)
             .chain(add_actions)

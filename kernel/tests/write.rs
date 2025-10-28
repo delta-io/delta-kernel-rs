@@ -1843,7 +1843,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 
     let mut txn = snapshot
         .clone()
-        .transaction()?
+        .transaction(Box::new(FileSystemCommitter::new()))?
         .with_engine_info("test engine")
         .with_data_change(true);
 
@@ -2016,7 +2016,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         // Now create a transaction to remove files
         let mut txn = snapshot
             .clone()
-            .transaction()?
+            .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine")
             .with_operation("DELETE".to_string())
             .with_data_change(true);
