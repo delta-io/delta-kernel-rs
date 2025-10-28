@@ -240,7 +240,7 @@ impl EngineData for ArrowEngineData {
     }
 
     fn apply_selection_vector(
-        &self,
+        self: Box<Self>,
         mut selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>> {
         selection_vector.resize(self.len(), true);

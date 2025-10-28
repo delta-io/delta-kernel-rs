@@ -65,8 +65,9 @@ impl FilteredEngineData {
         }
     }
 
-    /// Apply the contained selection vector and return an engine data with only the valid rows included
-    pub fn apply_selection_vector(&self) -> DeltaResult<Box<dyn EngineData>> {
+    /// Apply the contained selection vector and return an engine data with only the valid rows
+    /// included. This consumes the `FilteredEngineData`
+    pub fn apply_selection_vector(self) -> DeltaResult<Box<dyn EngineData>> {
         self.data
             .apply_selection_vector(self.selection_vector.clone())
     }
@@ -387,9 +388,11 @@ pub trait EngineData: AsAny {
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Apply a selection vector to the data and return a data where only the valid rows are included
+    /// Apply a selection vector to the data and return a data where only the valid rows are
+    /// included. This consumes the EngineData, allowing engines to implement this "in place" if
+    /// desired
     fn apply_selection_vector(
-        &self,
+        self: Box<Self>,
         selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 }
