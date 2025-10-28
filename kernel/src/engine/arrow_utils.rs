@@ -18,7 +18,8 @@ use crate::{
 
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    GenericStringArray, LargeStringArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
@@ -1012,16 +1013,24 @@ pub(crate) fn parse_json(
     schema: SchemaRef,
 ) -> DeltaResult<Box<dyn EngineData>> {
     let json_strings: RecordBatch = ArrowEngineData::try_from_engine_data(json_strings)?.into();
-    let json_strings = json_strings
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            Error::generic("Expected json_strings to be a StringArray, found something else")
-        })?;
+    let array_ref = json_strings.column(0);
     let schema = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
-    let result = parse_json_impl(json_strings, schema)?;
-    Ok(Box::new(ArrowEngineData::new(result)))
+
+    // Try LargeStringArray first
+    if let Some(large_strings) = array_ref.as_any().downcast_ref::<LargeStringArray>() {
+        let result = parse_json_impl(large_strings, schema)?;
+        return Ok(Box::new(ArrowEngineData::new(result)));
+    }
+
+    // Fall back to StringArray
+    if let Some(strings) = array_ref.as_any().downcast_ref::<StringArray>() {
+        let result = parse_json_impl(strings, schema)?;
+        return Ok(Box::new(ArrowEngineData::new(result)));
+    }
+
+    Err(Error::generic(
+        "Expected json_strings to be a StringArray or LargeStringArray, found something else",
+    ))
 }
 
 // Raw arrow implementation of the json parsing. Separate from the public function for testing.
@@ -1029,7 +1038,10 @@ pub(crate) fn parse_json(
 // NOTE: This code is really inefficient because arrow lacks the native capability to perform robust
 // StringArray -> StructArray JSON parsing. See https://github.com/apache/arrow-rs/issues/6522. If
 // that shortcoming gets fixed upstream, this method can simplify or hopefully even disappear.
-fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaResult<RecordBatch> {
+fn parse_json_impl<O: OffsetSizeTrait>(
+    json_strings: &GenericStringArray<O>,
+    schema: ArrowSchemaRef,
+) -> DeltaResult<RecordBatch> {
     if json_strings.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -1231,45 +1243,45 @@ mod tests {
             ArrowField::new("c", ArrowDataType::Int32, true),
         ]));
         let input: Vec<&str> = vec![];
-        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
 
         let input: Vec<Option<&str>> = vec![Some("")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone());
         result.expect_err("empty string");
 
         let input: Vec<Option<&str>> = vec![Some(" \n\t")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone());
         result.expect_err("empty string");
 
         let input: Vec<Option<&str>> = vec![Some(r#""a""#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone());
         result.expect_err("invalid string");
 
         let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone());
         result.expect_err("incomplete object");
 
         let input: Vec<Option<&str>> = vec![Some("{}{}")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone());
         assert!(matches!(
             result.unwrap_err(),
             Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
         ));
 
         let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone());
         assert!(matches!(
             result.unwrap_err(),
             Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
         ));
 
         let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b"}"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone());
         result.expect_err("split object");
 
         let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
-        let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
+        let result = parse_json_impl::<i32>(&input.into(), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.column(0).null_count(), 2);
         assert_eq!(result.column(1).null_count(), 2);
@@ -1288,7 +1300,7 @@ mod tests {
         let json_string = format!(r#"{{"long_val": "{long_string}"}}"#);
         let input: Vec<Option<&str>> = vec![Some(&json_string)];
 
-        let batch = parse_json_impl(&input.into(), schema.clone()).unwrap();
+        let batch = parse_json_impl::<i32>(&input.into(), schema.clone()).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let long_col = batch.column(0).as_string::<i32>();
         assert_eq!(long_col.value(0), long_string);

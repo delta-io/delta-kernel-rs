@@ -100,8 +100,14 @@ where
 
     fn get(&self, row_index: usize, index: usize) -> String {
         let arry = self.value(row_index);
-        let sarry = arry.as_string::<i32>();
-        sarry.value(index).to_string()
+        // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
+        if let Some(sarry) = arry.as_string_opt::<i32>() {
+            sarry.value(index).to_string()
+        } else if let Some(sarry) = arry.as_string_opt::<i64>() {
+            sarry.value(index).to_string()
+        } else {
+            String::new()
+        }
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
@@ -118,13 +124,28 @@ impl EngineMap for MapArray {
         let offsets = self.offsets();
         let start_offset = offsets[row_index] as usize;
         let count = offsets[row_index + 1] as usize - start_offset;
-        let keys = self.keys().as_string::<i32>();
-        for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
-            if let Some(map_key) = map_key {
-                if key == map_key {
-                    // found the item
-                    let vals = self.values().as_string::<i32>();
-                    return Some(vals.value(idx));
+
+        // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
+        if let (Some(keys), Some(vals)) = (
+            self.keys().as_string_opt::<i32>(),
+            self.values().as_string_opt::<i32>(),
+        ) {
+            for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
+                if let Some(map_key) = map_key {
+                    if key == map_key {
+                        return Some(vals.value(idx));
+                    }
+                }
+            }
+        } else if let (Some(keys), Some(vals)) = (
+            self.keys().as_string_opt::<i64>(),
+            self.values().as_string_opt::<i64>(),
+        ) {
+            for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
+                if let Some(map_key) = map_key {
+                    if key == map_key {
+                        return Some(vals.value(idx));
+                    }
                 }
             }
         }
@@ -134,11 +155,25 @@ impl EngineMap for MapArray {
     fn materialize(&self, row_index: usize) -> HashMap<String, String> {
         let mut ret = HashMap::new();
         let map_val = self.value(row_index);
-        let keys = map_val.column(0).as_string::<i32>();
-        let values = map_val.column(1).as_string::<i32>();
-        for (key, value) in keys.iter().zip(values.iter()) {
-            if let (Some(key), Some(value)) = (key, value) {
-                ret.insert(key.into(), value.into());
+
+        // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
+        if let (Some(keys), Some(values)) = (
+            map_val.column(0).as_string_opt::<i32>(),
+            map_val.column(1).as_string_opt::<i32>(),
+        ) {
+            for (key, value) in keys.iter().zip(values.iter()) {
+                if let (Some(key), Some(value)) = (key, value) {
+                    ret.insert(key.into(), value.into());
+                }
+            }
+        } else if let (Some(keys), Some(values)) = (
+            map_val.column(0).as_string_opt::<i64>(),
+            map_val.column(1).as_string_opt::<i64>(),
+        ) {
+            for (key, value) in keys.iter().zip(values.iter()) {
+                if let (Some(key), Some(value)) = (key, value) {
+                    ret.insert(key.into(), value.into());
+                }
             }
         }
         ret
@@ -277,19 +312,24 @@ impl ArrowEngineData {
         data_type: &DataType,
         col: &'a dyn Array,
     ) -> DeltaResult<&'a dyn GetData<'a>> {
-        use ArrowDataType::Utf8;
+        use ArrowDataType::{LargeUtf8, Utf8, Utf8View};
+
+        // Helper to check if a type is a string type (Utf8, LargeUtf8, or Utf8View)
+        let is_string_type = |dt: &ArrowDataType| matches!(dt, Utf8 | LargeUtf8 | Utf8View);
+
         let col_as_list = || {
             if let Some(array) = col.as_list_opt::<i32>() {
-                (array.value_type() == Utf8).then_some(array as _)
+                is_string_type(&array.value_type()).then_some(array as _)
             } else if let Some(array) = col.as_list_opt::<i64>() {
-                (array.value_type() == Utf8).then_some(array as _)
+                is_string_type(&array.value_type()).then_some(array as _)
             } else {
                 None
             }
         };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
-                (array.key_type() == &Utf8 && array.value_type() == &Utf8).then_some(array as _)
+                (is_string_type(&array.key_type()) && is_string_type(&array.value_type()))
+                    .then_some(array as _)
             })
         };
         let result: Result<&'a dyn GetData<'a>, _> = match data_type {
@@ -299,7 +339,7 @@ impl ArrowEngineData {
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt().map(|a| a as _).ok_or("string")
+                col.as_string_opt::<i64>().map(|a| a as _).ok_or("string")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
