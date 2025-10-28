@@ -11,7 +11,6 @@ use crate::{
     DeltaResult, EngineData, Error,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
@@ -20,7 +19,6 @@ use crate::arrow::array::{
     OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
-use crate::arrow::compute::concat_batches;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -1046,7 +1044,7 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
 }
 
 /// Arrow lacks the functionality to json-parse a string column into a struct column -- even tho the
-/// JSON file reader does exactly the same thing. This function is a hack to work around that gap.
+/// JSON file reader does exactly the same thing.
 #[internal_api]
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
@@ -1066,53 +1064,47 @@ pub(crate) fn parse_json(
 }
 
 // Raw arrow implementation of the json parsing. Separate from the public function for testing.
-//
-// NOTE: This code is really inefficient because arrow lacks the native capability to perform robust
-// StringArray -> StructArray JSON parsing. See https://github.com/apache/arrow-rs/issues/6522. If
-// that shortcoming gets fixed upstream, this method can simplify or hopefully even disappear.
 fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaResult<RecordBatch> {
     if json_strings.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }
 
-    // Use batch size of 1 to force one record per string input
     let mut decoder = ReaderBuilder::new(schema.clone())
-        .with_batch_size(1)
+        .with_batch_size(json_strings.len())
         .build_decoder()?;
-    let parse_one = |json_string: Option<&str>| -> DeltaResult<RecordBatch> {
-        let mut reader = BufReader::new(json_string.unwrap_or("{}").as_bytes());
-        // loop to fill + empty the buffer until end of input. note that we can't just one-shot
-        // attempt to decode the entire thing since the buffer might only contain part of the JSON.
-        // see: https://github.com/delta-io/delta-kernel-rs/pull/1244
-        loop {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break;
-            }
-            // from `decode` docs:
-            // > Read JSON objects from `buf`, returning the number of bytes read
-            // > This method returns once `batch_size` objects have been parsed since the last call
-            // > to [`Self::flush`], or `buf` is exhausted. Any remaining bytes should be included
-            // > in the next call to [`Self::decode`]
-            //
-            // if we attempt a `parse_one` of e.g. "{}{}", we will parse the first "{}" successfully
-            // then decode will always return immediately sinee we have read `batch_size = 1`,
-            // leading to an infinite loop. Since we always just want to parse one record here, we
-            // detect this by checking if we always consume the entire buffer, and error if not.
-            let consumed = decoder.decode(buf)?;
-            if consumed != buf.len() {
-                return Err(Error::generic("Malformed JSON: Multiple JSON objects"));
-            }
-            reader.consume(consumed);
+
+    for json in json_strings {
+        let line = json.unwrap_or("{}").trim();
+        if decoder.has_partial_record() {
+            return Err(Error::generic("Malformed JSON: Multiple JSON objects"));
         }
-        let Some(batch) = decoder.flush()? else {
-            return Err(Error::missing_data("Expected data"));
-        };
-        require!(batch.num_rows() == 1, Error::generic("Expected one row"));
-        Ok(batch)
-    };
-    let output: Vec<_> = json_strings.iter().map(parse_one).try_collect()?;
-    Ok(concat_batches(&schema, output.iter())?)
+        if line.is_empty() {
+            return Err(Error::missing_data(
+                "Malformed JSON: I don't know what to do with an empty string! {line:?}",
+            ));
+        }
+
+        let consumed = decoder.decode(line.as_bytes())?;
+        if consumed != line.len() {
+            return Err(Error::generic(
+                "Malformed JSON: Somehow the line decoded did not match what we consumed",
+            ));
+        }
+    }
+
+    if decoder.has_partial_record() {
+        return Err(Error::generic(
+            "Malformed JSON: Partial record still to parse?",
+        ));
+    }
+
+    // Ensure any remaining batches in the decoder are flushed before dropping
+    if let Some(batch) = decoder.flush()? {
+        return Ok(batch);
+    }
+    Err(Error::generic(
+        "Malformed JSON: exited parse_json_impl without deserializing anything useful",
+    ))
 }
 
 pub(crate) fn filter_to_record_batch(
@@ -1265,14 +1257,6 @@ mod tests {
         let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
 
-        let input: Vec<Option<&str>> = vec![Some("")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
-
-        let input: Vec<Option<&str>> = vec![Some(" \n\t")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
-
         let input: Vec<Option<&str>> = vec![Some(r#""a""#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
         result.expect_err("invalid string");
@@ -1283,19 +1267,32 @@ mod tests {
 
         let input: Vec<Option<&str>> = vec![Some("{}{}")];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
-        ));
+        result.expect_err("this should be an error, multiple objects on one line");
+
+        let input: Vec<Option<&str>> = vec![Some("")];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("empty string");
+
+        let input: Vec<Option<&str>> = vec![Some(" \n\t")];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("empty string");
 
         let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::Generic(s) if s == "Malformed JSON: Multiple JSON objects"
-        ));
+        assert!(result.is_err(), "The result should be an error! {result:?}");
+        let actual_error = match result.unwrap_err() {
+            Error::Backtraced {
+                source,
+                backtrace: _,
+            } => source,
+            others => Box::new(others),
+        };
+        assert!(
+            matches!(*actual_error, Error::Generic(_)),
+            "Somehow the result is not an error? {actual_error:?}"
+        );
 
-        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b"}"#)];
+        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
         result.expect_err("split object");
 
