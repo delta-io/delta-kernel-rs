@@ -12,9 +12,11 @@ use crate::parquet::arrow::arrow_reader::{
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use crate::parquet::arrow::async_writer::AsyncArrowWriter;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::DynObjectStore;
+use object_store::{DynObjectStore, ObjectStore};
+use parquet_56::arrow::async_writer::ParquetObjectWriter;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -249,52 +251,31 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         data: FilteredEngineData,
         overwrite: bool,
     ) -> DeltaResult<FileMeta> {
-        // Convert FilteredEngineData to RecordBatch, applying selection filter
         let batch = filter_to_record_batch(data)?;
 
-        // We buffer it in the application first, and then push everything to the object-store.
-        // The storage API does not seem to allow for streaming to the store, which is okay
-        // since often the object stores allocate their own buffers.
-        let mut buffer = Vec::new();
-
-        // Scope to ensure writer is dropped before we use buffer
-        {
-            let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)?;
-            writer.write(&batch)?;
-            writer.close()?; // writer must be closed to write footer
-        }
-
-        let store = self.store.clone();
         let path = Path::from_url_path(location.path())?;
+        let store = self.store.clone();
 
-        let size: u64 = buffer
-            .len()
-            .try_into()
-            .map_err(|_| Error::generic("unable to convert usize to u64"))?;
-
-        // Check if file exists when overwrite is false
-        if !overwrite {
-            let store_clone = store.clone();
-            let path_clone = path.clone();
-            let exists = self.task_executor.block_on(async move {
-                store_clone.head(&path_clone).await.is_ok()
-            });
-            if exists {
-                return Err(Error::generic(format!(
-                    "File already exists and overwrite is false: {}",
-                    location
-                )));
+        self.task_executor.block_on(async move {
+            // Check if file exists when overwrite is false
+            if !overwrite {
+                if let Ok(_) = store.head(&path).await {
+                    return Err(Error::generic("File already exists"));
+                }
             }
-        }
 
-        // Block on the async put operation
-        self.task_executor
-            .block_on(async move { store.put(&path, buffer.into()).await })?;
+            let object_writer = ParquetObjectWriter::new(store, path);
+            let mut writer = AsyncArrowWriter::try_new(object_writer, batch.schema(), None)?;
 
-        Ok(FileMeta {
-            location,
-            last_modified: 0,
-            size,
+            writer.write(&batch).await?;
+
+            writer.finish().await?;
+
+            Ok(FileMeta {
+                location,
+                last_modified: 0,
+                size: writer.bytes_written() as u64,
+            })
         })
     }
 }
@@ -964,10 +945,13 @@ mod tests {
         // Try to write again with overwrite=false, should fail
         let result = parquet_handler.write_parquet_file(file_url.clone(), filtered_data2, false);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("File already exists and overwrite is false"));
+        // PutMode::Create returns an object_store error when file already exists
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("already exists") || err_msg.contains("AlreadyExists"),
+            "Expected error about file already existing, got: {}",
+            err_msg
+        );
 
         // Verify the original file is still intact
         let path = Path::from_url_path(file_url.path()).unwrap();
