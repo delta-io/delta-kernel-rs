@@ -339,7 +339,11 @@ impl ArrowEngineData {
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt::<i64>().map(|a| a as _).ok_or("string")
+                // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
+                col.as_string_opt::<i32>()
+                    .map(|a| a as _)
+                    .or_else(|| col.as_string_opt::<i64>().map(|a| a as _))
+                    .ok_or("string")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));

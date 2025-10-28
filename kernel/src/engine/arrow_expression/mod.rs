@@ -86,7 +86,26 @@ impl Scalar {
             Byte(val) => append_val_as!(array::Int8Builder, *val),
             Float(val) => append_val_as!(array::Float32Builder, *val),
             Double(val) => append_val_as!(array::Float64Builder, *val),
-            String(val) => append_val_as!(array::StringBuilder, val),
+            String(val) => {
+                // Try both StringBuilder (Utf8) and LargeStringBuilder (LargeUtf8)
+                if let Some(sb) = builder.as_any_mut().downcast_mut::<array::StringBuilder>() {
+                    for _ in 0..num_rows {
+                        sb.append_value(val);
+                    }
+                } else if let Some(lsb) = builder
+                    .as_any_mut()
+                    .downcast_mut::<array::LargeStringBuilder>()
+                {
+                    for _ in 0..num_rows {
+                        lsb.append_value(val);
+                    }
+                } else {
+                    return Err(Error::invalid_expression(format!(
+                        "Invalid builder for {}",
+                        self.data_type()
+                    )));
+                }
+            }
             Boolean(val) => append_val_as!(array::BooleanBuilder, *val),
             Timestamp(val) | TimestampNtz(val) => {
                 // timezone was already set at builder construction time
@@ -167,7 +186,25 @@ impl Scalar {
             DataType::BYTE => append_null_as!(array::Int8Builder),
             DataType::FLOAT => append_null_as!(array::Float32Builder),
             DataType::DOUBLE => append_null_as!(array::Float64Builder),
-            DataType::STRING => append_null_as!(array::StringBuilder),
+            DataType::STRING => {
+                // Try both StringBuilder (Utf8) and LargeStringBuilder (LargeUtf8)
+                if let Some(sb) = builder.as_any_mut().downcast_mut::<array::StringBuilder>() {
+                    for _ in 0..num_rows {
+                        sb.append_null();
+                    }
+                } else if let Some(lsb) = builder
+                    .as_any_mut()
+                    .downcast_mut::<array::LargeStringBuilder>()
+                {
+                    for _ in 0..num_rows {
+                        lsb.append_null();
+                    }
+                } else {
+                    return Err(Error::invalid_expression(format!(
+                        "Invalid builder for {data_type}"
+                    )));
+                }
+            }
             DataType::BOOLEAN => append_null_as!(array::BooleanBuilder),
             DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
                 append_null_as!(array::TimestampMicrosecondBuilder)
@@ -310,8 +347,11 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
                 let array_ref = apply_schema_to(&array_ref, output_type)?;
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
-                let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+                // Use the actual data type of the array, not the converted kernel type
+                // This allows both Utf8 and LargeUtf8 to work correctly
+                let actual_arrow_type = array_ref.data_type().clone();
+                let schema =
+                    ArrowSchema::new(vec![ArrowField::new("output", actual_arrow_type, true)]);
                 RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
             }
         };

@@ -1497,13 +1497,13 @@ mod tests {
             let parquet_schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new(parquet_name(0, mode), ArrowDataType::Int32, false)
                     .with_metadata(arrow_fid(0)),
-                ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
                     .with_metadata(arrow_fid(1)),
             ]));
             let res = get_requested_indices(&requested_schema, &parquet_schema);
             assert_result_error_with_message(
                 res,
-                "Invalid argument error: Incorrect datatype. Expected integer, got Utf8",
+                "Invalid argument error: Incorrect datatype. Expected integer, got LargeUtf8",
             );
 
             let requested_schema = StructType::new_unchecked([
@@ -1521,7 +1521,7 @@ mod tests {
             let res = get_requested_indices(&requested_schema, &parquet_schema);
             assert_result_error_with_message(
                 res,
-                "Invalid argument error: Incorrect datatype. Expected Utf8, got Int32",
+                "Invalid argument error: Incorrect datatype. Expected LargeUtf8, got Int32",
             );
         })
     }
@@ -1622,7 +1622,7 @@ mod tests {
                 ReorderIndex::missing(
                     1,
                     Arc::new(
-                        ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+                        ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
                             .with_metadata(expected_arrow_metadata),
                     ),
                 ),
@@ -1661,7 +1661,7 @@ mod tests {
             ReorderIndex::missing(
                 1,
                 Arc::new(
-                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
+                    ArrowField::new("s_physical", ArrowDataType::LargeUtf8, true)
                         .with_metadata(expected_arrow_metadata),
                 ),
             ),
@@ -1699,7 +1699,7 @@ mod tests {
             ReorderIndex::missing(
                 1,
                 Arc::new(
-                    ArrowField::new("s_physical", ArrowDataType::Utf8, true)
+                    ArrowField::new("s_physical", ArrowDataType::LargeUtf8, true)
                         .with_metadata(expected_arrow_metadata),
                 ),
             ),
@@ -2753,7 +2753,7 @@ mod tests {
             let mut fields = requested_schema.fields();
             let metadata1 = fields.next().unwrap().metadata_with_string_values();
             let metadata2 = fields.next().unwrap().metadata_with_string_values();
-            let expected_field1 = ArrowField::new(parquet_name(1, mode), ArrowDataType::Utf8, true)
+            let expected_field1 = ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
                 .with_metadata(metadata1)
                 .into();
             let expected_field2 =

@@ -1003,8 +1003,8 @@ mod tests {
     use super::*;
     use crate::{
         arrow::array::{
-            Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-            MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+            Array, BooleanArray, Int32Array, Int64Array, LargeStringArray, LargeStringBuilder,
+            ListArray, ListBuilder, MapBuilder, MapFieldNames, RecordBatch, StructArray,
         },
         arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
         arrow::json::ReaderBuilder,
@@ -1044,19 +1044,19 @@ mod tests {
 
     fn create_string_map_builder(
         nullable_values: bool,
-    ) -> MapBuilder<StringBuilder, StringBuilder> {
+    ) -> MapBuilder<LargeStringBuilder, LargeStringBuilder> {
         MapBuilder::new(
             Some(MapFieldNames {
                 entry: "key_value".to_string(),
                 key: "key".to_string(),
                 value: "value".to_string(),
             }),
-            StringBuilder::new(),
-            StringBuilder::new(),
+            LargeStringBuilder::new(),
+            LargeStringBuilder::new(),
         )
         .with_values_field(Field::new(
             "value".to_string(),
-            ArrowDataType::Utf8,
+            ArrowDataType::LargeUtf8,
             nullable_values,
         ))
     }
@@ -1527,7 +1527,7 @@ mod tests {
             .into();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("appId", ArrowDataType::Utf8, false),
+            Field::new("appId", ArrowDataType::LargeUtf8, false),
             Field::new("version", ArrowDataType::Int64, false),
             Field::new("lastUpdated", ArrowDataType::Int64, true),
         ]));
@@ -1535,7 +1535,7 @@ mod tests {
         let expected = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["app_id"])),
+                Arc::new(LargeStringArray::from(vec!["app_id"])),
                 Arc::new(Int64Array::from(vec![0_i64])),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
             ],
@@ -1570,11 +1570,13 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from(vec![Some(0)])),
                 Arc::new(Int64Array::from(vec![None::<i64>])),
-                Arc::new(StringArray::from(vec![Some("UNKNOWN")])),
+                Arc::new(LargeStringArray::from(vec![Some("UNKNOWN")])),
                 operation_parameters,
-                Arc::new(StringArray::from(vec![Some(format!("v{KERNEL_VERSION}"))])),
-                Arc::new(StringArray::from(vec![None::<String>])),
-                Arc::new(StringArray::from(vec![commit_info_txn_id])),
+                Arc::new(LargeStringArray::from(vec![Some(format!(
+                    "v{KERNEL_VERSION}"
+                ))])),
+                Arc::new(LargeStringArray::from(vec![None::<String>])),
+                Arc::new(LargeStringArray::from(vec![commit_info_txn_id])),
             ],
         )
         .unwrap();
@@ -1605,8 +1607,8 @@ mod tests {
         let expected = RecordBatch::try_new(
             record_batch.schema(),
             vec![
-                Arc::new(StringArray::from(vec!["my.domain"])),
-                Arc::new(StringArray::from(vec!["config_value"])),
+                Arc::new(LargeStringArray::from(vec!["my.domain"])),
+                Arc::new(LargeStringArray::from(vec!["config_value"])),
                 Arc::new(BooleanArray::from(vec![false])),
             ],
         )
@@ -1859,7 +1861,7 @@ mod tests {
             .unwrap()
             .into();
 
-        let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
+        let list_field = Arc::new(Field::new("element", ArrowDataType::LargeUtf8, false));
         let protocol_fields = vec![
             Field::new("minReaderVersion", ArrowDataType::Int32, false),
             Field::new("minWriterVersion", ArrowDataType::Int32, false),
@@ -1876,13 +1878,13 @@ mod tests {
         ];
         let schema = Arc::new(Schema::new(protocol_fields.clone()));
 
-        let string_builder = StringBuilder::new();
+        let string_builder = LargeStringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
         list_builder.values().append_value("columnMapping");
         list_builder.append(true);
         let reader_features_array = list_builder.finish();
 
-        let string_builder = StringBuilder::new();
+        let string_builder = LargeStringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
         list_builder.values().append_value("deletionVectors");
         list_builder.append(true);

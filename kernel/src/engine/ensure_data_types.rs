@@ -437,7 +437,7 @@ mod tests {
                 &ArrowDataType::new_list(ArrowDataType::Int64, true),
                 false,
             ),
-            "Invalid argument error: Incorrect datatype. Expected Utf8, got Int64",
+            "Invalid argument error: Incorrect datatype. Expected LargeUtf8, got Int64",
         );
         assert_result_error_with_message(
             ensure_data_types(
