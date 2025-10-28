@@ -199,9 +199,9 @@ impl RemoveVisitor {
 
         let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
 
-        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "remove.baseRowId")?;
+        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
-            getters[13].get_opt(row_index, "remove.defaultRowCommitVersion")?;
+            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         Ok(Remove {
             path,
@@ -862,6 +862,57 @@ mod tests {
         assert_eq!(
             remove_visitor.removes[0], expected_remove,
             "Unexpected remove action"
+        );
+    }
+
+    #[test]
+    fn test_parse_remove_all_fields_unique() {
+        // This test verifies that all fields in the Remove action are correctly parsed
+        // and that each field gets a unique value, ensuring no index collisions
+        let json_strings: StringArray = vec![
+            r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
+            r#"{"metaData":{"id":"test-id","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1670892997849}}"#,
+            r#"{"remove":{"path":"test-path.parquet","deletionTimestamp":1234567890,"dataChange":false,"extendedFileMetadata":true,"partitionValues":{"part":"value"},"size":9999,"stats":"{\"numRecords\":42}","deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":3},"baseRowId":100,"defaultRowCommitVersion":5}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+        let mut remove_visitor = RemoveVisitor::default();
+        remove_visitor.visit_rows_of(batch.as_ref()).unwrap();
+
+        assert_eq!(
+            remove_visitor.removes.len(),
+            1,
+            "Expected exactly one remove action"
+        );
+
+        let remove = &remove_visitor.removes[0];
+
+        // Verify each field has the expected unique value
+        assert_eq!(remove.path, "test-path.parquet", "path mismatch");
+        assert_eq!(remove.deletion_timestamp, Some(1234567890), "deletion_timestamp mismatch");
+        assert_eq!(remove.data_change, false, "data_change mismatch");
+        assert_eq!(remove.extended_file_metadata, Some(true), "extended_file_metadata mismatch");
+        assert_eq!(
+            remove.partition_values,
+            Some(HashMap::from([("part".to_string(), "value".to_string())])),
+            "partition_values mismatch"
+        );
+        assert_eq!(remove.size, Some(9999), "size mismatch");
+        assert_eq!(remove.stats, Some(r#"{"numRecords":42}"#.to_string()), "stats mismatch");
+
+        // Verify deletion vector fields
+        let dv = remove.deletion_vector.as_ref().expect("deletion_vector should be present");
+        assert_eq!(dv.path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA", "deletion_vector.path_or_inline_dv mismatch");
+        assert_eq!(dv.offset, Some(1), "deletion_vector.offset mismatch");
+        assert_eq!(dv.size_in_bytes, 36, "deletion_vector.size_in_bytes mismatch");
+        assert_eq!(dv.cardinality, 3, "deletion_vector.cardinality mismatch");
+
+        // Verify row tracking fields (these would have been incorrect with the bug)
+        assert_eq!(remove.base_row_id, Some(100), "base_row_id mismatch - check getter index");
+        assert_eq!(
+            remove.default_row_commit_version,
+            Some(5),
+            "default_row_commit_version mismatch - check getter index"
         );
     }
 
