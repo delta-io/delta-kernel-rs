@@ -1,11 +1,10 @@
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::engine::default::DefaultEngine;
 
 use delta_kernel::{DeltaResult, Snapshot};
 
 mod common;
 
-use test_utils::{load_test_data, DefaultEngineExtension};
+use test_utils::load_test_data;
 
 use itertools::Itertools;
 use test_utils::read_scan;
@@ -14,9 +13,9 @@ fn read_v2_checkpoint_table(test_name: impl AsRef<str>) -> DeltaResult<Vec<Recor
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
 
-    let engine = DefaultEngine::new_local();
     let url =
         delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string")).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
     let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
     let scan = snapshot.scan_builder().build()?;
     let batches = read_scan(&scan, engine)?;

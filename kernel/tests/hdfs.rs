@@ -67,11 +67,7 @@ async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
     let url_str = format!("{}/my-delta-table", minidfs.url);
     let url = url::Url::parse(&url_str).unwrap();
 
-    let engine = DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    let engine = test_utils::create_default_engine(&url)?;
 
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
     assert_eq!(snapshot.version(), 1);

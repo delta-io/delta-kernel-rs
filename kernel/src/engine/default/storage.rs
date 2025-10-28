@@ -1,6 +1,5 @@
-use object_store::parse_url_opts as parse_url_opts_object_store;
 use object_store::path::Path;
-use object_store::{Error, ObjectStore};
+use object_store::{self, Error, ObjectStore};
 use url::Url;
 
 use crate::Error as DeltaError;
@@ -11,8 +10,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 type ClosureReturn = Result<(Box<dyn ObjectStore>, Path), Error>;
 /// This type alias makes it easier to reference the handler closure(s)
 ///
-/// It uses a HashMap<String, String> which _must_ be converted in our [parse_url_opts] because we
-/// cannot use generics in this scenario.
+/// It uses a HashMap<String, String> which _must_ be converted in [store_from_url_opts]
+/// because we cannot use generics in this scenario.
 type HandlerClosure = Arc<dyn Fn(&Url, HashMap<String, String>) -> ClosureReturn + Send + Sync>;
 /// hashmap containing scheme => handler fn mappings to allow consumers of delta-kernel-rs provide
 /// their own url opts parsers for different scemes
@@ -20,9 +19,9 @@ type Handlers = HashMap<String, HandlerClosure>;
 /// The URL_REGISTRY contains the custom URL scheme handlers that will parse URL options
 static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(HashMap::default()));
 
-/// Insert a new URL handler for [parse_url_opts] with the given `scheme`. This allows users to
-/// provide their own custom URL handler to plug new [object_store::ObjectStore] instances into
-/// delta-kernel
+/// Insert a new URL handler for [store_from_url_opts] with the given `scheme`. This allows
+/// users to provide their own custom URL handler to plug new [object_store::ObjectStore]
+/// instances into delta-kernel, which is used by [store_from_url_opts] to parse the URL.
 pub fn insert_url_handler(
     scheme: impl AsRef<str>,
     handler_closure: HandlerClosure,
@@ -36,28 +35,76 @@ pub fn insert_url_handler(
     Ok(())
 }
 
-/// Parse the given URL options to produce a valid and configured [ObjectStore]
+/// Create an [`ObjectStore`] from a URL.
 ///
-/// This function will first attempt to use any schemes registered via [insert_url_handler],
-/// falling back to the default behavior of [object_store::parse_url_opts]
-pub fn parse_url_opts<I, K, V>(url: &Url, options: I) -> Result<(Box<dyn ObjectStore>, Path), Error>
+/// Returns an `Arc<dyn ObjectStore>` ready to use with [`crate::engine::default::DefaultEngine`].
+///
+/// This function checks for custom URL handlers registered via [`insert_url_handler`]
+/// before falling back to [`object_store`]'s default behavior.
+///
+/// # Example
+///
+/// ```rust
+/// # use url::Url;
+/// # use delta_kernel::engine::default::storage::store_from_url;
+/// # use delta_kernel::DeltaResult;
+/// # fn example() -> DeltaResult<()> {
+/// let url = Url::parse("file:///path/to/table")?;
+/// let store = store_from_url(&url)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn store_from_url(url: &Url) -> crate::DeltaResult<Arc<dyn ObjectStore>> {
+    store_from_url_opts(url, std::iter::empty::<(&str, &str)>())
+}
+
+/// Create an [`ObjectStore`] from a URL with custom options.
+///
+/// Returns an `Arc<dyn ObjectStore>` ready to use with [`crate::engine::default::DefaultEngine`].
+///
+/// This function checks for custom URL handlers registered via [`insert_url_handler`]
+/// before falling back to [`object_store`]'s default behavior.
+///
+/// # Example
+///
+/// ```rust
+/// # use url::Url;
+/// # use std::collections::HashMap;
+/// # use delta_kernel::engine::default::storage::store_from_url_opts;
+/// # use delta_kernel::DeltaResult;
+/// # fn example() -> DeltaResult<()> {
+/// let url = Url::parse("s3://my-bucket/path/to/table")?;
+/// let options = HashMap::from([("region", "us-west-2")]);
+/// let store = store_from_url_opts(&url, options)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn store_from_url_opts<I, K, V>(
+    url: &Url,
+    options: I,
+) -> crate::DeltaResult<Arc<dyn ObjectStore>>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
     V: Into<String>,
 {
-    if let Ok(handlers) = URL_REGISTRY.read() {
+    // First attempt to use any schemes registered via insert_url_handler,
+    // falling back to the default behavior of object_store::parse_url_opts
+    let (store, _path) = if let Ok(handlers) = URL_REGISTRY.read() {
         if let Some(handler) = handlers.get(url.scheme()) {
-            let options: HashMap<String, String> = HashMap::from_iter(
-                options
-                    .into_iter()
-                    .map(|(k, v)| (k.as_ref().to_string(), v.into())),
-            );
-
-            return handler(url, options);
+            let options = options
+                .into_iter()
+                .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+                .collect();
+            handler(url, options)?
+        } else {
+            object_store::parse_url_opts(url, options)?
         }
-    }
-    parse_url_opts_object_store(url, options)
+    } else {
+        object_store::parse_url_opts(url, options)?
+    };
+
+    Ok(Arc::new(store))
 }
 
 #[cfg(test)]
@@ -110,15 +157,14 @@ mod tests {
         // Currently constructing an [HdfsObjectStore] won't work if there isn't an actual HDFS
         // to connect to, so the only way to really verify that we got the object store we
         // expected is to inspect the `store` on the error v_v
-        if let Err(store_error) = parse_url_opts(&url, options) {
-            match store_error {
-                object_store::Error::Generic { store, source: _ } => {
-                    assert_eq!(store, "HdfsObjectStore");
-                }
-                unexpected => panic!("Unexpected error happened: {unexpected:?}"),
+        match store_from_url_opts(&url, options) {
+            Err(crate::Error::ObjectStore(object_store::Error::Generic { store, source: _ })) => {
+                assert_eq!(store, "HdfsObjectStore");
             }
-        } else {
-            panic!("Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS");
+            Err(unexpected) => panic!("Unexpected error happened: {unexpected:?}"),
+            Ok(_) => {
+                panic!("Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS");
+            }
         }
     }
 }

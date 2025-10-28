@@ -541,13 +541,11 @@ fn get_default_engine_impl(
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use delta_kernel::engine::default::storage::store_from_url_opts;
     use delta_kernel::engine::default::DefaultEngine;
-    let engine = DefaultEngine::<TokioBackgroundExecutor>::try_new(
-        &url,
-        options,
-        Arc::new(TokioBackgroundExecutor::new()),
-    );
-    Ok(engine_to_handle(Arc::new(engine?), allocate_error))
+    let store = store_from_url_opts(&url, options)?;
+    let engine = DefaultEngine::<TokioBackgroundExecutor>::new(store);
+    Ok(engine_to_handle(Arc::new(engine), allocate_error))
 }
 
 /// # Safety
@@ -804,7 +802,7 @@ mod tests {
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
     };
-    use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use delta_kernel::engine::default::DefaultEngine;
     use object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
@@ -851,7 +849,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone());
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
@@ -897,7 +895,7 @@ mod tests {
             actions_to_string_partitioned(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone());
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
@@ -933,7 +931,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone());
         let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
         let path = "memory:///";
 

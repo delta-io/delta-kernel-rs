@@ -121,10 +121,7 @@ mod tests {
     ) {
         let table_root = Url::parse("memory:///test_table").unwrap();
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngine::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
+        let engine = Arc::new(DefaultEngine::new(store.clone()));
         (engine, store, table_root)
     }
 

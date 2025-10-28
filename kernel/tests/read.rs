@@ -8,7 +8,6 @@ use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
@@ -79,10 +78,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
 
     let expected_data = vec![batch.clone(), batch];
 
@@ -134,7 +130,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(storage.clone());
 
     let expected_data = vec![batch.clone(), batch];
 
@@ -187,7 +183,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(storage.clone());
 
     let expected_data = vec![batch];
 
@@ -258,10 +254,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
@@ -447,11 +440,7 @@ fn read_table_data(
     let path = std::fs::canonicalize(PathBuf::from(path))?;
     let predicate = predicate.map(Arc::new);
     let url = url::Url::from_directory_path(path).unwrap();
-    let engine = Arc::new(DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?);
+    let engine = test_utils::create_default_engine(&url)?;
 
     let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
 
@@ -1073,10 +1062,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
 
     let location = Url::parse("memory:///")?;
 
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
@@ -1135,10 +1121,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
 
     let location = Url::parse("memory:///")?;
 
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
@@ -1414,10 +1397,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     }
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
 
     // Create a schema that includes a row index metadata column
     let schema = Arc::new(StructType::try_new([
@@ -1493,10 +1473,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
 
     // Test that unsupported metadata columns fail with appropriate errors
     let test_cases = [

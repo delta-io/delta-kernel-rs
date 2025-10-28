@@ -41,11 +41,13 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let table_path = tempdir.path().join(table);
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
     // TODO: use multi-threaded executor
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::try_new(&url, HashMap::<String, String>::new(), executor)
-        .expect("Failed to create engine");
+    use delta_kernel::engine::default::storage::store_from_url;
+    let engine = DefaultEngine::new(Arc::new(
+        store_from_url(&url).expect("Failed to create store"),
+    ));
+    let engine = engine_to_handle(Arc::new(engine), allocate_error);
 
-    (tempdir, url, Arc::new(engine))
+    (tempdir, url, engine)
 }
 
 fn create_snapshot_benchmark(c: &mut Criterion) {
