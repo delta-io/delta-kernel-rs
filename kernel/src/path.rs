@@ -20,6 +20,9 @@ const MULTIPART_PART_LEN: usize = 10;
 /// The number of characters in the uuid part of a uuid checkpoint
 const UUID_PART_LEN: usize = 36;
 
+/// The subdirectory name within the table root where the delta log resides
+const DELTA_LOG_DIR: &str = "_delta_log/";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
 pub(crate) enum LogPathFileType {
@@ -260,16 +263,17 @@ impl ParsedLogPath<FileMeta> {
 }
 
 impl ParsedLogPath<Url> {
-    const DELTA_LOG_DIR: &'static str = "_delta_log/";
-
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
-        let location = table_root.join(Self::DELTA_LOG_DIR)?.join(&filename)?;
+        let location = table_root.join(DELTA_LOG_DIR)?.join(&filename)?;
         Self::try_from(location)?.ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
 
+    // TODO: normalize all these log path constructors. we have overlap with this + LogPath +
+    // LogRoot types.
+    #[allow(unused)]
     /// Create a new ParsedCommitPath<Url> for a new json commit file
     pub(crate) fn new_commit(table_root: &Url, version: Version) -> DeltaResult<Self> {
         let filename = format!("{version:020}.json");
@@ -342,6 +346,45 @@ impl ParsedLogPath<Url> {
             ));
         }
         Ok(path)
+    }
+}
+
+/// A wrapper around parsed log path to provide more structure/safety when handling
+/// table/log/commit paths.
+#[derive(Debug, Clone)]
+pub(crate) struct LogRoot(Url);
+
+impl LogRoot {
+    /// Create a new LogRoot from the table root URL (e.g. s3://bucket/table ->
+    /// s3://bucket/table/_delta_log/)
+    ///
+    /// TODO: could take a `table_root: TableRoot`
+    pub(crate) fn new(table_root: Url) -> DeltaResult<Self> {
+        // FIXME: need to check for trailing slash
+        Ok(Self(table_root.join(DELTA_LOG_DIR)?))
+    }
+
+    /// Create a new commit path (absolute path) for the given version.
+    pub(crate) fn new_commit_path(&self, version: Version) -> DeltaResult<ParsedLogPath<Url>> {
+        let filename = format!("{version:020}.json");
+        let path = self.0.join(&filename)?;
+        ParsedLogPath::try_from(path)?.ok_or_else(|| {
+            Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
+        })
+    }
+
+    /// Create a new staged commit path (absolute path) for the given version.
+    #[allow(unused)] // TODO: Remove this once we remove catalog-managed feature
+    pub(crate) fn new_staged_commit_path(
+        &self,
+        version: Version,
+    ) -> DeltaResult<ParsedLogPath<Url>> {
+        let uuid = uuid::Uuid::new_v4();
+        let filename = format!("{version:020}.{uuid}.json");
+        let path = self.0.join(&filename)?;
+        ParsedLogPath::try_from(path)?.ok_or_else(|| {
+            Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
+        })
     }
 }
 
