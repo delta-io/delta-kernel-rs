@@ -614,7 +614,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + use<'_>> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -700,9 +700,9 @@ impl Scan {
                     // to `rest` in a moment anyway
                     let mut sv = selection_vector.take();
                     let rest = split_vector(sv.as_mut(), len, None);
-                    let result = ScanResult {
-                        raw_data: logical,
-                        raw_mask: sv,
+                    let result = match sv {
+                        Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
+                        None => logical,
                     };
                     selection_vector = rest;
                     Ok(result)
@@ -711,7 +711,7 @@ impl Scan {
             // Iterator<DeltaResult<Iterator<DeltaResult<ScanResult>>>> to Iterator<DeltaResult<DeltaResult<ScanResult>>>
             .flatten_ok()
             // Iterator<DeltaResult<DeltaResult<ScanResult>>> to Iterator<DeltaResult<ScanResult>>
-            .map(|x| x?);
+            .map(|x| x??);
         Ok(result)
     }
 }
@@ -1155,10 +1155,10 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<ScanResult> = scan.execute(engine).unwrap().try_collect().unwrap();
+        let files: Vec<Box<dyn EngineData>> = scan.execute(engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
-        let num_rows = files[0].raw_data.as_ref().unwrap().len();
+        let num_rows = files[0].as_ref().len();
         assert_eq!(num_rows, 10)
     }
 

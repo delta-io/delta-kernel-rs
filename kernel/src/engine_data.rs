@@ -64,6 +64,12 @@ impl FilteredEngineData {
             selection_vector: vec![],
         }
     }
+
+    /// Apply the contained selection vector and return an engine data with only the valid rows included
+    pub fn apply_selection_vector(&self) -> DeltaResult<Box<dyn EngineData>> {
+        self.data
+            .apply_selection_vector(self.selection_vector.clone())
+    }
 }
 
 impl HasSelectionVector for FilteredEngineData {
@@ -379,6 +385,12 @@ pub trait EngineData: AsAny {
         &self,
         schema: SchemaRef,
         columns: Vec<ArrayData>,
+    ) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Apply a selection vector to the data and return a data where only the valid rows are included
+    fn apply_selection_vector(
+        &self,
+        selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
