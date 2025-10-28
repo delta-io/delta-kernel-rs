@@ -936,8 +936,8 @@ mod tests {
         r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
     }
 
-    #[test]
-    fn test_read_table_with_empty_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -945,14 +945,10 @@ mod tests {
         let empty = "{}".as_bytes().to_vec();
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        tokio::runtime::Runtime::new()
-            .expect("create tokio runtime")
-            .block_on(async {
-                store
-                    .put(&invalid_path, empty.into())
-                    .await
-                    .expect("put _last_checkpoint");
-            });
+        store
+            .put(&invalid_path, empty.into())
+            .await
+            .expect("put _last_checkpoint");
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
@@ -961,8 +957,8 @@ mod tests {
         assert!(invalid.is_none())
     }
 
-    #[test]
-    fn test_read_table_with_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -972,18 +968,14 @@ mod tests {
         let path = Path::from("valid/_last_checkpoint");
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        tokio::runtime::Runtime::new()
-            .expect("create tokio runtime")
-            .block_on(async {
-                store
-                    .put(&path, data.into())
-                    .await
-                    .expect("put _last_checkpoint");
-                store
-                    .put(&invalid_path, invalid_data.into())
-                    .await
-                    .expect("put _last_checkpoint");
-            });
+        store
+            .put(&path, data.into())
+            .await
+            .expect("put _last_checkpoint");
+        store
+            .put(&invalid_path, invalid_data.into())
+            .await
+            .expect("put _last_checkpoint");
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
