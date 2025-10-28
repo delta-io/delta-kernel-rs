@@ -55,11 +55,24 @@ impl ParquetHandler for SyncParquetHandler {
         read_files(files, schema, predicate, try_create_from_parquet)
     }
 
+    /// Writes filtered engine data to a Parquet file at the specified location.
+    ///
+    /// This implementation uses synchronous file I/O to write the Parquet file.
+    /// If a file already exists at the given location, it will be overwritten.
+    ///
+    /// # Parameters
+    ///
+    /// - `location` - The full URL path where the Parquet file should be written
+    ///   (e.g., `file:///path/to/file.parquet`).
+    /// - `data` - The filtered engine data to write to the Parquet file.
+    ///
+    /// # Returns
+    ///
+    /// A [`DeltaResult`] containing [`FileMeta`] with the file's location, size, and modification time.
     fn write_parquet_file(
         &self,
         location: Url,
         data: crate::FilteredEngineData,
-        overwrite: bool,
     ) -> DeltaResult<FileMeta> {
         // Convert FilteredEngineData to RecordBatch, applying selection filter
         let batch = filter_to_record_batch(data)?;
@@ -68,14 +81,6 @@ impl ParquetHandler for SyncParquetHandler {
         let path = location
             .to_file_path()
             .map_err(|_| crate::Error::generic(format!("Invalid file URL: {}", location)))?;
-
-        // Check if file exists when overwrite is false
-        if !overwrite && path.exists() {
-            return Err(crate::Error::generic(format!(
-                "File already exists and overwrite is false: {}",
-                location
-            )));
-        }
 
         let mut file = File::create(&path)?;
 

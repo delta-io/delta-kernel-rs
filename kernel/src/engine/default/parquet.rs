@@ -245,11 +245,24 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         )
     }
 
+    /// Writes filtered engine data to a Parquet file at the specified location.
+    ///
+    /// This implementation uses asynchronous file I/O with object_store to write the Parquet file.
+    /// If a file already exists at the given location, it will be overwritten.
+    ///
+    /// # Parameters
+    ///
+    /// - `location` - The full URL path where the Parquet file should be written
+    ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
+    /// - `data` - The filtered engine data to write to the Parquet file.
+    ///
+    /// # Returns
+    ///
+    /// A [`DeltaResult`] containing [`FileMeta`] with the file's location, size, and modification time.
     fn write_parquet_file(
         &self,
         location: url::Url,
         data: FilteredEngineData,
-        overwrite: bool,
     ) -> DeltaResult<FileMeta> {
         let batch = filter_to_record_batch(data)?;
 
@@ -257,13 +270,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
-            // Check if file exists when overwrite is false
-            if !overwrite {
-                if let Ok(_) = store.head(&path).await {
-                    return Err(Error::generic("File already exists"));
-                }
-            }
-
             let object_writer = ParquetObjectWriter::new(store, path);
             let mut writer = AsyncArrowWriter::try_new(object_writer, batch.schema(), None)?;
 
