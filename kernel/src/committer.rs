@@ -209,7 +209,7 @@ mod tests {
 
     #[cfg(feature = "catalog-managed")]
     #[tokio::test]
-    async fn catalog_managed_tables_block_transactions() {
+    async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
         let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
@@ -226,18 +226,16 @@ mod tests {
         let snapshot = crate::snapshot::SnapshotBuilder::new_for(table_root)
             .build(&engine)
             .unwrap();
-        // Try to create a transaction with FileSystemCommitter
+        // Try to commit a transaction with FileSystemCommitter
         let committer = Box::new(FileSystemCommitter::new());
-        let err = snapshot.transaction(committer).unwrap_err();
+        let err = snapshot
+            .transaction(committer)
+            .unwrap()
+            .commit(&engine)
+            .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Unsupported(e) if e.contains("Writes are not yet supported for catalog-managed tables")
+            crate::Error::Generic(e) if e.contains("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
         ));
-        // after allowing writes, we will check that this disallows default committer for
-        // catalog-managed tables.
-        // assert!(matches!(
-        //     err,
-        //     crate::Error::Generic(e) if e.contains("Cannot use the default committer for a catalog-managed table")
-        // ));
     }
 }

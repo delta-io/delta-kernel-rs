@@ -231,15 +231,21 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> = Lazy
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<WriterFeature>> = LazyLock::new(|| {
     vec![
         WriterFeature::AppendOnly,
+        #[cfg(feature = "catalog-managed")]
+        WriterFeature::CatalogManaged,
+        #[cfg(feature = "catalog-managed")]
+        WriterFeature::CatalogOwnedPreview,
         WriterFeature::DeletionVectors,
         WriterFeature::DomainMetadata,
         WriterFeature::InCommitTimestamp,
         WriterFeature::Invariants,
         WriterFeature::RowTracking,
         WriterFeature::TimestampWithoutTimezone,
+        WriterFeature::VacuumProtocolCheck,
         WriterFeature::VariantType,
         WriterFeature::VariantTypePreview,
         WriterFeature::VariantShreddingPreview,
+        WriterFeature::V2Checkpoint,
     ]
 });
 
