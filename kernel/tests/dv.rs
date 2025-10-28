@@ -15,8 +15,7 @@ fn count_total_scan_rows(
 ) -> DeltaResult<usize> {
     scan_result_iter
         .map(|result| {
-            let result = result?;
-            Ok(result.len())
+            Ok(result?.len())
         })
         .fold_ok(0, Add::add)
 }
