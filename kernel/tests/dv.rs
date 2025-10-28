@@ -14,9 +14,7 @@ fn count_total_scan_rows(
     scan_result_iter: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
 ) -> DeltaResult<usize> {
     scan_result_iter
-        .map(|result| {
-            Ok(result?.len())
-        })
+        .map(|result| Ok(result?.len()))
         .fold_ok(0, Add::add)
 }
 
