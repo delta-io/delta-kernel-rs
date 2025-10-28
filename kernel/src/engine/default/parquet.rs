@@ -247,6 +247,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         location: url::Url,
         data: FilteredEngineData,
+        overwrite: bool,
     ) -> DeltaResult<FileMeta> {
         // Convert FilteredEngineData to RecordBatch, applying selection filter
         let batch = filter_to_record_batch(data)?;
@@ -270,6 +271,21 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             .len()
             .try_into()
             .map_err(|_| Error::generic("unable to convert usize to u64"))?;
+
+        // Check if file exists when overwrite is false
+        if !overwrite {
+            let store_clone = store.clone();
+            let path_clone = path.clone();
+            let exists = self.task_executor.block_on(async move {
+                store_clone.head(&path_clone).await.is_ok()
+            });
+            if exists {
+                return Err(Error::generic(format!(
+                    "File already exists and overwrite is false: {}",
+                    location
+                )));
+            }
+        }
 
         // Block on the async put operation
         self.task_executor
@@ -706,7 +722,7 @@ mod tests {
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data)
+            .write_parquet_file(file_url.clone(), filtered_data, true)
             .unwrap();
 
         // Verify we can read the file back
@@ -774,7 +790,7 @@ mod tests {
         // Write the data
         let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data)
+            .write_parquet_file(file_url.clone(), filtered_data, true)
             .unwrap();
 
         // Read it back
@@ -831,5 +847,162 @@ mod tests {
             .unwrap();
         assert!(bool_col.value(0));
         assert!(!bool_col.value(1));
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write_overwrite_true() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let file_url = Url::parse("memory:///overwrite_test/data.parquet").unwrap();
+
+        // Create first data set
+        let engine_data1: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let filtered_data1 = crate::FilteredEngineData::with_all_rows_selected(engine_data1);
+
+        // Write the first file
+        parquet_handler
+            .write_parquet_file(file_url.clone(), filtered_data1, true)
+            .unwrap();
+
+        // Create second data set with different data
+        let engine_data2: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let filtered_data2 = crate::FilteredEngineData::with_all_rows_selected(engine_data2);
+
+        // Overwrite with second file (overwrite=true)
+        parquet_handler
+            .write_parquet_file(file_url.clone(), filtered_data2, true)
+            .unwrap();
+
+        // Read back and verify it contains the second data set
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify we have the second data set (2 rows, not 3)
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 2);
+        let value_col = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_col.values(), &[10, 20]);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write_overwrite_false() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let file_url = Url::parse("memory:///no_overwrite_test/data.parquet").unwrap();
+
+        // Create first data set
+        let engine_data1: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let filtered_data1 = crate::FilteredEngineData::with_all_rows_selected(engine_data1);
+
+        // Write the first file
+        parquet_handler
+            .write_parquet_file(file_url.clone(), filtered_data1, false)
+            .unwrap();
+
+        // Create second data set
+        let engine_data2: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let filtered_data2 = crate::FilteredEngineData::with_all_rows_selected(engine_data2);
+
+        // Try to write again with overwrite=false, should fail
+        let result = parquet_handler.write_parquet_file(file_url.clone(), filtered_data2, false);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("File already exists and overwrite is false"));
+
+        // Verify the original file is still intact
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify we still have the first data set (3 rows)
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 3);
+        let value_col = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_col.values(), &[1, 2, 3]);
     }
 }

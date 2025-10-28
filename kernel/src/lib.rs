@@ -700,6 +700,8 @@ pub trait ParquetHandler: AsAny {
     /// - `url` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
     /// - `data` - The data to write to the Parquet file, as FilteredEngineData.
+    /// - `overwrite` - If true, overwrite the file if it exists. If false, return an error if the
+    ///   file already exists.
     ///
     /// # Returns
     ///
@@ -708,6 +710,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: FilteredEngineData,
+        overwrite: bool,
     ) -> DeltaResult<FileMeta>;
 }
 
