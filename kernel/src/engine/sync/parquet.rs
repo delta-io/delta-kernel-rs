@@ -138,7 +138,7 @@ mod tests {
 
         // Write the file
         handler
-            .write_parquet_file(url.clone(), filtered_data, true)
+            .write_parquet_file(url.clone(), filtered_data)
             .unwrap();
 
         // Verify the file exists
@@ -224,7 +224,7 @@ mod tests {
 
         // Write the file with filter applied
         handler
-            .write_parquet_file(url.clone(), filtered_data, true)
+            .write_parquet_file(url.clone(), filtered_data)
             .unwrap();
 
         // Verify the file exists
@@ -299,7 +299,7 @@ mod tests {
 
         // Write the first file
         handler
-            .write_parquet_file(url.clone(), filtered_data1, true)
+            .write_parquet_file(url.clone(), filtered_data1)
             .unwrap();
         assert!(file_path.exists());
 
@@ -315,7 +315,7 @@ mod tests {
 
         // Overwrite with second file (overwrite=true)
         handler
-            .write_parquet_file(url.clone(), filtered_data2, true)
+            .write_parquet_file(url.clone(), filtered_data2)
             .unwrap();
 
         // Read back and verify it contains the second data set
@@ -356,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_write_parquet_file_overwrite_false() {
+    fn test_sync_write_parquet_file_always_overwrites() {
         let handler = SyncParquetHandler;
         let temp_dir = tempdir().unwrap();
         let file_path = temp_dir.path().join("test_no_overwrite.parquet");
@@ -374,7 +374,7 @@ mod tests {
 
         // Write the first file
         handler
-            .write_parquet_file(url.clone(), filtered_data1, false)
+            .write_parquet_file(url.clone(), filtered_data1)
             .unwrap();
         assert!(file_path.exists());
 
@@ -388,15 +388,12 @@ mod tests {
         ));
         let filtered_data2 = crate::FilteredEngineData::with_all_rows_selected(engine_data2);
 
-        // Try to write again with overwrite=false, should fail
-        let result = handler.write_parquet_file(url.clone(), filtered_data2, false);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("File already exists and overwrite is false"));
+        // Write again - should overwrite successfully (new behavior always overwrites)
+        handler
+            .write_parquet_file(url.clone(), filtered_data2)
+            .unwrap();
 
-        // Verify the original file is still intact
+        // Verify the file was overwritten with the new data
         let file = File::open(&file_path).unwrap();
         let reader =
             crate::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
@@ -421,14 +418,14 @@ mod tests {
         let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
         let record_batch = batch.record_batch();
 
-        // Verify we still have the first data set (3 rows)
-        assert_eq!(record_batch.num_rows(), 3);
+        // Verify we now have the second data set (2 rows)
+        assert_eq!(record_batch.num_rows(), 2);
         let value_col = record_batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(value_col.values(), &[1, 2, 3]);
+        assert_eq!(value_col.values(), &[10, 20]);
 
         assert!(result.next().is_none());
     }

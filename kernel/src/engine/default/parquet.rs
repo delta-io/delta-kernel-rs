@@ -709,7 +709,7 @@ mod tests {
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data, true)
+            .write_parquet_file(file_url.clone(), filtered_data)
             .unwrap();
 
         // Verify we can read the file back
@@ -777,7 +777,7 @@ mod tests {
         // Write the data
         let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data, true)
+            .write_parquet_file(file_url.clone(), filtered_data)
             .unwrap();
 
         // Read it back
@@ -858,7 +858,7 @@ mod tests {
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data1, true)
+            .write_parquet_file(file_url.clone(), filtered_data1)
             .unwrap();
 
         // Create second data set with different data
@@ -873,7 +873,7 @@ mod tests {
 
         // Overwrite with second file (overwrite=true)
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data2, true)
+            .write_parquet_file(file_url.clone(), filtered_data2)
             .unwrap();
 
         // Read back and verify it contains the second data set
@@ -914,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parquet_handler_trait_write_overwrite_false() {
+    async fn test_parquet_handler_trait_write_always_overwrites() {
         let store = Arc::new(InMemory::new());
         let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
             store.clone(),
@@ -935,7 +935,7 @@ mod tests {
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data1, false)
+            .write_parquet_file(file_url.clone(), filtered_data1)
             .unwrap();
 
         // Create second data set
@@ -948,18 +948,12 @@ mod tests {
         ));
         let filtered_data2 = crate::FilteredEngineData::with_all_rows_selected(engine_data2);
 
-        // Try to write again with overwrite=false, should fail
-        let result = parquet_handler.write_parquet_file(file_url.clone(), filtered_data2, false);
-        assert!(result.is_err());
-        // PutMode::Create returns an object_store error when file already exists
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("already exists") || err_msg.contains("AlreadyExists"),
-            "Expected error about file already existing, got: {}",
-            err_msg
-        );
+        // Write again - should overwrite successfully (new behavior always overwrites)
+        parquet_handler
+            .write_parquet_file(file_url.clone(), filtered_data2)
+            .unwrap();
 
-        // Verify the original file is still intact
+        // Verify the file was overwritten with the new data
         let path = Path::from_url_path(file_url.path()).unwrap();
         let reader = ParquetObjectReader::new(store.clone(), path);
         let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
@@ -985,14 +979,14 @@ mod tests {
             .try_collect()
             .unwrap();
 
-        // Verify we still have the first data set (3 rows)
+        // Verify we now have the second data set (2 rows)
         assert_eq!(data.len(), 1);
-        assert_eq!(data[0].num_rows(), 3);
+        assert_eq!(data[0].num_rows(), 2);
         let value_col = data[0]
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(value_col.values(), &[1, 2, 3]);
+        assert_eq!(value_col.values(), &[10, 20]);
     }
 }
