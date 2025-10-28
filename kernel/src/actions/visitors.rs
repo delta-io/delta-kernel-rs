@@ -890,7 +890,7 @@ mod tests {
         // Verify each field has the expected unique value
         assert_eq!(remove.path, "test-path.parquet", "path mismatch");
         assert_eq!(remove.deletion_timestamp, Some(1234567890), "deletion_timestamp mismatch");
-        assert_eq!(remove.data_change, false, "data_change mismatch");
+        assert!(!remove.data_change, "data_change mismatch");
         assert_eq!(remove.extended_file_metadata, Some(true), "extended_file_metadata mismatch");
         assert_eq!(
             remove.partition_values,
