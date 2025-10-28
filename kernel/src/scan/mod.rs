@@ -705,13 +705,13 @@ impl Scan {
                         None => logical,
                     };
                     selection_vector = rest;
-                    Ok(result)
+                    result
                 }))
             })
             // Iterator<DeltaResult<Iterator<DeltaResult<ScanResult>>>> to Iterator<DeltaResult<DeltaResult<ScanResult>>>
             .flatten_ok()
             // Iterator<DeltaResult<DeltaResult<ScanResult>>> to Iterator<DeltaResult<ScanResult>>
-            .map(|x| x??);
+            .map(|x| x?);
         Ok(result)
     }
 }
