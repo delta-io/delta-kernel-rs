@@ -64,7 +64,7 @@ impl DataFileMetadata {
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
     /// [`add_files_schema`].
     ///
-    /// [`add_files_schema`]: crate::transaction::add_files_schema
+    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
     #[internal_api]
     pub(crate) fn as_record_batch(
         &self,
