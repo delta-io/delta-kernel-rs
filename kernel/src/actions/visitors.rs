@@ -889,26 +889,51 @@ mod tests {
 
         // Verify each field has the expected unique value
         assert_eq!(remove.path, "test-path.parquet", "path mismatch");
-        assert_eq!(remove.deletion_timestamp, Some(1234567890), "deletion_timestamp mismatch");
+        assert_eq!(
+            remove.deletion_timestamp,
+            Some(1234567890),
+            "deletion_timestamp mismatch"
+        );
         assert!(!remove.data_change, "data_change mismatch");
-        assert_eq!(remove.extended_file_metadata, Some(true), "extended_file_metadata mismatch");
+        assert_eq!(
+            remove.extended_file_metadata,
+            Some(true),
+            "extended_file_metadata mismatch"
+        );
         assert_eq!(
             remove.partition_values,
             Some(HashMap::from([("part".to_string(), "value".to_string())])),
             "partition_values mismatch"
         );
         assert_eq!(remove.size, Some(9999), "size mismatch");
-        assert_eq!(remove.stats, Some(r#"{"numRecords":42}"#.to_string()), "stats mismatch");
+        assert_eq!(
+            remove.stats,
+            Some(r#"{"numRecords":42}"#.to_string()),
+            "stats mismatch"
+        );
 
         // Verify deletion vector fields
-        let dv = remove.deletion_vector.as_ref().expect("deletion_vector should be present");
-        assert_eq!(dv.path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA", "deletion_vector.path_or_inline_dv mismatch");
+        let dv = remove
+            .deletion_vector
+            .as_ref()
+            .expect("deletion_vector should be present");
+        assert_eq!(
+            dv.path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA",
+            "deletion_vector.path_or_inline_dv mismatch"
+        );
         assert_eq!(dv.offset, Some(1), "deletion_vector.offset mismatch");
-        assert_eq!(dv.size_in_bytes, 36, "deletion_vector.size_in_bytes mismatch");
+        assert_eq!(
+            dv.size_in_bytes, 36,
+            "deletion_vector.size_in_bytes mismatch"
+        );
         assert_eq!(dv.cardinality, 3, "deletion_vector.cardinality mismatch");
 
         // Verify row tracking fields (these would have been incorrect with the bug)
-        assert_eq!(remove.base_row_id, Some(100), "base_row_id mismatch - check getter index");
+        assert_eq!(
+            remove.base_row_id,
+            Some(100),
+            "base_row_id mismatch - check getter index"
+        );
         assert_eq!(
             remove.default_row_commit_version,
             Some(5),
