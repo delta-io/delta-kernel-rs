@@ -70,11 +70,12 @@ pub(crate) struct ParsedLogPath<Location: AsUrl = FileMeta> {
 }
 
 // Internal helper used by TryFrom<FileMeta> below. It parses a fixed-length string into the numeric
-// type expected by the caller. A wrong length produces an error, even if the parse succeeded.
-fn parse_path_part<T: FromStr>(value: &str, expect_len: usize, location: &Url) -> DeltaResult<T> {
+// type expected by the caller. A parsing failure returns None. A wrong length produces None, even
+// if the parse succeeded.
+fn parse_path_part<T: FromStr>(value: &str, expect_len: usize) -> Option<T> {
     match value.parse() {
-        Ok(result) if value.len() == expect_len => Ok(result),
-        _ => Err(Error::invalid_log_path(location)),
+        Ok(result) if value.len() == expect_len => Some(result),
+        _ => None,
     }
 }
 
@@ -102,9 +103,9 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
         let url = location.as_url();
-        let mut path_segments = url
-            .path_segments()
-            .ok_or_else(|| Error::invalid_log_path(url))?;
+        let Some(mut path_segments) = url.path_segments() else {
+            return Ok(None);
+        };
         #[allow(clippy::unwrap_used)]
         let filename = path_segments
             .next_back()
@@ -112,7 +113,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             .to_string();
         let subdir = path_segments.next_back();
         if filename.is_empty() {
-            return Err(Error::invalid_log_path(url));
+            return Ok(None); // Not a valid log path
         }
 
         let mut split = filename.split('.');
@@ -126,7 +127,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         // parsing succeeds for a wrong-length numeric string.
         let version = match version.parse().ok() {
             Some(v) if version.len() == VERSION_LEN => v,
-            Some(_) => return Err(Error::invalid_log_path(url)),
+            Some(_) => return Ok(None), // has a version but it's not 20 chars
             None => return Ok(None),
         };
 
@@ -142,28 +143,36 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["json"] => LogPathFileType::Commit,
             [uuid, "json"] if subdir == Some("_staged_commits") => {
                 // staged commits like _delta_log/_staged_commits/00000000000000000000.{uuid}.json
-                match parse_path_part::<String>(uuid, UUID_PART_LEN, url) {
-                    Ok(_uuid) => LogPathFileType::StagedCommit,
-                    Err(_) => LogPathFileType::Unknown,
+                match parse_path_part::<String>(uuid, UUID_PART_LEN) {
+                    Some(_uuid) => LogPathFileType::StagedCommit,
+                    None => LogPathFileType::Unknown,
                 }
             }
             ["crc"] => LogPathFileType::Crc,
             ["checkpoint", "parquet"] => LogPathFileType::SinglePartCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] => {
-                let _ = parse_path_part::<String>(uuid, UUID_PART_LEN, url)?;
+                let Some(_) = parse_path_part::<String>(uuid, UUID_PART_LEN) else {
+                    return Ok(None);
+                };
                 LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] => {
-                let hi = parse_path_part(hi, VERSION_LEN, url)?;
+                let Some(hi) = parse_path_part(hi, VERSION_LEN) else {
+                    return Ok(None);
+                };
                 LogPathFileType::CompactedCommit { hi }
             }
             ["checkpoint", part_num, num_parts, "parquet"] => {
-                let part_num = parse_path_part(part_num, MULTIPART_PART_LEN, url)?;
-                let num_parts = parse_path_part(num_parts, MULTIPART_PART_LEN, url)?;
+                let Some(part_num) = parse_path_part(part_num, MULTIPART_PART_LEN) else {
+                    return Ok(None);
+                };
+                let Some(num_parts) = parse_path_part(num_parts, MULTIPART_PART_LEN) else {
+                    return Ok(None);
+                };
 
                 // A valid part_num must be in the range [1, num_parts]
                 if !(0 < part_num && part_num <= num_parts) {
-                    return Err(Error::invalid_log_path(url));
+                    return Ok(None);
                 }
                 LogPathFileType::MultiPartCheckpoint {
                     part_num,
@@ -419,7 +428,8 @@ mod tests {
         assert!(log_path
             .path()
             .ends_with("/tests/data/table-with-dv-small/_delta_log/subdir/"));
-        ParsedLogPath::try_from(log_path).expect_err("directory path");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         // ignored - not versioned
         let log_path = table_log_dir.join("_last_checkpoint").unwrap();
@@ -455,11 +465,13 @@ mod tests {
 
         // invalid - version has too many digits
         let log_path = table_log_dir.join("000000000000000000010.json").unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("too many digits");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         // invalid - version has too few digits
         let log_path = table_log_dir.join("0000000000000000010.json").unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("too few digits");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         // unknown - two parts
         let log_path = table_log_dir.join("00000000000000000010.foo").unwrap();
@@ -605,7 +617,8 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.foo.parquet")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("not a uuid");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         // invalid file extension
         let log_path = table_log_dir
@@ -623,11 +636,8 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e.parquet")
             .unwrap();
-        let result = ParsedLogPath::try_from(log_path);
-        assert!(
-            matches!(result, Err(Error::InvalidLogPath(_))),
-            "Expected an error for UUID with exactly 35 characters"
-        );
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
     }
 
     #[test]
@@ -651,7 +661,8 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000000.0000000002.parquet")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("invalid part 0");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.0000000002.parquet")
@@ -696,27 +707,32 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000003.0000000002.parquet")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("invalid part 3");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.000000001.0000000002.parquet")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("invalid part_num");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.000000002.parquet")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("invalid num_parts");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.00000000x1.0000000002.parquet")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("invalid part_num");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.00000000x2.parquet")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("invalid num_parts");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
     }
 
     #[test]
@@ -758,17 +774,20 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.0000000000000000015.compacted.json")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("too few digits in hi");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.000000000000000000015.compacted.json")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("too many digits in hi");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.00000000000000000a15.compacted.json")
             .unwrap();
-        ParsedLogPath::try_from(log_path).expect_err("non-numeric hi");
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        assert!(log_path.is_none());
     }
 
     #[test]

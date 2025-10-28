@@ -1533,3 +1533,45 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
 
     Ok(())
 }
+
+#[tokio::test]
+async fn file_with_invalid_version() -> Result<(), Box<dyn std::error::Error>> {
+    let batch = generate_simple_batch()?;
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::Add(PARQUET_FILE2.to_string()),
+        ]),
+    )
+    .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE2),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    // add a file that starts with a number, but isn't a valid version, we should just skip it
+    storage
+        .put(&Path::from("_delta_log/0.zip"), vec![1u8].into())
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(
+        storage.clone(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
+
+    let _ = Snapshot::builder_for(location).build(engine.as_ref())?;
+    Ok(())
+}
