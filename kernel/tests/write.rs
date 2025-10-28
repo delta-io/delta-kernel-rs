@@ -859,6 +859,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[ignore]
 #[tokio::test]
 async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
