@@ -13,10 +13,10 @@ use crate::parquet::arrow::arrow_reader::{
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use crate::parquet::arrow::async_writer::AsyncArrowWriter;
+use crate::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore};
-use parquet_56::arrow::async_writer::ParquetObjectWriter;
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
