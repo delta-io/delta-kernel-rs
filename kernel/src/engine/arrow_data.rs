@@ -328,7 +328,7 @@ impl ArrowEngineData {
         };
         let col_as_map = || {
             col.as_map_opt().and_then(|array| {
-                (is_string_type(&array.key_type()) && is_string_type(&array.value_type()))
+                (is_string_type(array.key_type()) && is_string_type(array.value_type()))
                     .then_some(array as _)
             })
         };
