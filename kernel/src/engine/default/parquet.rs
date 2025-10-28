@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::array::builder::{LargeStringBuilder, MapBuilder, MapFieldNames};
+use crate::arrow::array::{Int64Array, LargeStringArray, RecordBatch, StructArray};
 use crate::arrow::datatypes::{DataType, Field};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
@@ -77,9 +77,9 @@ impl DataFileMetadata {
             num_records,
         } = self;
         // create the record batch of the write metadata
-        let path = Arc::new(StringArray::from(vec![location.to_string()]));
-        let key_builder = StringBuilder::new();
-        let val_builder = StringBuilder::new();
+        let path = Arc::new(LargeStringArray::from(vec![location.to_string()]));
+        let key_builder = LargeStringBuilder::new();
+        let val_builder = LargeStringBuilder::new();
         let names = MapFieldNames {
             entry: "key_value".to_string(),
             key: "key".to_string(),
@@ -517,8 +517,8 @@ mod tests {
                 key: "key".to_string(),
                 value: "value".to_string(),
             }),
-            StringBuilder::new(),
-            StringBuilder::new(),
+            LargeStringBuilder::new(),
+            LargeStringBuilder::new(),
         );
         partition_values_builder.keys().append_value("partition1");
         partition_values_builder.values().append_value("a");
@@ -535,7 +535,7 @@ mod tests {
         let expected = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec![location.to_string()])),
+                Arc::new(LargeStringArray::from(vec![location.to_string()])),
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),

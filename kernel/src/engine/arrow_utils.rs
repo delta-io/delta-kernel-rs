@@ -2753,9 +2753,10 @@ mod tests {
             let mut fields = requested_schema.fields();
             let metadata1 = fields.next().unwrap().metadata_with_string_values();
             let metadata2 = fields.next().unwrap().metadata_with_string_values();
-            let expected_field1 = ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
-                .with_metadata(metadata1)
-                .into();
+            let expected_field1 =
+                ArrowField::new(parquet_name(1, mode), ArrowDataType::LargeUtf8, true)
+                    .with_metadata(metadata1)
+                    .into();
             let expected_field2 =
                 ArrowField::new(parquet_name(2, mode), ArrowDataType::Int32, true)
                     .with_metadata(metadata2)

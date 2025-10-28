@@ -2,7 +2,7 @@ use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
     create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
-    ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder, StructArray,
+    LargeStringBuilder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
@@ -231,7 +231,7 @@ fn test_literal_complex_type_array() {
     let expected_values = [Some(1), Some(2), None, Some(3)];
     let expected_keys = (0..10).flat_map(|_| expected_keys.iter().cloned());
     let expected_values = (0..10).flat_map(|_| expected_values.iter().cloned());
-    let map_keys = map_array.keys().as_string::<i32>();
+    let map_keys = map_array.keys().as_string::<i64>();
     assert!(expected_keys.zip(map_keys).all(|(a, b)| a == b.unwrap()));
     let map_values = map_array
         .values()
@@ -266,11 +266,11 @@ fn test_invalid_array_sides() {
 
 #[test]
 fn test_str_arrays() {
-    let values = GenericStringArray::<i32>::from(vec![
+    let values = GenericStringArray::<i64>::from(vec![
         "hi", "bye", "hi", "hi", "bye", "bye", "hi", "bye", "hi",
     ]);
     let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, 3, 6, 9]));
-    let field = Arc::new(Field::new("item", DataType::Utf8, true));
+    let field = Arc::new(Field::new("item", DataType::LargeUtf8, true));
     let arr_field = Arc::new(Field::new("item", DataType::List(field.clone()), true));
     let schema = Schema::new([arr_field.clone()]);
     let array = ListArray::new(field.clone(), offsets, Arc::new(values), None);
@@ -664,12 +664,12 @@ fn test_null_row() {
             Arc::new(StructArray::new_null(
                 [
                     Arc::new(Field::new("a", DataType::Int32, true)),
-                    Arc::new(Field::new("b", DataType::Utf8, false)),
+                    Arc::new(Field::new("b", DataType::LargeUtf8, false)),
                 ]
                 .into(),
                 1,
             )),
-            create_array!(Utf8, [None::<String>]),
+            create_array!(LargeUtf8, [None::<String>]),
         ],
     )
     .unwrap();
@@ -723,7 +723,7 @@ fn test_create_one() {
 
     let expected_schema = Arc::new(Schema::new(vec![
         Field::new("a", DataType::Int32, true),
-        Field::new("b", DataType::Utf8, true),
+        Field::new("b", DataType::LargeUtf8, true),
         Field::new("c", DataType::Int32, false),
         Field::new("d", DataType::Int32, true),
     ]));
@@ -731,7 +731,7 @@ fn test_create_one() {
         expected_schema,
         vec![
             create_array!(Int32, [1]),
-            create_array!(Utf8, ["B"]),
+            create_array!(LargeUtf8, ["B"]),
             create_array!(Int32, [3]),
             create_array!(Int32, [None]),
         ],
@@ -879,12 +879,12 @@ fn test_scalar_map() -> DeltaResult<()> {
     let arrow_array = scalar_map.to_array(2)?;
     let map_array = arrow_array.as_any().downcast_ref::<MapArray>().unwrap();
 
-    let key_builder = StringBuilder::new();
+    let key_builder = LargeStringBuilder::new();
     let val_builder = Int32Builder::new();
     let names = MapFieldNames {
-        entry: "key_values".to_string(),
-        key: "keys".to_string(),
-        value: "values".to_string(),
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
     };
     let mut builder = MapBuilder::new(Some(names), key_builder, val_builder);
     builder.keys().append_value("key1");
