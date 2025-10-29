@@ -322,7 +322,7 @@ impl ListedLogFiles {
                     // want to know about in a debugging scenario
                     debug!(
                         "Found file {} with unknown file type {:?} at version {}",
-                        file.filename, file.file_type, version
+                        file.filename, file.file_type, file.version
                     );
                 }
             }
