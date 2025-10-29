@@ -64,6 +64,12 @@ pub(crate) struct ActionReconciliationProcessor {
 ///
 /// It contains the filtered batch of actions to be included, along with statistics about the
 /// number of actions filtered for inclusion.
+///
+/// # Warning
+///
+/// This iterator must be fully consumed to ensure proper collection of statistics. Additionally,
+/// all yielded data must be written to the specified path before e.g. calling
+/// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 pub(crate) struct ActionReconciliationBatch {
     /// The filtered batch of actions.
     pub(crate) filtered_data: FilteredEngineData,
@@ -81,11 +87,8 @@ impl HasSelectionVector for ActionReconciliationBatch {
 
 /// Iterator over action reconciliation data.
 ///
-/// This iterator wraps a stream of [`ActionReconciliationBatch`] items,
-/// tracking action counts and extracting filtered engine data for writing.
-///
-/// Used by both checkpoint and log compaction workflows to consume the output
-/// of [`ActionReconciliationProcessor`].
+/// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
+/// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
     inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
     actions_count: i64,
