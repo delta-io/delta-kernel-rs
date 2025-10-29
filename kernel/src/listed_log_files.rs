@@ -21,7 +21,7 @@ use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
 use itertools::Itertools;
-use tracing::{info, warn};
+use tracing::log::*;
 use url::Url;
 
 /// Represents the set of log files found during a listing operation in the Delta log directory.
@@ -317,9 +317,12 @@ impl ListedLogFiles {
                     latest_crc_file.replace(file);
                 }
                 Unknown => {
-                    warn!(
+                    // It is possible that there are other files being stashed away into
+                    // _delta_log/  This is not necessarily forbidden, but something we
+                    // want to know about in a debugging scenario
+                    debug!(
                         "Found file {} with unknown file type {:?} at version {}",
-                        file.filename, file.file_type, file.version
+                        file.filename, file.file_type, version
                     );
                 }
             }
@@ -639,6 +642,9 @@ mod list_log_files_with_log_tail_tests {
                 _files: Vec<crate::FileSlice>,
             ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<bytes::Bytes>>>> {
                 panic!("read_files used");
+            }
+            fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+                panic!("copy used from {src} to {dest}");
             }
         }
 
