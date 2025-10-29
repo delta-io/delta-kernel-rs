@@ -14,6 +14,7 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -88,8 +89,9 @@ async fn try_main() -> DeltaResult<()> {
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
+    let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction()?
+        .transaction(committer)?
         .with_operation("INSERT".to_string())
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
