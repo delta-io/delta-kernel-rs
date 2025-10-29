@@ -79,6 +79,83 @@ impl HasSelectionVector for ActionReconciliationBatch {
     }
 }
 
+/// Iterator over action reconciliation data.
+///
+/// This iterator wraps a stream of [`ActionReconciliationBatch`] items,
+/// tracking action counts and extracting filtered engine data for writing.
+///
+/// Used by both checkpoint and log compaction workflows to consume the output
+/// of [`ActionReconciliationProcessor`].
+pub struct ActionReconciliationIterator {
+    inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    actions_count: i64,
+    add_actions_count: i64,
+    is_exhausted: bool,
+}
+
+impl ActionReconciliationIterator {
+    /// Create a new iterator with counters initialized to 0
+    pub(crate) fn new(
+        inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    ) -> Self {
+        Self {
+            inner,
+            actions_count: 0,
+            add_actions_count: 0,
+            is_exhausted: false,
+        }
+    }
+
+    /// True if this iterator has been exhausted (ie all batches have been processed)
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.is_exhausted
+    }
+
+    /// Get the total number of actions processed so far
+    pub(crate) fn actions_count(&self) -> i64 {
+        self.actions_count
+    }
+
+    /// Get the total number of add actions processed so far
+    pub(crate) fn add_actions_count(&self) -> i64 {
+        self.add_actions_count
+    }
+
+    /// Helper to transform a batch: update metrics and extract filtered data
+    fn transform_batch(
+        &mut self,
+        batch: Option<DeltaResult<ActionReconciliationBatch>>,
+    ) -> Option<DeltaResult<FilteredEngineData>> {
+        let Some(batch) = batch else {
+            self.is_exhausted = true;
+            return None;
+        };
+        Some(batch.map(|batch| {
+            self.actions_count += batch.actions_count;
+            self.add_actions_count += batch.add_actions_count;
+            batch.filtered_data
+        }))
+    }
+}
+
+impl std::fmt::Debug for ActionReconciliationIterator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionReconciliationIterator")
+            .field("actions_count", &self.actions_count)
+            .field("add_actions_count", &self.add_actions_count)
+            .finish()
+    }
+}
+
+impl Iterator for ActionReconciliationIterator {
+    type Item = DeltaResult<FilteredEngineData>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.inner.next();
+        self.transform_batch(batch)
+    }
+}
+
 impl LogReplayProcessor for ActionReconciliationProcessor {
     type Output = ActionReconciliationBatch;
 
