@@ -7,9 +7,10 @@
 //! the [executor] module.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
+use futures::stream::{BoxStream, StreamExt as _};
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -17,6 +18,7 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use self::storage::parse_url_opts;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
@@ -35,58 +37,44 @@ pub mod storage;
 
 /// Converts a Stream-producing future to a synchronous iterator.
 ///
-/// This helper blocks on the future to obtain the stream, then spawns it in the
-/// background and bridges items via a channel. This avoids nested block_on calls
-/// that can cause deadlocks.
+/// Each call to `next` on the iterator translates to a blocking `stream.next()` call, using the
+/// provided `task_executor`. Buffered streams allow concurrency in the form of prefetching.
 ///
 /// This is an internal utility for bridging object_store's async API to
 /// Delta Kernel's synchronous handler traits.
-///
-/// # Parameters
-/// - `task_executor`: Executor for spawning background tasks
-/// - `stream_future`: Future that resolves to a Stream
-/// - `channel_size`: Buffer size for the sync_channel. When full, the background task blocks
-///   until the consumer pops an item. Use 0 for rendezvous (no buffering).
-///
-/// # Returns
-/// A synchronous iterator that yields items from the stream
-pub(crate) fn stream_future_to_iter<Fut, S, T, E: executor::TaskExecutor>(
+pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
     task_executor: Arc<E>,
-    stream_future: Fut,
-    channel_size: usize,
-) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<T>> + Send>>
-where
-    Fut: std::future::Future<Output = DeltaResult<S>> + Send + 'static,
-    S: futures::stream::Stream<Item = DeltaResult<T>> + Send + 'static,
-    T: Send + 'static,
-{
-    use futures::stream::StreamExt as _;
+    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
+) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
+    Ok(Box::new(BlockingStreamIterator {
+        stream: Some(task_executor.block_on(stream_future)?),
+        task_executor,
+    }))
+}
 
-    let stream = Box::pin(task_executor.block_on(stream_future)?);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(channel_size);
+struct BlockingStreamIterator<T: Send + 'static, E: executor::TaskExecutor> {
+    stream: Option<BoxStream<'static, T>>,
+    task_executor: Arc<E>,
+}
 
-    let executor_for_block = task_executor.clone();
-    task_executor.spawn(async move {
-        let mut stream = stream;
-        while let Some(item) = stream.next().await {
-            let sender_for_item = sender.clone();
-            let join_res = executor_for_block
-                .spawn_blocking(move || sender_for_item.send(item))
-                .await;
-            match join_res {
-                Ok(Ok(())) => continue,
-                Ok(Err(_)) => break, // Receiver dropped
-                Err(e) => {
-                    // spawn_blocking failed - runtime is likely in bad state
-                    // Send the error through the channel to propagate to consumer
-                    let _ = sender.send(Err(e));
-                    break;
-                }
-            }
+impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIterator<T, E> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Temporarily move the stream into the future so we can block on it.
+        let mut stream = self.stream.take()?;
+        let (item, stream) = self.task_executor.block_on(async move {
+            let item = stream.next().await;
+            (item, stream)
+        });
+
+        // The stream returns None when exhausted, and we must not poll it again after that.
+        if item.is_some() {
+            self.stream = Some(stream);
         }
-    });
 
-    Ok(Box::new(receiver.into_iter()))
+        item
+    }
 }
 
 #[derive(Debug)]

@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
@@ -13,7 +12,7 @@ use crate::parquet::arrow::arrow_reader::{
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use futures::stream::{self, Stream};
+use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::DynObjectStore;
@@ -208,8 +207,7 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         files: Vec<FileMeta>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'static>>>
-    {
+    ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
         if files.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
@@ -252,7 +250,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        // FIXME: What good is readahead if the file stream is unbuffered?
         super::stream_future_to_iter(
             self.task_executor.clone(),
             Self::read_parquet_files_impl(
@@ -261,7 +258,6 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 physical_schema,
                 predicate,
             ),
-            self.readahead,
         )
     }
 }

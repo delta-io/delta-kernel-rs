@@ -1,9 +1,8 @@
-use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore, PutMode};
@@ -40,7 +39,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     async fn list_from_impl(
         store: Arc<DynObjectStore>,
         path: Url,
-    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<FileMeta>> + Send + 'static>>> {
+    ) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
         // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
@@ -106,7 +105,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         store: Arc<DynObjectStore>,
         files: Vec<FileSlice>,
         readahead: usize,
-    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Bytes>> + Send + 'static>>> {
+    ) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
         Ok(Box::pin(
             stream::iter(files)
                 .map(move |(url, range)| {
@@ -152,7 +151,6 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         let iter = super::stream_future_to_iter(
             self.task_executor.clone(),
             Self::list_from_impl(self.inner.clone(), path.clone()),
-            0, // FIXME: should we use a non-zero channel_size?
         )?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }
@@ -170,7 +168,6 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         let iter = super::stream_future_to_iter(
             self.task_executor.clone(),
             Self::read_files_impl(self.inner.clone(), files, self.readahead),
-            0, // FIXME: should we use a non-zero channel_size?
         )?;
         Ok(iter) // type coercion drops the unneeded Send bound
     }

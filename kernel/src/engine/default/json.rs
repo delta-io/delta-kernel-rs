@@ -2,7 +2,6 @@
 
 use std::io::BufReader;
 use std::ops::Range;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -10,7 +9,7 @@ use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use bytes::{Buf, Bytes};
-use futures::stream::{self, BoxStream, Stream};
+use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
@@ -91,8 +90,7 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         _predicate: Option<PredicateRef>,
         batch_size: usize,
         buffer_size: usize,
-    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'static>>>
-    {
+    ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
         if files.is_empty() {
             return Ok(Box::pin(stream::empty()));
         }
@@ -170,7 +168,6 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
                 self.batch_size,
                 self.buffer_size,
             ),
-            self.buffer_size, // TODO: Should the channel and stream have different buffer sizes?
         )
     }
 
