@@ -87,12 +87,11 @@ fn list_log_files(
     // if the log_tail covers the entire requested range (i.e. starts at or before start_version),
     // we skip listing entirely. note that if we don't include this check, we will end up listing
     // and then just filtering out all the files we listed.
-    let listed_files = log_tail_start
-        // log_tail covers the entire requested range, so no listing is required
-        .is_none_or(|tail_start| start_version < tail_start.version)
-        .then(|| -> DeltaResult<_> {
-            // NOTE: since engine APIs don't limit listing, we list from start_version and filter
-            Ok(storage
+    let listed_files = if log_tail_start.is_some_and(|tail| tail.version <= start_version) {
+        None
+    } else {
+        Some(
+            storage
                 .list_from(&start_from)?
                 .map(|meta| ParsedLogPath::try_from(meta?))
                 // NOTE: this filters out .crc files etc which start with "." - some engines
@@ -106,11 +105,9 @@ fn list_log_files(
                     // discard any path with too-large version; keep errors
                     Ok(path) => path.version <= list_end_version,
                     Err(_) => true,
-                }))
-        })
-        .transpose()?
-        .into_iter()
-        .flatten();
+                }),
+        )
+    };
 
     // return chained [listed_files..log_tail], filtering log_tail by the requested range
     let filtered_log_tail = log_tail
@@ -118,6 +115,7 @@ fn list_log_files(
         .filter(move |entry| entry.version >= start_version && entry.version <= end_version)
         .map(Ok);
 
+    let listed_files = listed_files.into_iter().flatten();
     Ok(listed_files.chain(filtered_log_tail))
 }
 
@@ -254,47 +252,29 @@ impl ListedLogFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
+        let mut log_files =
+            list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
-        log_files.process_results(|iter| {
-            let mut ascending_commit_files = Vec::new();
-            let mut ascending_compaction_files = Vec::new();
-            let mut checkpoint_parts = vec![];
-            let mut latest_crc_file: Option<ParsedLogPath> = None;
-            let mut latest_commit_file: Option<ParsedLogPath> = None;
+        let mut ascending_commit_files = Vec::new();
+        let mut ascending_compaction_files = Vec::new();
+        let mut checkpoint_parts = vec![];
+        let mut latest_crc_file: Option<ParsedLogPath> = None;
+        let mut latest_commit_file: Option<ParsedLogPath> = None;
+        let mut new_checkpoint_parts = vec![];
+        let mut current_version = None;
+        loop {
+            let file = log_files.next().transpose()?;
 
-            // Group log files by version
-            let log_files_per_version = iter.chunk_by(|x| x.version);
-
-            for (version, files) in &log_files_per_version {
-                let mut new_checkpoint_parts = vec![];
-                for file in files {
-                    use LogPathFileType::*;
-                    match file.file_type {
-                        Commit | StagedCommit => ascending_commit_files.push(file),
-                        CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
-                            ascending_compaction_files.push(file);
-                        }
-                        CompactedCommit { .. } => (), // Failed the bounds check above
-                        SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
-                            new_checkpoint_parts.push(file)
-                        }
-                        Crc => {
-                            let latest_crc_ref = latest_crc_file.as_ref();
-                            if latest_crc_ref.is_none_or(|latest| latest.version < file.version) {
-                                latest_crc_file = Some(file);
-                            }
-                        }
-                        Unknown => {
-                            warn!(
-                                "Found file {} with unknown file type {:?} at version {}",
-                                file.filename, file.file_type, version
-                            );
-                        }
-                    }
-                }
+            // Flush any in-progress group unless the new file exists and belongs to it.
+            if let Some(group_version) =
+                current_version.filter(|v| file.as_ref().is_none_or(|f| f.version != *v))
+            {
                 // Group and find the first complete checkpoint for this version.
                 // All checkpoints for the same version are equivalent, so we only take one.
+                //
+                // If this version has a complete checkpoint, we can drop the existing commit and
+                // compaction files we collected so far -- except we must keep the latest commit.
+                let new_checkpoint_parts = std::mem::take(&mut new_checkpoint_parts);
                 if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
                     .into_iter()
                     // `num_parts` is guaranteed to be non-negative and within `usize` range
@@ -308,30 +288,59 @@ impl ListedLogFiles {
                     // from before the checkpoint
                     latest_commit_file = ascending_commit_files
                         .pop()
-                        .filter(|commit| commit.version == version);
+                        .filter(|commit: &ParsedLogPath| commit.version == group_version);
                     // Log replay only uses commits/compactions after a complete checkpoint
                     ascending_commit_files.clear();
                     ascending_compaction_files.clear();
                 }
             }
 
-            // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
-            // it contains only commits after the most recent checkpoint. The last element is the
-            // highest version commit overall, so we update latest_commit_file to it. If it's empty,
-            // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
-            // or remains None.
-            if let Some(commit_file) = ascending_commit_files.last() {
-                latest_commit_file = Some(commit_file.clone());
-            }
+            // NOTE: We break for EOF only _after_ flushing the last group.
+            let Some(file) = file else {
+                break;
+            };
 
-            ListedLogFiles::try_new(
-                ascending_commit_files,
-                ascending_compaction_files,
-                checkpoint_parts,
-                latest_crc_file,
-                latest_commit_file,
-            )
-        })?
+            // Capture the new version before we consume the file
+            current_version = Some(file.version);
+
+            use LogPathFileType::*;
+            match file.file_type {
+                Commit | StagedCommit => ascending_commit_files.push(file),
+                CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
+                    ascending_compaction_files.push(file);
+                }
+                CompactedCommit { .. } => (), // Failed the bounds check above
+                SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
+                    new_checkpoint_parts.push(file)
+                }
+                Crc => {
+                    latest_crc_file.replace(file);
+                }
+                Unknown => {
+                    warn!(
+                        "Found file {} with unknown file type {:?} at version {}",
+                        file.filename, file.file_type, file.version
+                    );
+                }
+            }
+        }
+
+        // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
+        // it contains only commits after the most recent checkpoint. The last element is the
+        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
+        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
+        // or remains None.
+        if let Some(commit_file) = ascending_commit_files.last() {
+            latest_commit_file = Some(commit_file.clone());
+        }
+
+        ListedLogFiles::try_new(
+            ascending_commit_files,
+            ascending_compaction_files,
+            checkpoint_parts,
+            latest_crc_file,
+            latest_commit_file,
+        )
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
