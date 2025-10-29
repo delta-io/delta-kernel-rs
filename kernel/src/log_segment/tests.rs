@@ -1079,9 +1079,8 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     Ok(())
 }
 
-#[test]
 #[tokio::test]
-fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
+async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
