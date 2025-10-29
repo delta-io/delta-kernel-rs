@@ -61,14 +61,13 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Temporarily move the stream into the future so we can block on it.
+        // Move the stream into the future so we can block on it.
         let mut stream = self.stream.take()?;
-        let (item, stream) = self.task_executor.block_on(async move {
-            let item = stream.next().await;
-            (item, stream)
-        });
+        let (item, stream) = self
+            .task_executor
+            .block_on(async move { (stream.next().await, stream) });
 
-        // The stream returns None when exhausted, and we must not poll it again after that.
+        // We must not poll an exhausted stream after it returned None.
         if item.is_some() {
             self.stream = Some(stream);
         }

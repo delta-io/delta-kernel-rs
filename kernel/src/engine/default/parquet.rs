@@ -200,47 +200,47 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let parquet_metadata = self.write_parquet(path, data).await?;
         parquet_metadata.as_record_batch(&partition_values)
     }
+}
 
-    /// Internal async implementation of read_parquet_files
-    async fn read_parquet_files_impl(
-        store: Arc<DynObjectStore>,
-        files: Vec<FileMeta>,
-        physical_schema: SchemaRef,
-        predicate: Option<PredicateRef>,
-    ) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
-        if files.is_empty() {
-            return Ok(Box::pin(stream::empty()));
-        }
-
-        // get the first FileMeta to decide how to fetch the file.
-        // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
-        // s3://    -> aws   (ParquetOpener)
-        // nothing  -> local (ParquetOpener)
-        // https:// -> assume presigned URL (and fetch without object_store)
-        //   -> reqwest to get data
-        //   -> parse to parquet
-        // SAFETY: we did is_empty check above, this is ok.
-        let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
-            Box::new(PresignedUrlOpener::new(
-                1024,
-                physical_schema.clone(),
-                predicate,
-            ))
-        } else {
-            Box::new(ParquetOpener::new(
-                1024,
-                physical_schema.clone(),
-                predicate,
-                store,
-            ))
-        };
-
-        let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);
-        let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
-            |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
-        );
-        Ok(Box::pin(stream))
+/// Internal async implementation of read_parquet_files
+async fn read_parquet_files_impl(
+    store: Arc<DynObjectStore>,
+    files: Vec<FileMeta>,
+    physical_schema: SchemaRef,
+    predicate: Option<PredicateRef>,
+) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+    if files.is_empty() {
+        return Ok(Box::pin(stream::empty()));
     }
+
+    // get the first FileMeta to decide how to fetch the file.
+    // NB: This means that every file in `FileMeta` _must_ have the same scheme or things will break
+    // s3://    -> aws   (ParquetOpener)
+    // nothing  -> local (ParquetOpener)
+    // https:// -> assume presigned URL (and fetch without object_store)
+    //   -> reqwest to get data
+    //   -> parse to parquet
+    // SAFETY: we did is_empty check above, this is ok.
+    let file_opener: Box<dyn FileOpener> = if files[0].location.is_presigned() {
+        Box::new(PresignedUrlOpener::new(
+            1024,
+            physical_schema.clone(),
+            predicate,
+        ))
+    } else {
+        Box::new(ParquetOpener::new(
+            1024,
+            physical_schema.clone(),
+            predicate,
+            store,
+        ))
+    };
+
+    let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);
+    let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
+        |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
+    );
+    Ok(Box::pin(stream))
 }
 
 impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
@@ -250,15 +250,13 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        super::stream_future_to_iter(
-            self.task_executor.clone(),
-            Self::read_parquet_files_impl(
-                self.store.clone(),
-                files.to_vec(),
-                physical_schema,
-                predicate,
-            ),
-        )
+        let future = read_parquet_files_impl(
+            self.store.clone(),
+            files.to_vec(),
+            physical_schema,
+            predicate,
+        );
+        super::stream_future_to_iter(self.task_executor.clone(), future)
     }
 }
 
