@@ -447,37 +447,29 @@ pub fn evaluate_predicate(
 /// When scale=0, the decimal represents a whole number with no fractional part:
 /// - Decimal128(10, 0) with value 1234 represents exactly 1234
 /// - Decimal128(10, 2) with value 1234 represents 12.34 (divided by 10^2)
-struct Decimal128ScaleZeroAsIntEncoder<'a> {
+struct Decimal128ScaleZeroEncoder<'a> {
     array: &'a Decimal128Array,
 }
 
-impl<'a> Encoder for Decimal128ScaleZeroAsIntEncoder<'a> {
+impl<'a> Encoder for Decimal128ScaleZeroEncoder<'a> {
     fn encode(&mut self, idx: usize, buf: &mut Vec<u8>) {
         let value = self.array.value(idx);
-        // Write as integer directly to buffer
-        // Writing to String is infallible, so we can safely ignore the result
-        use std::fmt::Write as FmtWrite;
-        let mut s = String::new();
-        let _ = write!(s, "{}", value as i64);
+        // Write full i128 value as integer
+        let s = format!("{}", value);
         buf.extend_from_slice(s.as_bytes());
     }
 }
 
 /// Custom encoder for Decimal256 arrays with scale=0.
-struct Decimal256ScaleZeroAsIntEncoder<'a> {
+struct Decimal256ScaleZeroEncoder<'a> {
     array: &'a Decimal256Array,
 }
 
-impl<'a> Encoder for Decimal256ScaleZeroAsIntEncoder<'a> {
+impl<'a> Encoder for Decimal256ScaleZeroEncoder<'a> {
     fn encode(&mut self, idx: usize, buf: &mut Vec<u8>) {
         let value = self.array.value(idx);
-        // Convert i256 to i64 for JSON encoding (may truncate large values)
-        let value_i64 = value.as_i128() as i64;
-        // Write as integer directly to buffer
-        // Writing to String is infallible, so we can safely ignore the result
-        use std::fmt::Write as FmtWrite;
-        let mut s = String::new();
-        let _ = write!(s, "{}", value_i64);
+        // Write full i256 value as integer
+        let s = format!("{}", value);
         buf.extend_from_slice(s.as_bytes());
     }
 }
@@ -487,9 +479,9 @@ impl<'a> Encoder for Decimal256ScaleZeroAsIntEncoder<'a> {
 /// Returns custom encoders for Decimal128/256 fields with scale=0 (to write as integers),
 /// and None for all other fields (to use Arrow's default encoder).
 #[derive(Debug)]
-struct DecimalScaleZeroAsIntEncoderFactory;
+struct DecimalScaleZeroEncoderFactory;
 
-impl EncoderFactory for DecimalScaleZeroAsIntEncoderFactory {
+impl EncoderFactory for DecimalScaleZeroEncoderFactory {
     fn make_default_encoder<'a>(
         &self,
         field: &'a Arc<ArrowField>,
@@ -507,7 +499,7 @@ impl EncoderFactory for DecimalScaleZeroAsIntEncoderFactory {
                             array.data_type()
                         ))
                     })?;
-                let encoder = Decimal128ScaleZeroAsIntEncoder {
+                let encoder = Decimal128ScaleZeroEncoder {
                     array: decimal_array,
                 };
                 Ok(Some(NullableEncoder::new(
@@ -525,7 +517,7 @@ impl EncoderFactory for DecimalScaleZeroAsIntEncoderFactory {
                             array.data_type()
                         ))
                     })?;
-                let encoder = Decimal256ScaleZeroAsIntEncoder {
+                let encoder = Decimal256ScaleZeroEncoder {
                     array: decimal_array,
                 };
                 Ok(Some(NullableEncoder::new(
@@ -561,7 +553,7 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
                 struct_array.fields().iter().cloned().collect_vec(),
                 true,
             ));
-            let factory = Arc::new(DecimalScaleZeroAsIntEncoderFactory);
+            let factory = Arc::new(DecimalScaleZeroEncoderFactory);
             let options = EncoderOptions::default()
                 .with_struct_mode(StructMode::ObjectOnly)
                 .with_encoder_factory(factory);
