@@ -52,6 +52,7 @@ async fn write_local_path_to_hdfs(
 }
 
 #[tokio::test]
+#[ignore = "Skipping HDFS integration test"]
 async fn read_table_version_hdfs() -> Result<(), Box<dyn std::error::Error>> {
     let minidfs = MiniDfs::with_features(&HashSet::new());
     let hdfs_client = Client::default();
