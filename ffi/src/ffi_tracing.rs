@@ -768,9 +768,7 @@ mod tests {
 
         let ok = target == "delta_kernel_ffi::ffi_tracing::tests"
             && file == expected_file
-            && expected_log_lines
-                .iter()
-                .any(|expected_log_line| *expected_log_line == msg);
+            && expected_log_lines.contains(&msg);
         if ok {
             let mut lock = EVENTS_OK.lock().unwrap();
             if let Some(ref mut events) = *lock {
