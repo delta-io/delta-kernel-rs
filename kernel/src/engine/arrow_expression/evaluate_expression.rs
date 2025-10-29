@@ -464,9 +464,6 @@ impl<'a> Encoder for Decimal128ScaleZeroAsIntEncoder<'a> {
 }
 
 /// Custom encoder for Decimal256 arrays with scale=0.
-///
-/// Same as Decimal128ScaleZeroAsIntEncoder but for Decimal256 types.
-/// See Decimal128ScaleZeroAsIntEncoder for detailed explanation.
 struct Decimal256ScaleZeroAsIntEncoder<'a> {
     array: &'a Decimal256Array,
 }
