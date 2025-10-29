@@ -1535,7 +1535,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
-async fn file_with_invalid_version() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Error>> {
     let batch = generate_simple_batch()?;
     let storage = Arc::new(InMemory::new());
     add_commit(
@@ -1561,17 +1561,35 @@ async fn file_with_invalid_version() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    // add a file that starts with a number, but isn't a valid version, we should just skip it
-    storage
-        .put(&Path::from("_delta_log/0.zip"), vec![1u8].into())
-        .await?;
-
     let location = Url::parse("memory:///")?;
     let engine = Arc::new(DefaultEngine::new(
         storage.clone(),
         Arc::new(TokioBackgroundExecutor::new()),
     ));
 
+    let invalid_files = [
+        "_delta_log/0.zip",
+        "_delta_log/_copy_into_log/0.zip",
+        "_delta_log/_ignore_me/00000000000000000000.json",
+        "_delta_log/_and_me/00000000000000000000.checkpoint.parquet",
+        "_delta_log/02184.json",
+        "_delta_log/0x000000000000000000.checkpoint.parquet",
+        "00000000000000000000.json",
+    ];
+
+    for invalid_file in invalid_files.iter() {
+        let invalid_path = Path::from(*invalid_file);
+        storage.put(&invalid_path, vec![1u8].into()).await?;
+        let _ = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        storage.delete(&invalid_path).await?;
+    }
+
+    // final test with _all_ the files we should ignore
+    for invalid_file in invalid_files.iter() {
+        let invalid_path = Path::from(*invalid_file);
+        storage.put(&invalid_path, vec![1u8].into()).await?;
+    }
     let _ = Snapshot::builder_for(location).build(engine.as_ref())?;
+
     Ok(())
 }

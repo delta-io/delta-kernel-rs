@@ -138,9 +138,11 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             None => return Ok(None),
         };
 
+        let in_root_dir = subdir == Some("_delta_log");
+
         // Parse the file type, based on the number of remaining parts
         let file_type = match split.as_slice() {
-            ["json"] => LogPathFileType::Commit,
+            ["json"] if in_root_dir => LogPathFileType::Commit,
             [uuid, "json"] if subdir == Some("_staged_commits") => {
                 // staged commits like _delta_log/_staged_commits/00000000000000000000.{uuid}.json
                 match parse_path_part::<String>(uuid, UUID_PART_LEN) {
@@ -148,21 +150,21 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
                     None => LogPathFileType::Unknown,
                 }
             }
-            ["crc"] => LogPathFileType::Crc,
-            ["checkpoint", "parquet"] => LogPathFileType::SinglePartCheckpoint,
-            ["checkpoint", uuid, "json" | "parquet"] => {
+            ["crc"] if in_root_dir => LogPathFileType::Crc,
+            ["checkpoint", "parquet"] if in_root_dir => LogPathFileType::SinglePartCheckpoint,
+            ["checkpoint", uuid, "json" | "parquet"] if in_root_dir => {
                 let Some(_) = parse_path_part::<String>(uuid, UUID_PART_LEN) else {
                     return Ok(None);
                 };
                 LogPathFileType::UuidCheckpoint
             }
-            [hi, "compacted", "json"] => {
+            [hi, "compacted", "json"] if in_root_dir => {
                 let Some(hi) = parse_path_part(hi, VERSION_LEN) else {
                     return Ok(None);
                 };
                 LogPathFileType::CompactedCommit { hi }
             }
-            ["checkpoint", part_num, num_parts, "parquet"] => {
+            ["checkpoint", part_num, num_parts, "parquet"] if in_root_dir => {
                 let Some(part_num) = parse_path_part(part_num, MULTIPART_PART_LEN) else {
                     return Ok(None);
                 };
