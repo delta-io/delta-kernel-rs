@@ -7,7 +7,8 @@ use url::Url;
 
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
-use crate::scan::{PhysicalPredicate, ScanResult, StateInfo};
+use crate::scan::state_info::StateInfo;
+use crate::scan::{PhysicalPredicate, ScanResult};
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
 
@@ -41,15 +42,14 @@ pub struct TableChangesScan {
 /// Construct a [`TableChangesScan`] from `table_changes` with a given schema and predicate
 /// ```rust
 /// # use std::sync::Arc;
-/// # use test_utils::DefaultEngineExtension;
-/// # use delta_kernel::engine::default::DefaultEngine;
 /// # use delta_kernel::expressions::{column_expr, Scalar};
 /// # use delta_kernel::Predicate;
 /// # use delta_kernel::table_changes::TableChanges;
 /// # let path = "./tests/data/table-with-cdf";
-/// # let engine = DefaultEngine::new_local();
 /// # let url = delta_kernel::try_parse_uri(path).unwrap();
-/// # let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1)).unwrap();
+/// # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngine};
+/// # let engine = DefaultEngine::new(store_from_url(&url).unwrap());
+/// # let table_changes = TableChanges::try_new(url, &engine, 0, Some(1)).unwrap();
 /// let schema = table_changes
 ///     .schema()
 ///     .project(&["id", "_commit_version"])
@@ -115,11 +115,7 @@ impl TableChangesScanBuilder {
         // Create StateInfo using CDF field classifier
         let state_info = StateInfo::try_new(
             logical_schema,
-            self.table_changes.partition_columns(),
-            self.table_changes
-                .end_snapshot
-                .table_configuration()
-                .column_mapping_mode(),
+            self.table_changes.end_snapshot.table_configuration(),
             self.predicate,
             CdfTransformFieldClassifier,
         )?;
@@ -192,13 +188,16 @@ impl TableChangesScan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
         let table_root = self.table_changes.table_root().clone();
         let state_info = self.state_info.clone();
         let dv_engine_ref = engine.clone();
+
+        let table_root_copy = self.table_changes.table_root().clone();
+        let physical_predicate = self.physical_predicate().clone();
 
         let result = scan_files
             .map(move |scan_file| {
@@ -209,9 +208,9 @@ impl TableChangesScan {
                 read_scan_file(
                     engine.as_ref(),
                     resolved_scan_file?,
-                    self.table_root(),
+                    &table_root_copy,
                     state_info.as_ref(),
-                    self.physical_predicate(),
+                    physical_predicate.clone(),
                 )
             }) // Iterator-Result-Iterator-Result
             .flatten_ok() // Iterator-Result-Result
@@ -239,11 +238,14 @@ fn read_scan_file(
         scan_file_physical_schema(&scan_file, state_info.physical_schema.as_ref());
     let transform_expr = get_cdf_transform_expr(&scan_file, state_info, physical_schema.as_ref())?;
 
-    let phys_to_logical_eval = engine.evaluation_handler().new_expression_evaluator(
-        physical_schema.clone(),
-        transform_expr,
-        state_info.logical_schema.clone().into(),
-    );
+    // Only create an evaluator if transformation is needed
+    let phys_to_logical_eval = transform_expr.map(|expr| {
+        engine.evaluation_handler().new_expression_evaluator(
+            physical_schema.clone(),
+            expr,
+            state_info.logical_schema.clone().into(),
+        )
+    });
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
@@ -261,8 +263,13 @@ fn read_scan_file(
 
     let result = read_result_iter.map(move |batch| -> DeltaResult<_> {
         let batch = batch?;
-        // to transform the physical data into the correct logical form
-        let logical = phys_to_logical_eval.evaluate(batch.as_ref());
+        // Transform the physical data into the correct logical form, or pass through unchanged
+        let logical = if let Some(ref eval) = phys_to_logical_eval {
+            eval.evaluate(batch.as_ref())
+        } else {
+            // No transformation needed - pass through the batch as-is
+            Ok(batch)
+        };
         let len = logical.as_ref().map_or(0, |res| res.len());
         // need to split the dv_mask. what's left in dv_mask covers this result, and rest
         // will cover the following results. we `take()` out of `selection_vector` to avoid

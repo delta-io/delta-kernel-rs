@@ -37,6 +37,8 @@ pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
+#[cfg(feature = "default-engine-base")]
+pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod expressions;
 #[cfg(feature = "tracing")]
@@ -127,6 +129,23 @@ impl KernelStringSlice {
         Self {
             ptr: source.as_ptr().cast(),
             len: source.len(),
+        }
+    }
+}
+
+/// FFI-safe implementation for Rust's `Option<T>`
+#[derive(PartialEq, Debug)]
+#[repr(C)]
+pub enum OptionalValue<T> {
+    Some(T),
+    None,
+}
+
+impl<T> From<Option<T>> for OptionalValue<T> {
+    fn from(item: Option<T>) -> Self {
+        match item {
+            Some(value) => OptionalValue::Some(value),
+            None => OptionalValue::None,
         }
     }
 }

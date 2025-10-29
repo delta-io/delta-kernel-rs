@@ -70,6 +70,10 @@ impl StorageHandler for SyncStorageHandler {
         });
         Ok(Box::new(iter))
     }
+
+    fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
+        unimplemented!("SyncStorageHandler does not implement copy");
+    }
 }
 
 #[cfg(test)]

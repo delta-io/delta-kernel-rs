@@ -5,7 +5,7 @@ use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore};
+use object_store::{DynObjectStore, ObjectStore, PutMode};
 use url::Url;
 
 use super::UrlExt;
@@ -175,6 +175,31 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
         Ok(Box::new(receiver.into_iter()))
     }
+
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+        let src_path = Path::from_url_path(src.path())?;
+        let dest_path = Path::from_url_path(dest.path())?;
+        let dest_path_str = dest_path.to_string();
+        let store = self.inner.clone();
+
+        // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
+        // necessarily atomic, but since the source file is immutable, we aren't exposed to the
+        // possiblilty of source file changing while we do the PUT.
+        self.task_executor.block_on(async move {
+            let data = store.get(&src_path).await?.bytes().await?;
+
+            store
+                .put_opts(&dest_path, data.into(), PutMode::Create.into())
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::AlreadyExists { .. } => {
+                        Error::FileAlreadyExists(dest_path_str)
+                    }
+                    e => e.into(),
+                })?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +324,37 @@ mod tests {
             len += 1;
         }
         assert_eq!(len, 10, "list_from should have returned 10 files");
+    }
+
+    #[tokio::test]
+    async fn test_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFileSystem::new());
+        let executor = Arc::new(TokioBackgroundExecutor::new());
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+
+        // basic
+        let data = Bytes::from("test-data");
+        let src_path = Path::from_absolute_path(tmp.path().join("src.txt")).unwrap();
+        store.put(&src_path, data.clone().into()).await.unwrap();
+        let src_url = Url::from_file_path(tmp.path().join("src.txt")).unwrap();
+        let dest_url = Url::from_file_path(tmp.path().join("dest.txt")).unwrap();
+        assert!(handler.copy_atomic(&src_url, &dest_url).is_ok());
+        let dest_path = Path::from_absolute_path(tmp.path().join("dest.txt")).unwrap();
+        assert_eq!(
+            store.get(&dest_path).await.unwrap().bytes().await.unwrap(),
+            data
+        );
+
+        // copy to existing fails
+        assert!(matches!(
+            handler.copy_atomic(&src_url, &dest_url),
+            Err(Error::FileAlreadyExists(_))
+        ));
+
+        // copy from non-existing fails
+        let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
+        let new_dest_url = Url::from_file_path(tmp.path().join("new_dest.txt")).unwrap();
+        assert!(handler.copy_atomic(&missing_url, &new_dest_url).is_err());
     }
 }

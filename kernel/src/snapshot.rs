@@ -8,6 +8,7 @@ use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
+use crate::committer::Committer;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -327,9 +328,9 @@ impl Snapshot {
         ScanBuilder::new(self)
     }
 
-    /// Create a [`Transaction`] for this `SnapshotRef`.
-    pub fn transaction(self: Arc<Self>) -> DeltaResult<Transaction> {
-        Transaction::try_new(self)
+    /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
+    pub fn transaction(self: Arc<Self>, committer: Box<dyn Committer>) -> DeltaResult<Transaction> {
+        Transaction::try_new(self, committer)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
@@ -712,7 +713,7 @@ mod tests {
         let parsed = handler
             .parse_json(
                 string_array_to_engine_data(json_strings),
-                crate::actions::get_log_schema().clone(),
+                crate::actions::get_commit_schema().clone(),
             )
             .unwrap();
         let checkpoint = ArrowEngineData::try_from_engine_data(parsed).unwrap();
@@ -1398,7 +1399,7 @@ mod tests {
             .into();
         let parsed = handler.parse_json(
             string_array_to_engine_data(json_strings),
-            crate::actions::get_log_schema().clone(),
+            crate::actions::get_commit_schema().clone(),
         )?;
         let checkpoint = ArrowEngineData::try_from_engine_data(parsed)?;
         let checkpoint: RecordBatch = checkpoint.into();
