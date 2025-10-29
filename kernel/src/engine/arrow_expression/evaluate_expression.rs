@@ -487,16 +487,8 @@ impl<'a> Encoder for Decimal256ScaleZeroAsIntEncoder<'a> {
 
 /// EncoderFactory that provides custom encoders for Decimal types with scale=0.
 ///
-/// This factory is used by Arrow's JSON encoder to selectively inject custom encoding logic
-/// for specific field types. When Arrow encounters a field during JSON encoding, it calls
-/// `make_default_encoder()` to check if we want to override the default behavior.
-///
-/// For Decimal128/256 fields with scale=0, we return custom encoders that write integers.
-/// For all other fields, we return None, causing Arrow to use its default encoder.
-///
-/// This approach allows us to customize encoding behavior without transforming the data,
-/// and it works automatically for nested structs since Arrow recursively calls the factory
-/// for each field at every nesting level.
+/// Returns custom encoders for Decimal128/256 fields with scale=0 (to write as integers),
+/// and None for all other fields (to use Arrow's default encoder).
 #[derive(Debug)]
 struct DecimalScaleZeroAsIntEncoderFactory;
 
@@ -699,9 +691,12 @@ pub fn coalesce_arrays(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
+    use crate::arrow::array::{
+        ArrayRef, Decimal128Array, Decimal256Array, Int32Array, Int64Array, StringArray,
+        StructArray,
+    };
     use crate::arrow::datatypes::{
-        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+        i256, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{column_expr_ref, Expression as Expr, Transform};
     use crate::schema::{DataType, StructField, StructType};
@@ -1218,9 +1213,6 @@ mod tests {
 
     #[test]
     fn test_to_json_decimal_scale_zero() {
-        use crate::arrow::array::{Decimal128Array, Int32Array};
-        use crate::arrow::datatypes::DataType as ArrowDataType;
-
         // Create arrays with sample data
         // For Decimal(10, 0): value 1234 stored as 1234 (no scaling)
         // For Decimal(10, 2): value 12.34 stored as 1234 (scaled by 10^2)
@@ -1297,18 +1289,14 @@ mod tests {
 
     #[test]
     fn test_to_json_decimal256_scale_zero() {
-        use crate::arrow::array::Decimal256Array;
-        use crate::arrow::datatypes::i256;
-        use crate::arrow::datatypes::DataType as ArrowDataType;
-
         // Test Decimal256 with scale=0 conversion
         let decimal256_scale0 = Arc::new(
-            Decimal256Array::from(vec![i256::from_i128(9999), i256::from_i128(1111)])
+            Decimal256Array::from(vec![i256::from(9999), i256::from(1111)])
                 .with_precision_and_scale(20, 0)
                 .unwrap(),
         );
         let decimal256_scale3 = Arc::new(
-            Decimal256Array::from(vec![i256::from_i128(9999), i256::from_i128(1111)])
+            Decimal256Array::from(vec![i256::from(9999), i256::from(1111)])
                 .with_precision_and_scale(20, 3)
                 .unwrap(),
         );
@@ -1367,9 +1355,6 @@ mod tests {
 
     #[test]
     fn test_to_json_nested_struct_with_decimal_scale_zero() {
-        use crate::arrow::array::{Decimal128Array, Int32Array};
-        use crate::arrow::datatypes::DataType as ArrowDataType;
-
         // Test nested struct containing Decimal with scale=0
         let inner_decimal = Arc::new(
             Decimal128Array::from(vec![100, 200])
