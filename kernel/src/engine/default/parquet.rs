@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
@@ -12,7 +13,8 @@ use crate::parquet::arrow::arrow_reader::{
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use futures::StreamExt;
+use futures::stream::{self, Stream};
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::DynObjectStore;
 use uuid::Uuid;
@@ -203,17 +205,17 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let parquet_metadata = self.write_parquet(path, data).await?;
         parquet_metadata.as_record_batch(&partition_values, data_change)
     }
-}
 
-impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
-    fn read_parquet_files(
-        &self,
-        files: &[FileMeta],
+    /// Internal async implementation of read_parquet_files
+    async fn read_parquet_files_impl(
+        store: Arc<DynObjectStore>,
+        files: Vec<FileMeta>,
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
-    ) -> DeltaResult<FileDataReadResultIterator> {
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'static>>>
+    {
         if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
+            return Ok(Box::pin(stream::empty()));
         }
 
         // get the first FileMeta to decide how to fetch the file.
@@ -235,14 +237,34 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                 1024,
                 physical_schema.clone(),
                 predicate,
-                self.store.clone(),
+                store,
             ))
         };
-        FileStream::new_async_read_iterator(
+
+        let arrow_schema = Arc::new(physical_schema.as_ref().try_into_arrow()?);
+        let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
+            |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
+        );
+        Ok(Box::pin(stream))
+    }
+}
+
+impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
+    fn read_parquet_files(
+        &self,
+        files: &[FileMeta],
+        physical_schema: SchemaRef,
+        predicate: Option<PredicateRef>,
+    ) -> DeltaResult<FileDataReadResultIterator> {
+        // FIXME: What good is readahead if the file stream is unbuffered?
+        super::stream_future_to_iter(
             self.task_executor.clone(),
-            Arc::new(physical_schema.as_ref().try_into_arrow()?),
-            file_opener,
-            files,
+            Self::read_parquet_files_impl(
+                self.store.clone(),
+                files.to_vec(),
+                physical_schema,
+                predicate,
+            ),
             self.readahead,
         )
     }

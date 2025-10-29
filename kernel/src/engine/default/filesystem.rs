@@ -1,8 +1,9 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
-use futures::stream::StreamExt;
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore};
@@ -34,13 +35,12 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
         self.readahead = readahead;
         self
     }
-}
 
-impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
-    fn list_from(
-        &self,
-        path: &Url,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+    /// Native async implementation for list_from
+    async fn list_from_impl(
+        store: Arc<DynObjectStore>,
+        path: Url,
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<FileMeta>> + Send + 'static>>> {
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
         // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
@@ -57,8 +57,6 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             }
             Path::from_iter(parts)
         };
-
-        let store = self.inner.clone();
 
         // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
         // local filesystem doesn't return a sorted list by default. Although the `object_store`
@@ -80,61 +78,37 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // So we just need to know if we're local and then if so, we sort the returned file list
         let has_ordered_listing = path.scheme() != "file";
 
-        // This channel will become the iterator
-        let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
-        let url = path.clone();
-        self.task_executor.spawn(async move {
-            let mut stream = store.list_with_offset(Some(&prefix), &offset);
-
-            while let Some(meta) = stream.next().await {
-                match meta {
-                    Ok(meta) => {
-                        let mut location = url.clone();
-                        location.set_path(&format!("/{}", meta.location.as_ref()));
-                        sender
-                            .send(Ok(FileMeta {
-                                location,
-                                last_modified: meta.last_modified.timestamp_millis(),
-                                size: meta.size,
-                            }))
-                            .ok();
-                    }
-                    Err(e) => {
-                        sender.send(Err(e.into())).ok();
-                    }
-                }
-            }
-        });
+        let stream = store
+            .list_with_offset(Some(&prefix), &offset)
+            .map(move |meta| {
+                let meta = meta?;
+                let mut location = path.clone();
+                location.set_path(&format!("/{}", meta.location.as_ref()));
+                Ok(FileMeta {
+                    location,
+                    last_modified: meta.last_modified.timestamp_millis(),
+                    size: meta.size,
+                })
+            });
 
         if !has_ordered_listing {
-            // This FS doesn't return things in the order we require
-            let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
-            fms.sort_unstable();
-            Ok(Box::new(fms.into_iter().map(Ok)))
+            // Local filesystem doesn't return sorted list - need to collect and sort
+            let mut items: Vec<_> = stream.try_collect().await?;
+            items.sort_unstable();
+            Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
         } else {
-            Ok(Box::new(receiver.into_iter()))
+            Ok(Box::pin(stream))
         }
     }
 
-    /// Read data specified by the start and end offset from the file.
-    ///
-    /// This will return the data in the same order as the provided file slices.
-    ///
-    /// Multiple reads may occur in parallel, depending on the configured readahead.
-    /// See [`Self::with_readahead`].
-    fn read_files(
-        &self,
+    /// Native async implementation for read_files
+    async fn read_files_impl(
+        store: Arc<DynObjectStore>,
         files: Vec<FileSlice>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let store = self.inner.clone();
-
-        // This channel will become the output iterator.
-        // Because there will already be buffering in the stream, we set the
-        // buffer size to 0.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
-
-        self.task_executor.spawn(
-            futures::stream::iter(files)
+        readahead: usize,
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Bytes>> + Send + 'static>>> {
+        Ok(Box::pin(
+            stream::iter(files)
                 .map(move |(url, range)| {
                     let store = store.clone();
                     async move {
@@ -164,16 +138,41 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     }
                 })
                 // We allow executing up to `readahead` futures concurrently and
-                // buffer the results. This allows us to achieve async concurrency
-                // within a synchronous method.
-                .buffered(self.readahead)
-                .for_each(move |res| {
-                    sender.send(res).ok();
-                    futures::future::ready(())
-                }),
-        );
+                // buffer the results. This allows us to achieve async concurrency.
+                .buffered(readahead),
+        ))
+    }
+}
 
-        Ok(Box::new(receiver.into_iter()))
+impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
+    fn list_from(
+        &self,
+        path: &Url,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        let iter = super::stream_future_to_iter(
+            self.task_executor.clone(),
+            Self::list_from_impl(self.inner.clone(), path.clone()),
+            0, // FIXME: should we use a non-zero channel_size?
+        )?;
+        Ok(iter) // type coercion drops the unneeded Send bound
+    }
+
+    /// Read data specified by the start and end offset from the file.
+    ///
+    /// This will return the data in the same order as the provided file slices.
+    ///
+    /// Multiple reads may occur in parallel, depending on the configured readahead.
+    /// See [`Self::with_readahead`].
+    fn read_files(
+        &self,
+        files: Vec<FileSlice>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
+        let iter = super::stream_future_to_iter(
+            self.task_executor.clone(),
+            Self::read_files_impl(self.inner.clone(), files, self.readahead),
+            0, // FIXME: should we use a non-zero channel_size?
+        )?;
+        Ok(iter) // type coercion drops the unneeded Send bound
     }
 }
 

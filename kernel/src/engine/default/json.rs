@@ -2,18 +2,18 @@
 
 use std::io::BufReader;
 use std::ops::Range;
-use std::sync::{mpsc, Arc};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Poll;
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use crate::arrow::json::ReaderBuilder;
 use crate::arrow::record_batch::RecordBatch;
 use bytes::{Buf, Bytes};
-use futures::stream::{self, BoxStream};
+use futures::stream::{self, BoxStream, Stream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
-use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
@@ -82,6 +82,67 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         self.batch_size = batch_size;
         self
     }
+
+    /// Internal async implementation of read_json_files
+    async fn read_json_files_impl(
+        store: Arc<DynObjectStore>,
+        files: Vec<FileMeta>,
+        physical_schema: SchemaRef,
+        _predicate: Option<PredicateRef>,
+        batch_size: usize,
+        buffer_size: usize,
+    ) -> DeltaResult<Pin<Box<dyn Stream<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'static>>>
+    {
+        if files.is_empty() {
+            return Ok(Box::pin(stream::empty()));
+        }
+
+        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
+        let file_opener = Arc::new(JsonOpener::new(batch_size, schema.clone(), store));
+
+        // an iterator of futures that open each file
+        let file_futures = files.into_iter().map(move |file| {
+            let opener = file_opener.clone();
+            async move { opener.open(file, None).await }
+        });
+
+        // create a stream from that iterator which buffers up to `buffer_size` futures at a time
+        let result_stream = stream::iter(file_futures)
+            .buffered(buffer_size)
+            .try_flatten()
+            .map_ok(|record_batch| -> Box<dyn EngineData> {
+                Box::new(ArrowEngineData::new(record_batch))
+            });
+
+        Ok(Box::pin(result_stream))
+    }
+
+    /// Internal async implementation of write_json_file
+    /// Note: for now we just buffer all the data and write it out all at once
+    async fn write_json_file_impl(
+        store: Arc<DynObjectStore>,
+        path: Url,
+        buffer: Vec<u8>,
+        overwrite: bool,
+    ) -> DeltaResult<()> {
+        let put_mode = if overwrite {
+            PutMode::Overwrite
+        } else {
+            PutMode::Create
+        };
+
+        let path = Path::from_url_path(path.path())?;
+        let path_str = path.to_string();
+
+        store
+            .put_opts(&path, buffer.into(), put_mode.into())
+            .await
+            .map_err(|e| match e {
+                object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
+                e => e.into(),
+            })?;
+        Ok(())
+    }
 }
 
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
@@ -97,40 +158,20 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
-        let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
-
-        let (tx, rx) = mpsc::sync_channel(self.buffer_size);
-        let files = files.to_vec();
-        let buffer_size = self.buffer_size;
-
-        self.task_executor.spawn(async move {
-            // an iterator of futures that open each file
-            let file_futures = files.into_iter().map(|file| file_opener.open(file, None));
-
-            // create a stream from that iterator which buffers up to `buffer_size` futures at a time
-            let mut stream = stream::iter(file_futures)
-                .buffered(buffer_size)
-                .try_flatten()
-                .map_ok(|record_batch| -> Box<dyn EngineData> {
-                    Box::new(ArrowEngineData::new(record_batch))
-                });
-
-            // send each record batch over the channel
-            while let Some(item) = stream.next().await {
-                if tx.send(item).is_err() {
-                    warn!("read_json receiver end of channel dropped before sending completed");
-                }
-            }
-        });
-
-        Ok(Box::new(rx.into_iter()))
+        super::stream_future_to_iter(
+            self.task_executor.clone(),
+            Self::read_json_files_impl(
+                self.store.clone(),
+                files.to_vec(),
+                physical_schema,
+                predicate,
+                self.batch_size,
+                self.buffer_size,
+            ),
+            self.buffer_size, // TODO: Should the channel and stream have different buffer sizes?
+        )
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -140,23 +181,12 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()> {
-        let buffer = to_json_bytes(data)?;
-        let put_mode = if overwrite {
-            PutMode::Overwrite
-        } else {
-            PutMode::Create
-        };
-
-        let store = self.store.clone(); // cheap Arc
-        let path = Path::from_url_path(path.path())?;
-        let path_str = path.to_string();
-        self.task_executor
-            .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
-                e => e.into(),
-            })?;
-        Ok(())
+        self.task_executor.block_on(Self::write_json_file_impl(
+            self.store.clone(),
+            path.clone(),
+            to_json_bytes(data)?,
+            overwrite,
+        ))
     }
 }
 
