@@ -6,8 +6,8 @@ use itertools::Itertools;
 
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
-    NullBufferBuilder, RecordBatch, StringArray, StructArray,
+    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, Decimal128Array,
+    Decimal256Array, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
@@ -18,7 +18,9 @@ use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields, IntervalUnit, TimeUnit,
 };
 use crate::arrow::error::ArrowError;
-use crate::arrow::json::writer::{make_encoder, EncoderOptions};
+use crate::arrow::json::writer::{
+    make_encoder, Encoder, EncoderFactory, EncoderOptions, NullableEncoder,
+};
 use crate::arrow::json::StructMode;
 use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_expression::opaque::{
@@ -436,6 +438,85 @@ pub fn evaluate_predicate(
     }
 }
 
+/// Custom encoder for Decimal128 arrays with scale=0.
+/// Encodes them as integers without decimal points (e.g., "123" instead of "123.0").
+struct Decimal128ScaleZeroAsIntEncoder<'a> {
+    array: &'a Decimal128Array,
+}
+
+impl<'a> Encoder for Decimal128ScaleZeroAsIntEncoder<'a> {
+    fn encode(&mut self, idx: usize, buf: &mut Vec<u8>) {
+        let value = self.array.value(idx);
+        // Write as integer directly to buffer
+        use std::io::Write;
+        #[allow(clippy::expect_used)]
+        write!(buf, "{}", value as i64).expect("Failed to write integer");
+    }
+}
+
+/// Custom encoder for Decimal256 arrays with scale=0.
+/// Encodes them as integers without decimal points.
+struct Decimal256ScaleZeroAsIntEncoder<'a> {
+    array: &'a Decimal256Array,
+}
+
+impl<'a> Encoder for Decimal256ScaleZeroAsIntEncoder<'a> {
+    fn encode(&mut self, idx: usize, buf: &mut Vec<u8>) {
+        let value = self.array.value(idx);
+        // Convert i256 to i64 for JSON encoding (may truncate large values)
+        let value_i64 = value.as_i128() as i64;
+        use std::io::Write;
+        #[allow(clippy::expect_used)]
+        write!(buf, "{}", value_i64).expect("Failed to write integer");
+    }
+}
+
+/// EncoderFactory that provides custom encoders for Decimal types with scale=0.
+/// Returns encoders that serialize decimals as integers in JSON output.
+#[derive(Debug)]
+struct DecimalScaleZeroAsIntEncoderFactory;
+
+impl EncoderFactory for DecimalScaleZeroAsIntEncoderFactory {
+    fn make_default_encoder<'a>(
+        &self,
+        field: &'a Arc<ArrowField>,
+        array: &'a dyn Array,
+        _options: &'a EncoderOptions,
+    ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
+        match field.data_type() {
+            ArrowDataType::Decimal128(_, scale) if *scale == 0 => {
+                #[allow(clippy::expect_used)]
+                let decimal_array = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Field type is Decimal128 but array is not. This is a bug.");
+                let encoder = Decimal128ScaleZeroAsIntEncoder {
+                    array: decimal_array,
+                };
+                Ok(Some(NullableEncoder::new(
+                    Box::new(encoder),
+                    array.nulls().cloned(),
+                )))
+            }
+            ArrowDataType::Decimal256(_, scale) if *scale == 0 => {
+                #[allow(clippy::expect_used)]
+                let decimal_array = array
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .expect("Field type is Decimal256 but array is not. This is a bug.");
+                let encoder = Decimal256ScaleZeroAsIntEncoder {
+                    array: decimal_array,
+                };
+                Ok(Some(NullableEncoder::new(
+                    Box::new(encoder),
+                    array.nulls().cloned(),
+                )))
+            }
+            _ => Ok(None), // Use default encoder for all other types
+        }
+    }
+}
+
 /// Converts a StructArray to JSON-encoded strings
 pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
     let (array_ref, _is_scalar) = input.get();
@@ -453,13 +534,16 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
                 return Ok(Arc::new(StringArray::from(Vec::<Option<String>>::new())));
             }
 
-            // Create the encoder using make_encoder with "struct mode" (not "list mode")
+            // Create the encoder using make_encoder with custom EncoderFactory for Decimal scale=0
             let field = Arc::new(ArrowField::new_struct(
                 "root",
                 struct_array.fields().iter().cloned().collect_vec(),
                 true,
             ));
-            let options = EncoderOptions::default().with_struct_mode(StructMode::ObjectOnly);
+            let factory = Arc::new(DecimalScaleZeroAsIntEncoderFactory);
+            let options = EncoderOptions::default()
+                .with_struct_mode(StructMode::ObjectOnly)
+                .with_encoder_factory(factory);
             let mut encoder = make_encoder(&field, struct_array, &options)?;
 
             // Pre-allocate the various buffers
@@ -1098,5 +1182,242 @@ mod tests {
             .unwrap();
         validate_i32_column(nested_struct_result, 0, &[1, 2, 3]);
         validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_to_json_decimal_scale_zero() {
+        use crate::arrow::array::{Decimal128Array, Int32Array};
+        use crate::arrow::datatypes::DataType as ArrowDataType;
+
+        // Create arrays with sample data
+        // For Decimal(10, 0): value 1234 stored as 1234 (no scaling)
+        // For Decimal(10, 2): value 12.34 stored as 1234 (scaled by 10^2)
+        let decimal_scale0 = Arc::new(
+            Decimal128Array::from(vec![1234, 5678])
+                .with_precision_and_scale(10, 0)
+                .unwrap(),
+        );
+        let decimal_scale2 = Arc::new(
+            Decimal128Array::from(vec![1234, 5678])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let int_array = Arc::new(Int32Array::from(vec![42, 99]));
+
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new(
+                    "decimalScale0",
+                    ArrowDataType::Decimal128(10, 0),
+                    false,
+                )),
+                decimal_scale0 as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    "decimalScale2",
+                    ArrowDataType::Decimal128(10, 2),
+                    false,
+                )),
+                decimal_scale2 as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("normalInt", ArrowDataType::Int32, false)),
+                int_array as ArrayRef,
+            ),
+        ]);
+
+        // Convert to JSON
+        let result = to_json(&struct_array).unwrap();
+        let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        // Check the JSON strings
+        assert_eq!(json_array.len(), 2);
+
+        // First row
+        let json1 = json_array.value(0);
+        assert!(
+            json1.contains(r#""decimalScale0":1234"#),
+            "Scale=0 decimal should NOT have .0, got: {}",
+            json1
+        );
+        assert!(
+            json1.contains(r#""decimalScale2":12.34"#),
+            "Scale=2 decimal SHOULD have decimal point, got: {}",
+            json1
+        );
+        assert!(json1.contains(r#""normalInt":42"#));
+
+        // Second row
+        let json2 = json_array.value(1);
+        assert!(
+            json2.contains(r#""decimalScale0":5678"#),
+            "Scale=0 decimal should NOT have .0, got: {}",
+            json2
+        );
+        assert!(
+            json2.contains(r#""decimalScale2":56.78"#),
+            "Scale=2 decimal SHOULD have decimal point, got: {}",
+            json2
+        );
+        assert!(json2.contains(r#""normalInt":99"#));
+    }
+
+    #[test]
+    fn test_to_json_decimal256_scale_zero() {
+        use crate::arrow::array::Decimal256Array;
+        use crate::arrow::datatypes::i256;
+        use crate::arrow::datatypes::DataType as ArrowDataType;
+
+        // Test Decimal256 with scale=0 conversion
+        let decimal256_scale0 = Arc::new(
+            Decimal256Array::from(vec![i256::from_i128(9999), i256::from_i128(1111)])
+                .with_precision_and_scale(20, 0)
+                .unwrap(),
+        );
+        let decimal256_scale3 = Arc::new(
+            Decimal256Array::from(vec![i256::from_i128(9999), i256::from_i128(1111)])
+                .with_precision_and_scale(20, 3)
+                .unwrap(),
+        );
+
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new(
+                    "decimal256Scale0",
+                    ArrowDataType::Decimal256(20, 0),
+                    false,
+                )),
+                decimal256_scale0 as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    "decimal256Scale3",
+                    ArrowDataType::Decimal256(20, 3),
+                    false,
+                )),
+                decimal256_scale3 as ArrayRef,
+            ),
+        ]);
+
+        // Convert to JSON
+        let result = to_json(&struct_array).unwrap();
+        let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(json_array.len(), 2);
+
+        // First row - scale=0 should be integer, scale=3 should have decimal point
+        let json1 = json_array.value(0);
+        assert!(
+            json1.contains(r#""decimal256Scale0":9999"#),
+            "Decimal256 scale=0 should NOT have .0, got: {}",
+            json1
+        );
+        assert!(
+            json1.contains(r#""decimal256Scale3":9.999"#),
+            "Decimal256 scale=3 SHOULD have decimal point, got: {}",
+            json1
+        );
+
+        // Second row
+        let json2 = json_array.value(1);
+        assert!(
+            json2.contains(r#""decimal256Scale0":1111"#),
+            "Decimal256 scale=0 should NOT have .0, got: {}",
+            json2
+        );
+        assert!(
+            json2.contains(r#""decimal256Scale3":1.111"#),
+            "Decimal256 scale=3 SHOULD have decimal point, got: {}",
+            json2
+        );
+    }
+
+    #[test]
+    fn test_to_json_nested_struct_with_decimal_scale_zero() {
+        use crate::arrow::array::{Decimal128Array, Int32Array};
+        use crate::arrow::datatypes::DataType as ArrowDataType;
+
+        // Test nested struct containing Decimal with scale=0
+        let inner_decimal = Arc::new(
+            Decimal128Array::from(vec![100, 200])
+                .with_precision_and_scale(10, 0)
+                .unwrap(),
+        );
+        let inner_int = Arc::new(Int32Array::from(vec![1, 2]));
+
+        let inner_struct = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new(
+                    "innerDecimal",
+                    ArrowDataType::Decimal128(10, 0),
+                    false,
+                )),
+                inner_decimal as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new("innerInt", ArrowDataType::Int32, false)),
+                inner_int as ArrayRef,
+            ),
+        ]));
+
+        let outer_int = Arc::new(Int32Array::from(vec![10, 20]));
+
+        let outer_struct = StructArray::from(vec![
+            (
+                Arc::new(ArrowField::new("outerInt", ArrowDataType::Int32, false)),
+                outer_int as ArrayRef,
+            ),
+            (
+                Arc::new(ArrowField::new(
+                    "nestedStruct",
+                    inner_struct.data_type().clone(),
+                    false,
+                )),
+                inner_struct as ArrayRef,
+            ),
+        ]);
+
+        // Convert to JSON
+        let result = to_json(&outer_struct).unwrap();
+        let json_array = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(json_array.len(), 2);
+
+        // First row - nested decimal should be converted to integer
+        let json1 = json_array.value(0);
+        assert!(
+            json1.contains(r#""outerInt":10"#),
+            "Outer int not found, got: {}",
+            json1
+        );
+        assert!(
+            json1.contains(r#""innerDecimal":100"#),
+            "Nested decimal scale=0 should NOT have .0, got: {}",
+            json1
+        );
+        assert!(
+            json1.contains(r#""innerInt":1"#),
+            "Inner int not found, got: {}",
+            json1
+        );
+
+        // Second row
+        let json2 = json_array.value(1);
+        assert!(
+            json2.contains(r#""outerInt":20"#),
+            "Outer int not found, got: {}",
+            json2
+        );
+        assert!(
+            json2.contains(r#""innerDecimal":200"#),
+            "Nested decimal scale=0 should NOT have .0, got: {}",
+            json2
+        );
+        assert!(
+            json2.contains(r#""innerInt":2"#),
+            "Inner int not found, got: {}",
+            json2
+        );
     }
 }
