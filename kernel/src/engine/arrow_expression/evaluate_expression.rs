@@ -439,7 +439,14 @@ pub fn evaluate_predicate(
 }
 
 /// Custom encoder for Decimal128 arrays with scale=0.
-/// Encodes them as integers without decimal points (e.g., "123" instead of "123.0").
+///
+/// Delta Lake requires Decimal values with scale=0 to serialize as JSON integers without
+/// decimal points (e.g., "123" not "123.0"). Arrow's default encoder adds ".0" to all
+/// decimals regardless of scale, so we provide this custom encoder for scale=0 cases.
+///
+/// When scale=0, the decimal represents a whole number with no fractional part:
+/// - Decimal128(10, 0) with value 1234 represents exactly 1234
+/// - Decimal128(10, 2) with value 1234 represents 12.34 (divided by 10^2)
 struct Decimal128ScaleZeroAsIntEncoder<'a> {
     array: &'a Decimal128Array,
 }
@@ -448,14 +455,18 @@ impl<'a> Encoder for Decimal128ScaleZeroAsIntEncoder<'a> {
     fn encode(&mut self, idx: usize, buf: &mut Vec<u8>) {
         let value = self.array.value(idx);
         // Write as integer directly to buffer
-        use std::io::Write;
-        #[allow(clippy::expect_used)]
-        write!(buf, "{}", value as i64).expect("Failed to write integer");
+        // Writing to String is infallible, so we can safely ignore the result
+        use std::fmt::Write as FmtWrite;
+        let mut s = String::new();
+        let _ = write!(s, "{}", value as i64);
+        buf.extend_from_slice(s.as_bytes());
     }
 }
 
 /// Custom encoder for Decimal256 arrays with scale=0.
-/// Encodes them as integers without decimal points.
+///
+/// Same as Decimal128ScaleZeroAsIntEncoder but for Decimal256 types.
+/// See Decimal128ScaleZeroAsIntEncoder for detailed explanation.
 struct Decimal256ScaleZeroAsIntEncoder<'a> {
     array: &'a Decimal256Array,
 }
@@ -465,14 +476,27 @@ impl<'a> Encoder for Decimal256ScaleZeroAsIntEncoder<'a> {
         let value = self.array.value(idx);
         // Convert i256 to i64 for JSON encoding (may truncate large values)
         let value_i64 = value.as_i128() as i64;
-        use std::io::Write;
-        #[allow(clippy::expect_used)]
-        write!(buf, "{}", value_i64).expect("Failed to write integer");
+        // Write as integer directly to buffer
+        // Writing to String is infallible, so we can safely ignore the result
+        use std::fmt::Write as FmtWrite;
+        let mut s = String::new();
+        let _ = write!(s, "{}", value_i64);
+        buf.extend_from_slice(s.as_bytes());
     }
 }
 
 /// EncoderFactory that provides custom encoders for Decimal types with scale=0.
-/// Returns encoders that serialize decimals as integers in JSON output.
+///
+/// This factory is used by Arrow's JSON encoder to selectively inject custom encoding logic
+/// for specific field types. When Arrow encounters a field during JSON encoding, it calls
+/// `make_default_encoder()` to check if we want to override the default behavior.
+///
+/// For Decimal128/256 fields with scale=0, we return custom encoders that write integers.
+/// For all other fields, we return None, causing Arrow to use its default encoder.
+///
+/// This approach allows us to customize encoding behavior without transforming the data,
+/// and it works automatically for nested structs since Arrow recursively calls the factory
+/// for each field at every nesting level.
 #[derive(Debug)]
 struct DecimalScaleZeroAsIntEncoderFactory;
 
@@ -485,11 +509,15 @@ impl EncoderFactory for DecimalScaleZeroAsIntEncoderFactory {
     ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
         match field.data_type() {
             ArrowDataType::Decimal128(_, scale) if *scale == 0 => {
-                #[allow(clippy::expect_used)]
                 let decimal_array = array
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .expect("Field type is Decimal128 but array is not. This is a bug.");
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError(format!(
+                            "Field type is Decimal128 but array type is {}. This is a bug.",
+                            array.data_type()
+                        ))
+                    })?;
                 let encoder = Decimal128ScaleZeroAsIntEncoder {
                     array: decimal_array,
                 };
@@ -499,11 +527,15 @@ impl EncoderFactory for DecimalScaleZeroAsIntEncoderFactory {
                 )))
             }
             ArrowDataType::Decimal256(_, scale) if *scale == 0 => {
-                #[allow(clippy::expect_used)]
                 let decimal_array = array
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
-                    .expect("Field type is Decimal256 but array is not. This is a bug.");
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError(format!(
+                            "Field type is Decimal256 but array type is {}. This is a bug.",
+                            array.data_type()
+                        ))
+                    })?;
                 let encoder = Decimal256ScaleZeroAsIntEncoder {
                     array: decimal_array,
                 };
