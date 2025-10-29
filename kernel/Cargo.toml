@@ -54,6 +54,7 @@ tracing = { version = "0.1", features = ["log"] }
 url = "2"
 uuid = { version = "1.18.0", features = ["v4", "fast-rng"] }
 z85 = "3.0.6"
+regex = "1"
 
 # optional deps
 futures = { version = "0.3", optional = true }
