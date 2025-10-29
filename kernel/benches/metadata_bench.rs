@@ -17,7 +17,6 @@
 //!
 //! Follow-ups: <https://github.com/delta-io/delta-kernel-rs/issues/1185>
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -42,12 +41,10 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
     // TODO: use multi-threaded executor
     use delta_kernel::engine::default::storage::store_from_url;
-    let engine = DefaultEngine::new(Arc::new(
-        store_from_url(&url).expect("Failed to create store"),
-    ));
-    let engine = engine_to_handle(Arc::new(engine), allocate_error);
+    let store = store_from_url(&url).expect("Failed to create store");
+    let engine = DefaultEngine::new(store);
 
-    (tempdir, url, engine)
+    (tempdir, url, Arc::new(engine))
 }
 
 fn create_snapshot_benchmark(c: &mut Criterion) {
