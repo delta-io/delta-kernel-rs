@@ -64,8 +64,12 @@ impl ToDataType for DeletionVectorStorageType {
 /// have business logic to help convert [`crate::actions::deletion_vector_writer::DeletionVectorWriteResult`] to a [`DeletionVectorDescriptor`]
 /// with appropriate storage type and path.
 pub struct DeletionVectorPath {
+    /// The base URL path to the Delta table
     table_path: Url,
+    /// Unique identifier for this deletion vector file
     uuid: uuid::Uuid,
+    /// Optional directory prefix within the table path where the DV file will be located,
+    /// this is to allow for randomizing reads/writes to avoid object store throttling.
     prefix: String,
 }
 
@@ -90,22 +94,19 @@ impl DeletionVectorPath {
     /// Helper method to cosntruct the relative path to a deletion vector file,
     /// the prefix and the UUID suffix.
     fn relative_path(prefix: &str, uuid: &uuid::Uuid) -> String {
-        let uuid_as_string = uuid::Uuid::to_string(uuid);
         if !prefix.is_empty() {
-            format!("{prefix}/deletion_vector_{uuid_as_string}.bin")
+            format!("{prefix}/deletion_vector_{uuid}.bin")
         } else {
-            format!("deletion_vector_{uuid_as_string}.bin")
+            format!("deletion_vector_{uuid}.bin")
         }
     }
 
     /// Returns the absolute path to the deletion vector file.
     pub fn absolute_path(&self) -> DeltaResult<Url> {
         let dv_suffix = Self::relative_path(&self.prefix, &self.uuid);
-        let dv_path = self
-            .table_path
+        self.table_path
             .join(&dv_suffix)
-            .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
-        Ok(dv_path)
+            .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))
     }
 
     /// Returns the compressed encoded path for use in descriptor (prefix + z85 encoded UUID).
@@ -271,10 +272,15 @@ impl DeletionVectorDescriptor {
                 );
 
                 // get the Bytes back out and limit it to dv_size
-                let position = cursor.position() as usize;
+                let position: usize = cursor.position().try_into().map_err(|_| {
+                    Error::DeletionVector("position doesn't fit in usize".to_string())
+                })?;
                 let bytes = cursor.into_inner();
                 // -4 to remove CRC portion.
-                let truncate_pos = position + dv_size as usize - 4;
+                let dv_size_usize: usize = dv_size.try_into().map_err(|_| {
+                    Error::DeletionVector("dv_size doesn't fit in usize".to_string())
+                })?;
+                let truncate_pos = position + dv_size_usize - 4;
 
                 if validate_crc {
                     require!(
@@ -294,12 +300,12 @@ impl DeletionVectorDescriptor {
                     require!(
                         crc == expected_crc,
                         Error::DeletionVector(format!(
-                            "CRC32 checksum mismatch: {crc} != {expected_crc}"
+                            "CRC32 checksum mismatch. Got: {crc}, expected: {expected_crc}"
                         ))
                     );
                 }
                 let dv_bytes = bytes.slice(position..truncate_pos);
-                let cursor = Cursor::new(dv_bytes.clone());
+                let cursor = Cursor::new(dv_bytes);
                 RoaringTreemap::deserialize_from(cursor)
                     .map_err(|err| Error::DeletionVector(err.to_string()))
             }
