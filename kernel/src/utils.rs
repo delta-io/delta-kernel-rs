@@ -146,7 +146,9 @@ impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, 
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::actions::{get_log_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
+    use crate::actions::{
+        get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
+    };
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
@@ -243,7 +245,7 @@ pub(crate) mod test_utils {
     pub(crate) fn parse_json_batch(json_strings: StringArray) -> Box<dyn EngineData> {
         let engine = SyncEngine::new();
         let json_handler = engine.json_handler();
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_all_actions_schema().clone();
         json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap()
