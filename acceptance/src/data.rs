@@ -85,15 +85,21 @@ fn assert_schema_fields_match(schema: &Schema, golden: &Schema) {
 
 // some things are equivalent, but don't show up as equivalent for `==`, so we normalize here
 fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
-    if let DataType::Timestamp(unit, Some(zone)) = col.data_type() {
-        if **zone == *"+00:00" {
-            let data_type = DataType::Timestamp(*unit, Some("UTC".into()));
-            delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to UTC")
-        } else {
-            col
+    match col.data_type() {
+        DataType::Timestamp(unit, Some(zone)) => {
+            if **zone == *"+00:00" {
+                let data_type = DataType::Timestamp(*unit, Some("UTC".into()));
+                delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to UTC")
+            } else {
+                col
+            }
         }
-    } else {
-        col
+        DataType::Utf8 => {
+            // just make everything LargeUtf8
+            let data_type = DataType::LargeUtf8;
+            delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to large utf8")
+        }
+        _ => col
     }
 }
 
