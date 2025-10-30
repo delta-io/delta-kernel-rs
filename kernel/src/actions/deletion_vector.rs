@@ -258,9 +258,25 @@ impl DeletionVectorDescriptor {
                     Error::DeletionVector(format!("Invalid version {version} for {path}"))
                 );
 
-                if let Some(offset) = offset {
-                    cursor.set_position(offset as u64);
-                }
+                // Deletion vector file format:
+                //  |--------------+-----------------|
+                //  |  num bytes   |  value          |
+                //  |==============+=================|
+                //  | 1 byte       |  version        |
+                //  |--------------+-----------------|
+                //  | offset-1     |  other dvs...   |
+                //  |--------------+-----------------| <- this_dv_start
+                //  | 4 bytes      |  dv_size        |
+                //  |--------------+-----------------|
+                //  | 4 bytes      |  magic value    |
+                //  |--------------+-----------------| <- bitmap_start
+                //  | dv_size bytes|  bitmap         |
+                //  |--------------+-----------------| <- crc_start
+                //  | 4 bytes      |  CRC            |
+                //  |--------------+-----------------|
+
+                let this_dv_start = offset.unwrap_or(1) as usize;
+                cursor.set_position(this_dv_start as u64);
                 let dv_size = read_u32(&mut cursor, Endian::Big)?;
                 require!(
                     dv_size == size_in_bytes as u32,
@@ -274,34 +290,33 @@ impl DeletionVectorDescriptor {
                     Error::DeletionVector(format!("Invalid magic {magic} for {path}"))
                 );
 
-                // get the Bytes back out and limit it to dv_size
-                let position: usize = cursor.position().try_into().map_err(|_| {
-                    Error::DeletionVector(format!("position doesn't fit in usize for {path}"))
-                })?;
                 let bytes = cursor.into_inner();
-                // -4 to remove CRC portion.
                 let dv_size_usize: usize = dv_size.try_into().map_err(|_| {
                     Error::DeletionVector(format!("{path}'s dv_size doesn't fit in usize"))
                 })?;
-                let truncate_pos = position + dv_size_usize - 4;
+                // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
+                let bitmap_start = this_dv_start + 8;
+                // crc_start = bitmap_start + bitmap_size (dv_size - 4 for CRC)
+                let crc_start = bitmap_start + dv_size_usize - 4;
 
                 // +4 to account for CRC value
                 require!(
-                    bytes.len() >= truncate_pos + 4,
+                    bytes.len() >= crc_start + 4,
                     Error::DeletionVector(format!(
                         "Can't read deletion vector for {path} as there are not enough bytes. Expected {}, but got {}",
-                        truncate_pos + 4,
+                        crc_start + 4,
                         bytes.len()
                     ))
                 );
 
                 if validate_crc {
                     let mut crc_cursor: Cursor<Bytes> =
-                        Cursor::new(bytes.slice(truncate_pos..truncate_pos + 4));
+                        Cursor::new(bytes.slice(crc_start..crc_start + 4));
                     let crc = read_u32(&mut crc_cursor, Endian::Big)?;
                     let crc32 = create_dv_crc32();
-                    // -4 to include magic portion of the CRC
-                    let expected_crc = crc32.checksum(&bytes.slice(position - 4..truncate_pos));
+                    // CRC is calculated from magic field through end of bitmap
+                    let magic_start = bitmap_start - 4;
+                    let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
                     require!(
                         crc == expected_crc,
                         Error::DeletionVector(format!(
@@ -309,7 +324,7 @@ impl DeletionVectorDescriptor {
                         ))
                     );
                 }
-                let dv_bytes = bytes.slice(position..truncate_pos);
+                let dv_bytes = bytes.slice(bitmap_start..crc_start);
                 let cursor = Cursor::new(dv_bytes);
                 RoaringTreemap::deserialize_from(cursor)
                     .map_err(|err| Error::DeletionVector(format!("Failed to deserialize deletion vector for {path}: {err}")))
