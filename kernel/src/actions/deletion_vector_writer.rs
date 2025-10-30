@@ -1,7 +1,6 @@
 //! Code for writing deletion vectors to object storage.
 //!
 //! This module provides APIs for engines to write deletion vectors as part of a Delta transaction.
-//! It follows the design outlined in the "Deletion Vector Writes in Rust Kernel" design document.
 
 use std::borrow::Borrow;
 use std::io::Write;
