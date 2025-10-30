@@ -49,8 +49,8 @@ pub unsafe extern "C" fn visit_domain_metadata(
     engine_context: NullableCvoid,
     visitor: extern "C" fn(
         engine_context: NullableCvoid,
-        key: KernelStringSlice,
-        value: KernelStringSlice,
+        domain: KernelStringSlice,
+        configuration: KernelStringSlice,
     ),
 ) -> ExternResult<bool> {
     let snapshot = unsafe { snapshot.as_ref() };
@@ -70,12 +70,14 @@ fn visit_domain_metadata_impl(
         value: KernelStringSlice,
     ),
 ) -> DeltaResult<bool> {
-    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref());
-    res?.iter().for_each(|(key, value)| {
+    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    res.iter().for_each(|metadata| {
+        let domain = &metadata.domain();
+        let configuration = &metadata.configuration();
         visitor(
             engine_context,
-            kernel_string_slice!(key),
-            kernel_string_slice!(value),
+            kernel_string_slice!(domain),
+            kernel_string_slice!(configuration),
         );
     });
 
@@ -246,6 +248,8 @@ mod tests {
         let collected_metadata = unsafe { Box::from_raw(visitor_state_ptr) };
         assert!(res);
         assert!(collected_metadata.get("domain1").is_none());
+        println!("{:?}", collected_metadata);
+        println!("{:?}", collected_metadata.get("delta.domain3"));
         assert!(collected_metadata.get("delta.domain3").is_none());
         assert_eq!(
             collected_metadata.get("domain2").unwrap(),

@@ -34,15 +34,15 @@ pub(crate) fn domain_metadata_configuration(
         .remove(domain)
         .map(|domain_metadata| domain_metadata.configuration))
 }
+
 pub(crate) fn all_domain_metadata_configuration(
     log_segment: &LogSegment,
     engine: &dyn Engine,
-) -> DeltaResult<HashMap<String, String>> {
+) -> DeltaResult<Vec<DomainMetadata>> {
     let domain_metadatas = scan_domain_metadatas(log_segment, None, engine)?;
-
     Ok(domain_metadatas
         .into_iter()
-        .map(|(key, domain_metadata)| (key, domain_metadata.configuration))
+        .map(|(key, domain_metadata)| DomainMetadata::new(key, domain_metadata.configuration))
         .collect())
 }
 
