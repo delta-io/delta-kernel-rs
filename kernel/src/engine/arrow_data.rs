@@ -90,6 +90,11 @@ impl From<Box<ArrowEngineData>> for RecordBatch {
     }
 }
 
+/// Helper function to get a string value from an array using the specified offset size
+fn get_string_value<OffsetSize: OffsetSizeTrait>(arry: &dyn Array, index: usize) -> String {
+    arry.as_string::<OffsetSize>().value(index).to_string()
+}
+
 impl<OffsetSize> EngineList for GenericListArray<OffsetSize>
 where
     OffsetSize: OffsetSizeTrait,
@@ -100,12 +105,10 @@ where
 
     fn get(&self, row_index: usize, index: usize) -> String {
         let arry = self.value(row_index);
-        if let Some(sarry) = arry.as_string_opt::<i64>() {
-            sarry.value(index).to_string()
-        } else if let Some(sarry) = arry.as_string_opt::<i32>() {
-            sarry.value(index).to_string()
-        } else {
-            String::new()
+        match arry.data_type() {
+            ArrowDataType::LargeUtf8 => get_string_value::<i64>(arry.as_ref(), index),
+            ArrowDataType::Utf8 => get_string_value::<i32>(arry.as_ref(), index),
+            _ => String::new(),
         }
     }
 
@@ -118,62 +121,70 @@ where
     }
 }
 
+/// Helper function to get a map value by key using the specified offset size
+fn get_map_value<'a, OffsetSize: OffsetSizeTrait>(
+    keys: &'a dyn Array,
+    vals: &'a dyn Array,
+    start_offset: usize,
+    count: usize,
+    key: &str,
+) -> Option<&'a str> {
+    let keys = keys.as_string::<OffsetSize>();
+    let vals = vals.as_string::<OffsetSize>();
+    for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
+        if let Some(map_key) = map_key {
+            if key == map_key {
+                return Some(vals.value(idx));
+            }
+        }
+    }
+    None
+}
+
+/// Helper function to materialize a map using the specified offset size
+fn materialize_map<OffsetSize: OffsetSizeTrait>(
+    keys: &dyn Array,
+    values: &dyn Array,
+) -> HashMap<String, String> {
+    let mut ret = HashMap::new();
+    let keys = keys.as_string::<OffsetSize>();
+    let values = values.as_string::<OffsetSize>();
+    for (key, value) in keys.iter().zip(values.iter()) {
+        if let (Some(key), Some(value)) = (key, value) {
+            ret.insert(key.into(), value.into());
+        }
+    }
+    ret
+}
+
 impl EngineMap for MapArray {
     fn get<'a>(&'a self, row_index: usize, key: &str) -> Option<&'a str> {
         let offsets = self.offsets();
         let start_offset = offsets[row_index] as usize;
         let count = offsets[row_index + 1] as usize - start_offset;
 
-        if let (Some(keys), Some(vals)) = (
-            self.keys().as_string_opt::<i64>(),
-            self.values().as_string_opt::<i64>(),
-        ) {
-            for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
-                if let Some(map_key) = map_key {
-                    if key == map_key {
-                        return Some(vals.value(idx));
-                    }
-                }
+        match (self.keys().data_type(), self.values().data_type()) {
+            (ArrowDataType::LargeUtf8, ArrowDataType::LargeUtf8) => {
+                get_map_value::<i64>(self.keys(), self.values(), start_offset, count, key)
             }
-        } else if let (Some(keys), Some(vals)) = (
-            self.keys().as_string_opt::<i32>(),
-            self.values().as_string_opt::<i32>(),
-        ) {
-            for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
-                if let Some(map_key) = map_key {
-                    if key == map_key {
-                        return Some(vals.value(idx));
-                    }
-                }
+            (ArrowDataType::Utf8, ArrowDataType::Utf8) => {
+                get_map_value::<i32>(self.keys(), self.values(), start_offset, count, key)
             }
+            _ => None,
         }
-        None
     }
 
     fn materialize(&self, row_index: usize) -> HashMap<String, String> {
-        let mut ret = HashMap::new();
         let map_val = self.value(row_index);
-
-        if let (Some(keys), Some(values)) = (
-            map_val.column(0).as_string_opt::<i64>(),
-            map_val.column(1).as_string_opt::<i64>(),
-        ) {
-            for (key, value) in keys.iter().zip(values.iter()) {
-                if let (Some(key), Some(value)) = (key, value) {
-                    ret.insert(key.into(), value.into());
-                }
+        match (map_val.column(0).data_type(), map_val.column(1).data_type()) {
+            (ArrowDataType::LargeUtf8, ArrowDataType::LargeUtf8) => {
+                materialize_map::<i64>(map_val.column(0), map_val.column(1))
             }
-        } else if let (Some(keys), Some(values)) = (
-            map_val.column(0).as_string_opt::<i32>(),
-            map_val.column(1).as_string_opt::<i32>(),
-        ) {
-            for (key, value) in keys.iter().zip(values.iter()) {
-                if let (Some(key), Some(value)) = (key, value) {
-                    ret.insert(key.into(), value.into());
-                }
+            (ArrowDataType::Utf8, ArrowDataType::Utf8) => {
+                materialize_map::<i32>(map_val.column(0), map_val.column(1))
             }
+            _ => HashMap::new(),
         }
-        ret
     }
 }
 
@@ -336,10 +347,12 @@ impl ArrowEngineData {
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                col.as_string_opt::<i64>()
-                    .map(|a| a as _)
-                    .or_else(|| col.as_string_opt::<i32>().map(|a| a as _))
-                    .ok_or("string")
+                match col.data_type() {
+                    ArrowDataType::LargeUtf8 => col.as_string_opt::<i64>().map(|a| a as _),
+                    ArrowDataType::Utf8 => col.as_string_opt::<i32>().map(|a| a as _),
+                    _ => None,
+                }
+                .ok_or("string")
             }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
@@ -385,9 +398,7 @@ mod tests {
 
     use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::Int32Type;
-    use crate::arrow::array::{
-        Array, AsArray, Int32Array, LargeStringArray, RecordBatch, StringArray,
-    };
+    use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
