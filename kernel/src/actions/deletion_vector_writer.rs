@@ -3,6 +3,7 @@
 //! This module provides APIs for engines to write deletion vectors as part of a Delta transaction.
 //! It follows the design outlined in the "Deletion Vector Writes in Rust Kernel" design document.
 
+use std::borrow::Borrow;
 use std::io::Write;
 
 use bytes::Bytes;
@@ -20,7 +21,7 @@ use crate::{DeltaResult, Error};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use delta_kernel::actions::deletion_vector_writer::DeletionVector;
 ///
 /// struct MyDeletionVector {
@@ -104,7 +105,7 @@ impl DeletionVectorWriteResult {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use delta_kernel::actions::deletion_vector_writer::KernelDeletionVector;
 ///
 /// let mut dv = KernelDeletionVector::new();
@@ -130,11 +131,16 @@ impl KernelDeletionVector {
     }
 
     /// Adds indexes to be deleted to this deletion vector.
-    pub fn add_deleted_row_indexes(&mut self, iter: impl Iterator<Item = u64>) {
+    pub fn add_deleted_row_indexes<I, T>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+        T: Borrow<u64>,
+    {
         for index in iter {
-            self.dv.insert(index);
+            self.dv.insert(*index.borrow());
         }
     }
+
     /// Get the number of deleted rows in this deletion vector.
     pub fn cardinality(&self) -> u64 {
         self.dv.len()
@@ -179,15 +185,14 @@ impl DeletionVector for KernelDeletionVector {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use std::io::Cursor;
+/// ```rust
 /// use delta_kernel::actions::deletion_vector_writer::{StreamingDeletionVectorWriter, KernelDeletionVector};
 ///
 /// let mut buffer = Vec::new();
 /// let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
 ///
 /// let mut dv = KernelDeletionVector::new();
-/// dv.add_deleted_row_indexes([1, 5, 10].iter().copied());
+/// dv.add_deleted_row_indexes([1, 5, 10]);
 ///
 /// let descriptor = writer.write_deletion_vector(dv)?;
 /// writer.finalize()?;
@@ -195,8 +200,7 @@ impl DeletionVector for KernelDeletionVector {
 /// ```
 pub struct StreamingDeletionVectorWriter<'a, W: Write> {
     writer: &'a mut W,
-    current_offset: i32,
-    has_written_version: bool,
+    current_offset: usize,
 }
 
 impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
@@ -216,7 +220,6 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         Self {
             writer,
             current_offset: 0,
-            has_written_version: false,
         }
     }
 
@@ -246,7 +249,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     ///
     /// ```rust,ignore
     /// let mut dv = KernelDeletionVector::new();
-    /// dv.add_deleted_row_indexes([1, 5, 10].iter().copied());
+    /// dv.add_deleted_row_indexes([1, 5, 10]);
     ///
     /// let descriptor = writer.write_deletion_vector(dv)?;
     /// println!("Written DV at offset {} with size {}", descriptor.offset, descriptor.size_in_bytes);
@@ -257,24 +260,25 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         deletion_vector: impl DeletionVector,
     ) -> DeltaResult<DeletionVectorWriteResult> {
         // Write version byte on first write
-        if !self.has_written_version {
+        if offset == 0 { // Write header.
             self.writer
                 .write_all(&[1u8])
                 .map_err(|e| Error::generic(format!("Failed to write version byte: {}", e)))?;
             self.current_offset = 1;
-            self.has_written_version = true;
         }
 
         let cardinality = deletion_vector.cardinality();
         // Serialize the deletion vector to bytes
         let serialized = deletion_vector.serialize()?;
 
-        // Deserialize to get cardinality (we need this for the metadata)
-
         // Calculate sizes
 
         // The size field contains the size of data + magic(4) (doesn't include CRC)
         let dv_size = serialized.len() + 4;
+        // Use i32::MAX as the limit since Java implementations don't have unsigned integers.
+        // This ensures compatibility with the Scala/Java implementation [1].
+        // 
+        // [1] https://github.com/delta-io/delta/blob/b388f280d083d4cf92c6434e4f7a549fc26cd1fa/spark/src/main/scala/org/apache/spark/sql/delta/deletionvectors/RoaringBitmapArray.scala#L311
         if dv_size > i32::MAX as usize {
             return Err(Error::generic(
                 "Deletion vector size exceeds maximum allowed size",
@@ -282,7 +286,10 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         }
 
         // Record the offset where this DV size starts.
-        let dv_offset = self.current_offset;
+        let dv_offset: i32 = self
+            .current_offset
+            .try_into()
+            .map_err(|_| Error::generic("Deletion vector offset doesn't fit in i32"))?;
 
         // Write size (big-endian, as per Delta spec)
         let size_bytes = (dv_size as u32).to_be_bytes();
@@ -315,10 +322,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
 
         // Update offset for next write (size_prefix + magic + data + crc)
         let bytes_written = 4 + dv_size + 4; // size + (magic + data) + crc
-        self.current_offset = self
-            .current_offset
-            .checked_add(bytes_written as i32)
-            .ok_or_else(|| Error::generic("Deletion vector offset overflow"))?;
+        self.current_offset += bytes_written;
 
         Ok(DeletionVectorWriteResult {
             offset: dv_offset,
@@ -345,6 +349,12 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
     /// # Ok::<(), delta_kernel::Error>(())
     /// ```
     pub fn finalize(self) -> DeltaResult<()> {
+        // Note: Currently this method only flushes the writer, but is kept as an explicit API
+        // for future-proofing. If we need to support formats that require footers (e.g., Puffin
+        // files or new DV file formats), this provides a consistent place to add that logic
+        // without breaking downstream code.
+        //
+
         self.writer
             .flush()
             .map_err(|e| Error::generic(format!("Failed to flush writer: {}", e)))
@@ -365,7 +375,7 @@ mod tests {
     #[test]
     fn test_kernel_deletion_vector_add_indexes() {
         let mut dv = KernelDeletionVector::new();
-        dv.add_deleted_row_indexes([1u64, 5, 10].iter().copied());
+        dv.add_deleted_row_indexes([1u64, 5, 10]);
 
         assert_eq!(dv.cardinality(), 3);
         assert_eq!(
@@ -380,7 +390,7 @@ mod tests {
         let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
 
         let mut dv = KernelDeletionVector::new();
-        dv.add_deleted_row_indexes([0u64, 9].iter().copied());
+        dv.add_deleted_row_indexes([0u64, 9]);
 
         let descriptor = writer.write_deletion_vector(dv).unwrap();
         writer.finalize().unwrap();
@@ -401,10 +411,10 @@ mod tests {
         let mut writer = StreamingDeletionVectorWriter::new(&mut buffer);
 
         let mut dv1 = KernelDeletionVector::new();
-        dv1.add_deleted_row_indexes([0u64, 9].iter().copied());
+        dv1.add_deleted_row_indexes([0u64, 9]);
 
         let mut dv2 = KernelDeletionVector::new();
-        dv2.add_deleted_row_indexes([5u64, 15, 25].iter().copied());
+        dv2.add_deleted_row_indexes([5u64, 15, 25]);
 
         let desc1 = writer.write_deletion_vector(dv1).unwrap();
         let desc2 = writer.write_deletion_vector(dv2).unwrap();
@@ -425,7 +435,7 @@ mod tests {
 
         let mut dv = KernelDeletionVector::new();
         let test_indexes = vec![3, 4, 7, 11, 18, 29];
-        dv.add_deleted_row_indexes(test_indexes.iter().copied());
+        dv.add_deleted_row_indexes(&test_indexes);
 
         let descriptor = writer.write_deletion_vector(dv).unwrap();
         writer.finalize().unwrap();
@@ -695,7 +705,7 @@ mod tests {
 
         for indexes in &test_data {
             let mut dv = KernelDeletionVector::new();
-            dv.add_deleted_row_indexes(indexes.iter().copied());
+            dv.add_deleted_row_indexes(indexes);
 
             let write_result = writer.write_deletion_vector(dv).unwrap();
             descriptors.push(write_result);
