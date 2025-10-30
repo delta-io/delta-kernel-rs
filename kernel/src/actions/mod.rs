@@ -457,7 +457,7 @@ impl Protocol {
 
     /// Validates the relationship between reader features and writer features in the protocol.
     pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
-        // Validate reader version and features relationship
+        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
         if self.min_reader_version == 3 {
             require!(
                 self.reader_features.is_some(),
@@ -474,7 +474,7 @@ impl Protocol {
             );
         }
 
-        // Validate writer version and features relationship
+        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
         if self.min_writer_version == 7 {
             require!(
                 self.writer_features.is_some(),

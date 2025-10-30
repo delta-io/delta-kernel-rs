@@ -41,7 +41,9 @@ mod timestamp_ntz;
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum TableFeature {
-    // Writer-only features
+    //////////////////////////
+    // Writer-only features //
+    //////////////////////////
     /// Append Only Tables
     AppendOnly,
     /// Table invariants
@@ -70,7 +72,9 @@ pub(crate) enum TableFeature {
     #[serde(rename = "clustering")]
     ClusteredTable,
 
-    // ReaderWriter features
+    ///////////////////////////
+    // ReaderWriter features //
+    ///////////////////////////
     /// CatalogManaged tables:
     /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
     CatalogManaged,
