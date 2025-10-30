@@ -146,6 +146,7 @@ impl std::fmt::Debug for ActionReconciliationIterator {
         f.debug_struct("ActionReconciliationIterator")
             .field("actions_count", &self.actions_count)
             .field("add_actions_count", &self.add_actions_count)
+            .field("is_exhausted", &self.is_exhausted)
             .finish()
     }
 }
