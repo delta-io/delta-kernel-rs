@@ -100,10 +100,9 @@ where
 
     fn get(&self, row_index: usize, index: usize) -> String {
         let arry = self.value(row_index);
-        // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
-        if let Some(sarry) = arry.as_string_opt::<i32>() {
+        if let Some(sarry) = arry.as_string_opt::<i64>() {
             sarry.value(index).to_string()
-        } else if let Some(sarry) = arry.as_string_opt::<i64>() {
+        } else if let Some(sarry) = arry.as_string_opt::<i32>() {
             sarry.value(index).to_string()
         } else {
             String::new()
@@ -125,10 +124,9 @@ impl EngineMap for MapArray {
         let start_offset = offsets[row_index] as usize;
         let count = offsets[row_index + 1] as usize - start_offset;
 
-        // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
         if let (Some(keys), Some(vals)) = (
-            self.keys().as_string_opt::<i32>(),
-            self.values().as_string_opt::<i32>(),
+            self.keys().as_string_opt::<i64>(),
+            self.values().as_string_opt::<i64>(),
         ) {
             for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
                 if let Some(map_key) = map_key {
@@ -138,8 +136,8 @@ impl EngineMap for MapArray {
                 }
             }
         } else if let (Some(keys), Some(vals)) = (
-            self.keys().as_string_opt::<i64>(),
-            self.values().as_string_opt::<i64>(),
+            self.keys().as_string_opt::<i32>(),
+            self.values().as_string_opt::<i32>(),
         ) {
             for (idx, map_key) in keys.iter().enumerate().skip(start_offset).take(count) {
                 if let Some(map_key) = map_key {
@@ -156,10 +154,9 @@ impl EngineMap for MapArray {
         let mut ret = HashMap::new();
         let map_val = self.value(row_index);
 
-        // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
         if let (Some(keys), Some(values)) = (
-            map_val.column(0).as_string_opt::<i32>(),
-            map_val.column(1).as_string_opt::<i32>(),
+            map_val.column(0).as_string_opt::<i64>(),
+            map_val.column(1).as_string_opt::<i64>(),
         ) {
             for (key, value) in keys.iter().zip(values.iter()) {
                 if let (Some(key), Some(value)) = (key, value) {
@@ -167,8 +164,8 @@ impl EngineMap for MapArray {
                 }
             }
         } else if let (Some(keys), Some(values)) = (
-            map_val.column(0).as_string_opt::<i64>(),
-            map_val.column(1).as_string_opt::<i64>(),
+            map_val.column(0).as_string_opt::<i32>(),
+            map_val.column(1).as_string_opt::<i32>(),
         ) {
             for (key, value) in keys.iter().zip(values.iter()) {
                 if let (Some(key), Some(value)) = (key, value) {
@@ -339,10 +336,9 @@ impl ArrowEngineData {
             }
             &DataType::STRING => {
                 debug!("Pushing string array for {}", ColumnName::new(path));
-                // Try both i32 (StringArray) and i64 (LargeStringArray) offsets
-                col.as_string_opt::<i32>()
+                col.as_string_opt::<i64>()
                     .map(|a| a as _)
-                    .or_else(|| col.as_string_opt::<i64>().map(|a| a as _))
+                    .or_else(|| col.as_string_opt::<i32>().map(|a| a as _))
                     .ok_or("string")
             }
             &DataType::INTEGER => {
@@ -389,7 +385,9 @@ mod tests {
 
     use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::Int32Type;
-    use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
+    use crate::arrow::array::{
+        Array, AsArray, Int32Array, LargeStringArray, RecordBatch, StringArray,
+    };
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
