@@ -13,7 +13,9 @@ use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
+use delta_kernel::log_segment::LogSegment;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::scan::{Scan, ScanResult};
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
@@ -1579,14 +1581,56 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         "_delta_log/my_random_dir/_delta_log/_staged_commits/00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
         "_delta_log/_delta_log/00000000000000000000.json",
         "_delta_log/_delta_log/00000000000000000000.checkpoint.parquet",
+        "_delta_log/something/_delta_log/00000000000000000000.crc",
         "_delta_log/something/_delta_log/00000000000000000000.json",
         "_delta_log/something/_delta_log/00000000000000000000.checkpoint.parquet",
     ];
 
+    fn get_file_path_for_test(path: &ParsedLogPath) -> &str {
+        &path.location.location.as_str()[10..]
+    }
+
+    fn ensure_segment_does_not_contain(invalid_files: &[&str], segment: &LogSegment) {
+        assert!(
+            !segment.ascending_commit_files.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "ascending_commit_files contained invalid file"
+        );
+        assert!(
+            !segment.ascending_compaction_files.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "ascending_compaction_files contained invalid file"
+        );
+        assert!(
+            !segment.checkpoint_parts.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "checkpoint_parts contained invalid file"
+        );
+        if let Some(ref crc) = segment.latest_crc_file {
+            assert!(
+                !invalid_files.contains(&get_file_path_for_test(crc)),
+                "Latest crc contained invalid file"
+            );
+        }
+        if let Some(ref latest_commit) = segment.latest_commit_file {
+            assert!(
+                !invalid_files.contains(&get_file_path_for_test(latest_commit)),
+                "Latest commit contained invalid file"
+            );
+        }
+    }
+
     for invalid_file in invalid_files.iter() {
         let invalid_path = Path::from(*invalid_file);
         storage.put(&invalid_path, vec![1u8].into()).await?;
-        let _ = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
         storage.delete(&invalid_path).await?;
     }
 
@@ -1595,7 +1639,8 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         let invalid_path = Path::from(*invalid_file);
         storage.put(&invalid_path, vec![1u8].into()).await?;
     }
-    let _ = Snapshot::builder_for(location).build(engine.as_ref())?;
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
 
     Ok(())
 }
