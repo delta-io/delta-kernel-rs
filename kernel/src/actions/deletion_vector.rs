@@ -238,7 +238,12 @@ impl DeletionVectorDescriptor {
             }
             Some(path) => {
                 let offset = self.offset;
-                let size_in_bytes = self.size_in_bytes;
+                let size_in_bytes: u32 =
+                    self.size_in_bytes
+                        .try_into()
+                        .or(Err(Error::DeletionVector(format!(
+                            "size_in_bytes doesn't fit in usize for {path}"
+                        ))))?;
 
                 let dv_data = storage
                     .read_files(vec![(path.clone(), None)])?
@@ -279,7 +284,7 @@ impl DeletionVectorDescriptor {
                 cursor.set_position(this_dv_start as u64);
                 let dv_size = read_u32(&mut cursor, Endian::Big)?;
                 require!(
-                    dv_size == size_in_bytes as u32,
+                    dv_size == size_in_bytes,
                     Error::DeletionVector(format!(
                         "DV size mismatch for {path}. Log indicates {size_in_bytes}, file says: {dv_size}"
                     ))
@@ -291,13 +296,12 @@ impl DeletionVectorDescriptor {
                 );
 
                 let bytes = cursor.into_inner();
-                let dv_size_usize: usize = dv_size.try_into().map_err(|_| {
-                    Error::DeletionVector(format!("{path}'s dv_size doesn't fit in usize"))
-                })?;
                 // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
                 let bitmap_start = this_dv_start + 8;
                 // crc_start = bitmap_start + bitmap_size (dv_size - 4 for CRC)
-                let crc_start = bitmap_start + dv_size_usize - 4;
+                // Safety: size_in_bytes is checked to fit in u32 which for all known platforms should
+                // fix in usize range.
+                let crc_start = bitmap_start + (size_in_bytes as usize) - 4;
 
                 // +4 to account for CRC value
                 require!(
@@ -316,6 +320,7 @@ impl DeletionVectorDescriptor {
                     let crc32 = create_dv_crc32();
                     // CRC is calculated from magic field through end of bitmap
                     let magic_start = bitmap_start - 4;
+                    // Safety: verified bytes is larger than crc_start + 4, above.
                     let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
                     require!(
                         crc == expected_crc,
@@ -324,6 +329,7 @@ impl DeletionVectorDescriptor {
                         ))
                     );
                 }
+                // Safety: verified bytes is larger than crc_start + 4, above.
                 let dv_bytes = bytes.slice(bitmap_start..crc_start);
                 let cursor = Cursor::new(dv_bytes);
                 RoaringTreemap::deserialize_from(cursor).map_err(|err| {

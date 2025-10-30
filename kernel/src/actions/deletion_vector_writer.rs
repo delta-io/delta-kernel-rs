@@ -259,7 +259,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         deletion_vector: impl DeletionVector,
     ) -> DeltaResult<DeletionVectorWriteResult> {
         // Write version byte on first write
-        if offset == 0 {
+        if self.current_offset == 0 {
             // Write header.
             self.writer
                 .write_all(&[1u8])
