@@ -129,6 +129,7 @@ pub(crate) enum FeatureType {
 }
 
 /// Defines how a feature's enablement is determined
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum EnablementCheck {
     /// Feature is enabled if it's supported (appears in protocol feature lists)
@@ -138,6 +139,7 @@ pub(crate) enum EnablementCheck {
 }
 
 /// Rich metadata about a table feature including version requirements, dependencies, and support status
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct FeatureInfo {
     /// The feature's canonical name as it appears in the protocol
@@ -159,6 +161,7 @@ pub(crate) struct FeatureInfo {
 }
 
 // Static FeatureInfo instances for each table feature
+#[allow(dead_code)]
 static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     name: "appendOnly",
     min_reader_version: 1,
@@ -170,6 +173,7 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
+#[allow(dead_code)]
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     name: "invariants",
     min_reader_version: 1,
@@ -181,6 +185,7 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     name: "checkConstraints",
     min_reader_version: 1,
@@ -192,6 +197,7 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     name: "changeDataFeed",
     min_reader_version: 1,
@@ -205,6 +211,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+#[allow(dead_code)]
 static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     name: "generatedColumns",
     min_reader_version: 1,
@@ -216,6 +223,7 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     name: "identityColumns",
     min_reader_version: 1,
@@ -227,6 +235,7 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     name: "inCommitTimestamp",
     min_reader_version: 3,
@@ -240,6 +249,7 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+#[allow(dead_code)]
 static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     name: "rowTracking",
     min_reader_version: 3,
@@ -251,6 +261,7 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_row_tracking == Some(true)),
 };
 
+#[allow(dead_code)]
 static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
     name: "domainMetadata",
     min_reader_version: 3,
@@ -262,6 +273,7 @@ static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     name: "icebergCompatV1",
     min_reader_version: 1,
@@ -273,6 +285,7 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     name: "icebergCompatV2",
     min_reader_version: 2,
@@ -284,6 +297,7 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     name: "clustering",
     min_reader_version: 1,
@@ -295,6 +309,7 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     name: "catalogManaged",
     min_reader_version: 3,
@@ -309,6 +324,7 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "catalogOwned-preview",
     min_reader_version: 3,
@@ -323,6 +339,7 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
     name: "columnMapping",
     min_reader_version: 2,
@@ -337,6 +354,7 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+#[allow(dead_code)]
 static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     name: "deletionVectors",
     min_reader_version: 3,
@@ -350,6 +368,7 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
+#[allow(dead_code)]
 static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     name: "timestampNtz",
     min_reader_version: 3,
@@ -361,6 +380,7 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     name: "typeWidening",
     min_reader_version: 3,
@@ -372,6 +392,7 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "typeWidening-preview",
     min_reader_version: 3,
@@ -383,6 +404,7 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
     name: "v2Checkpoint",
     min_reader_version: 3,
@@ -394,6 +416,7 @@ static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     name: "vacuumProtocolCheck",
     min_reader_version: 3,
@@ -405,6 +428,7 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
     name: "variantType",
     min_reader_version: 3,
@@ -416,6 +440,7 @@ static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "variantType-preview",
     min_reader_version: 3,
@@ -427,6 +452,7 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+#[allow(dead_code)]
 static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     name: "variantShredding-preview",
     min_reader_version: 3,
@@ -471,6 +497,7 @@ impl TableFeature {
 
     /// Returns rich metadata about this table feature including version requirements,
     /// dependencies, and support status. For Unknown features, returns None.
+    #[allow(dead_code)]
     pub(crate) fn info(&self) -> Option<&'static FeatureInfo> {
         match self {
             // Writer-only features
@@ -578,11 +605,13 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyL
 /// - Whether a feature is enabled (supported AND table properties indicate it's active)
 /// - Validation of read/write support
 /// - Dependency validation between features
+#[allow(dead_code)]
 pub(crate) struct TableFeatures<'a> {
     protocol: &'a Protocol,
     properties: &'a TableProperties,
 }
 
+#[allow(dead_code)]
 impl<'a> TableFeatures<'a> {
     /// Creates a new TableFeatures instance for checking feature support and enablement
     pub(crate) fn new(protocol: &'a Protocol, properties: &'a TableProperties) -> Self {
