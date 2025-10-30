@@ -98,6 +98,10 @@ impl AsUrl for Url {
     }
 }
 
+fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> bool {
+    path_segments.any(|p| p == "_delta_log")
+}
+
 impl<Location: AsUrl> ParsedLogPath<Location> {
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
     #[internal_api]
@@ -138,33 +142,56 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             None => return Ok(None),
         };
 
-        let in_root_dir = subdir == Some("_delta_log");
+        // this check determines if we're in the delta log dir, or in the staged commits dir. The check is:
+        // 1. If the dir is named _staged_commits, check if the parent dir is _delta_log, and ensure
+        //    no higher level directories are _also_ named _delta_log. If those checks pass we're in
+        //    the staged_commits dir
+        // 2. if the dir is named _delta_log, ensure no higher level directories are _also_ named
+        //    _delta_log. If those checks pass, we're in the delta log dir
+        let (in_delta_log_dir, in_staged_commits_dir) = if subdir == Some("_staged_commits") {
+            if path_segments.next_back() == Some("_delta_log")
+                && !path_contains_delta_log_dir(path_segments)
+            {
+                (false, true)
+            } else {
+                (false, false)
+            }
+        } else {
+            (
+                subdir == Some("_delta_log") && !path_contains_delta_log_dir(path_segments),
+                false,
+            )
+        };
+
+        println!(
+            "For {url:?} is_delta_log_dir {in_delta_log_dir}, is_staged {in_staged_commits_dir}"
+        );
 
         // Parse the file type, based on the number of remaining parts
         let file_type = match split.as_slice() {
-            ["json"] if in_root_dir => LogPathFileType::Commit,
-            [uuid, "json"] if subdir == Some("_staged_commits") => {
+            ["json"] if in_delta_log_dir => LogPathFileType::Commit,
+            [uuid, "json"] if in_staged_commits_dir => {
                 // staged commits like _delta_log/_staged_commits/00000000000000000000.{uuid}.json
                 match parse_path_part::<String>(uuid, UUID_PART_LEN) {
                     Some(_uuid) => LogPathFileType::StagedCommit,
                     None => LogPathFileType::Unknown,
                 }
             }
-            ["crc"] if in_root_dir => LogPathFileType::Crc,
-            ["checkpoint", "parquet"] if in_root_dir => LogPathFileType::SinglePartCheckpoint,
-            ["checkpoint", uuid, "json" | "parquet"] if in_root_dir => {
+            ["crc"] if in_delta_log_dir => LogPathFileType::Crc,
+            ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::SinglePartCheckpoint,
+            ["checkpoint", uuid, "json" | "parquet"] if in_delta_log_dir => {
                 let Some(_) = parse_path_part::<String>(uuid, UUID_PART_LEN) else {
                     return Ok(None);
                 };
                 LogPathFileType::UuidCheckpoint
             }
-            [hi, "compacted", "json"] if in_root_dir => {
+            [hi, "compacted", "json"] if in_delta_log_dir => {
                 let Some(hi) = parse_path_part(hi, VERSION_LEN) else {
                     return Ok(None);
                 };
                 LogPathFileType::CompactedCommit { hi }
             }
-            ["checkpoint", part_num, num_parts, "parquet"] if in_root_dir => {
+            ["checkpoint", part_num, num_parts, "parquet"] if in_delta_log_dir => {
                 let Some(part_num) = parse_path_part(part_num, MULTIPART_PART_LEN) else {
                     return Ok(None);
                 };
@@ -411,6 +438,15 @@ mod tests {
     use crate::utils::test_utils::assert_result_error_with_message;
     use object_store::memory::InMemory;
     use test_utils::add_commit;
+
+    fn table_root_dir_url() -> Url {
+        let path = PathBuf::from("./tests/data/table-with-dv-small/");
+        let path = std::fs::canonicalize(path).unwrap();
+        assert!(path.is_dir());
+        let url = url::Url::from_directory_path(path).unwrap();
+        assert!(url.path().ends_with('/'));
+        url
+    }
 
     fn table_log_dir_url() -> Url {
         let path = PathBuf::from("./tests/data/table-with-dv-small/_delta_log/");
@@ -794,8 +830,8 @@ mod tests {
 
     #[test]
     fn test_new_commit() {
-        let table_log_dir = table_log_dir_url();
-        let log_path = ParsedLogPath::new_commit(&table_log_dir, 10).unwrap();
+        let table_root_dir = table_root_dir_url();
+        let log_path = ParsedLogPath::new_commit(&table_root_dir, 10).unwrap();
         assert_eq!(log_path.version, 10);
         assert!(log_path.is_commit());
         assert_eq!(log_path.extension, "json");
@@ -805,8 +841,8 @@ mod tests {
 
     #[test]
     fn test_new_uuid_parquet_checkpoint() {
-        let table_log_dir = table_log_dir_url();
-        let log_path = ParsedLogPath::new_uuid_parquet_checkpoint(&table_log_dir, 10).unwrap();
+        let table_root_dir = table_root_dir_url();
+        let log_path = ParsedLogPath::new_uuid_parquet_checkpoint(&table_root_dir, 10).unwrap();
 
         assert_eq!(log_path.version, 10);
         assert!(log_path.is_checkpoint());
@@ -827,8 +863,8 @@ mod tests {
 
     #[test]
     fn test_new_classic_parquet_checkpoint() {
-        let table_log_dir = table_log_dir_url();
-        let log_path = ParsedLogPath::new_classic_parquet_checkpoint(&table_log_dir, 10).unwrap();
+        let table_root_dir = table_root_dir_url();
+        let log_path = ParsedLogPath::new_classic_parquet_checkpoint(&table_root_dir, 10).unwrap();
 
         assert_eq!(log_path.version, 10);
         assert!(log_path.is_checkpoint());
