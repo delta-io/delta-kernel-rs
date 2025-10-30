@@ -33,6 +33,10 @@ use crate::{DeltaResult, Error};
 ///     fn into_iter(self) -> Self::IndexIterator {
 ///         self.deleted_indexes.into_iter()
 ///     }
+///
+///     fn cardinality(&self) -> u64 {
+///         self.deleted_indexes.len() as u64
+///     }
 /// }
 /// ```
 pub trait DeletionVector: Sized {

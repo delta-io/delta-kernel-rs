@@ -92,8 +92,8 @@ impl DeletionVectorPath {
         }
     }
 
-    /// Helper method to cosntruct the relative path to a deletion vector file,
-    /// the prefix and the UUID suffix.
+    /// Helper method to construct the relative path to a deletion vector file
+    /// from the prefix and UUID suffix.
     fn relative_path(prefix: &str, uuid: &uuid::Uuid) -> String {
         if !prefix.is_empty() {
             format!("{prefix}/deletion_vector_{uuid}.bin")
