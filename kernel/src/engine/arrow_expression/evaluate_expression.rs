@@ -454,13 +454,14 @@ struct Decimal128ScaleZeroEncoder<'a> {
 impl<'a> Encoder for Decimal128ScaleZeroEncoder<'a> {
     fn encode(&mut self, idx: usize, buf: &mut Vec<u8>) {
         let value = self.array.value(idx);
-        // Write full i128 value as integer
+        // Scale=0 means the stored i128 value IS the integer
         let s = format!("{}", value);
         buf.extend_from_slice(s.as_bytes());
     }
 }
 
 /// Custom encoder for Decimal256 arrays with scale=0.
+/// See Decimal128ScaleZeroEncoder for more details.
 struct Decimal256ScaleZeroEncoder<'a> {
     array: &'a Decimal256Array,
 }
@@ -468,7 +469,7 @@ struct Decimal256ScaleZeroEncoder<'a> {
 impl<'a> Encoder for Decimal256ScaleZeroEncoder<'a> {
     fn encode(&mut self, idx: usize, buf: &mut Vec<u8>) {
         let value = self.array.value(idx);
-        // Write full i256 value as integer
+        // Scale=0 means the stored i256 value IS the integer
         let s = format!("{}", value);
         buf.extend_from_slice(s.as_bytes());
     }
