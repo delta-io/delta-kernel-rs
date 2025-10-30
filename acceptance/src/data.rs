@@ -97,9 +97,10 @@ fn normalize_col(col: Arc<dyn Array>) -> Arc<dyn Array> {
         DataType::Utf8 => {
             // just make everything LargeUtf8
             let data_type = DataType::LargeUtf8;
-            delta_kernel::arrow::compute::cast(&col, &data_type).expect("Could not cast to large utf8")
+            delta_kernel::arrow::compute::cast(&col, &data_type)
+                .expect("Could not cast to large utf8")
         }
-        _ => col
+        _ => col,
     }
 }
 
