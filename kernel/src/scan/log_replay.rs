@@ -404,6 +404,7 @@ mod tests {
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
+    use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
         engine::sync::SyncEngine,

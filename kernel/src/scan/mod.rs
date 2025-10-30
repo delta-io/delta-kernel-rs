@@ -27,6 +27,7 @@ use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     ToSchema as _,
 };
+use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -778,12 +779,8 @@ pub(crate) mod test_utils {
     };
 
     use super::state::ScanCallback;
-<<<<<<< HEAD
     use super::PhysicalPredicate;
-=======
-    use super::{PhysicalPredicate, StateInfo};
     use crate::table_features::ColumnMappingMode;
->>>>>>> 82b7f96 (pass ColumnMappingMode to physical_name)
     use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.

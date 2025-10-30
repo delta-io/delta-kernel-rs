@@ -400,6 +400,7 @@ mod tests {
             physical_schema: physical_schema.clone().into(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
+            column_mapping_mode: ColumnMappingMode::None,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);
