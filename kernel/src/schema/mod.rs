@@ -604,9 +604,6 @@ impl StructType {
                 Self::ensure_no_metadata_columns_in_field(&field)?;
             }
 
-            // Verify that nested structs also follow case-insensitive uniqueness
-            Self::ensure_no_case_insensitive_duplicates_in_nested(&field)?;
-
             // Check for duplicate metadata columns
             if let Some(metadata_column_spec) = field.get_metadata_column_spec() {
                 if metadata_columns.insert(metadata_column_spec, i).is_some() {
@@ -870,49 +867,6 @@ impl StructType {
             DataType::Primitive(_) | DataType::Variant(_) => {}
         };
 
-        Ok(())
-    }
-
-    /// Ensures that nested structs within a field also follow case-insensitive uniqueness rules
-    fn ensure_no_case_insensitive_duplicates_in_nested(field: &StructField) -> DeltaResult<()> {
-        match &field.data_type {
-            DataType::Struct(struct_type) => {
-                // Check the nested struct for case-insensitive duplicates
-                Self::check_case_insensitive_duplicates(struct_type)?;
-            }
-            DataType::Array(array_type) => {
-                if let DataType::Struct(struct_type) = array_type.element_type() {
-                    Self::check_case_insensitive_duplicates(struct_type)?;
-                }
-            }
-            DataType::Map(map_type) => {
-                if let DataType::Struct(struct_type) = map_type.key_type() {
-                    Self::check_case_insensitive_duplicates(struct_type)?;
-                }
-                if let DataType::Struct(struct_type) = map_type.value_type() {
-                    Self::check_case_insensitive_duplicates(struct_type)?;
-                }
-            }
-            // Primitive types and variants don't need this check
-            DataType::Primitive(_) | DataType::Variant(_) => {}
-        }
-        Ok(())
-    }
-
-    fn check_case_insensitive_duplicates(struct_type: &StructType) -> DeltaResult<()> {
-        let mut lowercase_names = HashMap::new();
-        for field in struct_type.fields() {
-            let lowercase_name = field.name.to_lowercase();
-            if Some(field) = lowercase_names.get(lowercase_name) {
-                return Err(Error::schema(format!(
-                    "Nested struct contains duplicate field names (case-insensitive): '{}' conflicts with '{}'",
-                    field.name, field
-                )));
-            }
-            lowercase_name.insert(lowercase_name, field);
-            // Recursively check nested structs
-            Self::ensure_no_case_insensitive_duplicates_in_nested(field)?;
-        }
         Ok(())
     }
 }
@@ -3355,64 +3309,45 @@ mod tests {
 
     #[test]
     fn test_reject_nested_struct_case_insensitive_duplicates() {
-        // Create a nested struct with case-insensitive duplicate field names
-        let nested_fields = vec![
+        // Try to create a nested struct with case-insensitive duplicate field names
+        // This should fail during the nested struct construction
+        let nested_result = StructType::try_new([
             StructField::new("nested_id", DataType::LONG, false),
             StructField::new("NESTED_ID", DataType::STRING, false),
-        ];
+        ]);
 
-        // Try to create a struct with the nested struct - should fail during validation
-        let nested_struct = DataType::Struct(Box::new(StructType::new_unchecked(nested_fields)));
-        let result = StructType::try_new([StructField::new("outer_field", nested_struct, false)]);
-
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        assert!(nested_result.is_err());
+        let error_msg = nested_result.unwrap_err().to_string();
         assert!(error_msg.contains("case-insensitive"));
         assert!(error_msg.contains("nested_id") || error_msg.contains("NESTED_ID"));
     }
 
     #[test]
     fn test_reject_array_element_struct_case_insensitive_duplicates() {
-        // Create an array with struct element that has case-insensitive duplicates
-        let element_struct = StructType::new_unchecked([
+        // Try to create a struct for array element with case-insensitive duplicates
+        // This should fail during the element struct construction
+        let element_result = StructType::try_new([
             StructField::new("item", DataType::STRING, false),
             StructField::new("ITEM", DataType::LONG, false),
         ]);
-        let array_type = ArrayType::new(DataType::Struct(Box::new(element_struct)), true);
 
-        let result = StructType::try_new([StructField::new(
-            "items",
-            DataType::Array(Box::new(array_type)),
-            false,
-        )]);
-
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        assert!(element_result.is_err());
+        let error_msg = element_result.unwrap_err().to_string();
         assert!(error_msg.contains("case-insensitive"));
         assert!(error_msg.contains("item") || error_msg.contains("ITEM"));
     }
 
     #[test]
     fn test_reject_map_value_struct_case_insensitive_duplicates() {
-        // Create a map with struct value that has case-insensitive duplicates
-        let value_struct = StructType::new_unchecked([
+        // Try to create a struct for map value with case-insensitive duplicates
+        // This should fail during the value struct construction
+        let value_result = StructType::try_new([
             StructField::new("value", DataType::STRING, false),
             StructField::new("VALUE", DataType::LONG, false),
         ]);
-        let map_type = MapType::new(
-            DataType::STRING,
-            DataType::Struct(Box::new(value_struct)),
-            true,
-        );
 
-        let result = StructType::try_new([StructField::new(
-            "map_field",
-            DataType::Map(Box::new(map_type)),
-            false,
-        )]);
-
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        assert!(value_result.is_err());
+        let error_msg = value_result.unwrap_err().to_string();
         assert!(error_msg.contains("case-insensitive"));
         assert!(error_msg.contains("value") || error_msg.contains("VALUE"));
     }
