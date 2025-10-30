@@ -3,6 +3,7 @@
 //! Exposes that an engine needs to call from C/C++ to interface with kernel
 
 #[cfg(feature = "default-engine-base")]
+use std::collections::HashMap;
 use std::default::Default;
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
@@ -15,7 +16,6 @@ use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Version;
 use delta_kernel::{DeltaResult, Engine, EngineData};
 use delta_kernel_ffi_macros::handle_descriptor;
-use std::collections::HashMap;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
 // twice. So we tell it to ignore one of the declarations to avoid double-definition errors.

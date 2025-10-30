@@ -248,8 +248,6 @@ mod tests {
         let collected_metadata = unsafe { Box::from_raw(visitor_state_ptr) };
         assert!(res);
         assert!(collected_metadata.get("domain1").is_none());
-        println!("{:?}", collected_metadata);
-        println!("{:?}", collected_metadata.get("delta.domain3"));
         assert!(collected_metadata.get("delta.domain3").is_none());
         assert_eq!(
             collected_metadata.get("domain2").unwrap(),
