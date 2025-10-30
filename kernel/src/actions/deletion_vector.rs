@@ -59,10 +59,11 @@ impl ToDataType for DeletionVectorStorageType {
     }
 }
 
-/// Represents and abstract path to a deltion vector. This is used in the public
-/// API to construct the path to a deletion vector file and
-/// have business logic to help convert [`crate::actions::deletion_vector_writer::DeletionVectorWriteResult`] to a [`DeletionVectorDescriptor`]
-/// with appropriate storage type and path.
+/// Represents an abstract path to a deletion vector file.
+///
+/// This is used in the public API to construct the path to a deletion vector file and
+/// has logic to convert [`crate::actions::deletion_vector_writer::DeletionVectorWriteResult`]
+/// to a [`DeletionVectorDescriptor`] with appropriate storage type and path.
 pub struct DeletionVectorPath {
     /// The base URL path to the Delta table
     table_path: Url,
@@ -240,19 +241,21 @@ impl DeletionVectorDescriptor {
                 let size_in_bytes = self.size_in_bytes;
 
                 let dv_data = storage
-                    .read_files(vec![(path, None)])?
+                    .read_files(vec![(path.clone(), None)])?
                     .next()
-                    .ok_or(Error::missing_data("No deletion vector data"))??;
+                    .ok_or(Error::missing_data(format!(
+                        "No deletion vector data for {path}"
+                    )))??;
 
                 let mut cursor = Cursor::new(dv_data);
                 let mut version_buf = [0; 1];
-                cursor
-                    .read(&mut version_buf)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))?;
+                cursor.read(&mut version_buf).map_err(|err| {
+                    Error::DeletionVector(format!("Failed to read version from {path}: {err}"))
+                })?;
                 let version = u8::from_be_bytes(version_buf);
                 require!(
                     version == 1,
-                    Error::DeletionVector(format!("Invalid version: {version}"))
+                    Error::DeletionVector(format!("Invalid version {version} for {path}"))
                 );
 
                 if let Some(offset) = offset {
@@ -262,35 +265,37 @@ impl DeletionVectorDescriptor {
                 require!(
                     dv_size == size_in_bytes as u32,
                     Error::DeletionVector(format!(
-                        "DV size mismatch. Log indicates {size_in_bytes}, file says: {dv_size}"
+                        "DV size mismatch for {path}. Log indicates {size_in_bytes}, file says: {dv_size}"
                     ))
                 );
                 let magic = read_u32(&mut cursor, Endian::Little)?;
                 require!(
                     magic == 1681511377,
-                    Error::DeletionVector(format!("Invalid magic: {magic}"))
+                    Error::DeletionVector(format!("Invalid magic {magic} for {path}"))
                 );
 
                 // get the Bytes back out and limit it to dv_size
                 let position: usize = cursor.position().try_into().map_err(|_| {
-                    Error::DeletionVector("position doesn't fit in usize".to_string())
+                    Error::DeletionVector(format!("position doesn't fit in usize for {path}"))
                 })?;
                 let bytes = cursor.into_inner();
                 // -4 to remove CRC portion.
                 let dv_size_usize: usize = dv_size.try_into().map_err(|_| {
-                    Error::DeletionVector("dv_size doesn't fit in usize".to_string())
+                    Error::DeletionVector(format!("{path}'s dv_size doesn't fit in usize"))
                 })?;
                 let truncate_pos = position + dv_size_usize - 4;
 
+                // +4 to account for CRC value
+                require!(
+                    bytes.len() >= truncate_pos + 4,
+                    Error::DeletionVector(format!(
+                        "Can't read deletion vector for {path} as there are not enough bytes. Expected {}, but got {}",
+                        truncate_pos + 4,
+                        bytes.len()
+                    ))
+                );
+
                 if validate_crc {
-                    require!(
-                        bytes.len() >= truncate_pos + 4,
-                        Error::DeletionVector(format!(
-                            "Can't validate CRC as there are not enough bytes {} < {}",
-                            bytes.len(),
-                            truncate_pos + 4
-                        ))
-                    );
                     let mut crc_cursor: Cursor<Bytes> =
                         Cursor::new(bytes.slice(truncate_pos..truncate_pos + 4));
                     let crc = read_u32(&mut crc_cursor, Endian::Big)?;
@@ -300,14 +305,14 @@ impl DeletionVectorDescriptor {
                     require!(
                         crc == expected_crc,
                         Error::DeletionVector(format!(
-                            "CRC32 checksum mismatch. Got: {crc}, expected: {expected_crc}"
+                            "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
                         ))
                     );
                 }
                 let dv_bytes = bytes.slice(position..truncate_pos);
                 let cursor = Cursor::new(dv_bytes);
                 RoaringTreemap::deserialize_from(cursor)
-                    .map_err(|err| Error::DeletionVector(err.to_string()))
+                    .map_err(|err| Error::DeletionVector(format!("Failed to deserialize deletion vector for {path}: {err}")))
             }
         }
     }
