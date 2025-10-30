@@ -259,7 +259,8 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         deletion_vector: impl DeletionVector,
     ) -> DeltaResult<DeletionVectorWriteResult> {
         // Write version byte on first write
-        if offset == 0 { // Write header.
+        if offset == 0 {
+            // Write header.
             self.writer
                 .write_all(&[1u8])
                 .map_err(|e| Error::generic(format!("Failed to write version byte: {}", e)))?;
@@ -276,7 +277,7 @@ impl<'a, W: Write> StreamingDeletionVectorWriter<'a, W> {
         let dv_size = serialized.len() + 4;
         // Use i32::MAX as the limit since Java implementations don't have unsigned integers.
         // This ensures compatibility with the Scala/Java implementation [1].
-        // 
+        //
         // [1] https://github.com/delta-io/delta/blob/b388f280d083d4cf92c6434e4f7a549fc26cd1fa/spark/src/main/scala/org/apache/spark/sql/delta/deletionvectors/RoaringBitmapArray.scala#L311
         if dv_size > i32::MAX as usize {
             return Err(Error::generic(

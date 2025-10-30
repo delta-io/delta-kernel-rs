@@ -326,8 +326,11 @@ impl DeletionVectorDescriptor {
                 }
                 let dv_bytes = bytes.slice(bitmap_start..crc_start);
                 let cursor = Cursor::new(dv_bytes);
-                RoaringTreemap::deserialize_from(cursor)
-                    .map_err(|err| Error::DeletionVector(format!("Failed to deserialize deletion vector for {path}: {err}")))
+                RoaringTreemap::deserialize_from(cursor).map_err(|err| {
+                    Error::DeletionVector(format!(
+                        "Failed to deserialize deletion vector for {path}: {err}"
+                    ))
+                })
             }
         }
     }
