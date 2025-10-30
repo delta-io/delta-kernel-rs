@@ -87,6 +87,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod committer;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -533,6 +534,10 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    /// Copy a file atomically from source to destination. If the destination file already exists,
+    /// it must return Err(Error::FileAlreadyExists).
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

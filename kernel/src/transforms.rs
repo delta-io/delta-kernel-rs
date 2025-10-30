@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 
-use crate::expressions::{Expression, ExpressionRef, Scalar, Transform};
+use crate::expressions::{
+    BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform, VariadicExpressionOp,
+};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::{DeltaResult, Error};
 
@@ -30,19 +32,18 @@ pub(crate) enum FieldTransformSpec {
         insert_after: Option<String>,
         expr: ExpressionRef,
     },
-    /// Replace the named input column with an expression
-    // NOTE: Row tracking will eventually need to replace the physical rowid column with a COALESCE
-    // to compute non-materialized row ids and row commit versions.
-    #[allow(unused)]
-    StaticReplace {
-        field_name: String,
-        expr: ExpressionRef,
-    },
     /// Drops the named input column
-    // NOTE: Row tracking will need to drop metadata columns that were used to compute rowids, since
+    // NOTE: Row tracking needs to drop metadata columns that were used to compute rowids, since
     // they should not appear in the query's output.
     #[allow(unused)]
     StaticDrop { field_name: String },
+    /// Generate the RowId column.
+    GenerateRowId {
+        /// column name which should end up containing the RowId
+        field_name: String,
+        /// column name which contains row indexes
+        row_index_field_name: String,
+    },
     /// Insert a partition column after the named input column.
     /// The partition column is identified by its field index in the logical table schema.
     /// Its value varies from file to file and is obtained from file metadata.
@@ -94,7 +95,7 @@ pub(crate) fn parse_partition_values(
             ),
             FieldTransformSpec::DynamicColumn { .. }
             | FieldTransformSpec::StaticInsert { .. }
-            | FieldTransformSpec::StaticReplace { .. }
+            | FieldTransformSpec::GenerateRowId { .. }
             | FieldTransformSpec::StaticDrop { .. } => None,
         })
         .try_collect()
@@ -109,6 +110,7 @@ pub(crate) fn get_transform_expr(
     transform_spec: &TransformSpec,
     mut metadata_values: HashMap<usize, (String, Scalar)>,
     physical_schema: &StructType,
+    base_row_id: Option<i64>,
 ) -> DeltaResult<ExpressionRef> {
     let mut transform = Transform::new_top_level();
 
@@ -118,10 +120,27 @@ pub(crate) fn get_transform_expr(
             StaticInsert { insert_after, expr } => {
                 transform.with_inserted_field(insert_after.clone(), expr.clone())
             }
-            StaticReplace { field_name, expr } => {
-                transform.with_replaced_field(field_name.clone(), expr.clone())
-            }
             StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
+            GenerateRowId {
+                field_name,
+                row_index_field_name,
+            } => {
+                let base_row_id = base_row_id.ok_or_else(|| {
+                    Error::generic("Asked to generate RowIds, but no baseRowId found.")
+                })?;
+                let expr = Arc::new(Expression::variadic(
+                    VariadicExpressionOp::Coalesce,
+                    vec![
+                        Expression::column([field_name]),
+                        Expression::binary(
+                            BinaryExpressionOp::Plus,
+                            Expression::literal(base_row_id),
+                            Expression::column([row_index_field_name]),
+                        ),
+                    ],
+                ));
+                transform.with_replaced_field(field_name.clone(), expr)
+            }
             MetadataDerivedColumn {
                 field_index,
                 insert_after,
@@ -314,7 +333,12 @@ mod tests {
 
         // Create a minimal physical schema for test
         let physical_schema = StructType::new_unchecked(vec![]);
-        let result = get_transform_expr(&transform_spec, partition_values, &physical_schema);
+        let result = get_transform_expr(
+            &transform_spec,
+            partition_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         assert_result_error_with_message(result, "missing partition value");
     }
 
@@ -326,12 +350,8 @@ mod tests {
                 insert_after: Some("col1".to_string()),
                 expr: expr.clone(),
             },
-            FieldTransformSpec::StaticReplace {
-                field_name: "col2".to_string(),
-                expr: expr.clone(),
-            },
             FieldTransformSpec::StaticDrop {
-                field_name: "col3".to_string(),
+                field_name: "col2".to_string(),
             },
         ];
         let metadata_values = HashMap::new();
@@ -339,11 +359,15 @@ mod tests {
         // Create a physical schema with the relevant columns
         let physical_schema = StructType::new_unchecked(vec![
             StructField::nullable("col1", DataType::STRING),
-            StructField::nullable("col2", DataType::INTEGER),
-            StructField::nullable("col3", DataType::LONG),
+            StructField::nullable("col2", DataType::LONG),
         ]);
-        let result =
-            get_transform_expr(&transform_spec, metadata_values, &physical_schema).unwrap();
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        )
+        .unwrap();
 
         let Expression::Transform(transform) = result.as_ref() else {
             panic!("Expected Transform expression");
@@ -359,20 +383,10 @@ mod tests {
         };
         assert_eq!(scalar, &Scalar::Integer(42));
 
-        // Verify StaticReplace: should replace col2 with the expression
+        // Verify StaticDrop: should drop col2 (empty expressions and is_replace = true)
         assert!(transform.field_transforms.contains_key("col2"));
         assert!(transform.field_transforms["col2"].is_replace);
-        assert_eq!(transform.field_transforms["col2"].exprs.len(), 1);
-        let Expression::Literal(scalar) = transform.field_transforms["col2"].exprs[0].as_ref()
-        else {
-            panic!("Expected literal expression for replace");
-        };
-        assert_eq!(scalar, &Scalar::Integer(42));
-
-        // Verify StaticDrop: should drop col3 (empty expressions and is_replace = true)
-        assert!(transform.field_transforms.contains_key("col3"));
-        assert!(transform.field_transforms["col3"].is_replace);
-        assert!(transform.field_transforms["col3"].exprs.is_empty());
+        assert!(transform.field_transforms["col2"].exprs.is_empty());
     }
 
     #[test]
@@ -390,7 +404,12 @@ mod tests {
         ]);
         let metadata_values = HashMap::new();
 
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         let transform_expr = result.expect("Transform expression should be created successfully");
 
         let Expression::Transform(transform) = transform_expr.as_ref() else {
@@ -433,7 +452,12 @@ mod tests {
             ),
         );
 
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         let transform_expr = result.expect("Transform expression should be created successfully");
 
         let Expression::Transform(transform) = transform_expr.as_ref() else {
@@ -465,7 +489,12 @@ mod tests {
         let mut metadata_values = HashMap::new();
         metadata_values.insert(1, ("year".to_string(), Scalar::Integer(2024)));
 
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         let transform_expr = result.expect("Transform expression should be created successfully");
 
         let Expression::Transform(transform) = transform_expr.as_ref() else {
@@ -500,7 +529,86 @@ mod tests {
         let metadata_values = HashMap::new();
 
         // Should fail with missing data error
-        let result = get_transform_expr(&transform_spec, metadata_values, &physical_schema);
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            None, /* base_row_id */
+        );
         assert_result_error_with_message(result, "missing partition value for dynamic column");
+    }
+
+    #[test]
+    fn get_transform_expr_generate_row_ids() {
+        let transform_spec = vec![FieldTransformSpec::GenerateRowId {
+            field_name: "row_id_col".to_string(),
+            row_index_field_name: "row_index_col".to_string(),
+        }];
+
+        // Physical schema contains row index col, but no row-id col
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::not_null("row_index_col", DataType::LONG),
+        ]);
+        let metadata_values = HashMap::new();
+
+        let result = get_transform_expr(
+            &transform_spec,
+            metadata_values,
+            &physical_schema,
+            Some(4), /* base_row_id */
+        );
+        let transform_expr = result.expect("Transform expression should be created successfully");
+
+        let Expression::Transform(transform) = transform_expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+
+        assert!(transform.input_path.is_none());
+        let row_id_transform = transform
+            .field_transforms
+            .get("row_id_col")
+            .expect("Should have row_id_col transform");
+        assert!(row_id_transform.is_replace);
+
+        let expeceted_expr = Arc::new(Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![
+                Expression::column(["row_id_col"]),
+                Expression::binary(
+                    BinaryExpressionOp::Plus,
+                    Expression::literal(4i64),
+                    Expression::column(["row_index_col"]),
+                ),
+            ],
+        ));
+        assert_eq!(row_id_transform.exprs.len(), 1);
+        let expr = &row_id_transform.exprs[0];
+        assert_eq!(expr, &expeceted_expr);
+    }
+
+    #[test]
+    fn get_transform_expr_generate_row_ids_no_base_id() {
+        let transform_spec = vec![FieldTransformSpec::GenerateRowId {
+            field_name: "row_id_col".to_string(),
+            row_index_field_name: "row_index_col".to_string(),
+        }];
+
+        // Physical schema contains row index col, but no row-id col
+        let physical_schema = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::STRING),
+            StructField::not_null("row_index_col", DataType::LONG),
+        ]);
+        let metadata_values = HashMap::new();
+
+        assert_result_error_with_message(
+            get_transform_expr(
+                &transform_spec,
+                metadata_values,
+                &physical_schema,
+                None, /* base_row_id */
+            ),
+            "Asked to generate RowIds, but no baseRowId found",
+        );
     }
 }

@@ -103,7 +103,6 @@ impl LogCompactionWriter {
         let actions_iter = compaction_log_segment.read_actions(
             engine,
             COMPACTION_ACTIONS_SCHEMA.clone(),
-            COMPACTION_ACTIONS_SCHEMA.clone(),
             None, // No predicate - we want all actions in the version range
         )?;
 
