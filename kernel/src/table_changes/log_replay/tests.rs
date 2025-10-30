@@ -566,7 +566,7 @@ async fn failing_protocol() {
 
     let protocol = Protocol::try_new(
         3,
-        1,
+        7,
         ["fake_feature".to_string()].into(),
         ["fake_feature".to_string()].into(),
     )

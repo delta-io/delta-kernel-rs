@@ -402,23 +402,6 @@ impl Protocol {
         reader_features: Option<impl IntoIterator<Item = impl ToString>>,
         writer_features: Option<impl IntoIterator<Item = impl ToString>>,
     ) -> DeltaResult<Self> {
-        if min_reader_version == 3 {
-            require!(
-                reader_features.is_some(),
-                Error::invalid_protocol(
-                    "Reader features must be present when minimum reader version = 3"
-                )
-            );
-        }
-        if min_writer_version == 7 {
-            require!(
-                writer_features.is_some(),
-                Error::invalid_protocol(
-                    "Writer features must be present when minimum writer version = 7"
-                )
-            );
-        }
-
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
@@ -474,9 +457,44 @@ impl Protocol {
 
     /// Validates the relationship between reader features and writer features in the protocol.
     pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
+        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
+        if self.min_reader_version == 3 {
+            require!(
+                self.reader_features.is_some(),
+                Error::invalid_protocol(
+                    "Reader features must be present when minimum reader version = 3"
+                )
+            );
+        } else {
+            require!(
+                self.reader_features.is_none(),
+                Error::invalid_protocol(
+                    "Reader features must not be present when minimum reader version != 3"
+                )
+            );
+        }
+
+        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
+        if self.min_writer_version == 7 {
+            require!(
+                self.writer_features.is_some(),
+                Error::invalid_protocol(
+                    "Writer features must be present when minimum writer version = 7"
+                )
+            );
+        } else {
+            require!(
+                self.writer_features.is_none(),
+                Error::invalid_protocol(
+                    "Writer features must not be present when minimum writer version != 7"
+                )
+            );
+        }
+
         match (&self.reader_features, &self.writer_features) {
             (Some(reader_features), Some(writer_features)) => {
                 // Check all reader features are ReaderWriter and present in writer features.
+                // Unknown features are treated as potentially ReaderWriter for forward compatibility.
                 let check_r = reader_features.iter().all(|feature| {
                     matches!(
                         feature.feature_type(),
@@ -490,13 +508,14 @@ impl Protocol {
                     )
                 );
 
-                // Check all writer features are either Writer or also in reader features (ReaderWriter).
-                let check_w = writer_features.iter().all(|feature| {
-                    matches!(
-                        feature.feature_type(),
-                        FeatureType::Writer | FeatureType::Unknown
-                    ) || reader_features.contains(feature)
-                });
+                // Check all writer features that are ReaderWriter must also be in reader features
+                // Unknown features are treated as potentially Writer-only for forward compatibility.
+                let check_w = writer_features
+                    .iter()
+                    .all(|feature| match feature.feature_type() {
+                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::ReaderWriter => reader_features.contains(feature),
+                    });
                 require!(
                     check_w,
                     Error::invalid_protocol(
@@ -507,6 +526,7 @@ impl Protocol {
             }
             (None, None) => Ok(()),
             (None, Some(writer_features)) => {
+                // Unknown features are treated as potentially Writer-only for forward compatibility.
                 require!(
                     writer_features.iter().all(|feature| matches!(
                         feature.feature_type(),
@@ -1373,9 +1393,9 @@ mod tests {
                 Some(vec![TableFeature::AppendOnly]),
                 "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
-            (Some(vec![TableFeature::DeletionVectors]), None, "Reader features should be present in writer features"),
+            (Some(vec![TableFeature::DeletionVectors]), Some(vec![]), "Reader features must contain only ReaderWriter features that are also listed in writer features"),
             // ReaderWriter feature not present in reader features
-            (None, Some(vec![TableFeature::DeletionVectors]), "Writer features must be Writer-only or also listed in reader features"),
+            (Some(vec![]), Some(vec![TableFeature::DeletionVectors]), "Writer features must be Writer-only or also listed in reader features"),
             (
                 Some(vec![TableFeature::VariantType]),
                 Some(vec![
@@ -1388,12 +1408,6 @@ mod tests {
             (
                 Some(vec![TableFeature::AppendOnly]),
                 Some(vec![TableFeature::AppendOnly]),
-                "Reader features must contain only ReaderWriter features that are also listed in writer features",
-            ),
-            // Reader only feature is not allowed
-            (
-                Some(vec![TableFeature::Unknown("r".to_string())]),
-                Some(vec![TableFeature::Unknown("w".to_string())]),
                 "Reader features must contain only ReaderWriter features that are also listed in writer features",
             ),
         ];
@@ -1418,6 +1432,40 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_table_features_unknown() {
+        // Unknown features are allowed during validation for forward compatibility,
+        // but will be rejected when trying to use the protocol (ensure_read_supported/ensure_write_supported)
+
+        // Test unknown features in reader - validation passes
+        let protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
+            writer_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
+        };
+        assert!(protocol.validate_table_features().is_ok());
+        // But ensure_read_supported should fail
+        assert!(matches!(
+            protocol.ensure_read_supported(),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Test unknown features in writer - validation passes
+        let protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![]),
+            writer_features: Some(vec![TableFeature::Unknown("unknown_writer".to_string())]),
+        };
+        assert!(protocol.validate_table_features().is_ok());
+        // But ensure_write_supported should fail
+        assert!(matches!(
+            protocol.ensure_write_supported(),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn test_validate_table_features_valid() {
         // (reader_feature, writer_feature)
         let valid_features = [
@@ -1427,12 +1475,12 @@ mod tests {
                 Some(vec![TableFeature::DeletionVectors]),
                 Some(vec![TableFeature::DeletionVectors]),
             ),
-            (None, Some(vec![TableFeature::AppendOnly])),
+            (Some(vec![]), Some(vec![TableFeature::AppendOnly])),
             (
                 Some(vec![TableFeature::VariantType]),
                 Some(vec![TableFeature::VariantType, TableFeature::AppendOnly]),
             ),
-            // Unknwon feature may be ReaderWriter or Writer only
+            // Unknown feature may be ReaderWriter or Writer only (for forward compatibility)
             (
                 Some(vec![TableFeature::Unknown("rw".to_string())]),
                 Some(vec![
@@ -1441,7 +1489,7 @@ mod tests {
                 ]),
             ),
             // Empty feature set is valid
-            (None, None),
+            (Some(vec![]), Some(vec![])),
         ];
 
         for (reader_features, writer_features) in valid_features {
@@ -1534,7 +1582,8 @@ mod tests {
             r#"Unsupported: Unknown TableFeatures: "identityColumns". Supported TableFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
-        // Unknown writer features should cause an error
+        // Unknown writer features are allowed during creation for forward compatibility,
+        // but will fail when trying to write
         let protocol = Protocol::try_new(
             3,
             7,
