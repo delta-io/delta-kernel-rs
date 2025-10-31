@@ -16,7 +16,7 @@ use crate::utils::CowExt as _;
 /// * `Some(Cow::Borrowed)` -- The input was not transformed.
 /// * `None` -- The input was filtered out and the parent should be updated to not reference it.
 ///
-/// The transform can start from the generic [`Self::transform_expr`] or [`Self::transform_pred`'],
+/// The transform can start from the generic [`Self::transform_expr`] or [`Self::transform_pred`],
 /// or directly from a specific expression/predicate variant (e.g. [`Self::transform_expr_column`]
 /// for [`ColumnName`], [`Self::transform_pred_unary`] for [`UnaryPredicate`]).
 ///
