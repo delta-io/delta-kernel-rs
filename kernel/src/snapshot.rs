@@ -373,7 +373,9 @@ impl Snapshot {
 
         domain_metadata_configuration(self.log_segment(), domain, engine)
     }
-    pub fn get_all_domain_metadata(&self, engine: &dyn Engine) -> DeltaResult<Vec<DomainMetadata>> {
+
+    #[internal_api]
+    pub(crate) fn get_all_domain_metadata(&self, engine: &dyn Engine) -> DeltaResult<Vec<DomainMetadata>> {
         let all_metadata = all_domain_metadata_configuration(self.log_segment(), engine)?;
         Ok(all_metadata
             .into_iter()
