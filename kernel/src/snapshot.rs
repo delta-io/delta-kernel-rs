@@ -453,6 +453,7 @@ mod tests {
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use delta_kernel::actions::DomainMetadata;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -1153,9 +1154,10 @@ mod tests {
 
         let metadata = snapshot.get_all_domain_metadata(&engine)?;
 
-        let mut expected = HashMap::new();
-        expected.insert("domain2".to_string(), "domain2_commit1".to_string());
-        expected.insert("domain3".to_string(), "domain3_commit0".to_string());
+        let expected = vec![
+            DomainMetadata::new("domain2".to_string(), "domain2_commit1".to_string()),
+            DomainMetadata::new("domain3".to_string(), "domain3_commit0".to_string()),
+        ];
 
         assert_eq!(metadata, expected);
 
