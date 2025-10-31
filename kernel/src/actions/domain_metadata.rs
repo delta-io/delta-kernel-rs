@@ -35,6 +35,7 @@ pub(crate) fn domain_metadata_configuration(
         .map(|domain_metadata| domain_metadata.configuration))
 }
 
+#[allow(unused)]
 #[internal_api]
 pub(crate) fn all_domain_metadata_configuration(
     log_segment: &LogSegment,
