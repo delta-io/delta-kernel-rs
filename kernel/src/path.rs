@@ -21,7 +21,8 @@ const MULTIPART_PART_LEN: usize = 10;
 const UUID_PART_LEN: usize = 36;
 
 /// The subdirectory name within the table root where the delta log resides
-const DELTA_LOG_DIR: &str = "_delta_log/";
+const DELTA_LOG_DIR: &str = "_delta_log";
+const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -99,7 +100,7 @@ impl AsUrl for Url {
 }
 
 fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> bool {
-    path_segments.any(|p| p == "_delta_log")
+    path_segments.any(|p| p == DELTA_LOG_DIR)
 }
 
 impl<Location: AsUrl> ParsedLogPath<Location> {
@@ -149,7 +150,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         // 2. if the dir is named _delta_log, ensure no higher level directories are _also_ named
         //    _delta_log. If those checks pass, we're in the delta log dir
         let (in_delta_log_dir, in_staged_commits_dir) = if subdir == Some("_staged_commits") {
-            if path_segments.next_back() == Some("_delta_log")
+            if path_segments.next_back() == Some(DELTA_LOG_DIR)
                 && !path_contains_delta_log_dir(path_segments)
             {
                 (false, true)
@@ -158,14 +159,10 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             }
         } else {
             (
-                subdir == Some("_delta_log") && !path_contains_delta_log_dir(path_segments),
+                subdir == Some(DELTA_LOG_DIR) && !path_contains_delta_log_dir(path_segments),
                 false,
             )
         };
-
-        println!(
-            "For {url:?} is_delta_log_dir {in_delta_log_dir}, is_staged {in_staged_commits_dir}"
-        );
 
         // Parse the file type, based on the number of remaining parts
         let file_type = match split.as_slice() {
@@ -303,7 +300,7 @@ impl ParsedLogPath<FileMeta> {
 impl ParsedLogPath<Url> {
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
-        let location = table_root.join(DELTA_LOG_DIR)?.join(&filename)?;
+        let location = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?.join(&filename)?;
         Self::try_from(location)?.ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
@@ -399,7 +396,7 @@ impl LogRoot {
     /// TODO: could take a `table_root: TableRoot`
     pub(crate) fn new(table_root: Url) -> DeltaResult<Self> {
         // FIXME: need to check for trailing slash
-        Ok(Self(table_root.join(DELTA_LOG_DIR)?))
+        Ok(Self(table_root.join(DELTA_LOG_DIR_WITH_SLASH)?))
     }
 
     /// Create a new commit path (absolute path) for the given version.
