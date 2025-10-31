@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-
+use delta_kernel_derive::internal_api;
 use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
@@ -35,6 +35,7 @@ pub(crate) fn domain_metadata_configuration(
         .map(|domain_metadata| domain_metadata.configuration))
 }
 
+#[internal_api]
 pub(crate) fn all_domain_metadata_configuration(
     log_segment: &LogSegment,
     engine: &dyn Engine,
