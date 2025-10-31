@@ -1041,7 +1041,7 @@ mod tests {
         let result2 = coalesce_arrays(&[arr1, arr2], Some(&DataType::STRING));
         assert_result_error_with_message(
             result2,
-            "Requested result type Utf8 does not match arrays' data type Int32",
+            "Requested result type LargeUtf8 does not match arrays' data type Int32",
         );
     }
 

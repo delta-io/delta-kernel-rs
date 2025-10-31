@@ -29,6 +29,41 @@ mod tests;
 
 // TODO leverage scalars / Datum
 
+/// Helper function to append string values or nulls to either StringBuilder or LargeStringBuilder.
+/// This works generically with both Utf8 (i32 offsets) and LargeUtf8 (i64 offsets) builders.
+fn append_string_to_builder(
+    builder: &mut dyn ArrayBuilder,
+    value: Option<&str>,
+    num_rows: usize,
+) -> DeltaResult<()> {
+    // Try StringBuilder (Utf8 with i32 offsets)
+    if let Some(sb) = builder.as_any_mut().downcast_mut::<array::StringBuilder>() {
+        for _ in 0..num_rows {
+            match value {
+                Some(v) => sb.append_value(v),
+                None => sb.append_null(),
+            }
+        }
+        return Ok(());
+    }
+
+    // Try LargeStringBuilder (LargeUtf8 with i64 offsets)
+    if let Some(lsb) = builder
+        .as_any_mut()
+        .downcast_mut::<array::LargeStringBuilder>()
+    {
+        for _ in 0..num_rows {
+            match value {
+                Some(v) => lsb.append_value(v),
+                None => lsb.append_null(),
+            }
+        }
+        return Ok(());
+    }
+
+    Err(Error::invalid_expression("Invalid builder type for string"))
+}
+
 impl Scalar {
     /// Convert scalar to arrow array.
     pub fn to_array(&self, num_rows: usize) -> DeltaResult<ArrayRef> {
@@ -86,7 +121,7 @@ impl Scalar {
             Byte(val) => append_val_as!(array::Int8Builder, *val),
             Float(val) => append_val_as!(array::Float32Builder, *val),
             Double(val) => append_val_as!(array::Float64Builder, *val),
-            String(val) => append_val_as!(array::StringBuilder, val),
+            String(val) => append_string_to_builder(builder, Some(val), num_rows)?,
             Boolean(val) => append_val_as!(array::BooleanBuilder, *val),
             Timestamp(val) | TimestampNtz(val) => {
                 // timezone was already set at builder construction time
@@ -167,7 +202,7 @@ impl Scalar {
             DataType::BYTE => append_null_as!(array::Int8Builder),
             DataType::FLOAT => append_null_as!(array::Float32Builder),
             DataType::DOUBLE => append_null_as!(array::Float64Builder),
-            DataType::STRING => append_null_as!(array::StringBuilder),
+            DataType::STRING => append_string_to_builder(builder, None, num_rows)?,
             DataType::BOOLEAN => append_null_as!(array::BooleanBuilder),
             DataType::TIMESTAMP | DataType::TIMESTAMP_NTZ => {
                 append_null_as!(array::TimestampMicrosecondBuilder)
@@ -310,8 +345,11 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
                 let array_ref = apply_schema_to(&array_ref, output_type)?;
-                let arrow_type = ArrowDataType::try_from_kernel(output_type)?;
-                let schema = ArrowSchema::new(vec![ArrowField::new("output", arrow_type, true)]);
+                // Use the actual data type of the array, not the converted kernel type
+                // This allows both Utf8 and LargeUtf8 to work correctly
+                let actual_arrow_type = array_ref.data_type().clone();
+                let schema =
+                    ArrowSchema::new(vec![ArrowField::new("output", actual_arrow_type, true)]);
                 RecordBatch::try_new(Arc::new(schema), vec![array_ref])?
             }
         };

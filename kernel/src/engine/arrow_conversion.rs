@@ -122,7 +122,7 @@ impl TryFromKernel<&DataType> for ArrowDataType {
         match t {
             DataType::Primitive(p) => {
                 match p {
-                    PrimitiveType::String => Ok(ArrowDataType::Utf8),
+                    PrimitiveType::String => Ok(ArrowDataType::LargeUtf8),
                     PrimitiveType::Long => Ok(ArrowDataType::Int64), // undocumented type
                     PrimitiveType::Integer => Ok(ArrowDataType::Int32),
                     PrimitiveType::Short => Ok(ArrowDataType::Int16),
