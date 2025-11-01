@@ -258,51 +258,6 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     }
 }
 
-/// A vector of this type is returned from calling [`Scan::execute`]. Each [`ScanResult`] contains
-/// the raw [`EngineData`] as read by the engines [`crate::ParquetHandler`], and a boolean
-/// mask. Rows can be dropped from a scan due to deletion vectors, so we communicate back both
-/// EngineData and information regarding whether a row should be included or not (via an internal
-/// mask). See the docs below for [`ScanResult::full_mask`] for details on the mask.
-pub struct ScanResult {
-    /// Raw engine data as read from the disk for a particular file included in the query. Note
-    /// that this data may include data that should be filtered out based on the mask given by
-    /// [`full_mask`].
-    ///
-    /// [`full_mask`]: #method.full_mask
-    pub raw_data: DeltaResult<Box<dyn EngineData>>,
-    /// Raw row mask.
-    // TODO(nick) this should be allocated by the engine
-    pub(crate) raw_mask: Option<Vec<bool>>,
-}
-
-impl ScanResult {
-    /// Returns the raw row mask. If an item at `raw_mask()[i]` is true, row `i` is
-    /// valid. Otherwise, row `i` is invalid and should be ignored.
-    ///
-    /// The raw mask is dangerous to use because it may be shorter than expected. In particular, if
-    /// you are using the default engine and plan to call arrow's `filter_record_batch`, you _need_
-    /// to extend the mask to the full length of the batch or arrow will drop the extra
-    /// rows. Calling [`full_mask`] instead avoids this risk entirely, at the cost of a copy.
-    ///
-    /// [`full_mask`]: #method.full_mask
-    pub fn raw_mask(&self) -> Option<&Vec<bool>> {
-        self.raw_mask.as_ref()
-    }
-
-    /// Extends the underlying (raw) mask to match the row count of the accompanying data.
-    ///
-    /// If the raw mask is *shorter* than the number of rows returned, missing elements are
-    /// considered `true`, i.e. included in the query. If the mask is `None`, all rows are valid.
-    ///
-    /// NB: If you are using the default engine and plan to call arrow's `filter_record_batch`, you
-    /// _need_ to extend the mask to the full length of the batch or arrow will drop the extra rows.
-    pub fn full_mask(&self) -> Option<Vec<bool>> {
-        let mut mask = self.raw_mask.clone()?;
-        mask.resize(self.raw_data.as_ref().ok()?.len(), true);
-        Some(mask)
-    }
-}
-
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row
@@ -604,17 +559,15 @@ impl Scan {
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all
-    /// the data for the query. Each [`ScanResult`] in the resultant iterator encapsulates the raw
-    /// data and an optional boolean vector built from the deletion vector if it was present. See
-    /// the documentation for [`ScanResult`] for more details. Generally connectors/engines will
-    /// want to use [`Scan::scan_metadata`] so they can have more control over the execution of the
-    /// scan.
+    /// the data for the query. Each [`EngineData`] in the resultant iterator is a portion of the
+    /// final table data. Generally connectors/engines will want to use [`Scan::scan_metadata`] so
+    /// they can have more control over the execution of the scan.
     // This calls [`Scan::scan_metadata`] to get an iterator of `ScanMetadata` actions for the scan,
     // and then uses the `engine`'s [`crate::ParquetHandler`] to read the actual table data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>> + use<'_>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + use<'_>> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -700,17 +653,17 @@ impl Scan {
                     // to `rest` in a moment anyway
                     let mut sv = selection_vector.take();
                     let rest = split_vector(sv.as_mut(), len, None);
-                    let result = ScanResult {
-                        raw_data: logical,
-                        raw_mask: sv,
+                    let result = match sv {
+                        Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
+                        None => logical,
                     };
                     selection_vector = rest;
-                    Ok(result)
+                    result
                 }))
             })
-            // Iterator<DeltaResult<Iterator<DeltaResult<ScanResult>>>> to Iterator<DeltaResult<DeltaResult<ScanResult>>>
+            // Iterator<DeltaResult<Iterator<DeltaResult<Box<dyn EngineData>>>>> to Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>>
             .flatten_ok()
-            // Iterator<DeltaResult<DeltaResult<ScanResult>>> to Iterator<DeltaResult<ScanResult>>
+            // Iterator<DeltaResult<DeltaResult<Box<dyn EngineData>>>> to Iterator<DeltaResult<Box<dyn EngineData>>>
             .map(|x| x?);
         Ok(result)
     }
@@ -1155,10 +1108,10 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
         let scan = snapshot.scan_builder().build().unwrap();
-        let files: Vec<ScanResult> = scan.execute(engine).unwrap().try_collect().unwrap();
+        let files: Vec<Box<dyn EngineData>> = scan.execute(engine).unwrap().try_collect().unwrap();
 
         assert_eq!(files.len(), 1);
-        let num_rows = files[0].raw_data.as_ref().unwrap().len();
+        let num_rows = files[0].as_ref().len();
         assert_eq!(num_rows, 10)
     }
 
