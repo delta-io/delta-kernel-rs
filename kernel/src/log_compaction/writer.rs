@@ -1,11 +1,8 @@
 use url::Url;
 
 use super::COMPACTION_ACTIONS_SCHEMA;
-use crate::action_reconciliation::log_replay::{
-    ActionReconciliationBatch, ActionReconciliationProcessor,
-};
-use crate::action_reconciliation::RetentionCalculator;
-use crate::engine_data::FilteredEngineData;
+use crate::action_reconciliation::log_replay::ActionReconciliationProcessor;
+use crate::action_reconciliation::{ActionReconciliationIterator, RetentionCalculator};
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
 use crate::path::ParsedLogPath;
@@ -80,7 +77,7 @@ impl LogCompactionWriter {
     pub fn compaction_data(
         &mut self,
         engine: &dyn Engine,
-    ) -> DeltaResult<LogCompactionDataIterator> {
+    ) -> DeltaResult<ActionReconciliationIterator> {
         // Validate that the requested version range is within the snapshot's range
         let snapshot_end_version = self.snapshot.version();
         if self.end_version > snapshot_end_version {
@@ -119,70 +116,7 @@ impl LogCompactionWriter {
         // The processor handles reverse chronological processing internally
         let result_iter = processor.process_actions_iter(actions_iter);
 
-        // Wrap the iterator in a LogCompactionDataIterator to track action counts lazily
-        Ok(LogCompactionDataIterator::new(Box::new(result_iter)))
-    }
-}
-
-/// Iterator over log compaction data. Provides the reconciled actions that should be written
-/// to the compaction file.
-pub struct LogCompactionDataIterator {
-    /// The nested iterator that yields compaction batches with action counts
-    pub(crate) compaction_batch_iterator:
-        Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
-    /// Running total of actions included in the compaction
-    pub(crate) actions_count: i64,
-    /// Running total of add actions included in the compaction
-    pub(crate) add_actions_count: i64,
-}
-
-impl LogCompactionDataIterator {
-    /// Create a new LogCompactionDataIterator with counters initialized to 0
-    pub(crate) fn new(
-        compaction_batch_iterator: Box<
-            dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
-        >,
-    ) -> Self {
-        Self {
-            compaction_batch_iterator,
-            actions_count: 0,
-            add_actions_count: 0,
-        }
-    }
-
-    /// Get the total number of actions in the compaction
-    /// We don't use it currently, leaving it on as a useful observabilty feature.
-    #[allow(dead_code)]
-    pub(crate) fn total_actions(&self) -> i64 {
-        self.actions_count
-    }
-
-    /// Get the total number of add actions in the compaction
-    /// We don't use it currently, leaving it on as a useful observabilty feature.
-    #[allow(dead_code)]
-    pub(crate) fn total_add_actions(&self) -> i64 {
-        self.add_actions_count
-    }
-}
-
-impl std::fmt::Debug for LogCompactionDataIterator {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LogCompactionDataIterator")
-            .field("actions_count", &self.actions_count)
-            .field("add_actions_count", &self.add_actions_count)
-            .finish()
-    }
-}
-
-impl Iterator for LogCompactionDataIterator {
-    type Item = DeltaResult<FilteredEngineData>;
-
-    /// Advances the iterator and returns the next value.
-    fn next(&mut self) -> Option<Self::Item> {
-        Some(self.compaction_batch_iterator.next()?.map(|batch| {
-            self.actions_count += batch.actions_count;
-            self.add_actions_count += batch.add_actions_count;
-            batch.filtered_data
-        }))
+        // Wrap the iterator to track action counts lazily
+        Ok(ActionReconciliationIterator::new(Box::new(result_iter)))
     }
 }
