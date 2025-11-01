@@ -159,7 +159,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::path::LogRoot;
 
@@ -212,7 +211,7 @@ mod tests {
     async fn catalog_managed_tables_block_transactions() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone());
 
         let actions = [
             r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,
