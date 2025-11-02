@@ -849,16 +849,23 @@ pub trait DataSkippingPredicateEvaluator {
         // See:
         // - https://github.com/delta-io/delta-kernel-rs/pull/1003
         if matches!(val, Scalar::Timestamp(_) | Scalar::TimestampNtz(_)) {
-            match ord {
-                Ordering::Greater | Ordering::Less => {
+            match (ord, inverted) {
+                // col > val => stats.max.col > val
+                // NOT(col < val) => NOT(stats.max.col < val)
+                (Ordering::Greater, false) | (Ordering::Less, true) => {
                     let max_ts_adjusted = timestamp_subtract(val, 999);
                     tracing::debug!(
                         "Adjusted timestamp value for col {col} for max stat comparison from {val:?} to {max_ts_adjusted:?}"
                     );
                     return self.eval_partial_cmp(ord, max, &max_ts_adjusted, inverted);
                 }
+                // // The following case is not currently used but included for completeness and to ensure correctness in the future if logic is changed to use it.
+                // !(max > val) or max < val
+                (Ordering::Greater, true) | (Ordering::Less, false) => {
+                    return self.eval_partial_cmp(ord, max, &val, inverted);
+                }
                 // Equality comparison can't be applied as max stats is truncated to milliseconds, so actual microsecond value is unknown.
-                Ordering::Equal => return None,
+                (Ordering::Equal, _) => return None,
             }
         }
 
