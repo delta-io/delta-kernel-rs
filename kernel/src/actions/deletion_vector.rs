@@ -164,7 +164,9 @@ impl DeletionVectorDescriptor {
                     1681511377 => RoaringTreemap::deserialize_from(&byte_slice[4..])
                         .map_err(|err| Error::DeletionVector(err.to_string())),
                     1681511376 => {
-                        todo!("Don't support native serialization in inline bitmaps yet");
+                        Err(Error::DeletionVector(
+                            "Native serialization in inline bitmaps is not yet supported".to_string()
+                        ))
                     }
                     _ => Err(Error::DeletionVector(format!("Invalid magic {magic}"))),
                 }
