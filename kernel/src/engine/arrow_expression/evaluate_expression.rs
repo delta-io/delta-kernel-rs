@@ -496,7 +496,8 @@ impl EncoderFactory for DecimalScaleZeroEncoderFactory {
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| {
                         ArrowError::InvalidArgumentError(format!(
-                            "Field type is Decimal128 but array type is {}. This is a bug.",
+                            "Field {} has type Decimal128 but array has type {}. This is a bug.",
+                            field.name(),
                             array.data_type()
                         ))
                     })?;
@@ -514,7 +515,8 @@ impl EncoderFactory for DecimalScaleZeroEncoderFactory {
                     .downcast_ref::<Decimal256Array>()
                     .ok_or_else(|| {
                         ArrowError::InvalidArgumentError(format!(
-                            "Field type is Decimal256 but array type is {}. This is a bug.",
+                            "Field {} has type Decimal256 but array has type {}. This is a bug.",
+                            field.name(),
                             array.data_type()
                         ))
                     })?;
@@ -1427,4 +1429,5 @@ mod tests {
             json2
         );
     }
+
 }
