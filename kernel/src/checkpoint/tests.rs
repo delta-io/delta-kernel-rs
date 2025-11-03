@@ -181,11 +181,11 @@ fn write_commit_to_store(
         .collect();
     let content = json_lines.join("\n");
 
-    let commit_path = format!("_delta_log/{}", delta_path_for_version(version, "json"));
+    let commit_path = delta_path_for_version(version, "json");
 
     tokio::runtime::Runtime::new()
         .expect("create tokio runtime")
-        .block_on(async { store.put(&Path::from(commit_path), content.into()).await })?;
+        .block_on(async { store.put(&commit_path, content.into()).await })?;
 
     Ok(())
 }
