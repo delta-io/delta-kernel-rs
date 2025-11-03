@@ -27,7 +27,7 @@
 //!     .with_predicate(predicate.clone())
 //!     .build()?;
 //!
-//! // Execute the table changes scan to get a fallible iterator of `ScanResult`s
+//! // Execute the table changes scan to get a fallible iterator of `Box<dyn EngineData>`s
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
 //! # Ok::<(), Error>(())
 //! ```
