@@ -13,6 +13,7 @@ use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
+use crate::metrics::{MetricEvent, MetricId, Timer};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -257,13 +258,57 @@ impl Snapshot {
         log_segment: LogSegment,
         engine: &dyn Engine,
     ) -> DeltaResult<Self> {
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-        Ok(Self {
-            log_segment,
-            table_configuration,
-        })
+        Self::try_new_from_log_segment_with_metrics(location, log_segment, engine, None)
+    }
+
+    pub(crate) fn try_new_from_log_segment_with_metrics(
+        location: Url,
+        log_segment: LogSegment,
+        engine: &dyn Engine,
+        operation_id: Option<MetricId>,
+    ) -> DeltaResult<Self> {
+        let operation_id = operation_id.unwrap_or_default();
+        let reporter = engine.get_metrics_reporter();
+        let timer = Timer::new();
+
+        let result = (|| {
+            let (metadata, protocol) = log_segment.read_metadata(engine)?;
+            let protocol_metadata_duration = timer.elapsed();
+
+            if let Some(ref r) = reporter {
+                r.report(MetricEvent::ProtocolMetadataLoaded {
+                    operation_id,
+                    duration: protocol_metadata_duration,
+                });
+            }
+
+            let table_configuration =
+                TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+
+            Ok(Self {
+                log_segment,
+                table_configuration,
+            })
+        })();
+
+        match result {
+            Ok(snapshot) => {
+                if let Some(ref r) = reporter {
+                    r.report(MetricEvent::SnapshotCompleted {
+                        operation_id,
+                        version: snapshot.version(),
+                        total_duration: timer.elapsed(),
+                    });
+                }
+                Ok(snapshot)
+            }
+            Err(e) => {
+                if let Some(ref r) = reporter {
+                    r.report(MetricEvent::SnapshotFailed { operation_id });
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -945,7 +990,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
         let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
@@ -1006,7 +1051,7 @@ mod tests {
             });
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
@@ -1040,7 +1085,7 @@ mod tests {
             });
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
 
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.
