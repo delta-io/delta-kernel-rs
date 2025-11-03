@@ -9,6 +9,7 @@ use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
+use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
@@ -236,6 +237,15 @@ impl EngineData for ArrowEngineData {
         // Create a new ArrowEngineData with the combined schema and columns
         let data = RecordBatch::try_new(combined_schema, combined_columns)?;
         Ok(Box::new(ArrowEngineData { data }))
+    }
+
+    fn apply_selection_vector(
+        self: Box<Self>,
+        mut selection_vector: Vec<bool>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        selection_vector.resize(self.len(), true);
+        let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
+        Ok(Box::new(Self::new(filtered)))
     }
 }
 
