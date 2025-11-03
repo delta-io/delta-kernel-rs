@@ -10,21 +10,102 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
+use crate::metrics::{MetricEvent, MetricsReporter, Timer};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+
+/// Iterator wrapper that emits metrics when exhausted
+struct ListMetricsIterator<I> {
+    inner: I,
+    reporter: Option<Arc<dyn MetricsReporter>>,
+    timer: Timer,
+    count: u64,
+    metrics_emitted: bool,
+}
+
+impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator<I> {
+    type Item = DeltaResult<FileMeta>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(item) => {
+                if item.is_ok() {
+                    self.count += 1;
+                }
+                Some(item)
+            }
+            None => {
+                if !self.metrics_emitted {
+                    if let Some(ref r) = self.reporter {
+                        r.report(MetricEvent::StorageListCompleted {
+                            duration: self.timer.elapsed(),
+                            num_files: self.count,
+                        });
+                    }
+                    self.metrics_emitted = true;
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Iterator wrapper for read operations that tracks bytes read
+struct ReadMetricsIterator<I> {
+    inner: I,
+    reporter: Option<Arc<dyn MetricsReporter>>,
+    timer: Timer,
+    num_files: u64,
+    bytes_read: u64,
+    metrics_emitted: bool,
+}
+
+impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I> {
+    type Item = DeltaResult<Bytes>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(item) => {
+                if let Ok(ref bytes) = item {
+                    self.bytes_read += bytes.len() as u64;
+                }
+                Some(item)
+            }
+            None => {
+                if !self.metrics_emitted {
+                    if let Some(ref r) = self.reporter {
+                        r.report(MetricEvent::StorageReadCompleted {
+                            duration: self.timer.elapsed(),
+                            num_files: self.num_files,
+                            bytes_read: self.bytes_read,
+                        });
+                    }
+                    self.metrics_emitted = true;
+                }
+                None
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
     task_executor: Arc<E>,
+    reporter: Option<Arc<dyn MetricsReporter>>,
     readahead: usize,
 }
 
 impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     #[internal_api]
-    pub(crate) fn new(store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub(crate) fn new(
+        store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        reporter: Option<Arc<dyn MetricsReporter>>,
+    ) -> Self {
         Self {
             inner: store,
             task_executor,
+            reporter,
             readahead: 10,
         }
     }
@@ -106,13 +187,31 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             }
         });
 
+        let timer = Timer::new();
+        let reporter = self.reporter.clone();
+
         if !has_ordered_listing {
             // This FS doesn't return things in the order we require
             let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
             fms.sort_unstable();
+
+            let num_files = fms.len() as u64;
+            if let Some(ref r) = reporter {
+                r.report(MetricEvent::StorageListCompleted {
+                    duration: timer.elapsed(),
+                    num_files,
+                });
+            }
+
             Ok(Box::new(fms.into_iter().map(Ok)))
         } else {
-            Ok(Box::new(receiver.into_iter()))
+            Ok(Box::new(ListMetricsIterator {
+                inner: receiver.into_iter(),
+                reporter,
+                timer,
+                count: 0,
+                metrics_emitted: false,
+            }))
         }
     }
 
@@ -127,6 +226,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let store = self.inner.clone();
+        let num_files = files.len() as u64;
 
         // This channel will become the output iterator.
         // Because there will already be buffering in the stream, we set the
@@ -173,19 +273,28 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                 }),
         );
 
-        Ok(Box::new(receiver.into_iter()))
+        Ok(Box::new(ReadMetricsIterator {
+            inner: receiver.into_iter(),
+            reporter: self.reporter.clone(),
+            timer: Timer::new(),
+            num_files,
+            bytes_read: 0,
+            metrics_emitted: false,
+        }))
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
+        let timer = Timer::new();
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
         let dest_path_str = dest_path.to_string();
         let store = self.inner.clone();
+        let reporter = self.reporter.clone();
 
         // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
         // necessarily atomic, but since the source file is immutable, we aren't exposed to the
         // possiblilty of source file changing while we do the PUT.
-        self.task_executor.block_on(async move {
+        let result = self.task_executor.block_on(async move {
             let data = store.get(&src_path).await?.bytes().await?;
 
             store
@@ -198,7 +307,15 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     e => e.into(),
                 })?;
             Ok(())
-        })
+        });
+
+        if let Some(ref r) = reporter {
+            r.report(MetricEvent::StorageCopyCompleted {
+                duration: timer.elapsed(),
+            });
+        }
+
+        result
     }
 
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
@@ -260,7 +377,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
@@ -348,7 +465,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
 
         // basic
         let data = Bytes::from("test-data");

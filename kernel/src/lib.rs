@@ -93,6 +93,7 @@ pub mod error;
 pub mod expressions;
 mod log_compaction;
 mod log_path;
+pub mod metrics;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -715,6 +716,14 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`metrics::MetricsReporter`] for metrics collection.
+    ///
+    /// Returns an optional reporter that will receive metric events from Delta operations.
+    /// The default implementation returns None (no metrics reporting).
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn crate::metrics::MetricsReporter>> {
+        None
+    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared
