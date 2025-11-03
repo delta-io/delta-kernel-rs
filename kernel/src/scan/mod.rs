@@ -384,10 +384,10 @@ impl Scan {
     /// - `Vec<Option<Expression>>`: Transformation expressions that need to be applied. For each
     ///   row at index `i` in the above data, if an expression exists at index `i` in the `Vec`,
     ///   the associated expression _must_ be applied to the data read from the file specified by
-    ///   the row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
-    ///   the item at index `i` in this `Vec` is `None`, or if the `Vec` contains fewer than `i`
-    ///   elements, no expression need be applied and the data read from disk is already in the
-    ///   correct logical state.
+    ///   the row. The resultant schema for this expression is guaranteed to be
+    ///   [`Self::logical_schema()`]. If the item at index `i` in this `Vec` is `None`, or if the
+    ///   `Vec` contains fewer than `i` elements, no expression need be applied and the data read
+    ///   from disk is already in the correct logical state.
     pub fn scan_metadata(
         &self,
         engine: &dyn Engine,
