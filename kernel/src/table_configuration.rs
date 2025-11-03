@@ -198,7 +198,8 @@ impl TableConfiguration {
                 self.is_cdf_read_supported(),
                 Error::unsupported(
                     "Change data feed is enabled on this table, but found invalid table
-                    table_configuration. Ensure that column mapping is enabled and the protocol reader/writer features"
+                    table_configuration. Ensure that column mapping is disabled and ensure correct
+                    protocol reader/writer features"
                 )
             );
         }
@@ -576,19 +577,22 @@ mod test {
                 ),
                 Err(Error::unsupported("Writing to table with Change Data Feed is only supported if append only mode is enabled"))
             ),
-            (
-                // Should fail since AppendOnly is not enabled
-                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"],None, 1, 4),
-                Err(Error::unsupported("Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"))
-
-            ),
-            (
+                    (
                 // Should succeed since AppendOnly is enabled
                 create_mock_table_config(
                     &["delta.delta.enableChangeDataFeed", "delta.appendOnly"],
                     &[ChangeDataFeed, AppendOnly],
                 ),
                 Ok(()),
+            ),
+
+            (
+                // Fails since writes are not supported on min_writer_version=4. Once version 4 is
+                // supported, ensure that this still fails since ChangeDataFeed is enabled while
+                // append only is not enabled.
+                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"],None, 1, 4),
+                Err(Error::unsupported("Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"))
+
             ),
             // NOTE: The following cases should be updated if column mapping for writes is
             // supported before cdc is.
