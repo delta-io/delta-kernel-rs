@@ -41,12 +41,9 @@ mod timestamp_ntz;
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 pub(crate) enum TableFeature {
-    /// CatalogManaged tables:
-    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
-    CatalogManaged,
-    #[strum(serialize = "catalogOwned-preview")]
-    #[serde(rename = "catalogOwned-preview")]
-    CatalogOwnedPreview,
+    //////////////////////////
+    // Writer-only features //
+    //////////////////////////
     /// Append Only Tables
     AppendOnly,
     /// Table invariants
@@ -57,16 +54,37 @@ pub(crate) enum TableFeature {
     ChangeDataFeed,
     /// Columns with generated values
     GeneratedColumns,
-    /// Mapping of one column to another
-    ColumnMapping,
     /// ID Columns
     IdentityColumns,
     /// Monotonically increasing timestamps in the CommitInfo
     InCommitTimestamp,
-    /// Deletion vectors for merge, update, delete
-    DeletionVectors,
     /// Row tracking on tables
     RowTracking,
+    /// domain specific metadata
+    DomainMetadata,
+    /// Iceberg compatibility support
+    IcebergCompatV1,
+    /// Iceberg compatibility support
+    IcebergCompatV2,
+    /// The Clustered Table feature facilitates the physical clustering of rows
+    /// that share similar values on a predefined set of clustering columns.
+    #[strum(serialize = "clustering")]
+    #[serde(rename = "clustering")]
+    ClusteredTable,
+
+    ///////////////////////////
+    // ReaderWriter features //
+    ///////////////////////////
+    /// CatalogManaged tables:
+    /// <https://github.com/delta-io/delta/blob/master/protocol_rfcs/catalog-managed.md>
+    CatalogManaged,
+    #[strum(serialize = "catalogOwned-preview")]
+    #[serde(rename = "catalogOwned-preview")]
+    CatalogOwnedPreview,
+    /// Mapping of one column to another
+    ColumnMapping,
+    /// Deletion vectors for merge, update, delete
+    DeletionVectors,
     /// timestamps without timezone support
     #[strum(serialize = "timestampNtz")]
     #[serde(rename = "timestampNtz")]
@@ -76,22 +94,11 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "typeWidening-preview")]
     #[serde(rename = "typeWidening-preview")]
     TypeWideningPreview,
-    /// domain specific metadata
-    DomainMetadata,
     /// version 2 of checkpointing
     V2Checkpoint,
-    /// Iceberg compatibility support
-    IcebergCompatV1,
-    /// Iceberg compatibility support
-    IcebergCompatV2,
     /// vacuumProtocolCheck ReaderWriter feature ensures consistent application of reader and writer
     /// protocol checks during VACUUM operations
     VacuumProtocolCheck,
-    /// The Clustered Table feature facilitates the physical clustering of rows
-    /// that share similar values on a predefined set of clustering columns.
-    #[strum(serialize = "clustering")]
-    #[serde(rename = "clustering")]
-    ClusteredTable,
     /// This feature enables support for the variant data type, which stores semi-structured data.
     VariantType,
     #[strum(serialize = "variantType-preview")]
@@ -100,15 +107,20 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "variantShredding-preview")]
     #[serde(rename = "variantShredding-preview")]
     VariantShreddingPreview,
+
     #[serde(untagged)]
     #[strum(default)]
     Unknown(String),
 }
 
-#[derive(Eq, PartialEq)]
+/// Classifies table features by their type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeatureType {
+    /// Feature only affects write operations
     Writer,
+    /// Feature affects both read and write operations (must appear in both feature lists)
     ReaderWriter,
+    /// Unknown feature type (for forward compatibility)
     Unknown,
 }
 
@@ -247,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_reader_features() {
+    fn test_roundtrip_table_features() {
         let cases = [
             (TableFeature::CatalogManaged, "catalogManaged"),
             (TableFeature::CatalogOwnedPreview, "catalogOwned-preview"),
