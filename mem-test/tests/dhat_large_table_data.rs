@@ -16,7 +16,6 @@ use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::Snapshot;
 
-use arrow::compute::filter_record_batch;
 use object_store::local::LocalFileSystem;
 use serde_json::json;
 use tempfile::tempdir;
@@ -142,21 +141,12 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 5: Execute the scan and read data
     let mut row_count = 0;
-    for scan_result in scan.execute(engine)? {
-        let scan_result = scan_result?;
-        let mask = scan_result.full_mask();
-        let data = scan_result.raw_data?;
-        let record_batch: RecordBatch = data
+    for data in scan.execute(engine)? {
+        let batch: RecordBatch = data?
             .into_any()
             .downcast::<ArrowEngineData>()
             .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
             .into();
-
-        let batch = if let Some(mask) = mask {
-            filter_record_batch(&record_batch, &mask.into())?
-        } else {
-            record_batch
-        };
         row_count += batch.num_rows();
     }
 

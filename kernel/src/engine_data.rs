@@ -64,6 +64,13 @@ impl FilteredEngineData {
             selection_vector: vec![],
         }
     }
+
+    /// Apply the contained selection vector and return an engine data with only the valid rows
+    /// included. This consumes the `FilteredEngineData`
+    pub fn apply_selection_vector(self) -> DeltaResult<Box<dyn EngineData>> {
+        self.data
+            .apply_selection_vector(self.selection_vector.clone())
+    }
 }
 
 impl HasSelectionVector for FilteredEngineData {
@@ -335,6 +342,9 @@ pub trait RowVisitor {
 ///   fn append_columns(&self, schema: SchemaRef, columns: Vec<ArrayData>) -> DeltaResult<Box<dyn EngineData>> {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
+///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
+///     todo!() // filter out unselected rows and return the new set of data
+///   }
 /// }
 /// ```
 pub trait EngineData: AsAny {
@@ -380,6 +390,14 @@ pub trait EngineData: AsAny {
         schema: SchemaRef,
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Apply a selection vector to the data and return a data where only the valid rows are
+    /// included. This consumes the EngineData, allowing engines to implement this "in place" if
+    /// desired
+    fn apply_selection_vector(
+        self: Box<Self>,
+        selection_vector: Vec<bool>,
+    ) -> DeltaResult<Box<dyn EngineData>>;
 }
 
 #[cfg(test)]
@@ -392,21 +410,22 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use std::sync::Arc;
 
-    #[test]
-    fn test_with_all_rows_selected_empty_data() {
-        // Test with empty data
+    fn get_engine_data(rows: usize) -> Box<dyn EngineData> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "value",
             ArrowDataType::Utf8,
             true,
         )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(Vec::<String>::new()))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+        let data: Vec<String> = (0..rows).map(|i| format!("row{i}")).collect();
+        Box::new(ArrowEngineData::new(
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(data))]).unwrap(),
+        ))
+    }
 
+    #[test]
+    fn test_with_all_rows_selected_empty_data() {
+        // Test with empty data
+        let data = get_engine_data(0);
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
 
         assert_eq!(filtered_data.selection_vector().len(), 0);
@@ -417,18 +436,7 @@ mod tests {
     #[test]
     fn test_with_all_rows_selected_single_row() {
         // Test with single row
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["single_row"]))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
-
+        let data = get_engine_data(1);
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
 
         // According to the new contract, empty selection vector means all rows are selected
@@ -440,20 +448,7 @@ mod tests {
     #[test]
     fn test_with_all_rows_selected_multiple_rows() {
         // Test with multiple rows
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec![
-                "row1", "row2", "row3", "row4",
-            ]))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
-
+        let data = get_engine_data(4);
         let filtered_data = FilteredEngineData::with_all_rows_selected(data);
 
         // According to the new contract, empty selection vector means all rows are selected
@@ -465,18 +460,7 @@ mod tests {
     #[test]
     fn test_has_selected_rows_empty_data() {
         // Test with empty data
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(Vec::<String>::new()))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
-
+        let data = get_engine_data(0);
         let filtered_data = FilteredEngineData::try_new(data, vec![]).unwrap();
 
         // Empty data should return false even with empty selection vector
@@ -486,18 +470,7 @@ mod tests {
     #[test]
     fn test_has_selected_rows_selection_vector_shorter_than_data() {
         // Test with selection vector shorter than data length
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["row1", "row2", "row3"]))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
-
+        let data = get_engine_data(3);
         // Selection vector with only 2 elements for 3 rows of data
         let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
 
@@ -507,19 +480,7 @@ mod tests {
 
     #[test]
     fn test_has_selected_rows_selection_vector_same_length_all_false() {
-        // Test with selection vector same length as data, all false
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["row1", "row2"]))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
-
+        let data = get_engine_data(2);
         let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
 
         // Should return false because no rows are selected
@@ -528,19 +489,7 @@ mod tests {
 
     #[test]
     fn test_has_selected_rows_selection_vector_same_length_some_true() {
-        // Test with selection vector same length as data, some true
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["row1", "row2", "row3"]))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
-
+        let data = get_engine_data(3);
         let filtered_data = FilteredEngineData::try_new(data, vec![true, false, true]).unwrap();
 
         // Should return true because some rows are selected
@@ -550,18 +499,7 @@ mod tests {
     #[test]
     fn test_try_new_selection_vector_larger_than_data() {
         // Test with selection vector larger than data length - should return error
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["row1", "row2"]))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
-
+        let data = get_engine_data(2);
         // Selection vector with 3 elements for 2 rows of data - should fail
         let result = FilteredEngineData::try_new(data, vec![true, false, true]);
 
@@ -577,17 +515,7 @@ mod tests {
 
     #[test]
     fn test_from_engine_data() {
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "value",
-            ArrowDataType::Utf8,
-            true,
-        )]));
-        let record_batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(vec!["test1", "test2", "test3"]))],
-        )
-        .unwrap();
-        let data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(record_batch));
+        let data = get_engine_data(3);
         let data_len = data.len(); // Save length before move
 
         // Use the From trait to convert
@@ -598,5 +526,21 @@ mod tests {
         assert_eq!(filtered_data.data().len(), data_len);
         assert_eq!(filtered_data.data().len(), 3);
         assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn filtered_apply_seclection_vector_full() {
+        let data = get_engine_data(4);
+        let filtered = FilteredEngineData::try_new(data, vec![true, false, true, false]).unwrap();
+        let data = filtered.apply_selection_vector().unwrap();
+        assert_eq!(data.len(), 2);
+    }
+
+    #[test]
+    fn filtered_apply_seclection_vector_partial() {
+        let data = get_engine_data(4);
+        let filtered = FilteredEngineData::try_new(data, vec![true, false]).unwrap();
+        let data = filtered.apply_selection_vector().unwrap();
+        assert_eq!(data.len(), 3);
     }
 }

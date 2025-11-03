@@ -1,7 +1,6 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
@@ -50,21 +49,14 @@ fn try_main() -> DeltaResult<()> {
     let mut rows_so_far = 0;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
+        .map(|data| -> DeltaResult<_> {
             // extract the batches and filter them if they have deletion vectors
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
+            let record_batch: RecordBatch = data?
                 .into_any()
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
+            Ok(record_batch)
         })
         .scan(&mut rows_so_far, |rows_so_far, record_batch| {
             // handle truncation if we've specified a limit

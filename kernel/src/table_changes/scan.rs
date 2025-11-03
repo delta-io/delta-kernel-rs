@@ -8,9 +8,9 @@ use url::Url;
 use crate::actions::deletion_vector::split_vector;
 use crate::scan::field_classifiers::CdfTransformFieldClassifier;
 use crate::scan::state_info::StateInfo;
-use crate::scan::{PhysicalPredicate, ScanResult};
+use crate::scan::PhysicalPredicate;
 use crate::schema::SchemaRef;
-use crate::{DeltaResult, Engine, FileMeta, PredicateRef};
+use crate::{DeltaResult, Engine, EngineData, FileMeta, PredicateRef};
 
 use super::log_replay::{table_changes_action_iter, TableChangesScanMetadata};
 use super::physical_to_logical::{get_cdf_transform_expr, scan_file_physical_schema};
@@ -182,14 +182,13 @@ impl TableChangesScan {
         }
     }
 
-    /// Perform an "all in one" scan to get the change data feed. This will use the provided `engine`
-    /// to read and process all the data for the query. Each [`ScanResult`] in the resultant iterator
-    /// encapsulates the raw data and an optional boolean vector built from the deletion vector if it
-    /// was present. See the documentation for [`ScanResult`] for more details.
+    /// Perform an "all in one" scan to get the change data feed. This will use the provided
+    /// `engine` to read and process all the data for the query. Each [`EngineData`] in the
+    /// resultant iterator is a portion of the final set of data.
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
         let scan_metadata = self.scan_metadata(engine.clone())?;
         let scan_files = scan_metadata_to_scan_file(scan_metadata);
 
@@ -222,14 +221,14 @@ impl TableChangesScan {
 }
 
 /// Reads the data at the `resolved_scan_file` and transforms the data from physical to logical.
-/// The result is a fallible iterator of [`ScanResult`] containing the logical data.
+/// The result is a fallible iterator of [`Box<dyn EngineData>`] containing the logical data.
 fn read_scan_file(
     engine: &dyn Engine,
     resolved_scan_file: ResolvedCdfScanFile,
     table_root: &Url,
     state_info: &StateInfo,
     _physical_predicate: Option<PredicateRef>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanResult>>> {
+) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
     let ResolvedCdfScanFile {
         scan_file,
         mut selection_vector,
@@ -302,12 +301,12 @@ fn read_scan_file(
         // the selection vector is `None`.
         let extend = Some(!is_dv_resolved_pair);
         let rest = split_vector(sv.as_mut(), len, extend);
-        let result = ScanResult {
-            raw_data: logical,
-            raw_mask: sv,
+        let result = match sv {
+            Some(sv) => logical.and_then(|data| data.apply_selection_vector(sv)),
+            None => logical,
         };
         selection_vector = rest;
-        Ok(result)
+        result
     });
     Ok(result)
 }

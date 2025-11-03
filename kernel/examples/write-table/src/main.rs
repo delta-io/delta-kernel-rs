@@ -320,24 +320,13 @@ async fn read_and_display_data(
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
+        .map(|data| -> DeltaResult<_> {
+            let record_batch: RecordBatch = data?
                 .into_any()
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-
-            if let Some(mask) = mask {
-                Ok(arrow::compute::filter_record_batch(
-                    &record_batch,
-                    &mask.into(),
-                )?)
-            } else {
-                Ok(record_batch)
-            }
+            Ok(record_batch)
         })
         .try_collect()?;
 
