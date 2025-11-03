@@ -15,7 +15,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(test, derive(serde::Serialize))]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum DeletionVectorStorageType {
     #[cfg_attr(test, serde(rename = "u"))]
     PersistedRelative,
@@ -58,7 +58,11 @@ impl ToDataType for DeletionVectorStorageType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(test, derive(serde::Serialize), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    test,
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct DeletionVectorDescriptor {
     /// A single character to indicate how to access the DV. Legal options are: ['u', 'i', 'p'].
     pub storage_type: DeletionVectorStorageType,
