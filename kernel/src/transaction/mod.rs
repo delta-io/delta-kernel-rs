@@ -1,6 +1,6 @@
 use crate::SchemaTransform;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
@@ -10,8 +10,8 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
-    get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
-    INTERNAL_DOMAIN_PREFIX,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
