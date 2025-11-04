@@ -212,16 +212,6 @@ impl DeletionVectorDescriptor {
         storage: Arc<dyn StorageHandler>,
         parent: &Url,
     ) -> DeltaResult<RoaringTreemap> {
-        self.read_with_possible_validation(storage, parent, false)
-    }
-
-    /// Same as above, but optionally validate the CRC32 checksum in the file.
-    pub(crate) fn read_with_possible_validation(
-        &self,
-        storage: Arc<dyn StorageHandler>,
-        parent: &Url,
-        validate_crc: bool,
-    ) -> DeltaResult<RoaringTreemap> {
         match self.absolute_path(parent)? {
             None => {
                 let byte_slice = z85::decode(&self.path_or_inline_dv)
@@ -313,22 +303,20 @@ impl DeletionVectorDescriptor {
                     ))
                 );
 
-                if validate_crc {
-                    let mut crc_cursor: Cursor<Bytes> =
-                        Cursor::new(bytes.slice(crc_start..crc_start + 4));
-                    let crc = read_u32(&mut crc_cursor, Endian::Big)?;
-                    let crc32 = create_dv_crc32();
-                    // CRC is calculated from magic field through end of bitmap
-                    let magic_start = bitmap_start - 4;
-                    // Safety: verified bytes is larger than crc_start + 4, above.
-                    let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
-                    require!(
-                        crc == expected_crc,
-                        Error::DeletionVector(format!(
-                            "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
-                        ))
-                    );
-                }
+                let mut crc_cursor: Cursor<Bytes> =
+                    Cursor::new(bytes.slice(crc_start..crc_start + 4));
+                let crc = read_u32(&mut crc_cursor, Endian::Big)?;
+                let crc32 = create_dv_crc32();
+                // CRC is calculated from magic field through end of bitmap
+                let magic_start = bitmap_start - 4;
+                // Safety: verified bytes is larger than crc_start + 4, above.
+                let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
+                require!(
+                    crc == expected_crc,
+                    Error::DeletionVector(format!(
+                        "CRC32 checksum mismatch for {path}. Got: {crc}, expected: {expected_crc}"
+                    ))
+                );
                 // Safety: verified bytes is larger than crc_start + 4, above.
                 let dv_bytes = bytes.slice(bitmap_start..crc_start);
                 let cursor = Cursor::new(dv_bytes);
@@ -563,9 +551,7 @@ mod tests {
 
         let example = dv_example();
         let tree_map = example.read(storage.clone(), &parent).unwrap();
-        let validated_treemap = example
-            .read_with_possible_validation(storage.clone(), &parent, true)
-            .unwrap();
+        let validated_treemap = example.read(storage.clone(), &parent).unwrap();
         assert_eq!(tree_map, validated_treemap);
 
         let expected: Vec<u64> = vec![0, 9];

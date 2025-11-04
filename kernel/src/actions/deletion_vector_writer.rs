@@ -583,9 +583,7 @@ mod tests {
         let storage = engine.storage_handler();
 
         let descriptor = write_result.to_descriptor(&dv_path);
-        let treemap = descriptor
-            .read_with_possible_validation(storage, &table_url, true)
-            .unwrap();
+        let treemap = descriptor.read(storage, &table_url).unwrap();
 
         // Verify the exact set of indexes matches
         let read_indexes: Vec<u64> = treemap.into_iter().collect();
@@ -730,9 +728,7 @@ mod tests {
             let descriptor = write_result.clone().to_descriptor(&dv_path);
 
             // Read the deletion vector back using the descriptor
-            let treemap = descriptor
-                .read_with_possible_validation(storage.clone(), &table_url, true)
-                .unwrap();
+            let treemap = descriptor.read(storage.clone(), &table_url).unwrap();
 
             // Verify the content matches
             assert_eq!(
