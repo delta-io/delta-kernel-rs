@@ -227,7 +227,6 @@ impl DeletionVectorDescriptor {
                 }
             }
             Some(path) => {
-                let offset = self.offset;
                 let size_in_bytes: u32 =
                     self.size_in_bytes
                         .try_into()
@@ -241,6 +240,7 @@ impl DeletionVectorDescriptor {
                     .ok_or(Error::missing_data(format!(
                         "No deletion vector data for {path}"
                     )))??;
+                let dv_data_len = dv_data.len();
 
                 let mut cursor = Cursor::new(dv_data);
                 let mut version_buf = [0; 1];
@@ -270,7 +270,14 @@ impl DeletionVectorDescriptor {
                 // | 4 bytes       |  CRC            |
                 // +---------------+-----------------+
 
-                let this_dv_start = offset.unwrap_or(1) as usize;
+                let this_dv_start: usize =
+                    self.offset
+                        .unwrap_or(1)
+                        .try_into()
+                        .or(Err(Error::DeletionVector(format!(
+                            "Offset {:?} doesn't fit in usize for {path}",
+                            self.offset
+                        ))))?;
                 let magic_start = this_dv_start + 4;
                 // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
                 let bitmap_start = this_dv_start + 8;
@@ -278,6 +285,12 @@ impl DeletionVectorDescriptor {
                 // Safety: size_in_bytes is checked to fit in u32 which for all known platforms should
                 // fix in usize range.
                 let crc_start = this_dv_start + 4 + (size_in_bytes as usize);
+                require!(
+                    this_dv_start < dv_data_len,
+                    Error::DeletionVector(format!(
+                        "This DV start is out of bounds for {path} (Offset: {this_dv_start} >= Size: {dv_data_len})"
+                    ))
+                );
 
                 cursor.set_position(this_dv_start as u64);
                 let dv_size = read_u32(&mut cursor, Endian::Big)?;
