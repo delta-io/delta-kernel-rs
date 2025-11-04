@@ -113,7 +113,7 @@ pub trait MetricsReporter: Send + Sync + std::fmt::Debug {
 
 /// Metric events emitted during Delta Kernel operations.
 ///
-/// Each event includes an `operation_id` (MetricId) that uniquely identifies the operation
+/// Some events include an `operation_id` (MetricId) that uniquely identifies the operation
 /// instance. This allows correlating multiple events from the same operation.
 #[derive(Debug, Clone)]
 pub enum MetricEvent {
