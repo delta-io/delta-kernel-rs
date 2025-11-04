@@ -368,7 +368,7 @@ pub unsafe extern "C" fn visit_string_map(
 /// Transformation expressions that need to be applied to each row `i` in ScanMetadata. You can use
 /// [`get_transform_for_row`] to get the transform for a particular row. If that returns an
 /// associated expression, it _must_ be applied to the data read from the file specified by the
-/// row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+/// row. The resultant schema for this expression is guaranteed to be [`scan_logical_schema()`]. If
 /// `get_transform_for_row` returns `NULL` no expression need be applied and the data read from disk
 /// is already in the correct logical state.
 ///
