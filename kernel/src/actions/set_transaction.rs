@@ -88,7 +88,6 @@ fn replay_for_app_ids(
     log_segment.read_actions(
         engine,
         txn_schema.clone(), // Arc clone
-        txn_schema.clone(), // Arc clone
         META_PREDICATE.clone(),
     )
 }

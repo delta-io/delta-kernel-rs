@@ -12,20 +12,93 @@ use crate::{AsAny, DeltaResult, Error};
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
 /// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
-/// while `false` means the row is logically deleted and should be ignored.
+/// while `false` means the row is logically deleted and should be ignored. If the selection vector is shorter
+/// then the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
 ///
 /// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
     // The underlying engine data
-    pub data: Box<dyn EngineData>,
-    // The selection vector where `true` marks rows to include in results
-    pub selection_vector: Vec<bool>,
+    data: Box<dyn EngineData>,
+    // The selection vector where `true` marks rows to include in results. N.B. this selection
+    // vector may be less then `data.len()` and any gaps represent rows that are assumed to be selected.
+    selection_vector: Vec<bool>,
+}
+
+impl FilteredEngineData {
+    pub fn try_new(data: Box<dyn EngineData>, selection_vector: Vec<bool>) -> DeltaResult<Self> {
+        if selection_vector.len() > data.len() {
+            return Err(Error::InvalidSelectionVector(format!(
+                "Selection vector is larger than data length: {} > {}",
+                selection_vector.len(),
+                data.len()
+            )));
+        }
+        Ok(Self {
+            data,
+            selection_vector,
+        })
+    }
+
+    /// Returns a reference to the underlying engine data.
+    pub fn data(&self) -> &dyn EngineData {
+        &*self.data
+    }
+
+    /// Returns a reference to the selection vector.
+    pub fn selection_vector(&self) -> &[bool] {
+        &self.selection_vector
+    }
+
+    /// Consumes the FilteredEngineData and returns the underlying data and selection vector.
+    pub fn into_parts(self) -> (Box<dyn EngineData>, Vec<bool>) {
+        (self.data, self.selection_vector)
+    }
+
+    /// Creates a new `FilteredEngineData` with all rows selected.
+    ///
+    /// This is a convenience method for the common case where you want to wrap
+    /// `EngineData` in `FilteredEngineData` without any filtering.
+    pub fn with_all_rows_selected(data: Box<dyn EngineData>) -> Self {
+        Self {
+            data,
+            selection_vector: vec![],
+        }
+    }
+
+    /// Apply the contained selection vector and return an engine data with only the valid rows
+    /// included. This consumes the `FilteredEngineData`
+    pub fn apply_selection_vector(self) -> DeltaResult<Box<dyn EngineData>> {
+        self.data
+            .apply_selection_vector(self.selection_vector.clone())
+    }
 }
 
 impl HasSelectionVector for FilteredEngineData {
     /// Returns true if any row in the selection vector is marked as selected
     fn has_selected_rows(&self) -> bool {
+        // Per contract if selection is not as long as data then at least one row is selected.
+        if self.selection_vector.len() < self.data.len() {
+            return true;
+        }
+
         self.selection_vector.contains(&true)
+    }
+}
+
+impl From<Box<dyn EngineData>> for FilteredEngineData {
+    /// Converts `EngineData` into `FilteredEngineData` with all rows selected.
+    ///
+    /// This is a convenience conversion that wraps the provided engine data
+    /// in a `FilteredEngineData` with an empty selection vector, meaning all
+    /// rows are logically selected.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let engine_data: Box<dyn EngineData> = ...;
+    /// let filtered: FilteredEngineData = engine_data.into();
+    /// ```
+    fn from(data: Box<dyn EngineData>) -> Self {
+        Self::with_all_rows_selected(data)
     }
 }
 
@@ -269,6 +342,9 @@ pub trait RowVisitor {
 ///   fn append_columns(&self, schema: SchemaRef, columns: Vec<ArrayData>) -> DeltaResult<Box<dyn EngineData>> {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
+///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
+///     todo!() // filter out unselected rows and return the new set of data
+///   }
 /// }
 /// ```
 pub trait EngineData: AsAny {
@@ -314,4 +390,157 @@ pub trait EngineData: AsAny {
         schema: SchemaRef,
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Apply a selection vector to the data and return a data where only the valid rows are
+    /// included. This consumes the EngineData, allowing engines to implement this "in place" if
+    /// desired
+    fn apply_selection_vector(
+        self: Box<Self>,
+        selection_vector: Vec<bool>,
+    ) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{
+        DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    };
+    use crate::engine::arrow_data::ArrowEngineData;
+    use std::sync::Arc;
+
+    fn get_engine_data(rows: usize) -> Box<dyn EngineData> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            ArrowDataType::Utf8,
+            true,
+        )]));
+        let data: Vec<String> = (0..rows).map(|i| format!("row{i}")).collect();
+        Box::new(ArrowEngineData::new(
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(data))]).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn test_with_all_rows_selected_empty_data() {
+        // Test with empty data
+        let data = get_engine_data(0);
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+
+        assert_eq!(filtered_data.selection_vector().len(), 0);
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), 0);
+    }
+
+    #[test]
+    fn test_with_all_rows_selected_single_row() {
+        // Test with single row
+        let data = get_engine_data(1);
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+
+        // According to the new contract, empty selection vector means all rows are selected
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), 1);
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_with_all_rows_selected_multiple_rows() {
+        // Test with multiple rows
+        let data = get_engine_data(4);
+        let filtered_data = FilteredEngineData::with_all_rows_selected(data);
+
+        // According to the new contract, empty selection vector means all rows are selected
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), 4);
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_empty_data() {
+        // Test with empty data
+        let data = get_engine_data(0);
+        let filtered_data = FilteredEngineData::try_new(data, vec![]).unwrap();
+
+        // Empty data should return false even with empty selection vector
+        assert!(!filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_selection_vector_shorter_than_data() {
+        // Test with selection vector shorter than data length
+        let data = get_engine_data(3);
+        // Selection vector with only 2 elements for 3 rows of data
+        let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
+
+        // Should return true because selection vector is shorter than data
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_selection_vector_same_length_all_false() {
+        let data = get_engine_data(2);
+        let filtered_data = FilteredEngineData::try_new(data, vec![false, false]).unwrap();
+
+        // Should return false because no rows are selected
+        assert!(!filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_has_selected_rows_selection_vector_same_length_some_true() {
+        let data = get_engine_data(3);
+        let filtered_data = FilteredEngineData::try_new(data, vec![true, false, true]).unwrap();
+
+        // Should return true because some rows are selected
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn test_try_new_selection_vector_larger_than_data() {
+        // Test with selection vector larger than data length - should return error
+        let data = get_engine_data(2);
+        // Selection vector with 3 elements for 2 rows of data - should fail
+        let result = FilteredEngineData::try_new(data, vec![true, false, true]);
+
+        // Should return an error
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e
+                .to_string()
+                .contains("Selection vector is larger than data length"));
+            assert!(e.to_string().contains("3 > 2"));
+        }
+    }
+
+    #[test]
+    fn test_from_engine_data() {
+        let data = get_engine_data(3);
+        let data_len = data.len(); // Save length before move
+
+        // Use the From trait to convert
+        let filtered_data: FilteredEngineData = data.into();
+
+        // Verify all rows are selected (empty selection vector)
+        assert!(filtered_data.selection_vector().is_empty());
+        assert_eq!(filtered_data.data().len(), data_len);
+        assert_eq!(filtered_data.data().len(), 3);
+        assert!(filtered_data.has_selected_rows());
+    }
+
+    #[test]
+    fn filtered_apply_seclection_vector_full() {
+        let data = get_engine_data(4);
+        let filtered = FilteredEngineData::try_new(data, vec![true, false, true, false]).unwrap();
+        let data = filtered.apply_selection_vector().unwrap();
+        assert_eq!(data.len(), 2);
+    }
+
+    #[test]
+    fn filtered_apply_seclection_vector_partial() {
+        let data = get_engine_data(4);
+        let filtered = FilteredEngineData::try_new(data, vec![true, false]).unwrap();
+        let data = filtered.apply_selection_vector().unwrap();
+        assert_eq!(data.len(), 3);
+    }
 }

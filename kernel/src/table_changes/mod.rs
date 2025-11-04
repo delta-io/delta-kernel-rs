@@ -27,7 +27,7 @@
 //!     .with_predicate(predicate.clone())
 //!     .build()?;
 //!
-//! // Execute the table changes scan to get a fallible iterator of `ScanResult`s
+//! // Execute the table changes scan to get a fallible iterator of `Box<dyn EngineData>`s
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
 //! # Ok::<(), Error>(())
 //! ```
@@ -41,7 +41,7 @@ use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_features::{ColumnMappingMode, ReaderFeature};
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -52,9 +52,9 @@ mod resolve_dvs;
 pub mod scan;
 mod scan_file;
 
-static CHANGE_TYPE_COL_NAME: &str = "_change_type";
-static COMMIT_VERSION_COL_NAME: &str = "_commit_version";
-static COMMIT_TIMESTAMP_COL_NAME: &str = "_commit_timestamp";
+pub(crate) const CHANGE_TYPE_COL_NAME: &str = "_change_type";
+pub(crate) const COMMIT_VERSION_COL_NAME: &str = "_commit_version";
+pub(crate) const COMMIT_TIMESTAMP_COL_NAME: &str = "_commit_timestamp";
 static ADD_CHANGE_TYPE: &str = "insert";
 static REMOVE_CHANGE_TYPE: &str = "delete";
 static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
@@ -160,6 +160,23 @@ impl TableChanges {
             None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
         };
 
+        // we block reading catalog-managed tables with CDF for now. note this is best-effort just
+        // checking that start/end snapshots are not catalog-managed.
+        //
+        // TODO: link issue
+        #[cfg(feature = "catalog-managed")]
+        require!(
+            !start_snapshot
+                .table_configuration()
+                .protocol()
+                .is_catalog_managed()
+                && !end_snapshot
+                    .table_configuration()
+                    .protocol()
+                    .is_catalog_managed(),
+            Error::unsupported("Change data feed is not supported for catalog-managed tables")
+        );
+
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
         // disabled.
@@ -223,10 +240,6 @@ impl TableChanges {
     pub fn table_root(&self) -> &Url {
         &self.table_root
     }
-    /// The partition columns that will be read.
-    pub(crate) fn partition_columns(&self) -> &Vec<String> {
-        &self.end_snapshot.metadata().partition_columns
-    }
 
     /// Create a [`TableChangesScanBuilder`] for an `Arc<TableChanges>`.
     pub fn scan_builder(self: Arc<Self>) -> TableChangesScanBuilder {
@@ -259,8 +272,8 @@ fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult
 /// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
 /// See the documentation of [`TableChanges`] for more details.
 fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
-    static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<ReaderFeature>> =
-        LazyLock::new(|| vec![ReaderFeature::DeletionVectors]);
+    static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> =
+        LazyLock::new(|| vec![TableFeature::DeletionVectors]);
     match &protocol.reader_features() {
         // if min_reader_version = 3 and all reader features are subset of supported => OK
         Some(reader_features) if protocol.min_reader_version() == 3 => {

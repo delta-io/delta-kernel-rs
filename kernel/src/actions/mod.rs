@@ -13,7 +13,7 @@ use crate::schema::{
     ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::table_features::{
-    ReaderFeature, WriterFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
+    FeatureType, TableFeature, SUPPORTED_READER_FEATURES, SUPPORTED_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -67,7 +67,7 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
-static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),
         StructField::nullable(REMOVE_NAME, Remove::to_schema()),
@@ -76,10 +76,17 @@ static LOG_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
         StructField::nullable(COMMIT_INFO_NAME, CommitInfo::to_schema()),
         StructField::nullable(CDC_NAME, Cdc::to_schema()),
-        StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
-        StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
         StructField::nullable(DOMAIN_METADATA_NAME, DomainMetadata::to_schema()),
     ]))
+});
+
+static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked(
+        get_commit_schema().fields().cloned().chain([
+            StructField::nullable(CHECKPOINT_METADATA_NAME, CheckpointMetadata::to_schema()),
+            StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        ]),
+    ))
 });
 
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -111,8 +118,17 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 #[internal_api]
-pub(crate) fn get_log_schema() -> &'static SchemaRef {
-    &LOG_SCHEMA
+/// Gets the schema for all actions that can appear in commits
+/// logs.  This excludes actions that can only appear in checkpoints.
+pub(crate) fn get_commit_schema() -> &'static SchemaRef {
+    &COMMIT_SCHEMA
+}
+
+#[internal_api]
+#[allow(dead_code)]
+/// Gets a schema for all actions defined by the delta spec.
+pub(crate) fn get_all_actions_schema() -> &'static SchemaRef {
+    &ALL_ACTIONS_SCHEMA
 }
 
 #[internal_api]
@@ -130,6 +146,13 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+/// Returns true if the schema contains file actions (add or remove)
+/// columns.
+#[internal_api]
+pub(crate) fn schema_contains_file_actions(schema: &SchemaRef) -> bool {
+    schema.contains(ADD_NAME) || schema.contains(REMOVE_NAME)
 }
 
 /// Nest an existing add action schema in an additional [`ADD_NAME`] struct.
@@ -190,27 +213,32 @@ impl TryFrom<Format> for Scalar {
 )]
 #[internal_api]
 pub(crate) struct Metadata {
-    // TODO: Make the struct fields private to force using the try_new function.
     /// Unique identifier for this table
-    pub(crate) id: String,
+    id: String,
     /// User-provided identifier for this table
-    pub(crate) name: Option<String>,
+    name: Option<String>,
     /// User-provided description for this table
-    pub(crate) description: Option<String>,
+    description: Option<String>,
     /// Specification of the encoding for the files stored in the table
-    pub(crate) format: Format,
+    format: Format,
     /// Schema of the table
-    pub(crate) schema_string: String,
+    schema_string: String,
     /// Column names by which the data should be partitioned
-    pub(crate) partition_columns: Vec<String>,
+    partition_columns: Vec<String>,
     /// The time when this metadata action is created, in milliseconds since the Unix epoch
-    pub(crate) created_time: Option<i64>,
+    created_time: Option<i64>,
     /// Configuration options for the metadata action. These are parsed into [`TableProperties`].
-    pub(crate) configuration: HashMap<String, String>,
+    configuration: HashMap<String, String>,
 }
 
 impl Metadata {
+    /// Create a new [`Metadata`] instances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there are any metadata columns in the schema.
     // TODO: remove allow(dead_code) after we use this API in CREATE TABLE, etc.
+    #[internal_api]
     #[allow(dead_code)]
     pub(crate) fn try_new(
         name: Option<String>,
@@ -246,6 +274,13 @@ impl Metadata {
         })
     }
 
+    #[internal_api]
+    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
+        let mut visitor = MetadataVisitor::default();
+        visitor.visit_rows_of(data)?;
+        Ok(visitor.metadata)
+    }
+
     // TODO(#1068/1069): make these just pub directly or make better internal_api macro for fields
     #[internal_api]
     #[allow(dead_code)]
@@ -269,12 +304,6 @@ impl Metadata {
     #[allow(dead_code)]
     pub(crate) fn created_time(&self) -> Option<i64> {
         self.created_time
-    }
-
-    pub(crate) fn try_new_from_data(data: &dyn EngineData) -> DeltaResult<Option<Metadata>> {
-        let mut visitor = MetadataVisitor::default();
-        visitor.visit_rows_of(data)?;
-        Ok(visitor.metadata)
     }
 
     #[internal_api]
@@ -342,11 +371,11 @@ pub(crate) struct Protocol {
     /// A collection of features that a client must implement in order to correctly
     /// read this table (exist only when minReaderVersion is set to 3)
     #[serde(skip_serializing_if = "Option::is_none")]
-    reader_features: Option<Vec<ReaderFeature>>,
+    reader_features: Option<Vec<TableFeature>>,
     /// A collection of features that a client must implement in order to correctly
     /// write this table (exist only when minWriterVersion is set to 7)
     #[serde(skip_serializing_if = "Option::is_none")]
-    writer_features: Option<Vec<WriterFeature>>,
+    writer_features: Option<Vec<TableFeature>>,
 }
 
 fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
@@ -373,32 +402,18 @@ impl Protocol {
         reader_features: Option<impl IntoIterator<Item = impl ToString>>,
         writer_features: Option<impl IntoIterator<Item = impl ToString>>,
     ) -> DeltaResult<Self> {
-        if min_reader_version == 3 {
-            require!(
-                reader_features.is_some(),
-                Error::invalid_protocol(
-                    "Reader features must be present when minimum reader version = 3"
-                )
-            );
-        }
-        if min_writer_version == 7 {
-            require!(
-                writer_features.is_some(),
-                Error::invalid_protocol(
-                    "Writer features must be present when minimum writer version = 7"
-                )
-            );
-        }
-
         let reader_features = parse_features(reader_features);
         let writer_features = parse_features(writer_features);
 
-        Ok(Protocol {
+        let protocol = Protocol {
             min_reader_version,
             min_writer_version,
             reader_features,
             writer_features,
-        })
+        };
+        protocol.validate_table_features()?;
+
+        Ok(protocol)
     }
 
     /// Create a new Protocol by visiting the EngineData and extracting the first protocol row into
@@ -423,26 +438,110 @@ impl Protocol {
 
     /// Get the reader features for the protocol
     #[internal_api]
-    pub(crate) fn reader_features(&self) -> Option<&[ReaderFeature]> {
+    pub(crate) fn reader_features(&self) -> Option<&[TableFeature]> {
         self.reader_features.as_deref()
     }
 
     /// Get the writer features for the protocol
     #[internal_api]
-    pub(crate) fn writer_features(&self) -> Option<&[WriterFeature]> {
+    pub(crate) fn writer_features(&self) -> Option<&[TableFeature]> {
         self.writer_features.as_deref()
     }
 
-    /// True if this protocol has the requested reader feature
-    pub(crate) fn has_reader_feature(&self, feature: &ReaderFeature) -> bool {
-        self.reader_features()
+    /// True if this protocol has the requested feature
+    pub(crate) fn has_table_feature(&self, feature: &TableFeature) -> bool {
+        // Since each reader features is a subset of writer features, we only check writer feature
+        self.writer_features()
             .is_some_and(|features| features.contains(feature))
     }
 
-    /// True if this protocol has the requested writer feature
-    pub(crate) fn has_writer_feature(&self, feature: &WriterFeature) -> bool {
-        self.writer_features()
-            .is_some_and(|features| features.contains(feature))
+    /// Validates the relationship between reader features and writer features in the protocol.
+    pub(crate) fn validate_table_features(&self) -> DeltaResult<()> {
+        // The protocol states that Reader features may be present if and only if the min_reader_version is 3
+        if self.min_reader_version == 3 {
+            require!(
+                self.reader_features.is_some(),
+                Error::invalid_protocol(
+                    "Reader features must be present when minimum reader version = 3"
+                )
+            );
+        } else {
+            require!(
+                self.reader_features.is_none(),
+                Error::invalid_protocol(
+                    "Reader features must not be present when minimum reader version != 3"
+                )
+            );
+        }
+
+        // The protocol states that Writer features may be present if and only if the min_writer_version is 7
+        if self.min_writer_version == 7 {
+            require!(
+                self.writer_features.is_some(),
+                Error::invalid_protocol(
+                    "Writer features must be present when minimum writer version = 7"
+                )
+            );
+        } else {
+            require!(
+                self.writer_features.is_none(),
+                Error::invalid_protocol(
+                    "Writer features must not be present when minimum writer version != 7"
+                )
+            );
+        }
+
+        match (&self.reader_features, &self.writer_features) {
+            (Some(reader_features), Some(writer_features)) => {
+                // Check all reader features are ReaderWriter and present in writer features.
+                // Unknown features are treated as potentially ReaderWriter for forward compatibility.
+                let check_r = reader_features.iter().all(|feature| {
+                    matches!(
+                        feature.feature_type(),
+                        FeatureType::ReaderWriter | FeatureType::Unknown
+                    ) && writer_features.contains(feature)
+                });
+                require!(
+                    check_r,
+                    Error::invalid_protocol(
+                        "Reader features must contain only ReaderWriter features that are also listed in writer features"
+                    )
+                );
+
+                // Check all writer features that are ReaderWriter must also be in reader features
+                // Unknown features are treated as potentially Writer-only for forward compatibility.
+                let check_w = writer_features
+                    .iter()
+                    .all(|feature| match feature.feature_type() {
+                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::ReaderWriter => reader_features.contains(feature),
+                    });
+                require!(
+                    check_w,
+                    Error::invalid_protocol(
+                        "Writer features must be Writer-only or also listed in reader features"
+                    )
+                );
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            (None, Some(writer_features)) => {
+                // Unknown features are treated as potentially Writer-only for forward compatibility.
+                require!(
+                    writer_features.iter().all(|feature| matches!(
+                        feature.feature_type(),
+                        FeatureType::Writer | FeatureType::Unknown
+                    )),
+                    Error::invalid_protocol(
+                        "Writer features must be Writer-only or also listed in reader features"
+                    )
+                );
+                Ok(())
+            }
+            (Some(_), None) => Err(Error::invalid_protocol(
+                "Reader features should be present in writer features",
+            )),
+        }
     }
 
     /// Check if reading a table with this protocol is supported. That is: does the kernel support
@@ -479,14 +578,19 @@ impl Protocol {
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+        #[cfg(feature = "catalog-managed")]
+        require!(
+            !self.is_catalog_managed(),
+            Error::unsupported("Writes are not yet supported for catalog-managed tables")
+        );
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
                 ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)?;
 
                 // ensure that there is no illegal combination of features
-                if writer_features.contains(&WriterFeature::RowTracking)
-                    && !writer_features.contains(&WriterFeature::DomainMetadata)
+                if writer_features.contains(&TableFeature::RowTracking)
+                    && !writer_features.contains(&TableFeature::DomainMetadata)
                 {
                     Err(Error::invalid_protocol(
                         "rowTracking feature requires domainMetadata to also be enabled",
@@ -512,6 +616,12 @@ impl Protocol {
                 Ok(())
             }
         }
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    pub(crate) fn is_catalog_managed(&self) -> bool {
+        self.has_table_feature(&TableFeature::CatalogManaged)
+            || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
 }
 
@@ -571,7 +681,7 @@ where
         return Ok(());
     }
 
-    // we get the type name (ReaderFeature/WriterFeature) for better error messages
+    // we get the type name (TableFeature) for better error messages
     let features_type = std::any::type_name::<T>()
         .rsplit("::")
         .next()
@@ -623,12 +733,13 @@ pub(crate) struct CommitInfo {
 impl CommitInfo {
     pub(crate) fn new(
         timestamp: i64,
+        in_commit_timestamp: Option<i64>,
         operation: Option<String>,
         engine_info: Option<String>,
     ) -> Self {
         Self {
             timestamp: Some(timestamp),
-            in_commit_timestamp: None,
+            in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
             operation_parameters: None,
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
@@ -660,7 +771,11 @@ impl IntoEngineData for CommitInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -697,8 +812,13 @@ pub(crate) struct Add {
     pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
+    /// Note: map values can be null.
+    /// We don't use `#[allow_null_container_values]` here because [`EngineMap::materialize`]
+    /// drops null values when that attribute is present.
+    ///
+    /// [`EngineMap::materialize`]: crate::engine_data::EngineMap::materialize
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub tags: Option<HashMap<String, String>>,
+    pub tags: Option<HashMap<String, Option<String>>>,
 
     /// Information about deletion vector (DV) associated with this add action
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -757,6 +877,12 @@ pub(crate) struct Remove {
     /// The size of this data file in bytes
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) size: Option<i64>,
+
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
+    ///
+    /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -915,21 +1041,36 @@ pub(crate) struct DomainMetadata {
 
 impl DomainMetadata {
     /// Create a new DomainMetadata action.
-    // TODO: Discuss if we should remove `removed` from this method and introduce a dedicated
-    // method for removed domain metadata.
-    pub(crate) fn new(domain: String, configuration: String, removed: bool) -> Self {
-        DomainMetadata {
+    pub(crate) fn new(domain: String, configuration: String) -> Self {
+        Self {
             domain,
             configuration,
-            removed,
+            removed: false,
+        }
+    }
+
+    /// Create a new DomainMetadata action to remove a domain.
+    pub(crate) fn remove(domain: String, configuration: String) -> Self {
+        Self {
+            domain,
+            configuration,
+            removed: true,
         }
     }
 
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
-    fn is_internal(&self) -> bool {
+    pub(crate) fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
+    }
+
+    pub(crate) fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    pub(crate) fn configuration(&self) -> &str {
+        &self.configuration
     }
 }
 
@@ -998,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_metadata_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[METADATA_NAME])
             .expect("Couldn't get metaData field");
 
@@ -1032,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_add_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[ADD_NAME])
             .expect("Couldn't get add field");
 
@@ -1050,7 +1191,7 @@ mod tests {
                 StructField::nullable("stats", DataType::STRING),
                 StructField::nullable(
                     "tags",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    MapType::new(DataType::STRING, DataType::STRING, true),
                 ),
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
@@ -1090,7 +1231,7 @@ mod tests {
 
     #[test]
     fn test_remove_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[REMOVE_NAME])
             .expect("Couldn't get remove field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1102,6 +1243,7 @@ mod tests {
                 StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
                 partition_values_field(),
                 StructField::nullable("size", DataType::LONG),
+                StructField::nullable("stats", DataType::STRING),
                 tags_field(),
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
@@ -1113,7 +1255,7 @@ mod tests {
 
     #[test]
     fn test_cdc_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[CDC_NAME])
             .expect("Couldn't get cdc field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1134,24 +1276,19 @@ mod tests {
 
     #[test]
     fn test_sidecar_schema() {
-        let schema = get_log_schema()
-            .project(&[SIDECAR_NAME])
-            .expect("Couldn't get sidecar field");
-        let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
-            "sidecar",
-            StructType::new_unchecked([
-                StructField::not_null("path", DataType::STRING),
-                StructField::not_null("sizeInBytes", DataType::LONG),
-                StructField::not_null("modificationTime", DataType::LONG),
-                tags_field(),
-            ]),
-        )]));
+        let schema = Sidecar::to_schema();
+        let expected = StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("sizeInBytes", DataType::LONG),
+            StructField::not_null("modificationTime", DataType::LONG),
+            tags_field(),
+        ]);
         assert_eq!(schema, expected);
     }
 
     #[test]
     fn test_checkpoint_metadata_schema() {
-        let schema = get_log_schema()
+        let schema = get_all_actions_schema()
             .project(&[CHECKPOINT_METADATA_NAME])
             .expect("Couldn't get checkpointMetadata field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1166,7 +1303,7 @@ mod tests {
 
     #[test]
     fn test_transaction_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&["txn"])
             .expect("Couldn't get transaction field");
 
@@ -1183,7 +1320,7 @@ mod tests {
 
     #[test]
     fn test_commit_info_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&["commitInfo"])
             .expect("Couldn't get commitInfo field");
 
@@ -1207,7 +1344,7 @@ mod tests {
 
     #[test]
     fn test_domain_metadata_schema() {
-        let schema = get_log_schema()
+        let schema = get_commit_schema()
             .project(&[DOMAIN_METADATA_NAME])
             .expect("Couldn't get domainMetadata field");
         let expected = Arc::new(StructType::new_unchecked([StructField::nullable(
@@ -1263,12 +1400,133 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_table_features_invalid() {
+        // (reader_feature, writer_feature)
+        let invalid_features = [
+            // ReaderWriter feature not present in writer features
+            (
+                Some(vec![TableFeature::DeletionVectors]),
+                Some(vec![TableFeature::AppendOnly]),
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+            (Some(vec![TableFeature::DeletionVectors]), Some(vec![]), "Reader features must contain only ReaderWriter features that are also listed in writer features"),
+            // ReaderWriter feature not present in reader features
+            (Some(vec![]), Some(vec![TableFeature::DeletionVectors]), "Writer features must be Writer-only or also listed in reader features"),
+            (
+                Some(vec![TableFeature::VariantType]),
+                Some(vec![
+                    TableFeature::VariantType,
+                    TableFeature::DeletionVectors,
+                ]),
+                "Writer features must be Writer-only or also listed in reader features",
+            ),
+            // Writer only feature present in reader features
+            (
+                Some(vec![TableFeature::AppendOnly]),
+                Some(vec![TableFeature::AppendOnly]),
+                "Reader features must contain only ReaderWriter features that are also listed in writer features",
+            ),
+        ];
+
+        for (reader_features, writer_features, error_msg) in invalid_features {
+            let protocol = Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features,
+                writer_features,
+            };
+
+            let res = protocol.validate_table_features();
+            assert!(
+                matches!(
+                    protocol.validate_table_features(),
+                    Err(Error::InvalidProtocol(error)) if error.to_string().eq(error_msg)
+                ),
+                "Expected:\t{error_msg}\nBut got:{res:?}\n"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_table_features_unknown() {
+        // Unknown features are allowed during validation for forward compatibility,
+        // but will be rejected when trying to use the protocol (ensure_read_supported/ensure_write_supported)
+
+        // Test unknown features in reader - validation passes
+        let protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
+            writer_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
+        };
+        assert!(protocol.validate_table_features().is_ok());
+        // But ensure_read_supported should fail
+        assert!(matches!(
+            protocol.ensure_read_supported(),
+            Err(Error::Unsupported(_))
+        ));
+
+        // Test unknown features in writer - validation passes
+        let protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![]),
+            writer_features: Some(vec![TableFeature::Unknown("unknown_writer".to_string())]),
+        };
+        assert!(protocol.validate_table_features().is_ok());
+        // But ensure_write_supported should fail
+        assert!(matches!(
+            protocol.ensure_write_supported(),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_table_features_valid() {
+        // (reader_feature, writer_feature)
+        let valid_features = [
+            // ReaderWriter feature present in both reader/writer features,
+            // Writer only feature present in writer feature
+            (
+                Some(vec![TableFeature::DeletionVectors]),
+                Some(vec![TableFeature::DeletionVectors]),
+            ),
+            (Some(vec![]), Some(vec![TableFeature::AppendOnly])),
+            (
+                Some(vec![TableFeature::VariantType]),
+                Some(vec![TableFeature::VariantType, TableFeature::AppendOnly]),
+            ),
+            // Unknown feature may be ReaderWriter or Writer only (for forward compatibility)
+            (
+                Some(vec![TableFeature::Unknown("rw".to_string())]),
+                Some(vec![
+                    TableFeature::Unknown("rw".to_string()),
+                    TableFeature::Unknown("w".to_string()),
+                ]),
+            ),
+            // Empty feature set is valid
+            (Some(vec![]), Some(vec![])),
+        ];
+
+        for (reader_features, writer_features) in valid_features {
+            let protocol = Protocol {
+                min_reader_version: 3,
+                min_writer_version: 7,
+                reader_features,
+                writer_features,
+            };
+
+            assert!(matches!(protocol.validate_table_features(), Ok(()),));
+        }
+    }
+
+    #[test]
     fn test_v2_checkpoint_supported() {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::V2Checkpoint]),
-            Some([ReaderFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -1284,30 +1542,11 @@ mod tests {
         };
         assert!(protocol.ensure_read_supported().is_ok());
 
-        let empty_features: [String; 0] = [];
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::V2Checkpoint]),
-            Some(&empty_features),
-        )
-        .unwrap();
-        assert!(protocol.ensure_read_supported().is_ok());
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some(&empty_features),
-            Some([WriterFeature::V2Checkpoint]),
-        )
-        .unwrap();
-        assert!(protocol.ensure_read_supported().is_ok());
-
-        let protocol = Protocol::try_new(
-            3,
-            7,
-            Some([ReaderFeature::V2Checkpoint]),
-            Some([WriterFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
+            Some([TableFeature::V2Checkpoint]),
         )
         .unwrap();
         assert!(protocol.ensure_read_supported().is_ok());
@@ -1334,43 +1573,43 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some::<Vec<String>>(vec![]),
+            Some(vec![TableFeature::DeletionVectors]),
             Some(vec![
-                WriterFeature::AppendOnly,
-                WriterFeature::DeletionVectors,
-                WriterFeature::DomainMetadata,
-                WriterFeature::Invariants,
-                WriterFeature::RowTracking,
+                TableFeature::AppendOnly,
+                TableFeature::DeletionVectors,
+                TableFeature::DomainMetadata,
+                TableFeature::Invariants,
+                TableFeature::RowTracking,
             ]),
         )
         .unwrap();
         assert!(protocol.ensure_write_supported().is_ok());
 
         // Verify that unsupported writer features are rejected
-        // NOTE: Unsupported reader features should not cause an error here
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
-            Some([WriterFeature::IdentityColumns]),
+            Some::<Vec<String>>(vec![]),
+            Some([TableFeature::IdentityColumns]),
         )
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "identityColumns". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown TableFeatures: "identityColumns". Supported TableFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
-        // Unknown writer features should cause an error
+        // Unknown writer features are allowed during creation for forward compatibility,
+        // but will fail when trying to write
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::Unknown("unsupported reader".to_string())]),
-            Some([WriterFeature::Unknown("unsupported writer".to_string())]),
+            Some::<Vec<String>>(vec![]),
+            Some([TableFeature::Unknown("unsupported writer".to_string())]),
         )
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown WriterFeatures: "unsupported writer". Supported WriterFeatures: "appendOnly", "deletionVectors", "domainMetadata", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Unknown TableFeatures: "unsupported writer". Supported TableFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
     }
 
@@ -1382,7 +1621,7 @@ mod tests {
             Some::<Vec<String>>(vec![]),
             Some(vec![
                 // No domain metadata even though that is required
-                WriterFeature::RowTracking,
+                TableFeature::RowTracking,
             ]),
         )
         .unwrap();
@@ -1395,16 +1634,16 @@ mod tests {
 
     #[test]
     fn test_ensure_supported_features() {
-        let supported_features = [ReaderFeature::ColumnMapping, ReaderFeature::DeletionVectors];
-        let table_features = vec![ReaderFeature::ColumnMapping];
+        let supported_features = [TableFeature::ColumnMapping, TableFeature::DeletionVectors];
+        let table_features = vec![TableFeature::ColumnMapping];
         ensure_supported_features(&table_features, &supported_features).unwrap();
 
         // test unknown features
-        let table_features = vec![ReaderFeature::ColumnMapping, ReaderFeature::unknown("idk")];
+        let table_features = vec![TableFeature::ColumnMapping, TableFeature::unknown("idk")];
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown ReaderFeatures: \"idk\". Supported ReaderFeatures: \"columnMapping\", \"deletionVectors\""
+                "Unknown TableFeatures: \"idk\". Supported TableFeatures: \"columnMapping\", \"deletionVectors\""
             => {},
             _ => panic!("Expected unsupported error, got: {error}"),
         }
@@ -1414,16 +1653,36 @@ mod tests {
     fn test_parse_table_feature_never_fails() {
         // parse a non-str
         let features = Some([5]);
-        let expected = Some(vec![ReaderFeature::unknown("5")]);
-        assert_eq!(parse_features::<ReaderFeature>(features), expected);
+        let expected = Some(vec![TableFeature::unknown("5")]);
+        assert_eq!(parse_features::<TableFeature>(features), expected);
 
         // weird strs
         let features = Some(["", "absurD_)(+13%^⚙️"]);
         let expected = Some(vec![
-            ReaderFeature::unknown(""),
-            ReaderFeature::unknown("absurD_)(+13%^⚙️"),
+            TableFeature::unknown(""),
+            TableFeature::unknown("absurD_)(+13%^⚙️"),
         ]);
-        assert_eq!(parse_features::<ReaderFeature>(features), expected);
+        assert_eq!(parse_features::<TableFeature>(features), expected);
+    }
+
+    #[test]
+    fn test_no_catalog_managed_writes() {
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([TableFeature::CatalogManaged]),
+            Some([TableFeature::CatalogManaged]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([TableFeature::CatalogOwnedPreview]),
+            Some([TableFeature::CatalogOwnedPreview]),
+        )
+        .unwrap();
+        assert!(protocol.ensure_write_supported().is_err());
     }
 
     #[test]
@@ -1469,7 +1728,7 @@ mod tests {
     fn test_commit_info_into_engine_data() {
         let engine = ExprEngine::new();
 
-        let commit_info = CommitInfo::new(0, None, None);
+        let commit_info = CommitInfo::new(0, None, None, None);
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
@@ -1725,9 +1984,9 @@ mod tests {
         let metadata_id = metadata.id.clone();
 
         // test with the full log schema that wraps metadata in a "metaData" field
-        let log_schema = get_log_schema().project(&[METADATA_NAME]).unwrap();
+        let commit_schema = get_commit_schema().project(&[METADATA_NAME]).unwrap();
         let actual: RecordBatch = metadata
-            .into_engine_data(log_schema, &engine)
+            .into_engine_data(commit_schema, &engine)
             .unwrap()
             .into_any()
             .downcast::<ArrowEngineData>()
@@ -1764,8 +2023,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::ColumnMapping]),
-            Some([WriterFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
         )
         .unwrap();
 
@@ -1798,6 +2057,7 @@ mod tests {
 
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
+        list_builder.values().append_value("deletionVectors");
         list_builder.values().append_value("columnMapping");
         list_builder.append(true);
         let reader_features_array = list_builder.finish();
@@ -1805,6 +2065,7 @@ mod tests {
         let string_builder = StringBuilder::new();
         let mut list_builder = ListBuilder::new(string_builder).with_field(list_field.clone());
         list_builder.values().append_value("deletionVectors");
+        list_builder.values().append_value("columnMapping");
         list_builder.append(true);
         let writer_features_array = list_builder.finish();
 
@@ -1822,8 +2083,8 @@ mod tests {
         assert_eq!(record_batch, expected);
 
         // test with the full log schema that wraps protocol in a "protocol" field
-        let log_schema = get_log_schema().project(&[PROTOCOL_NAME]).unwrap();
-        let engine_data = protocol.into_engine_data(log_schema, &engine);
+        let commit_schema = get_commit_schema().project(&[PROTOCOL_NAME]).unwrap();
+        let engine_data = protocol.into_engine_data(commit_schema, &engine);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "protocol",
@@ -1928,5 +2189,87 @@ mod tests {
         // reader/writer features are null
         assert!(record_batch.column(2).is_null(0));
         assert!(record_batch.column(3).is_null(0));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_add() {
+        let schema = get_commit_schema()
+            .project(&[ADD_NAME, PROTOCOL_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[ADD_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_remove() {
+        let schema = get_commit_schema()
+            .project(&[REMOVE_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+        assert!(schema_contains_file_actions(
+            &schema.project(&[REMOVE_NAME]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_both() {
+        let schema = get_commit_schema()
+            .project(&[ADD_NAME, REMOVE_NAME])
+            .unwrap();
+        assert!(schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_with_neither() {
+        let schema = get_commit_schema()
+            .project(&[PROTOCOL_NAME, METADATA_NAME])
+            .unwrap();
+        assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_schema_contains_file_actions_empty_schema() {
+        let schema = Arc::new(StructType::new_unchecked([]));
+        assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_null_case() {
+        let json1 = r#"{"path":"file1.parquet","partitionValues":{},"size":100,"modificationTime":1234567890,"dataChange":true,"tags":null}"#;
+        let add1: Add = serde_json::from_str(json1).unwrap();
+        assert_eq!(add1.tags, None);
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_nullable_values_case() {
+        let json2 = r#"{"path":"file2.parquet","partitionValues":{},"size":200,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","NULLABLE_TAG":null}}"#;
+        let add2: Add = serde_json::from_str(json2).unwrap();
+        assert!(add2.tags.is_some());
+        let tags = add2.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(tags.get("NULLABLE_TAG"), Some(&None));
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_non_null_values_case() {
+        let json3 = r#"{"path":"file3.parquet","partitionValues":{},"size":300,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000"}}"#;
+        let add3: Add = serde_json::from_str(json3).unwrap();
+        assert!(add3.tags.is_some());
+        let tags = add3.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(
+            tags.get("MIN_INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
     }
 }

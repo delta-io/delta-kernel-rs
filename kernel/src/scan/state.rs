@@ -156,11 +156,11 @@ impl ScanMetadata {
     pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
         let mut visitor = ScanFileVisitor {
             callback,
-            selection_vector: &self.scan_files.selection_vector,
+            selection_vector: self.scan_files.selection_vector(),
             transforms: &self.scan_file_transforms,
             context,
         };
-        visitor.visit_rows_of(self.scan_files.data.as_ref())?;
+        visitor.visit_rows_of(self.scan_files.data())?;
         Ok(visitor.context)
     }
 }
@@ -179,7 +179,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 10,
+            getters.len() == 11,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
@@ -229,7 +229,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::actions::get_log_schema;
+    use crate::actions::get_commit_schema;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
     use crate::ExpressionRef;
 
@@ -269,7 +269,7 @@ mod tests {
     fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
-            vec![add_batch_simple(get_log_schema().clone())],
+            vec![add_batch_simple(get_commit_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],

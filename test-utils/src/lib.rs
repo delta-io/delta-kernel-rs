@@ -6,7 +6,6 @@ use delta_kernel::arrow::array::{
     ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 
-use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -68,7 +67,7 @@ pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
 }
 
-fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
+pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
     actions
         .into_iter()
         .map(|test_action| match test_action {
@@ -153,6 +152,12 @@ pub fn delta_path_for_version(version: u64, suffix: &str) -> Path {
     Path::from(path.as_str())
 }
 
+pub fn staged_commit_path_for_version(version: u64) -> Path {
+    let uuid = uuid::Uuid::new_v4();
+    let path = format!("_delta_log/_staged_commits/{version:020}.{uuid}.json");
+    Path::from(path.as_str())
+}
+
 /// get an ObjectStore path for a compressed log file, based on the start/end versions
 pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suffix: &str) -> Path {
     let path = format!("_delta_log/{start_version:020}.{end_version:020}.compacted.{suffix}");
@@ -168,6 +173,16 @@ pub async fn add_commit(
     let path = delta_path_for_version(version, "json");
     store.put(&path, data.into()).await?;
     Ok(())
+}
+
+pub async fn add_staged_commit(
+    store: &dyn ObjectStore,
+    version: u64,
+    data: String,
+) -> Result<Path, Box<dyn std::error::Error>> {
+    let path = staged_commit_path_for_version(version);
+    store.put(&path, data.into()).await?;
+    Ok(path)
 }
 
 /// Try to convert an `EngineData` into a `RecordBatch`. Panics if not using `ArrowEngineData` from
@@ -275,6 +290,17 @@ pub async fn create_table(
                 json!("another_dummy_column_name"),
             );
         }
+        if writer_features.contains(&"inCommitTimestamp") {
+            config.insert("delta.enableInCommitTimestamps".to_string(), json!("true"));
+            config.insert(
+                "delta.inCommitTimestampEnablementVersion".to_string(),
+                json!("0"),
+            );
+            config.insert(
+                "delta.inCommitTimestampEnablementTimestamp".to_string(),
+                json!("1612345678"),
+            );
+        }
 
         config
     };
@@ -293,12 +319,40 @@ pub async fn create_table(
         }
     });
 
-    let data = [
-        to_vec(&protocol).unwrap(),
-        b"\n".to_vec(),
-        to_vec(&metadata).unwrap(),
-    ]
-    .concat();
+    // Add commitInfo with ICT if ICT is enabled
+    let commit_info = if writer_features.contains(&"inCommitTimestamp") {
+        // When ICT is enabled from version 0, we need to include it in the initial commit
+        let timestamp = 1612345678i64; // Use a fixed timestamp for testing
+        Some(json!({
+            "commitInfo": {
+                "timestamp": timestamp,
+                "inCommitTimestamp": timestamp,
+                "operation": "CREATE TABLE",
+                "operationParameters": {},
+                "isBlindAppend": true
+            }
+        }))
+    } else {
+        None
+    };
+
+    let data = if let Some(commit_info) = commit_info {
+        [
+            to_vec(&commit_info).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&protocol).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&metadata).unwrap(),
+        ]
+        .concat()
+    } else {
+        [
+            to_vec(&protocol).unwrap(),
+            b"\n".to_vec(),
+            to_vec(&metadata).unwrap(),
+        ]
+        .concat()
+    };
 
     // put 0.json with protocol + metadata
     let path = table_path.join("_delta_log/00000000000000000000.json")?;
@@ -377,16 +431,9 @@ pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
+        .map(|data| -> DeltaResult<_> {
+            let data = data?;
+            to_arrow(data)
         })
         .try_collect()
 }
@@ -425,4 +472,17 @@ pub fn set_json_value(
         .ok_or_else(|| format!("key '{path}' not found"))?;
     *v = new_value;
     Ok(())
+}
+
+pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, message: &str) {
+    match res {
+        Ok(_) => panic!("Expected error, but got Ok result"),
+        Err(error) => {
+            let error_str = error.to_string();
+            assert!(
+                error_str.contains(message),
+                "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
+            );
+        }
+    }
 }
