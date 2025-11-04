@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
-use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
