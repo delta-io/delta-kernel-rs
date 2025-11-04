@@ -273,7 +273,7 @@ pub(crate) mod test_utils {
         message: &str,
     ) {
         match res {
-            Ok(_) => panic!("Expected error, but got Ok result"),
+            Ok(_) => panic!("Expected error with message {message}, but got Ok result"),
             Err(error) => {
                 let error_str = error.to_string();
                 assert!(
