@@ -254,23 +254,31 @@ impl DeletionVectorDescriptor {
                 );
 
                 // Deletion vector file format:
-                //  |--------------+-----------------|
-                //  |  num bytes   |  value          |
-                //  |==============+=================|
-                //  | 1 byte       |  version        |
-                //  |--------------+-----------------|
-                //  | offset-1     |  other dvs...   |
-                //  |--------------+-----------------| <- this_dv_start
-                //  | 4 bytes      |  dv_size        |
-                //  |--------------+-----------------|
-                //  | 4 bytes      |  magic value    |
-                //  |--------------+-----------------| <- bitmap_start
-                //  | dv_size bytes|  bitmap         |
-                //  |--------------+-----------------| <- crc_start
-                //  | 4 bytes      |  CRC            |
-                //  |--------------+-----------------|
+                // +---------------+-----------------+
+                // |  num bytes    |  value          |
+                // +===============+=================+
+                // | 1 byte        |  version        |
+                // +---------------+-----------------+
+                // | offset-1      |  other dvs...   |
+                // +---------------+-----------------+ <- this_dv_start
+                // | 4 bytes       |  dv_size        |
+                // +---------------+-----------------+
+                // | 4 bytes       |  magic value    |
+                // +---------------+-----------------+ <- bitmap_start
+                // | dv_size - 4   |  bitmap         |
+                // +---------------+-----------------+ <- crc_start
+                // | 4 bytes       |  CRC            |
+                // +---------------+-----------------+
 
                 let this_dv_start = offset.unwrap_or(1) as usize;
+                let magic_start = this_dv_start + 4;
+                // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
+                let bitmap_start = this_dv_start + 8;
+                // crc_start = this_dv_start + 4 (dv_size field) + dv_size (magic field + bitmap)
+                // Safety: size_in_bytes is checked to fit in u32 which for all known platforms should
+                // fix in usize range.
+                let crc_start = this_dv_start + 4 + (size_in_bytes as usize);
+
                 cursor.set_position(this_dv_start as u64);
                 let dv_size = read_u32(&mut cursor, Endian::Big)?;
                 require!(
@@ -286,12 +294,6 @@ impl DeletionVectorDescriptor {
                 );
 
                 let bytes = cursor.into_inner();
-                // bitmap_start = this_dv_start + 4 (dv_size field) + 4 (magic field)
-                let bitmap_start = this_dv_start + 8;
-                // crc_start = bitmap_start + bitmap_size (dv_size - 4 for CRC)
-                // Safety: size_in_bytes is checked to fit in u32 which for all known platforms should
-                // fix in usize range.
-                let crc_start = bitmap_start + (size_in_bytes as usize) - 4;
 
                 // +4 to account for CRC value
                 require!(
@@ -308,7 +310,6 @@ impl DeletionVectorDescriptor {
                 let crc = read_u32(&mut crc_cursor, Endian::Big)?;
                 let crc32 = create_dv_crc32();
                 // CRC is calculated from magic field through end of bitmap
-                let magic_start = bitmap_start - 4;
                 // Safety: verified bytes is larger than crc_start + 4, above.
                 let expected_crc = crc32.checksum(&bytes.slice(magic_start..crc_start));
                 require!(
@@ -551,8 +552,6 @@ mod tests {
 
         let example = dv_example();
         let tree_map = example.read(storage.clone(), &parent).unwrap();
-        let validated_treemap = example.read(storage.clone(), &parent).unwrap();
-        assert_eq!(tree_map, validated_treemap);
 
         let expected: Vec<u64> = vec![0, 9];
         let found = tree_map.iter().collect::<Vec<_>>();

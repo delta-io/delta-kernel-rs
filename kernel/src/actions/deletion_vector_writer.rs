@@ -432,6 +432,53 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_writer_empty_dv() {
+        use crate::Engine;
+        use std::fs::File;
+        use tempfile::tempdir;
+        use url::Url;
+
+        // Create a temporary directory and file
+        let temp_dir = tempdir().unwrap();
+        let table_url = Url::from_directory_path(temp_dir.path()).unwrap();
+
+        let dv_path = DeletionVectorPath::new(table_url.clone(), String::from("test"));
+        let file_path = dv_path.absolute_path().unwrap().to_file_path().unwrap();
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        let mut file = File::create(&file_path).unwrap();
+
+        // Create an empty deletion vector
+        let dv = KernelDeletionVector::new();
+
+        let mut writer = StreamingDeletionVectorWriter::new(&mut file);
+        let write_result = writer.write_deletion_vector(dv).unwrap();
+        writer.finalize().unwrap();
+        drop(file); // Ensure file is closed
+
+        // Check descriptor values for empty DV
+        assert_eq!(write_result.offset, 1); // After version byte
+        assert_eq!(write_result.cardinality, 0);
+        assert!(write_result.size_in_bytes > 0); // Still has magic number
+
+        // Read back using the descriptor to verify empty bitmap can be read
+        use crate::engine::sync::SyncEngine;
+        let engine = SyncEngine::new();
+        let storage = engine.storage_handler();
+
+        let descriptor = write_result.to_descriptor(&dv_path);
+        let treemap = descriptor.read(storage, &table_url).unwrap();
+
+        // Verify the treemap is empty
+        assert_eq!(treemap.len(), 0);
+        assert!(treemap.is_empty());
+    }
+
+    #[test]
     fn test_streaming_writer_roundtrip() {
         // Write a deletion vector
         let mut buffer = Vec::new();
