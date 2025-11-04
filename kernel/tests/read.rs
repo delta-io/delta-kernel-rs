@@ -3,19 +3,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::{AsArray as _, BooleanArray};
+use delta_kernel::arrow::array::AsArray as _;
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
-use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
+use delta_kernel::log_segment::LogSegment;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
+use delta_kernel::path::ParsedLogPath;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
-use delta_kernel::scan::{Scan, ScanResult};
+use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
 
@@ -33,23 +34,6 @@ mod common;
 const PARQUET_FILE1: &str = "part-00000-a72b1fb3-f2df-41fe-a8f0-e65b746382dd-c000.snappy.parquet";
 const PARQUET_FILE2: &str = "part-00001-c506e79a-0bf8-4e2b-a42b-9731b2e490ae-c000.snappy.parquet";
 const PARQUET_FILE3: &str = "part-00002-c506e79a-0bf8-4e2b-a42b-9731b2e490ff-c000.snappy.parquet";
-
-/// Helper function to extract filtered data from a scan result, respecting row masks
-fn extract_record_batch(
-    scan_result: ScanResult,
-) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-    let mask = scan_result.full_mask();
-    let record_batch = into_record_batch(scan_result.raw_data?);
-
-    if let Some(mask) = mask {
-        Ok(filter_record_batch(
-            &record_batch,
-            &BooleanArray::from(mask),
-        )?)
-    } else {
-        Ok(record_batch)
-    }
-}
 
 #[tokio::test]
 async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>> {
@@ -93,9 +77,8 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
     let stream = scan.execute(engine)?.zip(expected_data);
 
     for (data, expected) in stream {
-        let raw_data = data?.raw_data?;
         files += 1;
-        assert_eq!(into_record_batch(raw_data), expected);
+        assert_eq!(into_record_batch(data?), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
     Ok(())
@@ -145,9 +128,8 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
     let stream = scan.execute(Arc::new(engine))?.zip(expected_data);
 
     for (data, expected) in stream {
-        let raw_data = data?.raw_data?;
         files += 1;
-        assert_eq!(into_record_batch(raw_data), expected);
+        assert_eq!(into_record_batch(data?), expected);
     }
     assert_eq!(2, files, "Expected to have scanned two files");
 
@@ -198,9 +180,8 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut files = 0;
     for (data, expected) in stream {
-        let raw_data = data?.raw_data?;
         files += 1;
-        assert_eq!(into_record_batch(raw_data), expected);
+        assert_eq!(into_record_batch(data?), expected);
     }
     assert_eq!(1, files, "Expected to have scanned one file");
     Ok(())
@@ -315,9 +296,8 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         let stream = scan.execute(engine.clone())?.zip(expected_batches);
 
         for (batch, expected) in stream {
-            let raw_data = batch?.raw_data?;
             files_scanned += 1;
-            assert_eq!(into_record_batch(raw_data), expected.clone());
+            assert_eq!(into_record_batch(batch?), expected.clone());
         }
         assert_eq!(expected_files, files_scanned, "{predicate:?}");
     }
@@ -1089,7 +1069,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
 
     let mut files_scanned = 0;
     for engine_data in stream {
-        let mut result_batch = into_record_batch(engine_data?.raw_data?);
+        let mut result_batch = into_record_batch(engine_data?);
         let _ = result_batch.remove_column(result_batch.schema().index_of("id")?);
         assert_eq!(&batch, &result_batch);
         files_scanned += 1;
@@ -1151,7 +1131,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
 
     let mut files_scanned = 0;
     for engine_data in stream {
-        let result_batch = into_record_batch(engine_data?.raw_data?);
+        let result_batch = into_record_batch(engine_data?);
         assert_eq!(&batch_2, &result_batch);
         files_scanned += 1;
     }
@@ -1433,8 +1413,8 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     let expected_row_counts = [5, 3, 4];
     let stream = scan.execute(engine.clone())?;
 
-    for scan_result in stream {
-        let batch = extract_record_batch(scan_result?)?;
+    for data in stream {
+        let batch = into_record_batch(data?);
         file_count += 1;
 
         // Verify the schema structure
@@ -1530,6 +1510,116 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
             "Expected {error_msg} to contain {error_text}"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Error>> {
+    let batch = generate_simple_batch()?;
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::Add(PARQUET_FILE2.to_string()),
+        ]),
+    )
+    .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE1),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+    storage
+        .put(
+            &Path::from(PARQUET_FILE2),
+            record_batch_to_bytes(&batch).into(),
+        )
+        .await?;
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(
+        storage.clone(),
+        Arc::new(TokioBackgroundExecutor::new()),
+    ));
+
+    let invalid_files = [
+        "_delta_log/0.zip",
+        "_delta_log/_copy_into_log/0.zip",
+        "_delta_log/_ignore_me/00000000000000000000.json",
+        "_delta_log/_and_me/00000000000000000000.checkpoint.parquet",
+        "_delta_log/02184.json",
+        "_delta_log/0x000000000000000000.checkpoint.parquet",
+        "00000000000000000000.json",
+        "_delta_log/_staged_commits/_staged_commits/00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        "_delta_log/my_random_dir/_staged_commits/00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        "_delta_log/my_random_dir/_delta_log/_staged_commits/00000000000000000000.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+        "_delta_log/_delta_log/00000000000000000000.json",
+        "_delta_log/_delta_log/00000000000000000000.checkpoint.parquet",
+        "_delta_log/something/_delta_log/00000000000000000000.crc",
+        "_delta_log/something/_delta_log/00000000000000000000.json",
+        "_delta_log/something/_delta_log/00000000000000000000.checkpoint.parquet",
+    ];
+
+    fn get_file_path_for_test(path: &ParsedLogPath) -> &str {
+        &path.location.location.as_str()[10..]
+    }
+
+    fn ensure_segment_does_not_contain(invalid_files: &[&str], segment: &LogSegment) {
+        assert!(
+            !segment.ascending_commit_files.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "ascending_commit_files contained invalid file"
+        );
+        assert!(
+            !segment.ascending_compaction_files.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "ascending_compaction_files contained invalid file"
+        );
+        assert!(
+            !segment.checkpoint_parts.iter().any(|p| {
+                let test_path = get_file_path_for_test(p);
+                invalid_files.contains(&test_path)
+            }),
+            "checkpoint_parts contained invalid file"
+        );
+        if let Some(ref crc) = segment.latest_crc_file {
+            assert!(
+                !invalid_files.contains(&get_file_path_for_test(crc)),
+                "Latest crc contained invalid file"
+            );
+        }
+        if let Some(ref latest_commit) = segment.latest_commit_file {
+            assert!(
+                !invalid_files.contains(&get_file_path_for_test(latest_commit)),
+                "Latest commit contained invalid file"
+            );
+        }
+    }
+
+    for invalid_file in invalid_files.iter() {
+        let invalid_path = Path::from(*invalid_file);
+        storage.put(&invalid_path, vec![1u8].into()).await?;
+        let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+        ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
+        storage.delete(&invalid_path).await?;
+    }
+
+    // final test with _all_ the files we should ignore
+    for invalid_file in invalid_files.iter() {
+        let invalid_path = Path::from(*invalid_file);
+        storage.put(&invalid_path, vec![1u8].into()).await?;
+    }
+    let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
+    ensure_segment_does_not_contain(&invalid_files, snapshot.log_segment());
 
     Ok(())
 }
