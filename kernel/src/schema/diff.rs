@@ -57,8 +57,8 @@ pub(crate) struct FieldUpdate {
     pub after: StructField,
     /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
     pub path: ColumnName,
-    /// The type of change that occurred
-    pub change_type: FieldChangeType,
+    /// The types of changes that occurred (can be multiple, e.g. renamed + nullability changed)
+    pub change_types: Vec<FieldChangeType>,
 }
 
 /// The types of changes that can occur to a field
@@ -74,8 +74,6 @@ pub(crate) enum FieldChangeType {
     TypeChanged,
     /// Field metadata was changed (excluding column mapping metadata)
     MetadataChanged,
-    /// Multiple aspects of the field changed
-    Multiple(Vec<FieldChangeType>),
     /// The container nullability was loosened (safe change)
     ContainerNullabilityLoosened,
     /// The container nullability was tightened (breaking change)
@@ -316,16 +314,13 @@ fn compute_schema_diff(
 
 /// Helper function to check if a change type is breaking
 fn is_breaking_change_type(change_type: &FieldChangeType) -> bool {
-    match change_type {
+    matches!(
+        change_type,
         FieldChangeType::TypeChanged
-        | FieldChangeType::NullabilityTightened
-        | FieldChangeType::ContainerNullabilityTightened
-        | FieldChangeType::MetadataChanged => true,
-        FieldChangeType::Multiple(multiple_changes) => {
-            multiple_changes.iter().any(is_breaking_change_type)
-        }
-        _ => false,
-    }
+            | FieldChangeType::NullabilityTightened
+            | FieldChangeType::ContainerNullabilityTightened
+            | FieldChangeType::MetadataChanged
+    )
 }
 
 /// Computes whether the diff contains breaking changes
@@ -339,9 +334,12 @@ fn compute_has_breaking_changes(
     // Adding a non-nullable (required) field is breaking - existing data won't have values
     added_fields.iter().any(|add| !add.field.nullable)
         // Certain update types are breaking (type changes, nullability tightening, etc.)
-        || updated_fields
-            .iter()
-            .any(|update| is_breaking_change_type(&update.change_type))
+        || updated_fields.iter().any(|update| {
+            update
+                .change_types
+                .iter()
+                .any(is_breaking_change_type)
+        })
 }
 
 /// Filters field changes to keep only the least common ancestors (LCA).
@@ -585,30 +583,26 @@ fn compute_field_update(
     validate_physical_name(before, after)?;
 
     // Check for type change (including container changes)
-    if let Some(change_type) =
-        classify_data_type_change(before.field.data_type(), after.field.data_type())
-    {
-        changes.push(change_type);
-    }
-    // If None is returned, the types are identical or the container structure is the same
-    // and nested changes are already captured via field IDs, so we don't report a change here
+    changes.extend(classify_data_type_change(
+        before.field.data_type(),
+        after.field.data_type(),
+    ));
 
     // Check for metadata changes (excluding column mapping metadata)
     if has_metadata_changes(&before.field, &after.field) {
         changes.push(FieldChangeType::MetadataChanged);
     }
 
-    let change_type = match changes.as_slice() {
-        [] => return Ok(None),
-        [single] => single.clone(),
-        _ => FieldChangeType::Multiple(changes),
-    };
+    // If no changes detected, return None
+    if changes.is_empty() {
+        return Ok(None);
+    }
 
     Ok(Some(FieldUpdate {
         before: before.field.clone(),
         after: after.field.clone(),
         path: after.path.clone(), // Use the new path in case of renames
-        change_type,
+        change_types: changes,
     }))
 }
 
@@ -649,34 +643,34 @@ fn check_container_nullability_change(
 /// Classifies a type change between two data types.
 ///
 /// Returns:
-/// - `Some(FieldChangeType)` if there's a reportable change (type changed or container nullability changed)
-/// - `None` if the types are the same container with nested changes handled elsewhere
+/// - A `Vec<FieldChangeType>` containing all changes detected (type changed or container nullability changed)
+/// - An empty vec if the types are the same container with nested changes handled elsewhere
 ///
 /// This function handles the following cases:
-/// 1. **Struct containers**: Changes to nested fields are captured via field IDs, so return None
+/// 1. **Struct containers**: Changes to nested fields are captured via field IDs, so return empty vec
 /// 2. **Array containers**:
 ///    - If element types match and only nullability changed, return the specific nullability change
-///    - If element types are both structs with same nullability, nested changes handled via field IDs (return None)
+///    - If element types are both structs with same nullability, nested changes handled via field IDs (return empty vec)
 ///    - Otherwise, it's a type change
 /// 3. **Map containers**: Similar logic to arrays, but for both key and value types
 /// 4. **Different container types or primitives**: Type change
-fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<FieldChangeType> {
+fn classify_data_type_change(before: &DataType, after: &DataType) -> Vec<FieldChangeType> {
     // Early return if types are identical - no change to report
     if before == after {
-        return None;
+        return Vec::new();
     }
 
     match (before, after) {
         // Struct-to-struct: nested field changes are handled separately via field IDs
-        (DataType::Struct(_), DataType::Struct(_)) => None,
+        (DataType::Struct(_), DataType::Struct(_)) => Vec::new(),
 
         // Array-to-array: check element types and nullability
         (DataType::Array(before_array), DataType::Array(after_array)) => {
             // Recursively check for element type changes
-            let element_type_change =
+            let element_type_changes =
                 match (before_array.element_type(), after_array.element_type()) {
                     // Both have struct elements - nested changes handled via field IDs
-                    (DataType::Struct(_), DataType::Struct(_)) => None,
+                    (DataType::Struct(_), DataType::Struct(_)) => Vec::new(),
                     // For non-struct elements, recurse to check for changes
                     (e1, e2) => classify_data_type_change(e1, e2),
                 };
@@ -688,29 +682,27 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
             );
 
             // Combine both changes if present
-            match (element_type_change, nullability_change) {
-                (Some(type_change), Some(null_change)) => {
-                    Some(FieldChangeType::Multiple(vec![type_change, null_change]))
-                }
-                (Some(change), None) | (None, Some(change)) => Some(change),
-                (None, None) => None,
+            let mut changes = element_type_changes;
+            if let Some(null_change) = nullability_change {
+                changes.push(null_change);
             }
+            changes
         }
 
         // Map-to-map: check key types, value types, and nullability
         (DataType::Map(before_map), DataType::Map(after_map)) => {
             // Recursively check for key type changes
-            let key_type_change = match (before_map.key_type(), after_map.key_type()) {
+            let key_type_changes = match (before_map.key_type(), after_map.key_type()) {
                 // Both have struct keys - nested changes handled via field IDs
-                (DataType::Struct(_), DataType::Struct(_)) => None,
+                (DataType::Struct(_), DataType::Struct(_)) => Vec::new(),
                 // For non-struct keys (including arrays/maps containing structs), recurse
                 (k1, k2) => classify_data_type_change(k1, k2),
             };
 
             // Recursively check for value type changes
-            let value_type_change = match (before_map.value_type(), after_map.value_type()) {
+            let value_type_changes = match (before_map.value_type(), after_map.value_type()) {
                 // Both have struct values - nested changes handled via field IDs
-                (DataType::Struct(_), DataType::Struct(_)) => None,
+                (DataType::Struct(_), DataType::Struct(_)) => Vec::new(),
                 // For non-struct values (including arrays/maps containing structs), recurse
                 (v1, v2) => classify_data_type_change(v1, v2),
             };
@@ -722,26 +714,16 @@ fn classify_data_type_change(before: &DataType, after: &DataType) -> Option<Fiel
             );
 
             // Combine all changes if present
-            let mut changes = Vec::new();
-            if let Some(change) = key_type_change {
-                changes.push(change);
+            let mut changes = key_type_changes;
+            changes.extend(value_type_changes);
+            if let Some(null_change) = nullability_change {
+                changes.push(null_change);
             }
-            if let Some(change) = value_type_change {
-                changes.push(change);
-            }
-            if let Some(change) = nullability_change {
-                changes.push(change);
-            }
-
-            match changes.as_slice() {
-                [] => None,
-                [single] => Some(single.clone()),
-                _ => Some(FieldChangeType::Multiple(changes)),
-            }
+            changes
         }
 
         // Different container types or primitive type changes
-        _ => Some(FieldChangeType::TypeChanged),
+        _ => vec![FieldChangeType::TypeChanged],
     }
 }
 
@@ -966,7 +948,10 @@ mod tests {
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
-        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
         assert!(!diff.has_breaking_changes()); // Rename is not breaking
 
         // Test: Physical name changed - INVALID (returns error)
@@ -1062,7 +1047,10 @@ mod tests {
             diff.updated_fields[0].path,
             ColumnName::new(["user", "full_name"])
         );
-        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
 
         // Crucially, there should be NO update reported for the "user" field itself
         // even though its DataType::Struct contains different nested fields
@@ -1111,8 +1099,8 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["data"]));
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::TypeChanged
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::TypeChanged]
         );
         assert!(diff.has_breaking_changes());
 
@@ -1171,7 +1159,10 @@ mod tests {
             diff.updated_fields[0].path,
             ColumnName::new(["items", "element", "title"])
         );
-        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
 
         // No change should be reported for the "items" array itself
         let array_updates: Vec<_> = diff
@@ -1282,7 +1273,7 @@ mod tests {
 
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["user", "full_name"]));
-        assert_eq!(update.change_type, FieldChangeType::Renamed);
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
         assert!(!diff.has_breaking_changes()); // Rename is not breaking
     }
 
@@ -1379,7 +1370,7 @@ mod tests {
         // Check updated field (rename)
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
-        assert_eq!(update.change_type, FieldChangeType::Renamed);
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
 
         assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
     }
@@ -1421,8 +1412,8 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::TypeChanged
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::TypeChanged]
         );
 
         assert!(diff.has_breaking_changes()); // Type change is breaking
@@ -1464,8 +1455,8 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityLoosened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
         );
         assert!(!diff.has_breaking_changes()); // Loosening is safe
     }
@@ -1506,8 +1497,8 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityTightened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
         );
         assert!(diff.has_breaking_changes()); // Tightening is breaking
     }
@@ -1548,8 +1539,8 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityLoosened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
         );
         assert!(!diff.has_breaking_changes()); // Loosening is safe
     }
@@ -1590,8 +1581,8 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityTightened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
         );
         assert!(diff.has_breaking_changes()); // Tightening is breaking
     }
@@ -1654,7 +1645,7 @@ mod tests {
         // Check updated field (rename)
         let update = &diff.updated_fields[0];
         assert_eq!(update.path, ColumnName::new(["lookup", "value", "count"]));
-        assert_eq!(update.change_type, FieldChangeType::Renamed);
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
 
         assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
     }
@@ -1711,7 +1702,7 @@ mod tests {
             update.path,
             ColumnName::new(["level1", "level2", "very_deep_field"])
         );
-        assert_eq!(update.change_type, FieldChangeType::Renamed);
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
     }
 
     #[test]
@@ -1883,19 +1874,15 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
 
-        // Should be Multiple with 3 changes
-        match &update.change_type {
-            FieldChangeType::Multiple(changes) => {
-                assert_eq!(changes.len(), 3);
-                assert!(changes.contains(&FieldChangeType::Renamed));
-                assert!(changes.contains(&FieldChangeType::NullabilityLoosened));
-                assert!(changes.contains(&FieldChangeType::MetadataChanged));
-            }
-            _ => panic!(
-                "Expected Multiple change type, got {:?}",
-                update.change_type
-            ),
-        }
+        // Should have 3 changes
+        assert_eq!(update.change_types.len(), 3);
+        assert!(update.change_types.contains(&FieldChangeType::Renamed));
+        assert!(update
+            .change_types
+            .contains(&FieldChangeType::NullabilityLoosened));
+        assert!(update
+            .change_types
+            .contains(&FieldChangeType::MetadataChanged));
 
         // Breaking because metadata changed (metadata changes can be unsafe, e.g., row tracking)
         assert!(diff.has_breaking_changes());
@@ -1929,18 +1916,14 @@ mod tests {
         assert_eq!(diff.updated_fields.len(), 1);
         let update = &diff.updated_fields[0];
 
-        match &update.change_type {
-            FieldChangeType::Multiple(changes) => {
-                assert_eq!(changes.len(), 3);
-                assert!(changes.contains(&FieldChangeType::Renamed));
-                assert!(changes.contains(&FieldChangeType::NullabilityTightened));
-                assert!(changes.contains(&FieldChangeType::MetadataChanged));
-            }
-            _ => panic!(
-                "Expected Multiple change type, got {:?}",
-                update.change_type
-            ),
-        }
+        assert_eq!(update.change_types.len(), 3);
+        assert!(update.change_types.contains(&FieldChangeType::Renamed));
+        assert!(update
+            .change_types
+            .contains(&FieldChangeType::NullabilityTightened));
+        assert!(update
+            .change_types
+            .contains(&FieldChangeType::MetadataChanged));
 
         // Breaking because nullability was tightened
         assert!(diff.has_breaking_changes());
@@ -1998,8 +1981,8 @@ mod tests {
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityLoosened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
         );
         assert!(!diff.has_breaking_changes()); // Loosening is safe
     }
@@ -2031,8 +2014,8 @@ mod tests {
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityTightened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
         );
         assert!(diff.has_breaking_changes()); // Tightening is breaking
     }
@@ -2072,8 +2055,8 @@ mod tests {
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityLoosened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
         );
         assert!(!diff.has_breaking_changes());
     }
@@ -2113,8 +2096,8 @@ mod tests {
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
         assert_eq!(
-            diff.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityTightened
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
         );
         assert!(diff.has_breaking_changes());
     }
@@ -2171,7 +2154,10 @@ mod tests {
             diff.updated_fields[0].path,
             ColumnName::new(["lookup", "key", "identifier"])
         );
-        assert_eq!(diff.updated_fields[0].change_type, FieldChangeType::Renamed);
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
+        );
     }
 
     #[test]
@@ -2257,8 +2243,8 @@ mod tests {
             ColumnName::new(["data", "items", "element", "inner", "renamed_a"])
         );
         assert_eq!(
-            diff1.updated_fields[0].change_type,
-            FieldChangeType::Renamed
+            diff1.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
         );
 
         assert!(!diff1.has_breaking_changes()); // Removal is safe, rename is safe
@@ -2330,8 +2316,8 @@ mod tests {
             ColumnName::new(["lookup", "value", "nested", "value", "renamed_x"])
         );
         assert_eq!(
-            diff2.updated_fields[0].change_type,
-            FieldChangeType::Renamed
+            diff2.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
         );
 
         assert!(!diff2.has_breaking_changes()); // Just a rename
@@ -2392,8 +2378,8 @@ mod tests {
             ColumnName::new(["matrix", "element", "element", "renamed_x"])
         );
         assert_eq!(
-            diff3.updated_fields[0].change_type,
-            FieldChangeType::Renamed
+            diff3.updated_fields[0].change_types,
+            vec![FieldChangeType::Renamed]
         );
         assert!(!diff3.has_breaking_changes()); // Rename and added nullable field
 
@@ -2649,8 +2635,8 @@ mod tests {
             ColumnName::new(["wrapper", "element", "items", "element", "value"])
         );
         assert_eq!(
-            diff6.updated_fields[0].change_type,
-            FieldChangeType::NullabilityTightened
+            diff6.updated_fields[0].change_types,
+            vec![FieldChangeType::NullabilityTightened]
         );
         assert!(diff6.has_breaking_changes()); // Nullability tightening is breaking
 
@@ -2721,8 +2707,8 @@ mod tests {
             ColumnName::new(["wrapper", "element", "items"])
         );
         assert_eq!(
-            diff7.updated_fields[0].change_type,
-            FieldChangeType::ContainerNullabilityTightened
+            diff7.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
         );
         assert!(diff7.has_breaking_changes()); // Container nullability tightening is breaking
     }
