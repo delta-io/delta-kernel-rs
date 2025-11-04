@@ -207,6 +207,7 @@ pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyL
 ///   tables with row tracking yet.
 pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
     vec![
+        TableFeature::ChangeDataFeed,
         TableFeature::AppendOnly,
         TableFeature::DeletionVectors,
         TableFeature::DomainMetadata,
