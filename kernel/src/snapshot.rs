@@ -273,12 +273,11 @@ impl Snapshot {
 
         let result = (|| {
             let (metadata, protocol) = log_segment.read_metadata(engine)?;
-            let protocol_metadata_duration = timer.elapsed();
 
             if let Some(ref r) = reporter {
                 r.report(MetricEvent::ProtocolMetadataLoaded {
                     operation_id,
-                    duration: protocol_metadata_duration,
+                    duration: timer.elapsed(),
                 });
             }
 
