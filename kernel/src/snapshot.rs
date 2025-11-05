@@ -274,12 +274,10 @@ impl Snapshot {
         let result = (|| {
             let (metadata, protocol) = log_segment.read_metadata(engine)?;
 
-            if let Some(ref r) = reporter {
-                r.report(MetricEvent::ProtocolMetadataLoaded {
-                    operation_id,
-                    duration: timer.elapsed(),
-                });
-            }
+            reporter.report(MetricEvent::ProtocolMetadataLoaded {
+                operation_id,
+                duration: timer.elapsed(),
+            });
 
             let table_configuration =
                 TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
@@ -292,19 +290,15 @@ impl Snapshot {
 
         match result {
             Ok(snapshot) => {
-                if let Some(ref r) = reporter {
-                    r.report(MetricEvent::SnapshotCompleted {
-                        operation_id,
-                        version: snapshot.version(),
-                        total_duration: timer.elapsed(),
-                    });
-                }
+                reporter.report(MetricEvent::SnapshotCompleted {
+                    operation_id,
+                    version: snapshot.version(),
+                    total_duration: timer.elapsed(),
+                });
                 Ok(snapshot)
             }
             Err(e) => {
-                if let Some(ref r) = reporter {
-                    r.report(MetricEvent::SnapshotFailed { operation_id });
-                }
+                reporter.report(MetricEvent::SnapshotFailed { operation_id });
                 Err(e)
             }
         }
@@ -989,7 +983,8 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage =
+            ObjectStoreStorageHandler::new(store, executor, Arc::new(crate::metrics::NullReporter));
         let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
@@ -1050,7 +1045,8 @@ mod tests {
             });
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage =
+            ObjectStoreStorageHandler::new(store, executor, Arc::new(crate::metrics::NullReporter));
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
@@ -1084,7 +1080,8 @@ mod tests {
             });
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage =
+            ObjectStoreStorageHandler::new(store, executor, Arc::new(crate::metrics::NullReporter));
 
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.

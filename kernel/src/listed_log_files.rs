@@ -444,7 +444,11 @@ mod list_log_files_with_log_tail_tests {
         });
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
+        let storage = Box::new(ObjectStoreStorageHandler::new(
+            store,
+            executor,
+            Arc::new(crate::metrics::NullReporter),
+        ));
         (storage, log_root)
     }
 

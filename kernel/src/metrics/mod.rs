@@ -111,6 +111,18 @@ pub trait MetricsReporter: Send + Sync + std::fmt::Debug {
     fn report(&self, event: MetricEvent);
 }
 
+/// A no-op metrics reporter that discards all metrics.
+///
+/// This is used as the default reporter when no metrics collection is configured.
+#[derive(Debug, Clone, Copy)]
+pub struct NullReporter;
+
+impl MetricsReporter for NullReporter {
+    fn report(&self, _event: MetricEvent) {
+        // No-op: discard the metric
+    }
+}
+
 /// Metric events emitted during Delta Kernel operations.
 ///
 /// Some events include an `operation_id` (MetricId) that uniquely identifies the operation

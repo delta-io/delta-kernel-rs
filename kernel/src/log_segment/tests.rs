@@ -114,8 +114,11 @@ fn build_log_with_paths_and_checkpoint(
         }
     });
 
-    let storage =
-        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
+    let storage = ObjectStoreStorageHandler::new(
+        store,
+        Arc::new(TokioBackgroundExecutor::new()),
+        Arc::new(crate::metrics::NullReporter),
+    );
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
