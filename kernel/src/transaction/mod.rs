@@ -578,7 +578,7 @@ impl Transaction {
                     input_schema.clone(),
                     Arc::new(adds_expr),
                     as_log_add_schema(output_schema.clone()).into(),
-                );
+                )?;
                 adds_evaluator.evaluate(add_files_batch?.deref())
             })
         }
