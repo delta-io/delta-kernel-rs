@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
+use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
     get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
@@ -724,6 +725,30 @@ impl WriteContext {
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
     }
+
+    /// Generate a new unique absolute URL for a deletion vector file.
+    ///
+    /// This method generates a unique file name in the table directory.
+    /// Each call to this method returns a new unique path.
+    ///
+    /// # Arguments
+    ///
+    /// * `random_prefix` - A random prefix to use for the deletion vector file name.
+    ///   Making this non-empty can help distributed load on object storage when writing/reading
+    ///   to avoid throttling.  Typically a random string fo 2-4 characters is sufficient
+    ///   for this purpose.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let write_context = transaction.get_write_context();
+    /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
+    /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
+    /// ```
+    pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
+        DeletionVectorPath::new(self.target_dir.clone(), random_prefix)
+    }
 }
 
 /// Kernel exposes information about the state of the table that engines might want to use to
@@ -874,6 +899,41 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
+        let write_context = txn.get_write_context();
+
+        // Test with empty prefix
+        let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
+        let abs_path1 = dv_path1.absolute_path()?;
+        assert!(abs_path1.as_str().contains(url.as_str()));
+
+        // Test with non-empty prefix
+        let prefix = String::from("dv_test");
+        let dv_path2 = write_context.new_deletion_vector_path(prefix.clone());
+        let abs_path2 = dv_path2.absolute_path()?;
+        assert!(abs_path2.as_str().contains(url.as_str()));
+        assert!(abs_path2.as_str().contains(&prefix));
+
+        // Test that two paths with same prefix are different (unique UUIDs)
+        let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
+        let abs_path3 = dv_path3.absolute_path()?;
+        assert_ne!(abs_path2, abs_path3);
+
         Ok(())
     }
 }

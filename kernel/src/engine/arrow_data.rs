@@ -9,6 +9,7 @@ use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
+use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
@@ -237,6 +238,15 @@ impl EngineData for ArrowEngineData {
         let data = RecordBatch::try_new(combined_schema, combined_columns)?;
         Ok(Box::new(ArrowEngineData { data }))
     }
+
+    fn apply_selection_vector(
+        self: Box<Self>,
+        mut selection_vector: Vec<bool>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        selection_vector.resize(self.len(), true);
+        let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
+        Ok(Box::new(Self::new(filtered)))
+    }
 }
 
 impl ArrowEngineData {
@@ -352,7 +362,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
 
@@ -394,11 +404,11 @@ mod tests {
         assert_eq!(protocol.min_writer_version(), 7);
         assert_eq!(
             protocol.reader_features(),
-            Some([ReaderFeature::unknown("rw1")].as_slice())
+            Some([TableFeature::unknown("rw1")].as_slice())
         );
         assert_eq!(
             protocol.writer_features(),
-            Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
+            Some([TableFeature::unknown("rw1"), TableFeature::unknown("w2")].as_slice())
         );
         Ok(())
     }

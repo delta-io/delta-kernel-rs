@@ -153,15 +153,7 @@ Some design principles which should be considered:
 - If using `emacs`, both [eglot](https://github.com/joaotavora/eglot) and
   [lsp-mode](https://github.com/emacs-lsp/lsp-mode) provide excellent integration with
   `rust-analyzer`. [rustic](https://github.com/brotzeit/rustic) is a nice mode as well.
-- When also developing in VS Code it's sometimes convenient to configure rust-analyzer in
-  `.vscode/settings.json`.
-
-```json
-{
-  "editor.formatOnSave": true,
-  "rust-analyzer.cargo.features": ["default-engine"]
-}
-```
+- When also developing in VS Code it's convenient to add rust-analyzer to your workspace.
 
 - The crate's documentation can be easily reviewed with: `cargo docs --open`
 - Code coverage is available on codecov via [cargo-llvm-cov]. See their docs for instructions to install/run locally.
