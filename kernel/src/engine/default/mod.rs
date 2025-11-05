@@ -128,7 +128,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                reporter.clone(),
+                Arc::clone(&reporter),
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
@@ -187,7 +187,7 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     }
 
     fn get_metrics_reporter(&self) -> Arc<dyn crate::metrics::MetricsReporter> {
-        self.reporter.clone()
+        Arc::clone(&self.reporter)
     }
 }
 

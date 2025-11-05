@@ -184,7 +184,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         });
 
         let timer = Timer::new();
-        let reporter = self.reporter.clone();
+        let reporter = Arc::clone(&self.reporter);
 
         if !has_ordered_listing {
             // This FS doesn't return things in the order we require
@@ -269,7 +269,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
         Ok(Box::new(ReadMetricsIterator {
             inner: receiver.into_iter(),
-            reporter: self.reporter.clone(),
+            reporter: Arc::clone(&self.reporter),
             timer: Timer::new(),
             num_files,
             bytes_read: 0,
@@ -283,7 +283,6 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         let dest_path = Path::from_url_path(dest.path())?;
         let dest_path_str = dest_path.to_string();
         let store = self.inner.clone();
-        let reporter = self.reporter.clone();
 
         // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
         // necessarily atomic, but since the source file is immutable, we aren't exposed to the
@@ -303,7 +302,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             Ok(())
         });
 
-        reporter.report(MetricEvent::StorageCopyCompleted {
+        self.reporter.report(MetricEvent::StorageCopyCompleted {
             duration: timer.elapsed(),
         });
 
