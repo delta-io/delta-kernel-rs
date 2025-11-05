@@ -16,7 +16,7 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 /// Iterator wrapper that emits metrics when exhausted
 struct ListMetricsIterator<I> {
     inner: I,
-    reporter: Option<Arc<dyn MetricsReporter>>,
+    reporter: Arc<dyn MetricsReporter>,
     timer: Timer,
     count: u64,
     metrics_emitted: bool,
@@ -35,12 +35,10 @@ impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator
             }
             None => {
                 if !self.metrics_emitted {
-                    if let Some(ref r) = self.reporter {
-                        r.report(MetricEvent::StorageListCompleted {
-                            duration: self.timer.elapsed(),
-                            num_files: self.count,
-                        });
-                    }
+                    self.reporter.report(MetricEvent::StorageListCompleted {
+                        duration: self.timer.elapsed(),
+                        num_files: self.count,
+                    });
                     self.metrics_emitted = true;
                 }
                 None
@@ -52,7 +50,7 @@ impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator
 /// Iterator wrapper for read operations that tracks bytes read
 struct ReadMetricsIterator<I> {
     inner: I,
-    reporter: Option<Arc<dyn MetricsReporter>>,
+    reporter: Arc<dyn MetricsReporter>,
     timer: Timer,
     num_files: u64,
     bytes_read: u64,
@@ -72,13 +70,11 @@ impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I>
             }
             None => {
                 if !self.metrics_emitted {
-                    if let Some(ref r) = self.reporter {
-                        r.report(MetricEvent::StorageReadCompleted {
-                            duration: self.timer.elapsed(),
-                            num_files: self.num_files,
-                            bytes_read: self.bytes_read,
-                        });
-                    }
+                    self.reporter.report(MetricEvent::StorageReadCompleted {
+                        duration: self.timer.elapsed(),
+                        num_files: self.num_files,
+                        bytes_read: self.bytes_read,
+                    });
                     self.metrics_emitted = true;
                 }
                 None
@@ -91,7 +87,7 @@ impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I>
 pub struct ObjectStoreStorageHandler<E: TaskExecutor> {
     inner: Arc<DynObjectStore>,
     task_executor: Arc<E>,
-    reporter: Option<Arc<dyn MetricsReporter>>,
+    reporter: Arc<dyn MetricsReporter>,
     readahead: usize,
 }
 
@@ -100,7 +96,7 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     pub(crate) fn new(
         store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
-        reporter: Option<Arc<dyn MetricsReporter>>,
+        reporter: Arc<dyn MetricsReporter>,
     ) -> Self {
         Self {
             inner: store,
@@ -196,12 +192,10 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             fms.sort_unstable();
 
             let num_files = fms.len() as u64;
-            if let Some(ref r) = reporter {
-                r.report(MetricEvent::StorageListCompleted {
-                    duration: timer.elapsed(),
-                    num_files,
-                });
-            }
+            reporter.report(MetricEvent::StorageListCompleted {
+                duration: timer.elapsed(),
+                num_files,
+            });
 
             Ok(Box::new(fms.into_iter().map(Ok)))
         } else {
@@ -309,11 +303,9 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             Ok(())
         });
 
-        if let Some(ref r) = reporter {
-            r.report(MetricEvent::StorageCopyCompleted {
-                duration: timer.elapsed(),
-            });
-        }
+        reporter.report(MetricEvent::StorageCopyCompleted {
+            duration: timer.elapsed(),
+        });
 
         result
     }
@@ -377,7 +369,8 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor, None);
+        let storage =
+            ObjectStoreStorageHandler::new(store, executor, Arc::new(crate::metrics::NullReporter));
 
         let mut slices: Vec<FileSlice> = Vec::new();
 
@@ -465,7 +458,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
+        let handler = ObjectStoreStorageHandler::new(
+            store.clone(),
+            executor,
+            Arc::new(crate::metrics::NullReporter),
+        );
 
         // basic
         let data = Bytes::from("test-data");
