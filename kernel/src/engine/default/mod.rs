@@ -38,7 +38,10 @@ pub mod storage;
 /// Converts a Stream-producing future to a synchronous iterator.
 ///
 /// Each call to `next` on the iterator translates to a blocking `stream.next()` call, using the
-/// provided `task_executor`. Buffered streams allow concurrency in the form of prefetching.
+/// provided `task_executor`. Buffered streams allow concurrency in the form of prefetching, because
+/// every call to `stream.next()` leaves an empty slot (out of N buffer slots) that the stream
+/// immediately attempts to fill by launching another future that can make progress in the
+/// background while we block on and consume each of the N-1 entries that precede it.
 ///
 /// This is an internal utility for bridging object_store's async API to
 /// Delta Kernel's synchronous handler traits.
