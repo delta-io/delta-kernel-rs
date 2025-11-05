@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
 use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
 use crate::arrow::datatypes::{DataType, Field};
@@ -62,8 +64,9 @@ impl DataFileMetadata {
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
     /// [`add_files_schema`].
     ///
-    /// [`add_files_schema`]: crate::transaction::add_files_schema
-    fn as_record_batch(
+    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
+    #[internal_api]
+    pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
