@@ -267,6 +267,9 @@ fn visit_expression_literal_string_impl(
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
 
+// This is a function called by the engine to transform the engine expression into a kernel expression
+// The engine visitor calls this function with the argument (predicate, kernel_expression_visitor) where
+// kernel_expression_visitor is a pointer to the KernelExpressionVisitorState struct.
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,
