@@ -243,7 +243,7 @@ impl LogReplayScanner {
             get_log_add_schema().clone(),
             Arc::new(cdf_scan_row_expression(timestamp, commit_version)),
             cdf_scan_row_schema().into(),
-        );
+        )?;
 
         let result = action_iter.map(move |actions| -> DeltaResult<_> {
             let actions = actions?;

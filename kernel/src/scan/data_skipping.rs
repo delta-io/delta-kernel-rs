@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::sync::{Arc, LazyLock};
 
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::actions::get_log_add_schema;
 use crate::actions::visitors::SelectionVectorVisitor;
@@ -134,21 +134,37 @@ impl DataSkippingFilter {
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
         //    the predicate is true/null and false (= skip) when the predicate is false.
-        let select_stats_evaluator = engine.evaluation_handler().new_expression_evaluator(
-            // safety: kernel is very broken if we don't have the schema for Add actions
-            get_log_add_schema().clone(),
-            STATS_EXPR.clone(),
-            DataType::STRING,
-        );
+        let select_stats_evaluator = engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                // safety: kernel is very broken if we don't have the schema for Add actions
+                get_log_add_schema().clone(),
+                STATS_EXPR.clone(),
+                DataType::STRING,
+            )
+            // A stats expression failure here doesn't affect correctness
+            // as its a performance optimization so we log the error and continue.
+            .inspect_err(|e| error!("Failed to create select stats evaluator: {e}"))
+            .ok()?;
 
-        let skipping_evaluator = engine.evaluation_handler().new_predicate_evaluator(
-            stats_schema.clone(),
-            Arc::new(as_sql_data_skipping_predicate(&predicate)?),
-        );
+        let skipping_evaluator = engine
+            .evaluation_handler()
+            .new_predicate_evaluator(
+                stats_schema.clone(),
+                Arc::new(as_sql_data_skipping_predicate(&predicate)?),
+            )
+            // A skipping predicate expression failure here doesn't affect correctness
+            // as its a performance optimization so we log the error and continue.
+            .inspect_err(|e| error!("Failed to create skipping evaluator: {e}"))
+            .ok()?;
 
         let filter_evaluator = engine
             .evaluation_handler()
-            .new_predicate_evaluator(stats_schema.clone(), FILTER_PRED.clone());
+            .new_predicate_evaluator(stats_schema.clone(), FILTER_PRED.clone())
+            // A filter predicate expression failure here doesn't affect correctness
+            // as its a performance optimization so we log the error and continue.
+            .inspect_err(|e| error!("Failed to create filter evaluator: {e}"))
+            .ok()?;
 
         Some(Self {
             stats_schema,
