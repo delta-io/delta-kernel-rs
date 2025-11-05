@@ -33,7 +33,6 @@ use crate::{
     RowVisitor, Version,
 };
 use delta_kernel_derive::internal_api;
-use url::Url;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -52,6 +51,7 @@ pub(crate) static MANDATORY_ADD_FILE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new
     ]))
 });
 
+/// Returns a reference to the mandatory fields in an add action.
 ///
 /// Note this does not include "dataChange" which is a required field but
 /// but should be set on the transactoin level. Getting the full schema
