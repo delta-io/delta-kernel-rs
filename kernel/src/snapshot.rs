@@ -1157,13 +1157,14 @@ mod tests {
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
 
         // Test get_all_domain_metadata
+        let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
+        metadata.sort_by(|a, b| a.domain().cmp(b.domain()));
 
-        let metadata = snapshot.get_all_domain_metadata(&engine)?;
-
-        let expected = vec![
+        let mut expected = vec![
             DomainMetadata::new("domain2".to_string(), "domain2_commit1".to_string()),
             DomainMetadata::new("domain3".to_string(), "domain3_commit0".to_string()),
         ];
+        expected.sort_by(|a, b| a.domain().cmp(b.domain()));
 
         assert_eq!(metadata, expected);
 
