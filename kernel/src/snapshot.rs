@@ -298,7 +298,10 @@ impl Snapshot {
                 Ok(snapshot)
             }
             Err(e) => {
-                reporter.report(MetricEvent::SnapshotFailed { operation_id });
+                reporter.report(MetricEvent::SnapshotFailed {
+                    operation_id,
+                    duration: timer.elapsed(),
+                });
                 Err(e)
             }
         }
