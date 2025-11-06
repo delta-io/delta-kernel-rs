@@ -810,4 +810,66 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_binary_column_extraction_type_mismatch() -> DeltaResult<()> {
+        use crate::engine_data::{GetData, RowVisitor};
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Create a RecordBatch with Int32 data (not binary)
+        let data: Vec<Option<i32>> = vec![Some(123)];
+        let int_array = Int32Array::from(data);
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            ArrowDataType::Int32,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(int_array)])?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        // Create a visitor that tries to extract binary data from an int column
+        struct BinaryVisitor {
+            values: Vec<Option<Vec<u8>>>,
+        }
+
+        impl RowVisitor for BinaryVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::BINARY]);
+                (&NAMES, &TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                assert_eq!(getters.len(), 1);
+                let getter = getters[0];
+
+                for i in 0..row_count {
+                    self.values
+                        .push(getter.get_binary(i, "data")?.map(|b| b.to_vec()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = BinaryVisitor { values: vec![] };
+        let result = arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor);
+
+        // Verify that we get a type mismatch error
+        assert_result_error_with_message(
+            result,
+            "Type mismatch on data: expected binary, got Int32",
+        );
+
+        Ok(())
+    }
 }
