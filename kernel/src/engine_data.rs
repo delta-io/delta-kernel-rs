@@ -590,6 +590,7 @@ mod tests {
         assert_eq!(result.unwrap().len(), 0);
     }
 
+    #[test]
     fn test_from_engine_data() {
         let data = get_engine_data(3);
         let data_len = data.len(); // Save length before move
