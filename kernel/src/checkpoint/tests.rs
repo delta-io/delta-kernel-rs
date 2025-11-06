@@ -6,6 +6,10 @@ use crate::action_reconciliation::{
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{ArrayRef, StructArray};
 use crate::arrow::datatypes::{DataType, Schema};
+use crate::arrow::{
+    array::{create_array, RecordBatch},
+    datatypes::Field,
+};
 use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
@@ -13,11 +17,6 @@ use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
 use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
-
-use arrow_56::{
-    array::{create_array, RecordBatch},
-    datatypes::Field,
-};
 
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
