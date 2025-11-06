@@ -588,6 +588,7 @@ mod tests {
         let result: Option<&[u8]> = getter.get_opt(0, "binary_field").unwrap();
         assert_eq!(result, Some([].as_ref()));
         assert_eq!(result.unwrap().len(), 0);
+    }
 
     fn test_from_engine_data() {
         let data = get_engine_data(3);
