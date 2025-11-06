@@ -556,6 +556,36 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_native_serialization_error() {
+        // Construct an inline DV payload whose first 4 bytes (little-endian) are the
+        // native serialization magic (1681511376). The `read` method should return
+        // a DeletionVector error indicating native serialization isn't supported.
+        let sync_engine = SyncEngine::new();
+        let storage = sync_engine.storage_handler();
+        let parent = Url::parse("http://not.used").unwrap();
+
+        let mut bytes = Vec::new();
+        // native serialization magic (little-endian)
+        bytes.extend_from_slice(&1681511376u32.to_le_bytes());
+        // some trailing bytes (content not important for this test)
+        bytes.extend_from_slice(&[1u8, 2, 3, 4]);
+
+        let encoded = z85::encode(&bytes);
+
+        let inline = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::Inline,
+            path_or_inline_dv: encoded,
+            offset: None,
+            size_in_bytes: bytes.len() as i32,
+            cardinality: 0,
+        };
+
+        let err = inline.read(storage, &parent).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Native serialization in inline bitmaps is not yet supported"));
+    }
+
+    #[test]
     fn test_deletion_vector_read() {
         let path =
             std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
