@@ -1,7 +1,7 @@
 //! Builder for creating [`Snapshot`] instances.
+use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
 use crate::snapshot::SnapshotRef;
-use crate::LogPath;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
 use url::Url;

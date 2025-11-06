@@ -87,6 +87,7 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod committer;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -425,7 +426,7 @@ pub trait EvaluationHandler: AsAny {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator>;
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>>;
 
     /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
     /// batches with the given [`Schema`] to produce a column of boolean results.
@@ -442,7 +443,7 @@ pub trait EvaluationHandler: AsAny {
         &self,
         input_schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Arc<dyn PredicateEvaluator>;
+    ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
     /// `output_schema`.
@@ -473,7 +474,8 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.try_into_expr()?;
 
-        let eval = self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into());
+        let eval =
+            self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
         eval.evaluate(null_row.as_ref())
     }
 }
@@ -533,6 +535,10 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    /// Copy a file atomically from source to destination. If the destination file already exists,
+    /// it must return Err(Error::FileAlreadyExists).
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

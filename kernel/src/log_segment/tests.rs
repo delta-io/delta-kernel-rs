@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::actions::visitors::AddVisitor;
 use crate::actions::{
-    get_log_add_schema, get_log_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
+    get_all_actions_schema, get_commit_schema, Add, Sidecar, ADD_NAME, METADATA_NAME, REMOVE_NAME,
     SIDECAR_NAME,
 };
 use crate::engine::arrow_data::ArrowEngineData;
@@ -938,13 +938,13 @@ fn test_sidecar_to_filemeta_valid_paths() -> DeltaResult<()> {
 fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let (_, log_root) = new_in_memory_store();
     let engine = Arc::new(SyncEngine::new());
-    let checkpoint_batch = add_batch_simple(get_log_schema().clone());
+    let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
 
     let mut iter = LogSegment::process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
-        get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
+        get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
         None,
     )?
     .into_iter()
@@ -960,7 +960,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
+    let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
         &store,
@@ -1003,14 +1003,14 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-        get_log_schema().clone(),
+        get_all_actions_schema().clone(),
     );
 
     let mut iter = LogSegment::process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
-        get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
+        get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?,
         None,
     )?
     .into_iter()
@@ -1027,7 +1027,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
-    let read_schema = get_log_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
+    let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let checkpoint_batch =
         sidecar_batch_with_given_paths(vec!["sidecarfile1.parquet"], read_schema.clone());
@@ -1063,66 +1063,6 @@ fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 }
 
 #[test]
-fn test_create_checkpoint_stream_errors_when_schema_has_remove_but_no_sidecar_action(
-) -> DeltaResult<()> {
-    let engine = SyncEngine::new();
-    let log_root = Url::parse("s3://example-bucket/logs/")?;
-
-    // Create the stream over checkpoint batches.
-    let log_segment = LogSegment::try_new(
-        ListedLogFiles::try_new(
-            vec![],
-            vec![],
-            vec![create_log_path(
-                "file:///00000000000000000001.checkpoint.parquet",
-            )],
-            None,
-            Some(create_log_path("file:///00000000000000000001.json")),
-        )?,
-        log_root,
-        None,
-    )?;
-    let result = log_segment.create_checkpoint_stream(
-        &engine,
-        get_log_schema().project(&[REMOVE_NAME])?,
-        None,
-    );
-
-    // Errors because the schema has an REMOVE action but no SIDECAR action.
-    assert_result_error_with_message(result, "Invalid Checkpoint: If the checkpoint read schema contains file actions, it must contain the sidecar column");
-
-    Ok(())
-}
-
-#[test]
-fn test_create_checkpoint_stream_errors_when_schema_has_add_but_no_sidecar_action(
-) -> DeltaResult<()> {
-    let engine = SyncEngine::new();
-    let log_root = Url::parse("s3://example-bucket/logs/")?;
-
-    // Create the stream over checkpoint batches.
-    let log_segment = LogSegment::try_new(
-        ListedLogFiles::try_new(
-            vec![],
-            vec![],
-            vec![create_log_path(
-                "file:///00000000000000000001.checkpoint.parquet",
-            )],
-            None,
-            Some(create_log_path("file:///00000000000000000001.json")),
-        )?,
-        log_root,
-        None,
-    )?;
-    let result = log_segment.create_checkpoint_stream(&engine, get_log_add_schema().clone(), None);
-
-    // Errors because the schema has an ADD action but no SIDECAR action.
-    assert_result_error_with_message(result, "Invalid Checkpoint: If the checkpoint read schema contains file actions, it must contain the sidecar column");
-
-    Ok(())
-}
-
-#[test]
 fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
@@ -1130,7 +1070,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )?;
 
@@ -1138,7 +1078,7 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[METADATA_NAME])?;
+    let v2_checkpoint_read_schema = get_commit_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1186,19 +1126,19 @@ fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_mul
 
     add_checkpoint_to_store(
         &store,
-        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar1.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_1,
     )?;
     add_checkpoint_to_store(
         &store,
-        sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_log_schema().clone()),
+        sidecar_batch_with_given_paths(vec!["sidecar2.parquet"], get_all_actions_schema().clone()),
         checkpoint_part_2,
     )?;
 
     let checkpoint_one_file = log_root.join(checkpoint_part_1)?.to_string();
     let checkpoint_two_file = log_root.join(checkpoint_part_2)?.to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_commit_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1245,7 +1185,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
 
     add_checkpoint_to_store(
         &store,
-        add_batch_simple(get_log_schema().clone()),
+        add_batch_simple(get_commit_schema().clone()),
         "00000000000000000001.checkpoint.parquet",
     )?;
 
@@ -1253,7 +1193,7 @@ fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1300,7 +1240,7 @@ fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars() 
 
     let checkpoint_one_file = log_root.join(filename)?.to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1348,19 +1288,19 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         &store,
         sidecar_batch_with_given_paths(
             vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-            get_log_schema().clone(),
+            get_all_actions_schema().clone(),
         ),
         "00000000000000000001.checkpoint.parquet",
     )?;
 
     add_sidecar_to_store(
         &store,
-        add_batch_simple(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile1.parquet",
     )?;
     add_sidecar_to_store(
         &store,
-        add_batch_with_remove(get_log_schema().project(&[ADD_NAME, REMOVE_NAME])?),
+        add_batch_with_remove(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
         "sidecarfile2.parquet",
     )?;
 
@@ -1368,7 +1308,7 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
-    let v2_checkpoint_read_schema = get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
+    let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFiles::try_new(
@@ -1390,11 +1330,13 @@ fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batch
         is_log_batch,
     } = iter.next().unwrap()?;
     assert!(!is_log_batch);
+    // TODO: per contract this batch is not required to have sidecars, but leaving this test in to
+    // verify no behavior change.
     assert_batch_matches(
         first_batch,
         sidecar_batch_with_given_paths(
             vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-            get_log_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
+            get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
         ),
     );
     // Assert that the second batch returned is from reading sidecarfile1
@@ -1818,12 +1760,18 @@ fn test_debug_assert_listed_log_file_in_order_compaction_files() {
     let _ = ListedLogFiles::try_new(
         vec![],
         vec![
-            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
-            create_log_path("file:///00000000000000000001.00000000000000000002.compacted.json"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",
+            ),
         ],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -1834,12 +1782,18 @@ fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
     let _ = ListedLogFiles::try_new(
         vec![],
         vec![
-            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
-            create_log_path("file:///00000000000000000000.00000000000000000003.compacted.json"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000000.00000000000000000003.compacted.json",
+            ),
         ],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -1851,11 +1805,17 @@ fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
         vec![],
         vec![],
         vec![
-            create_log_path("00000000000000000010.checkpoint.0000000001.0000000002.parquet"),
-            create_log_path("00000000000000000011.checkpoint.0000000002.0000000002.parquet"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000002.parquet",
+            ),
         ],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -1867,11 +1827,17 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
         vec![],
         vec![],
         vec![
-            create_log_path("00000000000000000010.checkpoint.0000000001.0000000003.parquet"),
-            create_log_path("00000000000000000011.checkpoint.0000000002.0000000003.parquet"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000003.parquet",
+            ),
         ],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -2245,27 +2211,31 @@ fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
 fn test_log_segment_contiguous_commit_files() {
     let res = ListedLogFiles::try_new(
         vec![
-            create_log_path("file:///00000000000000000001.json"),
-            create_log_path("file:///00000000000000000002.json"),
-            create_log_path("file:///00000000000000000003.json"),
+            create_log_path("file:///_delta_log/00000000000000000001.json"),
+            create_log_path("file:///_delta_log/00000000000000000002.json"),
+            create_log_path("file:///_delta_log/00000000000000000003.json"),
         ],
         vec![],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
     assert!(res.is_ok());
 
     // allow gaps in ListedLogFiles
     let listed = ListedLogFiles::try_new(
         vec![
-            create_log_path("file:///00000000000000000001.json"),
-            create_log_path("file:///00000000000000000003.json"),
+            create_log_path("file:///_delta_log/00000000000000000001.json"),
+            create_log_path("file:///_delta_log/00000000000000000003.json"),
         ],
         vec![],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 
     // disallow gaps in LogSegment
@@ -2275,11 +2245,11 @@ fn test_log_segment_contiguous_commit_files() {
         "Generic delta kernel error: Expected ordered \
         contiguous commit files [ParsedLogPath { location: FileMeta { location: Url { scheme: \
         \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
+        None, path: \"/_delta_log/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
         0, size: 0 }, filename: \"00000000000000000001.json\", extension: \"json\", version: 1, \
         file_type: Commit }, ParsedLogPath { location: FileMeta { location: Url { scheme: \
         \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
+        None, path: \"/_delta_log/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
         0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
         file_type: Commit }]",
     );

@@ -6,7 +6,6 @@ use delta_kernel::arrow::array::{
     ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 
-use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
@@ -68,7 +67,7 @@ pub fn actions_to_string_partitioned(actions: Vec<TestAction>) -> String {
     actions_to_string_with_metadata(actions, METADATA_WITH_PARTITION_COLS)
 }
 
-fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
+pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str) -> String {
     actions
         .into_iter()
         .map(|test_action| match test_action {
@@ -432,16 +431,9 @@ pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
+        .map(|data| -> DeltaResult<_> {
+            let data = data?;
+            to_arrow(data)
         })
         .try_collect()
 }

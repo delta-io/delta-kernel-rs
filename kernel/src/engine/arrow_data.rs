@@ -9,6 +9,7 @@ use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
+use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
@@ -237,6 +238,15 @@ impl EngineData for ArrowEngineData {
         let data = RecordBatch::try_new(combined_schema, combined_columns)?;
         Ok(Box::new(ArrowEngineData { data }))
     }
+
+    fn apply_selection_vector(
+        self: Box<Self>,
+        mut selection_vector: Vec<bool>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        selection_vector.resize(self.len(), true);
+        let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
+        Ok(Box::new(Self::new(filtered)))
+    }
 }
 
 impl ArrowEngineData {
@@ -347,7 +357,7 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::Arc;
 
-    use crate::actions::{get_log_schema, Metadata, Protocol};
+    use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::Int32Type;
     use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{
@@ -356,7 +366,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
 
@@ -370,7 +380,7 @@ mod tests {
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -389,7 +399,7 @@ mod tests {
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().project(&["protocol"])?;
+        let output_schema = get_commit_schema().project(&["protocol"])?;
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -398,11 +408,11 @@ mod tests {
         assert_eq!(protocol.min_writer_version(), 7);
         assert_eq!(
             protocol.reader_features(),
-            Some([ReaderFeature::unknown("rw1")].as_slice())
+            Some([TableFeature::unknown("rw1")].as_slice())
         );
         assert_eq!(
             protocol.writer_features(),
-            Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
+            Some([TableFeature::unknown("rw1"), TableFeature::unknown("w2")].as_slice())
         );
         Ok(())
     }
