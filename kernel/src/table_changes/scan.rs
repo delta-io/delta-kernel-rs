@@ -239,13 +239,15 @@ fn read_scan_file(
     let transform_expr = get_cdf_transform_expr(&scan_file, state_info, physical_schema.as_ref())?;
 
     // Only create an evaluator if transformation is needed
-    let phys_to_logical_eval = transform_expr.map(|expr| {
-        engine.evaluation_handler().new_expression_evaluator(
-            physical_schema.clone(),
-            expr,
-            state_info.logical_schema.clone().into(),
-        )
-    });
+    let phys_to_logical_eval = transform_expr
+        .map(|expr| {
+            engine.evaluation_handler().new_expression_evaluator(
+                physical_schema.clone(),
+                expr,
+                state_info.logical_schema.clone().into(),
+            )
+        })
+        .transpose()?;
     // Determine if the scan file was derived from a deletion vector pair
     let is_dv_resolved_pair = scan_file.remove_dv.is_some();
 
