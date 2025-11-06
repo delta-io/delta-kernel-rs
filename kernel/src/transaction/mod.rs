@@ -801,7 +801,7 @@ impl Transaction {
                     input_schema.clone(),
                     Arc::new(expr),
                     target_schema.clone().into(),
-                );
+                )?;
 
                 let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
                 FilteredEngineData::try_new(
