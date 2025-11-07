@@ -290,6 +290,7 @@ fn build_snapshot_with_correct_last_uuid_checkpoint() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -381,6 +382,7 @@ fn build_snapshot_with_out_of_date_last_checkpoint() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -424,6 +426,7 @@ fn build_snapshot_with_correct_last_multipart_checkpoint() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -473,6 +476,7 @@ fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -516,6 +520,7 @@ fn build_snapshot_with_bad_checkpoint_hint_fails() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -606,6 +611,7 @@ fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_checkpo
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -714,6 +720,7 @@ fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -760,6 +767,7 @@ fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
