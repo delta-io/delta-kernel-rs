@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use delta_kernel::scan::state::DvInfo;
 use delta_kernel::scan::{Scan, ScanMetadata};
-use delta_kernel::snapshot::Snapshot;
+use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
@@ -18,7 +18,8 @@ use crate::schema_visitor::{unwrap_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
+    TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -90,7 +91,7 @@ pub unsafe extern "C" fn selection_vector_from_scan_metadata(
 fn selection_vector_from_scan_metadata_impl(
     scan_metadata: &ScanMetadata,
 ) -> DeltaResult<KernelBoolSlice> {
-    Ok(scan_metadata.scan_files.selection_vector.clone().into())
+    Ok(scan_metadata.scan_files.selection_vector().to_vec().into())
 }
 
 /// Drops a scan.
@@ -120,7 +121,7 @@ pub unsafe extern "C" fn scan(
 }
 
 fn scan_impl(
-    snapshot: Arc<Snapshot>,
+    snapshot: SnapshotRef,
     predicate: Option<&mut EnginePredicate>,
     projection: Option<&mut EngineSchema>,
 ) -> DeltaResult<Handle<SharedScan>> {
@@ -303,13 +304,27 @@ pub struct Stats {
     pub num_records: u64,
 }
 
+/// Contains information that can be used to get a selection vector. If `has_vector` is false, that
+/// indicates there is no selection vector to consider. It is always possible to get a vector out of
+/// a `DvInfo`, but if `has_vector` is false it will just be an empty vector (indicating all
+/// selected). Without this there's no way for a connector using ffi to know if a &DvInfo actually
+/// has a vector in it. We have has_vector() on the rust side, but this isn't exposed via ffi. So
+/// this just wraps the &DvInfo in another struct which includes a boolean that says if there is a
+/// dv to consider or not.  This allows engines to ignore dv info if there isn't any without needing
+/// to make another ffi call at all.
+#[repr(C)]
+pub struct CDvInfo<'a> {
+    info: &'a DvInfo,
+    has_vector: bool,
+}
+
 /// This callback will be invoked for each valid file that needs to be read for a scan.
 ///
 /// The arguments to the callback are:
 /// * `context`: a `void*` context this can be anything that engine needs to pass through to each call
 /// * `path`: a `KernelStringSlice` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
-/// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
+/// * `dv_info`: a [`CDvInfo`] struct, which allows getting the selection vector for this file
 /// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
 ///   convert it to the correct logical format. If this is `NULL`, no transform is needed.
 /// * `partition_values`: [DEPRECATED] a `HashMap<String, String>` which are partition values
@@ -318,7 +333,7 @@ type CScanCallback = extern "C" fn(
     path: KernelStringSlice,
     size: i64,
     stats: Option<&Stats>,
-    dv_info: &DvInfo,
+    dv_info: &CDvInfo,
     transform: Option<&Expression>,
     partition_map: &CStringMap,
 );
@@ -354,10 +369,34 @@ pub unsafe extern "C" fn get_from_string_map(
         .and_then(|v| allocate_fn(kernel_string_slice!(v)))
 }
 
+/// Visit all values in a CStringMap. The callback will be called once for each element of the map
+///
+/// # Safety
+///
+/// The engine is responsible for providing a valid [`CStringMap`] pointer and callback
+#[no_mangle]
+pub unsafe extern "C" fn visit_string_map(
+    map: &CStringMap,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) {
+    for (key, val) in map.values.iter() {
+        visitor(
+            engine_context,
+            kernel_string_slice!(key),
+            kernel_string_slice!(val),
+        );
+    }
+}
+
 /// Transformation expressions that need to be applied to each row `i` in ScanMetadata. You can use
 /// [`get_transform_for_row`] to get the transform for a particular row. If that returns an
 /// associated expression, it _must_ be applied to the data read from the file specified by the
-/// row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+/// row. The resultant schema for this expression is guaranteed to be [`scan_logical_schema()`]. If
 /// `get_transform_for_row` returns `NULL` no expression need be applied and the data read from disk
 /// is already in the correct logical state.
 ///
@@ -379,13 +418,14 @@ pub struct CTransforms {
 pub unsafe extern "C" fn get_transform_for_row(
     row: usize,
     transforms: &CTransforms,
-) -> Option<Handle<SharedExpression>> {
+) -> OptionalValue<Handle<SharedExpression>> {
     transforms
         .transforms
         .get(row)
         .cloned()
         .flatten()
         .map(Into::into)
+        .into()
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct
@@ -458,12 +498,16 @@ fn rust_callback(
     let stats = kernel_stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
+    let cdv_info = CDvInfo {
+        info: &dv_info,
+        has_vector: dv_info.has_vector(),
+    };
     (context.callback)(
         context.engine_context,
         kernel_string_slice!(path),
         size,
         stats.as_ref(),
-        &dv_info,
+        &cdv_info,
         transform.as_ref(),
         &partition_map,
     );
@@ -496,4 +540,43 @@ pub unsafe extern "C" fn visit_scan_metadata(
     scan_metadata
         .visit_scan_files(context_wrapper, rust_callback)
         .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, ptr::NonNull};
+
+    use crate::{KernelStringSlice, NullableCvoid, TryFromStringSlice};
+
+    extern "C" fn visit_entry(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ) {
+        let map_ptr: *mut HashMap<String, String> = engine_context.unwrap().as_ptr().cast();
+        let key = unsafe { String::try_from_slice(&key).unwrap() };
+        let value = unsafe { String::try_from_slice(&value).unwrap() };
+        unsafe {
+            (*map_ptr).insert(key, value);
+        }
+    }
+
+    #[test]
+    fn visit_string_map() {
+        let test_map: HashMap<String, String> = HashMap::from([
+            ("A".into(), "B".into()),
+            ("C".into(), "D".into()),
+            ("E".into(), "F".into()),
+            ("G".into(), "H".into()),
+        ]);
+        let cmap: super::CStringMap = test_map.clone().into();
+        let context_map: Box<HashMap<String, String>> = Box::default();
+        let map_ptr: *mut HashMap<String, String> = Box::into_raw(context_map);
+        unsafe {
+            let ptr = NonNull::new_unchecked(map_ptr.cast());
+            super::visit_string_map(&cmap, Some(ptr), visit_entry);
+        }
+        let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
+        assert_eq!(test_map, final_map);
+    }
 }

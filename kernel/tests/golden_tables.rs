@@ -10,7 +10,7 @@ use delta_kernel::arrow::array::{Array, AsArray, StructArray};
 use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
-use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
+use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -168,21 +168,11 @@ async fn latest_snapshot_test(
     url: Url,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder(url).build(&engine)?;
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
+        .map(|result| -> DeltaResult<_> { to_arrow(result?) })
         .try_collect()?;
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
@@ -271,12 +261,9 @@ async fn canonicalized_paths_test(
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // assert latest version is 1 and there are no files in the snapshot (add is removed)
-    let snapshot = Snapshot::builder(table_root).build(&engine).unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.version(), 1);
-    let scan = snapshot
-        .into_scan_builder()
-        .build()
-        .expect("build the scan");
+    let scan = snapshot.scan_builder().build().expect("build the scan");
     let mut scan_metadata = scan.scan_metadata(&engine).expect("scan metadata");
     assert!(scan_metadata.next().is_none());
     Ok(())
@@ -287,12 +274,9 @@ async fn checkpoint_test(
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder(table_root).build(&engine).unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let version = snapshot.version();
-    let scan = snapshot
-        .into_scan_builder()
-        .build()
-        .expect("build the scan");
+    let scan = snapshot.scan_builder().build().expect("build the scan");
     let scan_metadata: Vec<_> = scan
         .scan_metadata(&engine)
         .expect("scan metadata")

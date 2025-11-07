@@ -37,6 +37,8 @@ pub use domain_metadata::get_domain_metadata;
 pub mod engine_data;
 pub mod engine_funcs;
 pub mod error;
+#[cfg(feature = "default-engine-base")]
+pub mod table_changes;
 use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod expressions;
 #[cfg(feature = "tracing")]
@@ -128,6 +130,23 @@ impl KernelStringSlice {
         Self {
             ptr: source.as_ptr().cast(),
             len: source.len(),
+        }
+    }
+}
+
+/// FFI-safe implementation for Rust's `Option<T>`
+#[derive(PartialEq, Debug)]
+#[repr(C)]
+pub enum OptionalValue<T> {
+    Some(T),
+    None,
+}
+
+impl<T> From<Option<T>> for OptionalValue<T> {
+    fn from(item: Option<T>) -> Self {
+        match item {
+            Some(value) => OptionalValue::Some(value),
+            None => OptionalValue::None,
         }
     }
 }
@@ -602,7 +621,7 @@ fn snapshot_impl(
     extern_engine: &dyn ExternEngine,
     version: Option<Version>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
-    let builder = Snapshot::builder(url?);
+    let builder = Snapshot::builder_for(url?);
     let builder = if let Some(v) = version {
         // TODO: should we include a `with_version_opt` method for the builder?
         builder.at_version(v)
@@ -610,7 +629,7 @@ fn snapshot_impl(
         builder
     };
     let snapshot = builder.build(extern_engine.engine().as_ref())?;
-    Ok(Arc::new(snapshot).into())
+    Ok(snapshot.into())
 }
 
 /// # Safety
@@ -676,7 +695,11 @@ pub unsafe extern "C" fn snapshot_table_root(
 #[no_mangle]
 pub unsafe extern "C" fn get_partition_column_count(snapshot: Handle<SharedSnapshot>) -> usize {
     let snapshot = unsafe { snapshot.as_ref() };
-    snapshot.metadata().partition_columns().len()
+    snapshot
+        .table_configuration()
+        .metadata()
+        .partition_columns()
+        .len()
 }
 
 /// Get an iterator of the list of partition columns for this snapshot.
@@ -688,8 +711,14 @@ pub unsafe extern "C" fn get_partition_columns(
     snapshot: Handle<SharedSnapshot>,
 ) -> Handle<StringSliceIterator> {
     let snapshot = unsafe { snapshot.as_ref() };
-    let iter: Box<StringIter> =
-        Box::new(snapshot.metadata().partition_columns().clone().into_iter());
+    let iter: Box<StringIter> = Box::new(
+        snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns()
+            .clone()
+            .into_iter(),
+    );
     iter.into()
 }
 

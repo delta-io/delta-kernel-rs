@@ -98,7 +98,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         data: &ArrowEngineData,
         write_context: &WriteContext,
         partition_values: HashMap<String, String>,
-        data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
@@ -107,15 +106,10 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             input_schema.into(),
             transform.clone(),
             output_schema.clone().into(),
-        );
+        )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
         self.parquet
-            .write_parquet_file(
-                write_context.target_dir(),
-                physical_data,
-                partition_values,
-                data_change,
-            )
+            .write_parquet_file(write_context.target_dir(), physical_data, partition_values)
             .await
     }
 }

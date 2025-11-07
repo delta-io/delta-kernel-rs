@@ -21,6 +21,7 @@ use crate::engine::arrow_conversion::TryFromKernel as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -136,7 +137,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         let buffer = to_json_bytes(data)?;
@@ -251,7 +252,7 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
 
-    use crate::actions::get_log_schema;
+    use crate::actions::get_commit_schema;
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
@@ -487,7 +488,7 @@ mod tests {
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]);
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
 
         let batch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
@@ -502,7 +503,7 @@ mod tests {
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2, "maxRowId": 3}}}"#,
         ]);
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
 
         let batch: RecordBatch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
@@ -541,7 +542,7 @@ mod tests {
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_log_schema().clone(), None)
+            .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -553,7 +554,7 @@ mod tests {
         // limit batch size
         let handler = handler.with_batch_size(2);
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_log_schema().clone(), None)
+            .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -701,7 +702,7 @@ mod tests {
                 )),
             );
             let handler = handler.with_buffer_size(*buffer_size);
-            let physical_schema = Arc::new(Schema::new(vec![StructField::nullable(
+            let physical_schema = Arc::new(Schema::new_unchecked(vec![StructField::nullable(
                 "val",
                 DeltaDataType::INTEGER,
             )]));
@@ -774,7 +775,9 @@ mod tests {
 
         // First write with no existing file
         let data = create_test_data(vec!["remi", "wilson"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+        let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
+        let result =
+            handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
         // Verify the first write is successful
         assert!(result.is_ok());
@@ -783,7 +786,9 @@ mod tests {
 
         // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
-        let result = handler.write_json_file(&path, Box::new(std::iter::once(Ok(data))), overwrite);
+        let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
+        let result =
+            handler.write_json_file(&path, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
             // Verify the second write is successful

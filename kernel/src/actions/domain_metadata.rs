@@ -38,7 +38,7 @@ pub(crate) fn domain_metadata_configuration(
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
 /// is provided. Note that this returns the latest domain metadata for each domain, accounting for
 /// tombstones (removed=true) - that is, removed domain metadatas will _never_ be returned.
-fn scan_domain_metadatas(
+pub(crate) fn scan_domain_metadatas(
     log_segment: &LogSegment,
     domain: Option<&str>,
     engine: &dyn Engine,
@@ -73,7 +73,6 @@ fn replay_for_domain_metadatas(
     });
     log_segment.read_actions(
         engine,
-        schema.clone(), // Arc clone
         schema.clone(), // Arc clone
         META_PREDICATE.clone(),
     )

@@ -4,8 +4,11 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
+use crate::arrow::datatypes::{DataType, Field};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -20,7 +23,10 @@ use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{fixup_parquet_read, generate_mask, get_requested_indices};
+use crate::engine::arrow_utils::{
+    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
+    RowIndexBuilder,
+};
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
@@ -55,11 +61,14 @@ impl DataFileMetadata {
         }
     }
 
-    // convert DataFileMetadata into a record batch which matches the 'add_files_schema' schema
-    fn as_record_batch(
+    /// Convert DataFileMetadata into a record batch which matches the schema returned by
+    /// [`add_files_schema`].
+    ///
+    /// [`add_files_schema`]: crate::transaction::Transaction::add_files_schema
+    #[internal_api]
+    pub(crate) fn as_record_batch(
         &self,
         partition_values: &HashMap<String, String>,
-        data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let DataFileMetadata {
             file_meta:
@@ -70,8 +79,6 @@ impl DataFileMetadata {
                 },
             num_records,
         } = self;
-        let add_files_schema = crate::transaction::add_files_schema();
-
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
         let key_builder = StringBuilder::new();
@@ -93,20 +100,21 @@ impl DataFileMetadata {
             .try_into()
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
-        let data_change = Arc::new(BooleanArray::from(vec![data_change]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let num_records = Arc::new(Int64Array::from(vec![*num_records as i64]));
+        let stats = Arc::new(StructArray::try_new_with_length(
+            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
+            None,
+            1,
+        )?);
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(add_files_schema.as_ref().try_into_arrow()?),
-            vec![
-                path,
-                partitions,
-                size,
-                modification_time,
-                data_change,
-                num_records,
-            ],
+            Arc::new(
+                crate::transaction::BASE_ADD_FILES_SCHEMA
+                    .as_ref()
+                    .try_into_arrow()?,
+            ),
+            vec![path, partitions, size, modification_time, stats],
         )?)))
     }
 }
@@ -181,16 +189,18 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
     /// is a generated UUIDv4).
     ///
-    /// [add file metadata]: crate::transaction::add_files_schema
+    /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
+    /// use [`crate::transaction::Transaction::with_data_change`].
+    ///
+    /// [add file metadata]: crate::transaction::Transaction::add_files_schema
     pub async fn write_parquet_file(
         &self,
         path: &url::Url,
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
-        data_change: bool,
     ) -> DeltaResult<Box<dyn EngineData>> {
         let parquet_metadata = self.write_parquet(path, data).await?;
-        parquet_metadata.as_record_batch(&partition_values, data_change)
+        parquet_metadata.as_record_batch(&partition_values)
     }
 }
 
@@ -315,16 +325,24 @@ impl FileOpener for ParquetOpener {
                 builder = builder.with_projection(mask)
             }
 
+            // Only create RowIndexBuilder if row indexes are actually needed
+            let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
+                .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+
+            // Filter row groups and row indexes if a predicate is provided
             if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate);
+                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
             }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
             }
 
+            let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = builder.with_batch_size(batch_size).build()?;
 
-            let stream = stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering));
+            let stream = stream.map(move |rbr| {
+                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())
+            });
             Ok(stream.boxed())
         }))
     }
@@ -383,8 +401,13 @@ impl FileOpener for PresignedUrlOpener {
                 builder = builder.with_projection(mask)
             }
 
+            // Only create RowIndexBuilder if row indexes are actually needed
+            let mut row_indexes = ordering_needs_row_indexes(&requested_ordering)
+                .then(|| RowIndexBuilder::new(builder.metadata().row_groups()));
+
+            // Filter row groups and row indexes if a predicate is provided
             if let Some(ref predicate) = predicate {
-                builder = builder.with_row_group_filter(predicate);
+                builder = builder.with_row_group_filter(predicate, row_indexes.as_mut());
             }
             if let Some(limit) = limit {
                 builder = builder.with_limit(limit)
@@ -392,8 +415,11 @@ impl FileOpener for PresignedUrlOpener {
 
             let reader = builder.with_batch_size(batch_size).build()?;
 
+            let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
-            let stream = stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering));
+            let stream = stream.map(move |rbr| {
+                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())
+            });
             Ok(stream.boxed())
         }))
     }
@@ -477,14 +503,13 @@ mod tests {
         let file_metadata = FileMeta::new(location.clone(), last_modified, size);
         let data_file_metadata = DataFileMetadata::new(file_metadata, num_records);
         let partition_values = HashMap::from([("partition1".to_string(), "a".to_string())]);
-        let data_change = true;
         let actual = data_file_metadata
-            .as_record_batch(&partition_values, data_change)
+            .as_record_batch(&partition_values)
             .unwrap();
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::add_files_schema()
+            crate::transaction::BASE_ADD_FILES_SCHEMA
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),
@@ -502,6 +527,14 @@ mod tests {
         partition_values_builder.values().append_value("a");
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
+        let stats_struct = StructArray::try_new_with_length(
+            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![num_records as i64]))],
+            None,
+            1,
+        )
+        .unwrap();
+
         let expected = RecordBatch::try_new(
             schema,
             vec![
@@ -509,8 +542,7 @@ mod tests {
                 Arc::new(partition_values),
                 Arc::new(Int64Array::from(vec![size as i64])),
                 Arc::new(Int64Array::from(vec![last_modified])),
-                Arc::new(BooleanArray::from(vec![data_change])),
-                Arc::new(Int64Array::from(vec![num_records as i64])),
+                Arc::new(stats_struct),
             ],
         )
         .unwrap();

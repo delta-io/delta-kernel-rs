@@ -25,6 +25,16 @@ pub(crate) enum CdfScanFileType {
     Cdc,
 }
 
+impl CdfScanFileType {
+    pub(crate) fn get_cdf_string_value(&self) -> &str {
+        match self {
+            CdfScanFileType::Add => super::ADD_CHANGE_TYPE,
+            CdfScanFileType::Remove => super::REMOVE_CHANGE_TYPE,
+            CdfScanFileType::Cdc => "not-expected",
+        }
+    }
+}
+
 /// Represents all the metadata needed to read a Change Data Feed.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct CdfScanFile {
@@ -175,7 +185,7 @@ impl<T> RowVisitor for CdfScanFileVisitor<'_, T> {
 /// Get the schema that scan rows (from [`TableChanges::scan_metadata`]) will be returned with.
 pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
     static CDF_SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
-        let deletion_vector = StructType::new([
+        let deletion_vector = StructType::new_unchecked([
             StructField::nullable("storageType", DataType::STRING),
             StructField::nullable("pathOrInlineDv", DataType::STRING),
             StructField::nullable("offset", DataType::INTEGER),
@@ -184,24 +194,24 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
         ]);
         let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
         let file_constant_values =
-            StructType::new([StructField::nullable("partitionValues", partition_values)]);
+            StructType::new_unchecked([StructField::nullable("partitionValues", partition_values)]);
 
-        let add = StructType::new([
+        let add = StructType::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("deletionVector", deletion_vector.clone()),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
-        let remove = StructType::new([
+        let remove = StructType::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("deletionVector", deletion_vector),
             StructField::nullable("fileConstantValues", file_constant_values.clone()),
         ]);
-        let cdc = StructType::new([
+        let cdc = StructType::new_unchecked([
             StructField::nullable("path", DataType::STRING),
             StructField::nullable("fileConstantValues", file_constant_values),
         ]);
 
-        Arc::new(StructType::new([
+        Arc::new(StructType::new_unchecked([
             StructField::nullable("add", add),
             StructField::nullable("remove", remove),
             StructField::nullable("cdc", cdc),
@@ -212,7 +222,7 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
     CDF_SCAN_ROW_SCHEMA.clone()
 }
 
-/// Expression to convert an action with `log_schema` into one with
+/// Expression to convert an action with `commit_schema` into one with
 /// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanMetadata`].
 pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64) -> Expression {
     Expression::struct_from([
@@ -243,7 +253,7 @@ mod tests {
     use itertools::Itertools;
 
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};
-    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
@@ -259,7 +269,7 @@ mod tests {
         let mut mock_table = LocalMockTable::new();
 
         let dv_info = DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
             offset: Some(1),
             size_in_bytes: 36,
@@ -282,7 +292,7 @@ mod tests {
         };
 
         let rm_dv = DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
             offset: Some(1),
             size_in_bytes: 38,
@@ -329,7 +339,7 @@ mod tests {
         let log_segment =
             LogSegment::for_table_changes(engine.storage_handler().as_ref(), log_root, 0, None)
                 .unwrap();
-        let table_schema = StructType::new([
+        let table_schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);

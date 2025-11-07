@@ -182,7 +182,7 @@ impl Scalar {
                 // insert an entry for each child builder, even when we're inserting NULL.
                 let builder = builder_as!(array::StructBuilder);
                 require!(
-                    builder.num_fields() == stype.fields_len(),
+                    builder.num_fields() == stype.num_fields(),
                     Error::generic("Struct builder has wrong number of fields")
                 );
                 for _ in 0..num_rows {
@@ -238,23 +238,23 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator> {
-        Arc::new(DefaultExpressionEvaluator {
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+        Ok(Arc::new(DefaultExpressionEvaluator {
             input_schema: schema,
             expression,
             output_type,
-        })
+        }))
     }
 
     fn new_predicate_evaluator(
         &self,
         schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Arc<dyn PredicateEvaluator> {
-        Arc::new(DefaultPredicateEvaluator {
+    ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
+        Ok(Arc::new(DefaultPredicateEvaluator {
             input_schema: schema,
             predicate,
-        })
+        }))
     }
 
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is

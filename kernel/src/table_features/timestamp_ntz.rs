@@ -1,6 +1,6 @@
 //! Validation for TIMESTAMP_NTZ feature support
 
-use super::{ReaderFeature, WriterFeature};
+use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{PrimitiveType, Schema, SchemaTransform};
 use crate::utils::require;
@@ -14,9 +14,7 @@ pub(crate) fn validate_timestamp_ntz_feature_support(
     schema: &Schema,
     protocol: &Protocol,
 ) -> DeltaResult<()> {
-    if !protocol.has_reader_feature(&ReaderFeature::TimestampWithoutTimezone)
-        || !protocol.has_writer_feature(&WriterFeature::TimestampWithoutTimezone)
-    {
+    if !protocol.has_table_feature(&TableFeature::TimestampWithoutTimezone) {
         let mut uses_timestamp_ntz = UsesTimestampNtz(false);
         let _ = uses_timestamp_ntz.transform_struct(schema);
         require!(
@@ -46,17 +44,17 @@ mod tests {
     use super::*;
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
     fn test_timestamp_ntz_feature_validation() {
-        let schema_with_timestamp_ntz = StructType::new([
+        let schema_with_timestamp_ntz = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("ts", DataType::Primitive(PrimitiveType::TimestampNtz), true),
         ]);
 
-        let schema_without_timestamp_ntz = StructType::new([
+        let schema_without_timestamp_ntz = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new("name", DataType::STRING, true),
         ]);
@@ -65,8 +63,8 @@ mod tests {
         let protocol_with_features = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::TimestampWithoutTimezone]),
-            Some([WriterFeature::TimestampWithoutTimezone]),
+            Some([TableFeature::TimestampWithoutTimezone]),
+            Some([TableFeature::TimestampWithoutTimezone]),
         )
         .unwrap();
 
@@ -105,11 +103,11 @@ mod tests {
         assert_result_error_with_message(result, "Unsupported: Table contains TIMESTAMP_NTZ columns but does not have the required 'timestampNtz' feature in reader and writer features");
 
         // Nested schema with TIMESTAMP_NTZ
-        let nested_schema_with_timestamp_ntz = StructType::new([
+        let nested_schema_with_timestamp_ntz = StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, false),
             StructField::new(
                 "nested",
-                DataType::Struct(Box::new(StructType::new([StructField::new(
+                DataType::Struct(Box::new(StructType::new_unchecked([StructField::new(
                     "inner_ts",
                     DataType::Primitive(PrimitiveType::TimestampNtz),
                     true,

@@ -150,14 +150,14 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::Engine;
 
     #[test]
     fn test_file_size_histogram_schema() {
         let schema = FileSizeHistogram::to_schema();
-        let expected = StructType::new([
+        let expected = StructType::new_unchecked([
             StructField::not_null("sortedBinBoundaries", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("fileCounts", ArrayType::new(DataType::LONG, false)),
             StructField::not_null("totalBytes", ArrayType::new(DataType::LONG, false)),
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn test_deleted_record_counts_histogram_schema() {
         let schema = DeletedRecordCountsHistogram::to_schema();
-        let expected = StructType::new([StructField::not_null(
+        let expected = StructType::new_unchecked([StructField::not_null(
             "deletedRecordCounts",
             ArrayType::new(DataType::LONG, false),
         )]);
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn test_crc_schema() {
         let schema = Crc::to_schema();
-        let expected = StructType::new([
+        let expected = StructType::new_unchecked([
             StructField::nullable("txnId", DataType::STRING),
             StructField::not_null("tableSizeBytes", DataType::LONG),
             StructField::not_null("numFiles", DataType::LONG),
@@ -252,8 +252,8 @@ mod tests {
         let expected_protocol = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
-            reader_features: Some(vec![ReaderFeature::ColumnMapping]),
-            writer_features: Some(vec![WriterFeature::ColumnMapping]),
+            reader_features: Some(vec![TableFeature::ColumnMapping]),
+            writer_features: Some(vec![TableFeature::ColumnMapping]),
         };
         let expected_metadata = Metadata {
             id: "testId".to_string(),

@@ -49,7 +49,7 @@ void scan_row_callback(
   KernelStringSlice path,
   int64_t size,
   const Stats* stats,
-  const DvInfo* dv_info,
+  const CDvInfo* cdv_info,
   const Expression* transform,
   const CStringMap* partition_values)
 {
@@ -62,18 +62,25 @@ void scan_row_callback(
     print_diag(" [no stats])\n");
   }
   KernelStringSlice table_root_slice = { context->table_root, strlen(context->table_root) };
-  ExternResultKernelBoolSlice selection_vector_res =
-    selection_vector_from_dv(dv_info, context->engine, table_root_slice);
-  if (selection_vector_res.tag != OkKernelBoolSlice) {
-    printf("Could not get selection vector from kernel\n");
-    exit(-1);
-  }
-  KernelBoolSlice selection_vector = selection_vector_res.ok;
-  if (selection_vector.len > 0) {
-    print_diag("  Selection vector for this file:\n");
-    print_selection_vector("    ", &selection_vector);
+  KernelBoolSlice selection_vector;
+
+  if (cdv_info->has_vector) {
+    ExternResultKernelBoolSlice selection_vector_res =
+      selection_vector_from_dv(cdv_info->info, context->engine, table_root_slice);
+    if (selection_vector_res.tag != OkKernelBoolSlice) {
+      printf("Could not get selection vector from kernel\n");
+      exit(-1);
+    }
+    selection_vector = selection_vector_res.ok;
+    if (selection_vector.len > 0) {
+      print_diag("  Selection vector for this file:\n");
+      print_selection_vector("    ", &selection_vector);
+    } else {
+      print_diag("  No selection vector for this file\n");
+    }
   } else {
     print_diag("  No selection vector for this file\n");
+    selection_vector.len = 0;
   }
   context->partition_values = partition_values;
   print_partition_info(context, partition_values);

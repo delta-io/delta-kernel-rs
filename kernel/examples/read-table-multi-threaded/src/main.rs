@@ -7,7 +7,7 @@ use std::thread;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use common::{LocationArgs, ScanArgs};
+use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
@@ -94,12 +94,12 @@ struct ScanState {
 }
 
 fn try_main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder(url).build(&engine)?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
     let Some(scan) = common::get_scan(snapshot, &cli.scan_args)? else {
         return Ok(());
     };
@@ -113,7 +113,7 @@ fn try_main() -> DeltaResult<()> {
 
     if cli.metadata {
         let (scan_metadata_batches, scan_metadata_rows) = scan_metadata
-            .map(|res| res.unwrap().scan_files.data.len())
+            .map(|res| res.unwrap().scan_files.data().len())
             .fold((0, 0), |(batches, rows), len| (batches + 1, rows + len));
         println!("Scan metadata: {scan_metadata_batches} chunks, {scan_metadata_rows} files",);
         return Ok(());
