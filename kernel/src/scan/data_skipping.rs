@@ -137,7 +137,6 @@ impl DataSkippingFilter {
         let select_stats_evaluator = engine
             .evaluation_handler()
             .new_expression_evaluator(
-                // safety: kernel is very broken if we don't have the schema for Add actions
                 get_log_add_schema().clone(),
                 STATS_EXPR.clone(),
                 DataType::STRING,
