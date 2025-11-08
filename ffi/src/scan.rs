@@ -9,7 +9,7 @@ use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
@@ -50,15 +50,16 @@ pub struct EnginePredicate {
         extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
 }
 
-/// A schema projection that can be used for column pruning during scanning.
+/// A schema for columns to select from the snapshot.
 ///
-/// Similar to [`EnginePredicate`], this allows engines to specify which columns they want to read
-/// for projection pushdown. The engine provides a pointer to its native schema representation
+/// This allows engines to specify which columns they want to read for projection pushdown or to
+/// specify metadata columns. The engine provides a pointer to its native schema representation
 /// along with a visitor function. The kernel uses this to build a kernel [`Schema`] that specifies
-/// the projection.
-///
-/// **Design Decision**: Mirror the EnginePredicate pattern for consistency and safety.
-/// The visitor pattern ensures both engine and kernel retain ownership of their objects.
+/// the projection. Inside [`scan`] the kernel allocates visitor state, which becomes the second
+/// argument to the schema visitor invocation along with the engine-provided schema pointer. The
+/// visitor state is valid for the lifetime of the schema visitor invocation. Thanks to this
+/// double indirection, engine and kernel each retain ownership of their respective objects, with no
+/// need to coordinate memory lifetimes with the other.
 #[repr(C)]
 pub struct EngineSchema {
     pub schema: *mut c_void,
@@ -114,16 +115,16 @@ pub unsafe extern "C" fn scan(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     predicate: Option<&mut EnginePredicate>,
-    projection: Option<&mut EngineSchema>,
+    schema: Option<&mut EngineSchema>,
 ) -> ExternResult<Handle<SharedScan>> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
-    scan_impl(snapshot, predicate, projection).into_extern_result(&engine.as_ref())
+    scan_impl(snapshot, predicate, schema).into_extern_result(&engine.as_ref())
 }
 
 fn scan_impl(
     snapshot: SnapshotRef,
     predicate: Option<&mut EnginePredicate>,
-    projection: Option<&mut EngineSchema>,
+    schema: Option<&mut EngineSchema>,
 ) -> DeltaResult<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();
 
@@ -135,11 +136,15 @@ fn scan_impl(
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
 
-    if let Some(projection) = projection {
+    if let Some(schema) = schema {
         let mut visitor_state = KernelSchemaVisitorState::default();
-        let schema_id = (projection.visitor)(projection.schema, &mut visitor_state);
+        let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
         let schema = unwrap_kernel_schema(&mut visitor_state, schema_id);
-        debug!("Got projection schema: {:#?}", schema);
+        if schema.is_none() {
+            warn!("Passed a schema to scan, but visiting it did not produce a valid schema");
+        } else {
+            debug!("Got schema: {:#?}", schema);
+        }
         scan_builder = scan_builder.with_schema_opt(schema.map(Arc::new));
     }
 
