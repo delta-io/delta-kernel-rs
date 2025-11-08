@@ -571,7 +571,85 @@ mod tests {
                 )
             }) }
         };
+
+        ($type:ident, $state:ident, $name:expr, $arg1:expr, $nullable:tt) => {
+            paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
+                let arg1 = $arg1;
+                [<visit_field_ $type>](
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    arg1,
+                    $nullable,
+                    test_allocate_error,
+                )
+            }) }
+        };
+
+        ($type:ident, $state:ident, $name:expr, $arg1:expr, $arg2:expr, $nullable:tt) => {
+            paste::paste! { ok_or_panic(#[allow(unused_unsafe)] unsafe {
+                let arg1 = $arg1;
+                let arg2 = $arg2;
+                [<visit_field_ $type>](
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    arg1,
+                    arg2,
+                    $nullable,
+                    test_allocate_error,
+                )
+            }) }
+        };
     }
+
+    macro_rules! visit_array_field {
+        ($state:ident, $name:expr, $elem_field:expr, $nullable:tt) => {{
+            let ef = $elem_field;
+            ok_or_panic(unsafe {
+                visit_field_array(
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    ef,
+                    $nullable,
+                    test_allocate_error,
+                )
+            }) 
+        }};
+    }
+
+    macro_rules! visit_map_field {
+        ($state:ident, $name:expr, $key_field:expr, $val_field:expr, $nullable:tt) => {{
+            let kf = $key_field;
+            let vf = $val_field;
+            ok_or_panic(unsafe {
+                visit_field_map(
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    kf,
+                    vf,
+                    $nullable,
+                    test_allocate_error,
+                )
+            }) 
+        }};
+    }
+
+    macro_rules! visit_struct_field {
+        ($state:ident, $name:expr, $nullable:tt, $($fields:expr),* $(,)?) => {{
+            let fields = vec![$($fields),*];
+            let field_count = fields.len();
+            ok_or_panic(unsafe {
+                visit_field_struct(
+                    &mut $state,
+                    KernelStringSlice::new_unsafe($name),
+                    fields.as_ptr(),
+                    field_count,
+                    $nullable,
+                    test_allocate_error,
+                )
+            })
+        }};
+    }
+
 
     #[test]
     fn test_schema_all_types() {
@@ -610,80 +688,47 @@ mod tests {
         let col_date = visit_field!(date, state, "col_date", false);
         let col_timestamp = visit_field!(timestamp, state, "col_timestamp", false);
         let col_timestamp_ntz = visit_field!(timestamp_ntz, state, "col_timestamp_ntz", false);
-
-        let col_decimal = ok_or_panic(unsafe {
-            visit_field_decimal(
-                &mut state,
-                KernelStringSlice::new_unsafe("col_decimal"),
-                10,
-                2,
-                false,
-                test_allocate_error,
-            )
-        });
+        let col_decimal = visit_field!(decimal, state, "col_decimal", 10, 2, false);
 
         // Create array<string>
-        let string_element_field = visit_field!(string, state, "element", false);
-        let col_array = ok_or_panic(unsafe {
-            visit_field_array(
-                &mut state,
-                KernelStringSlice::new_unsafe("col_array"),
-                string_element_field,
-                false,
-                test_allocate_error,
-            )
-        });
+        let col_array = visit_array_field!(
+            state,
+            "col_array",
+            visit_field!(string, state, "element", false),
+            false
+        );
 
         // Create map<string, long>
-        let map_key_field = visit_field!(string, state, "key", false);
-        let map_value_field = visit_field!(long, state, "value", false);
-        let col_map = ok_or_panic(unsafe {
-            visit_field_map(
-                &mut state,
-                KernelStringSlice::new_unsafe("col_map"),
-                map_key_field,
-                map_value_field,
-                false,
-                test_allocate_error,
-            )
-        });
+        let col_map = visit_map_field!(
+            state,
+            "col_map",
+            visit_field!(string, state, "key", false),
+            visit_field!(long, state, "value", false),
+            false
+        );
 
         // Create struct<inner_name: string>
-        let struct_inner_field = visit_field!(string, state, "inner_name", false);
-        let col_struct = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("col_struct"),
-                &struct_inner_field,
-                1,
-                false,
-                test_allocate_error,
-            )
-        });
+        let col_struct = visit_struct_field!(
+            state,
+            "col_struct",
+            false,
+            visit_field!(string, state, "inner_name", false),
+        );
 
         // Create variant<metadata: binary, value: binary>
-        let variant_inner_field1 = visit_field!(binary, state, "metadata", false);
-        let variant_inner_field2 = visit_field!(binary, state, "value", false);
-        let variant_inner_fields = vec![variant_inner_field1, variant_inner_field2];
-        let variant_struct_type = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant"),
-                variant_inner_fields.as_ptr(),
-                2,
+        let col_variant = visit_field!(
+            variant,
+            state,
+            "col_variant",
+            visit_struct_field!(
+                state,
+                "variant",
                 false,
-                test_allocate_error,
-            )
-        });
-        let col_variant = ok_or_panic(unsafe {
-            visit_field_variant(
-                &mut state,
-                KernelStringSlice::new_unsafe("col_variant"),
-                variant_struct_type,
-                false,
-                test_allocate_error,
-            )
-        });
+                visit_field!(binary, state, "metadata", false),
+                visit_field!(binary, state, "value", false),
+            ),
+            false
+        );
 
         // Build the final schema
         let all_columns = vec![
