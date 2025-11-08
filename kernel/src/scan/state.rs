@@ -107,7 +107,7 @@ pub fn transform_to_logical(
                 physical_schema.clone(),
                 transform,
                 logical_schema.clone().into(), // TODO: expensive deep clone!
-            )
+            )?
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),
     }

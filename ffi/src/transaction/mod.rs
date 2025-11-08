@@ -241,7 +241,7 @@ mod tests {
         // writer must be closed to write footer
         let res = writer.close().unwrap();
 
-        create_file_metadata(file_path, res.num_rows, metadata_schema)
+        create_file_metadata(file_path, res.file_metadata().num_rows(), metadata_schema)
     }
 
     #[tokio::test]

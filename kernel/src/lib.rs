@@ -108,7 +108,7 @@ pub use log_path::LogPath;
 mod row_tracking;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
+#[cfg(any(feature = "arrow-55", feature = "arrow-56", feature = "arrow-57"))]
 pub use arrow_compat::*;
 
 pub mod kernel_predicates;
@@ -426,7 +426,7 @@ pub trait EvaluationHandler: AsAny {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator>;
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>>;
 
     /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
     /// batches with the given [`Schema`] to produce a column of boolean results.
@@ -443,7 +443,7 @@ pub trait EvaluationHandler: AsAny {
         &self,
         input_schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Arc<dyn PredicateEvaluator>;
+    ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
     /// `output_schema`.
@@ -474,7 +474,8 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.try_into_expr()?;
 
-        let eval = self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into());
+        let eval =
+            self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
         eval.evaluate(null_row.as_ref())
     }
 }

@@ -478,7 +478,7 @@ impl Scan {
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
             RESTORED_ADD_SCHEMA.clone(),
-        );
+        )?;
         let apply_transform = move |data: Box<dyn EngineData>| {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
         };
@@ -537,7 +537,7 @@ impl Scan {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone());
+        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -850,7 +850,8 @@ pub(crate) mod test_utils {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
-        );
+        )
+        .unwrap();
         let mut batch_count = 0;
         for res in iter {
             let scan_metadata = res.unwrap();

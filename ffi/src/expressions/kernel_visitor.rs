@@ -266,7 +266,6 @@ fn visit_expression_literal_string_impl(
 }
 
 // We need to get parse.expand working to be able to macro everything below, see issue #255
-
 #[no_mangle]
 pub extern "C" fn visit_expression_literal_int(
     state: &mut KernelExpressionVisitorState,

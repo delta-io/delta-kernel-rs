@@ -238,23 +238,23 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator> {
-        Arc::new(DefaultExpressionEvaluator {
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+        Ok(Arc::new(DefaultExpressionEvaluator {
             input_schema: schema,
             expression,
             output_type,
-        })
+        }))
     }
 
     fn new_predicate_evaluator(
         &self,
         schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Arc<dyn PredicateEvaluator> {
-        Arc::new(DefaultPredicateEvaluator {
+    ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
+        Ok(Arc::new(DefaultPredicateEvaluator {
             input_schema: schema,
             predicate,
-        })
+        }))
     }
 
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is
