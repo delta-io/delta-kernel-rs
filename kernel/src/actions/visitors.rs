@@ -1169,6 +1169,7 @@ mod tests {
                 expression.into(),
                 InCommitTimestampVisitor::schema().into(),
             )
+            .unwrap()
             .evaluate(batch.as_ref())
             .unwrap()
     }

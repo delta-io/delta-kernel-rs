@@ -53,7 +53,7 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> Self {
+    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -72,17 +72,17 @@ impl ScanLogReplayProcessor {
                 None
             }
         };
-        Self {
+        Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
             data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
                 SCAN_ROW_DATATYPE.clone(),
-            ),
+            )?,
             seen_file_keys: Default::default(),
             state_info,
-        }
+        })
     }
 }
 
@@ -382,8 +382,8 @@ pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
-) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(engine, state_info).process_actions_iter(action_iter)
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
+    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
 }
 
 #[cfg(test)]
@@ -477,7 +477,8 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
-        );
+        )
+        .unwrap();
         for res in iter {
             let scan_metadata = res.unwrap();
             assert!(
@@ -502,7 +503,8 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-        );
+        )
+        .unwrap();
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
@@ -579,7 +581,8 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-        );
+        )
+        .unwrap();
 
         for res in iter {
             let scan_metadata = res.unwrap();
