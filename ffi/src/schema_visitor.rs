@@ -602,7 +602,7 @@ mod tests {
     }
 
     macro_rules! visit_array_field {
-        ($state:ident, $name:expr, $elem_field:expr, $nullable:tt) => {{
+        ($state:ident, $name:expr, $nullable:tt, $elem_field:expr) => {{
             let ef = $elem_field;
             ok_or_panic(unsafe {
                 visit_field_array(
@@ -617,7 +617,7 @@ mod tests {
     }
 
     macro_rules! visit_map_field {
-        ($state:ident, $name:expr, $key_field:expr, $val_field:expr, $nullable:tt) => {{
+        ($state:ident, $name:expr, $nullable:tt, $key_field:expr, $val_field:expr) => {{
             let kf = $key_field;
             let vf = $val_field;
             ok_or_panic(unsafe {
@@ -647,6 +647,24 @@ mod tests {
                     test_allocate_error,
                 )
             })
+        }};
+    }
+
+    macro_rules! visit_variant_field {
+        ($state:ident, $name:expr, $nullable:tt) => {{
+            visit_field!(
+                variant,
+                $state,
+                $name,
+                visit_struct_field!(
+                    $state,
+                    "variant",
+                    false,
+                    visit_field!(binary, $state, "metadata", false),
+                    visit_field!(binary, $state, "value", false),
+                ),
+                false
+            )
         }};
     }
 
@@ -694,17 +712,17 @@ mod tests {
         let col_array = visit_array_field!(
             state,
             "col_array",
-            visit_field!(string, state, "element", false),
-            false
+            false,
+            visit_field!(string, state, "element", false)
         );
 
         // Create map<string, long>
         let col_map = visit_map_field!(
             state,
             "col_map",
+            false,
             visit_field!(string, state, "key", false),
-            visit_field!(long, state, "value", false),
-            false
+            visit_field!(long, state, "value", false)
         );
 
         // Create struct<inner_name: string>
@@ -716,17 +734,9 @@ mod tests {
         );
 
         // Create variant<metadata: binary, value: binary>
-        let col_variant = visit_field!(
-            variant,
+        let col_variant = visit_variant_field!(
             state,
             "col_variant",
-            visit_struct_field!(
-                state,
-                "variant",
-                false,
-                visit_field!(binary, state, "metadata", false),
-                visit_field!(binary, state, "value", false),
-            ),
             false
         );
 
@@ -884,272 +894,96 @@ mod tests {
         //   >>>
         // >
 
-        // Build from deepest level outward
 
-        // 6a: Complex key for final map: struct<coord: double>
-        let coord_double_field = ok_or_panic(unsafe {
-            visit_field_double(
-                &mut state,
-                KernelStringSlice::new_unsafe("coord"),
-                false,
-                test_allocate_error,
-            )
-        });
-        let coord_struct_field = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("key"),
-                &coord_double_field,
-                1,
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // 6b: double for final map values
-        let double_field = ok_or_panic(unsafe {
-            visit_field_double(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // 6: map<struct<coord: double>, double>
-        let final_map_field = ok_or_panic(unsafe {
-            visit_field_map(
-                &mut state,
-                KernelStringSlice::new_unsafe("final_map"),
-                coord_struct_field,
-                double_field,
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // 4c: struct<final_array: array<map<struct<coord: double>, double>>>
-        let final_array_field = ok_or_panic(unsafe {
-            visit_field_array(
-                &mut state,
-                KernelStringSlice::new_unsafe("final_array"),
-                final_map_field, // Pass the map type as the array element type
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // 4: Create the inner struct with all three complex fields
-
-        // 4a: deep_maps field - create key and value types fresh for this field
-        let variant_key_metadata_field = ok_or_panic(unsafe {
-            visit_field_binary(
-                &mut state,
-                KernelStringSlice::new_unsafe("metadata"),
-                false,
-                test_allocate_error,
-            )
-        });
-        let variant_key_value_field = ok_or_panic(unsafe {
-            visit_field_binary(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                false,
-                test_allocate_error,
-            )
-        });
-        let variant_key_fields = vec![variant_key_metadata_field, variant_key_value_field];
-        let variant_key_struct_field = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant"),
-                variant_key_fields.as_ptr(),
-                variant_key_fields.len(),
-                false,
-                test_allocate_error,
-            )
-        });
-        let variant_key_field = ok_or_panic(unsafe {
-            visit_field_variant(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant"),
-                variant_key_struct_field,
-                false,
-                test_allocate_error,
-            )
-        });
-
-        let decimal_field = ok_or_panic(unsafe {
-            visit_field_decimal(
-                &mut state,
-                KernelStringSlice::new_unsafe("element"),
-                10,
-                2,
+        let schema_id = visit_struct_field!(
+            state,
+            "top_struct",
+            false,
+            visit_array_field!( // nested field in struct is an array
+                state,
+                "col_nested",
                 true,
-                test_allocate_error,
+                visit_map_field!( // array element is a map
+                    state,
+                    "element",
+                    false,
+                    visit_struct_field!( // map key is a struct
+                        state,
+                        "key",
+                        false,
+                        visit_field!(long, state, "key_id", false),
+                    ),
+                    visit_struct_field!( // map value is a struct
+                        state,
+                        "value",
+                        true,
+                        visit_array_field!( // even more nested array
+                            state,
+                            "inner_arrays",
+                            false,
+                            visit_struct_field!( // inner array element is a struct
+                                state,
+                                "element",
+                                true,
+                                visit_map_field!( // struct field 1 is map
+                                    state,
+                                    "deep_maps",
+                                    true,
+                                    visit_variant_field!( // key is variant
+                                        state,
+                                        "key",
+                                        false
+                                    ),
+                                    visit_array_field!( // value is an array
+                                        state,
+                                        "value",
+                                        false,
+                                        visit_field!( // array element is decimal
+                                            decimal,
+                                            state,
+                                            "element",
+                                            10,
+                                            2,
+                                            true
+                                        )
+                                    )
+                                ),
+                                visit_variant_field!( // struct field 2 is variant
+                                    state,
+                                    "variant_data",
+                                    false
+                                ),
+                                visit_struct_field!( // struct field 3 is nested_struct
+                                    state,
+                                    "nested_struct",
+                                    true,
+                                    visit_array_field!(
+                                        state,
+                                        "final_array",
+                                        false,
+                                        visit_map_field!(
+                                            state,
+                                            "element",
+                                            false,
+                                            visit_struct_field!(
+                                                state,
+                                                "key",
+                                                false,
+                                                visit_field!(double, state, "coord", false),
+                                            ),
+                                            visit_field!(double, state, "value", false)
+                                        )
+                                    ),
+                                ),
+                            )
+                        )
+                    )
+                )
             )
-        });
-        let decimal_array_field = ok_or_panic(unsafe {
-            visit_field_array(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                decimal_field,
-                true,
-                test_allocate_error,
-            )
-        });
+        );
 
-        let deep_maps_field = ok_or_panic(unsafe {
-            visit_field_map(
-                &mut state,
-                KernelStringSlice::new_unsafe("deep_maps"),
-                variant_key_field,
-                decimal_array_field,
-                true,
-                test_allocate_error,
-            )
-        });
-        // 4b: Create fresh variant struct for variant_data field
-        let variant_data_metadata_field = ok_or_panic(unsafe {
-            visit_field_binary(
-                &mut state,
-                KernelStringSlice::new_unsafe("metadata"),
-                false,
-                test_allocate_error,
-            )
-        });
-        let variant_data_value_field = ok_or_panic(unsafe {
-            visit_field_binary(
-                &mut state,
-                KernelStringSlice::new_unsafe("value"),
-                false,
-                test_allocate_error,
-            )
-        });
-        let variant_data_fields = vec![variant_data_metadata_field, variant_data_value_field];
-        let variant_data_struct_field = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant"),
-                variant_data_fields.as_ptr(),
-                variant_data_fields.len(),
-                false,
-                test_allocate_error,
-            )
-        });
 
-        let variant_data_field = ok_or_panic(unsafe {
-            visit_field_variant(
-                &mut state,
-                KernelStringSlice::new_unsafe("variant_data"),
-                variant_data_struct_field,
-                false,
-                test_allocate_error,
-            )
-        });
-        let nested_struct_field = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("nested_struct"),
-                [final_array_field].as_ptr(),
-                1,
-                true,
-                test_allocate_error,
-            )
-        });
-
-        let inner_struct_fields = vec![deep_maps_field, variant_data_field, nested_struct_field];
-        let inner_struct_field = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("inner_struct"),
-                inner_struct_fields.as_ptr(),
-                inner_struct_fields.len(),
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // 2b: struct field for inner_arrays: array<struct<deep_maps: ..., variant_data: ..., nested_struct: ...>>
-        let inner_arrays_field = ok_or_panic(unsafe {
-            visit_field_array(
-                &mut state,
-                KernelStringSlice::new_unsafe("inner_arrays"),
-                inner_struct_field,
-                true,
-                test_allocate_error,
-            )
-        });
-        let middle_struct_field = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("middle_struct"),
-                &inner_arrays_field,
-                1,
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // 2a: Complex key for outer map: struct<key_id: long>
-        let key_id_field = ok_or_panic(unsafe {
-            visit_field_long(
-                &mut state,
-                KernelStringSlice::new_unsafe("key_id"),
-                false,
-                test_allocate_error,
-            )
-        });
-        let outer_map_key_field = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("key"),
-                &key_id_field,
-                1,
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // 2: map<struct<key_id: long>, struct<inner_arrays: ...>>
-        let outer_map_field = ok_or_panic(unsafe {
-            visit_field_map(
-                &mut state,
-                KernelStringSlice::new_unsafe("map"),
-                outer_map_key_field,
-                middle_struct_field,
-                true,
-                test_allocate_error,
-            )
-        });
-
-        // Final column: col_nested: array<map<struct<key_id: long>, struct<...>>>
-        let col_nested = ok_or_panic(unsafe {
-            visit_field_array(
-                &mut state,
-                KernelStringSlice::new_unsafe("col_nested"),
-                outer_map_field, // Pass the map type directly as the array element type
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // Build final schema
-        let schema_id = ok_or_panic(unsafe {
-            visit_field_struct(
-                &mut state,
-                KernelStringSlice::new_unsafe("schema"),
-                &col_nested,
-                1,
-                false,
-                test_allocate_error,
-            )
-        });
-
-        // Verify the deeply nested structure step by step
         let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
-
-        //println!("Got schema: {schema:#?}");
 
         let root_fields: Vec<_> = schema.fields().collect();
         assert_eq!(root_fields.len(), 1);
