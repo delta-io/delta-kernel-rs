@@ -23,6 +23,20 @@ struct ListMetricsIterator<I> {
     metrics_emitted: bool,
 }
 
+impl<I> ListMetricsIterator<I> {
+    fn emit_metrics_once(&mut self) {
+        if !self.metrics_emitted {
+            self.reporter.as_ref().inspect(|r| {
+                r.report(MetricEvent::StorageListCompleted {
+                    duration: self.start.elapsed(),
+                    num_files: self.count,
+                });
+            });
+            self.metrics_emitted = true;
+        }
+    }
+}
+
 impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator<I> {
     type Item = DeltaResult<FileMeta>;
 
@@ -35,18 +49,16 @@ impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator
                 Some(item)
             }
             None => {
-                if !self.metrics_emitted {
-                    self.reporter.as_ref().inspect(|r| {
-                        r.report(MetricEvent::StorageListCompleted {
-                            duration: self.start.elapsed(),
-                            num_files: self.count,
-                        });
-                    });
-                    self.metrics_emitted = true;
-                }
+                self.emit_metrics_once();
                 None
             }
         }
+    }
+}
+
+impl<I> Drop for ListMetricsIterator<I> {
+    fn drop(&mut self) {
+        self.emit_metrics_once();
     }
 }
 
@@ -58,6 +70,21 @@ struct ReadMetricsIterator<I> {
     num_files: u64,
     bytes_read: u64,
     metrics_emitted: bool,
+}
+
+impl<I> ReadMetricsIterator<I> {
+    fn emit_metrics_once(&mut self) {
+        if !self.metrics_emitted {
+            self.reporter.as_ref().inspect(|r| {
+                r.report(MetricEvent::StorageReadCompleted {
+                    duration: self.start.elapsed(),
+                    num_files: self.num_files,
+                    bytes_read: self.bytes_read,
+                });
+            });
+            self.metrics_emitted = true;
+        }
+    }
 }
 
 impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I> {
@@ -72,19 +99,16 @@ impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I>
                 Some(item)
             }
             None => {
-                if !self.metrics_emitted {
-                    self.reporter.as_ref().inspect(|r| {
-                        r.report(MetricEvent::StorageReadCompleted {
-                            duration: self.start.elapsed(),
-                            num_files: self.num_files,
-                            bytes_read: self.bytes_read,
-                        });
-                    });
-                    self.metrics_emitted = true;
-                }
+                self.emit_metrics_once();
                 None
             }
         }
+    }
+}
+
+impl<I> Drop for ReadMetricsIterator<I> {
+    fn drop(&mut self) {
+        self.emit_metrics_once();
     }
 }
 
