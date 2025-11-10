@@ -441,7 +441,7 @@ mod tests {
                     $nullable,
                     test_allocate_error,
                 )
-            }) 
+            })
         }};
     }
 
@@ -458,7 +458,7 @@ mod tests {
                     $nullable,
                     test_allocate_error,
                 )
-            }) 
+            })
         }};
     }
 
@@ -501,17 +501,38 @@ mod tests {
         let DataType::Array(array_type) = field.data_type() else {
             panic!("Expected array type");
         };
-        assert_eq!(array_type.element_type(), &element_type, "Mismatch on array element type");
-        assert_eq!(array_type.contains_null(), contains_null, "Mismatch on array element nullability");
+        assert_eq!(
+            array_type.element_type(),
+            &element_type,
+            "Mismatch on array element type"
+        );
+        assert_eq!(
+            array_type.contains_null(),
+            contains_null,
+            "Mismatch on array element nullability"
+        );
     }
 
-    fn assert_map(field: &StructField,  key_type: DataType, value_type: DataType, contains_null: bool) {
+    fn assert_map(
+        field: &StructField,
+        key_type: DataType,
+        value_type: DataType,
+        contains_null: bool,
+    ) {
         let DataType::Map(map_type) = field.data_type() else {
             panic!("Expected map type");
         };
         assert_eq!(map_type.key_type(), &key_type, "Mismatch on map key type");
-        assert_eq!(map_type.value_type(), &value_type, "Mismatch on map value type");
-        assert_eq!(map_type.value_contains_null(), contains_null, "Mismatch on map value nullability");
+        assert_eq!(
+            map_type.value_type(),
+            &value_type,
+            "Mismatch on map value type"
+        );
+        assert_eq!(
+            map_type.value_contains_null(),
+            contains_null,
+            "Mismatch on map value nullability"
+        );
     }
 
     fn assert_struct(field: &StructField, inner_type: DataType, inner_is_nullable: bool) {
@@ -521,7 +542,11 @@ mod tests {
         let inner_fields: Vec<_> = struct_type.fields().collect();
         assert_eq!(inner_fields.len(), 1);
         assert_eq!(inner_fields[0].name(), "inner");
-        assert_eq!(inner_fields[0].data_type(), &inner_type, "Mismatch on inner field type");
+        assert_eq!(
+            inner_fields[0].data_type(),
+            &inner_type,
+            "Mismatch on inner field type"
+        );
         assert_eq!(inner_fields[0].is_nullable(), inner_is_nullable);
     }
 
@@ -590,14 +615,10 @@ mod tests {
         );
 
         // Create variant<metadata: binary, value: binary>
-        let col_variant = visit_variant_field!(
-            state,
-            "col_variant",
-            false
-        );
+        let col_variant = visit_variant_field!(state, "col_variant", false);
 
         // Build the final schema
-        let all_columns = vec![
+        let all_columns = [
             col_string,
             col_long,
             col_int,
@@ -676,7 +697,6 @@ mod tests {
         assert_eq!(fields[15].name(), "col_struct");
         assert_struct(fields[15], DataType::STRING, false);
 
-
         assert_eq!(fields[16].name(), "col_variant");
         let DataType::Variant(variant_type) = fields[16].data_type() else {
             panic!("Expected variant type for col_variant");
@@ -718,66 +738,70 @@ mod tests {
         //   >>>
         // >
 
-
         let schema_id = visit_struct_field!(
             state,
             "top_struct",
             false,
-            visit_array_field!( // nested field in struct is an array
+            visit_array_field!(
+                // nested field in struct is an array
                 state,
                 "col_nested",
                 true,
-                visit_map_field!( // array element is a map
+                visit_map_field!(
+                    // array element is a map
                     state,
                     "element",
                     false,
-                    visit_struct_field!( // map key is a struct
+                    visit_struct_field!(
+                        // map key is a struct
                         state,
                         "key",
                         false,
                         visit_field!(long, state, "key_id", false),
                     ),
-                    visit_struct_field!( // map value is a struct
+                    visit_struct_field!(
+                        // map value is a struct
                         state,
                         "value",
                         true,
-                        visit_array_field!( // even more nested array
+                        visit_array_field!(
+                            // even more nested array
                             state,
                             "inner_arrays",
                             false,
-                            visit_struct_field!( // inner array element is a struct
+                            visit_struct_field!(
+                                // inner array element is a struct
                                 state,
                                 "element",
                                 true,
-                                visit_map_field!( // struct field 1 is map
+                                visit_map_field!(
+                                    // struct field 1 is map
                                     state,
                                     "deep_maps",
                                     true,
-                                    visit_variant_field!( // key is variant
-                                        state,
-                                        "key",
-                                        false
+                                    visit_variant_field!(
+                                        // key is variant
+                                        state, "key", false
                                     ),
-                                    visit_array_field!( // value is an array
+                                    visit_array_field!(
+                                        // value is an array
                                         state,
                                         "value",
                                         false,
-                                        visit_field!( // array element is decimal
-                                            decimal,
-                                            state,
-                                            "element",
-                                            10,
-                                            2,
-                                            true
+                                        visit_field!(
+                                            // array element is decimal
+                                            decimal, state, "element", 10, 2, true
                                         )
                                     )
                                 ),
-                                visit_variant_field!( // struct field 2 is variant
+                                visit_variant_field!(
+                                    // struct field 2 is variant
                                     state,
                                     "variant_data",
                                     false
                                 ),
-                                visit_struct_field!( // struct field 3 is nested_struct
+                                visit_struct_field!(
+                                    // struct field 3 is nested_struct
                                     state,
                                     "nested_struct",
                                     true,
@@ -986,21 +1010,20 @@ mod tests {
         let col_required_string = visit_field!(string, state, "col_required_string", false);
         let col_nullable_string = visit_field!(string, state, "col_nullable_string", true);
 
-
         // Nullable array with non-null elements: array<string> NULL (elements NOT NULL)
         let col_nullable_array_non_null_elements = visit_array_field!(
             state,
             "col_nullable_array_non_null_elements",
-            true, // array can be null
-            visit_field!(string, state, "element", false) // elements cannot be null
+            true,                                          // array can be null
+            visit_field!(string, state, "element", false)  // elements cannot be null
         );
 
         // Non-null array with nullable elements: array<string> NOT NULL (elements NULL)
         let col_non_null_array_nullable_elements = visit_array_field!(
             state,
             "col_non_null_array_nullable_elements",
-            false, // array not null
-            visit_field!(string, state, "element", true) // elements can be null
+            false,                                        // array not null
+            visit_field!(string, state, "element", true)  // elements can be null
         );
 
         // Nullable map with nullable values: map<string, integer> NULL (values NULL)
@@ -1024,7 +1047,7 @@ mod tests {
         let col_nullable_struct = visit_struct_field!(
             state,
             "col_nullable_struct",
-            true, // struct is nullable
+            true,                                        // struct is nullable
             visit_field!(string, state, "inner", false), // inner is not nullable
         );
 
@@ -1032,7 +1055,7 @@ mod tests {
         let col_non_null_struct_nullable_field = visit_struct_field!(
             state,
             "col_non_null_struct_nullable_field",
-            false, // struct not null
+            false,                                      // struct not null
             visit_field!(string, state, "inner", true), // inner is nullable
         );
 
@@ -1069,7 +1092,12 @@ mod tests {
 
         for (field, (name, nullability)) in fields.iter().zip(expected_names_and_nulls) {
             assert_eq!(field.name(), name);
-            assert_eq!(field.is_nullable(), nullability, "Nullablity didn't match for {}", field.name());
+            assert_eq!(
+                field.is_nullable(),
+                nullability,
+                "Nullablity didn't match for {}",
+                field.name()
+            );
         }
 
         assert_array(fields[2], DataType::STRING, false);
