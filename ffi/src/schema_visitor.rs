@@ -982,7 +982,6 @@ mod tests {
             )
         );
 
-
         let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
 
         let root_fields: Vec<_> = schema.fields().collect();
@@ -1142,236 +1141,163 @@ mod tests {
     }
 
     // // TODO: manndp review by hand (vibe-coded).
-    // #[test]
-    // fn test_nullability_combinations() {
-    //     let mut state = KernelSchemaVisitorState::default();
+    #[test]
+    fn test_nullability_combinations() {
+        let mut state = KernelSchemaVisitorState::default();
 
-    //     // Test all the tricky nullability cases:
-    //     // - Field-level nullability vs element/value-level nullability
-    //     // - Required fields vs nullable fields
-    //     // - Nullable collections with non-null elements
-    //     // - Non-null collections with nullable elements
-    //     // - Mixed nullability in nested structures
-    //     //
-    //     // Schema:
-    //     // struct<
-    //     //   col_required_string: string NOT NULL,
-    //     //   col_nullable_string: string NULL,
-    //     //   col_nullable_array_non_null_elements: array<string> NULL (elements NOT NULL),
-    //     //   col_non_null_array_nullable_elements: array<string> NOT NULL (elements NULL),
-    //     //   col_nullable_map_nullable_values: map<string, integer> NULL (values NULL),
-    //     //   col_non_null_map_non_null_values: map<string, integer> NOT NULL (values NOT NULL),
-    //     //   col_nullable_struct: struct<inner: string> NULL,
-    //     //   col_non_null_struct_nullable_field: struct<inner: string NULL> NOT NULL
-    //     // >
+        // Test all the tricky nullability cases:
+        // - Field-level nullability vs element/value-level nullability
+        // - Required fields vs nullable fields
+        // - Nullable collections with non-null elements
+        // - Non-null collections with nullable elements
+        // - Mixed nullability in nested structures
+        //
+        // Schema:
+        // struct<
+        //   col_required_string: string NOT NULL,
+        //   col_nullable_string: string NULL,
+        //   col_nullable_array_non_null_elements: array<string> NULL (elements NOT NULL),
+        //   col_non_null_array_nullable_elements: array<string> NOT NULL (elements NULL),
+        //   col_nullable_map_nullable_values: map<string, integer> NULL (values NULL),
+        //   col_non_null_map_non_null_values: map<string, integer> NOT NULL (values NOT NULL),
+        //   col_nullable_struct: struct<inner: string> NULL,
+        //   col_non_null_struct_nullable_field: struct<inner: string NULL> NOT NULL
+        // >
 
-    //     // Required string field
-    //     let col_required_string = ok_or_panic(unsafe {
-    //         visit_field_string(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_required_string"),
-    //             false,
-    //             test_allocate_error,
-    //         )
-    //     });
+        // Required string field
+        let col_required_string = visit_field!(string, state, "col_required_string", false);
+        let col_nullable_string = visit_field!(string, state, "col_nullable_string", true);
 
-    //     // Nullable string field
-    //     let col_nullable_string = ok_or_panic(unsafe {
-    //         visit_field_string(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_nullable_string"),
-    //             true,
-    //             test_allocate_error,
-    //         )
-    //     });
 
-    //     // Nullable array with non-null elements: array<string> NULL (elements NOT NULL)
-    //     let string_type_for_nullable_array =
-    //         ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
-    //     let col_nullable_array_non_null_elements = ok_or_panic(unsafe {
-    //         visit_field_array(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_nullable_array_non_null_elements"),
-    //             string_type_for_nullable_array,
-    //             false, // contains_null = false (elements NOT NULL)
-    //             true,  // field_nullable = true (array itself NULL)
-    //             test_allocate_error,
-    //         )
-    //     });
+        // Nullable array with non-null elements: array<string> NULL (elements NOT NULL)
+        let col_nullable_array_non_null_elements = visit_array_field!(
+            state,
+            "col_nullable_array_non_null_elements",
+            true, // array can be null
+            visit_field!(string, state, "element", false) // elements cannot be null
+        );
 
-    //     // Non-null array with nullable elements: array<string> NOT NULL (elements NULL)
-    //     let string_type_for_non_null_array =
-    //         ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
-    //     let col_non_null_array_nullable_elements = ok_or_panic(unsafe {
-    //         visit_field_array(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_non_null_array_nullable_elements"),
-    //             string_type_for_non_null_array,
-    //             true,  // contains_null = true (elements NULL)
-    //             false, // field_nullable = false (array itself NOT NULL)
-    //             test_allocate_error,
-    //         )
-    //     });
+        // Non-null array with nullable elements: array<string> NOT NULL (elements NULL)
+        let col_non_null_array_nullable_elements = visit_array_field!(
+            state,
+            "col_non_null_array_nullable_elements",
+            false, // array not null
+            visit_field!(string, state, "element", true) // elements can be null
+        );
 
-    //     // Nullable map with nullable values: map<string, integer> NULL (values NULL)
-    //     let string_key_type_nullable_map =
-    //         ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
-    //     let integer_value_type_nullable_map =
-    //         ok_or_panic(visit_data_type_integer(&mut state, test_allocate_error));
-    //     let col_nullable_map_nullable_values = ok_or_panic(unsafe {
-    //         visit_field_map(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_nullable_map_nullable_values"),
-    //             string_key_type_nullable_map,
-    //             integer_value_type_nullable_map,
-    //             true, // value_contains_null = true (values NULL)
-    //             true, // field_nullable = true (map itself NULL)
-    //             test_allocate_error,
-    //         )
-    //     });
+        // Nullable map with nullable values: map<string, integer> NULL (values NULL)
+        let col_nullable_map_nullable_values = visit_map_field!(
+            state,
+            "col_nullable_map_nullable_values",
+            true, // map can be null
+            visit_field!(string, state, "key", false),
+            visit_field!(integer, state, "value", true) // values can be null
+        );
 
-    //     // Non-null map with non-null values: map<string, integer> NOT NULL (values NOT NULL)
-    //     let string_key_type_non_null_map =
-    //         ok_or_panic(visit_data_type_string(&mut state, test_allocate_error));
-    //     let integer_value_type_non_null_map =
-    //         ok_or_panic(visit_data_type_integer(&mut state, test_allocate_error));
-    //     let col_non_null_map_non_null_values = ok_or_panic(unsafe {
-    //         visit_field_map(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_non_null_map_non_null_values"),
-    //             string_key_type_non_null_map,
-    //             integer_value_type_non_null_map,
-    //             false, // value_contains_null = false (values NOT NULL)
-    //             false, // field_nullable = false (map itself NOT NULL)
-    //             test_allocate_error,
-    //         )
-    //     });
+        // Non-null map with non-null values: map<string, integer> NOT NULL (values NOT NULL)
+        let col_non_null_map_non_null_values = visit_map_field!(
+            state,
+            "col_non_null_map_non_null_values",
+            false, // map cannot be null
+            visit_field!(string, state, "key", false),
+            visit_field!(integer, state, "value", false) // values cannot be null
+        );
 
-    //     // Nullable struct: struct<inner: string> NULL
-    //     let struct_inner_field_nullable_struct = ok_or_panic(unsafe {
-    //         visit_field_string(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("inner"),
-    //             false,
-    //             test_allocate_error,
-    //         )
-    //     });
-    //     let col_nullable_struct = ok_or_panic(unsafe {
-    //         visit_field_struct(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_nullable_struct"),
-    //             &struct_inner_field_nullable_struct,
-    //             1,
-    //             true, // field_nullable = true (struct itself NULL)
-    //             test_allocate_error,
-    //         )
-    //     });
+        let col_nullable_struct = visit_struct_field!(
+            state,
+            "col_nullable_struct",
+            true, // struct is nullable
+            visit_field!(string, state, "inner", false), // inner is not nullable
+        );
 
-    //     // Non-null struct with nullable field: struct<inner: string NULL> NOT NULL
-    //     let struct_nullable_inner_field = ok_or_panic(unsafe {
-    //         visit_field_string(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("inner"),
-    //             true, // inner field is nullable
-    //             test_allocate_error,
-    //         )
-    //     });
-    //     let col_non_null_struct_nullable_field = ok_or_panic(unsafe {
-    //         visit_field_struct(
-    //             &mut state,
-    //             KernelStringSlice::new_unsafe("col_non_null_struct_nullable_field"),
-    //             &struct_nullable_inner_field,
-    //             1,
-    //             false, // field_nullable = false (struct itself NOT NULL)
-    //             test_allocate_error,
-    //         )
-    //     });
+        // Non-null struct with nullable field: struct<inner: string NULL> NOT NULL
+        let col_non_null_struct_nullable_field = visit_struct_field!(
+            state,
+            "col_non_null_struct_nullable_field",
+            false, // struct not null
+            visit_field!(string, state, "inner", true), // inner is nullable
+        );
 
-    //     // Build final schema
-    //     let all_columns = vec![
-    //         col_required_string,
-    //         col_nullable_string,
-    //         col_nullable_array_non_null_elements,
-    //         col_non_null_array_nullable_elements,
-    //         col_nullable_map_nullable_values,
-    //         col_non_null_map_non_null_values,
-    //         col_nullable_struct,
-    //         col_non_null_struct_nullable_field,
-    //     ];
-    //     let schema_id = ok_or_panic(unsafe {
-    //         visit_data_type_struct(
-    //             &mut state,
-    //             all_columns.as_ptr(),
-    //             all_columns.len(),
-    //             test_allocate_error,
-    //         )
-    //     });
+        // Build final schema
+        let schema_id = visit_struct_field!(
+            state,
+            "top_struct",
+            false,
+            col_required_string,
+            col_nullable_string,
+            col_nullable_array_non_null_elements,
+            col_non_null_array_nullable_elements,
+            col_nullable_map_nullable_values,
+            col_non_null_map_non_null_values,
+            col_nullable_struct,
+            col_non_null_struct_nullable_field,
+        );
 
-    //     // Verify nullability settings
-    //     let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
-    //     let fields: Vec<_> = schema.fields().collect();
-    //     assert_eq!(fields.len(), 8);
+        // Verify nullability settings
+        let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
+        let fields: Vec<_> = schema.fields().collect();
+        assert_eq!(fields.len(), 8);
 
-    //     // Required string
-    //     assert_eq!(fields[0].name(), "col_required_string");
-    //     assert!(!fields[0].is_nullable());
+        // Required string
+        assert_eq!(fields[0].name(), "col_required_string");
+        assert!(!fields[0].is_nullable());
 
-    //     // Nullable string
-    //     assert_eq!(fields[1].name(), "col_nullable_string");
-    //     assert!(fields[1].is_nullable());
+        // Nullable string
+        assert_eq!(fields[1].name(), "col_nullable_string");
+        assert!(fields[1].is_nullable());
 
-    //     // Nullable array with non-null elements
-    //     assert_eq!(fields[2].name(), "col_nullable_array_non_null_elements");
-    //     assert!(fields[2].is_nullable()); // Array field itself is nullable
-    //     let DataType::Array(array_type_nullable_field) = fields[2].data_type() else {
-    //         panic!("Expected array type");
-    //     };
-    //     assert!(!array_type_nullable_field.contains_null()); // But elements are not nullable
+        // Nullable array with non-null elements
+        assert_eq!(fields[2].name(), "col_nullable_array_non_null_elements");
+        assert!(fields[2].is_nullable()); // Array field itself is nullable
+        let DataType::Array(array_type_nullable_field) = fields[2].data_type() else {
+            panic!("Expected array type");
+        };
+        assert!(!array_type_nullable_field.contains_null()); // But elements are not nullable
 
-    //     // Non-null array with nullable elements
-    //     assert_eq!(fields[3].name(), "col_non_null_array_nullable_elements");
-    //     assert!(!fields[3].is_nullable()); // Array field itself is not nullable
-    //     let DataType::Array(array_type_non_null_field) = fields[3].data_type() else {
-    //         panic!("Expected array type");
-    //     };
-    //     assert!(array_type_non_null_field.contains_null()); // But elements are nullable
+        // Non-null array with nullable elements
+        assert_eq!(fields[3].name(), "col_non_null_array_nullable_elements");
+        assert!(!fields[3].is_nullable()); // Array field itself is not nullable
+        let DataType::Array(array_type_non_null_field) = fields[3].data_type() else {
+            panic!("Expected array type");
+        };
+        assert!(array_type_non_null_field.contains_null()); // But elements are nullable
 
-    //     // Nullable map with nullable values
-    //     assert_eq!(fields[4].name(), "col_nullable_map_nullable_values");
-    //     assert!(fields[4].is_nullable()); // Map field itself is nullable
-    //     let DataType::Map(map_type_nullable_field) = fields[4].data_type() else {
-    //         panic!("Expected map type");
-    //     };
-    //     assert!(map_type_nullable_field.value_contains_null()); // Values are nullable
+        // Nullable map with nullable values
+        assert_eq!(fields[4].name(), "col_nullable_map_nullable_values");
+        assert!(fields[4].is_nullable()); // Map field itself is nullable
+        let DataType::Map(map_type_nullable_field) = fields[4].data_type() else {
+            panic!("Expected map type");
+        };
+        assert!(map_type_nullable_field.value_contains_null()); // Values are nullable
 
-    //     // Non-null map with non-null values
-    //     assert_eq!(fields[5].name(), "col_non_null_map_non_null_values");
-    //     assert!(!fields[5].is_nullable()); // Map field itself is not nullable
-    //     let DataType::Map(map_type_non_null_field) = fields[5].data_type() else {
-    //         panic!("Expected map type");
-    //     };
-    //     assert!(!map_type_non_null_field.value_contains_null()); // Values are not nullable
+        // Non-null map with non-null values
+        assert_eq!(fields[5].name(), "col_non_null_map_non_null_values");
+        assert!(!fields[5].is_nullable()); // Map field itself is not nullable
+        let DataType::Map(map_type_non_null_field) = fields[5].data_type() else {
+            panic!("Expected map type");
+        };
+        assert!(!map_type_non_null_field.value_contains_null()); // Values are not nullable
 
-    //     // Nullable struct
-    //     assert_eq!(fields[6].name(), "col_nullable_struct");
-    //     assert!(fields[6].is_nullable()); // Struct field itself is nullable
+        // Nullable struct
+        assert_eq!(fields[6].name(), "col_nullable_struct");
+        assert!(fields[6].is_nullable()); // Struct field itself is nullable
 
-    //     // Non-null struct with nullable inner field
-    //     assert_eq!(fields[7].name(), "col_non_null_struct_nullable_field");
-    //     assert!(!fields[7].is_nullable()); // Struct field itself is not nullable
-    //     let DataType::Struct(struct_type_non_null_field) = fields[7].data_type() else {
-    //         panic!("Expected struct type");
-    //     };
-    //     let inner_fields: Vec<_> = struct_type_non_null_field.fields().collect();
-    //     assert_eq!(inner_fields.len(), 1);
-    //     assert_eq!(inner_fields[0].name(), "inner");
-    //     assert!(inner_fields[0].is_nullable()); // But inner field is nullable
+        // Non-null struct with nullable inner field
+        assert_eq!(fields[7].name(), "col_non_null_struct_nullable_field");
+        assert!(!fields[7].is_nullable()); // Struct field itself is not nullable
+        let DataType::Struct(struct_type_non_null_field) = fields[7].data_type() else {
+            panic!("Expected struct type");
+        };
+        let inner_fields: Vec<_> = struct_type_non_null_field.fields().collect();
+        assert_eq!(inner_fields.len(), 1);
+        assert_eq!(inner_fields[0].name(), "inner");
+        assert!(inner_fields[0].is_nullable()); // But inner field is nullable
 
-    //     // Success! This proves that nullability works correctly at all levels:
-    //     // - Field-level nullability is independent of element/value nullability
-    //     // - Arrays can be nullable with non-null elements or vice versa
-    //     // - Maps can be nullable with non-null values or vice versa
-    //     // - Structs can be nullable with non-null fields or vice versa
-    //     // - Nullability propagates correctly through nested structures
-    // }
+        // Success! This proves that nullability works correctly at all levels:
+        // - Field-level nullability is independent of element/value nullability
+        // - Arrays can be nullable with non-null elements or vice versa
+        // - Maps can be nullable with non-null values or vice versa
+        // - Structs can be nullable with non-null fields or vice versa
+        // - Nullability propagates correctly through nested structures
+    }
 }
