@@ -668,6 +668,33 @@ mod tests {
         }};
     }
 
+    fn assert_array(field: &StructField, element_type: DataType, contains_null: bool) {
+        let DataType::Array(array_type) = field.data_type() else {
+            panic!("Expected array type");
+        };
+        assert_eq!(array_type.element_type(), &element_type, "Mismatch on array element type");
+        assert_eq!(array_type.contains_null(), contains_null, "Mismatch on array element nullability");
+    }
+
+    fn assert_map(field: &StructField,  key_type: DataType, value_type: DataType, contains_null: bool) {
+        let DataType::Map(map_type) = field.data_type() else {
+            panic!("Expected map type");
+        };
+        assert_eq!(map_type.key_type(), &key_type, "Mismatch on map key type");
+        assert_eq!(map_type.value_type(), &value_type, "Mismatch on map value type");
+        assert_eq!(map_type.value_contains_null(), contains_null, "Mismatch on map value nullability");
+    }
+
+    fn assert_struct(field: &StructField, inner_type: DataType, inner_is_nullable: bool) {
+        let DataType::Struct(struct_type) = field.data_type() else {
+            panic!("Expected struct type");
+        };
+        let inner_fields: Vec<_> = struct_type.fields().collect();
+        assert_eq!(inner_fields.len(), 1);
+        assert_eq!(inner_fields[0].name(), "inner");
+        assert_eq!(inner_fields[0].data_type(), &inner_type, "Mismatch on inner field type");
+        assert_eq!(inner_fields[0].is_nullable(), inner_is_nullable);
+    }
 
     #[test]
     fn test_schema_all_types() {
@@ -730,7 +757,7 @@ mod tests {
             state,
             "col_struct",
             false,
-            visit_field!(string, state, "inner_name", false),
+            visit_field!(string, state, "inner", false),
         );
 
         // Create variant<metadata: binary, value: binary>
@@ -803,7 +830,6 @@ mod tests {
             assert!(!fields[index].is_nullable());
         }
 
-        // Validate the decimal field
         assert_eq!(fields[12].name(), "col_decimal");
         let DataType::Primitive(PrimitiveType::Decimal(decimal_type)) = fields[12].data_type()
         else {
@@ -812,46 +838,16 @@ mod tests {
         assert_eq!(decimal_type.precision(), 10);
         assert_eq!(decimal_type.scale(), 2);
 
-        // Validate array field: array<string>
         assert_eq!(fields[13].name(), "col_array");
-        let DataType::Array(array_type) = fields[13].data_type() else {
-            panic!("Expected array type for col_array");
-        };
-        assert_eq!(
-            array_type.element_type(),
-            &DataType::Primitive(PrimitiveType::String)
-        );
-        assert!(!array_type.contains_null());
+        assert_array(fields[13], DataType::STRING, false);
 
-        // Validate map field: map<string, long>
         assert_eq!(fields[14].name(), "col_map");
-        let DataType::Map(map_type) = fields[14].data_type() else {
-            panic!("Expected map type for col_map");
-        };
-        assert_eq!(
-            map_type.key_type(),
-            &DataType::Primitive(PrimitiveType::String)
-        );
-        assert_eq!(
-            map_type.value_type(),
-            &DataType::Primitive(PrimitiveType::Long)
-        );
-        assert!(!map_type.value_contains_null());
+        assert_map(fields[14], DataType::STRING, DataType::LONG, false);
 
-        // Validate struct field: struct<inner_name: string>
         assert_eq!(fields[15].name(), "col_struct");
-        let DataType::Struct(struct_type) = fields[15].data_type() else {
-            panic!("Expected struct type for col_struct");
-        };
-        let struct_fields: Vec<_> = struct_type.fields().collect();
-        assert_eq!(struct_fields.len(), 1);
-        assert_eq!(struct_fields[0].name(), "inner_name");
-        assert_eq!(
-            struct_fields[0].data_type(),
-            &DataType::Primitive(PrimitiveType::String)
-        );
+        assert_struct(fields[15], DataType::STRING, false);
 
-        // Validate variant field: variant<metadata: string, value: string>
+
         assert_eq!(fields[16].name(), "col_variant");
         let DataType::Variant(variant_type) = fields[16].data_type() else {
             panic!("Expected variant type for col_variant");
@@ -870,7 +866,6 @@ mod tests {
         );
     }
 
-    // TODO: manndp review by hand (vibe-coded).
     #[test]
     fn test_deeply_nested_structures() {
         let mut state = KernelSchemaVisitorState::default();
@@ -1145,13 +1140,7 @@ mod tests {
     fn test_nullability_combinations() {
         let mut state = KernelSchemaVisitorState::default();
 
-        // Test all the tricky nullability cases:
-        // - Field-level nullability vs element/value-level nullability
-        // - Required fields vs nullable fields
-        // - Nullable collections with non-null elements
-        // - Non-null collections with nullable elements
-        // - Mixed nullability in nested structures
-        //
+        // Test more nullability cases:
         // Schema:
         // struct<
         //   col_required_string: string NOT NULL,
@@ -1238,66 +1227,29 @@ mod tests {
         let fields: Vec<_> = schema.fields().collect();
         assert_eq!(fields.len(), 8);
 
-        // Required string
-        assert_eq!(fields[0].name(), "col_required_string");
-        assert!(!fields[0].is_nullable());
+        let expected_names_and_nulls = [
+            ("col_required_string", false),
+            ("col_nullable_string", true),
+            ("col_nullable_array_non_null_elements", true),
+            ("col_non_null_array_nullable_elements", false),
+            ("col_nullable_map_nullable_values", true),
+            ("col_non_null_map_non_null_values", false),
+            ("col_nullable_struct", true),
+            ("col_non_null_struct_nullable_field", false),
+        ];
 
-        // Nullable string
-        assert_eq!(fields[1].name(), "col_nullable_string");
-        assert!(fields[1].is_nullable());
+        for (field, (name, nullability)) in fields.iter().zip(expected_names_and_nulls) {
+            assert_eq!(field.name(), name);
+            assert_eq!(field.is_nullable(), nullability, "Nullablity didn't match for {}", field.name());
+        }
 
-        // Nullable array with non-null elements
-        assert_eq!(fields[2].name(), "col_nullable_array_non_null_elements");
-        assert!(fields[2].is_nullable()); // Array field itself is nullable
-        let DataType::Array(array_type_nullable_field) = fields[2].data_type() else {
-            panic!("Expected array type");
-        };
-        assert!(!array_type_nullable_field.contains_null()); // But elements are not nullable
+        assert_array(fields[2], DataType::STRING, false);
+        assert_array(fields[3], DataType::STRING, true);
 
-        // Non-null array with nullable elements
-        assert_eq!(fields[3].name(), "col_non_null_array_nullable_elements");
-        assert!(!fields[3].is_nullable()); // Array field itself is not nullable
-        let DataType::Array(array_type_non_null_field) = fields[3].data_type() else {
-            panic!("Expected array type");
-        };
-        assert!(array_type_non_null_field.contains_null()); // But elements are nullable
+        assert_map(fields[4], DataType::STRING, DataType::INTEGER, true);
+        assert_map(fields[5], DataType::STRING, DataType::INTEGER, false);
 
-        // Nullable map with nullable values
-        assert_eq!(fields[4].name(), "col_nullable_map_nullable_values");
-        assert!(fields[4].is_nullable()); // Map field itself is nullable
-        let DataType::Map(map_type_nullable_field) = fields[4].data_type() else {
-            panic!("Expected map type");
-        };
-        assert!(map_type_nullable_field.value_contains_null()); // Values are nullable
-
-        // Non-null map with non-null values
-        assert_eq!(fields[5].name(), "col_non_null_map_non_null_values");
-        assert!(!fields[5].is_nullable()); // Map field itself is not nullable
-        let DataType::Map(map_type_non_null_field) = fields[5].data_type() else {
-            panic!("Expected map type");
-        };
-        assert!(!map_type_non_null_field.value_contains_null()); // Values are not nullable
-
-        // Nullable struct
-        assert_eq!(fields[6].name(), "col_nullable_struct");
-        assert!(fields[6].is_nullable()); // Struct field itself is nullable
-
-        // Non-null struct with nullable inner field
-        assert_eq!(fields[7].name(), "col_non_null_struct_nullable_field");
-        assert!(!fields[7].is_nullable()); // Struct field itself is not nullable
-        let DataType::Struct(struct_type_non_null_field) = fields[7].data_type() else {
-            panic!("Expected struct type");
-        };
-        let inner_fields: Vec<_> = struct_type_non_null_field.fields().collect();
-        assert_eq!(inner_fields.len(), 1);
-        assert_eq!(inner_fields[0].name(), "inner");
-        assert!(inner_fields[0].is_nullable()); // But inner field is nullable
-
-        // Success! This proves that nullability works correctly at all levels:
-        // - Field-level nullability is independent of element/value nullability
-        // - Arrays can be nullable with non-null elements or vice versa
-        // - Maps can be nullable with non-null values or vice versa
-        // - Structs can be nullable with non-null fields or vice versa
-        // - Nullability propagates correctly through nested structures
+        assert_struct(fields[6], DataType::STRING, false);
+        assert_struct(fields[7], DataType::STRING, true);
     }
 }
