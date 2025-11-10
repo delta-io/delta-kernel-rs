@@ -13,7 +13,7 @@ use crate::{AsAny, DeltaResult, Error};
 ///
 /// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
 /// while `false` means the row is logically deleted and should be ignored. If the selection vector is shorter
-/// then the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
+/// than the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
 ///
 /// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
@@ -196,6 +196,7 @@ pub trait GetData<'a> {
         (get_int, i32),
         (get_long, i64),
         (get_str, &'a str),
+        (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
@@ -217,6 +218,7 @@ impl<'a> GetData<'a> for () {
         (get_int, i32),
         (get_long, i64),
         (get_str, &'a str),
+        (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
         (get_map, MapItem<'a>)
     );
@@ -251,6 +253,7 @@ impl_typed_get_data!(
     (get_int, i32),
     (get_long, i64),
     (get_str, &'a str),
+    (get_binary, &'a [u8]),
     (get_list, ListItem<'a>),
     (get_map, MapItem<'a>)
 );
@@ -511,6 +514,80 @@ mod tests {
                 .contains("Selection vector is larger than data length"));
             assert!(e.to_string().contains("3 > 2"));
         }
+    }
+
+    #[test]
+
+    fn test_get_binary_some_value() {
+        use crate::arrow::array::BinaryArray;
+
+        // Use Arrow's BinaryArray implementation
+        let binary_data: Vec<Option<&[u8]>> = vec![Some(b"hello"), Some(b"world"), None];
+        let binary_array = BinaryArray::from(binary_data);
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &binary_array;
+
+        // Test getting first row
+        let result: Option<&[u8]> = getter.get_opt(0, "binary_field").unwrap();
+        assert_eq!(result, Some(b"hello".as_ref()));
+
+        // Test getting second row
+        let result: Option<&[u8]> = getter.get_opt(1, "binary_field").unwrap();
+        assert_eq!(result, Some(b"world".as_ref()));
+
+        // Test getting None value
+        let result: Option<&[u8]> = getter.get_opt(2, "binary_field").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_binary_required() {
+        use crate::arrow::array::BinaryArray;
+
+        let binary_data: Vec<Option<&[u8]>> = vec![Some(b"hello")];
+        let binary_array = BinaryArray::from(binary_data);
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &binary_array;
+
+        // Test using get() for required field
+        let result: &[u8] = getter.get(0, "binary_field").unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn test_get_binary_required_missing() {
+        use crate::arrow::array::BinaryArray;
+
+        let binary_data: Vec<Option<&[u8]>> = vec![None];
+        let binary_array = BinaryArray::from(binary_data);
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &binary_array;
+
+        // Test using get() for missing required field should error
+        let result: DeltaResult<&[u8]> = getter.get(0, "binary_field");
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("Data missing for field"));
+        }
+    }
+
+    #[test]
+    fn test_get_binary_empty_bytes() {
+        use crate::arrow::array::BinaryArray;
+
+        let binary_data: Vec<Option<&[u8]>> = vec![Some(b"")];
+        let binary_array = BinaryArray::from(binary_data);
+
+        // Cast to dyn GetData to use TypedGetData trait
+        let getter: &dyn GetData<'_> = &binary_array;
+
+        // Test getting empty bytes
+        let result: Option<&[u8]> = getter.get_opt(0, "binary_field").unwrap();
+        assert_eq!(result, Some([].as_ref()));
+        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[test]
