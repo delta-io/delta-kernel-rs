@@ -36,12 +36,6 @@ impl fmt::Display for MetricId {
 /// instance. This allows correlating multiple events from the same operation.
 #[derive(Debug, Clone)]
 pub enum MetricEvent {
-    /// A snapshot creation operation has started.
-    SnapshotStarted {
-        operation_id: MetricId,
-        table_path: String,
-    },
-
     /// Log segment loading completed (listing and organizing log files).
     LogSegmentLoaded {
         operation_id: MetricId,
@@ -89,14 +83,6 @@ pub enum MetricEvent {
 impl fmt::Display for MetricEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MetricEvent::SnapshotStarted {
-                operation_id,
-                table_path,
-            } => write!(
-                f,
-                "SnapshotStarted(id={}, table={})",
-                operation_id, table_path
-            ),
             MetricEvent::LogSegmentLoaded {
                 operation_id,
                 duration,
