@@ -552,6 +552,12 @@ mod tests {
     }
 
     #[test]
+    fn test_magic_number_constants() {
+        assert_eq!(ROARING_BITMAP_PORTABLE_MAGIC, 1681511377);
+        assert_eq!(ROARING_BITMAP_NATIVE_MAGIC, 1681511376);
+    }
+
+    #[test]
     fn test_inline_read() {
         let inline = dv_inline();
         let sync_engine = SyncEngine::new();
