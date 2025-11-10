@@ -1,25 +1,26 @@
 //! The `KernelSchemaVisitor` defines a visitor system to allow engines to build kernel-native
 //! representations of schemas for projection pushdown during scans.
 //!
-//! The model is ID based. When the engine wants to create a schema element, it calls the appropriate
-//! visitor function which constructs the analogous kernel schema element and returns an `id` (`usize`).
-//! That ID is passed to other visitor functions to reference that element when building complex types.
+//! Building a schema requires creating elements in dependency order. Referenced elements must be
+//! constructed before the elements that reference them. In other words, children must be created
+//! before parents.
 //!
-//! Every schema element belongs to one of two categories:
-//!     1. **Fields** are created by `visit_schema_*` functions and represent named schema columns.
-//!     2. **DataTypes** are created by `visit_*_type` functions and represent type information for use
-//!         as array elements, map keys/values, or struct field types.
-//! **Complex types** (arrays, maps, structs) reference other elements by their IDs
-//! The final schema is built by combining field IDs of the top-level fields, and is represented
-//! as a DataType::Struct.
+//! The model is ID based. When the engine wants to create a schema element (a [`StructField`] in
+//! kernel terms) it calls the appropriate visitor function which constructs the analogous kernel
+//! schema field and returns an `id` (`usize`) that identifies the field. That ID can be passed to
+//! other visitor functions to reference that element when building complex types.
 //!
-//! Note: Schemas are structs but can also contain struct fields. Use `visit_struct_type` for both the root
-//! schema and anonymous struct types, and `visit_field_struct` for named struct fields.
+//! The final schema is built by visiting a struct field combining the field IDs of the top-level
+//! fields.
 //!
-//! IDs are consumed when used. Each element takes ownership of its referenced child elements.
+//! Note: Schemas are structs but can also contain struct fields. Use `visit_field_struct` for both
+//! the root schema and for named struct fields. The name of the root struct is ignored and can be
+//! anything.
 //!
-//! Building a schema requires creating elements in dependency order. Referenced elements must be constructed
-//! before the elements that reference them. In other words, children must be created before parents.
+//! IDs are consumed when used. Each element takes ownership of its referenced child
+//! elements. Trying to pass an ID more than once to a complex field visitor will result in an
+//! error.
+//!
 
 use crate::{
     AllocateErrorFn, ExternResult, IntoExternResult, KernelStringSlice, ReferenceSet,
@@ -167,8 +168,9 @@ fn visit_field_decimal_impl(
 
 /// Visit a struct field. Struct fields contain nested fields organized as ordered key-value pairs.
 ///
-/// Note: This creates a named struct field (e.g. `address: struct<street, city>`), different from the
-/// `visit_data_type_struct` which creates anonymous struct DataTypes.
+/// Note: This creates a named struct field (e.g. `address: struct<street, city>`). This function
+/// should _also_ be used to create the final schema element, where the field IDs of the top-level
+/// fields should be passed as `field_ids`. The name for the final schema element is ignored.
 ///
 /// The `field_ids` array must contain IDs from previous `visit_field_*` field creation calls.
 ///
@@ -223,7 +225,8 @@ fn visit_field_struct_impl(
 
 /// Visit an array field. Array fields store ordered sequences of elements of the same type.
 ///
-/// The `element_type_id` must reference a DataType created by a previous `visit_data_type_*` call.
+/// The `element_type_id` must reference a field created by a previous `visit_field_*`. Elements of
+/// the array can be null if and only if the field referenced by `element_type_id` is nullable.
 ///
 /// # Safety
 ///
@@ -260,9 +263,12 @@ fn visit_field_array_impl(
     Ok(wrap_field(state, field))
 }
 
-/// Visit a map field. Map fields store key-value pairs where all keys have the same type and all values have the same type.
+/// Visit a map field. Map fields store key-value pairs where all keys have the same type and all
+/// values have the same type.
 ///
-/// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `visit_data_type_*` calls.
+/// Both `key_type_id` and `value_type_id` must reference fields created by previous `visit_field_*`
+/// calls. The map can contain null values if and only if the field referenced by `value_type_id` is
+/// nullable.
 ///
 /// # Safety
 ///
@@ -306,8 +312,10 @@ fn visit_field_map_impl(
     Ok(wrap_field(state, field))
 }
 
-/// Visit a variant field (for semi-structured data)
-/// Takes a struct type ID that defines the variant schema
+/// Visit a variant field.
+///
+/// Takes a struct type ID that defines the variant schema. This must reference a field created by
+/// previous `visit_field_struct` call.
 ///
 /// # Safety
 ///
@@ -354,185 +362,6 @@ fn create_variant_data_type(
     };
     Ok(DataType::Variant(variant_struct))
 }
-
-// // =============================================================================
-// // FFI Visitor Functions for data type creation - Primitive Types
-// // =============================================================================
-
-// /// Generic helper to create primitive types
-// fn visit_primitive_data_type_impl(
-//     state: &mut KernelSchemaVisitorState,
-//     primitive_type: PrimitiveType,
-// ) -> DeltaResult<usize> {
-//     let data_type = DataType::Primitive(primitive_type);
-//     Ok(wrap_data_type(state, data_type))
-// }
-
-// // Macro to generate primitive DataType visitor functions
-// macro_rules! generate_primitive_type_visitors {
-//     ($(($fn_name:ident, $primitive_type:expr, $doc:expr)),* $(,)?) => {
-//         $(
-//             #[doc = $doc]
-//             #[no_mangle]
-//             pub extern "C" fn $fn_name(
-//                 state: &mut KernelSchemaVisitorState,
-//                 allocate_error: AllocateErrorFn,
-//             ) -> ExternResult<usize> {
-//                 unsafe {
-//                     visit_primitive_data_type_impl(state, $primitive_type)
-//                         .into_extern_result(&allocate_error)
-//                 }
-//             }
-//         )*
-//     };
-// }
-
-// // Generate all primitive DataType visitor functions (except decimal which has different signature)
-// generate_primitive_type_visitors! {
-//     (visit_data_type_string, PrimitiveType::String, "Create a string DataType for text data in complex types."),
-//     (visit_data_type_long, PrimitiveType::Long, "Create a long DataType for 64-bit integers in complex types."),
-//     (visit_data_type_integer, PrimitiveType::Integer, "Create an integer DataType for 32-bit integers in complex types."),
-//     (visit_data_type_short, PrimitiveType::Short, "Create a short DataType for 16-bit integers in complex types."),
-//     (visit_data_type_byte, PrimitiveType::Byte, "Create a byte DataType for 8-bit integers in complex types."),
-//     (visit_data_type_float, PrimitiveType::Float, "Create a float DataType for 32-bit floating point numbers in complex types."),
-//     (visit_data_type_double, PrimitiveType::Double, "Create a double DataType for 64-bit floating point numbers in complex types."),
-//     (visit_data_type_boolean, PrimitiveType::Boolean, "Create a boolean DataType for true/false values in complex types."),
-//     (visit_data_type_binary, PrimitiveType::Binary, "Create a binary DataType for byte arrays in complex types."),
-//     (visit_data_type_date, PrimitiveType::Date, "Create a date DataType for calendar dates in complex types."),
-//     (visit_data_type_timestamp, PrimitiveType::Timestamp, "Create a timestamp DataType for timestamps with timezone in complex types."),
-//     (visit_data_type_timestamp_ntz, PrimitiveType::TimestampNtz, "Create a timestamp_ntz DataType for timestamps without timezone in complex types."),
-// }
-
-// // =============================================================================
-// // FFI Visitor Functions for data type creation - Complex Types
-// // =============================================================================
-
-// /// Visit a decimal DataType with specified precision and scale for use in complex types.
-// ///
-// /// # Safety
-// ///
-// /// Caller is responsible for providing a valid `state`, `precision` and `scale`,
-// /// and `allocate_error` function pointer.
-// #[no_mangle]
-// pub extern "C" fn visit_data_type_decimal(
-//     state: &mut KernelSchemaVisitorState,
-//     precision: u8,
-//     scale: u8,
-//     allocate_error: AllocateErrorFn,
-// ) -> ExternResult<usize> {
-//     unsafe {
-//         visit_data_type_decimal_impl(state, precision, scale).into_extern_result(&allocate_error)
-//     }
-// }
-
-// fn visit_data_type_decimal_impl(
-//     state: &mut KernelSchemaVisitorState,
-//     precision: u8,
-//     scale: u8,
-// ) -> DeltaResult<usize> {
-//     let decimal_type = DecimalType::try_new(precision, scale)
-//         .map_err(|e| Error::generic(format!("Invalid decimal type precision/scale: {}", e)))?;
-//     let data_type = DataType::Primitive(PrimitiveType::Decimal(decimal_type));
-//     Ok(wrap_data_type(state, data_type))
-// }
-
-// /// Create a struct DataType from field IDs for use in complex types.
-// /// This creates an anonymous struct type that can be used as array elements,
-// /// map values, or nested within other structs.
-// ///
-// /// Note: This is also the final step for building the root schema. Create all your
-// /// top-level fields with `visit_field_*` functions, then call this function with
-// /// those field IDs to build the root schema struct.
-// ///
-// /// # Safety
-// ///
-// /// Caller is responsible for providing valid `state`, `field_ids` array pointing
-// /// to valid field IDs previously returned by `visit_field_*` calls, and
-// /// `allocate_error` function pointer.
-// #[no_mangle]
-// pub unsafe extern "C" fn visit_data_type_struct(
-//     state: &mut KernelSchemaVisitorState,
-//     field_ids: *const usize,
-//     field_count: usize,
-//     allocate_error: AllocateErrorFn,
-// ) -> ExternResult<usize> {
-//     let field_slice = unsafe { std::slice::from_raw_parts(field_ids, field_count) };
-//     let result = create_struct_data_type(state, field_slice)
-//         .map(|data_type| wrap_data_type(state, data_type));
-//     result.into_extern_result(&allocate_error)
-// }
-
-// /// Create an array DataType for use in complex types.
-// /// This creates an anonymous array type that can be used as struct field types,
-// /// map values, or nested within other arrays.
-// ///
-// /// The `element_type_id` must reference a DataType created by a previous `visit_data_type_*` call.
-// ///
-// /// # Safety
-// ///
-// /// Caller is responsible for providing valid `state`, `element_type_id` from
-// /// previous `visit_data_type_*` call, and `allocate_error` function pointer.
-// #[no_mangle]
-// pub extern "C" fn visit_data_type_array(
-//     state: &mut KernelSchemaVisitorState,
-//     element_type_id: usize,
-//     contains_null: bool,
-//     allocate_error: AllocateErrorFn,
-// ) -> ExternResult<usize> {
-//     unsafe {
-//         let result = create_array_data_type(state, element_type_id, contains_null)
-//             .map(|data_type| wrap_data_type(state, data_type));
-//         result.into_extern_result(&allocate_error)
-//     }
-// }
-
-// /// Create a map DataType for use in complex types.
-// /// This creates an anonymous map type that can be used as struct field types,
-// /// array elements, or nested within other maps.
-// ///
-// /// Both `key_type_id` and `value_type_id` must reference DataTypes created by previous `visit_data_type_*` calls.
-// ///
-// /// # Safety
-// ///
-// /// Caller is responsible for providing valid `state`, `key_type_id` and `value_type_id`
-// /// from previous `visit_data_type_*` calls, and `allocate_error` function pointer.
-// #[no_mangle]
-// pub extern "C" fn visit_data_type_map(
-//     state: &mut KernelSchemaVisitorState,
-//     key_type_id: usize,
-//     value_type_id: usize,
-//     value_contains_null: bool,
-//     allocate_error: AllocateErrorFn,
-// ) -> ExternResult<usize> {
-//     unsafe {
-//         let result = create_map_data_type(state, key_type_id, value_type_id, value_contains_null)
-//             .map(|data_type| wrap_data_type(state, data_type));
-//         result.into_extern_result(&allocate_error)
-//     }
-// }
-
-// /// Create a variant DataType for use in complex types.
-// /// This creates an anonymous variant type that can be used as struct field types,
-// /// array elements, or map values.
-// ///
-// /// The `struct_type_id` must reference a struct DataType created by a previous `visit_data_type_struct` call.
-// ///
-// /// # Safety
-// ///
-// /// Caller is responsible for providing valid `state`, `struct_type_id` from
-// /// previous `visit_data_type_struct` call, and `allocate_error` function pointer.
-// #[no_mangle]
-// pub extern "C" fn visit_data_type_variant(
-//     state: &mut KernelSchemaVisitorState,
-//     struct_type_id: usize,
-//     allocate_error: AllocateErrorFn,
-// ) -> ExternResult<usize> {
-//     unsafe {
-//         let result = create_variant_data_type(state, struct_type_id)
-//             .map(|data_type| wrap_data_type(state, data_type));
-//         result.into_extern_result(&allocate_error)
-//     }
-// }
 
 #[cfg(test)]
 mod tests {
