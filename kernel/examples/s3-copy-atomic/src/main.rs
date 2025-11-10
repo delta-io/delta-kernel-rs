@@ -12,10 +12,6 @@ use object_store::ObjectStore;
 use url::Url;
 
 /// Integration test for copy_atomic with S3.
-///
-/// Tests atomic copy operations using different copy-if-not-exists strategies
-/// (multipart or header) against real S3 storage.
-///
 /// Requires AWS credentials set via AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
