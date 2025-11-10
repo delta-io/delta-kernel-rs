@@ -1,7 +1,7 @@
 //! Metric event types and utilities.
 
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Unique identifier for a metrics operation.
@@ -156,40 +156,5 @@ impl fmt::Display for MetricEvent {
                 duration
             ),
         }
-    }
-}
-
-/// A simple timer for tracking operation durations.
-///
-/// # Example
-/// ```
-/// use delta_kernel::metrics::Timer;
-///
-/// let timer = Timer::new();
-/// // ... do work ...
-/// let duration = timer.elapsed();
-/// ```
-#[derive(Debug)]
-pub struct Timer {
-    start: Instant,
-}
-
-impl Timer {
-    /// Create a new timer that starts immediately.
-    pub fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
-    }
-
-    /// Get the elapsed time as a Duration since this timer was created.
-    pub fn elapsed(&self) -> Duration {
-        self.start.elapsed()
-    }
-}
-
-impl Default for Timer {
-    fn default() -> Self {
-        Self::new()
     }
 }

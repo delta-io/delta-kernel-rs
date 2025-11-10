@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
@@ -10,14 +11,14 @@ use url::Url;
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::{MetricEvent, MetricsReporter, Timer};
+use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
 struct ListMetricsIterator<I> {
     inner: I,
     reporter: Option<Arc<dyn MetricsReporter>>,
-    timer: Timer,
+    start: Instant,
     count: u64,
     metrics_emitted: bool,
 }
@@ -37,7 +38,7 @@ impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator
                 if !self.metrics_emitted {
                     self.reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::StorageListCompleted {
-                            duration: self.timer.elapsed(),
+                            duration: self.start.elapsed(),
                             num_files: self.count,
                         });
                     });
@@ -53,7 +54,7 @@ impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator
 struct ReadMetricsIterator<I> {
     inner: I,
     reporter: Option<Arc<dyn MetricsReporter>>,
-    timer: Timer,
+    start: Instant,
     num_files: u64,
     bytes_read: u64,
     metrics_emitted: bool,
@@ -74,7 +75,7 @@ impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I>
                 if !self.metrics_emitted {
                     self.reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::StorageReadCompleted {
-                            duration: self.timer.elapsed(),
+                            duration: self.start.elapsed(),
                             num_files: self.num_files,
                             bytes_read: self.bytes_read,
                         });
@@ -187,7 +188,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             }
         });
 
-        let timer = Timer::new();
+        let start = Instant::now();
         let reporter = self.reporter.clone();
 
         if !has_ordered_listing {
@@ -198,7 +199,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             let num_files = fms.len() as u64;
             reporter.as_ref().inspect(|r| {
                 r.report(MetricEvent::StorageListCompleted {
-                    duration: timer.elapsed(),
+                    duration: start.elapsed(),
                     num_files,
                 });
             });
@@ -208,7 +209,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             Ok(Box::new(ListMetricsIterator {
                 inner: receiver.into_iter(),
                 reporter,
-                timer,
+                start,
                 count: 0,
                 metrics_emitted: false,
             }))
@@ -276,7 +277,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         Ok(Box::new(ReadMetricsIterator {
             inner: receiver.into_iter(),
             reporter: self.reporter.clone(),
-            timer: Timer::new(),
+            start: Instant::now(),
             num_files,
             bytes_read: 0,
             metrics_emitted: false,
@@ -284,7 +285,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
-        let timer = Timer::new();
+        let start = Instant::now();
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
         let dest_path_str = dest_path.to_string();
@@ -310,7 +311,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
         self.reporter.as_ref().inspect(|r| {
             r.report(MetricEvent::StorageCopyCompleted {
-                duration: timer.elapsed(),
+                duration: start.elapsed(),
             });
         });
 

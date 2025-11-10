@@ -1,7 +1,9 @@
 //! Builder for creating [`Snapshot`] instances.
+use std::time::Instant;
+
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
-use crate::metrics::{MetricEvent, MetricId, Timer};
+use crate::metrics::{MetricEvent, MetricId};
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
@@ -106,7 +108,7 @@ impl SnapshotBuilder {
         });
 
         if let Some(table_root) = self.table_root {
-            let timer = Timer::new();
+            let start = Instant::now();
             let log_segment_result = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
@@ -116,7 +118,7 @@ impl SnapshotBuilder {
 
             let log_segment = match log_segment_result {
                 Ok(seg) => {
-                    let duration = timer.elapsed();
+                    let duration = start.elapsed();
                     reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::LogSegmentLoaded {
                             operation_id,
@@ -132,7 +134,7 @@ impl SnapshotBuilder {
                     reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::SnapshotFailed {
                             operation_id,
-                            duration: timer.elapsed(),
+                            duration: start.elapsed(),
                         });
                     });
                     return Err(e);
@@ -153,7 +155,7 @@ impl SnapshotBuilder {
                 )
             })?;
 
-            let timer = Timer::new();
+            let start = Instant::now();
             let result = Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version);
 
             match result {
@@ -162,7 +164,7 @@ impl SnapshotBuilder {
                         r.report(MetricEvent::SnapshotCompleted {
                             operation_id,
                             version: snapshot.version(),
-                            total_duration: timer.elapsed(),
+                            total_duration: start.elapsed(),
                         });
                     });
                     Ok(snapshot)
@@ -171,7 +173,7 @@ impl SnapshotBuilder {
                     reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::SnapshotFailed {
                             operation_id,
-                            duration: timer.elapsed(),
+                            duration: start.elapsed(),
                         });
                     });
                     Err(e)
