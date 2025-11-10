@@ -98,9 +98,11 @@ impl SnapshotBuilder {
             })
             .unwrap_or_else(|| "unknown".to_string());
 
-        reporter.report(MetricEvent::SnapshotStarted {
-            operation_id,
-            table_path,
+        reporter.as_ref().inspect(|r| {
+            r.report(MetricEvent::SnapshotStarted {
+                operation_id,
+                table_path,
+            });
         });
 
         if let Some(table_root) = self.table_root {
@@ -115,19 +117,23 @@ impl SnapshotBuilder {
             let log_segment = match log_segment_result {
                 Ok(seg) => {
                     let duration = timer.elapsed();
-                    reporter.report(MetricEvent::LogSegmentLoaded {
-                        operation_id,
-                        duration,
-                        num_commit_files: seg.ascending_commit_files.len() as u64,
-                        num_checkpoint_files: seg.checkpoint_parts.len() as u64,
-                        num_compaction_files: seg.ascending_compaction_files.len() as u64,
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::LogSegmentLoaded {
+                            operation_id,
+                            duration,
+                            num_commit_files: seg.ascending_commit_files.len() as u64,
+                            num_checkpoint_files: seg.checkpoint_parts.len() as u64,
+                            num_compaction_files: seg.ascending_compaction_files.len() as u64,
+                        });
                     });
                     seg
                 }
                 Err(e) => {
-                    reporter.report(MetricEvent::SnapshotFailed {
-                        operation_id,
-                        duration: timer.elapsed(),
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::SnapshotFailed {
+                            operation_id,
+                            duration: timer.elapsed(),
+                        });
                     });
                     return Err(e);
                 }
@@ -152,17 +158,21 @@ impl SnapshotBuilder {
 
             match result {
                 Ok(snapshot) => {
-                    reporter.report(MetricEvent::SnapshotCompleted {
-                        operation_id,
-                        version: snapshot.version(),
-                        total_duration: timer.elapsed(),
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::SnapshotCompleted {
+                            operation_id,
+                            version: snapshot.version(),
+                            total_duration: timer.elapsed(),
+                        });
                     });
                     Ok(snapshot)
                 }
                 Err(e) => {
-                    reporter.report(MetricEvent::SnapshotFailed {
-                        operation_id,
-                        duration: timer.elapsed(),
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::SnapshotFailed {
+                            operation_id,
+                            duration: timer.elapsed(),
+                        });
                     });
                     Err(e)
                 }
