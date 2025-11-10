@@ -2,6 +2,7 @@
 //! has schema etc.)
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::domain_metadata_configuration;
@@ -11,7 +12,7 @@ use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
-use crate::metrics::{MetricEvent, MetricId, Timer};
+use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -266,7 +267,7 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let operation_id = operation_id.unwrap_or_default();
         let reporter = engine.get_metrics_reporter();
-        let timer = Timer::new();
+        let start = Instant::now();
 
         let result = {
             let (metadata, protocol) = log_segment.read_metadata(engine)?;
@@ -274,7 +275,7 @@ impl Snapshot {
             reporter.as_ref().inspect(|r| {
                 r.report(MetricEvent::ProtocolMetadataLoaded {
                     operation_id,
-                    duration: timer.elapsed(),
+                    duration: start.elapsed(),
                 });
             });
 
@@ -293,7 +294,7 @@ impl Snapshot {
                     r.report(MetricEvent::SnapshotCompleted {
                         operation_id,
                         version: snapshot.version(),
-                        total_duration: timer.elapsed(),
+                        total_duration: start.elapsed(),
                     });
                 });
                 Ok(snapshot)
@@ -302,7 +303,7 @@ impl Snapshot {
                 reporter.as_ref().inspect(|r| {
                     r.report(MetricEvent::SnapshotFailed {
                         operation_id,
-                        duration: timer.elapsed(),
+                        duration: start.elapsed(),
                     });
                 });
                 Err(e)
