@@ -89,24 +89,6 @@ impl SnapshotBuilder {
         let operation_id = MetricId::new();
         let reporter = engine.get_metrics_reporter();
 
-        let table_path = self
-            .table_root
-            .as_ref()
-            .map(|url| url.to_string())
-            .or_else(|| {
-                self.existing_snapshot
-                    .as_ref()
-                    .map(|s| s.table_root().to_string())
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-
-        reporter.as_ref().inspect(|r| {
-            r.report(MetricEvent::SnapshotStarted {
-                operation_id,
-                table_path,
-            });
-        });
-
         if let Some(table_root) = self.table_root {
             let start = Instant::now();
             let log_segment_result = LogSegment::for_snapshot(

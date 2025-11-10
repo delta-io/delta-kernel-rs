@@ -20,11 +20,8 @@
 //! impl MetricsReporter for LoggingReporter {
 //!     fn report(&self, event: MetricEvent) {
 //!         match event {
-//!             MetricEvent::SnapshotStarted { operation_id, table_path } => {
-//!                 println!("Snapshot started: {} for table {}", operation_id, table_path);
-//!             }
 //!             MetricEvent::LogSegmentLoaded { operation_id, duration, num_commit_files, .. } => {
-//!                 println!("  Log segment loaded in {:?}: {} commits", duration, num_commit_files);
+//!                 println!("Log segment loaded in {:?}: {} commits", duration, num_commit_files);
 //!             }
 //!             MetricEvent::SnapshotCompleted { operation_id, version, total_duration } => {
 //!                 println!("Snapshot completed: v{} in {:?}", version, total_duration);
