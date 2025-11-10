@@ -719,10 +719,10 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`metrics::MetricsReporter`] for metrics collection.
     ///
-    /// Returns a reporter that will receive metric events from Delta operations.
-    /// The default implementation returns a [`metrics::NullReporter`] (no metrics reporting).
-    fn get_metrics_reporter(&self) -> Arc<dyn crate::metrics::MetricsReporter> {
-        Arc::new(crate::metrics::NullReporter)
+    /// Returns an optional reporter that will receive metric events from Delta operations.
+    /// The default implementation returns None (no metrics reporting).
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn crate::metrics::MetricsReporter>> {
+        None
     }
 }
 

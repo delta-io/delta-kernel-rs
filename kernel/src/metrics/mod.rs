@@ -74,4 +74,4 @@ mod events;
 mod reporter;
 
 pub use events::{MetricEvent, MetricId, Timer};
-pub use reporter::{MetricsReporter, NullReporter};
+pub use reporter::MetricsReporter;

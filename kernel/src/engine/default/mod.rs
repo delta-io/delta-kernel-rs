@@ -41,7 +41,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
-    reporter: Arc<dyn crate::metrics::MetricsReporter>,
+    reporter: Option<Arc<dyn crate::metrics::MetricsReporter>>,
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
@@ -61,12 +61,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         K: AsRef<str>,
         V: Into<String>,
     {
-        Self::try_new_with_metrics(
-            table_root,
-            options,
-            task_executor,
-            Arc::new(crate::metrics::NullReporter),
-        )
+        Self::try_new_with_metrics(table_root, options, task_executor, None)
     }
 
     /// Create a new [`DefaultEngine`] instance with metrics reporting
@@ -76,13 +71,13 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// - `table_root`: The URL of the table within storage.
     /// - `options`: key/value pairs of options to pass to the object store.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    /// - `reporter`: Metrics reporter for tracking operation metrics.
+    /// - `reporter`: Optional metrics reporter for tracking operation metrics.
     #[internal_api]
     pub(crate) fn try_new_with_metrics<K, V>(
         table_root: &Url,
         options: impl IntoIterator<Item = (K, V)>,
         task_executor: Arc<E>,
-        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+        reporter: Option<Arc<dyn crate::metrics::MetricsReporter>>,
     ) -> DeltaResult<Self>
     where
         K: AsRef<str>,
@@ -104,11 +99,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// - `object_store`: The object store to use.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
     pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
-        Self::new_with_metrics(
-            object_store,
-            task_executor,
-            Arc::new(crate::metrics::NullReporter),
-        )
+        Self::new_with_metrics(object_store, task_executor, None)
     }
 
     /// Create a new [`DefaultEngine`] instance with metrics reporting
@@ -117,18 +108,18 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ///
     /// - `object_store`: The object store to use.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    /// - `reporter`: Metrics reporter for tracking operation metrics.
+    /// - `reporter`: Optional metrics reporter for tracking operation metrics.
     #[internal_api]
     pub(crate) fn new_with_metrics(
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
-        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+        reporter: Option<Arc<dyn crate::metrics::MetricsReporter>>,
     ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                Arc::clone(&reporter),
+                reporter.clone(),
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
@@ -186,8 +177,8 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
         self.parquet.clone()
     }
 
-    fn get_metrics_reporter(&self) -> Arc<dyn crate::metrics::MetricsReporter> {
-        Arc::clone(&self.reporter)
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn crate::metrics::MetricsReporter>> {
+        self.reporter.clone()
     }
 }
 
