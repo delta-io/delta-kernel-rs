@@ -1,18 +1,16 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::UrlExt;
+use crate::engine::default::executor::TaskExecutor;
+use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use object_store::path::Path;
-use object_store::{DynObjectStore, ObjectStore, PutMode};
+use object_store::{DynObjectStore, ObjectStore};
 use url::Url;
-
-use super::UrlExt;
-use crate::engine::default::executor::TaskExecutor;
-use crate::metrics::{MetricEvent, MetricsReporter};
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
 ///
@@ -333,10 +331,8 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         // necessarily atomic, but since the source file is immutable, we aren't exposed to the
         // possiblilty of source file changing while we do the PUT.
         let result = self.task_executor.block_on(async move {
-            let data = store.get(&src_path).await?.bytes().await?;
-
             store
-                .put_opts(&dest_path, data.into(), PutMode::Create.into())
+                .copy_if_not_exists(&src_path, &dest_path)
                 .await
                 .map_err(|e| match e {
                     object_store::Error::AlreadyExists { .. } => {
@@ -344,6 +340,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                     }
                     e => e.into(),
                 })?;
+
             Ok(())
         });
         let copy_atomic_duration = start.elapsed();
