@@ -228,8 +228,10 @@ impl DeletionVectorDescriptor {
                     .map_err(|_| Error::deletion_vector("Failed to decode DV"))?;
                 let magic = slice_to_u32(&byte_slice[0..4], Endian::Little)?;
                 match magic {
-                    ROARING_BITMAP_PORTABLE_MAGIC => RoaringTreemap::deserialize_from(&byte_slice[4..])
-                        .map_err(|err| Error::DeletionVector(err.to_string())),
+                    ROARING_BITMAP_PORTABLE_MAGIC => {
+                        RoaringTreemap::deserialize_from(&byte_slice[4..])
+                            .map_err(|err| Error::DeletionVector(err.to_string()))
+                    }
                     ROARING_BITMAP_NATIVE_MAGIC => Err(Error::deletion_vector(
                         "Native serialization in inline bitmaps is not yet supported",
                     )),
