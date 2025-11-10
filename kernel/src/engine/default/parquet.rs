@@ -24,15 +24,15 @@ use super::UrlExt;
 use crate::engine::arrow_conversion::TryIntoArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
-    filter_to_record_batch, fixup_parquet_read, generate_mask, get_requested_indices,
-    ordering_needs_row_indexes, RowIndexBuilder,
+    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
+    RowIndexBuilder,
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, FilteredEngineData,
-    ParquetHandler, PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
+    PredicateRef,
 };
 
 #[derive(Debug)]
@@ -245,7 +245,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         )
     }
 
-    /// Writes filtered engine data to a Parquet file at the specified location.
+    /// Writes engine data to a Parquet file at the specified location.
     ///
     /// This implementation uses asynchronous file I/O with object_store to write the Parquet file.
     /// If a file already exists at the given location, it will be overwritten.
@@ -254,7 +254,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
-    /// - `data` - The filtered engine data to write to the Parquet file.
+    /// - `data` - An iterator of engine data to write to the Parquet file.
     ///
     /// # Returns
     ///
@@ -262,18 +262,35 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: FilteredEngineData,
+        mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
     ) -> DeltaResult<FileMeta> {
-        let batch = filter_to_record_batch(data)?;
-
         let path = Path::from_url_path(location.path())?;
         let store = self.store.clone();
 
+        // Get first batch to initialize writer with schema
+        let first_batch = data.next().ok_or_else(|| {
+            Error::generic("Cannot write parquet file with empty data iterator")
+        })??;
+        let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
+        let first_record_batch: RecordBatch = (*first_arrow).into();
+
+        // Collect remaining batches
+        let mut batches = vec![first_record_batch];
+        for result in data {
+            let engine_data = result?;
+            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
+            let batch: RecordBatch = (*arrow_data).into();
+            batches.push(batch);
+        }
+
         self.task_executor.block_on(async move {
             let object_writer = ParquetObjectWriter::new(store, path);
-            let mut writer = AsyncArrowWriter::try_new(object_writer, batch.schema(), None)?;
+            let schema = batches[0].schema();
+            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
 
-            writer.write(&batch).await?;
+            for batch in &batches {
+                writer.write(batch).await?;
+            }
 
             writer.finish().await?;
 
@@ -703,13 +720,14 @@ mod tests {
             .unwrap(),
         ));
 
-        // Wrap in FilteredEngineData with all rows selected
-        let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
+        // Create iterator with single batch
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data)));
 
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data)
+            .write_parquet_file(file_url.clone(), data_iter)
             .unwrap();
 
         // Verify we can read the file back
@@ -771,13 +789,14 @@ mod tests {
             .unwrap(),
         ));
 
-        // Wrap in FilteredEngineData with all rows selected
-        let filtered_data = crate::FilteredEngineData::with_all_rows_selected(engine_data);
+        // Create iterator with single batch
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data)));
 
         // Write the data
         let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data)
+            .write_parquet_file(file_url.clone(), data_iter)
             .unwrap();
 
         // Read it back
@@ -854,11 +873,12 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let filtered_data1 = crate::FilteredEngineData::with_all_rows_selected(engine_data1);
+        let data_iter1: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data1)
+            .write_parquet_file(file_url.clone(), data_iter1)
             .unwrap();
 
         // Create second data set with different data
@@ -869,11 +889,12 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let filtered_data2 = crate::FilteredEngineData::with_all_rows_selected(engine_data2);
+        let data_iter2: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data2)));
 
         // Overwrite with second file (overwrite=true)
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data2)
+            .write_parquet_file(file_url.clone(), data_iter2)
             .unwrap();
 
         // Read back and verify it contains the second data set
@@ -931,11 +952,12 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let filtered_data1 = crate::FilteredEngineData::with_all_rows_selected(engine_data1);
+        let data_iter1: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data1)));
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data1)
+            .write_parquet_file(file_url.clone(), data_iter1)
             .unwrap();
 
         // Create second data set
@@ -946,11 +968,12 @@ mod tests {
             )])
             .unwrap(),
         ));
-        let filtered_data2 = crate::FilteredEngineData::with_all_rows_selected(engine_data2);
+        let data_iter2: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data2)));
 
         // Write again - should overwrite successfully (new behavior always overwrites)
         parquet_handler
-            .write_parquet_file(file_url.clone(), filtered_data2)
+            .write_parquet_file(file_url.clone(), data_iter2)
             .unwrap();
 
         // Verify the file was overwritten with the new data

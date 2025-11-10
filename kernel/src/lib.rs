@@ -701,7 +701,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `url` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
-    /// - `data` - The data to write to the Parquet file, as FilteredEngineData.
+    /// - `data` - An iterator of engine data to write to the Parquet file.
     ///
     /// # Returns
     ///
@@ -709,7 +709,7 @@ pub trait ParquetHandler: AsAny {
     fn write_parquet_file(
         &self,
         location: url::Url,
-        data: FilteredEngineData,
+        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
     ) -> DeltaResult<FileMeta>;
 }
 
