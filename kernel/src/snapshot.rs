@@ -268,7 +268,7 @@ impl Snapshot {
         let reporter = engine.get_metrics_reporter();
         let timer = Timer::new();
 
-        let result = (|| {
+        let result = {
             let (metadata, protocol) = log_segment.read_metadata(engine)?;
 
             reporter.as_ref().inspect(|r| {
@@ -285,7 +285,7 @@ impl Snapshot {
                 log_segment,
                 table_configuration,
             })
-        })();
+        };
 
         match result {
             Ok(snapshot) => {
