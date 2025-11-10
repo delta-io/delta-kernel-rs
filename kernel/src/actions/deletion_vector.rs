@@ -16,6 +16,16 @@ use crate::schema::DataType;
 use crate::utils::require;
 use crate::{DeltaResult, Error, StorageHandler};
 
+/// Magic number for portable RoaringBitmap serialization format.
+/// This is the standard format defined in the RoaringBitmap Specification
+/// and is used by Delta for deletion vector storage.
+/// See: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#deletion-vector-format
+const ROARING_BITMAP_PORTABLE_MAGIC: u32 = 1681511377;
+
+/// Magic number for native RoaringBitmap serialization format.
+/// This format is reserved for future use and not currently supported.
+const ROARING_BITMAP_NATIVE_MAGIC: u32 = 1681511376;
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum DeletionVectorStorageType {
@@ -218,9 +228,11 @@ impl DeletionVectorDescriptor {
                     .map_err(|_| Error::deletion_vector("Failed to decode DV"))?;
                 let magic = slice_to_u32(&byte_slice[0..4], Endian::Little)?;
                 match magic {
-                    1681511377 => RoaringTreemap::deserialize_from(&byte_slice[4..])
-                        .map_err(|err| Error::DeletionVector(err.to_string())),
-                    1681511376 => Err(Error::deletion_vector(
+                    ROARING_BITMAP_PORTABLE_MAGIC => {
+                        RoaringTreemap::deserialize_from(&byte_slice[4..])
+                            .map_err(|err| Error::DeletionVector(err.to_string()))
+                    }
+                    ROARING_BITMAP_NATIVE_MAGIC => Err(Error::deletion_vector(
                         "Native serialization in inline bitmaps is not yet supported",
                     )),
                     _ => Err(Error::DeletionVector(format!("Invalid magic {magic}"))),
@@ -302,7 +314,7 @@ impl DeletionVectorDescriptor {
                 );
                 let magic = read_u32(&mut cursor, Endian::Little)?;
                 require!(
-                    magic == 1681511377,
+                    magic == ROARING_BITMAP_PORTABLE_MAGIC,
                     Error::DeletionVector(format!("Invalid magic {magic} for {path}"))
                 );
 
@@ -537,6 +549,12 @@ mod tests {
             .unwrap();
         let example = dv_example();
         assert_eq!(dv_url, example.absolute_path(&parent).unwrap().unwrap());
+    }
+
+    #[test]
+    fn test_magic_number_constants() {
+        assert_eq!(ROARING_BITMAP_PORTABLE_MAGIC, 1681511377);
+        assert_eq!(ROARING_BITMAP_NATIVE_MAGIC, 1681511376);
     }
 
     #[test]
