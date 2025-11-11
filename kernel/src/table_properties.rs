@@ -93,6 +93,14 @@ pub struct TableProperties {
     /// ALTER TABLE CHANGE COLUMN or automatically if automatic schema evolution is enabled.
     pub enable_type_widening: Option<bool>,
 
+    /// Whether Iceberg compatibility V1 is enabled for this table. When enabled, Delta Lake
+    /// ensures compatibility with Apache Iceberg V1 table format.
+    pub enable_iceberg_compat_v1: Option<bool>,
+
+    /// Whether Iceberg compatibility V2 is enabled for this table. When enabled, Delta Lake
+    /// ensures compatibility with Apache Iceberg V2 table format.
+    pub enable_iceberg_compat_v2: Option<bool>,
+
     /// The degree to which a transaction must be isolated from modifications made by concurrent
     /// transactions.
     ///
@@ -252,6 +260,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_iceberg_compat_v1() {
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV1".to_string(),
+            "true".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v1, Some(true));
+
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV1".to_string(),
+            "false".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v1, Some(false));
+    }
+
+    #[test]
+    fn test_parse_iceberg_compat_v2() {
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV2".to_string(),
+            "true".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v2, Some(true));
+
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV2".to_string(),
+            "false".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v2, Some(false));
+    }
+
+    #[test]
     fn known_key_unknown_val() {
         let properties = HashMap::from([("delta.appendOnly".to_string(), "wack".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
@@ -299,6 +341,8 @@ mod tests {
             ("delta.enableChangeDataFeed", "true"),
             ("delta.enableDeletionVectors", "true"),
             ("delta.enableTypeWidening", "true"),
+            ("delta.enableIcebergCompatV1", "true"),
+            ("delta.enableIcebergCompatV2", "true"),
             ("delta.isolationLevel", "snapshotIsolation"),
             ("delta.logRetentionDuration", "interval 2 seconds"),
             ("delta.enableExpiredLogCleanup", "true"),
@@ -340,6 +384,8 @@ mod tests {
             enable_change_data_feed: Some(true),
             enable_deletion_vectors: Some(true),
             enable_type_widening: Some(true),
+            enable_iceberg_compat_v1: Some(true),
+            enable_iceberg_compat_v2: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
             enable_expired_log_cleanup: Some(true),
