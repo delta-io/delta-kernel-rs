@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+use crate::expressions::Scalar;
 use crate::schema::{DataType, StructType};
-use crate::statistics::{StatValue, StatsParsed};
+use crate::statistics::StatsParsed;
 use crate::{DeltaResult, Error};
 
 /// Convert JSON stats string to StatsParsed
@@ -41,7 +42,7 @@ pub fn parse_json_stats_to_parsed(
 fn parse_json_stat_values(
     values: &Value,
     table_schema: &StructType,
-) -> DeltaResult<HashMap<String, Option<StatValue>>> {
+) -> DeltaResult<HashMap<String, Option<Scalar>>> {
     let mut result = HashMap::new();
 
     if let Some(obj) = values.as_object() {
@@ -79,100 +80,100 @@ fn parse_json_null_counts(
 }
 
 /// Convert a JSON value to StatValue based on the expected data type
-fn json_value_to_stat_value(value: &Value, data_type: &DataType) -> DeltaResult<StatValue> {
+fn json_value_to_stat_value(value: &Value, data_type: &DataType) -> DeltaResult<Scalar> {
     use crate::schema::PrimitiveType;
 
     match (value, data_type) {
-        (Value::Bool(b), DataType::Primitive(PrimitiveType::Boolean)) => Ok(StatValue::Boolean(*b)),
+        (Value::Bool(b), DataType::Primitive(PrimitiveType::Boolean)) => Ok(Scalar::Boolean(*b)),
         (Value::Number(n), DataType::Primitive(PrimitiveType::Byte)) => {
             let v = n
                 .as_i64()
                 .ok_or_else(|| Error::generic("Invalid byte value"))?;
-            Ok(StatValue::Byte(v as i8))
+            Ok(Scalar::Byte(v as i8))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Short)) => {
             let v = n
                 .as_i64()
                 .ok_or_else(|| Error::generic("Invalid short value"))?;
-            Ok(StatValue::Short(v as i16))
+            Ok(Scalar::Short(v as i16))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Integer)) => {
             let v = n
                 .as_i64()
                 .ok_or_else(|| Error::generic("Invalid integer value"))?;
-            Ok(StatValue::Int(v as i32))
+            Ok(Scalar::Integer(v as i32))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Long)) => {
             let v = n
                 .as_i64()
                 .ok_or_else(|| Error::generic("Invalid long value"))?;
-            Ok(StatValue::Long(v))
+            Ok(Scalar::Long(v))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Float)) => {
             let v = n
                 .as_f64()
                 .ok_or_else(|| Error::generic("Invalid float value"))?;
-            Ok(StatValue::Float(v as f32))
+            Ok(Scalar::Float(v as f32))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Double)) => {
             let v = n
                 .as_f64()
                 .ok_or_else(|| Error::generic("Invalid double value"))?;
-            Ok(StatValue::Double(v))
+            Ok(Scalar::Double(v))
         }
         (Value::String(s), DataType::Primitive(PrimitiveType::String)) => {
-            Ok(StatValue::String(s.clone()))
+            Ok(Scalar::String(s.clone()))
         }
         (Value::String(s), DataType::Primitive(PrimitiveType::Binary)) => {
             // For now, treat binary as a string
             // TODO: Implement proper base64 encoding/decoding
-            Ok(StatValue::Binary(s.as_bytes().to_vec()))
+            Ok(Scalar::Binary(s.as_bytes().to_vec()))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Date)) => {
             let v = n
                 .as_i64()
                 .ok_or_else(|| Error::generic("Invalid date value"))?;
-            Ok(StatValue::Date(v as i32))
+            Ok(Scalar::Date(v as i32))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Timestamp)) => {
             let v = n
                 .as_i64()
                 .ok_or_else(|| Error::generic("Invalid timestamp value"))?;
-            Ok(StatValue::Timestamp(v))
+            Ok(Scalar::Timestamp(v))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::TimestampNtz)) => {
             let v = n
                 .as_i64()
                 .ok_or_else(|| Error::generic("Invalid timestamp_ntz value"))?;
-            Ok(StatValue::TimestampNtz(v))
+            Ok(Scalar::TimestampNtz(v))
         }
         (Value::String(s), DataType::Primitive(PrimitiveType::Date)) => {
             // Try to parse date string
             let days = s
                 .parse::<i32>()
                 .map_err(|_| Error::generic("Invalid date string"))?;
-            Ok(StatValue::Date(days))
+            Ok(Scalar::Date(days))
         }
         (Value::String(s), DataType::Primitive(PrimitiveType::Timestamp)) => {
             // Try to parse timestamp string
             let micros = s
                 .parse::<i64>()
                 .map_err(|_| Error::generic("Invalid timestamp string"))?;
-            Ok(StatValue::Timestamp(micros))
+            Ok(Scalar::Timestamp(micros))
         }
         (Value::String(s), DataType::Primitive(PrimitiveType::TimestampNtz)) => {
             // Try to parse timestamp string
             let micros = s
                 .parse::<i64>()
                 .map_err(|_| Error::generic("Invalid timestamp string"))?;
-            Ok(StatValue::TimestampNtz(micros))
+            Ok(Scalar::TimestampNtz(micros))
         }
         (Value::Number(n), DataType::Primitive(PrimitiveType::Decimal(_))) => {
             // For decimal, use the number as is (could be int or float)
             if let Some(v) = n.as_i64() {
-                Ok(StatValue::Long(v))
+                Ok(Scalar::Long(v))
             } else if let Some(v) = n.as_f64() {
-                Ok(StatValue::Double(v))
+                Ok(Scalar::Double(v))
             } else {
                 Err(Error::generic("Invalid decimal value"))
             }
@@ -239,24 +240,41 @@ pub fn serialize_stats_to_json(parsed: &StatsParsed) -> DeltaResult<String> {
 }
 
 /// Convert StatValue to JSON Value
-fn stat_value_to_json(value: &StatValue) -> Value {
+fn stat_value_to_json(value: &Scalar) -> Value {
     match value {
-        StatValue::Boolean(b) => json!(*b),
-        StatValue::Byte(v) => json!(*v),
-        StatValue::Short(v) => json!(*v),
-        StatValue::Int(v) => json!(*v),
-        StatValue::Long(v) => json!(*v),
-        StatValue::Float(v) => json!(*v),
-        StatValue::Double(v) => json!(*v),
-        StatValue::String(s) => json!(s),
-        StatValue::Binary(bytes) => {
+        Scalar::Boolean(b) => json!(*b),
+        Scalar::Byte(v) => json!(*v),
+        Scalar::Short(v) => json!(*v),
+        Scalar::Integer(v) => json!(*v),
+        Scalar::Long(v) => json!(*v),
+        Scalar::Float(v) => json!(*v),
+        Scalar::Double(v) => json!(*v),
+        Scalar::String(s) => json!(s),
+        Scalar::Binary(bytes) => {
             // For now, convert to string
             // TODO: Implement proper base64 encoding
             json!(String::from_utf8_lossy(bytes))
         }
-        StatValue::Date(days) => json!(*days),
-        StatValue::Timestamp(micros) => json!(*micros),
-        StatValue::TimestampNtz(micros) => json!(*micros),
+        Scalar::Date(days) => json!(*days),
+        Scalar::Timestamp(micros) => json!(*micros),
+        Scalar::TimestampNtz(micros) => json!(*micros),
+        Scalar::Decimal(decimal) => {
+            // Convert decimal to JSON number using bits
+            json!(decimal.bits())
+        }
+        Scalar::Null(_) => Value::Null,
+        Scalar::Struct(_) => {
+            // Struct stats are not supported in min/max values
+            Value::Null
+        }
+        Scalar::Array(_) => {
+            // Array stats are not supported in min/max values
+            Value::Null
+        }
+        Scalar::Map(_) => {
+            // Map stats are not supported in min/max values
+            Value::Null
+        }
     }
 }
 
@@ -284,14 +302,14 @@ mod tests {
         let parsed = parse_json_stats_to_parsed(json_stats, &table_schema).unwrap();
 
         assert_eq!(parsed.num_records, 100);
-        assert_eq!(parsed.min_values.get("id"), Some(&Some(StatValue::Int(1))));
+        assert_eq!(parsed.min_values.get("id"), Some(&Some(Scalar::Integer(1))));
         assert_eq!(
             parsed.min_values.get("name"),
-            Some(&Some(StatValue::String("Alice".to_string())))
+            Some(&Some(Scalar::String("Alice".to_string())))
         );
         assert_eq!(
             parsed.max_values.get("id"),
-            Some(&Some(StatValue::Int(100)))
+            Some(&Some(Scalar::Integer(100)))
         );
         assert_eq!(parsed.null_count.get("id"), Some(&0));
         assert_eq!(parsed.null_count.get("name"), Some(&5));
@@ -301,18 +319,15 @@ mod tests {
     #[test]
     fn test_parsed_to_json_conversion() {
         let mut min_values = HashMap::new();
-        min_values.insert("id".to_string(), Some(StatValue::Int(1)));
+        min_values.insert("id".to_string(), Some(Scalar::Integer(1)));
         min_values.insert(
             "name".to_string(),
-            Some(StatValue::String("Alice".to_string())),
+            Some(Scalar::String("Alice".to_string())),
         );
 
         let mut max_values = HashMap::new();
-        max_values.insert("id".to_string(), Some(StatValue::Int(100)));
-        max_values.insert(
-            "name".to_string(),
-            Some(StatValue::String("Zoe".to_string())),
-        );
+        max_values.insert("id".to_string(), Some(Scalar::Integer(100)));
+        max_values.insert("name".to_string(), Some(Scalar::String("Zoe".to_string())));
 
         let mut null_count = HashMap::new();
         null_count.insert("id".to_string(), 0);

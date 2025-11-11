@@ -164,22 +164,23 @@ pub(crate) mod test_utils {
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
 
-    #[derive(Serialize)]
-    pub(crate) enum Action {
-        #[serde(rename = "add")]
-        Add(Add),
-        #[serde(rename = "remove")]
-        Remove(Remove),
-        #[serde(rename = "cdc")]
-        Cdc(Cdc),
-        #[serde(rename = "metaData")]
-        Metadata(Metadata),
-        #[serde(rename = "protocol")]
-        Protocol(Protocol),
-        #[allow(unused)]
-        #[serde(rename = "commitInfo")]
-        CommitInfo(CommitInfo),
-    }
+    // TODO: Re-enable once we figure out Serialize/Deserialize with Scalar
+    // #[derive(Serialize)]
+    // pub(crate) enum Action {
+    //     #[serde(rename = "add")]
+    //     Add(Add),
+    //     #[serde(rename = "remove")]
+    //     Remove(Remove),
+    //     #[serde(rename = "cdc")]
+    //     Cdc(Cdc),
+    //     #[serde(rename = "metaData")]
+    //     Metadata(Metadata),
+    //     #[serde(rename = "protocol")]
+    //     Protocol(Protocol),
+    //     #[allow(unused)]
+    //     #[serde(rename = "commitInfo")]
+    //     CommitInfo(CommitInfo),
+    // }
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
     /// construct a delta log used for testing.
