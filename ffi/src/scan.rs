@@ -54,12 +54,13 @@ pub struct EnginePredicate {
 ///
 /// This allows engines to specify which columns they want to read for projection pushdown or to
 /// specify metadata columns. The engine provides a pointer to its native schema representation
-/// along with a visitor function. The kernel uses this to build a kernel [`Schema`] that specifies
-/// the projection. Inside [`scan`] the kernel allocates visitor state, which becomes the second
-/// argument to the schema visitor invocation along with the engine-provided schema pointer. The
-/// visitor state is valid for the lifetime of the schema visitor invocation. Thanks to this
-/// double indirection, engine and kernel each retain ownership of their respective objects, with no
-/// need to coordinate memory lifetimes with the other.
+/// along with a visitor function. The kernel uses this to build a kernel
+/// [`delta_kernel::schema::Schema`] that specifies the projection. Inside [`scan`] the kernel
+/// allocates visitor state, which becomes the second argument to the schema visitor invocation
+/// along with the engine-provided schema pointer. The visitor state is valid for the lifetime of
+/// the schema visitor invocation. Thanks to this double indirection, engine and kernel each retain
+/// ownership of their respective objects, with no need to coordinate memory lifetimes with the
+/// other.
 #[repr(C)]
 pub struct EngineSchema {
     pub schema: *mut c_void,
