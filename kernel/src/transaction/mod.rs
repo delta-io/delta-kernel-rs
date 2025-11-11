@@ -1050,7 +1050,7 @@ impl Transaction {
         let evaluation_handler = engine.evaluation_handler();
 
         // Create the transform expression once, since it only contains literals and column references
-        let transform = Expression::transform(
+        let mut transform = Expression::transform(
             Transform::new_top_level()
                 // deletionTimestamp
                 .with_inserted_field(
@@ -1088,6 +1088,12 @@ impl Transaction {
                 .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
                 .with_dropped_field("modificationTime"),
         );
+        // Drop any additional columns specified in columns_to_drop
+        for column_to_drop in columns_to_drop {
+            transform = transform.with_dropped_field(*column_to_drop);
+        }
+
+
         let expr = Arc::new(Expression::struct_from([transform]));
         let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
