@@ -384,9 +384,8 @@ mod tests {
 
         let data = Bytes::from("test-content");
         let file_path = Path::from_absolute_path(tmp.path().join("test.txt")).unwrap();
-        let before_write = current_time_duration().unwrap();
+        let write_time = current_time_duration().unwrap();
         store.put(&file_path, data.clone().into()).await.unwrap();
-        let after_write = current_time_duration().unwrap();
 
         let file_url = Url::from_file_path(tmp.path().join("test.txt")).unwrap();
         let file_meta = handler.head(&file_url).unwrap();
@@ -397,10 +396,9 @@ mod tests {
         // Verify timestamp is within the expected range
         let meta_time = Duration::from_millis(file_meta.last_modified as u64);
         assert!(
-            meta_time >= before_write && meta_time <= after_write + Duration::from_millis(100),
-            "last_modified timestamp should be between {} and {} ms, but was {} ms",
-            before_write.as_millis(),
-            (after_write + Duration::from_secs(1)).as_millis(),
+            meta_time.abs_diff(write_time) < Duration::from_millis(100),
+            "last_modified timestamp should be around {} ms, but was {} ms",
+            write_time.as_millis(),
             meta_time.as_millis()
         );
     }
