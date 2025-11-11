@@ -1030,10 +1030,7 @@ impl Transaction {
                 Some("path"),
                 Expression::literal(self.commit_timestamp).into(),
             )
-            .with_inserted_field(
-                Some("path"),
-                Expression::literal(self.data_change).into(),
-            )
+            .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
             .with_inserted_field(
                 // extended_file_metadata
                 Some("path"),
@@ -1054,11 +1051,8 @@ impl Transaction {
             )
             .with_inserted_field(
                 Some("deletionVector"),
-                Expression::column([
-                    FILE_CONSTANT_VALUES_NAME,
-                    DEFAULT_ROW_COMMIT_VERSION_NAME,
-                ])
-                .into(),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
+                    .into(),
             )
             .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
             .with_dropped_field("modificationTime");
