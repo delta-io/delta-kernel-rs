@@ -1,4 +1,3 @@
-use crate::SchemaTransform;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::iter;
@@ -30,7 +29,7 @@ use crate::snapshot::SnapshotRef;
 use crate::utils::current_time_ms;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version,
+    RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
 
@@ -708,9 +707,43 @@ impl Transaction {
     /// delete data (at file-level granularity) from the table. Note that this API can be called
     /// multiple times to remove multiple batches.
     ///
-    /// the expected schema for `remove_metadata` is given by [`scan_row_schema`] it, is expected
+    /// The expected schema for `remove_metadata` is given by [`scan_row_schema`]. It is expected
     /// this will be the result of passing [`FilteredEngineData`] returned from a scan
-    /// with rows modified for removal (selected rows in FilteredEngineData are the ones to be removed).
+    /// with the selection vector modified to select rows for removal (selected rows in the selection vector are the ones to be removed).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::Engine;
+    /// # use delta_kernel::snapshot::Snapshot;
+    /// # #[cfg(feature = "catalog-managed")]
+    /// # use delta_kernel::committer::FileSystemCommitter;
+    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
+    /// # #[cfg(feature = "catalog-managed")]
+    /// # {
+    /// // Create a snapshot and transaction
+    /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?;
+    ///
+    /// // Get file metadata from a scan
+    /// let scan = snapshot.scan_builder().build()?;
+    /// let scan_metadata = scan.scan_metadata(engine.as_ref())?;
+    ///
+    /// // Remove specific files based on scan metadata
+    /// for metadata in scan_metadata {
+    ///     let metadata = metadata?;
+    ///     // In practice, you would modify the selection vector to choose which files to remove
+    ///     let files_to_remove = metadata.scan_files;
+    ///     txn.remove_files(files_to_remove);
+    /// }
+    ///
+    /// // Commit the transaction
+    /// txn.commit(engine.as_ref())?;
+    /// # }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
         self.remove_files_metadata.push(remove_metadata);
     }
@@ -751,55 +784,57 @@ impl Transaction {
             .into_owned();
         let evaluation_handler = engine.evaluation_handler();
 
+        // Create the transform expression once, since it only contains literals and column references
+        let transform = Expression::transform(
+            Transform::new_top_level()
+                .with_inserted_field(
+                    Some("path"),
+                    Expression::literal(self.commit_timestamp).into(),
+                )
+                .with_inserted_field(
+                    Some("path"),
+                    Expression::literal(self.data_change).into(),
+                )
+                .with_inserted_field(
+                    // extended_file_metadata
+                    Some("path"),
+                    Expression::literal(true).into(),
+                )
+                .with_inserted_field(
+                    Some("path"),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"])
+                        .into(),
+                )
+                // tags
+                .with_inserted_field(
+                    Some("stats"),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
+                        .into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::column([
+                        FILE_CONSTANT_VALUES_NAME,
+                        DEFAULT_ROW_COMMIT_VERSION_NAME,
+                    ])
+                    .into(),
+                )
+                .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+                .with_dropped_field("modificationTime"),
+        );
+        let expr = Arc::new(Expression::struct_from([transform]));
+
         Ok(self
             .remove_files_metadata
             .iter()
             .map(move |file_metadata_batch| {
-                let transform = Expression::transform(
-                    Transform::new_top_level()
-                        .with_inserted_field(
-                            Some("path"),
-                            Expression::literal(self.commit_timestamp).into(),
-                        )
-                        .with_inserted_field(
-                            Some("path"),
-                            Expression::literal(self.data_change).into(),
-                        )
-                        .with_inserted_field(
-                            // extended_file_metadata
-                            Some("path"),
-                            Expression::literal(true).into(),
-                        )
-                        .with_inserted_field(
-                            Some("path"),
-                            Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"])
-                                .into(),
-                        )
-                        // tags
-                        .with_inserted_field(
-                            Some("stats"),
-                            Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-                        )
-                        .with_inserted_field(
-                            Some("deletionVector"),
-                            Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
-                                .into(),
-                        )
-                        .with_inserted_field(
-                            Some("deletionVector"),
-                            Expression::column([
-                                FILE_CONSTANT_VALUES_NAME,
-                                DEFAULT_ROW_COMMIT_VERSION_NAME,
-                            ])
-                            .into(),
-                        )
-                        .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-                        .with_dropped_field("modificationTime"),
-                );
-                let expr = Expression::struct_from([transform]);
                 let file_action_eval = evaluation_handler.new_expression_evaluator(
                     input_schema.clone(),
-                    Arc::new(expr),
+                    expr.clone(),
                     target_schema.clone().into(),
                 )?;
 
