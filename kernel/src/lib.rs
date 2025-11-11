@@ -96,6 +96,8 @@ mod log_path;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
+pub mod statistics;
+pub mod stats_schema;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;

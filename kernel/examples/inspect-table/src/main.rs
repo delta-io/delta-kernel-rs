@@ -120,7 +120,7 @@ impl RowVisitor for LogVisitor {
         let (cdc_start, cdc_end) = self.offsets[CDC_NAME];
         for i in 0..row_count {
             let action = if let Some(path) = getters[add_start].get_opt(i, "add.path")? {
-                let add = AddVisitor::visit_add(i, path, &getters[add_start..add_end])?;
+                let add = AddVisitor::visit_add(i, path, &getters[add_start..add_end], None)?;
                 Action::Add(add)
             } else if let Some(path) = getters[remove_start].get_opt(i, "remove.path")? {
                 let remove =

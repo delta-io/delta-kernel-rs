@@ -103,9 +103,10 @@ impl AddVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
+        table_schema: Option<&crate::schema::StructType>,
     ) -> DeltaResult<Add> {
         require!(
-            getters.len() == 15,
+            getters.len() >= 16,
             Error::InternalError(format!(
                 "Wrong number of AddVisitor getters: {}",
                 getters.len()
@@ -117,15 +118,31 @@ impl AddVisitor {
         let data_change: bool = getters[4].get(row_index, "add.dataChange")?;
         let stats: Option<String> = getters[5].get_opt(row_index, "add.stats")?;
 
-        // TODO(nick) extract tags if we ever need them at getters[6]
+        // stats_parsed is at getters[6] - we'll extract it below
+        // TODO(nick) extract tags if we ever need them at getters[7]
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[7..])?;
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
 
-        let base_row_id: Option<i64> = getters[12].get_opt(row_index, "add.base_row_id")?;
+        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "add.base_row_id")?;
         let default_row_commit_version: Option<i64> =
-            getters[13].get_opt(row_index, "add.default_row_commit")?;
+            getters[14].get_opt(row_index, "add.default_row_commit")?;
         let clustering_provider: Option<String> =
-            getters[14].get_opt(row_index, "add.clustering_provider")?;
+            getters[15].get_opt(row_index, "add.clustering_provider")?;
+
+        // Phase 3: Extract stats_parsed if available
+        // stats_parsed is at position 6 in the getters array
+        let stats_parsed = if getters.len() > 6 {
+            if let Some(schema) = table_schema {
+                // Try to parse stats_parsed from getter at position 6
+                super::stats_parsed_reader::parse_stats_parsed_from_getters(
+                    row_index, getters[6], schema,
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         Ok(Add {
             path,
@@ -134,6 +151,7 @@ impl AddVisitor {
             modification_time,
             data_change,
             stats,
+            stats_parsed,
             tags: None,
             deletion_vector,
             base_row_id,
@@ -156,7 +174,8 @@ impl RowVisitor for AddVisitor {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
-                self.adds.push(Self::visit_add(i, path, getters)?);
+                // TODO: Pass table schema when available for stats_parsed extraction
+                self.adds.push(Self::visit_add(i, path, getters, None)?);
             }
         }
         Ok(())
@@ -178,7 +197,7 @@ impl RemoveVisitor {
         getters: &[&'a dyn GetData<'a>],
     ) -> DeltaResult<Remove> {
         require!(
-            getters.len() == 15,
+            getters.len() == 16,
             Error::InternalError(format!(
                 "Wrong number of RemoveVisitor getters: {}",
                 getters.len()
@@ -195,13 +214,14 @@ impl RemoveVisitor {
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
         let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
-        // TODO(nick) tags are skipped in getters[7]
+        // stats_parsed is at getters[7] - we skip it for Remove
+        // TODO(nick) tags are skipped in getters[8]
 
-        let deletion_vector = visit_deletion_vector_at(row_index, &getters[8..])?;
+        let deletion_vector = visit_deletion_vector_at(row_index, &getters[9..])?;
 
-        let base_row_id: Option<i64> = getters[13].get_opt(row_index, "remove.baseRowId")?;
+        let base_row_id: Option<i64> = getters[14].get_opt(row_index, "remove.baseRowId")?;
         let default_row_commit_version: Option<i64> =
-            getters[14].get_opt(row_index, "remove.defaultRowCommitVersion")?;
+            getters[15].get_opt(row_index, "remove.defaultRowCommitVersion")?;
 
         Ok(Remove {
             path,
@@ -211,6 +231,7 @@ impl RemoveVisitor {
             partition_values,
             size,
             stats,
+            stats_parsed: None, // TODO: Implement stats_parsed extraction in Phase 3
             tags: None,
             deletion_vector,
             base_row_id,
