@@ -791,10 +791,7 @@ impl Transaction {
                     Some("path"),
                     Expression::literal(self.commit_timestamp).into(),
                 )
-                .with_inserted_field(
-                    Some("path"),
-                    Expression::literal(self.data_change).into(),
-                )
+                .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
                 .with_inserted_field(
                     // extended_file_metadata
                     Some("path"),
@@ -802,8 +799,7 @@ impl Transaction {
                 )
                 .with_inserted_field(
                     Some("path"),
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"])
-                        .into(),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
                 )
                 // tags
                 .with_inserted_field(
@@ -812,8 +808,7 @@ impl Transaction {
                 )
                 .with_inserted_field(
                     Some("deletionVector"),
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME])
-                        .into(),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
                 )
                 .with_inserted_field(
                     Some("deletionVector"),
