@@ -221,9 +221,10 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             fms.sort_unstable();
 
             let num_files = fms.len() as u64;
+            let storage_list_duration = start.elapsed();
             reporter.as_ref().inspect(|r| {
                 r.report(MetricEvent::StorageListCompleted {
-                    duration: start.elapsed(),
+                    duration: storage_list_duration,
                     num_files,
                 });
             });
@@ -332,10 +333,11 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                 })?;
             Ok(())
         });
+        let copy_atomic_duration = start.elapsed();
 
         self.reporter.as_ref().inspect(|r| {
             r.report(MetricEvent::StorageCopyCompleted {
-                duration: start.elapsed(),
+                duration: copy_atomic_duration,
             });
         });
 
