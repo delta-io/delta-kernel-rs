@@ -25,6 +25,8 @@ pub(crate) struct StateInfo {
     pub(crate) physical_predicate: PhysicalPredicate,
     /// Transform specification for converting physical to logical data
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
+    /// The column mapping mode for this scan
+    pub(crate) column_mapping_mode: ColumnMappingMode,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -192,7 +194,7 @@ impl StateInfo {
         let physical_schema = Arc::new(StructType::try_new(read_fields)?);
 
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
@@ -208,6 +210,7 @@ impl StateInfo {
             physical_schema,
             physical_predicate,
             transform_spec,
+            column_mapping_mode,
         })
     }
 }

@@ -13,6 +13,7 @@ use crate::expressions::{
     BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform, VariadicExpressionOp,
 };
 use crate::schema::{DataType, SchemaRef, StructType};
+use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
 
 /// A list of field transforms that describes a transform expression to be created at scan time.
@@ -70,13 +71,14 @@ pub(crate) fn parse_partition_value(
     field_idx: usize,
     logical_schema: &SchemaRef,
     partition_values: &HashMap<String, String>,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<(usize, (String, Scalar))> {
     let Some(field) = logical_schema.field_at_index(field_idx) else {
         return Err(Error::InternalError(format!(
             "out of bounds partition column field index {field_idx}"
         )));
     };
-    let name = field.physical_name();
+    let name = field.physical_name(column_mapping_mode);
     let partition_value = parse_partition_value_raw(partition_values.get(name), field.data_type())?;
     Ok((field_idx, (name.to_string(), partition_value)))
 }
@@ -86,13 +88,19 @@ pub(crate) fn parse_partition_values(
     logical_schema: &SchemaRef,
     transform_spec: &TransformSpec,
     partition_values: &HashMap<String, String>,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
     transform_spec
         .iter()
         .filter_map(|field_transform| match field_transform {
-            FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => Some(
-                parse_partition_value(*field_index, logical_schema, partition_values),
-            ),
+            FieldTransformSpec::MetadataDerivedColumn { field_index, .. } => {
+                Some(parse_partition_value(
+                    *field_index,
+                    logical_schema,
+                    partition_values,
+                    column_mapping_mode,
+                ))
+            }
             FieldTransformSpec::DynamicColumn { .. }
             | FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::GenerateRowId { .. }
@@ -221,7 +229,7 @@ mod tests {
         )]));
         let partition_values = HashMap::new();
 
-        let result = parse_partition_value(5, &schema, &partition_values);
+        let result = parse_partition_value(5, &schema, &partition_values, ColumnMappingMode::None);
         assert_result_error_with_message(result, "out of bounds");
     }
 
@@ -256,7 +264,13 @@ mod tests {
         partition_values.insert("id".to_string(), "test".to_string());
         partition_values.insert("_change_type".to_string(), "insert".to_string());
 
-        let result = parse_partition_values(&schema, &transform_spec, &partition_values).unwrap();
+        let result = parse_partition_values(
+            &schema,
+            &transform_spec,
+            &partition_values,
+            ColumnMappingMode::None,
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
         assert!(result.contains_key(&0));
         assert!(result.contains_key(&1));
@@ -276,7 +290,13 @@ mod tests {
         let transform_spec = vec![];
         let partition_values = HashMap::new();
 
-        let result = parse_partition_values(&schema, &transform_spec, &partition_values).unwrap();
+        let result = parse_partition_values(
+            &schema,
+            &transform_spec,
+            &partition_values,
+            ColumnMappingMode::None,
+        )
+        .unwrap();
         assert!(result.is_empty());
     }
 
