@@ -1,6 +1,7 @@
 #pragma once
 
 #include "delta_kernel_ffi.h"
+#include "../common/kernel_utils.h"
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -167,10 +168,6 @@ ExpressionItemList get_expr_list(void* data, size_t list_id) {
   ExpressionBuilder* data_ptr = (ExpressionBuilder*)data;
   assert(list_id < data_ptr->list_count);
   return data_ptr->lists[list_id];
-}
-// utility to turn a slice into a char*
-char* allocate_string(const KernelStringSlice slice) {
-  return strndup(slice.ptr, slice.len);
 }
 
 /*************************************************************
