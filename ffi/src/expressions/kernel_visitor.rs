@@ -330,3 +330,169 @@ pub extern "C" fn visit_expression_literal_date(
 ) -> usize {
     wrap_expression(state, Expression::literal(Scalar::Date(value)))
 }
+
+/// visit a timestamp literal expression 'value' (i64 representing microseconds since unix epoch)
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_timestamp(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
+}
+
+/// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix epoch)
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_timestamp_ntz(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::TimestampNtz(value)))
+}
+
+/// visit a binary literal expression
+///
+/// # Safety
+/// The caller must ensure that `value` points to a valid array of at least `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_literal_binary(
+    state: &mut KernelExpressionVisitorState,
+    value: *const u8,
+    len: usize,
+) -> usize {
+    let bytes = std::slice::from_raw_parts(value, len);
+    wrap_expression(state, Expression::literal(Scalar::Binary(bytes.to_vec())))
+}
+
+/// visit a decimal literal expression
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_decimal(
+    state: &mut KernelExpressionVisitorState,
+    value_hi: u64,
+    value_lo: u64,
+    precision: u8,
+    scale: u8,
+) -> usize {
+    // Reconstruct the i128 from two u64 parts
+    let value = ((value_hi as i128) << 64) | (value_lo as i128);
+    match Scalar::decimal(value, precision, scale) {
+        Ok(decimal) => wrap_expression(state, Expression::literal(decimal)),
+        Err(_) => {
+            // If decimal creation fails, return a zero integer literal
+            wrap_expression(state, Expression::literal(0i64))
+        }
+    }
+}
+
+/// visit a null literal expression with a specific data type
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_null(state: &mut KernelExpressionVisitorState) -> usize {
+    wrap_expression(
+        state,
+        Expression::null_literal(delta_kernel::schema::DataType::STRING),
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_distinct(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_predicate_binary(state, BinaryPredicateOp::Distinct, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_in(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_predicate_binary(state, BinaryPredicateOp::In, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_or(
+    state: &mut KernelExpressionVisitorState,
+    children: &mut EngineIterator,
+) -> usize {
+    use delta_kernel::expressions::JunctionPredicateOp;
+    let result = Predicate::junction(
+        JunctionPredicateOp::Or,
+        children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
+    );
+    wrap_predicate(state, result)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_struct(
+    state: &mut KernelExpressionVisitorState,
+    children: &mut EngineIterator,
+) -> usize {
+    let exprs: Vec<Expression> = children
+        .flat_map(|child| unwrap_kernel_expression(state, child as usize))
+        .collect();
+    wrap_expression(state, Expression::struct_from(exprs))
+}
+
+/// Create a new KernelExpressionVisitorState. Must be freed with
+/// visit_expression_state_free.
+///
+/// # Safety
+/// The caller must ensure the returned pointer is freed.
+#[no_mangle]
+pub extern "C" fn visit_expression_state_new() -> *mut KernelExpressionVisitorState {
+    Box::into_raw(Box::new(KernelExpressionVisitorState::default()))
+}
+
+/// Free a KernelExpressionVisitorState.
+///
+/// # Safety
+/// The state pointer must be a valid pointer created by
+/// visit_expression_state_new, and must not be used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_state_free(state: *mut KernelExpressionVisitorState) {
+    if !state.is_null() {
+        drop(Box::from_raw(state));
+    }
+}
+
+/// Convert an expression ID from the visitor state into a SharedExpression
+/// handle.
+///
+/// # Safety
+/// The state pointer must be valid, and the expr_id must be a valid
+/// expression ID from a previous visit call.
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_state_to_expression(
+    state: &mut KernelExpressionVisitorState,
+    expr_id: usize,
+) -> crate::handle::Handle<crate::expressions::SharedExpression> {
+    use delta_kernel::schema::DataType;
+    use std::sync::Arc;
+    if let Some(expr) = unwrap_kernel_expression(state, expr_id) {
+        Arc::new(expr).into()
+    } else {
+        // Return a null literal if the expression doesn't exist
+        Arc::new(Expression::null_literal(DataType::STRING)).into()
+    }
+}
+
+/// Convert a predicate ID from the visitor state into a SharedPredicate
+/// handle.
+///
+/// # Safety
+/// The state pointer must be valid, and the pred_id must be a valid
+/// predicate ID from a previous visit call.
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_state_to_predicate(
+    state: &mut KernelExpressionVisitorState,
+    pred_id: usize,
+) -> crate::handle::Handle<crate::expressions::SharedPredicate> {
+    use std::sync::Arc;
+    if let Some(pred) = unwrap_kernel_predicate(state, pred_id) {
+        Arc::new(pred).into()
+    } else {
+        // Return a literal false predicate if the predicate doesn't exist
+        Arc::new(Predicate::literal(false)).into()
+    }
+}
