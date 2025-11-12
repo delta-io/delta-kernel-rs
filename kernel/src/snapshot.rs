@@ -272,7 +272,8 @@ impl Snapshot {
         let reporter = engine.get_metrics_reporter();
         let start = Instant::now();
 
-        let result = {
+        // Wrap the main logic in a closure to capture both success and failure for metrics
+        let result: DeltaResult<Self> = (|| {
             let (metadata, protocol) = log_segment.read_metadata(engine)?;
 
             reporter.as_ref().inspect(|r| {
@@ -289,7 +290,7 @@ impl Snapshot {
                 log_segment,
                 table_configuration,
             })
-        };
+        })();
 
         match result {
             Ok(snapshot) => {
