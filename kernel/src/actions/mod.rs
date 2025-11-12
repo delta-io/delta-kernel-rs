@@ -33,6 +33,7 @@ const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
+pub mod deletion_vector_writer;
 pub mod set_transaction;
 
 pub(crate) mod crc;
@@ -693,7 +694,7 @@ where
         .filter(|feature| !supported_features.contains(*feature));
 
     Err(Error::Unsupported(format!(
-        "Unknown {}s: \"{}\". Supported {}s: \"{}\"",
+        "Found unsupported {}s: \"{}\". Supported {}s: \"{}\"",
         features_type,
         unsupported.join("\", \""),
         features_type,
@@ -771,7 +772,11 @@ impl IntoEngineData for CommitInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
-#[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
+#[cfg_attr(
+    test,
+    derive(Serialize, Deserialize, Default),
+    serde(rename_all = "camelCase")
+)]
 #[internal_api]
 pub(crate) struct Add {
     /// A relative path to a data file from the root of the table or an absolute path to a file
@@ -808,8 +813,13 @@ pub(crate) struct Add {
     pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
+    /// Note: map values can be null.
+    /// We don't use `#[allow_null_container_values]` here because [`EngineMap::materialize`]
+    /// drops null values when that attribute is present.
+    ///
+    /// [`EngineMap::materialize`]: crate::engine_data::EngineMap::materialize
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
-    pub tags: Option<HashMap<String, String>>,
+    pub tags: Option<HashMap<String, Option<String>>>,
 
     /// Information about deletion vector (DV) associated with this add action
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -868,6 +878,12 @@ pub(crate) struct Remove {
     /// The size of this data file in bytes
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub(crate) size: Option<i64>,
+
+    /// Contains [statistics] (e.g., count, min/max values for columns) about the data in this logical file encoded as a JSON string.
+    ///
+    /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
+    #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    pub stats: Option<String>,
 
     /// Map containing metadata about this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
@@ -1179,7 +1195,7 @@ mod tests {
                 StructField::nullable("stats", DataType::STRING),
                 StructField::nullable(
                     "tags",
-                    MapType::new(DataType::STRING, DataType::STRING, false),
+                    MapType::new(DataType::STRING, DataType::STRING, true),
                 ),
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
@@ -1231,6 +1247,7 @@ mod tests {
                 StructField::nullable("extendedFileMetadata", DataType::BOOLEAN),
                 partition_values_field(),
                 StructField::nullable("size", DataType::LONG),
+                StructField::nullable("stats", DataType::STRING),
                 tags_field(),
                 deletion_vector_field(),
                 StructField::nullable("baseRowId", DataType::LONG),
@@ -1582,7 +1599,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown TableFeatures: "identityColumns". Supported TableFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Found unsupported TableFeatures: "identityColumns". Supported TableFeatures: "changeDataFeed", "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
         // Unknown writer features are allowed during creation for forward compatibility,
@@ -1596,7 +1613,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Unknown TableFeatures: "unsupported writer". Supported TableFeatures: "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Found unsupported TableFeatures: "unsupported writer". Supported TableFeatures: "changeDataFeed", "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
     }
 
@@ -1630,7 +1647,7 @@ mod tests {
         let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
         match error {
             Error::Unsupported(e) if e ==
-                "Unknown TableFeatures: \"idk\". Supported TableFeatures: \"columnMapping\", \"deletionVectors\""
+                "Found unsupported TableFeatures: \"idk\". Supported TableFeatures: \"columnMapping\", \"deletionVectors\""
             => {},
             _ => panic!("Expected unsupported error, got: {error}"),
         }
@@ -2220,5 +2237,43 @@ mod tests {
     fn test_schema_contains_file_actions_empty_schema() {
         let schema = Arc::new(StructType::new_unchecked([]));
         assert!(!schema_contains_file_actions(&schema));
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_null_case() {
+        let json1 = r#"{"path":"file1.parquet","partitionValues":{},"size":100,"modificationTime":1234567890,"dataChange":true,"tags":null}"#;
+        let add1: Add = serde_json::from_str(json1).unwrap();
+        assert_eq!(add1.tags, None);
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_nullable_values_case() {
+        let json2 = r#"{"path":"file2.parquet","partitionValues":{},"size":200,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","NULLABLE_TAG":null}}"#;
+        let add2: Add = serde_json::from_str(json2).unwrap();
+        assert!(add2.tags.is_some());
+        let tags = add2.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(tags.get("NULLABLE_TAG"), Some(&None));
+    }
+
+    #[test]
+    fn test_add_tags_deserialization_non_null_values_case() {
+        let json3 = r#"{"path":"file3.parquet","partitionValues":{},"size":300,"modificationTime":1234567890,"dataChange":true,"tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000"}}"#;
+        let add3: Add = serde_json::from_str(json3).unwrap();
+        assert!(add3.tags.is_some());
+        let tags = add3.tags.unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(
+            tags.get("INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
+        assert_eq!(
+            tags.get("MIN_INSERTION_TIME"),
+            Some(&Some("1677811178336000".to_string()))
+        );
     }
 }
