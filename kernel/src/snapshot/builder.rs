@@ -84,27 +84,27 @@ impl SnapshotBuilder {
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        let start = Instant::now();
         let log_tail = self.log_tail.into_iter().map(Into::into).collect();
 
         let operation_id = MetricId::new();
         let reporter = engine.get_metrics_reporter();
 
         if let Some(table_root) = self.table_root {
-            let start = Instant::now();
             let log_segment_result = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
                 log_tail,
                 self.version,
             );
+            let log_segment_loading_duration = start.elapsed();
 
             let log_segment = match log_segment_result {
                 Ok(seg) => {
-                    let duration = start.elapsed();
                     reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::LogSegmentLoaded {
                             operation_id,
-                            duration,
+                            duration: log_segment_loading_duration,
                             num_commit_files: seg.ascending_commit_files.len() as u64,
                             num_checkpoint_files: seg.checkpoint_parts.len() as u64,
                             num_compaction_files: seg.ascending_compaction_files.len() as u64,
@@ -116,7 +116,7 @@ impl SnapshotBuilder {
                     reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::SnapshotFailed {
                             operation_id,
-                            duration: start.elapsed(),
+                            duration: log_segment_loading_duration,
                         });
                     });
                     return Err(e);
@@ -137,8 +137,8 @@ impl SnapshotBuilder {
                 )
             })?;
 
-            let start = Instant::now();
             let result = Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version);
+            let snapshot_building_duration = start.elapsed();
 
             match result {
                 Ok(snapshot) => {
@@ -146,7 +146,7 @@ impl SnapshotBuilder {
                         r.report(MetricEvent::SnapshotCompleted {
                             operation_id,
                             version: snapshot.version(),
-                            total_duration: start.elapsed(),
+                            total_duration: snapshot_building_duration,
                         });
                     });
                     Ok(snapshot)
@@ -155,7 +155,7 @@ impl SnapshotBuilder {
                     reporter.as_ref().inspect(|r| {
                         r.report(MetricEvent::SnapshotFailed {
                             operation_id,
-                            duration: start.elapsed(),
+                            duration: snapshot_building_duration,
                         });
                     });
                     Err(e)

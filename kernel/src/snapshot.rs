@@ -275,11 +275,12 @@ impl Snapshot {
         // Wrap the main logic in a closure to capture both success and failure for metrics
         let result: DeltaResult<Self> = (|| {
             let (metadata, protocol) = log_segment.read_metadata(engine)?;
+            let read_metadata_duration = start.elapsed();
 
             reporter.as_ref().inspect(|r| {
                 r.report(MetricEvent::ProtocolMetadataLoaded {
                     operation_id,
-                    duration: start.elapsed(),
+                    duration: read_metadata_duration,
                 });
             });
 
@@ -291,6 +292,7 @@ impl Snapshot {
                 table_configuration,
             })
         })();
+        let snapshot_duration = start.elapsed();
 
         match result {
             Ok(snapshot) => {
@@ -298,7 +300,7 @@ impl Snapshot {
                     r.report(MetricEvent::SnapshotCompleted {
                         operation_id,
                         version: snapshot.version(),
-                        total_duration: start.elapsed(),
+                        total_duration: snapshot_duration,
                     });
                 });
                 Ok(snapshot)
@@ -307,7 +309,7 @@ impl Snapshot {
                 reporter.as_ref().inspect(|r| {
                     r.report(MetricEvent::SnapshotFailed {
                         operation_id,
-                        duration: start.elapsed(),
+                        duration: snapshot_duration,
                     });
                 });
                 Err(e)
