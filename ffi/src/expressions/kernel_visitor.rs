@@ -1,13 +1,14 @@
 //! Defines [`KernelExpressionVisitorState`]. This is a visitor that can be used to convert an
 //! engine's native expressions into kernel's [`Expression`] and [`Predicate`] types.
 use crate::{
-    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult, KernelStringSlice,
-    ReferenceSet, TryFromStringSlice,
+    AllocateErrorFn, EngineIterator, ExternResult, IntoExternResult,
+    KernelStringSlice, ReferenceSet, TryFromStringSlice,
 };
 use delta_kernel::expressions::{
-    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate, Scalar,
-    UnaryPredicateOp,
+    BinaryExpressionOp, BinaryPredicateOp, ColumnName, Expression, Predicate,
+    Scalar, UnaryPredicateOp,
 };
+use delta_kernel::schema::DataType;
 use delta_kernel::DeltaResult;
 
 pub(crate) enum ExpressionOrPredicate {
@@ -20,12 +21,18 @@ pub struct KernelExpressionVisitorState {
     inflight_ids: ReferenceSet<ExpressionOrPredicate>,
 }
 
-fn wrap_expression(state: &mut KernelExpressionVisitorState, expr: impl Into<Expression>) -> usize {
+fn wrap_expression(
+    state: &mut KernelExpressionVisitorState,
+    expr: impl Into<Expression>,
+) -> usize {
     let expr = ExpressionOrPredicate::Expression(expr.into());
     state.inflight_ids.insert(expr)
 }
 
-fn wrap_predicate(state: &mut KernelExpressionVisitorState, pred: impl Into<Predicate>) -> usize {
+fn wrap_predicate(
+    state: &mut KernelExpressionVisitorState,
+    pred: impl Into<Predicate>,
+) -> usize {
     let pred = ExpressionOrPredicate::Predicate(pred.into());
     state.inflight_ids.insert(pred)
 }
@@ -36,7 +43,9 @@ pub(crate) fn unwrap_kernel_expression(
 ) -> Option<Expression> {
     match state.inflight_ids.take(exprid)? {
         ExpressionOrPredicate::Expression(expr) => Some(expr),
-        ExpressionOrPredicate::Predicate(pred) => Some(Expression::from_pred(pred)),
+        ExpressionOrPredicate::Predicate(pred) => {
+            Some(Expression::from_pred(pred))
+        }
     }
 }
 
@@ -45,7 +54,9 @@ pub(crate) fn unwrap_kernel_predicate(
     predid: usize,
 ) -> Option<Predicate> {
     match state.inflight_ids.take(predid)? {
-        ExpressionOrPredicate::Expression(expr) => Some(Predicate::from_expr(expr)),
+        ExpressionOrPredicate::Expression(expr) => {
+            Some(Predicate::from_expr(expr))
+        }
         ExpressionOrPredicate::Predicate(pred) => Some(pred),
     }
 }
@@ -59,7 +70,9 @@ fn visit_expression_binary(
     let a = unwrap_kernel_expression(state, a);
     let b = unwrap_kernel_expression(state, b);
     match (a, b) {
-        (Some(a), Some(b)) => wrap_expression(state, Expression::binary(op, a, b)),
+        (Some(a), Some(b)) => {
+            wrap_expression(state, Expression::binary(op, a, b))
+        }
         _ => 0, // invalid child => invalid node
     }
 }
@@ -73,7 +86,9 @@ fn visit_predicate_binary(
     let a = unwrap_kernel_expression(state, a);
     let b = unwrap_kernel_expression(state, b);
     match (a, b) {
-        (Some(a), Some(b)) => wrap_predicate(state, Predicate::binary(op, a, b)),
+        (Some(a), Some(b)) => {
+            wrap_predicate(state, Predicate::binary(op, a, b))
+        }
         _ => 0, // invalid child => invalid node
     }
 }
@@ -94,7 +109,8 @@ pub extern "C" fn visit_predicate_and(
     children: &mut EngineIterator,
 ) -> usize {
     let result = Predicate::and_from(
-        children.flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
+        children
+            .flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
     );
     wrap_predicate(state, result)
 }
@@ -219,7 +235,8 @@ pub unsafe extern "C" fn visit_expression_column(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name = unsafe { TryFromStringSlice::try_from_slice(&name) };
-    visit_expression_column_impl(state, name).into_extern_result(&allocate_error)
+    visit_expression_column_impl(state, name)
+        .into_extern_result(&allocate_error)
 }
 fn visit_expression_column_impl(
     state: &mut KernelExpressionVisitorState,
@@ -256,7 +273,8 @@ pub unsafe extern "C" fn visit_expression_literal_string(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let value = unsafe { String::try_from_slice(&value) };
-    visit_expression_literal_string_impl(state, value).into_extern_result(&allocate_error)
+    visit_expression_literal_string_impl(state, value)
+        .into_extern_result(&allocate_error)
 }
 fn visit_expression_literal_string_impl(
     state: &mut KernelExpressionVisitorState,
@@ -329,4 +347,184 @@ pub extern "C" fn visit_expression_literal_date(
     value: i32,
 ) -> usize {
     wrap_expression(state, Expression::literal(Scalar::Date(value)))
+}
+
+/// visit a timestamp literal expression 'value' (i64 representing microseconds since unix epoch)
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_timestamp(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::Timestamp(value)))
+}
+
+/// visit a timestamp_ntz literal expression 'value' (i64 representing microseconds since unix epoch)
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_timestamp_ntz(
+    state: &mut KernelExpressionVisitorState,
+    value: i64,
+) -> usize {
+    wrap_expression(state, Expression::literal(Scalar::TimestampNtz(value)))
+}
+
+/// visit a binary literal expression
+///
+/// # Safety
+/// The caller must ensure that `value` points to a valid array of at least `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn visit_expression_literal_binary(
+    state: &mut KernelExpressionVisitorState,
+    value: *const u8,
+    len: usize,
+) -> usize {
+    let bytes = std::slice::from_raw_parts(value, len);
+    wrap_expression(state, Expression::literal(Scalar::Binary(bytes.to_vec())))
+}
+
+/// visit a decimal literal expression
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_decimal(
+    state: &mut KernelExpressionVisitorState,
+    value_hi: u64,
+    value_lo: u64,
+    precision: u8,
+    scale: u8,
+) -> usize {
+    // Reconstruct the i128 from two u64 parts
+    let value = ((value_hi as i128) << 64) | (value_lo as i128);
+    match Scalar::decimal(value, precision, scale) {
+        Ok(decimal) => wrap_expression(state, Expression::literal(decimal)),
+        Err(_) => {
+            // If decimal creation fails, return a zero integer literal
+            wrap_expression(state, Expression::literal(0i64))
+        }
+    }
+}
+
+/// visit a null literal expression with a specific data type
+#[no_mangle]
+pub extern "C" fn visit_expression_literal_null(
+    state: &mut KernelExpressionVisitorState,
+) -> usize {
+    wrap_expression(state, Expression::null_literal(DataType::STRING))
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_distinct(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_predicate_binary(state, BinaryPredicateOp::Distinct, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_in(
+    state: &mut KernelExpressionVisitorState,
+    a: usize,
+    b: usize,
+) -> usize {
+    visit_predicate_binary(state, BinaryPredicateOp::In, a, b)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_predicate_or(
+    state: &mut KernelExpressionVisitorState,
+    children: &mut EngineIterator,
+) -> usize {
+    use delta_kernel::expressions::JunctionPredicateOp;
+    let result = Predicate::junction(
+        JunctionPredicateOp::Or,
+        children
+            .flat_map(|child| unwrap_kernel_predicate(state, child as usize)),
+    );
+    wrap_predicate(state, result)
+}
+
+#[no_mangle]
+pub extern "C" fn visit_expression_struct(
+    state: &mut KernelExpressionVisitorState,
+    children: &mut EngineIterator,
+) -> usize {
+    let exprs: Vec<Expression> = children
+        .flat_map(|child| unwrap_kernel_expression(state, child as usize))
+        .collect();
+    wrap_expression(state, Expression::struct_from(exprs))
+}
+
+use crate::expressions::{SharedExpression, SharedPredicate};
+use crate::handle::Handle;
+use crate::scan::{EngineExpression, EnginePredicate};
+use std::sync::Arc;
+
+/// Convert an engine expression to a kernel expression using the visitor
+/// pattern.
+///
+/// # Safety
+///
+/// Caller must ensure that `engine_expression` points to a valid
+/// `EngineExpression` with a valid visitor function and expression pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_engine_expression(
+    engine_expression: &mut EngineExpression,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<Handle<SharedExpression>> {
+    visit_engine_expression_impl(engine_expression)
+        .into_extern_result(&allocate_error)
+}
+
+fn visit_engine_expression_impl(
+    engine_expression: &mut EngineExpression,
+) -> DeltaResult<Handle<SharedExpression>> {
+    let mut visitor_state = KernelExpressionVisitorState::default();
+    let expr_id = (engine_expression.visitor)(
+        engine_expression.expression,
+        &mut visitor_state,
+    );
+
+    let expr = unwrap_kernel_expression(&mut visitor_state, expr_id)
+        .ok_or_else(|| {
+            delta_kernel::Error::generic(format!(
+                "Invalid expression ID {} returned from engine visitor",
+                expr_id
+            ))
+        })?;
+
+    Ok(Arc::new(expr).into())
+}
+
+/// Convert an engine predicate to a kernel predicate using the visitor
+/// pattern.
+///
+/// # Safety
+///
+/// Caller must ensure that `engine_predicate` points to a valid
+/// `EnginePredicate` with a valid visitor function and predicate pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_engine_predicate(
+    engine_predicate: &mut EnginePredicate,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<Handle<SharedPredicate>> {
+    visit_engine_predicate_impl(engine_predicate)
+        .into_extern_result(&allocate_error)
+}
+
+fn visit_engine_predicate_impl(
+    engine_predicate: &mut EnginePredicate,
+) -> DeltaResult<Handle<SharedPredicate>> {
+    let mut visitor_state = KernelExpressionVisitorState::default();
+    let pred_id = (engine_predicate.visitor)(
+        engine_predicate.predicate,
+        &mut visitor_state,
+    );
+
+    let pred = unwrap_kernel_predicate(&mut visitor_state, pred_id)
+        .ok_or_else(|| {
+            delta_kernel::Error::generic(format!(
+                "Invalid predicate ID {} returned from engine visitor",
+                pred_id
+            ))
+        })?;
+
+    Ok(Arc::new(pred).into())
 }
