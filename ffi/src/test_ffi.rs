@@ -227,3 +227,109 @@ pub unsafe extern "C" fn get_testing_kernel_predicate() -> Handle<SharedPredicat
 
     Arc::new(Pred::and_from(sub_exprs)).into()
 }
+
+/// Constructs a simple kernel expression using only primitive types for round-trip testing.
+/// This expression only uses types that have full visitor support.
+///
+/// # Safety
+/// The caller is responsible for freeing the returned memory.
+#[no_mangle]
+pub unsafe extern "C" fn get_simple_testing_kernel_expression() -> Handle<SharedExpression> {
+    let sub_exprs = vec![
+        column_expr!("simple_col"),
+        Expr::literal(42i32),
+        Expr::literal(100i64),
+        Expr::literal(2.5f64), // Using 2.5 to avoid clippy::approx_constant warning
+        Expr::literal(true),
+        Expr::literal(false),
+        Expr::literal("test string"),
+        Scalar::Date(19000).into(),
+        Scalar::Timestamp(1234567890).into(),
+        Scalar::TimestampNtz(9876543210).into(),
+        Expr::binary(
+            BinaryExpressionOp::Plus,
+            Expr::literal(10),
+            Expr::literal(20),
+        ),
+        Expr::binary(
+            BinaryExpressionOp::Minus,
+            Expr::literal(50),
+            Expr::literal(30),
+        ),
+        Expr::binary(
+            BinaryExpressionOp::Multiply,
+            Expr::literal(5),
+            Expr::literal(6),
+        ),
+        Expr::binary(
+            BinaryExpressionOp::Divide,
+            Expr::literal(100),
+            Expr::literal(4),
+        ),
+        Expr::struct_from([
+            Expr::literal(1_i32),
+            Expr::literal(2_i64),
+            Expr::literal(3.0_f64),
+        ]),
+    ];
+    Arc::new(Expr::struct_from(sub_exprs)).into()
+}
+
+/// Constructs a simple kernel predicate using only primitive types for round-trip testing.
+/// This predicate only uses types that have full visitor support.
+///
+/// # Safety
+/// The caller is responsible for freeing the returned memory.
+#[no_mangle]
+pub unsafe extern "C" fn get_simple_testing_kernel_predicate() -> Handle<SharedPredicate> {
+    let sub_preds = vec![
+        column_pred!("pred_col"),
+        Pred::literal(true),
+        Pred::literal(false),
+        Pred::eq(Expr::literal(10), Expr::literal(10)),
+        Pred::ne(Expr::literal(5), Expr::literal(10)),
+        Pred::lt(Expr::literal(5), Expr::literal(10)),
+        Pred::le(Expr::literal(10), Expr::literal(10)),
+        Pred::gt(Expr::literal(20), Expr::literal(10)),
+        Pred::ge(Expr::literal(10), Expr::literal(10)),
+        Pred::distinct(Expr::literal(1), Expr::literal(2)),
+        Pred::is_null(column_expr!("nullable_col")),
+        Pred::is_not_null(column_expr!("nonnull_col")),
+        Pred::not(Pred::literal(false)),
+        Pred::or_from(vec![
+            Pred::eq(Expr::literal(1), Expr::literal(1)),
+            Pred::eq(Expr::literal(2), Expr::literal(2)),
+        ]),
+    ];
+    Arc::new(Pred::and_from(sub_preds)).into()
+}
+
+/// Compare two kernel expressions for equality. Returns true if they are
+/// structurally equal, false otherwise.
+///
+/// # Safety
+/// Both expr1 and expr2 must be valid SharedExpression handles.
+#[no_mangle]
+pub unsafe extern "C" fn expressions_are_equal(
+    expr1: &Handle<SharedExpression>,
+    expr2: &Handle<SharedExpression>,
+) -> bool {
+    let expr1: &Expr = expr1.as_ref();
+    let expr2: &Expr = expr2.as_ref();
+    expr1 == expr2
+}
+
+/// Compare two kernel predicates for equality. Returns true if they are
+/// structurally equal, false otherwise.
+///
+/// # Safety
+/// Both pred1 and pred2 must be valid SharedPredicate handles.
+#[no_mangle]
+pub unsafe extern "C" fn predicates_are_equal(
+    pred1: &Handle<SharedPredicate>,
+    pred2: &Handle<SharedPredicate>,
+) -> bool {
+    let pred1: &Pred = pred1.as_ref();
+    let pred2: &Pred = pred2.as_ref();
+    pred1 == pred2
+}
