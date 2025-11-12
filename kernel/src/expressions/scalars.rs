@@ -10,6 +10,56 @@ use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, St
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
+/// A trait for converting types into Scalar values. This unifies both infallible (`Into<Scalar>`)
+/// and fallible (`TryInto<Scalar, Error = Error>`) conversions for use with the IntoEngineData derive macro.
+#[doc(hidden)]
+pub trait ToScalar {
+    fn to_scalar(self) -> DeltaResult<Scalar>;
+}
+
+// Blanket impl for types that implement TryInto<Scalar, Error = Error>
+impl<T> ToScalar for T
+where
+    T: TryInto<Scalar, Error = Error>,
+{
+    fn to_scalar(self) -> DeltaResult<Scalar> {
+        self.try_into()
+    }
+}
+
+// Manual ToScalar implementations for types that only have Into<Scalar>
+// (these won't conflict because they're more specific than the blanket impl above)
+macro_rules! impl_to_scalar_via_into {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl ToScalar for $t {
+                fn to_scalar(self) -> DeltaResult<Scalar> {
+                    Ok(self.into())
+                }
+            }
+        )*
+    };
+}
+
+impl_to_scalar_via_into!(
+    i8,
+    i16,
+    i32,
+    i64,
+    f32,
+    f64,
+    bool,
+    &str,
+    String,
+    &[u8],
+    bytes::Bytes,
+    DecimalData,
+    ArrayData,
+    MapData,
+    Option<i64>,
+    Option<String>,
+);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecimalData {
     bits: i128,
@@ -578,6 +628,23 @@ where
     }
 }
 
+impl<T> TryFrom<Option<Vec<T>>> for Scalar
+where
+    T: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(vec: Option<Vec<T>>) -> Result<Self, Self::Error> {
+        match vec {
+            Some(vec) => vec.try_into(),
+            None => {
+                let array_type = ArrayType::new(T::to_data_type(), false);
+                Ok(Self::Null(array_type.into()))
+            }
+        }
+    }
+}
+
 impl<K, V> TryFrom<HashMap<K, V>> for Scalar
 where
     K: Into<Scalar> + ToDataType,
@@ -603,6 +670,20 @@ where
         let map_type = MapType::new(K::to_data_type(), V::to_data_type(), true);
         let map_data = MapData::try_new(map_type, map)?;
         Ok(map_data.into())
+    }
+}
+
+impl<K, V> TryFrom<Option<HashMap<K, V>>> for Scalar
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(map: Option<HashMap<K, V>>) -> Result<Self, Self::Error> {
+        // Convert None to empty HashMap for backwards compatibility
+        // (needed for CommitInfo.operation_parameters)
+        map.unwrap_or_default().try_into()
     }
 }
 
