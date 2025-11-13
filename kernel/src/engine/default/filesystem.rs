@@ -523,7 +523,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store.clone(), executor);
+        let handler = ObjectStoreStorageHandler::new(store.clone(), executor, None);
 
         let data = Bytes::from("test-content");
         let file_path = Path::from_absolute_path(tmp.path().join("test.txt")).unwrap();
@@ -551,7 +551,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let handler = ObjectStoreStorageHandler::new(store, executor);
+        let handler = ObjectStoreStorageHandler::new(store, executor, None);
 
         let missing_url = Url::from_file_path(tmp.path().join("missing.txt")).unwrap();
         let result = handler.head(&missing_url);
