@@ -859,7 +859,6 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[ignore]
 #[tokio::test]
 async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -880,37 +879,19 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a table with VARIANT column
     let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("v", DataType::unshredded_variant())
-            .with_metadata([("delta.columnMapping.physicalName", "col1")])
-            .add_metadata([("delta.columnMapping.id", 1)]),
-        StructField::nullable("i", DataType::INTEGER)
-            .with_metadata([("delta.columnMapping.physicalName", "col2")])
-            .add_metadata([("delta.columnMapping.id", 2)]),
+        StructField::nullable("v", DataType::unshredded_variant()),
+        StructField::nullable("i", DataType::INTEGER),
         StructField::nullable(
             "nested",
             // We flip the value and metadata fields in the actual parquet file for the test
             StructType::try_new(vec![StructField::nullable(
                 "nested_v",
                 unshredded_variant_schema_flipped(),
-            )
-            .with_metadata([("delta.columnMapping.physicalName", "col21")])
-            .add_metadata([("delta.columnMapping.id", 3)])])?,
-        )
-        .with_metadata([("delta.columnMapping.physicalName", "col3")])
-        .add_metadata([("delta.columnMapping.id", 4)]),
-    ])?);
-
-    let write_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("col1", DataType::unshredded_variant()),
-        StructField::nullable("col2", DataType::INTEGER),
-        StructField::nullable(
-            "col3",
-            StructType::try_new(vec![StructField::nullable(
-                "col21",
-                unshredded_variant_schema_flipped(),
             )])?,
         ),
     ])?);
+
+    let write_schema = table_schema.clone();
 
     let tmp_test_dir = tempdir()?;
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
@@ -921,16 +902,13 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // We can add shredding features as well as we are allowed to write unshredded variants
     // into shredded tables and shredded reads are explicitly blocked in the default
     // engine's parquet reader.
-    // TODO: (#1124) we don't actually support column mapping writes yet, but have some
-    // tests that do column mapping on writes. For now omit the writer feature to let tests
-    // run, but after actual support this should be enabled.
     let table_url = create_table(
         store.clone(),
         table_location,
         table_schema.clone(),
         &[],
         true,
-        vec!["variantType", "variantShredding-preview", "columnMapping"],
+        vec!["variantType", "variantShredding-preview"],
         vec!["variantType", "variantShredding-preview"],
     )
     .await?;
@@ -1016,7 +994,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(Int32Array::from(i_values.clone())),
             // nested struct<nested_v variant>
             Arc::new(StructArray::try_new(
-                vec![Field::new("col21", variant_arrow_type_flipped(), true)].into(),
+                vec![Field::new("nested_v", variant_arrow_type_flipped(), true)].into(),
                 vec![variant_nested_v_array.clone()],
                 None,
             )?),

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::arrow::{compute::filter_record_batch, util::pretty::print_batches};
+use delta_kernel::arrow::util::pretty::print_batches;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::DeltaResult;
@@ -38,20 +38,13 @@ fn main() -> DeltaResult<()> {
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan
         .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
+        .map(|data| -> DeltaResult<_> {
+            let record_batch: RecordBatch = data?
                 .into_any()
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
+            Ok(record_batch)
         })
         .try_collect()?;
     print_batches(&batches)?;

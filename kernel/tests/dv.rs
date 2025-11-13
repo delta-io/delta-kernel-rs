@@ -4,25 +4,17 @@ use std::ops::Add;
 use std::path::PathBuf;
 
 use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::scan::ScanResult;
-use delta_kernel::{DeltaResult, Snapshot};
+use delta_kernel::{DeltaResult, EngineData, Snapshot};
 use test_utils::DefaultEngineExtension;
 
 use itertools::Itertools;
 use test_log::test;
 
 fn count_total_scan_rows(
-    scan_result_iter: impl Iterator<Item = DeltaResult<ScanResult>>,
+    scan_result_iter: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>,
 ) -> DeltaResult<usize> {
     scan_result_iter
-        .map(|scan_result| {
-            let scan_result = scan_result?;
-            // NOTE: The mask only suppresses rows for which it is both present and false.
-            let mask = scan_result.raw_mask();
-            let deleted_rows = mask.into_iter().flatten().filter(|&&m| !m).count();
-            let data = scan_result.raw_data?;
-            Ok(data.len() - deleted_rows)
-        })
+        .map(|result| Ok(result?.len()))
         .fold_ok(0, Add::add)
 }
 

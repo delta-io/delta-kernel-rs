@@ -1,11 +1,11 @@
-# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.84+]][rustc]
+# Delta Kernel (rust) &emsp; [![build-status]][actions] [![latest-version]][crates.io] [![docs]][docs.rs] [![rustc-version-1.85+]][rustc]
 
 [build-status]: https://img.shields.io/github/actions/workflow/status/delta-io/delta-kernel-rs/build.yml?branch=main
 [actions]: https://github.com/delta-io/delta-kernel-rs/actions/workflows/build.yml?query=branch%3Amain
 [latest-version]: https://img.shields.io/crates/v/delta_kernel.svg
 [crates.io]: https://crates.io/crates/delta\_kernel
-[rustc-version-1.84+]: https://img.shields.io/badge/rustc-1.84+-lightgray.svg
-[rustc]: https://blog.rust-lang.org/2025/01/09/Rust-1.84.0/
+[rustc-version-1.85+]: https://img.shields.io/badge/rustc-1.85+-lightgray.svg
+[rustc]: https://blog.rust-lang.org/2025/02/20/Rust-1.85.0/
 [docs]: https://img.shields.io/docsrs/delta_kernel
 [docs.rs]: https://docs.rs/delta_kernel/latest/delta_kernel/
 
@@ -52,10 +52,10 @@ consumer's own `Engine` trait, the kernel has a feature flag to enable a default
 ```toml
 # fewer dependencies, requires consumer to implement Engine trait.
 # allows consumers to implement their own in-memory format
-delta_kernel = "0.16.0"
+delta_kernel = "0.17.0"
 
-# or turn on the default engine, based on arrow
-delta_kernel = { version = "0.16.0", features = ["default-engine", "arrow-56"] }
+# or turn on the default engine, based on latest arrow
+delta_kernel = { version = "0.17.0", features = ["default-engine", "arrow"] }
 ```
 
 ### Feature flags
@@ -87,6 +87,7 @@ flags:
 
 - `arrow-55`: Use arrow version 55
 - `arrow-56`: Use arrow version 56
+- `arrow-57`: Use arrow version 57
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
   the latest arrow version at every arrow version release. Only removing old arrow versions will
   cause a breaking change for kernel. If you require a specific version N of arrow, you should
@@ -153,15 +154,7 @@ Some design principles which should be considered:
 - If using `emacs`, both [eglot](https://github.com/joaotavora/eglot) and
   [lsp-mode](https://github.com/emacs-lsp/lsp-mode) provide excellent integration with
   `rust-analyzer`. [rustic](https://github.com/brotzeit/rustic) is a nice mode as well.
-- When also developing in VS Code it's sometimes convenient to configure rust-analyzer in
-  `.vscode/settings.json`.
-
-```json
-{
-  "editor.formatOnSave": true,
-  "rust-analyzer.cargo.features": ["default-engine"]
-}
-```
+- When also developing in VS Code it's convenient to add rust-analyzer to your workspace.
 
 - The crate's documentation can be easily reviewed with: `cargo docs --open`
 - Code coverage is available on codecov via [cargo-llvm-cov]. See their docs for instructions to install/run locally.
