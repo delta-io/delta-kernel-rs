@@ -185,6 +185,7 @@ impl Snapshot {
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
                 engine,
+                None,
             );
             return Ok(Arc::new(snapshot?));
         }
@@ -255,14 +256,6 @@ impl Snapshot {
 
     /// Create a new [`Snapshot`] instance.
     pub(crate) fn try_new_from_log_segment(
-        location: Url,
-        log_segment: LogSegment,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Self> {
-        Self::try_new_from_log_segment_with_metrics(location, log_segment, engine, None)
-    }
-
-    pub(crate) fn try_new_from_log_segment_with_metrics(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
