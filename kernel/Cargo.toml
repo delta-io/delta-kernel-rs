@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.17.0" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.17.1" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
