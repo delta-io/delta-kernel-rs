@@ -263,16 +263,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 4,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::Custom(|_protocol, _properties, operation| {
-        // Kernel can read tables with CDF enabled for normal scans,
-        // but cannot read the actual CDF data (Operation::Cdf)
-        match operation {
-            Operation::Scan => Ok(()),
-            Operation::Cdf => Err(Error::unsupported(
-                "CDF reads are not supported for tables with Change Data Feed enabled",
-            )),
-        }
-    }),
+    read_support: KernelSupport::Supported,
     write_support: KernelSupport::Custom(|_protocol, properties, _operation| {
         // Kernel supports writing to CDF-enabled tables only if AppendOnly is also enabled
         // because we don't yet support writing .cdc files for DML operations
@@ -320,8 +311,18 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    read_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
+        Operation::Scan => Ok(()),
+        Operation::Cdf => Err(Error::unsupported(
+            "CDF reads are not supported for tables with In-Commit Timestamps enabled",
+        )),
+    }),
+    write_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
+        Operation::Scan => Ok(()),
+        Operation::Cdf => Err(Error::unsupported(
+            "CDF writes are not supported for tables with In-Commit Timestamps enabled",
+        )),
+    }),
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_in_commit_timestamps == Some(true)
     }),
