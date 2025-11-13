@@ -42,10 +42,7 @@ pub(crate) fn all_domain_metadata_configuration(
     engine: &dyn Engine,
 ) -> DeltaResult<Vec<DomainMetadata>> {
     let domain_metadatas = scan_domain_metadatas(log_segment, None, engine)?;
-    Ok(domain_metadatas
-        .into_iter()
-        .map(|(key, domain_metadata)| DomainMetadata::new(key, domain_metadata.configuration))
-        .collect())
+    Ok(domain_metadatas.into_values().collect())
 }
 
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain
