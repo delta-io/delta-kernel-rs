@@ -27,12 +27,12 @@
 //!
 //! ```no_run
 //! # use std::sync::Arc;
-//! # use delta_kernel::{LogCompactionDataIterator, LogCompactionWriter};
+//! # use delta_kernel::{ActionReconciliationIterator, LogCompactionWriter};
 //! # use delta_kernel::{Engine, Snapshot, DeltaResult, Error, FileMeta};
 //! # use url::Url;
 //!
 //! // Engine-specific function to write compaction data
-//! fn write_compaction_file(path: &Url, data: LogCompactionDataIterator) -> DeltaResult<FileMeta> {
+//! fn write_compaction_file(path: &Url, data: ActionReconciliationIterator) -> DeltaResult<FileMeta> {
 //!     // In a real implementation, this would write the data to cloud storage
 //!     todo!("Write data batches to storage at path: {}", path)
 //! }
@@ -84,7 +84,7 @@ use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 
 mod writer;
 
-pub use writer::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
+pub use writer::{should_compact, LogCompactionWriter};
 
 #[cfg(test)]
 mod tests;
