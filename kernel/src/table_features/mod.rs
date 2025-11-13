@@ -233,6 +233,9 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
 };
 
 #[allow(dead_code)]
+// Although kernel marks invariants as "Supported", invariants must NOT actually be present in the table schema.
+// Kernel will fail to read/write any table that actually uses invariants (see check in TableConfiguration::ensure_write_supported).
+// This is to allow legacy tables with the Invariants feature enabled but not in use.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     name: "invariants",
     min_reader_version: 1,
