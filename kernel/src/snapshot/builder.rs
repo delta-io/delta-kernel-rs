@@ -123,7 +123,7 @@ impl SnapshotBuilder {
                 }
             };
 
-            Ok(Snapshot::try_new_from_log_segment_with_metrics(
+            Ok(Snapshot::try_new_from_log_segment(
                 table_root,
                 log_segment,
                 engine,
