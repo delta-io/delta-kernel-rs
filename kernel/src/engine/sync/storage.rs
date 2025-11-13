@@ -74,6 +74,10 @@ impl StorageHandler for SyncStorageHandler {
     fn copy_atomic(&self, _src: &Url, _dest: &Url) -> DeltaResult<()> {
         unimplemented!("SyncStorageHandler does not implement copy");
     }
+
+    fn head(&self, _path: &Url) -> DeltaResult<FileMeta> {
+        unimplemented!("head is not implemented for SyncStorageHandler")
+    }
 }
 
 #[cfg(test)]

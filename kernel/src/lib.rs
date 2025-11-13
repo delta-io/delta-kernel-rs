@@ -539,6 +539,11 @@ pub trait StorageHandler: AsAny {
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(Error::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
+
+    /// Perform a HEAD request for the given file at a Url, returning the file metadata.
+    ///
+    /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
+    fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

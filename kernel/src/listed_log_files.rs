@@ -637,6 +637,9 @@ mod list_log_files_with_log_tail_tests {
             fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
                 panic!("copy used from {src} to {dest}");
             }
+            fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+                panic!("head used");
+            }
         }
 
         // when log_tail covers the entire requested range, no filesystem listing should occur
