@@ -166,7 +166,7 @@ mod tests {
         }
     }
 
-    fn create_getters<'a>(num_records_mock: &'a MockGetData) -> Vec<&'a dyn GetData<'a>> {
+    fn create_getters(num_records_mock: &MockGetData) -> Vec<&dyn GetData<'_>> {
         vec![num_records_mock]
     }
 

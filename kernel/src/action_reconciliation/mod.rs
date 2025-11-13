@@ -23,6 +23,8 @@ use crate::{DeltaResult, Error};
 
 pub(crate) mod log_replay;
 
+pub use log_replay::ActionReconciliationIterator;
+
 const SECONDS_PER_MINUTE: u64 = 60;
 const MINUTES_PER_HOUR: u64 = 60;
 const HOURS_PER_DAY: u64 = 24;
