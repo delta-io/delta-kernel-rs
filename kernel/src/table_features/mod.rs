@@ -489,7 +489,7 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    write_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
     }),
