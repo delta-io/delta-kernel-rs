@@ -230,7 +230,7 @@ mod tests {
         let err = snapshot.transaction(committer).unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Unsupported(e) if e.contains("Writes are not yet supported for catalog-managed tables")
+            crate::Error::Unsupported(e) if e.contains("Feature 'catalogManaged' not supported for writes")
         ));
         // after allowing writes, we will check that this disallows default committer for
         // catalog-managed tables.
