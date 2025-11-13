@@ -91,13 +91,30 @@ impl RowVisitor for ProtocolVisitor {
 }
 
 #[allow(unused)]
-#[derive(Default)]
 #[internal_api]
 pub(crate) struct AddVisitor {
     pub(crate) adds: Vec<Add>,
+    pub(crate) table_schema: Option<Arc<StructType>>,
+}
+
+impl Default for AddVisitor {
+    fn default() -> Self {
+        Self {
+            adds: Vec::new(),
+            table_schema: None,
+        }
+    }
 }
 
 impl AddVisitor {
+    #[internal_api]
+    pub(crate) fn new(table_schema: Option<Arc<StructType>>) -> Self {
+        Self {
+            adds: Vec::new(),
+            table_schema,
+        }
+    }
+
     #[internal_api]
     fn visit_add<'a>(
         row_index: usize,
@@ -129,11 +146,11 @@ impl AddVisitor {
         let clustering_provider: Option<String> =
             getters[15].get_opt(row_index, "add.clustering_provider")?;
 
-        // Phase 3: Extract stats_parsed if available
+        // Phase 3: Extract stats_parsed if available, or generate from JSON stats
         // stats_parsed is at position 6 in the getters array
         let stats_parsed = if getters.len() > 6 {
+            // First try to read existing stats_parsed from checkpoint
             if let Some(schema) = table_schema {
-                // Try to parse stats_parsed from getter at position 6
                 super::stats_parsed_reader::parse_stats_parsed_from_getters(
                     row_index, getters[6], schema,
                 )?
@@ -141,7 +158,22 @@ impl AddVisitor {
                 None
             }
         } else {
-            None
+            // No stats_parsed field in the data (e.g., reading from JSON commits)
+            // Generate stats_parsed from JSON stats if we have both stats and schema
+            if let (Some(ref json_stats), Some(schema)) = (&stats, table_schema) {
+                // Try to parse JSON stats to create stats_parsed
+                // We do this here so that when writing checkpoints, we already have parsed stats
+                match super::stats_conversion::parse_json_stats_to_parsed(json_stats, schema) {
+                    Ok(parsed) => Some(parsed),
+                    Err(_) => {
+                        // If parsing fails, just continue without parsed stats
+                        // This maintains backward compatibility
+                        None
+                    }
+                }
+            } else {
+                None
+            }
         };
 
         Ok(Add {
@@ -174,8 +206,10 @@ impl RowVisitor for AddVisitor {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(i, "add.path")? {
-                // TODO: Pass table schema when available for stats_parsed extraction
-                self.adds.push(Self::visit_add(i, path, getters, None)?);
+                // Pass table schema for stats_parsed extraction
+                let table_schema = self.table_schema.as_deref();
+                self.adds
+                    .push(Self::visit_add(i, path, getters, table_schema)?);
             }
         }
         Ok(())

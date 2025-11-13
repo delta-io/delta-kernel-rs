@@ -106,6 +106,9 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 
 use url::Url;
 
+mod stats_transformer;
+use self::stats_transformer::StatsTransformationProcessor;
+
 #[cfg(test)]
 mod tests;
 
@@ -268,6 +271,13 @@ impl CheckpointWriter {
             .table_configuration()
             .is_v2_checkpoint_write_supported();
 
+        // Check if we should write stats as struct
+        let write_stats_as_struct = self
+            .snapshot
+            .table_properties()
+            .checkpoint_write_stats_as_struct
+            .unwrap_or(false);
+
         let actions = self.snapshot.log_segment().read_actions(
             engine,
             CHECKPOINT_ACTIONS_SCHEMA.clone(),
@@ -280,6 +290,18 @@ impl CheckpointWriter {
             self.get_transaction_expiration_timestamp()?,
         )
         .process_actions_iter(actions);
+
+        // If write_stats_as_struct is enabled, transform the actions to populate stats_parsed
+        let checkpoint_data: Box<
+            dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
+        > = if write_stats_as_struct {
+            // Create stats transformation processor
+            let table_schema = self.snapshot.schema();
+            let transformer = StatsTransformationProcessor::new(table_schema, true);
+            Box::new(transformer.process_actions_iter(checkpoint_data))
+        } else {
+            Box::new(checkpoint_data)
+        };
 
         let checkpoint_metadata =
             is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));

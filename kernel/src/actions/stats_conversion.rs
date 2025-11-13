@@ -12,7 +12,8 @@ use crate::{DeltaResult, Error};
 /// Convert JSON stats string to StatsParsed
 ///
 /// This is used when writing checkpoints to generate stats_parsed from JSON stats
-pub fn parse_json_stats_to_parsed(
+#[allow(dead_code)]
+pub(crate) fn parse_json_stats_to_parsed(
     json_stats: &str,
     table_schema: &StructType,
 ) -> DeltaResult<StatsParsed> {
@@ -189,7 +190,8 @@ fn json_value_to_stat_value(value: &Value, data_type: &DataType) -> DeltaResult<
 ///
 /// This is used as a fallback when only parsed stats are available
 /// but JSON stats are needed for compatibility
-pub fn serialize_stats_to_json(parsed: &StatsParsed) -> DeltaResult<String> {
+#[allow(dead_code)]
+pub(crate) fn serialize_stats_to_json(parsed: &StatsParsed) -> DeltaResult<String> {
     let mut obj = serde_json::Map::new();
 
     // Add numRecords
@@ -240,6 +242,7 @@ pub fn serialize_stats_to_json(parsed: &StatsParsed) -> DeltaResult<String> {
 }
 
 /// Convert StatValue to JSON Value
+#[allow(dead_code)]
 fn stat_value_to_json(value: &Scalar) -> Value {
     match value {
         Scalar::Boolean(b) => json!(*b),
