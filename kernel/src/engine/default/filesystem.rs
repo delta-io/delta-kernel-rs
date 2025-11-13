@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
@@ -15,36 +15,68 @@ use crate::metrics::{MetricEvent, MetricsReporter};
 use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 
 /// Iterator wrapper that emits metrics when exhausted
-struct ListMetricsIterator<I> {
+///
+/// Generic over the inner iterator type and item type.
+/// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate MetricEvent.
+struct MetricsIterator<I, T>
+where
+    I: Iterator<Item = DeltaResult<T>>,
+{
     inner: I,
     reporter: Option<Arc<dyn MetricsReporter>>,
     start: Instant,
-    count: u64,
+    num_files: u64,
+    bytes_read: u64,
     metrics_emitted: bool,
+    event_fn: fn(Duration, u64, u64) -> MetricEvent,
 }
 
-impl<I> ListMetricsIterator<I> {
+impl<I, T> MetricsIterator<I, T>
+where
+    I: Iterator<Item = DeltaResult<T>>,
+{
+    fn new(
+        inner: I,
+        reporter: Option<Arc<dyn MetricsReporter>>,
+        start: Instant,
+        event_fn: fn(Duration, u64, u64) -> MetricEvent,
+    ) -> Self {
+        Self {
+            inner,
+            reporter,
+            start,
+            num_files: 0,
+            bytes_read: 0,
+            metrics_emitted: false,
+            event_fn,
+        }
+    }
+
     fn emit_metrics_once(&mut self) {
         if !self.metrics_emitted {
             self.reporter.as_ref().inspect(|r| {
-                r.report(MetricEvent::StorageListCompleted {
-                    duration: self.start.elapsed(),
-                    num_files: self.count,
-                });
+                r.report((self.event_fn)(
+                    self.start.elapsed(),
+                    self.num_files,
+                    self.bytes_read,
+                ));
             });
             self.metrics_emitted = true;
         }
     }
 }
 
-impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator<I> {
+impl<I> Iterator for MetricsIterator<I, FileMeta>
+where
+    I: Iterator<Item = DeltaResult<FileMeta>>,
+{
     type Item = DeltaResult<FileMeta>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next() {
             Some(item) => {
                 if item.is_ok() {
-                    self.count += 1;
+                    self.num_files += 1;
                 }
                 Some(item)
             }
@@ -56,44 +88,17 @@ impl<I: Iterator<Item = DeltaResult<FileMeta>>> Iterator for ListMetricsIterator
     }
 }
 
-impl<I> Drop for ListMetricsIterator<I> {
-    fn drop(&mut self) {
-        self.emit_metrics_once();
-    }
-}
-
-/// Iterator wrapper for read operations that tracks bytes read
-struct ReadMetricsIterator<I> {
-    inner: I,
-    reporter: Option<Arc<dyn MetricsReporter>>,
-    start: Instant,
-    num_files: u64,
-    bytes_read: u64,
-    metrics_emitted: bool,
-}
-
-impl<I> ReadMetricsIterator<I> {
-    fn emit_metrics_once(&mut self) {
-        if !self.metrics_emitted {
-            self.reporter.as_ref().inspect(|r| {
-                r.report(MetricEvent::StorageReadCompleted {
-                    duration: self.start.elapsed(),
-                    num_files: self.num_files,
-                    bytes_read: self.bytes_read,
-                });
-            });
-            self.metrics_emitted = true;
-        }
-    }
-}
-
-impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I> {
+impl<I> Iterator for MetricsIterator<I, Bytes>
+where
+    I: Iterator<Item = DeltaResult<Bytes>>,
+{
     type Item = DeltaResult<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next() {
             Some(item) => {
                 if let Ok(ref bytes) = item {
+                    self.num_files += 1;
                     self.bytes_read += bytes.len() as u64;
                 }
                 Some(item)
@@ -106,7 +111,10 @@ impl<I: Iterator<Item = DeltaResult<Bytes>>> Iterator for ReadMetricsIterator<I>
     }
 }
 
-impl<I> Drop for ReadMetricsIterator<I> {
+impl<I, T> Drop for MetricsIterator<I, T>
+where
+    I: Iterator<Item = DeltaResult<T>>,
+{
     fn drop(&mut self) {
         self.emit_metrics_once();
     }
@@ -231,13 +239,15 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
 
             Ok(Box::new(fms.into_iter().map(Ok)))
         } else {
-            Ok(Box::new(ListMetricsIterator {
-                inner: receiver.into_iter(),
+            Ok(Box::new(MetricsIterator::new(
+                receiver.into_iter(),
                 reporter,
                 start,
-                count: 0,
-                metrics_emitted: false,
-            }))
+                |duration, num_files, _bytes_read| MetricEvent::StorageListCompleted {
+                    duration,
+                    num_files,
+                },
+            )))
         }
     }
 
@@ -252,7 +262,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
         let store = self.inner.clone();
-        let num_files = files.len() as u64;
+        let start = Instant::now();
 
         // This channel will become the output iterator.
         // Because there will already be buffering in the stream, we set the
@@ -299,14 +309,16 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
                 }),
         );
 
-        Ok(Box::new(ReadMetricsIterator {
-            inner: receiver.into_iter(),
-            reporter: self.reporter.clone(),
-            start: Instant::now(),
-            num_files,
-            bytes_read: 0,
-            metrics_emitted: false,
-        }))
+        Ok(Box::new(MetricsIterator::new(
+            receiver.into_iter(),
+            self.reporter.clone(),
+            start,
+            |duration, num_files, bytes_read| MetricEvent::StorageReadCompleted {
+                duration,
+                num_files,
+                bytes_read,
+            },
+        )))
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
