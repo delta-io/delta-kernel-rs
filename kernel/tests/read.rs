@@ -1519,10 +1519,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
 
     let invalid_files = [
         "_delta_log/0.zip",
