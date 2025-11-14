@@ -1,5 +1,18 @@
 # Changelog
 
+## [v0.17.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.17.1/) (2025-11-13)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.17.0...v0.17.1)
+
+
+### 📚 Documentation
+
+1. Fix docs for rustc 1.92+ ([#1470])
+
+
+[#1470]: https://github.com/delta-io/delta-kernel-rs/pull/1470
+
+
 ## [v0.17.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.17.0/) (2025-11-10)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.16.0...v0.17.0)
