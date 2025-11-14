@@ -221,14 +221,24 @@ impl RowVisitor for AddVisitor {
 #[internal_api]
 pub(crate) struct RemoveVisitor {
     pub(crate) removes: Vec<Remove>,
+    pub(crate) table_schema: Option<Arc<StructType>>,
 }
 
 impl RemoveVisitor {
+    #[internal_api]
+    pub(crate) fn new(table_schema: Option<Arc<StructType>>) -> Self {
+        Self {
+            removes: Vec::new(),
+            table_schema,
+        }
+    }
+
     #[internal_api]
     pub(crate) fn visit_remove<'a>(
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
+        table_schema: Option<&StructType>,
     ) -> DeltaResult<Remove> {
         require!(
             getters.len() == 16,
@@ -248,7 +258,30 @@ impl RemoveVisitor {
 
         let size: Option<i64> = getters[5].get_opt(row_index, "remove.size")?;
         let stats: Option<String> = getters[6].get_opt(row_index, "remove.stats")?;
-        // stats_parsed is at getters[7] - we skip it for Remove
+
+        // Extract stats_parsed if available (same logic as Add actions)
+        let stats_parsed = if getters.len() > 7 {
+            // Try to read existing stats_parsed from checkpoint
+            if let Some(schema) = table_schema {
+                super::stats_parsed_reader::parse_stats_parsed_from_getters(
+                    row_index, getters[7], schema,
+                )?
+            } else {
+                None
+            }
+        } else {
+            // No stats_parsed field in the data (e.g., reading from JSON commits)
+            // Generate stats_parsed from JSON stats if we have both stats and schema
+            if let (Some(ref json_stats), Some(schema)) = (&stats, table_schema) {
+                match super::stats_conversion::parse_json_stats_to_parsed(json_stats, schema) {
+                    Ok(parsed) => Some(parsed),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        };
+
         // TODO(nick) tags are skipped in getters[8]
 
         let deletion_vector = visit_deletion_vector_at(row_index, &getters[9..])?;
@@ -265,7 +298,7 @@ impl RemoveVisitor {
             partition_values,
             size,
             stats,
-            stats_parsed: None, // TODO: Implement stats_parsed extraction in Phase 3
+            stats_parsed,
             tags: None,
             deletion_vector,
             base_row_id,
@@ -287,7 +320,9 @@ impl RowVisitor for RemoveVisitor {
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Remove action
             if let Some(path) = getters[0].get_opt(i, "remove.path")? {
-                self.removes.push(Self::visit_remove(i, path, getters)?);
+                let table_schema = self.table_schema.as_deref();
+                self.removes
+                    .push(Self::visit_remove(i, path, getters, table_schema)?);
             }
         }
         Ok(())

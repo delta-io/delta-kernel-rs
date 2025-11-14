@@ -271,12 +271,19 @@ impl CheckpointWriter {
             .table_configuration()
             .is_v2_checkpoint_write_supported();
 
-        // Check if we should write stats as struct
+        // Read table properties for stats configuration
+        // Default to true (match DBR behavior) for both properties
+        let write_stats_as_json = self
+            .snapshot
+            .table_properties()
+            .checkpoint_write_stats_as_json
+            .unwrap_or(true);
+
         let write_stats_as_struct = self
             .snapshot
             .table_properties()
             .checkpoint_write_stats_as_struct
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let actions = self.snapshot.log_segment().read_actions(
             engine,
@@ -291,15 +298,24 @@ impl CheckpointWriter {
         )
         .process_actions_iter(actions);
 
-        // If write_stats_as_struct is enabled, transform the actions to populate stats_parsed
+        // Transform actions based on table properties:
+        // - write_stats_as_json: Whether to keep JSON stats field
+        // - write_stats_as_struct: Whether to populate stats_parsed field
         let checkpoint_data: Box<
             dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
-        > = if write_stats_as_struct {
-            // Create stats transformation processor
+        > = if write_stats_as_struct || !write_stats_as_json {
+            // Need transformation if:
+            // 1. We need to populate stats_parsed (write_stats_as_struct = true)
+            // 2. We need to remove stats JSON (write_stats_as_json = false)
             let table_schema = self.snapshot.schema();
-            let transformer = StatsTransformationProcessor::new(table_schema, true);
+            let transformer = StatsTransformationProcessor::new(
+                table_schema,
+                write_stats_as_struct,
+                write_stats_as_json,
+            );
             Box::new(transformer.process_actions_iter(checkpoint_data))
         } else {
+            // Both false or only JSON enabled - no transformation needed
             Box::new(checkpoint_data)
         };
 
