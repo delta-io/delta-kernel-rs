@@ -50,7 +50,7 @@
 //! connectors are asked to provide the context information they require to execute the actual
 //! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
-#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
+#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_cfg))]
 #![warn(
     unreachable_pub,
     trivial_numeric_casts,
@@ -148,12 +148,12 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-pub use crate::engine_data::FilteredEngineData;
+pub use action_reconciliation::ActionReconciliationIterator;
 pub use delta_kernel_derive;
-pub use engine_data::{EngineData, RowVisitor};
+pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use log_compaction::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
+pub use log_compaction::{should_compact, LogCompactionWriter};
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 
