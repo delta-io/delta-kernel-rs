@@ -661,8 +661,7 @@ mod tests {
             .enable_all()
             .build()?;
 
-        let executor = Arc::new(TokioMultiThreadExecutor::new(runtime.handle().clone()));
-        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()), executor);
+        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
 
         let file_vec = vec![FileMeta::new(file_url, 1, 1)];
 
