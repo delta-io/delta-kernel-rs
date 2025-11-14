@@ -448,6 +448,13 @@ impl TableConfiguration {
         self.protocol.min_writer_version() < 7
     }
 
+    /// Helper to check if a feature is present in a feature list.
+    fn has_feature(features: Option<&[TableFeature]>, feature: &TableFeature) -> bool {
+        features
+            .map(|features| features.contains(feature))
+            .unwrap_or(false)
+    }
+
     /// Helper method to check if a feature is supported based on its FeatureInfo.
     /// This checks protocol versions and feature lists but does NOT check enablement properties.
     #[allow(dead_code)]
@@ -459,10 +466,7 @@ impl TableConfiguration {
                     self.protocol.min_writer_version() >= info.min_writer_version
                 } else {
                     // Table features writer: feature is in writer_features list
-                    self.protocol
-                        .writer_features()
-                        .map(|features| features.contains(feature))
-                        .unwrap_or(false)
+                    Self::has_feature(self.protocol.writer_features(), feature)
                 }
             }
             FeatureType::ReaderWriter => {
@@ -471,10 +475,7 @@ impl TableConfiguration {
                     self.protocol.min_reader_version() >= info.min_reader_version
                 } else {
                     // Table features reader: feature is in reader_features list
-                    self.protocol
-                        .reader_features()
-                        .map(|features| features.contains(feature))
-                        .unwrap_or(false)
+                    Self::has_feature(self.protocol.reader_features(), feature)
                 };
 
                 let writer_supported = if self.uses_legacy_writer() {
@@ -482,10 +483,7 @@ impl TableConfiguration {
                     self.protocol.min_writer_version() >= info.min_writer_version
                 } else {
                     // Table features writer: feature is in writer_features list
-                    self.protocol
-                        .writer_features()
-                        .map(|features| features.contains(feature))
-                        .unwrap_or(false)
+                    Self::has_feature(self.protocol.writer_features(), feature)
                 };
 
                 reader_supported && writer_supported
