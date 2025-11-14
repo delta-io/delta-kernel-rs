@@ -105,7 +105,6 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 
         let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
-
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
         let files = files.to_vec();
         let buffer_size = self.buffer_size;
@@ -126,6 +125,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             while let Some(item) = stream.next().await {
                 if tx.send(item).is_err() {
                     warn!("read_json receiver end of channel dropped before sending completed");
+                    break;
                 }
             }
         });
@@ -199,7 +199,19 @@ impl JsonOpener {
                 let reader = ReaderBuilder::new(schema)
                     .with_batch_size(batch_size)
                     .build(BufReader::new(file))?;
-                Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
+
+                let mut seen_error = false;
+                Ok(futures::stream::iter(reader)
+                    .map_err(Error::from)
+                    .take_while(move |result| {
+                        // Emit exactly one error, then stop the stream. We check seen_error BEFORE
+                        // updating it so the first error passes through, but subsequent items don't.
+                        // This is necessary because Arrow's Reader loops the same error indefinitely.
+                        let return_this = !seen_error;
+                        seen_error = seen_error || result.is_err();
+                        futures::future::ready(return_this)
+                    })
+                    .boxed())
             }
             GetResultPayload::Stream(s) => {
                 let mut decoder = ReaderBuilder::new(schema)
@@ -271,6 +283,7 @@ mod tests {
         PutPayload, PutResult, Result,
     };
     use serde_json::json;
+    use tracing::info;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -621,6 +634,72 @@ mod tests {
             ordered_paths.into_iter().collect_vec(),
             "Expected paths to complete in order"
         );
+    }
+
+    use crate::engine::default::DefaultEngine;
+    use crate::schema::StructType;
+    use crate::Engine;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    use tempfile::NamedTempFile;
+    use tokio::runtime::Builder;
+
+    #[test]
+    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt().try_init();
+
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
+        let path = temp_file.path();
+        let file_url = Url::from_file_path(path).expect("Failed to create file URL");
+
+        info!("Created temporary malformed file at: {file_url}");
+
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()?;
+
+        let executor = Arc::new(TokioMultiThreadExecutor::new(runtime.handle().clone()));
+        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()), executor);
+
+        let file_vec = vec![FileMeta::new(file_url, 1, 1)];
+
+        let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
+        let struct_type = StructType::try_new(vec![field]).unwrap();
+        let physical_schema = Arc::new(struct_type);
+
+        info!("\nAttempting to read malformed JSON file...");
+        let mut iter =
+            default_engine
+                .json_handler()
+                .read_json_files(&file_vec, physical_schema, None)?;
+
+        let read_result = iter.next().unwrap();
+
+        if read_result.is_ok() {
+            panic!("Read succeeded unexpectedly. The JSON should have been invalid.");
+        }
+
+        // The Tokio runtime will use the entire duration to
+        // shutdown!
+        //
+        // note that a non-existent file does not cause any hanging
+        // here, which is interesting
+        info!("\nAttempting to shut down runtime...");
+
+        let start = Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Runtime shutdown took {:?}, expected < 1s",
+            elapsed
+        );
+        info!("Runtime shutdown complete.");
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
