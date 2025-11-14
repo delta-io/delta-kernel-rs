@@ -1554,52 +1554,302 @@ mod tests {
         assert!(updated_paths.contains(&ColumnName::new(["identifier"])));
         assert!(updated_paths.contains(&ColumnName::new(["user", "full_name"])));
     }
+    #[test]
+    fn test_array_element_struct_field_changes() {
+        let before = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([
+                    create_field_with_id("name", DataType::STRING, false, 2),
+                    create_field_with_id("removed_field", DataType::INTEGER, true, 3),
+                ])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::try_struct_type([
+                    create_field_with_id("title", DataType::STRING, false, 2), // Renamed!
+                    create_field_with_id("added_field", DataType::STRING, true, 4), // Added!
+                ])
+                .unwrap(),
+                true,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 1);
+        assert_eq!(diff.removed_fields.len(), 1);
+        assert_eq!(diff.updated_fields.len(), 1);
+
+        // Check added field
+        assert_eq!(
+            diff.added_fields[0].path,
+            ColumnName::new(["items", "element", "added_field"])
+        );
+
+        // Check removed field
+        assert_eq!(
+            diff.removed_fields[0].path,
+            ColumnName::new(["items", "element", "removed_field"])
+        );
+
+        // Check updated field (rename)
+        let update = &diff.updated_fields[0];
+        assert_eq!(update.path, ColumnName::new(["items", "element", "title"]));
+        assert_eq!(update.change_types, vec![FieldChangeType::Renamed]);
+
+        assert!(!diff.has_breaking_changes()); // Removal is safe, rename is safe
+    }
 
     #[test]
-    fn test_top_level_and_nested_change_filters() {
-        // Test that top_level_changes and nested_changes correctly filter by path depth.
-        // This test manually constructs a SchemaDiff to exercise the filtering logic.
+    fn test_doubly_nested_array_type_change() {
+        // Test that we can detect type changes in doubly nested arrays: array<array<int>> -> array<array<double>>
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
 
-        let top_level_field = create_field_with_id("name", DataType::STRING, false, 1);
-        let nested_field = create_field_with_id("street", DataType::STRING, false, 2);
-        let deeply_nested_field = create_field_with_id("city", DataType::STRING, false, 3);
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::DOUBLE, false))),
+                false,
+            ))),
+            false,
+            1,
+        )]);
 
-        // Create a diff with mixed top-level and nested changes
-        let diff = SchemaDiff {
-            added_fields: vec![
-                FieldChange {
-                    field: top_level_field.clone(),
-                    path: ColumnName::new(["name"]), // Top-level (depth 1)
-                },
-                FieldChange {
-                    field: nested_field.clone(),
-                    path: ColumnName::new(["address", "street"]), // Nested (depth 2)
-                },
-            ],
-            removed_fields: vec![FieldChange {
-                field: deeply_nested_field.clone(),
-                path: ColumnName::new(["user", "address", "city"]), // Deeply nested (depth 3)
-            }],
-            updated_fields: vec![],
-            has_breaking_changes: false,
-        };
+        let diff = SchemaDiff::new(&before, &after).unwrap();
 
-        // Test top_level_changes - should only return depth 1 fields
-        let (top_added, top_removed, top_updated) = diff.top_level_changes();
-        assert_eq!(top_added.len(), 1);
-        assert_eq!(top_added[0].path, ColumnName::new(["name"]));
-        assert_eq!(top_removed.len(), 0);
-        assert_eq!(top_updated.len(), 0);
-
-        // Test nested_changes - should only return depth > 1 fields
-        let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
-        assert_eq!(nested_added.len(), 1);
-        assert_eq!(nested_added[0].path, ColumnName::new(["address", "street"]));
-        assert_eq!(nested_removed.len(), 1);
+        // The entire field should be reported as TypeChanged since we can't recurse into
+        // non-struct array elements (no field IDs at intermediate levels)
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
         assert_eq!(
-            nested_removed[0].path,
-            ColumnName::new(["user", "address", "city"])
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::TypeChanged]
         );
-        assert_eq!(nested_updated.len(), 0);
+
+        assert!(diff.has_breaking_changes()); // Type change is breaking
+    }
+
+    #[test]
+    fn test_nested_array_nullability_loosened() {
+        // Test: array<array<int> not null> -> array<array<int>>
+        // Outer array element nullability loosened (safe change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                false, // Outer array elements are non-nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                true, // Outer array elements now nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_nested_array_nullability_tightened() {
+        // Test: array<array<int>> -> array<array<int> not null>
+        // Outer array element nullability tightened (breaking change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                true, // Outer array elements are nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))),
+                false, // Outer array elements now non-nullable
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_nested_array_inner_nullability_loosened() {
+        // Test: array<array<int not null>> -> array<array<int>>
+        // Inner array element nullability loosened (safe change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), // Inner elements non-nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Inner elements now nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_nested_array_inner_nullability_tightened() {
+        // Test: array<array<int>> -> array<array<int not null>>
+        // Inner array element nullability tightened (breaking change)
+        let before = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, true))), // Inner elements nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "matrix",
+            DataType::Array(Box::new(ArrayType::new(
+                DataType::Array(Box::new(ArrayType::new(DataType::INTEGER, false))), // Inner elements now non-nullable
+                false,
+            ))),
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(diff.updated_fields[0].path, ColumnName::new(["matrix"]));
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
+    }
+
+    #[test]
+    fn test_array_nullability_loosened() {
+        let before = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable elements
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), // Nullable elements now
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityLoosened]
+        );
+        assert!(!diff.has_breaking_changes()); // Loosening is safe
+    }
+
+    #[test]
+    fn test_array_nullability_tightened() {
+        let before = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))), // Nullable elements
+            false,
+            1,
+        )]);
+
+        let after = StructType::new_unchecked([create_field_with_id(
+            "items",
+            DataType::Array(Box::new(ArrayType::new(DataType::STRING, false))), // Non-nullable now
+            false,
+            1,
+        )]);
+
+        let diff = SchemaDiff::new(&before, &after).unwrap();
+
+        assert_eq!(diff.added_fields.len(), 0);
+        assert_eq!(diff.removed_fields.len(), 0);
+        assert_eq!(diff.updated_fields.len(), 1);
+        assert_eq!(
+            diff.updated_fields[0].change_types,
+            vec![FieldChangeType::ContainerNullabilityTightened]
+        );
+        assert!(diff.has_breaking_changes()); // Tightening is breaking
     }
 }
