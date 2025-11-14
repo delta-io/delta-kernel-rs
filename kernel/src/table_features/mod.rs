@@ -74,6 +74,8 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "clustering")]
     #[serde(rename = "clustering")]
     ClusteredTable,
+    /// Materialize partition columns in parquet data files.
+    MaterializePartitionColumns,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -440,6 +442,18 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
 };
 
 #[allow(dead_code)]
+static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
+    name: "materializePartitionColumns",
+    min_reader_version: 3,
+    min_writer_version: 7,
+    feature_type: FeatureType::Writer,
+    feature_requirements: &[],
+    read_support: KernelSupport::Supported,
+    write_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+#[allow(dead_code)]
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     name: "catalogManaged",
     min_reader_version: 3,
@@ -620,7 +634,8 @@ impl TableFeature {
             | TableFeature::InCommitTimestamp
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
-            | TableFeature::ClusteredTable => FeatureType::Writer,
+            | TableFeature::ClusteredTable
+            | TableFeature::MaterializePartitionColumns => FeatureType::Writer,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -643,6 +658,7 @@ impl TableFeature {
             TableFeature::IcebergCompatV1 => Some(&ICEBERG_COMPAT_V1_INFO),
             TableFeature::IcebergCompatV2 => Some(&ICEBERG_COMPAT_V2_INFO),
             TableFeature::ClusteredTable => Some(&CLUSTERED_TABLE_INFO),
+            TableFeature::MaterializePartitionColumns => Some(&MATERIALIZE_PARTITION_COLUMNS_INFO),
 
             // ReaderWriter features
             TableFeature::CatalogManaged => Some(&CATALOG_MANAGED_INFO),
@@ -721,6 +737,7 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyL
         TableFeature::DomainMetadata,
         TableFeature::InCommitTimestamp,
         TableFeature::Invariants,
+        TableFeature::MaterializePartitionColumns,
         TableFeature::RowTracking,
         TableFeature::TimestampWithoutTimezone,
         TableFeature::VariantType,
@@ -825,6 +842,10 @@ mod tests {
             (TableFeature::IcebergCompatV2, "icebergCompatV2"),
             (TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (TableFeature::ClusteredTable, "clustering"),
+            (
+                TableFeature::MaterializePartitionColumns,
+                "materializePartitionColumns",
+            ),
             (TableFeature::VariantType, "variantType"),
             (TableFeature::VariantTypePreview, "variantType-preview"),
             (
