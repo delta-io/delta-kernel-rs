@@ -5,9 +5,13 @@ use url::Url;
 
 use crate::{KernelStringSlice, TryFromStringSlice};
 
-/// FFI-safe array of LogPaths
+/// FFI-safe array of LogPaths. Note that we _explicitly_ do not implement `Copy` on this struct
+/// despite all types being `Copy`, to avoid accidental misuse of the pointer.
+///
+/// This struct is essentially a borrowed view into an array. The owner must ensure the underlying
+/// array remains valid for the duration of its use.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LogPathArray {
     /// Pointer to the first element of the FfiLogPath array. If len is 0, this pointer may be null,
     /// otherwise it must be non-null.
@@ -80,6 +84,10 @@ impl FfiLogPath {
     }
 
     /// Convert this FFI log path into a kernel LogPath
+    ///
+    /// # Safety
+    ///
+    /// The `self.location` string slice must be valid UTF-8 and represent a valid URL.
     unsafe fn log_path(&self) -> DeltaResult<LogPath> {
         let location_str = unsafe { TryFromStringSlice::try_from_slice(&self.location) }?;
         let url = Url::parse(location_str)?;

@@ -619,7 +619,7 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     // Convert LogPathArray to Vec<LogPath>
     let log_tail = match unsafe { log_paths.log_paths() } {
         Ok(paths) => paths,
-        Err(e) => return DeltaResult::Err(e).into_extern_result(&engine_ref),
+        Err(err) => return Err(err).into_extern_result(&engine_ref),
     };
 
     snapshot_impl(url, engine_ref, None, log_tail).into_extern_result(&engine_ref)
@@ -662,7 +662,7 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
     // Convert LogPathArray to Vec<LogPath>
     let log_tail = match unsafe { log_tail.log_paths() } {
         Ok(paths) => paths,
-        Err(e) => return DeltaResult::Err(e).into_extern_result(&engine_ref),
+        Err(err) => return Err(err).into_extern_result(&engine_ref),
     };
 
     snapshot_impl(url, engine_ref, version.into(), log_tail).into_extern_result(&engine_ref)
@@ -1051,7 +1051,7 @@ mod tests {
         );
         let log_path =
             log_path::FfiLogPath::new(kernel_string_slice!(commit1_path), 123456789, 100);
-        let log_tail = vec![log_path];
+        let log_tail = [log_path];
         let log_tail = log_path::LogPathArray {
             ptr: log_tail.as_ptr(),
             len: log_tail.len(),
