@@ -1690,6 +1690,7 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -2899,8 +2900,6 @@ mod tests {
 
     #[test]
     fn test_physical_name_with_mode_none() {
-        use crate::table_features::ColumnMappingMode;
-
         let field_json = r#"{
             "name": "logical_name",
             "type": "string",
@@ -2917,8 +2916,6 @@ mod tests {
 
     #[test]
     fn test_physical_name_with_mode_id() {
-        use crate::table_features::ColumnMappingMode;
-
         let field_json = r#"{
             "name": "logical_name",
             "type": "string",
@@ -2939,8 +2936,6 @@ mod tests {
 
     #[test]
     fn test_physical_name_with_mode_name() {
-        use crate::table_features::ColumnMappingMode;
-
         let field_json = r#"{
             "name": "logical_name",
             "type": "string",
@@ -2960,8 +2955,6 @@ mod tests {
 
     #[test]
     fn test_physical_name_fallback_id() {
-        use crate::table_features::ColumnMappingMode;
-
         let field_json = r#"{
             "name": "logical_name",
             "type": "string",
@@ -2976,8 +2969,6 @@ mod tests {
 
     #[test]
     fn test_physical_name_fallback_name() {
-        use crate::table_features::ColumnMappingMode;
-
         let field_json = r#"{
             "name": "logical_name",
             "type": "string",
