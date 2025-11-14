@@ -429,7 +429,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -958,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_success() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
         let table_url = url::Url::parse("memory://test/").unwrap();
 
         // Create a commit file with ICT using add_commit
@@ -987,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_in_commit_timestamp_missing_ict() {
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
         let table_url = url::Url::parse("memory://test/").unwrap();
 
         // Create a commit file without ICT

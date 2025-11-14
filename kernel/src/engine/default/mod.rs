@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -42,35 +41,34 @@ pub struct DefaultEngine<E: TaskExecutor> {
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
-impl<E: TaskExecutor> DefaultEngine<E> {
-    /// Create a new [`DefaultEngine`] instance
+impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+    /// Create a new [`DefaultEngine`] instance with the default executor.
+    ///
+    /// Uses `TokioBackgroundExecutor` as the default executor.
+    /// For custom executors, use [`DefaultEngine::new_with_executor`].
     ///
     /// # Parameters
     ///
-    /// - `table_root`: The URL of the table within storage.
-    /// - `options`: key/value pairs of options to pass to the object store.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn try_new<K, V>(
-        table_root: &Url,
-        options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
-    ) -> DeltaResult<Self>
-    where
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        // table root is the path of the table in the ObjectStore
-        let (object_store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(object_store), task_executor))
+    /// - `object_store`: The object store to use.
+    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+        Self::new_with_executor(
+            object_store,
+            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+        )
     }
+}
 
-    /// Create a new [`DefaultEngine`] instance
+impl<E: TaskExecutor> DefaultEngine<E> {
+    /// Create a new [`DefaultEngine`] instance with a custom executor.
+    ///
+    /// Most users should use [`DefaultEngine::new`] instead. This method is only
+    /// needed for specialized testing scenarios (e.g., multi-threaded executors).
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn new_with_executor(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
@@ -163,7 +161,6 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use object_store::local::LocalFileSystem;
@@ -173,7 +170,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(object_store);
         test_arrow_engine(&engine, &url);
     }
 
