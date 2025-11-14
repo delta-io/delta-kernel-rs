@@ -1038,7 +1038,7 @@ mod tests {
             actions_to_string(vec![TestAction::Add("path1".into())]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone());
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
