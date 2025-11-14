@@ -2,6 +2,7 @@
 //! has schema etc.)
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::{
@@ -13,6 +14,7 @@ use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
+use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -183,6 +185,7 @@ impl Snapshot {
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
                 engine,
+                None,
             );
             return Ok(Arc::new(snapshot?));
         }
@@ -256,14 +259,40 @@ impl Snapshot {
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
+        operation_id: Option<MetricId>,
     ) -> DeltaResult<Self> {
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        let operation_id = operation_id.unwrap_or_default();
+        let reporter = engine.get_metrics_reporter();
+        let start = Instant::now();
+
         let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-        Ok(Self {
-            log_segment,
-            table_configuration,
-        })
+            Self::build_table_configuration(&log_segment, engine, location, operation_id);
+        let snapshot_duration = start.elapsed();
+
+        match table_configuration {
+            Ok(table_configuration) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotCompleted {
+                        operation_id,
+                        version: table_configuration.version(),
+                        total_duration: snapshot_duration,
+                    });
+                });
+                Ok(Self {
+                    log_segment,
+                    table_configuration,
+                })
+            }
+            Err(e) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotFailed {
+                        operation_id,
+                        duration: snapshot_duration,
+                    });
+                });
+                Err(e)
+            }
+        }
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -428,6 +457,30 @@ impl Snapshot {
             }
             None => Err(Error::generic("Last commit file not found in log segment")),
         }
+    }
+
+    fn build_table_configuration(
+        log_segment: &LogSegment,
+        engine: &dyn Engine,
+        location: Url,
+        operation_id: MetricId,
+    ) -> DeltaResult<TableConfiguration> {
+        let start = Instant::now();
+        let reporter = engine.get_metrics_reporter();
+        let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        let read_metadata_duration = start.elapsed();
+
+        reporter.as_ref().inspect(|r| {
+            r.report(MetricEvent::ProtocolMetadataLoaded {
+                operation_id,
+                duration: read_metadata_duration,
+            });
+        });
+
+        let table_configuration =
+            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+
+        Ok(table_configuration)
     }
 }
 
@@ -945,7 +998,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
         let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
@@ -1006,7 +1059,7 @@ mod tests {
             });
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
@@ -1040,7 +1093,7 @@ mod tests {
             });
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
 
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.

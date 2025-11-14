@@ -1,6 +1,9 @@
 //! Builder for creating [`Snapshot`] instances.
+use std::time::Instant;
+
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
+use crate::metrics::{MetricEvent, MetricId};
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
@@ -81,22 +84,83 @@ impl SnapshotBuilder {
     ///
     /// - `engine`: Implementation of [`Engine`] apis.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
+        let start = Instant::now();
         let log_tail = self.log_tail.into_iter().map(Into::into).collect();
+
+        let operation_id = MetricId::new();
+        let reporter = engine.get_metrics_reporter();
+
         if let Some(table_root) = self.table_root {
-            let log_segment = LogSegment::for_snapshot(
+            let log_segment_result = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
                 log_tail,
                 self.version,
-            )?;
-            Ok(Snapshot::try_new_from_log_segment(table_root, log_segment, engine)?.into())
+            );
+            let log_segment_loading_duration = start.elapsed();
+
+            let log_segment = match log_segment_result {
+                Ok(seg) => {
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::LogSegmentLoaded {
+                            operation_id,
+                            duration: log_segment_loading_duration,
+                            num_commit_files: seg.ascending_commit_files.len() as u64,
+                            num_checkpoint_files: seg.checkpoint_parts.len() as u64,
+                            num_compaction_files: seg.ascending_compaction_files.len() as u64,
+                        });
+                    });
+                    seg
+                }
+                Err(e) => {
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::SnapshotFailed {
+                            operation_id,
+                            duration: log_segment_loading_duration,
+                        });
+                    });
+                    return Err(e);
+                }
+            };
+
+            Ok(Snapshot::try_new_from_log_segment(
+                table_root,
+                log_segment,
+                engine,
+                Some(operation_id),
+            )?
+            .into())
         } else {
             let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
                 Error::internal_error(
                     "SnapshotBuilder should have either table_root or existing_snapshot",
                 )
             })?;
-            Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version)
+
+            let result = Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version);
+            let snapshot_building_duration = start.elapsed();
+
+            match result {
+                Ok(snapshot) => {
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::SnapshotCompleted {
+                            operation_id,
+                            version: snapshot.version(),
+                            total_duration: snapshot_building_duration,
+                        });
+                    });
+                    Ok(snapshot)
+                }
+                Err(e) => {
+                    reporter.as_ref().inspect(|r| {
+                        r.report(MetricEvent::SnapshotFailed {
+                            operation_id,
+                            duration: snapshot_building_duration,
+                        });
+                    });
+                    Err(e)
+                }
+            }
         }
     }
 }
