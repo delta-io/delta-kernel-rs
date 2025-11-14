@@ -1852,4 +1852,52 @@ mod tests {
         );
         assert!(diff.has_breaking_changes()); // Tightening is breaking
     }
+
+    #[test]
+    fn test_top_level_and_nested_change_filters() {
+        // Test that top_level_changes and nested_changes correctly filter by path depth.
+        // This test manually constructs a SchemaDiff to exercise the filtering logic.
+
+        let top_level_field = create_field_with_id("name", DataType::STRING, false, 1);
+        let nested_field = create_field_with_id("street", DataType::STRING, false, 2);
+        let deeply_nested_field = create_field_with_id("city", DataType::STRING, false, 3);
+
+        // Create a diff with mixed top-level and nested changes
+        let diff = SchemaDiff {
+            added_fields: vec![
+                FieldChange {
+                    field: top_level_field.clone(),
+                    path: ColumnName::new(["name"]), // Top-level (depth 1)
+                },
+                FieldChange {
+                    field: nested_field.clone(),
+                    path: ColumnName::new(["address", "street"]), // Nested (depth 2)
+                },
+            ],
+            removed_fields: vec![FieldChange {
+                field: deeply_nested_field.clone(),
+                path: ColumnName::new(["user", "address", "city"]), // Deeply nested (depth 3)
+            }],
+            updated_fields: vec![],
+            has_breaking_changes: false,
+        };
+
+        // Test top_level_changes - should only return depth 1 fields
+        let (top_added, top_removed, top_updated) = diff.top_level_changes();
+        assert_eq!(top_added.len(), 1);
+        assert_eq!(top_added[0].path, ColumnName::new(["name"]));
+        assert_eq!(top_removed.len(), 0);
+        assert_eq!(top_updated.len(), 0);
+
+        // Test nested_changes - should only return depth > 1 fields
+        let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
+        assert_eq!(nested_added.len(), 1);
+        assert_eq!(nested_added[0].path, ColumnName::new(["address", "street"]));
+        assert_eq!(nested_removed.len(), 1);
+        assert_eq!(
+            nested_removed[0].path,
+            ColumnName::new(["user", "address", "city"])
+        );
+        assert_eq!(nested_updated.len(), 0);
+    }
 }
