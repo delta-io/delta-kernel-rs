@@ -231,13 +231,13 @@ fn test_version_filtering() {
 #[test]
 fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
-    use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use crate::engine::default::DefaultEngine;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
 
     // Set up in-memory store
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // Create basic commits with proper metadata and protocol
     use crate::actions::{Metadata, Protocol};

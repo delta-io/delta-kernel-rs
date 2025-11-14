@@ -118,7 +118,6 @@ impl<'a> UCCatalog<'a> {
 mod tests {
     use std::env;
 
-    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
 
     use super::*;
@@ -175,11 +174,10 @@ mod tests {
 
         let table_url = Url::parse(&table_uri)?;
         let (store, path) = object_store::parse_url_opts(&table_url, options)?;
-        let store: Arc<_> = store.into();
 
         info!("created object store: {:?}\npath: {:?}\n", store, path);
 
-        let engine = DefaultEngine::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.into());
 
         // read table
         let snapshot = catalog
