@@ -787,10 +787,12 @@ impl Transaction {
         // Create the transform expression once, since it only contains literals and column references
         let transform = Expression::transform(
             Transform::new_top_level()
+                // deletionTimestamp
                 .with_inserted_field(
                     Some("path"),
                     Expression::literal(self.commit_timestamp).into(),
                 )
+                // dataChange
                 .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
                 .with_inserted_field(
                     // extended_file_metadata
@@ -822,17 +824,16 @@ impl Transaction {
                 .with_dropped_field("modificationTime"),
         );
         let expr = Arc::new(Expression::struct_from([transform]));
+        let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
+            input_schema.clone(),
+            expr.clone(),
+            target_schema.clone().into(),
+        )?);
 
         Ok(self
             .remove_files_metadata
             .iter()
             .map(move |file_metadata_batch| {
-                let file_action_eval = evaluation_handler.new_expression_evaluator(
-                    input_schema.clone(),
-                    expr.clone(),
-                    target_schema.clone().into(),
-                )?;
-
                 let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
                 FilteredEngineData::try_new(
                     updated_engine_data,

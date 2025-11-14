@@ -2056,9 +2056,155 @@ async fn test_remove_files_verify_files_excluded_from_scan(
                     new_file_count += new_metadata?.scan_files.data().len();
                 }
 
-                assert_eq!(new_file_count, initial_file_count - file_remove_count);
+                // All files were removed, so new_file_count should be zero
+                assert_eq!(new_file_count, 0);
             }
             _ => panic!("Transaction did not succeeed."),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dyn std::error::Error>>
+{
+    // This test verifies that we can selectively remove files by:
+    // 1. Calling remove_files multiple times with different subsets
+    // 2. Modifying the selection vector to choose which files to remove
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let engine = Arc::new(engine);
+
+        // Write data multiple times to create multiple files
+        for i in 1..=5 {
+            write_data_and_check_result_and_stats(
+                table_url.clone(),
+                schema.clone(),
+                engine.clone(),
+                i,
+            )
+            .await?;
+        }
+
+        // Get initial file count
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = snapshot.clone().scan_builder().build()?;
+
+        let mut initial_file_count = 0;
+        for metadata in scan.scan_metadata(engine.as_ref())? {
+            let metadata = metadata?;
+            initial_file_count += metadata
+                .scan_files
+                .selection_vector()
+                .iter()
+                .filter(|&x| *x)
+                .count();
+        }
+
+        assert!(
+            initial_file_count >= 3,
+            "Need at least 3 files for this test, got {}",
+            initial_file_count
+        );
+
+        // Create a transaction to remove files in two batches
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("selective remove test")
+            .with_operation("DELETE".to_string())
+            .with_data_change(true);
+
+        // First batch: Remove only the first file
+        let scan2 = snapshot.clone().scan_builder().build()?;
+        let scan_metadata2 = scan2.scan_metadata(engine.as_ref())?.next().unwrap()?;
+        let (data, mut selection_vector) = scan_metadata2.scan_files.into_parts();
+
+        // Select only the first file for removal
+        let mut first_batch_removed = 0;
+        for selected in selection_vector.iter_mut() {
+            if *selected && first_batch_removed < 1 {
+                // Keep selected for removal
+                first_batch_removed += 1;
+            } else {
+                // Don't remove
+                *selected = false;
+            }
+        }
+
+        assert_eq!(
+            first_batch_removed, 1,
+            "Should remove exactly 1 file in first batch"
+        );
+        txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+
+        // Second batch: Remove only the last file
+        let scan3 = snapshot.clone().scan_builder().build()?;
+        let scan_metadata3 = scan3.scan_metadata(engine.as_ref())?.next().unwrap()?;
+        let (data2, mut selection_vector2) = scan_metadata3.scan_files.into_parts();
+
+        // Find the last selected file and keep only that one selected
+        let mut last_selected_idx = None;
+        for (i, &selected) in selection_vector2.iter().enumerate() {
+            if selected {
+                last_selected_idx = Some(i);
+            }
+        }
+
+        // Deselect all except the last one
+        for (i, selected) in selection_vector2.iter_mut().enumerate() {
+            if Some(i) != last_selected_idx {
+                *selected = false;
+            }
+        }
+
+        let second_batch_removed = selection_vector2.iter().filter(|&x| *x).count();
+        assert_eq!(
+            second_batch_removed, 1,
+            "Should remove exactly 1 file in second batch"
+        );
+        txn.remove_files(FilteredEngineData::try_new(data2, selection_vector2)?);
+
+        // Commit the transaction
+        let result = txn.commit(engine.as_ref())?;
+
+        match result {
+            CommitResult::CommittedTransaction(committed) => {
+                assert_eq!(committed.commit_version(), 6);
+
+                // Verify that exactly 2 files were removed (1 from each batch)
+                let new_snapshot = Snapshot::builder_for(table_url.clone())
+                    .at_version(6)
+                    .build(engine.as_ref())?;
+
+                let new_scan = new_snapshot.scan_builder().build()?;
+                let mut new_file_count = 0;
+                for new_metadata in new_scan.scan_metadata(engine.as_ref())? {
+                    let metadata = new_metadata?;
+                    new_file_count += metadata
+                        .scan_files
+                        .selection_vector()
+                        .iter()
+                        .filter(|&x| *x)
+                        .count();
+                }
+
+                // Verify we removed exactly 2 files (1 + 1)
+                let total_removed = first_batch_removed + second_batch_removed;
+                assert_eq!(total_removed, 2);
+                assert_eq!(new_file_count, initial_file_count - total_removed);
+                assert!(new_file_count > 0, "At least one file should remain");
+            }
+            _ => panic!("Transaction did not succeed"),
         }
     }
     Ok(())
