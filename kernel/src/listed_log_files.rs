@@ -252,80 +252,107 @@ impl ListedLogFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let mut log_files =
-            list_log_files(storage, log_root, log_tail, start_version, end_version)?;
+        let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
-        let mut ascending_commit_files = Vec::new();
-        let mut ascending_compaction_files = Vec::new();
-        let mut checkpoint_parts = vec![];
-        let mut latest_crc_file: Option<ParsedLogPath> = None;
-        let mut latest_commit_file: Option<ParsedLogPath> = None;
-        let mut new_checkpoint_parts = vec![];
-        let mut current_version = None;
-        loop {
-            let file = log_files.next().transpose()?;
+        // Helper that accumulates and groups log files during listing. Each "group" consists of all
+        // files that share the same version number (e.g., commit, checkpoint parts, CRC files).
+        //
+        // We need to group by version because:
+        // 1. A version may have multiple checkpoint parts that must be collected before we can
+        //    determine if the checkpoint is complete
+        // 2. If a complete checkpoint exists, we can discard all commits before it
+        //
+        // Groups are flushed (processed) when we encounter a file with a different version or
+        // reach EOF, at which point we check for complete checkpoints and update our state.
+        #[derive(Default)]
+        struct LogListingGroupBuilder {
+            ascending_commit_files: Vec<ParsedLogPath>,
+            ascending_compaction_files: Vec<ParsedLogPath>,
+            checkpoint_parts: Vec<ParsedLogPath>,
+            latest_crc_file: Option<ParsedLogPath>,
+            latest_commit_file: Option<ParsedLogPath>,
+            new_checkpoint_parts: Vec<ParsedLogPath>,
+            end_version: Option<Version>,
+        }
 
-            // Flush any in-progress group unless the new file exists and belongs to it.
-            if let Some(group_version) =
-                current_version.filter(|v| file.as_ref().is_none_or(|f| f.version != *v))
-            {
-                // Group and find the first complete checkpoint for this version.
-                // All checkpoints for the same version are equivalent, so we only take one.
-                //
-                // If this version has a complete checkpoint, we can drop the existing commit and
-                // compaction files we collected so far -- except we must keep the latest commit.
-                let new_checkpoint_parts = std::mem::take(&mut new_checkpoint_parts);
+        impl LogListingGroupBuilder {
+            fn process_file(&mut self, file: ParsedLogPath) {
+                use LogPathFileType::*;
+                match file.file_type {
+                    Commit | StagedCommit => self.ascending_commit_files.push(file),
+                    CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+                        self.ascending_compaction_files.push(file);
+                    }
+                    CompactedCommit { .. } => (),
+                    SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
+                        self.new_checkpoint_parts.push(file)
+                    }
+                    Crc => {
+                        self.latest_crc_file.replace(file);
+                    }
+                    Unknown => {
+                        // It is possible that there are other files being stashed away into
+                        // _delta_log/  This is not necessarily forbidden, but something we
+                        // want to know about in a debugging scenario
+                        debug!(
+                            "Found file {} with unknown file type {:?} at version {}",
+                            file.filename, file.file_type, file.version
+                        );
+                    }
+                }
+            }
+
+            // Group and find the first complete checkpoint for this version.
+            // All checkpoints for the same version are equivalent, so we only take one.
+            //
+            // If this version has a complete checkpoint, we can drop the existing commit and
+            // compaction files we collected so far -- except we must keep the latest commit.
+            fn flush_group(&mut self, version: Version) {
+                let new_checkpoint_parts = std::mem::take(&mut self.new_checkpoint_parts);
                 if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
                     .into_iter()
                     // `num_parts` is guaranteed to be non-negative and within `usize` range
                     .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
                 {
-                    checkpoint_parts = complete_checkpoint;
+                    self.checkpoint_parts = complete_checkpoint;
                     // Check if there's a commit file at the same version as this checkpoint. We pop
                     // the last element from ascending_commit_files (which is sorted by version) and
                     // set latest_commit_file to it only if it matches the checkpoint version. If it
                     // doesn't match, we set latest_commit_file to None to discard any older commits
                     // from before the checkpoint
-                    latest_commit_file = ascending_commit_files
+                    self.latest_commit_file = self
+                        .ascending_commit_files
                         .pop()
-                        .filter(|commit: &ParsedLogPath| commit.version == group_version);
+                        .filter(|commit| commit.version == version);
                     // Log replay only uses commits/compactions after a complete checkpoint
-                    ascending_commit_files.clear();
-                    ascending_compaction_files.clear();
+                    self.ascending_commit_files.clear();
+                    self.ascending_compaction_files.clear();
                 }
             }
+        }
 
-            // NOTE: We break for EOF only _after_ flushing the last group.
-            let Some(file) = file else {
-                break;
-            };
+        let mut builder = LogListingGroupBuilder {
+            end_version,
+            ..Default::default()
+        };
 
-            // Capture the new version before we consume the file
-            current_version = Some(file.version);
+        let mut log_files = log_files;
+        if let Some(file) = log_files.next().transpose()? {
+            // Process first file to establish an initial group
+            let mut group_version = file.version;
+            builder.process_file(file);
 
-            use LogPathFileType::*;
-            match file.file_type {
-                Commit | StagedCommit => ascending_commit_files.push(file),
-                CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
-                    ascending_compaction_files.push(file);
+            // Process remaining files, flushing the previous groups first if the version changed
+            while let Some(file) = log_files.next().transpose()? {
+                if file.version != group_version {
+                    builder.flush_group(group_version);
+                    group_version = file.version;
                 }
-                CompactedCommit { .. } => (), // Failed the bounds check above
-                SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
-                    new_checkpoint_parts.push(file)
-                }
-                Crc => {
-                    latest_crc_file.replace(file);
-                }
-                Unknown => {
-                    // It is possible that there are other files being stashed away into
-                    // _delta_log/  This is not necessarily forbidden, but something we
-                    // want to know about in a debugging scenario
-                    debug!(
-                        "Found file {} with unknown file type {:?} at version {}",
-                        file.filename, file.file_type, file.version
-                    );
-                }
+                builder.process_file(file);
             }
+
+            // Flush the final group, which must always contain at least one file
+            builder.flush_group(group_version);
         }
 
         // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
@@ -333,16 +360,16 @@ impl ListedLogFiles {
         // highest version commit overall, so we update latest_commit_file to it. If it's empty,
         // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
         // or remains None.
-        if let Some(commit_file) = ascending_commit_files.last() {
-            latest_commit_file = Some(commit_file.clone());
+        if let Some(commit_file) = builder.ascending_commit_files.last() {
+            builder.latest_commit_file = Some(commit_file.clone());
         }
 
         ListedLogFiles::try_new(
-            ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-            latest_commit_file,
+            builder.ascending_commit_files,
+            builder.ascending_compaction_files,
+            builder.checkpoint_parts,
+            builder.latest_crc_file,
+            builder.latest_commit_file,
         )
     }
 
