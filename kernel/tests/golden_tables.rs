@@ -10,7 +10,7 @@ use delta_kernel::arrow::array::{Array, AsArray, StructArray};
 use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
-use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
+use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -172,17 +172,7 @@ async fn latest_snapshot_test(
     let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
+        .map(|result| -> DeltaResult<_> { to_arrow(result?) })
         .try_collect()?;
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;

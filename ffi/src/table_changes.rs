@@ -4,12 +4,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use delta_kernel::arrow::array::{Array, ArrayData, RecordBatch, StructArray};
-use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::ffi::to_ffi;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::scan::ScanResult;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
+use delta_kernel::EngineData;
 use delta_kernel::Error;
 use delta_kernel::{DeltaResult, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
@@ -238,8 +237,10 @@ pub unsafe extern "C" fn table_changes_scan_physical_schema(
     table_changes_scan.physical_schema().clone().into()
 }
 
+type TableChangesData = Mutex<Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>>;
+
 pub struct ScanTableChangesIterator {
-    data: Mutex<Box<dyn Iterator<Item = DeltaResult<ScanResult>> + Send>>,
+    data: TableChangesData,
     engine: Arc<dyn ExternEngine>,
 }
 
@@ -314,21 +315,15 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
         .lock()
         .map_err(|_| Error::generic("poisoned scan table changes iterator mutex"))?;
 
-    let Some(scan_result) = data.next().transpose()? else {
+    let Some(data) = data.next().transpose()? else {
         return Ok(ArrowFFIData::empty());
     };
 
-    let mask = scan_result.full_mask();
-    let data = scan_result.raw_data?;
-    let mut record_batch: RecordBatch = data
+    let record_batch: RecordBatch = data
         .into_any()
         .downcast::<ArrowEngineData>()
         .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
         .into();
-
-    if let Some(mask) = mask {
-        record_batch = filter_record_batch(&record_batch, &mask.into())?;
-    }
 
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
@@ -485,17 +480,7 @@ mod tests {
     ) -> DeltaResult<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
         scan_results
-            .map(|scan_result| -> DeltaResult<_> {
-                let scan_result = scan_result?;
-                let mask = scan_result.full_mask();
-                let data = scan_result.raw_data?;
-                let record_batch = to_arrow(data)?;
-                if let Some(mask) = mask {
-                    Ok(filter_record_batch(&record_batch, &mask.into())?)
-                } else {
-                    Ok(record_batch)
-                }
-            })
+            .map(|data| -> DeltaResult<_> { to_arrow(data?) })
             .try_collect()
     }
 
