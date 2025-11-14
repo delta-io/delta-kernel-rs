@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
-use crate::actions::domain_metadata::domain_metadata_configuration;
+use crate::actions::domain_metadata::{
+    all_domain_metadata_configuration, domain_metadata_configuration,
+};
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
@@ -24,6 +26,7 @@ use delta_kernel_derive::internal_api;
 mod builder;
 pub use builder::SnapshotBuilder;
 
+use delta_kernel::actions::DomainMetadata;
 use tracing::debug;
 use url::Url;
 
@@ -371,6 +374,19 @@ impl Snapshot {
         domain_metadata_configuration(self.log_segment(), domain, engine)
     }
 
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_all_domain_metadata(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
+        let all_metadata = all_domain_metadata_configuration(self.log_segment(), engine)?;
+        Ok(all_metadata
+            .into_iter()
+            .filter(|domain| !domain.is_internal())
+            .collect())
+    }
+
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
     ///
     /// Returns the `inCommitTimestamp` from the CommitInfo action of the commit that created this snapshot.
@@ -443,6 +459,7 @@ mod tests {
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
+    use delta_kernel::actions::DomainMetadata;
 
     /// Helper function to create a commitInfo action with optional ICT
     fn create_commit_info(timestamp: i64, ict: Option<i64>) -> serde_json::Value {
@@ -933,8 +950,41 @@ mod tests {
         assert!(cp.is_none());
     }
 
-    fn valid_last_checkpoint() -> Vec<u8> {
-        r#"{"size":8,"sizeInBytes":21857,"version":1}"#.as_bytes().to_vec()
+    fn valid_last_checkpoint() -> (Vec<u8>, LastCheckpointHint) {
+        let checkpoint = LastCheckpointHint {
+            version: 1,
+            size: 8,
+            parts: None,
+            size_in_bytes: Some(21857),
+            num_of_add_files: None,
+            checkpoint_schema: None,
+            checksum: None,
+            tags: None,
+        };
+        let data = checkpoint.to_json_bytes();
+        (data, checkpoint)
+    }
+
+    fn valid_last_checkpoint_with_tags() -> (Vec<u8>, LastCheckpointHint) {
+        use std::collections::HashMap;
+
+        let (_, base_checkpoint) = valid_last_checkpoint();
+
+        let mut tags = HashMap::new();
+        tags.insert(
+            "author".to_string(),
+            "test_read_table_with_last_checkpoint".to_string(),
+        );
+        tags.insert("environment".to_string(), "snapshot_tests".to_string());
+        tags.insert("created_by".to_string(), "delta-kernel-rs".to_string());
+
+        let checkpoint = LastCheckpointHint {
+            tags: Some(tags),
+            ..base_checkpoint
+        };
+
+        let data = checkpoint.to_json_bytes();
+        (data, checkpoint)
     }
 
     #[tokio::test]
@@ -963,38 +1013,35 @@ mod tests {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
-        // put a valid/invalid _last_checkpoint file
-        let data = valid_last_checkpoint();
-        let invalid_data = "invalid".as_bytes().to_vec();
-        let path = Path::from("valid/_last_checkpoint");
-        let invalid_path = Path::from("invalid/_last_checkpoint");
+        // Define test cases: (path, data, expected_result)
+        let (data, expected) = valid_last_checkpoint();
+        let (data_with_tags, expected_with_tags) = valid_last_checkpoint_with_tags();
+        let test_cases = vec![
+            ("valid", data, Some(expected)),
+            ("invalid", "invalid".as_bytes().to_vec(), None),
+            ("valid_with_tags", data_with_tags, Some(expected_with_tags)),
+        ];
 
-        store
-            .put(&path, data.into())
-            .await
-            .expect("put _last_checkpoint");
-        store
-            .put(&invalid_path, invalid_data.into())
-            .await
-            .expect("put _last_checkpoint");
+        // Write all test files to the in memory file system
+        for (path_prefix, data, _) in &test_cases {
+            let path = Path::from(format!("{}/_last_checkpoint", path_prefix));
+            store
+                .put(&path, data.clone().into())
+                .await
+                .expect("put _last_checkpoint");
+        }
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
         let storage = ObjectStoreStorageHandler::new(store, executor);
-        let url = Url::parse("memory:///valid/").expect("valid url");
-        let valid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
-        let url = Url::parse("memory:///invalid/").expect("valid url");
-        let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
-        let expected = LastCheckpointHint {
-            version: 1,
-            size: 8,
-            parts: None,
-            size_in_bytes: Some(21857),
-            num_of_add_files: None,
-            checkpoint_schema: None,
-            checksum: None,
-        };
-        assert_eq!(valid.unwrap(), expected);
-        assert!(invalid.is_none());
+
+        // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
+        // valid with tags.
+        for (path_prefix, _, expected_result) in test_cases {
+            let url = Url::parse(&format!("memory:///{}/", path_prefix)).expect("valid url");
+            let result =
+                LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
+            assert_eq!(result, expected_result);
+        }
     }
 
     #[test_log::test]
@@ -1114,6 +1161,8 @@ mod tests {
 
         let snapshot = Snapshot::builder_for(url.clone()).build(&engine)?;
 
+        // Test get_domain_metadata
+
         assert_eq!(snapshot.get_domain_metadata("domain1", &engine)?, None);
         assert_eq!(
             snapshot.get_domain_metadata("domain2", &engine)?,
@@ -1128,6 +1177,19 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::Generic(msg) if
                 msg == "User DomainMetadata are not allowed to use system-controlled 'delta.*' domain"));
+
+        // Test get_all_domain_metadata
+        let mut metadata = snapshot.get_all_domain_metadata(&engine)?;
+        metadata.sort_by(|a, b| a.domain().cmp(b.domain()));
+
+        let mut expected = vec![
+            DomainMetadata::new("domain2".to_string(), "domain2_commit1".to_string()),
+            DomainMetadata::new("domain3".to_string(), "domain3_commit0".to_string()),
+        ];
+        expected.sort_by(|a, b| a.domain().cmp(b.domain()));
+
+        assert_eq!(metadata, expected);
+
         Ok(())
     }
 

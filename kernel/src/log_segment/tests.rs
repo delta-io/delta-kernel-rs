@@ -285,6 +285,7 @@ async fn build_snapshot_with_correct_last_uuid_checkpoint() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -379,6 +380,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -424,6 +426,7 @@ async fn build_snapshot_with_correct_last_multipart_checkpoint() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -474,6 +477,7 @@ async fn build_snapshot_with_missing_checkpoint_part_from_hint_fails() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -519,6 +523,7 @@ async fn build_snapshot_with_bad_checkpoint_hint_fails() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -611,6 +616,7 @@ async fn build_snapshot_with_out_of_date_last_checkpoint_and_incomplete_recent_c
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -721,6 +727,7 @@ async fn build_snapshot_with_checkpoint_greater_than_time_travel_version() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
         &[
@@ -768,6 +775,7 @@ async fn build_snapshot_with_start_checkpoint_and_time_travel_version() {
         num_of_add_files: None,
         checkpoint_schema: None,
         checksum: None,
+        tags: None,
     };
 
     let (storage, log_root) = build_log_with_paths_and_checkpoint(
@@ -1808,12 +1816,18 @@ fn test_debug_assert_listed_log_file_in_order_compaction_files() {
     let _ = ListedLogFiles::try_new(
         vec![],
         vec![
-            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
-            create_log_path("file:///00000000000000000001.00000000000000000002.compacted.json"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000001.00000000000000000002.compacted.json",
+            ),
         ],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -1824,12 +1838,18 @@ fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
     let _ = ListedLogFiles::try_new(
         vec![],
         vec![
-            create_log_path("file:///00000000000000000000.00000000000000000004.compacted.json"),
-            create_log_path("file:///00000000000000000000.00000000000000000003.compacted.json"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000000.00000000000000000003.compacted.json",
+            ),
         ],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -1841,11 +1861,17 @@ fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
         vec![],
         vec![],
         vec![
-            create_log_path("00000000000000000010.checkpoint.0000000001.0000000002.parquet"),
-            create_log_path("00000000000000000011.checkpoint.0000000002.0000000002.parquet"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000002.parquet",
+            ),
         ],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -1857,11 +1883,17 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
         vec![],
         vec![],
         vec![
-            create_log_path("00000000000000000010.checkpoint.0000000001.0000000003.parquet"),
-            create_log_path("00000000000000000011.checkpoint.0000000002.0000000003.parquet"),
+            create_log_path(
+                "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
+            ),
+            create_log_path(
+                "file:///_delta_log/00000000000000000011.checkpoint.0000000002.0000000003.parquet",
+            ),
         ],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 }
 
@@ -2254,27 +2286,31 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
 fn test_log_segment_contiguous_commit_files() {
     let res = ListedLogFiles::try_new(
         vec![
-            create_log_path("file:///00000000000000000001.json"),
-            create_log_path("file:///00000000000000000002.json"),
-            create_log_path("file:///00000000000000000003.json"),
+            create_log_path("file:///_delta_log/00000000000000000001.json"),
+            create_log_path("file:///_delta_log/00000000000000000002.json"),
+            create_log_path("file:///_delta_log/00000000000000000003.json"),
         ],
         vec![],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
     assert!(res.is_ok());
 
     // allow gaps in ListedLogFiles
     let listed = ListedLogFiles::try_new(
         vec![
-            create_log_path("file:///00000000000000000001.json"),
-            create_log_path("file:///00000000000000000003.json"),
+            create_log_path("file:///_delta_log/00000000000000000001.json"),
+            create_log_path("file:///_delta_log/00000000000000000003.json"),
         ],
         vec![],
         vec![],
         None,
-        Some(create_log_path("file:///00000000000000000001.json")),
+        Some(create_log_path(
+            "file:///_delta_log/00000000000000000001.json",
+        )),
     );
 
     // disallow gaps in LogSegment
@@ -2284,11 +2320,11 @@ fn test_log_segment_contiguous_commit_files() {
         "Generic delta kernel error: Expected ordered \
         contiguous commit files [ParsedLogPath { location: FileMeta { location: Url { scheme: \
         \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
+        None, path: \"/_delta_log/00000000000000000001.json\", query: None, fragment: None }, last_modified: \
         0, size: 0 }, filename: \"00000000000000000001.json\", extension: \"json\", version: 1, \
         file_type: Commit }, ParsedLogPath { location: FileMeta { location: Url { scheme: \
         \"file\", cannot_be_a_base: false, username: \"\", password: None, host: None, port: \
-        None, path: \"/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
+        None, path: \"/_delta_log/00000000000000000003.json\", query: None, fragment: None }, last_modified: \
         0, size: 0 }, filename: \"00000000000000000003.json\", extension: \"json\", version: 3, \
         file_type: Commit }]",
     );
