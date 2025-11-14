@@ -105,6 +105,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
 
         let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
         let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
+
         let (tx, rx) = mpsc::sync_channel(self.buffer_size);
         let files = files.to_vec();
         let buffer_size = self.buffer_size;
