@@ -307,7 +307,7 @@ impl ListedLogFiles {
             //
             // If this version has a complete checkpoint, we can drop the existing commit and
             // compaction files we collected so far -- except we must keep the latest commit.
-            fn flush_group(&mut self, version: Version) {
+            fn flush_checkpoint_group(&mut self, version: Version) {
                 let new_checkpoint_parts = std::mem::take(&mut self.new_checkpoint_parts);
                 if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
                     .into_iter()
@@ -345,14 +345,14 @@ impl ListedLogFiles {
             // Process remaining files, flushing the previous groups first if the version changed
             while let Some(file) = log_files.next().transpose()? {
                 if file.version != group_version {
-                    builder.flush_group(group_version);
+                    builder.flush_checkpoint_group(group_version);
                     group_version = file.version;
                 }
                 builder.process_file(file);
             }
 
             // Flush the final group, which must always contain at least one file
-            builder.flush_group(group_version);
+            builder.flush_checkpoint_group(group_version);
         }
 
         // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
