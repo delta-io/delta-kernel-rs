@@ -34,10 +34,7 @@ fn setup_test() -> (
 ) {
     let storage = Arc::new(InMemory::new());
     let table_root = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngine::new(
-        storage.clone(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
     (storage, engine, table_root)
 }
 
