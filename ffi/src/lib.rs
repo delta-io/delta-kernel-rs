@@ -13,8 +13,7 @@ use url::Url;
 
 use delta_kernel::schema::Schema;
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::Version;
-use delta_kernel::{DeltaResult, Engine, EngineData};
+use delta_kernel::{DeltaResult, Engine, EngineData, LogPath, Version};
 use delta_kernel_ffi_macros::handle_descriptor;
 
 // cbindgen doesn't understand our use of feature flags here, and by default it parses `mod handle`
@@ -43,6 +42,8 @@ use error::{AllocateError, AllocateErrorFn, ExternResult, IntoExternResult};
 pub mod expressions;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
+#[cfg(feature = "catalog-managed")]
+pub mod log_path;
 pub mod scan;
 pub mod schema;
 
@@ -596,10 +597,36 @@ pub unsafe extern "C" fn snapshot(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, None).into_extern_result(&engine)
+    snapshot_impl(url, engine, None, Vec::new()).into_extern_result(&engine)
 }
 
-/// Get the snapshot from the specified table at a specific version
+/// Get the latest snapshot from the specified table with optional log tail
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+/// The log_paths array and its contents must remain valid for the duration of this call.
+#[cfg(feature = "catalog-managed")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_with_log_tail(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    log_paths: log_path::LogPathArray,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine_ref = unsafe { engine.as_ref() };
+
+    // Convert LogPathArray to Vec<LogPath>
+    let log_tail = match unsafe { log_paths.log_paths() } {
+        Ok(paths) => paths,
+        Err(err) => return Err(err).into_extern_result(&engine_ref),
+    };
+
+    snapshot_impl(url, engine_ref, None, log_tail).into_extern_result(&engine_ref)
+}
+
+/// Get the snapshot from the specified table at a specific version. Note this is only safe for
+/// non-catalog-managed tables.
 ///
 /// # Safety
 ///
@@ -612,21 +639,52 @@ pub unsafe extern "C" fn snapshot_at_version(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, version.into()).into_extern_result(&engine)
+    snapshot_impl(url, engine, version.into(), Vec::new()).into_extern_result(&engine)
+}
+
+/// Get the snapshot from the specified table at a specific version with log tail.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles and path pointer.
+/// The log_tail array and its contents must remain valid for the duration of this call.
+#[cfg(feature = "catalog-managed")]
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    version: Version,
+    log_tail: log_path::LogPathArray,
+) -> ExternResult<Handle<SharedSnapshot>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine_ref = unsafe { engine.as_ref() };
+
+    // Convert LogPathArray to Vec<LogPath>
+    let log_tail = match unsafe { log_tail.log_paths() } {
+        Ok(paths) => paths,
+        Err(err) => return Err(err).into_extern_result(&engine_ref),
+    };
+
+    snapshot_impl(url, engine_ref, version.into(), log_tail).into_extern_result(&engine_ref)
 }
 
 fn snapshot_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
     version: Option<Version>,
+    #[allow(unused_variables)] log_tail: Vec<LogPath>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
-    let builder = Snapshot::builder_for(url?);
-    let builder = if let Some(v) = version {
-        // TODO: should we include a `with_version_opt` method for the builder?
-        builder.at_version(v)
-    } else {
-        builder
-    };
+    let mut builder = Snapshot::builder_for(url?);
+
+    if let Some(v) = version {
+        builder = builder.at_version(v);
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    if !log_tail.is_empty() {
+        builder = builder.with_log_tail(log_tail);
+    }
+
     let snapshot = builder.build(extern_engine.engine().as_ref())?;
     Ok(snapshot.into())
 }
@@ -961,6 +1019,67 @@ mod tests {
             unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
         assert!(snapshot_at_non_existent_version.is_err());
 
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[tokio::test]
+    async fn test_snapshot_log_tail() -> Result<(), Box<dyn std::error::Error>> {
+        use test_utils::add_staged_commit;
+        let storage = Arc::new(InMemory::new());
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let commit1 = add_staged_commit(
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("path1".into())]),
+        )
+        .await?;
+        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        let commit1_path = format!(
+            "{}_delta_log/_staged_commits/{}",
+            path,
+            commit1.filename().unwrap()
+        );
+        let log_path =
+            log_path::FfiLogPath::new(kernel_string_slice!(commit1_path), 123456789, 100);
+        let log_tail = [log_path];
+        let log_tail = log_path::LogPathArray {
+            ptr: log_tail.as_ptr(),
+            len: log_tail.len(),
+        };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot_with_log_tail(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                log_tail.clone(),
+            ))
+        };
+        let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
+        assert_eq!(snapshot_version, 1);
+
+        // Test getting snapshot at version
+        let snapshot2 = unsafe {
+            ok_or_panic(snapshot_at_version_with_log_tail(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                1,
+                log_tail,
+            ))
+        };
+        let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
+        assert_eq!(snapshot_version, 1);
+
+        unsafe { free_snapshot(snapshot) }
+        unsafe { free_snapshot(snapshot2) }
         unsafe { free_engine(engine) }
         Ok(())
     }
