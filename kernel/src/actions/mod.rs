@@ -1004,14 +1004,17 @@ impl DomainMetadata {
     // returns true if the domain metadata is an system-controlled domain (all domains that start
     // with "delta.")
     #[allow(unused)]
+    #[internal_api]
     pub(crate) fn is_internal(&self) -> bool {
         self.domain.starts_with(INTERNAL_DOMAIN_PREFIX)
     }
 
+    #[internal_api]
     pub(crate) fn domain(&self) -> &str {
         &self.domain
     }
 
+    #[internal_api]
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
     }
