@@ -102,6 +102,14 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
+    if fields.len() != output_schema.num_fields() {
+        return Err(Error::generic(format!(
+            "Struct expression field count mismatch: {} fields in expression but {} in schema",
+            fields.len(),
+            output_schema.num_fields()
+        )));
+    }
+
     let output_cols: Vec<ArrayRef> = fields
         .iter()
         .zip(output_schema.fields())
@@ -930,6 +938,112 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Data type is required"));
+    }
+
+    #[test]
+    fn test_struct_expression_schema_validation() {
+        let batch = create_test_batch();
+
+        // Test 1: Too many output schema fields - struct has 2 fields, schema expects 3
+        let struct_expr_2fields = Expr::Struct(vec![column_expr_ref!("a"), column_expr_ref!("b")]);
+
+        let schema_3fields = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER), // surplus field
+        ]);
+
+        let result1 = evaluate_expression(
+            &struct_expr_2fields,
+            &batch,
+            Some(&DataType::Struct(Box::new(schema_3fields))),
+        );
+        assert!(result1.is_err());
+        assert!(result1
+            .unwrap_err()
+            .to_string()
+            .contains("field count mismatch"));
+
+        // Test 2: Too few output schema fields - struct has 3 fields, schema expects 2
+        let struct_expr_3fields = Expr::Struct(vec![
+            column_expr_ref!("a"),
+            column_expr_ref!("b"),
+            column_expr_ref!("c"),
+        ]);
+
+        let schema_2fields = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+        ]);
+
+        let result2 = evaluate_expression(
+            &struct_expr_3fields,
+            &batch,
+            Some(&DataType::Struct(Box::new(schema_2fields))),
+        );
+        assert!(result2.is_err());
+        assert!(result2
+            .unwrap_err()
+            .to_string()
+            .contains("field count mismatch"));
+
+        // Test 3: Exact match - struct has 2 fields, schema expects 2 (should succeed)
+        let struct_expr_match = Expr::Struct(vec![column_expr_ref!("a"), column_expr_ref!("b")]);
+
+        let schema_match = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+        ]);
+
+        let result3 = evaluate_expression(
+            &struct_expr_match,
+            &batch,
+            Some(&DataType::Struct(Box::new(schema_match))),
+        );
+        assert!(result3.is_ok(), "Exact field count match should succeed");
+
+        // Verify the result has correct structure
+        let struct_result = result3.unwrap();
+        let struct_array = struct_result
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(struct_array.num_columns(), 2);
+
+        // Test 4: Nested struct with surplus field (tests the original #1248 issue)
+        // This specifically tests that fields like stats.numRecords aren't silently ignored
+        let nested_batch = create_nested_test_batch();
+
+        let nested_struct_expr = Expr::Struct(vec![
+            column_expr_ref!("a"),
+            // Nested struct with only 1 field (x)
+            Arc::new(Expr::Struct(vec![column_expr_ref!("nested.x")])),
+        ]);
+
+        // Schema expects 2 fields in nested struct (x and a surplus "numRecords" field)
+        let schema_with_surplus_nested = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null(
+                "nested",
+                StructType::new_unchecked(vec![
+                    StructField::not_null("x", DataType::INTEGER),
+                    StructField::not_null("numRecords", DataType::LONG), // surplus field
+                ]),
+            ),
+        ]);
+
+        let result4 = evaluate_expression(
+            &nested_struct_expr,
+            &nested_batch,
+            Some(&DataType::Struct(Box::new(schema_with_surplus_nested))),
+        );
+
+        // Should error because nested struct has 1 field but schema expects 2
+        assert!(result4.is_err());
+        assert!(result4
+            .unwrap_err()
+            .to_string()
+            .contains("field count mismatch"));
     }
 
     #[test]

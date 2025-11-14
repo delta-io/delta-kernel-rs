@@ -522,9 +522,23 @@ impl Transaction {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
+
+        // Compute physical schema: exclude partition columns since they're stored in the path
+        let partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let physical_fields = snapshot_schema
+            .fields()
+            .filter(|f| !partition_columns.contains(f.name()))
+            .cloned();
+        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
+
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
+            physical_schema,
             Arc::new(logical_to_physical),
         )
     }
@@ -702,14 +716,21 @@ impl Transaction {
 pub struct WriteContext {
     target_dir: Url,
     schema: SchemaRef,
+    physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
 }
 
 impl WriteContext {
-    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: ExpressionRef) -> Self {
+    fn new(
+        target_dir: Url,
+        schema: SchemaRef,
+        physical_schema: SchemaRef,
+        logical_to_physical: ExpressionRef,
+    ) -> Self {
         WriteContext {
             target_dir,
             schema,
+            physical_schema,
             logical_to_physical,
         }
     }
@@ -720,6 +741,10 @@ impl WriteContext {
 
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
+    }
+
+    pub fn physical_schema(&self) -> &SchemaRef {
+        &self.physical_schema
     }
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
