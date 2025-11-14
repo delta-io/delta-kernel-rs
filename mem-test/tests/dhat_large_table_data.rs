@@ -10,7 +10,6 @@ use std::sync::Arc;
 use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
@@ -118,10 +117,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: Create engine and snapshot
     let store = Arc::new(LocalFileSystem::new());
     let url = Url::from_directory_path(table_path).unwrap();
-    let engine = Arc::new(DefaultEngine::new(
-        store,
-        Arc::new(TokioBackgroundExecutor::new()),
-    ));
+    let engine = Arc::new(DefaultEngine::new(store));
 
     let snapshot = Snapshot::builder_for(url)
         .build(engine.as_ref())
