@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::mem;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use crate::arrow::array::RecordBatch;
@@ -10,11 +9,8 @@ use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use futures::FutureExt;
-use tracing::error;
 
-use super::executor::TaskExecutor;
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::{DeltaResult, FileDataReadResultIterator, FileMeta};
+use crate::{DeltaResult, FileMeta};
 
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 /// cbindgen:ignore
@@ -95,52 +91,6 @@ pub struct FileStream {
 }
 
 impl FileStream {
-    /// Creates a new `FileStream` from a given schema, `FileOpener`, and files list; the files are
-    /// processed asynchronously by the provided `TaskExecutor`. Returns an `Iterator` that consumes
-    /// the results.
-    pub fn new_async_read_iterator<E: TaskExecutor>(
-        task_executor: Arc<E>,
-        schema: ArrowSchemaRef,
-        file_opener: Box<dyn FileOpener>,
-        files: &[FileMeta],
-        readahead: usize,
-    ) -> DeltaResult<FileDataReadResultIterator> {
-        let mut stream = FileStream::new(files.to_vec(), schema, file_opener)?;
-
-        // This channel will become the output iterator
-        // The stream will execute in the background, and we allow up to `readahead`
-        // batches to be buffered in the channel.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(readahead);
-
-        let executor_for_block = task_executor.clone();
-        task_executor.spawn(async move {
-            while let Some(res) = stream.next().await {
-                let sender_clone = sender.clone();
-                let join_res = executor_for_block
-                    .spawn_blocking(move || sender_clone.send(res))
-                    .await;
-                match join_res {
-                    Ok(send_res) => match send_res {
-                        Ok(()) => continue,
-                        Err(_) => break,
-                    },
-                    Err(je) => {
-                        error!("Couldn't join spawned task, runtime is likely in bad state: {je}");
-                        // Send an error through the channel to be handled by the receiver
-                        let _ = sender.send(Err(crate::Error::JoinFailure(format!(
-                            "Failed to join spawned task: {je}",
-                        ))));
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Box::new(receiver.into_iter().map(|rbr| {
-            rbr.map(|rb| Box::new(ArrowEngineData::new(rb)) as _)
-        })))
-    }
-
     /// Create a new `FileStream` using the given `FileOpener` to scan underlying files
     pub fn new(
         files: impl IntoIterator<Item = FileMeta>,
