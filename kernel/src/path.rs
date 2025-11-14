@@ -110,9 +110,8 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[internal_api]
     pub(crate) fn try_from(location: Location) -> Option<ParsedLogPath<Location>> {
         let url = location.as_url();
-        let Some(mut path_segments) = url.path_segments() else {
-            return None;
-        };
+        let mut path_segments = url.path_segments()?;
+
         #[allow(clippy::unwrap_used)]
         let filename = path_segments
             .next_back()
@@ -178,24 +177,16 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["crc"] if in_delta_log_dir => LogPathFileType::Crc,
             ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::SinglePartCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] if in_delta_log_dir => {
-                let Some(_) = parse_path_part::<String>(uuid, UUID_PART_LEN) else {
-                    return None;
-                };
+                let _ = parse_path_part::<String>(uuid, UUID_PART_LEN)?;
                 LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] if in_delta_log_dir => {
-                let Some(hi) = parse_path_part(hi, VERSION_LEN) else {
-                    return None;
-                };
+                let hi = parse_path_part(hi, VERSION_LEN)?;
                 LogPathFileType::CompactedCommit { hi }
             }
             ["checkpoint", part_num, num_parts, "parquet"] if in_delta_log_dir => {
-                let Some(part_num) = parse_path_part(part_num, MULTIPART_PART_LEN) else {
-                    return None;
-                };
-                let Some(num_parts) = parse_path_part(num_parts, MULTIPART_PART_LEN) else {
-                    return None;
-                };
+                let part_num = parse_path_part(part_num, MULTIPART_PART_LEN)?;
+                let num_parts = parse_path_part(num_parts, MULTIPART_PART_LEN)?;
 
                 // A valid part_num must be in the range [1, num_parts]
                 if !(0 < part_num && part_num <= num_parts) {
@@ -492,10 +483,7 @@ mod tests {
         // ignored - no extension
         let log_path = table_log_dir.join("00000000000000000010").unwrap();
         let result = ParsedLogPath::try_from(log_path);
-        assert!(
-            matches!(result, None),
-            "Expected Ok(None) for missing file extension"
-        );
+        assert!(result.is_none());
 
         // empty extension - should be treated as unknown file type
         let log_path = table_log_dir.join("00000000000000000011.").unwrap();
