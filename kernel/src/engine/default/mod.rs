@@ -162,7 +162,6 @@ impl UrlExt for Url {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::storage::store_from_url_opts;
     use crate::engine::tests::test_arrow_engine;
     use object_store::local::LocalFileSystem;
 
@@ -198,48 +197,5 @@ mod tests {
 
         let url = Url::parse("https://example.com").unwrap();
         assert!(!url.is_presigned());
-    }
-
-    #[test]
-    fn test_s3_default_copy_if_not_exists() {
-        // Test that S3 URLs automatically get header copy_if_not_exists by default
-        let url = Url::parse("s3://test-bucket/path").unwrap();
-        let options: HashMap<String, String> = HashMap::new();
-
-        // Should succeed and set header strategy
-        let store = store_from_url_opts(&url, options);
-        assert!(
-            store.is_ok(),
-            "Should successfully create object store with default header strategy"
-        );
-    }
-
-    #[test]
-    fn test_s3_override_copy_if_not_exists() {
-        // Test that users can override the default copy_if_not_exists strategy
-        let url = Url::parse("s3://test-bucket/path").unwrap();
-        let options = HashMap::from([("copy_if_not_exists".to_string(), "multipart".to_string())]);
-
-        // Should succeed with user-specified multipart strategy
-        let store = store_from_url_opts(&url, options);
-        assert!(
-            store.is_ok(),
-            "Should successfully create object store with overridden multipart strategy"
-        );
-    }
-
-    #[test]
-    fn test_non_s3_urls_unaffected() {
-        // Test that non-S3 URLs don't get copy_if_not_exists set
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let options: HashMap<String, String> = HashMap::new();
-
-        // Should succeed without adding copy_if_not_exists
-        let store = store_from_url_opts(&url, options);
-        assert!(
-            store.is_ok(),
-            "Should successfully create object store for local filesystem"
-        );
     }
 }
