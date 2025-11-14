@@ -12,6 +12,11 @@
 use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
 use std::collections::{HashMap, HashSet};
 
+/// Feature gate for schema diff functionality.
+/// Set to `false` to ensure incomplete implementations don't activate until all PRs are merged.
+/// Will be removed in the final PR when all tests and implementation are complete.
+const SCHEMA_DIFF_ENABLED: bool = false;
+
 /// Arguments for computing a schema diff
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaDiffArgs<'a> {
@@ -184,8 +189,22 @@ fn compute_schema_diff(
     _before: &StructType,
     _after: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
-    // Stub implementation - returns empty diff
-    // This allows PR 1 to compile and basic tests to run
+    // Feature gate check - prevents activation of incomplete implementation in production
+    // This gate will be removed in the final PR when all functionality is complete
+    // Note: Gate is bypassed in test builds to allow tests to validate the implementation
+    #[cfg(not(test))]
+    {
+        if !SCHEMA_DIFF_ENABLED {
+            return Ok(SchemaDiff {
+                added_fields: Vec::new(),
+                removed_fields: Vec::new(),
+                updated_fields: Vec::new(),
+                has_breaking_changes: false,
+            });
+        }
+    }
+
+    // Stub implementation - actual implementation will be added in PR 2
     Ok(SchemaDiff {
         added_fields: Vec::new(),
         removed_fields: Vec::new(),
@@ -256,5 +275,53 @@ mod tests {
         // With stub implementation, this will be 0 in PR 1
         // In PR 2, this will correctly be 3 (1 removed, 1 added, 1 updated)
         assert_eq!(diff.change_count(), 0); // TEMPORARY: Will be 3 in PR 2
+    }
+
+    #[test]
+    fn test_top_level_and_nested_change_filters() {
+        // Test that top_level_changes and nested_changes correctly filter by path depth.
+        // This test manually constructs a SchemaDiff to exercise the filtering logic.
+
+        let top_level_field = create_field_with_id("name", DataType::STRING, false, 1);
+        let nested_field = create_field_with_id("street", DataType::STRING, false, 2);
+        let deeply_nested_field = create_field_with_id("city", DataType::STRING, false, 3);
+
+        // Create a diff with mixed top-level and nested changes
+        let diff = SchemaDiff {
+            added_fields: vec![
+                FieldChange {
+                    field: top_level_field.clone(),
+                    path: ColumnName::new(["name"]), // Top-level (depth 1)
+                },
+                FieldChange {
+                    field: nested_field.clone(),
+                    path: ColumnName::new(["address", "street"]), // Nested (depth 2)
+                },
+            ],
+            removed_fields: vec![FieldChange {
+                field: deeply_nested_field.clone(),
+                path: ColumnName::new(["user", "address", "city"]), // Deeply nested (depth 3)
+            }],
+            updated_fields: vec![],
+            has_breaking_changes: false,
+        };
+
+        // Test top_level_changes - should only return depth 1 fields
+        let (top_added, top_removed, top_updated) = diff.top_level_changes();
+        assert_eq!(top_added.len(), 1);
+        assert_eq!(top_added[0].path, ColumnName::new(["name"]));
+        assert_eq!(top_removed.len(), 0);
+        assert_eq!(top_updated.len(), 0);
+
+        // Test nested_changes - should only return depth > 1 fields
+        let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
+        assert_eq!(nested_added.len(), 1);
+        assert_eq!(nested_added[0].path, ColumnName::new(["address", "street"]));
+        assert_eq!(nested_removed.len(), 1);
+        assert_eq!(
+            nested_removed[0].path,
+            ColumnName::new(["user", "address", "city"])
+        );
+        assert_eq!(nested_updated.len(), 0);
     }
 }
