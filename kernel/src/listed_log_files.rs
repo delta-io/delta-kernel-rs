@@ -91,14 +91,18 @@ fn list_log_files(
         // NOTE: since engine APIs don't limit listing, we list from start_version and filter
         let files = storage
             .list_from(&start_from)?
-            .map(|meta| ParsedLogPath::try_from(meta?))
+            .filter_map(|meta| match meta {
+                Ok(m) => ParsedLogPath::try_from(m)
+                    .filter(|p| p.should_list())
+                    .map(Ok),
+                Err(e) => Some(Err(e)),
+            })
             // NOTE: this filters out .crc files etc which start with "." - some engines
             // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
             // doesn't care about these files. Critically, note these are _different_ than
             // normal `version.crc` files which are listed + captured normally. Additionally
             // we likely aren't even 'seeing' these files since lexicographically the string
             // "." comes before the string "0".
-            .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
             .take_while(move |path_res| match path_res {
                 // discard any path with too-large version; keep errors
                 Ok(path) => path.version <= list_end_version,

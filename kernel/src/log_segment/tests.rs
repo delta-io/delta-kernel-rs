@@ -205,7 +205,6 @@ fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
         size: 0,
     })
     .unwrap()
-    .unwrap()
 }
 
 #[test]
