@@ -37,6 +37,53 @@ fn get_domain_metadata_impl(
         .and_then(|config: String| allocate_fn(kernel_string_slice!(config))))
 }
 
+/// Get the domain metadata as an optional string allocated by `AllocatedStringFn` for a specific domain in this snapshot
+///
+/// # Safety
+///
+/// Caller is responsible for passing in a valid handle
+#[no_mangle]
+pub unsafe extern "C" fn visit_domain_metadata(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        domain: KernelStringSlice,
+        configuration: KernelStringSlice,
+    ),
+) -> ExternResult<bool> {
+    let snapshot = unsafe { snapshot.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+
+    visit_domain_metadata_impl(snapshot, engine, engine_context, visitor)
+        .into_extern_result(&engine)
+}
+
+fn visit_domain_metadata_impl(
+    snapshot: &Snapshot,
+    extern_engine: &dyn ExternEngine,
+    engine_context: NullableCvoid,
+    visitor: extern "C" fn(
+        engine_context: NullableCvoid,
+        key: KernelStringSlice,
+        value: KernelStringSlice,
+    ),
+) -> DeltaResult<bool> {
+    let res = snapshot.get_all_domain_metadata(extern_engine.engine().as_ref())?;
+    res.iter().for_each(|metadata| {
+        let domain = &metadata.domain();
+        let configuration = &metadata.configuration();
+        visitor(
+            engine_context,
+            kernel_string_slice!(domain),
+            kernel_string_slice!(configuration),
+        );
+    });
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +98,8 @@ mod tests {
     use delta_kernel::DeltaResult;
     use object_store::memory::InMemory;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::ptr::NonNull;
     use std::sync::Arc;
     use test_utils::add_commit;
 
@@ -148,6 +197,8 @@ mod tests {
             )
         };
 
+        // First, we test fetching the domain metadata one-by-one
+
         let domain1 = "domain1";
         let res = ok_or_panic(get_domain_metadata_helper(domain1));
         assert!(res.is_none());
@@ -159,6 +210,49 @@ mod tests {
         let domain3 = "delta.domain3";
         let res = get_domain_metadata_helper(domain3);
         assert_extern_result_error_with_message(res, KernelError::GenericError, "Generic delta kernel error: User DomainMetadata are not allowed to use system-controlled 'delta.*' domain");
+
+        // Secondly, we visit the entire domain metadata
+
+        // Create visitor state
+        let visitor_state: Box<HashMap<String, String>> = Box::default();
+        let visitor_state_ptr = Box::into_raw(visitor_state);
+
+        // Test visitor function
+        extern "C" fn visitor(
+            state: NullableCvoid,
+            key: KernelStringSlice,
+            value: KernelStringSlice,
+        ) {
+            let mut collected_metadata = unsafe {
+                Box::from_raw(
+                    state.unwrap().as_ptr() as *mut std::collections::HashMap<String, String>
+                )
+            };
+            let key: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&key) };
+            let value: DeltaResult<String> = unsafe { TryFromStringSlice::try_from_slice(&value) };
+            collected_metadata.insert(key.unwrap(), value.unwrap());
+            Box::leak(collected_metadata);
+        }
+
+        // Visit all (user) domain metadata
+        let res = unsafe {
+            ok_or_panic(visit_domain_metadata(
+                snapshot.shallow_copy(),
+                engine.shallow_copy(),
+                Some(NonNull::new_unchecked(visitor_state_ptr).cast()),
+                visitor,
+            ))
+        };
+
+        // Confirm visitor picked up all entries in map
+        let collected_metadata = unsafe { Box::from_raw(visitor_state_ptr) };
+        assert!(res);
+        assert!(collected_metadata.get("domain1").is_none());
+        assert!(collected_metadata.get("delta.domain3").is_none());
+        assert_eq!(
+            collected_metadata.get("domain2").unwrap(),
+            "domain2_commit1"
+        );
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_engine(engine) }
