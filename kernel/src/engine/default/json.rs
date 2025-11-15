@@ -669,10 +669,10 @@ mod tests {
                 .map(|url| FileMeta::new(url, 1, 1))
                 .collect();
 
-            let mut iter =
-                default_engine
-                    .json_handler()
-                    .read_json_files(&file_vec, schema.clone(), None)?;
+            let mut iter = default_engine
+                .json_handler()
+                .read_json_files(&file_vec, schema.clone(), None)
+                .unwrap();
 
             for _ in 0..expected_errors {
                 assert!(
@@ -685,17 +685,15 @@ mod tests {
                 iter.next().is_none(),
                 "The stream should end once the read result fails"
             );
-
-            Ok::<_, Box<dyn std::error::Error>>(())
         };
 
         // CASE 1: Single failing file
         info!("\nAttempting to read single malformed JSON file...");
-        check_errors(vec![file_url1.clone()], 1)?;
+        check_errors(vec![file_url1.clone()], 1);
 
         // CASE 2: Two failing files
         info!("\nAttempting to read two malformed JSON files...");
-        check_errors(vec![file_url1, file_url2], 2)?;
+        check_errors(vec![file_url1, file_url2], 2);
 
         Ok(())
     }
