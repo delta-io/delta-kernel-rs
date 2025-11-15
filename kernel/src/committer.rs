@@ -45,12 +45,17 @@ use url::Url;
 pub struct CommitMetadata {
     pub(crate) log_root: LogRoot,
     pub(crate) version: Version,
+    pub(crate) in_commit_timestamp: i64,
     // in the future this will include Protocol, Metadata, CommitInfo, Domain Metadata, etc.
 }
 
 impl CommitMetadata {
-    pub(crate) fn new(log_root: LogRoot, version: Version) -> Self {
-        Self { log_root, version }
+    pub(crate) fn new(log_root: LogRoot, version: Version, in_commit_timestamp: i64) -> Self {
+        Self {
+            log_root,
+            version,
+            in_commit_timestamp,
+        }
     }
 
     /// The commit path is the absolute path (e.g. s3://bucket/table/_delta_log/{version}.json) to
@@ -72,6 +77,16 @@ impl CommitMetadata {
     /// The version to which the transaction is being committed.
     pub fn version(&self) -> Version {
         self.version
+    }
+
+    /// The in-commit timestamp for the commit. Note that this may differ from the actual commit
+    /// file modification time.
+    pub fn in_commit_timestamp(&self) -> i64 {
+        self.in_commit_timestamp
+    }
+
+    pub fn table_root(&self) -> &Url {
+        self.log_root.table_root()
     }
 }
 
@@ -171,11 +186,14 @@ mod tests {
         let table_root = Url::parse("s3://my-bucket/path/to/table/").unwrap();
         let log_root = LogRoot::new(table_root).unwrap();
         let version = 42;
+        let ts = 1234;
 
-        let commit_metadata = CommitMetadata::new(log_root, version);
+        let commit_metadata = CommitMetadata::new(log_root, version, ts);
 
         // version
         assert_eq!(commit_metadata.version(), 42);
+        // in_commit_timestamp
+        assert_eq!(commit_metadata.in_commit_timestamp(), 1234);
 
         // published commit path
         let published_path = commit_metadata.published_commit_path().unwrap();
@@ -189,8 +207,9 @@ mod tests {
         let staged_path_str = staged_path.as_str();
 
         assert!(
-            staged_path_str
-                .starts_with("s3://my-bucket/path/to/table/_delta_log/00000000000000000042."),
+            staged_path_str.starts_with(
+                "s3://my-bucket/path/to/table/_delta_log/_staged_commits/00000000000000000042."
+            ),
             "Staged path should start with the correct prefix, got: {}",
             staged_path_str
         );
@@ -200,7 +219,9 @@ mod tests {
             staged_path_str
         );
         let uuid_str = staged_path_str
-            .strip_prefix("s3://my-bucket/path/to/table/_delta_log/00000000000000000042.")
+            .strip_prefix(
+                "s3://my-bucket/path/to/table/_delta_log/_staged_commits/00000000000000000042.",
+            )
             .and_then(|s| s.strip_suffix(".json"))
             .expect("Staged path should have expected format");
         uuid::Uuid::parse_str(uuid_str).expect("Staged path should contain a valid UUID");
@@ -208,7 +229,7 @@ mod tests {
 
     #[cfg(feature = "catalog-managed")]
     #[tokio::test]
-    async fn catalog_managed_tables_block_transactions() {
+    async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
         let engine = DefaultEngine::new(storage.clone());
@@ -225,18 +246,16 @@ mod tests {
         let snapshot = crate::snapshot::SnapshotBuilder::new_for(table_root)
             .build(&engine)
             .unwrap();
-        // Try to create a transaction with FileSystemCommitter
+        // Try to commit a transaction with FileSystemCommitter
         let committer = Box::new(FileSystemCommitter::new());
-        let err = snapshot.transaction(committer).unwrap_err();
+        let err = snapshot
+            .transaction(committer)
+            .unwrap()
+            .commit(&engine)
+            .unwrap_err();
         assert!(matches!(
             err,
-            crate::Error::Unsupported(e) if e.contains("Writes are not yet supported for catalog-managed tables")
+            crate::Error::Generic(e) if e.contains("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
         ));
-        // after allowing writes, we will check that this disallows default committer for
-        // catalog-managed tables.
-        // assert!(matches!(
-        //     err,
-        //     crate::Error::Generic(e) if e.contains("Cannot use the default committer for a catalog-managed table")
-        // ));
     }
 }

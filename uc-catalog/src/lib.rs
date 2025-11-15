@@ -1,5 +1,8 @@
 //! UCCatalog implements a high-level interface for interacting with Delta Tables in Unity Catalog.
 
+mod committer;
+pub use committer::UCCommitter;
+
 use std::sync::Arc;
 
 use delta_kernel::{Engine, LogPath, Snapshot, Version};
@@ -63,8 +66,10 @@ impl<'a> UCCatalog<'a> {
             start_version: Some(0),
             end_version: version.and_then(|v| v.try_into().ok()),
         };
-        // TODO: does it paginate?
-        let commits = self.client.get_commits(req).await?;
+        let mut commits = self.client.get_commits(req).await?;
+        if let Some(commits) = &mut commits.commits {
+            commits.sort_by_key(|c| c.version);
+        }
 
         // if commits are present, we ensure they are sorted+contiguous
         if let Some(commits) = &commits.commits {
@@ -88,7 +93,11 @@ impl<'a> UCCatalog<'a> {
         };
 
         // consume uc-client's Commit and hand back a delta_kernel LogPath
-        let table_url = Url::parse(&table_uri)?;
+        let mut table_url = Url::parse(&table_uri)?;
+        // add trailing slash
+        if !table_url.path().ends_with('/') {
+            table_url.path_segments_mut().unwrap().push("");
+        }
         let commits: Vec<_> = commits
             .commits
             .unwrap_or_default()
@@ -119,6 +128,7 @@ mod tests {
     use std::env;
 
     use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::transaction::CommitResult;
 
     use super::*;
 
@@ -188,6 +198,70 @@ mod tests {
 
         println!("🎉 loaded snapshot: {snapshot:?}");
 
+        Ok(())
+    }
+
+    // ignored test which you can run manually to play around with writing to a UC table. run with:
+    // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
+        let token = env::var("TOKEN").expect("TOKEN environment variable not set");
+        let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
+
+        // build UC client, get table info and credentials
+        let client = Arc::new(UCClient::builder(endpoint, &token).build()?);
+        let (table_id, table_uri) = get_table(&client, &table_name).await?;
+        let creds = client
+            .get_credentials(&table_id, Operation::ReadWrite)
+            .await
+            .map_err(|e| format!("Failed to get credentials: {}", e))?;
+
+        // build catalog
+        let catalog = UCCatalog::new(&client);
+
+        // TODO: support non-AWS
+        let creds = creds
+            .aws_temp_credentials
+            .ok_or("No AWS temporary credentials found")?;
+
+        let options = [
+            ("region", "us-west-2"),
+            ("access_key_id", &creds.access_key_id),
+            ("secret_access_key", &creds.secret_access_key),
+            ("session_token", &creds.session_token),
+        ];
+
+        let table_url = Url::parse(&table_uri)?;
+        let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
+        let store: Arc<dyn object_store::ObjectStore> = store.into();
+
+        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let committer = Box::new(UCCommitter::new(client.clone(), table_id.clone()));
+        let snapshot = catalog
+            .load_snapshot(&table_id, &table_uri, &engine)
+            .await?;
+        println!("latest snapshot version: {:?}", snapshot.version());
+        let txn = snapshot.clone().transaction(committer)?;
+        let _write_context = txn.get_write_context();
+
+        match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(t) => {
+                println!("🎉 committed version {}", t.commit_version());
+                // TODO: should use post-commit snapshot here (plumb through log tail)
+                let _snapshot = catalog
+                    .load_snapshot_at(&table_id, &table_uri, t.commit_version(), &engine)
+                    .await?;
+                // then do publish
+            }
+            CommitResult::ConflictedTransaction(t) => {
+                println!("💥 commit conflicted at version {}", t.conflict_version());
+            }
+            CommitResult::RetryableTransaction(_) => {
+                println!("we should retry...");
+            }
+        }
         Ok(())
     }
 }

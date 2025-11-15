@@ -717,12 +717,18 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyL
     vec![
         TableFeature::ChangeDataFeed,
         TableFeature::AppendOnly,
+        #[cfg(feature = "catalog-managed")]
+        TableFeature::CatalogManaged,
+        #[cfg(feature = "catalog-managed")]
+        TableFeature::CatalogOwnedPreview,
         TableFeature::DeletionVectors,
         TableFeature::DomainMetadata,
         TableFeature::InCommitTimestamp,
         TableFeature::Invariants,
         TableFeature::RowTracking,
         TableFeature::TimestampWithoutTimezone,
+        TableFeature::V2Checkpoint,
+        TableFeature::VacuumProtocolCheck,
         TableFeature::VariantType,
         TableFeature::VariantTypePreview,
         TableFeature::VariantShreddingPreview,

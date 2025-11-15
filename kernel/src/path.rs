@@ -23,6 +23,8 @@ const UUID_PART_LEN: usize = 36;
 /// The subdirectory name within the table root where the delta log resides
 const DELTA_LOG_DIR: &str = "_delta_log";
 const DELTA_LOG_DIR_WITH_SLASH: &str = "_delta_log/";
+/// The subdirectory name within the delta log where staged commits reside
+const STAGED_COMMITS_DIR: &str = "_staged_commits/";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[internal_api]
@@ -387,22 +389,40 @@ impl ParsedLogPath<Url> {
 /// A wrapper around parsed log path to provide more structure/safety when handling
 /// table/log/commit paths.
 #[derive(Debug, Clone)]
-pub(crate) struct LogRoot(Url);
+pub(crate) struct LogRoot {
+    table_root: Url,
+    log_root: Url,
+}
 
 impl LogRoot {
     /// Create a new LogRoot from the table root URL (e.g. s3://bucket/table ->
     /// s3://bucket/table/_delta_log/)
     ///
     /// TODO: could take a `table_root: TableRoot`
-    pub(crate) fn new(table_root: Url) -> DeltaResult<Self> {
-        // FIXME: need to check for trailing slash
-        Ok(Self(table_root.join(DELTA_LOG_DIR_WITH_SLASH)?))
+    pub(crate) fn new(mut table_root: Url) -> DeltaResult<Self> {
+        if !table_root.path().ends_with('/') {
+            let new_path = format!("{}/", table_root.path());
+            table_root.set_path(&new_path);
+        }
+        let log_root = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?;
+        Ok(Self {
+            table_root,
+            log_root,
+        })
+    }
+
+    pub(crate) fn table_root(&self) -> &Url {
+        &self.table_root
+    }
+
+    pub(crate) fn log_root(&self) -> &Url {
+        &self.log_root
     }
 
     /// Create a new commit path (absolute path) for the given version.
     pub(crate) fn new_commit_path(&self, version: Version) -> DeltaResult<ParsedLogPath<Url>> {
         let filename = format!("{version:020}.json");
-        let path = self.0.join(&filename)?;
+        let path = self.log_root().join(&filename)?;
         ParsedLogPath::try_from(path)?.ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
@@ -416,7 +436,7 @@ impl LogRoot {
     ) -> DeltaResult<ParsedLogPath<Url>> {
         let uuid = uuid::Uuid::new_v4();
         let filename = format!("{version:020}.{uuid}.json");
-        let path = self.0.join(&filename)?;
+        let path = self.log_root().join(STAGED_COMMITS_DIR)?.join(&filename)?;
         ParsedLogPath::try_from(path)?.ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
