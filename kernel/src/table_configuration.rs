@@ -20,7 +20,6 @@ use crate::table_features::{
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureType, TableFeature,
 };
 use crate::table_properties::TableProperties;
-use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
 
@@ -182,27 +181,6 @@ impl TableConfiguration {
     #[internal_api]
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
         self.protocol.ensure_write_supported()?;
-
-        // We allow Change Data Feed to be enabled only if AppendOnly is enabled.
-        // This is because kernel does not yet support writing `.cdc` files for DML operations.
-        if self
-            .table_properties()
-            .enable_change_data_feed
-            .unwrap_or(false)
-        {
-            require!(
-                self.is_append_only_enabled(),
-                Error::unsupported("Writing to table with Change Data Feed is only supported if append only mode is enabled")
-            );
-            require!(
-                self.is_cdf_read_supported(),
-                Error::unsupported(
-                    "Change data feed is enabled on this table, but found invalid table
-                    table_configuration. Ensure that column mapping is disabled and ensure correct
-                    protocol reader/writer features"
-                )
-            );
-        }
 
         // for now we don't allow invariants so although we support writer version 2 and the
         // ColumnInvariant TableFeature we _must_ check here that they are not actually in use
@@ -686,17 +664,17 @@ mod test {
         use TableFeature::*;
         let cases = [
             (
-                // Should fail since AppendOnly is not supported
+                // Writing to CDF-enabled table is supported for writes
                 create_mock_table_config(&["delta.enableChangeDataFeed"], &[ChangeDataFeed]),
-                Err(Error::unsupported("Writing to table with Change Data Feed is only supported if append only mode is enabled"))
+                Ok(())
             ),
             (
-                // Should fail since AppendOnly is supported but not enabled
+                // Should succeed even if AppendOnly is supported but not enabled
                 create_mock_table_config(
                     &["delta.enableChangeDataFeed"],
                     &[ChangeDataFeed, AppendOnly],
                 ),
-                Err(Error::unsupported("Writing to table with Change Data Feed is only supported if append only mode is enabled"))
+                Ok(())
             ),
                     (
                 // Should succeed since AppendOnly is enabled
