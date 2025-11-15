@@ -2213,14 +2213,8 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 async fn create_cdf_table(
     table_name: &str,
     schema: SchemaRef,
-) -> Result<
-    (
-        Url,
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        TempDir,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(Url, Arc<DefaultEngine<TokioBackgroundExecutor>>, TempDir), Box<dyn std::error::Error>>
+{
     let tmp_dir = tempdir()?;
     let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path()).unwrap();
 
@@ -2295,7 +2289,8 @@ async fn test_cdf_write_all_adds_succeeds() -> Result<(), Box<dyn std::error::Er
         DataType::INTEGER,
     )])?);
 
-    let (table_url, engine, _tmp_dir) = create_cdf_table("test_cdf_all_adds", schema.clone()).await?;
+    let (table_url, engine, _tmp_dir) =
+        create_cdf_table("test_cdf_all_adds", schema.clone()).await?;
 
     // Add files - this should succeed
     let version = write_data_to_table(&table_url, &engine, schema, vec![1, 2, 3]).await?;
@@ -2314,7 +2309,8 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
         DataType::INTEGER,
     )])?);
 
-    let (table_url, engine, _tmp_dir) = create_cdf_table("test_cdf_all_removes", schema.clone()).await?;
+    let (table_url, engine, _tmp_dir) =
+        create_cdf_table("test_cdf_all_removes", schema.clone()).await?;
 
     // First, add some data
     write_data_to_table(&table_url, &engine, schema, vec![1, 2, 3]).await?;
@@ -2434,4 +2430,3 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     Ok(())
 }
-
