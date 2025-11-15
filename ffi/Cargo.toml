@@ -25,7 +25,7 @@ url = "2"
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
-delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.17.0" }
+delta_kernel_ffi_macros = { path = "../ffi-proc-macros", version = "0.17.1" }
 
 [build-dependencies]
 cbindgen = "0.29.2"
@@ -46,6 +46,7 @@ object_store = "0.12.3"
 default = ["default-engine-rustls"]
 default-engine-native-tls = ["delta_kernel/default-engine-native-tls", "default-engine-base"]
 default-engine-rustls = ["delta_kernel/default-engine-rustls", "default-engine-base"]
+catalog-managed = ["delta_kernel/catalog-managed"]
 
 # This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
