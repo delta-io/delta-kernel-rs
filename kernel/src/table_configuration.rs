@@ -593,13 +593,15 @@ mod test {
                 .collect::<Vec<_>>();
             (
                 // Only add reader_features if reader >= 3 (non-legacy reader mode)
-                if min_reader_version >= 3 && !reader_features.is_empty() {
+                // Protocol requires Some (even if empty) when reader = 3
+                if min_reader_version >= 3 {
                     Some(reader_features)
                 } else {
                     None
                 },
                 // Only add writer_features if writer >= 7 (non-legacy writer mode)
-                if min_writer_version >= 7 && !writer_features.is_empty() {
+                // Protocol requires Some (even if empty) when writer = 7
+                if min_writer_version >= 7 {
                     Some(writer_features)
                 } else {
                     None
