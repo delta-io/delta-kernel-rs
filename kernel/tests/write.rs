@@ -24,7 +24,6 @@ use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
 
 use test_utils::set_json_value;
-use test_utils::DefaultEngineExtension;
 
 use itertools::Itertools;
 use object_store::path::Path;
@@ -36,8 +35,8 @@ use tempfile::tempdir;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_table, engine_store_setup,
-    setup_test_tables, test_read,
+    assert_result_error_with_message, copy_directory, create_default_engine, create_table,
+    engine_store_setup, setup_test_tables, test_read,
 };
 
 mod common;
@@ -1835,7 +1834,7 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
     copy_directory(&source_path, &tmp_table_path)?;
 
     let table_url = url::Url::from_directory_path(&tmp_table_path).unwrap();
-    let engine = DefaultEngine::new_local();
+    let engine = create_default_engine(&table_url)?;
 
     let snapshot = Snapshot::builder_for(table_url.clone())
         .at_version(1)
