@@ -272,6 +272,11 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
     }
 }
 
+pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
+pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
+pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
+pub(crate) static TAGS_NAME: &str = "tags";
+
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
@@ -280,7 +285,16 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values = StructType::new_unchecked([
         StructField::nullable("partitionValues", partition_values),
-        StructField::nullable("baseRowId", DataType::LONG),
+        StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+        StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+        StructField::nullable(
+            "tags",
+            MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                /*valueContainsNull*/ true,
+            ),
+        ),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -288,7 +302,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable("modificationTime", DataType::LONG),
         StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-        StructField::nullable("fileConstantValues", file_constant_values),
+        StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
     ]))
 });
 
@@ -307,6 +321,8 @@ fn get_add_transform_expr() -> ExpressionRef {
             Arc::new(Expression::Struct(vec![
                 column_expr_ref!("add.partitionValues"),
                 column_expr_ref!("add.baseRowId"),
+                column_expr_ref!("add.defaultRowCommitVersion"),
+                column_expr_ref!("add.tags"),
             ])),
         ]))
     });
@@ -325,8 +341,10 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("size"),
                 column_expr_ref!("modificationTime"),
                 column_expr_ref!("stats"),
+                column_expr_ref!("fileConstantValues.tags"),
                 column_expr_ref!("deletionVector"),
                 column_expr_ref!("fileConstantValues.baseRowId"),
+                column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
             ],
         ))]))
     });
