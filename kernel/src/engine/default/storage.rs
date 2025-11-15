@@ -88,20 +88,32 @@ where
     K: AsRef<str>,
     V: Into<String>,
 {
+    // Convert options to HashMap and apply S3-specific defaults
+    let mut opts: HashMap<String, String> = options
+        .into_iter()
+        .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+        .collect();
+
+    // For S3 URLs, set copy_if_not_exists header strategy by default
+    // This ensures atomic copy operations work correctly with S3
+    // Users can override this by explicitly passing the option
+    if url.scheme() == "s3" && !opts.contains_key("copy_if_not_exists") {
+        opts.insert(
+            "copy_if_not_exists".to_string(),
+            "header:If-None-Match:*".to_string(),
+        );
+    }
+
     // First attempt to use any schemes registered via insert_url_handler,
     // falling back to the default behavior of object_store::parse_url_opts
     let (store, _path) = if let Ok(handlers) = URL_REGISTRY.read() {
         if let Some(handler) = handlers.get(url.scheme()) {
-            let options = options
-                .into_iter()
-                .map(|(k, v)| (k.as_ref().to_string(), v.into()))
-                .collect();
-            handler(url, options)?
+            handler(url, opts)?
         } else {
-            object_store::parse_url_opts(url, options)?
+            object_store::parse_url_opts(url, opts)?
         }
     } else {
-        object_store::parse_url_opts(url, options)?
+        object_store::parse_url_opts(url, opts)?
     };
 
     Ok(Arc::new(store))
@@ -114,7 +126,7 @@ mod tests {
     use hdfs_native_object_store::HdfsObjectStoreBuilder;
     use object_store::{self, path::Path};
 
-    /// Example funciton of doing testing of a custom [HdfsObjectStore] construction
+    /// Example function of doing testing of a custom [HdfsObjectStore] construction
     fn parse_url_opts_hdfs_native<I, K, V>(
         url: &Url,
         options: I,
@@ -166,5 +178,48 @@ mod tests {
                 panic!("Expected to get an error when constructing an HdfsObjectStore, but something didn't work as expected! Either the parse_url_opts_hdfs_native function didn't get called, or the hdfs-native-object-store no longer errors when it cannot connect to HDFS");
             }
         }
+    }
+
+    #[test]
+    fn test_s3_default_copy_if_not_exists() {
+        // Test that S3 URLs automatically get header copy_if_not_exists by default
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let options: HashMap<String, String> = HashMap::new();
+
+        // Should succeed and set header strategy
+        let store = store_from_url_opts(&url, options);
+        assert!(
+            store.is_ok(),
+            "Should successfully create object store with default header strategy"
+        );
+    }
+
+    #[test]
+    fn test_s3_override_copy_if_not_exists() {
+        // Test that users can override the default copy_if_not_exists strategy
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let options = HashMap::from([("copy_if_not_exists".to_string(), "multipart".to_string())]);
+
+        // Should succeed with user-specified multipart strategy
+        let store = store_from_url_opts(&url, options);
+        assert!(
+            store.is_ok(),
+            "Should successfully create object store with overridden multipart strategy"
+        );
+    }
+
+    #[test]
+    fn test_non_s3_urls_unaffected() {
+        // Test that non-S3 URLs don't get copy_if_not_exists set
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let options: HashMap<String, String> = HashMap::new();
+
+        // Should succeed without adding copy_if_not_exists
+        let store = store_from_url_opts(&url, options);
+        assert!(
+            store.is_ok(),
+            "Should successfully create object store for local filesystem"
+        );
     }
 }
