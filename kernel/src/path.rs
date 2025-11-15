@@ -106,11 +106,10 @@ fn path_contains_delta_log_dir(mut path_segments: std::str::Split<'_, char>) -> 
 impl<Location: AsUrl> ParsedLogPath<Location> {
     // NOTE: We can't actually impl TryFrom because Option<T> is a foreign struct even if T is local.
     #[internal_api]
-    pub(crate) fn try_from(location: Location) -> DeltaResult<Option<ParsedLogPath<Location>>> {
+    pub(crate) fn try_from(location: Location) -> Option<ParsedLogPath<Location>> {
         let url = location.as_url();
-        let Some(mut path_segments) = url.path_segments() else {
-            return Ok(None);
-        };
+        let mut path_segments = url.path_segments()?;
+
         #[allow(clippy::unwrap_used)]
         let filename = path_segments
             .next_back()
@@ -118,7 +117,7 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             .to_string();
         let subdir = path_segments.next_back();
         if filename.is_empty() {
-            return Ok(None); // Not a valid log path
+            return None; // Not a valid log path
         }
 
         let mut split = filename.split('.');
@@ -130,17 +129,16 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         // Every valid log path starts with a numeric version part. If version parsing fails, it
         // must not be a log path and we simply return None. However, it is an error if version
         // parsing succeeds for a wrong-length numeric string.
-        let version = match version.parse().ok() {
-            Some(v) if version.len() == VERSION_LEN => v,
-            Some(_) => return Ok(None), // has a version but it's not 20 chars
-            None => return Ok(None),
-        };
+        if version.len() != VERSION_LEN {
+            return None;
+        }
+        let version = version.parse().ok()?;
 
         // Every valid log path has a file extension as its last part. Return None if it's missing.
         let split: Vec<_> = split.collect();
         let extension = match split.last() {
             Some(extension) => extension.to_string(),
-            None => return Ok(None),
+            None => return None,
         };
 
         // this check determines if we're in the delta log dir, or in the staged commits dir. The check is:
@@ -177,28 +175,20 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             ["crc"] if in_delta_log_dir => LogPathFileType::Crc,
             ["checkpoint", "parquet"] if in_delta_log_dir => LogPathFileType::SinglePartCheckpoint,
             ["checkpoint", uuid, "json" | "parquet"] if in_delta_log_dir => {
-                let Some(_) = parse_path_part::<String>(uuid, UUID_PART_LEN) else {
-                    return Ok(None);
-                };
+                let _ = parse_path_part::<String>(uuid, UUID_PART_LEN)?;
                 LogPathFileType::UuidCheckpoint
             }
             [hi, "compacted", "json"] if in_delta_log_dir => {
-                let Some(hi) = parse_path_part(hi, VERSION_LEN) else {
-                    return Ok(None);
-                };
+                let hi = parse_path_part(hi, VERSION_LEN)?;
                 LogPathFileType::CompactedCommit { hi }
             }
             ["checkpoint", part_num, num_parts, "parquet"] if in_delta_log_dir => {
-                let Some(part_num) = parse_path_part(part_num, MULTIPART_PART_LEN) else {
-                    return Ok(None);
-                };
-                let Some(num_parts) = parse_path_part(num_parts, MULTIPART_PART_LEN) else {
-                    return Ok(None);
-                };
+                let part_num = parse_path_part(part_num, MULTIPART_PART_LEN)?;
+                let num_parts = parse_path_part(num_parts, MULTIPART_PART_LEN)?;
 
                 // A valid part_num must be in the range [1, num_parts]
                 if !(0 < part_num && part_num <= num_parts) {
-                    return Ok(None);
+                    return None;
                 }
                 LogPathFileType::MultiPartCheckpoint {
                     part_num,
@@ -209,13 +199,13 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             // Unrecognized log paths are allowed, so long as they have a valid version.
             _ => LogPathFileType::Unknown,
         };
-        Ok(Some(ParsedLogPath {
+        Some(ParsedLogPath {
             location,
             filename,
             extension,
             version,
             file_type,
-        }))
+        })
     }
 
     pub(crate) fn should_list(&self) -> bool {
@@ -301,7 +291,7 @@ impl ParsedLogPath<Url> {
     /// Helper method to create a path with the given filename generator
     fn create_path(table_root: &Url, filename: String) -> DeltaResult<Self> {
         let location = table_root.join(DELTA_LOG_DIR_WITH_SLASH)?.join(&filename)?;
-        Self::try_from(location)?.ok_or_else(|| {
+        Self::try_from(location).ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
@@ -403,7 +393,7 @@ impl LogRoot {
     pub(crate) fn new_commit_path(&self, version: Version) -> DeltaResult<ParsedLogPath<Url>> {
         let filename = format!("{version:020}.json");
         let path = self.0.join(&filename)?;
-        ParsedLogPath::try_from(path)?.ok_or_else(|| {
+        ParsedLogPath::try_from(path).ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
@@ -417,7 +407,7 @@ impl LogRoot {
         let uuid = uuid::Uuid::new_v4();
         let filename = format!("{version:020}.{uuid}.json");
         let path = self.0.join(&filename)?;
-        ParsedLogPath::try_from(path)?.ok_or_else(|| {
+        ParsedLogPath::try_from(path).ok_or_else(|| {
             Error::internal_error(format!("Attempted to create an invalid path: {filename}"))
         })
     }
@@ -462,21 +452,18 @@ mod tests {
         assert!(log_path
             .path()
             .ends_with("/tests/data/table-with-dv-small/_delta_log/subdir/"));
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         // ignored - not versioned
         let log_path = table_log_dir.join("_last_checkpoint").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         // ignored - no extension
         let log_path = table_log_dir.join("00000000000000000010").unwrap();
         let result = ParsedLogPath::try_from(log_path);
-        assert!(
-            matches!(result, Ok(None)),
-            "Expected Ok(None) for missing file extension"
-        );
+        assert!(result.is_none());
 
         // empty extension - should be treated as unknown file type
         let log_path = table_log_dir.join("00000000000000000011.").unwrap();
@@ -484,32 +471,32 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Ok(Some(ParsedLogPath {
+                Some(ParsedLogPath {
                     file_type: LogPathFileType::Unknown,
                     ..
-                }))
+                })
             ),
             "Expected Unknown file type, got {result:?}"
         );
 
         // ignored - version fails to parse
         let log_path = table_log_dir.join("abc.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         // invalid - version has too many digits
         let log_path = table_log_dir.join("000000000000000000010.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         // invalid - version has too few digits
         let log_path = table_log_dir.join("0000000000000000010.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         // unknown - two parts
         let log_path = table_log_dir.join("00000000000000000010.foo").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.filename, "00000000000000000010.foo");
         assert_eq!(log_path.extension, "foo");
         assert_eq!(log_path.version, 10);
@@ -520,7 +507,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000010.a.b.c.foo")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.filename, "00000000000000000010.a.b.c.foo");
         assert_eq!(log_path.extension, "foo");
         assert_eq!(log_path.version, 10);
@@ -532,7 +519,7 @@ mod tests {
         let table_log_dir = table_log_dir_url();
 
         let log_path = table_log_dir.join("00000000000000000000.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.filename, "00000000000000000000.json");
         assert_eq!(log_path.extension, "json");
         assert_eq!(log_path.version, 0);
@@ -541,7 +528,7 @@ mod tests {
         assert!(!log_path.is_checkpoint());
 
         let log_path = table_log_dir.join("00000000000000000005.json").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.version, 5);
         assert!(log_path.is_commit());
     }
@@ -551,7 +538,7 @@ mod tests {
         let table_log_dir = table_log_dir_url();
 
         let log_path = table_log_dir.join("00000000000000000000.crc").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.filename, "00000000000000000000.crc");
         assert_eq!(log_path.extension, "crc");
         assert_eq!(log_path.version, 0);
@@ -560,9 +547,9 @@ mod tests {
         assert!(!log_path.is_checkpoint());
 
         let log_path = table_log_dir.join("00000000000000000005.crc").unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.version, 5);
-        assert!(log_path.file_type == LogPathFileType::Crc);
+        assert_eq!(log_path.file_type, LogPathFileType::Crc);
     }
 
     #[test]
@@ -572,7 +559,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.filename, "00000000000000000002.checkpoint.parquet");
         assert_eq!(log_path.extension, "parquet");
         assert_eq!(log_path.version, 2);
@@ -587,7 +574,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.filename, "00000000000000000002.checkpoint.json");
         assert_eq!(log_path.extension, "json");
         assert_eq!(log_path.version, 2);
@@ -603,7 +590,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.parquet"
@@ -620,7 +607,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"
@@ -637,7 +624,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.foo")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000002.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.foo"
@@ -651,14 +638,14 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.foo.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         // invalid file extension
         let log_path = table_log_dir
             .join("00000000000000000002.checkpoint.foo")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(log_path.filename, "00000000000000000002.checkpoint.foo");
         assert_eq!(log_path.extension, "foo");
         assert_eq!(log_path.version, 2);
@@ -670,7 +657,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000010.checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
     }
 
@@ -681,7 +668,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000000.0000000002.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000008.checkpoint.0000000000.0000000002.json"
@@ -695,13 +682,13 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000000.0000000002.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.0000000002.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000008.checkpoint.0000000001.0000000002.parquet"
@@ -721,7 +708,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000002.0000000002.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000008.checkpoint.0000000002.0000000002.parquet"
@@ -741,31 +728,31 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000003.0000000002.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.000000001.0000000002.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.000000002.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.00000000x1.0000000002.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.checkpoint.0000000001.00000000x2.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
     }
 
@@ -776,7 +763,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.00000000000000000015.compacted.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000008.00000000000000000015.compacted.json"
@@ -794,7 +781,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.00000000000000000015.compacted.parquet")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000008.00000000000000000015.compacted.parquet"
@@ -808,19 +795,19 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000008.0000000000000000015.compacted.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.000000000000000000015.compacted.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
 
         let log_path = table_log_dir
             .join("00000000000000000008.00000000000000000a15.compacted.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap();
+        let log_path = ParsedLogPath::try_from(log_path);
         assert!(log_path.is_none());
     }
 
@@ -880,7 +867,7 @@ mod tests {
         let log_path = table_log_dir
             .join("_staged_commits/00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"
@@ -896,7 +883,7 @@ mod tests {
         let log_path = table_log_dir
             .join("_staged_commits/00000000000000000010.not-a-uuid.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert!(log_path.is_unknown());
         assert!(!log_path.is_commit());
         assert!(!log_path.is_checkpoint());
@@ -905,7 +892,7 @@ mod tests {
         let log_path = table_log_dir
             .join("00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")
             .unwrap();
-        let log_path = ParsedLogPath::try_from(log_path).unwrap().unwrap();
+        let log_path = ParsedLogPath::try_from(log_path).unwrap();
         assert_eq!(
             log_path.filename,
             "00000000000000000010.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json"
@@ -975,7 +962,6 @@ mod tests {
             last_modified: 0,
             size: commit_content.len() as u64,
         })
-        .unwrap()
         .unwrap();
 
         // Now actually test reading the timestamp
@@ -1004,7 +990,6 @@ mod tests {
             last_modified: 0,
             size: commit_content.len() as u64,
         })
-        .unwrap()
         .unwrap();
 
         // Should return error when ICT is missing
@@ -1026,7 +1011,6 @@ mod tests {
             last_modified: 0,
             size: 100,
         })
-        .unwrap()
         .unwrap();
 
         // Should return error for non-commit files
