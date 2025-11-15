@@ -202,12 +202,8 @@ fn setup_golden_table(
     let table_path = test_path.join("delta");
     let url = delta_kernel::try_parse_uri(table_path.to_str().expect("table path to string"))
         .expect("table from uri");
-    let engine = DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )
-    .unwrap();
+    let engine = Arc::try_unwrap(test_utils::create_default_engine(&url).unwrap())
+        .expect("Arc should have single reference");
     let expected_path = test_path.join("expected");
     let expected_path = expected_path.exists().then_some(expected_path);
     (engine, url, expected_path, test_dir)

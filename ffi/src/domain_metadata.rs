@@ -93,7 +93,6 @@ mod tests {
         recover_string,
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
-    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::DeltaResult;
     use object_store::memory::InMemory;
@@ -107,7 +106,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let storage = Arc::new(InMemory::new());
 
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage.clone());
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
