@@ -656,59 +656,46 @@ mod tests {
     #[test]
     fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tracing_subscriber::fmt().try_init();
-
         let (_temp_file1, file_url1) = make_invalid_named_temp();
         let (_temp_file2, file_url2) = make_invalid_named_temp();
-
         let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
         let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
         let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
 
-        ////////////////////////////////////////
-        // CASE 1: only a single failing file //
-        ////////////////////////////////////////
-        info!("\nAttempting to read single malformed JSON file...");
-        let file_vec = vec![FileMeta::new(file_url1.clone(), 1, 1)];
-        let mut iter =
-            default_engine
-                .json_handler()
-                .read_json_files(&file_vec, schema.clone(), None)?;
+        // Helper to check that we get expected number of errors then stream ends
+        let check_errors = |file_urls: Vec<_>, expected_errors: usize| {
+            let file_vec: Vec<_> = file_urls
+                .into_iter()
+                .map(|url| FileMeta::new(url, 1, 1))
+                .collect();
 
-        // One error should be emitted
-        assert!(
-            iter.next().unwrap().is_err(),
-            "Read succeeded unexpectedly. The JSON should have been invalid."
-        );
-        // The stream should be complete after the error
-        assert!(
-            iter.next().is_none(),
-            "The stream should end once the read result fails"
-        );
+            let mut iter =
+                default_engine
+                    .json_handler()
+                    .read_json_files(&file_vec, schema.clone(), None)?;
 
-        ///////////////////////////////
-        // CASE 2: Two failing files //
-        ///////////////////////////////
-        let file_vec = vec![
-            FileMeta::new(file_url1, 1, 1),
-            FileMeta::new(file_url2, 1, 1),
-        ];
-        info!("\nAttempting to read malformed JSON file...");
-        let mut iter = default_engine
-            .json_handler()
-            .read_json_files(&file_vec, schema, None)?;
+            for _ in 0..expected_errors {
+                assert!(
+                    iter.next().unwrap().is_err(),
+                    "Read succeeded unexpectedly. The JSON should have been invalid."
+                );
+            }
 
-        // 2 errors should be emitted
-        for _ in 0..2 {
             assert!(
-                iter.next().unwrap().is_err(),
-                "Read succeeded unexpectedly. The JSON should have been invalid."
+                iter.next().is_none(),
+                "The stream should end once the read result fails"
             );
-        }
-        // The stream should be complete after the error
-        assert!(
-            iter.next().is_none(),
-            "The stream should end once the read result fails"
-        );
+
+            Ok::<_, Box<dyn std::error::Error>>(())
+        };
+
+        // CASE 1: Single failing file
+        info!("\nAttempting to read single malformed JSON file...");
+        check_errors(vec![file_url1.clone()], 1)?;
+
+        // CASE 2: Two failing files
+        info!("\nAttempting to read two malformed JSON files...");
+        check_errors(vec![file_url1, file_url2], 2)?;
 
         Ok(())
     }
