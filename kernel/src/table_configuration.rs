@@ -438,13 +438,13 @@ impl TableConfiguration {
 
     /// Returns true if the protocol uses legacy reader version (< 3)
     #[allow(dead_code)]
-    fn uses_legacy_reader(&self) -> bool {
+    fn is_legacy_reader_version(&self) -> bool {
         self.protocol.min_reader_version() < 3
     }
 
     /// Returns true if the protocol uses legacy writer version (< 7)
     #[allow(dead_code)]
-    fn uses_legacy_writer(&self) -> bool {
+    fn is_legacy_writer_version(&self) -> bool {
         self.protocol.min_writer_version() < 7
     }
 
@@ -461,7 +461,7 @@ impl TableConfiguration {
     fn is_feature_info_supported(&self, feature: &TableFeature, info: &FeatureInfo) -> bool {
         match info.feature_type {
             FeatureType::Writer => {
-                if self.uses_legacy_writer() {
+                if self.is_legacy_writer_version() {
                     // Legacy writer: protocol writer version meets minimum requirement
                     self.protocol.min_writer_version() >= info.min_writer_version
                 } else {
@@ -470,7 +470,7 @@ impl TableConfiguration {
                 }
             }
             FeatureType::ReaderWriter => {
-                let reader_supported = if self.uses_legacy_reader() {
+                let reader_supported = if self.is_legacy_reader_version() {
                     // Legacy reader: protocol reader version meets minimum requirement
                     self.protocol.min_reader_version() >= info.min_reader_version
                 } else {
@@ -478,7 +478,7 @@ impl TableConfiguration {
                     Self::has_feature(self.protocol.reader_features(), feature)
                 };
 
-                let writer_supported = if self.uses_legacy_writer() {
+                let writer_supported = if self.is_legacy_writer_version() {
                     // Legacy writer: protocol writer version meets minimum requirement
                     self.protocol.min_writer_version() >= info.min_writer_version
                 } else {
@@ -551,7 +551,7 @@ mod test {
         props_to_enable: &[&str],
         features: &[TableFeature],
     ) -> TableConfiguration {
-        create_mock_table_config_with_version(props_to_enable, features.into(), 3, 7)
+        create_mock_table_config_with_version(props_to_enable, Some(features), 3, 7)
     }
 
     fn create_mock_table_config_with_version(
@@ -574,25 +574,49 @@ mod test {
             ),
         )
         .unwrap();
-        let reader_features = features_opt.map(|features| {
-            features
+
+        let (reader_features_opt, writer_features_opt) = if let Some(features) = features_opt {
+            let reader_features = features
                 .iter()
                 .filter(|feature| matches!(feature.feature_type(), FeatureType::ReaderWriter))
-        });
-        let writer_features = features_opt.map(|features| {
-            features.iter().filter(|feature| {
-                matches!(
-                    feature.feature_type(),
-                    FeatureType::Writer | FeatureType::ReaderWriter
-                )
-            })
-        });
+                .cloned()
+                .collect::<Vec<_>>();
+            let writer_features = features
+                .iter()
+                .filter(|feature| {
+                    matches!(
+                        feature.feature_type(),
+                        FeatureType::Writer | FeatureType::ReaderWriter
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                // Only add reader_features if reader >= 3 (non-legacy reader mode)
+                if min_reader_version >= 3 && !reader_features.is_empty() {
+                    Some(reader_features)
+                } else {
+                    None
+                },
+                // Only add writer_features if writer >= 7 (non-legacy writer mode)
+                if min_writer_version >= 7 && !writer_features.is_empty() {
+                    Some(writer_features)
+                } else {
+                    None
+                },
+            )
+        } else {
+            (None, None)
+        };
+
+        let reader_features_iter = reader_features_opt.as_ref().map(|f| f.iter());
+        let writer_features_iter = writer_features_opt.as_ref().map(|f| f.iter());
 
         let protocol = Protocol::try_new(
             min_reader_version,
             min_writer_version,
-            reader_features,
-            writer_features,
+            reader_features_iter,
+            writer_features_iter,
         )
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
@@ -1077,10 +1101,13 @@ mod test {
     }
 
     #[test]
-    fn test_is_feature_info_supported_writer_legacy() {
-        // Create a custom Writer feature that requires min_writer_version = 2
+    fn test_is_feature_info_supported_writer() {
+        // Use ColumnMapping (a ReaderWriter feature) with custom FeatureInfo as Writer type
+        let feature = TableFeature::ColumnMapping;
+
+        // Custom FeatureInfo that treats ColumnMapping as Writer-only with min_writer_version = 2
         let custom_feature_info = FeatureInfo {
-            name: "customWriterFeature",
+            name: "columnMapping",
             min_reader_version: 1,
             min_writer_version: 2,
             feature_type: FeatureType::Writer,
@@ -1092,19 +1119,57 @@ mod test {
 
         // Test with legacy protocol writer v2 - should be supported
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
-        let feature = TableFeature::unknown("customWriterFeature");
         assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
 
         // Test with legacy protocol writer v1 - should NOT be supported
         let config = create_mock_table_config_with_version(&[], None, 1, 1);
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
+
+        // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
+        // For this to work with a Writer-only FeatureInfo, we need a real Writer-only feature
+        // Use AppendOnly instead of ColumnMapping for the 2,7 test cases
+        let writer_only_feature = TableFeature::AppendOnly;
+        let writer_only_info = FeatureInfo {
+            name: "appendOnly",
+            min_reader_version: 1,
+            min_writer_version: 2,
+            feature_type: FeatureType::Writer,
+            feature_requirements: &[],
+            read_support: KernelSupport::Supported,
+            write_support: KernelSupport::Supported,
+            enablement_check: EnablementCheck::AlwaysIfSupported,
+        };
+
+        // reader=2 (legacy), writer=7 (non-legacy) - feature in list, should be supported
+        let config =
+            create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
+        assert!(config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
+
+        // reader=2 (legacy), writer=7 (non-legacy) - feature NOT in list, should NOT be supported
+        // Use ChangeDataFeed which is also a Writer-only feature
+        let config =
+            create_mock_table_config_with_version(&[], Some(&[TableFeature::ChangeDataFeed]), 2, 7);
+        assert!(!config.is_feature_info_supported(&writer_only_feature, &writer_only_info));
+
+        // Test with protocol reader=3, writer=7 (both non-legacy) - feature in list, should be supported
+        let config = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
+        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
+
+        // Test with protocol reader=3, writer=7 (both non-legacy) - feature NOT in list, should NOT be supported
+        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
+        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
     }
 
     #[test]
-    fn test_is_feature_info_supported_reader_writer_legacy() {
-        // Create a custom ReaderWriter feature that requires reader=2, writer=5
+    fn test_is_feature_info_supported_reader_writer() {
+        // Use ColumnMapping (a real ReaderWriter feature) with custom FeatureInfo
+        // ColumnMapping is a legacy feature (reader=2, writer=5) which makes it ideal for
+        // testing both legacy mode (version checks) and non-legacy mode (feature list checks)
+        let feature = TableFeature::ColumnMapping;
+
+        // Custom FeatureInfo that requires reader=2, writer=5
         let custom_feature_info = FeatureInfo {
-            name: "customReaderWriterFeature",
+            name: "columnMapping",
             min_reader_version: 2,
             min_writer_version: 5,
             feature_type: FeatureType::ReaderWriter,
@@ -1114,9 +1179,7 @@ mod test {
             enablement_check: EnablementCheck::AlwaysIfSupported,
         };
 
-        let feature = TableFeature::unknown("customReaderWriterFeature");
-
-        // Test with sufficient versions - should be supported
+        // Test with sufficient versions (legacy mode) - should be supported
         let config = create_mock_table_config_with_version(&[], None, 2, 5);
         assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
 
@@ -1126,6 +1189,26 @@ mod test {
 
         // Test with insufficient writer version - should NOT be supported
         let config = create_mock_table_config_with_version(&[], None, 2, 4);
+        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
+
+        // Test with asymmetric: reader=2 (legacy), writer=7 (non-legacy)
+        // ReaderWriter features CANNOT be enabled in this protocol state (protocol validation)
+        // But we still need to test that the code correctly identifies them as NOT supported
+        // Create a table with only Writer-only features (e.g., AppendOnly)
+        let config =
+            create_mock_table_config_with_version(&[], Some(&[TableFeature::AppendOnly]), 2, 7);
+        // ColumnMapping (ReaderWriter) should NOT be supported because:
+        // - reader=2 (legacy) checks version: 2 >= 2 ✓ (reader_supported = true)
+        // - writer=7 (non-legacy) checks list: ColumnMapping not in writer_features ✗ (writer_supported = false)
+        // - Result: false (requires BOTH to be true)
+        assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
+
+        // Test with non-legacy mode (3,7) - feature in list, should be supported
+        let config = create_mock_table_config(&[], &[TableFeature::ColumnMapping]);
+        assert!(config.is_feature_info_supported(&feature, &custom_feature_info));
+
+        // Test with non-legacy mode (3,7) - feature NOT in list, should NOT be supported
+        let config = create_mock_table_config(&[], &[TableFeature::DeletionVectors]);
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
     }
 
