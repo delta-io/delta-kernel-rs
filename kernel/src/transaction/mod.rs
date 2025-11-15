@@ -250,8 +250,9 @@ impl Transaction {
             require!(
                 !cdf_enabled,
                 Error::generic(
-                    "Cannot add and remove data in the same transaction
-                    if the table property 'delta.enableChangeDataFeed' = true."
+                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+                     This would require writing CDC files for DML operations, which is not yet supported. \
+                     Consider using separate transactions: one to add files, another to remove files."
                 )
             );
         }
