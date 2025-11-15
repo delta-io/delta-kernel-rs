@@ -39,6 +39,44 @@ pub fn load_test_data(
     Ok(temp_dir)
 }
 
+/// Recursively copies a directory and all its contents from source to destination.
+///
+/// This function is used to create isolated copies of test tables, enabling parallel
+/// test execution without interference. Each test gets its own copy of the table data,
+/// preventing race conditions and cross-test pollution.
+///
+/// # Arguments
+///
+/// * `source` - Path to the source directory to copy from
+/// * `dest` - Path to the destination directory (will be created if it doesn't exist)
+///
+/// # Note
+///
+/// This function copies ALL files and subdirectories, including any test artifacts
+/// that may have been created in the source directory. Ensure the source directory
+/// contains only the intended baseline data.
+pub fn copy_directory(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dest)?;
+
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let dest_path = dest.join(&file_name);
+
+        if path.is_dir() {
+            copy_directory(&path, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
 pub const METADATA: &str = r#"{"commitInfo":{"timestamp":1587968586154,"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists","partitionBy":"[]"},"isBlindAppend":true}}
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
