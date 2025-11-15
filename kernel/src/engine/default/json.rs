@@ -641,9 +641,7 @@ mod tests {
     use crate::schema::StructType;
     use crate::Engine;
     use std::io::Write;
-    use std::time::{Duration, Instant};
     use tempfile::NamedTempFile;
-    use tokio::runtime::Builder;
 
     #[test]
     fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
@@ -655,11 +653,6 @@ mod tests {
         let file_url = Url::from_file_path(path).expect("Failed to create file URL");
 
         info!("Created temporary malformed file at: {file_url}");
-
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()?;
 
         let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
 
@@ -677,27 +670,17 @@ mod tests {
 
         let read_result = iter.next().unwrap();
 
-        if read_result.is_ok() {
-            panic!("Read succeeded unexpectedly. The JSON should have been invalid.");
-        }
-
-        // The Tokio runtime will use the entire duration to
-        // shutdown!
-        //
-        // note that a non-existent file does not cause any hanging
-        // here, which is interesting
-        info!("\nAttempting to shut down runtime...");
-
-        let start = Instant::now();
-        runtime.shutdown_timeout(Duration::from_secs(5));
-        let elapsed = start.elapsed();
-
+        // One error should be emitted
         assert!(
-            elapsed < Duration::from_secs(1),
-            "Runtime shutdown took {:?}, expected < 1s",
-            elapsed
+            read_result.is_err(),
+            "Read succeeded unexpectedly. The JSON should have been invalid."
         );
-        info!("Runtime shutdown complete.");
+
+        // The stream should be complete after the error
+        assert!(
+            iter.next().is_none(),
+            "The stream should end once the read result fails"
+        );
 
         Ok(())
     }
