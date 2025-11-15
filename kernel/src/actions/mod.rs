@@ -1398,7 +1398,6 @@ mod tests {
             writer_features: Some(vec![TableFeature::Unknown("unknown_reader".to_string())]),
         };
         assert!(protocol.validate_table_features().is_ok());
-        // Read/write support validation happens in TableConfiguration, not Protocol
 
         // Test unknown features in writer - validation passes
         let protocol = Protocol {
@@ -1408,7 +1407,6 @@ mod tests {
             writer_features: Some(vec![TableFeature::Unknown("unknown_writer".to_string())]),
         };
         assert!(protocol.validate_table_features().is_ok());
-        // Read/write support validation happens in TableConfiguration, not Protocol
     }
 
     #[test]
