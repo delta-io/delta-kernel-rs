@@ -294,7 +294,7 @@ impl TableConfiguration {
     fn ensure_read_supported(&self) -> DeltaResult<()> {
         // Version check
         match self.protocol.min_reader_version() {
-            1 | 2 | 3 => {}
+            1..=3 => {}
             _ => {
                 return Err(Error::unsupported(format!(
                     "Unsupported minimum reader version {}",
@@ -453,6 +453,7 @@ impl TableConfiguration {
     }
 
     /// Returns `true` if the table supports the column invariant table feature.
+    #[allow(unused)]
     pub(crate) fn is_invariants_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
@@ -560,6 +561,7 @@ impl TableConfiguration {
     /// In order to enable row tracking the table must:
     /// - Support row tracking (see [`Self::is_row_tracking_supported`]).
     /// - Have the `delta.enableRowTracking` table property set to `true`.
+    #[allow(unused)]
     pub(crate) fn is_row_tracking_enabled(&self) -> bool {
         self.is_row_tracking_supported()
             && self.table_properties().enable_row_tracking.unwrap_or(false)
