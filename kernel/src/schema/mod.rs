@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -173,6 +173,12 @@ impl FromStr for MetadataColumnSpec {
             "row_commit_version" => Ok(Self::RowCommitVersion),
             _ => Err(Error::Schema(format!("Unknown metadata column spec: {s}"))),
         }
+    }
+}
+
+impl Display for MetadataColumnSpec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MetadataColumn({}, {}, {})", self.text_value(), self.data_type(), self.nullable())
     }
 }
 
@@ -511,6 +517,36 @@ impl StructField {
     }
 }
 
+impl Display for StructField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StructField({}, {}, {}, ",
+               self.name,
+               self.data_type,
+               self.nullable,
+        )?;
+
+        // display metadata if exists
+        if self.metadata.is_empty() {
+            write!(f, "{{}}")?;
+        } else {
+            write!(f, "{{")?;
+
+            let mut first = true;
+            for (k, v) in &self.metadata {
+                if !first {
+                    write!(f, ", ")?;
+                }
+                first = false;
+                write!(f, "{}: {:?}", k, v)?;
+            }
+
+            write!(f, "}}")?;
+        }
+
+        write!(f, ")")
+    }
+}
+
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
 #[derive(Debug, PartialEq, Clone, Eq)]
@@ -785,6 +821,50 @@ impl StructType {
             // Primitive types cannot contain nested metadata columns and variant types are validated at creation
             DataType::Primitive(_) | DataType::Variant(_) => {}
         };
+
+        Ok(())
+    }
+}
+
+impl Display for StructType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}(", self.type_name)?;
+
+        let mut first = true;
+        for field in self.fields.values() {
+            if !first {
+                writeln!(f, ",")?;
+            }
+            first = false;
+
+            write!(f, "    {}", field)?;
+        }
+
+        writeln!(f)?;
+        write!(f, ")")?;
+        if !self.metadata_columns.is_empty() {
+            writeln!(f, "\nMetadataColumns(")?;
+
+            // Display suppose to be stable, so sort metadata columns by their indexes
+            let entries = {
+                let mut v: Vec<_> = self.metadata_columns.iter().collect();
+                v.sort_by_key(|(_, idx)| *idx);
+                v
+            };
+
+            let mut first = true;
+            for (col, idx) in entries {
+                if !first {
+                    writeln!(f, ",")?;
+                }
+                first = false;
+
+                write!(f, "    {} -> {}", col, idx)?;
+            }
+
+            writeln!(f)?;
+            write!(f, ")")?;
+        }
 
         Ok(())
     }
@@ -2894,6 +2974,30 @@ mod tests {
             schema.index_of_metadata_column(&MetadataColumnSpec::RowCommitVersion),
             Some(&3)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_display_stable_output() -> DeltaResult<()> {
+        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        assert_eq!(schema.to_string(), "struct(
+    StructField(regular_col, string, true, {})
+)");
+        let schema = schema
+            .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
+            .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?;
+        assert_eq!(schema.to_string(), "struct(
+    StructField(regular_col, string, true, {}),
+    StructField(row_index, long, false, {delta.metadataSpec: String(\"row_index\")}),
+    StructField(row_id, long, false, {delta.metadataSpec: String(\"row_id\")}),
+    StructField(row_commit_version, long, false, {delta.metadataSpec: String(\"row_commit_version\")})
+)
+MetadataColumns(
+    MetadataColumn(row_index, long, false) -> 1,
+    MetadataColumn(row_id, long, false) -> 2,
+    MetadataColumn(row_commit_version, long, false) -> 3
+)");
         Ok(())
     }
 }
