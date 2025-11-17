@@ -10,7 +10,7 @@ use delta_kernel::{Engine, LogPath, Snapshot, Version};
 use uc_client::prelude::*;
 
 use itertools::Itertools;
-use tracing::info;
+use tracing::debug;
 use url::Url;
 
 /// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
@@ -67,8 +67,8 @@ impl<'a> UCCatalog<'a> {
             end_version: version.and_then(|v| v.try_into().ok()),
         };
         let mut commits = self.client.get_commits(req).await?;
-        if let Some(commits) = &mut commits.commits {
-            commits.sort_by_key(|c| c.version);
+        if let Some(commits) = commits.commits.as_mut() {
+            commits.sort_by_key(|c| c.version)
         }
 
         // if commits are present, we ensure they are sorted+contiguous
@@ -96,7 +96,11 @@ impl<'a> UCCatalog<'a> {
         let mut table_url = Url::parse(&table_uri)?;
         // add trailing slash
         if !table_url.path().ends_with('/') {
-            table_url.path_segments_mut().unwrap().push("");
+            // NB: we push an empty segment which effectively adds a trailing slash
+            table_url
+                .path_segments_mut()
+                .map_err(|_| "Cannot modify URL path segments")?
+                .push("");
         }
         let commits: Vec<_> = commits
             .commits
@@ -113,7 +117,7 @@ impl<'a> UCCatalog<'a> {
             })
             .try_collect()?;
 
-        info!("commits for kernel: {:?}\n", commits);
+        debug!("commits for kernel: {:?}\n", commits);
 
         Snapshot::builder_for(Url::parse(&(table_uri + "/"))?)
             .at_version(version)
@@ -129,6 +133,8 @@ mod tests {
 
     use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::transaction::CommitResult;
+
+    use tracing::info;
 
     use super::*;
 
@@ -237,7 +243,7 @@ mod tests {
         let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
         let store: Arc<dyn object_store::ObjectStore> = store.into();
 
-        let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(store.clone());
         let committer = Box::new(UCCommitter::new(client.clone(), table_id.clone()));
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)

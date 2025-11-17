@@ -5,8 +5,13 @@ use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData}
 use uc_client::models::commits::{Commit, CommitRequest};
 use uc_client::prelude::UCClient;
 
-// A [UCCommitter] is a Unity Catalog [Committer] implementation for committing to a specific
+// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
+///
+/// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever
+/// implementation consumes the Committer to commit to the table, must call `commit` from within a
+/// muti-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
+/// but must ensure that the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
 pub struct UCCommitter {
     client: Arc<UCClient>,
@@ -69,7 +74,9 @@ impl Committer for UCCommitter {
             ),
             last_backfilled_version,
         );
-        let handle = tokio::runtime::Handle::current();
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            DeltaError::generic("UCCommitter may only be used within a tokio runtime")
+        })?;
         tokio::task::block_in_place(|| {
             handle.block_on(async move {
                 self.client
