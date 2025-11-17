@@ -1109,4 +1109,44 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
+
+        let write_context = txn.get_write_context();
+        let logical_schema = write_context.schema();
+        let physical_schema = write_context.physical_schema();
+
+        // Logical schema should include the partition column
+        assert!(
+            logical_schema.contains("letter"),
+            "Logical schema should contain partition column 'letter'"
+        );
+
+        // Physical schema should exclude the partition column
+        assert!(
+            !physical_schema.contains("letter"),
+            "Physical schema should not contain partition column 'letter' (stored in path)"
+        );
+
+        // Both should contain the non-partition columns
+        assert!(
+            logical_schema.contains("number"),
+            "Logical schema should contain data column 'number'"
+        );
+
+        assert!(
+            physical_schema.contains("number"),
+            "Physical schema should contain data column 'number'"
+        );
+
+        Ok(())
+    }
 }
