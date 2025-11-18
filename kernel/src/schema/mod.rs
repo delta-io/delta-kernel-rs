@@ -834,9 +834,12 @@ impl Display for StructType {
         writeln!(f, "{}:", self.type_name)?;
         for (i, (_name, field)) in self.fields.iter().enumerate() {
             let is_last = i == self.fields.len() - 1;
-            let field_branch = if is_last { "└─" } else { "├─" };
+            let branch = if is_last { "└─" } else { "├─" };
 
-            writeln!(f, "{} {}", field_branch, field,)?;
+            writeln!(f, "{} {}", branch, field)?;
+
+            // print recursive nested types if exist
+            field.data_type.fmt_recursive(f, "", is_last)?;
         }
 
         Ok(())
@@ -1456,6 +1459,59 @@ impl DataType {
         match self {
             DataType::Primitive(ptype) => Some(ptype),
             _ => None,
+        }
+    }
+
+    fn fmt_recursive(
+        &self,
+        f: &mut Formatter<'_>,
+        indent: &str,
+        is_last: bool,
+    ) -> std::fmt::Result {
+        let next_indent = if is_last {
+            format!("{}   ", indent)
+        } else {
+            format!("{}│  ", indent)
+        };
+
+        match self {
+            DataType::Struct(inner) => {
+                for (i, (_, field)) in inner.fields.iter().enumerate() {
+                    let last = i == inner.fields.len() - 1;
+                    let branch = if last { "└─" } else { "├─" };
+
+                    write!(f, "{}{} {}", next_indent, branch, field)?;
+                    writeln!(f)?;
+
+                    field.data_type.fmt_recursive(f, &indent, last)?;
+                }
+                Ok(())
+            }
+
+            DataType::Array(inner) => {
+                write!(
+                    f,
+                    "{}{} array_element: {}",
+                    next_indent, "└─", inner.element_type
+                )?;
+                writeln!(f)?;
+
+                inner.element_type.fmt_recursive(f, &next_indent, true)
+            }
+
+            DataType::Map(inner) => {
+                write!(f, "{}{} map_key: {}", next_indent, "├─", inner.key_type)?;
+                writeln!(f)?;
+                inner.key_type.fmt_recursive(f, &next_indent, false)?;
+                write!(f, "{}└─ map_value: {}", next_indent, inner.value_type)?;
+                writeln!(f)?;
+
+                inner
+                    .value_type
+                    .fmt_recursive(f, &format!("{}   ", indent), true)
+            }
+
+            _ => Ok(()),
         }
     }
 }
@@ -2956,10 +3012,16 @@ mod tests {
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
         let nested_struct = StructType {
             type_name: "struct".into(),
-            fields: [(
-                nested_field_with_metadata.name.clone(),
-                nested_field_with_metadata,
-            )]
+            fields: [
+                (
+                    nested_field_with_metadata.name.clone(),
+                    nested_field_with_metadata,
+                ),
+                (
+                    "simple_x".to_string(),
+                    StructField::new("x", DataType::DOUBLE, true),
+                ),
+            ]
             .into_iter()
             .collect(),
             metadata_columns: HashMap::new(),
@@ -2967,7 +3029,7 @@ mod tests {
         let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
         let map_type = MapType::new(
             DataType::Struct(Box::new(nested_struct.clone())),
-            DataType::STRING,
+            DataType::Struct(Box::new(nested_struct.clone())), // kek
             true,
         );
         let fields = vec![
@@ -2986,8 +3048,17 @@ mod tests {
 ├─ x: double (is nullable: true, metadata: {})
 ├─ y: float (is nullable: false, metadata: {})
 ├─ z: long (is nullable: true, metadata: {})
-├─ array_col: array<struct<nested_row_index: long>> (is nullable: true, metadata: {})
-└─ map_col: map<struct<nested_row_index: long>, string> (is nullable: true, metadata: {})
+├─ array_col: array<struct<nested_row_index: long, x: double>> (is nullable: true, metadata: {})
+│  └─ array_element: struct<nested_row_index: long, x: double>
+│     ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│     └─ x: double (is nullable: true, metadata: {})
+└─ map_col: map<struct<nested_row_index: long, x: double>, struct<nested_row_index: long, x: double>> (is nullable: true, metadata: {})
+   ├─ map_key: struct<nested_row_index: long, x: double>
+   │  ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+   │  └─ x: double (is nullable: true, metadata: {})
+   └─ map_value: struct<nested_row_index: long, x: double>
+      ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+      └─ x: double (is nullable: true, metadata: {})
 "
         );
 
