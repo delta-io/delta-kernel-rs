@@ -1690,6 +1690,7 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -2895,5 +2896,88 @@ mod tests {
             Some(&3)
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_none() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.physicalName": "physical_name_col123"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::None, should return logical name even though physical name exists
+        assert_eq!(field.physical_name(ColumnMappingMode::None), "logical_name");
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_id() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 5,
+                "delta.columnMapping.physicalName": "physical_name_col123"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Id, should return physical name
+        assert_eq!(
+            field.physical_name(ColumnMappingMode::Id),
+            "physical_name_col123"
+        );
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_name() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.physicalName": "physical_name_col456"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Name, should return physical name
+        assert_eq!(
+            field.physical_name(ColumnMappingMode::Name),
+            "physical_name_col456"
+        );
+    }
+
+    #[test]
+    fn test_physical_name_fallback_id() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {}
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Id but no physical name, should fallback to logical name
+        assert_eq!(field.physical_name(ColumnMappingMode::Id), "logical_name");
+    }
+
+    #[test]
+    fn test_physical_name_fallback_name() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {}
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Name but no physical name, should fallback to logical name
+        assert_eq!(field.physical_name(ColumnMappingMode::Name), "logical_name");
     }
 }
