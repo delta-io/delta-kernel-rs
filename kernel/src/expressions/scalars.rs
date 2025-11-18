@@ -94,9 +94,6 @@ impl ArrayData {
         &self.tpe
     }
 
-    #[deprecated(
-        note = "These fields will be removed eventually and are unstable. See https://github.com/delta-io/delta-kernel-rs/issues/291"
-    )]
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
@@ -923,7 +920,6 @@ mod tests {
 
     #[test]
     fn test_arrays() {
-        #[allow(deprecated)]
         let array = Scalar::Array(ArrayData {
             tpe: ArrayType::new(DataType::INTEGER, false),
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
@@ -1173,7 +1169,6 @@ mod tests {
         let Scalar::Array(array_data) = scalar else {
             panic!("Expected Array scalar");
         };
-        #[allow(deprecated)]
         let elements = array_data.array_elements();
         assert_eq!(elements.len(), 3);
         assert!(!array_data.array_type().contains_null());
@@ -1206,7 +1201,6 @@ mod tests {
             panic!("Expected Array scalar");
         };
 
-        #[allow(deprecated)]
         let elements = array_data.array_elements();
         assert_eq!(elements.len(), 3);
         assert!(array_data.array_type().contains_null());
