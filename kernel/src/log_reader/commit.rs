@@ -52,6 +52,7 @@ mod tests {
     use crate::log_replay::LogReplayProcessor;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state_info::StateInfo;
+    use crate::scan::COMMIT_READ_SCHEMA;
     use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
     use std::sync::Arc as StdArc;
@@ -93,7 +94,8 @@ mod tests {
         )?);
 
         let mut processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut commit_phase = CommitPhase::try_new(&log_segment, engine.clone())?;
+        let schema = COMMIT_READ_SCHEMA.clone();
+        let mut commit_phase = CommitReader::try_new(engine.as_ref(), &log_segment, schema)?;
 
         let mut batch_count = 0;
         let mut file_paths = Vec::new();
@@ -123,7 +125,7 @@ mod tests {
             vec!["part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"];
         assert_eq!(
             file_paths, expected_files,
-            "CommitPhase should find exactly the expected file"
+            "CommitReader should find exactly the expected file"
         );
 
         Ok(())
