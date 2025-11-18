@@ -525,31 +525,28 @@ impl StructField {
 
 impl Display for StructField {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "StructField({}, {}, {}, ",
-            self.name, self.data_type, self.nullable,
-        )?;
-
-        // display metadata if exists
-        if self.metadata.is_empty() {
-            write!(f, "{{}}")?;
+        let metadata_str = if self.metadata.is_empty() {
+            "{}".to_string()
         } else {
-            write!(f, "{{")?;
+            let mut s = String::from("{");
 
             let mut first = true;
-            for (k, v) in &self.metadata {
+            for (k, v) in self.metadata.iter() {
                 if !first {
-                    write!(f, ", ")?;
+                    s.push_str(", ");
                 }
                 first = false;
-                write!(f, "{}: {:?}", k, v)?;
+                s.push_str(&format!("{}: {:?}", k, v));
             }
 
-            write!(f, "}}")?;
-        }
-
-        write!(f, ")")
+            s.push('}');
+            s
+        };
+        write!(
+            f,
+            "{}: {} (is nullable: {}, metadata: {})",
+            self.name, self.data_type, self.nullable, metadata_str,
+        )
     }
 }
 
@@ -834,42 +831,16 @@ impl StructType {
 
 impl Display for StructType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}(", self.type_name)?;
+        writeln!(f, "{}:", self.type_name)?;
+        for (i, (_name, field)) in self.fields.iter().enumerate() {
+            let is_last = i == self.fields.len() - 1;
+            let field_branch = if is_last { "└─" } else { "├─" };
 
-        let mut first = true;
-        for field in self.fields.values() {
-            if !first {
-                writeln!(f, ",")?;
-            }
-            first = false;
-
-            write!(f, "    {}", field)?;
-        }
-
-        writeln!(f)?;
-        write!(f, ")")?;
-        if !self.metadata_columns.is_empty() {
-            writeln!(f, "\nMetadataColumns(")?;
-
-            // Display suppose to be stable, so sort metadata columns by their indexes
-            let entries = {
-                let mut v: Vec<_> = self.metadata_columns.iter().collect();
-                v.sort_by_key(|(_, idx)| *idx);
-                v
-            };
-
-            let mut first = true;
-            for (col, idx) in entries {
-                if !first {
-                    writeln!(f, ",")?;
-                }
-                first = false;
-
-                write!(f, "    {} -> {}", col, idx)?;
-            }
-
-            writeln!(f)?;
-            write!(f, ")")?;
+            writeln!(
+                f,
+                "{} {}",
+                field_branch, field,
+            )?;
         }
 
         Ok(())
@@ -2984,29 +2955,58 @@ mod tests {
     }
 
     #[test]
-    fn test_display_stable_output() -> DeltaResult<()> {
-        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
-        assert_eq!(
-            schema.to_string(),
-            "struct(
-    StructField(regular_col, string, true, {})
-)"
+    fn test_display_struct_type_stable_output() -> DeltaResult<()> {
+        let nested_field_with_metadata =
+            StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
+        let nested_struct = StructType {
+            type_name: "struct".into(),
+            fields: [(
+                nested_field_with_metadata.name.clone(),
+                nested_field_with_metadata,
+            )]
+            .into_iter()
+            .collect(),
+            metadata_columns: HashMap::new(),
+        };
+        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
+        let map_type = MapType::new(
+            DataType::Struct(Box::new(nested_struct.clone())),
+            DataType::STRING,
+            true,
         );
+        let fields = vec![
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new("y", DataType::FLOAT, false),
+            StructField::new("z", DataType::LONG, true),
+            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
+            StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+        ];
+
+        let struct_type = StructType::new_unchecked(fields);
+        println!("{}", struct_type);
+        assert_eq!(
+            struct_type.to_string(),
+            "struct:
+├─ x: double (is nullable: true, metadata: {})
+├─ y: float (is nullable: false, metadata: {})
+├─ z: long (is nullable: true, metadata: {})
+├─ array_col: array<struct<nested_row_index: long>> (is nullable: true, metadata: {})
+└─ map_col: map<struct<nested_row_index: long>, string> (is nullable: true, metadata: {})
+"
+        );
+
+        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
         let schema = schema
             .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
             .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
             .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?;
-        assert_eq!(schema.to_string(), "struct(
-    StructField(regular_col, string, true, {}),
-    StructField(row_index, long, false, {delta.metadataSpec: String(\"row_index\")}),
-    StructField(row_id, long, false, {delta.metadataSpec: String(\"row_id\")}),
-    StructField(row_commit_version, long, false, {delta.metadataSpec: String(\"row_commit_version\")})
-)
-MetadataColumns(
-    MetadataColumn(row_index, long, false) -> 1,
-    MetadataColumn(row_id, long, false) -> 2,
-    MetadataColumn(row_commit_version, long, false) -> 3
-)");
+        println!("{}", schema);
+        assert_eq!(schema.to_string(), "struct:
+├─ regular_col: string (is nullable: true, metadata: {})
+├─ row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+├─ row_id: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_id\")})
+└─ row_commit_version: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_commit_version\")})
+");
         Ok(())
     }
 }
