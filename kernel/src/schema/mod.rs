@@ -178,7 +178,13 @@ impl FromStr for MetadataColumnSpec {
 
 impl Display for MetadataColumnSpec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MetadataColumn({}, {}, {})", self.text_value(), self.data_type(), self.nullable())
+        write!(
+            f,
+            "MetadataColumn({}, {}, {})",
+            self.text_value(),
+            self.data_type(),
+            self.nullable()
+        )
     }
 }
 
@@ -519,10 +525,10 @@ impl StructField {
 
 impl Display for StructField {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StructField({}, {}, {}, ",
-               self.name,
-               self.data_type,
-               self.nullable,
+        write!(
+            f,
+            "StructField({}, {}, {}, ",
+            self.name, self.data_type, self.nullable,
         )?;
 
         // display metadata if exists
@@ -2980,9 +2986,12 @@ mod tests {
     #[test]
     fn test_display_stable_output() -> DeltaResult<()> {
         let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
-        assert_eq!(schema.to_string(), "struct(
+        assert_eq!(
+            schema.to_string(),
+            "struct(
     StructField(regular_col, string, true, {})
-)");
+)"
+        );
         let schema = schema
             .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
             .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
