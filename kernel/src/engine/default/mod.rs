@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -44,82 +43,60 @@ pub struct DefaultEngine<E: TaskExecutor> {
     reporter: Option<Arc<dyn crate::metrics::MetricsReporter>>,
 }
 
-impl<E: TaskExecutor> DefaultEngine<E> {
-    /// Create a new [`DefaultEngine`] instance
+impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+    /// Create a new [`DefaultEngine`] instance with the default executor.
     ///
-    /// # Parameters
-    ///
-    /// - `table_root`: The URL of the table within storage.
-    /// - `options`: key/value pairs of options to pass to the object store.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn try_new<K, V>(
-        table_root: &Url,
-        options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
-    ) -> DeltaResult<Self>
-    where
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        Self::try_new_with_metrics(table_root, options, task_executor, None)
-    }
-
-    /// Create a new [`DefaultEngine`] instance with metrics reporting
-    ///
-    /// # Parameters
-    ///
-    /// - `table_root`: The URL of the table within storage.
-    /// - `options`: key/value pairs of options to pass to the object store.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    /// - `reporter`: Optional metrics reporter for tracking operation metrics.
-    #[internal_api]
-    pub(crate) fn try_new_with_metrics<K, V>(
-        table_root: &Url,
-        options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
-        reporter: Option<Arc<dyn crate::metrics::MetricsReporter>>,
-    ) -> DeltaResult<Self>
-    where
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        // table root is the path of the table in the ObjectStore
-        let (object_store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new_with_metrics(
-            Arc::new(object_store),
-            task_executor,
-            reporter,
-        ))
-    }
-
-    /// Create a new [`DefaultEngine`] instance
+    /// Uses `TokioBackgroundExecutor` as the default executor.
+    /// For custom executors, use [`DefaultEngine::new_with_executor`].
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
-        Self::new_with_metrics(object_store, task_executor, None)
+    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+        Self::new_with_executor(
+            object_store,
+            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+        )
     }
 
-    /// Create a new [`DefaultEngine`] instance with metrics reporting
+    /// Create a new [`DefaultEngine`] instance with the default executor and metrics reporting.
+    ///
+    /// Uses `TokioBackgroundExecutor` as the default executor.
+    /// For custom executors, use [`DefaultEngine::new_with_executor_and_metrics_reporter`].
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    /// - `reporter`: Optional metrics reporter for tracking operation metrics.
+    /// - `reporter`: Metrics reporter for tracking operation metrics.
     #[internal_api]
-    pub(crate) fn new_with_metrics(
+    pub(crate) fn new_with_metrics_reporter(
         object_store: Arc<DynObjectStore>,
-        task_executor: Arc<E>,
-        reporter: Option<Arc<dyn crate::metrics::MetricsReporter>>,
+        reporter: Arc<dyn crate::metrics::MetricsReporter>,
     ) -> Self {
+        Self::new_with_executor_and_metrics_reporter(
+            object_store,
+            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+            reporter,
+        )
+    }
+}
+
+impl<E: TaskExecutor> DefaultEngine<E> {
+    /// Create a new [`DefaultEngine`] instance with a custom executor.
+    ///
+    /// Most users should use [`DefaultEngine::new`] instead. This method is only
+    /// needed for specialized testing scenarios (e.g., multi-threaded executors).
+    ///
+    /// # Parameters
+    ///
+    /// - `object_store`: The object store to use.
+    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
+    pub fn new_with_executor(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
-                reporter.clone(),
+                None,
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
@@ -131,7 +108,47 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
-            reporter,
+            reporter: None,
+        }
+    }
+
+    /// Create a new [`DefaultEngine`] instance with a custom executor and metrics reporting.
+    ///
+    /// Most users should use [`DefaultEngine::new`] instead. This method is only
+    /// needed for specialized testing scenarios (e.g., multi-threaded executors) with metrics.
+    ///
+    /// # Parameters
+    ///
+    /// - `object_store`: The object store to use.
+    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
+    /// - `reporter`: Metrics reporter for tracking operation metrics.
+    ///
+    /// # TODO
+    ///
+    /// Switch to Builder pattern to avoid explosion of constructor methods.
+    #[internal_api]
+    pub(crate) fn new_with_executor_and_metrics_reporter(
+        object_store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+    ) -> Self {
+        Self {
+            storage: Arc::new(ObjectStoreStorageHandler::new(
+                object_store.clone(),
+                task_executor.clone(),
+                Some(reporter.clone()),
+            )),
+            json: Arc::new(DefaultJsonHandler::new(
+                object_store.clone(),
+                task_executor.clone(),
+            )),
+            parquet: Arc::new(DefaultParquetHandler::new(
+                object_store.clone(),
+                task_executor,
+            )),
+            object_store,
+            evaluation: Arc::new(ArrowEvaluationHandler {}),
+            reporter: Some(reporter),
         }
     }
 
@@ -213,7 +230,6 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use object_store::local::LocalFileSystem;
@@ -223,7 +239,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(object_store);
         test_arrow_engine(&engine, &url);
     }
 
