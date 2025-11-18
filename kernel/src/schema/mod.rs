@@ -836,11 +836,7 @@ impl Display for StructType {
             let is_last = i == self.fields.len() - 1;
             let field_branch = if is_last { "└─" } else { "├─" };
 
-            writeln!(
-                f,
-                "{} {}",
-                field_branch, field,
-            )?;
+            writeln!(f, "{} {}", field_branch, field,)?;
         }
 
         Ok(())
