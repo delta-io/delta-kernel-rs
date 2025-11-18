@@ -2344,7 +2344,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
 async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn std::error::Error>> {
     // This test verifies that mixed add+remove transactions work when dataChange=false.
     // It's allowed because the transaction does not contain any logical data changes.
-    // This can happen when a table is being optimized or vacuumed.
+    // This can happen when a table is being optimized/compacted.
     let _ = tracing_subscriber::fmt::try_init();
 
     let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
