@@ -1,0 +1,115 @@
+Reading table at ../../../../acceptance/tests/dat/out/reader_tests/generated/nested_types/delta/
+version: 0
+
+Schema:
+├─ pk: integer
+├─ struct: struct
+│  ├─ float64: double
+│  └─ bool: boolean
+├─ array (is nullable: true): array
+│  └─ array_element: short
+└─ map (is nullable: true): map
+   ├─ map_key: string
+   └─ map_value: integer
+
+pk:  [
+  0,
+  1,
+  2,
+  3,
+  4
+]
+struct:  -- is_valid: all not null
+-- child 0 type: double
+  [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+-- child 1 type: bool
+  [
+    true,
+    false,
+    true,
+    false,
+    true
+  ]
+array:  [
+  [
+    0
+  ],
+  [
+    0,
+    1
+  ],
+  [
+    0,
+    1,
+    2
+  ],
+  [
+    0,
+    1,
+    2,
+    3
+  ],
+  [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+]
+map:  [
+  keys:
+  []
+  values:
+  [],
+  keys:
+  [
+    "0"
+  ]
+  values:
+  [
+    0
+  ],
+  keys:
+  [
+    "0",
+    "1"
+  ]
+  values:
+  [
+    0,
+    1
+  ],
+  keys:
+  [
+    "0",
+    "1",
+    "2"
+  ]
+  values:
+  [
+    0,
+    1,
+    2
+  ],
+  keys:
+  [
+    "0",
+    "1",
+    "2",
+    "3"
+  ]
+  values:
+  [
+    0,
+    1,
+    2,
+    3
+  ]
+]
