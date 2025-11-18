@@ -1,14 +1,16 @@
 //! Manifest phase for log replay - processes single-part checkpoint manifest files.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use itertools::Itertools;
 use url::Url;
 
-use crate::actions::Sidecar;
 use crate::actions::{get_all_actions_schema, visitors::SidecarVisitor, SIDECAR_NAME};
+use crate::actions::{get_commit_schema, Sidecar, ADD_NAME};
 use crate::expressions::Transform;
 use crate::log_replay::ActionsBatch;
 use crate::schema::{Schema, SchemaRef, StructField, ToSchema};
+use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Expression, ExpressionEvaluator, FileMeta, RowVisitor};
 
 /// Phase that processes single-part checkpoint manifest files.
@@ -17,8 +19,9 @@ use crate::{DeltaResult, Engine, Error, Expression, ExpressionEvaluator, FileMet
 pub(crate) struct ManifestPhase {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     sidecar_visitor: SidecarVisitor,
-    original_schema: SchemaRef,
+    manifest_file: FileMeta,
     log_root: Url,
+    is_complete: bool,
 }
 
 /// Possible transitions after ManifestPhase completes.
@@ -39,12 +42,18 @@ impl ManifestPhase {
     /// - `manifest_file`: The checkpoint manifest file to process
     /// - `log_root`: Root URL for resolving sidecar paths
     /// - `engine`: Engine for reading files
-    /// - `base_schema`: Schema columns required by the processor (will be augmented with sidecar)
     pub fn new(
         manifest_file: FileMeta,
         log_root: Url,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
+        #[allow(clippy::unwrap_used)]
+        static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            get_commit_schema()
+                .project(&[ADD_NAME, SIDECAR_NAME])
+                .unwrap()
+        });
+
         let files = vec![manifest_file.clone()];
 
         // Determine file type from extension
@@ -59,13 +68,13 @@ impl ManifestPhase {
             "json" => {
                 engine
                     .json_handler()
-                    .read_json_files(&files, sidecar_schema.clone(), None)?
+                    .read_json_files(&files, MANIFEST_READ_SCHMEA.clone(), None)?
             }
-            "parquet" => {
-                engine
-                    .parquet_handler()
-                    .read_parquet_files(&files, sidecar_schema.clone(), None)?
-            }
+            "parquet" => engine.parquet_handler().read_parquet_files(
+                &files,
+                MANIFEST_READ_SCHMEA.clone(),
+                None,
+            )?,
             ext => {
                 return Err(Error::generic(format!(
                     "Unsupported checkpoint extension: {}",
@@ -80,8 +89,8 @@ impl ManifestPhase {
             actions: Box::new(actions),
             sidecar_visitor: SidecarVisitor::default(),
             log_root,
-            original_schema,
-            projector,
+            manifest_file,
+            is_complete: false,
         })
     }
 
@@ -91,13 +100,20 @@ impl ManifestPhase {
     /// - `Sidecars`: Extracted sidecar files
     /// - `Done`: No sidecars found
     pub(crate) fn finalize(self) -> DeltaResult<AfterManifest> {
-        // TODO: Check that stream is exhausted. We can track a boolean flag  on whether we saw a None yet.
-        let sidecars = self
+        require!(
+            self.is_complete,
+            Error::generic(format!(
+                "Finalized called on ManifestReader for file {:?}",
+                self.manifest_file.location
+            ))
+        );
+
+        let sidecars: Vec<_> = self
             .sidecar_visitor
             .sidecars
             .into_iter()
             .map(|s| s.to_filemeta(&self.log_root))
-            .collect::<Result<Vec<_>, _>>()?;
+            .try_collect()?;
 
         if sidecars.is_empty() {
             Ok(AfterManifest::Done)
@@ -111,18 +127,18 @@ impl Iterator for ManifestPhase {
     type Item = DeltaResult<ActionsBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.actions.next().map(|batch_result| {
+        let result = self.actions.next().map(|batch_result| {
             batch_result.and_then(|batch| {
-                // Extract sidecar references from the batch
                 self.sidecar_visitor.visit_rows_of(batch.actions())?;
-
-                // Return the batch
-                // TODO: un-select sidecar actions
-                // TODO: project out sidecar actions
-                let batch = self.projector.evaluate(batch);
                 Ok(batch)
             })
-        })
+        });
+
+        if result.is_none() {
+            self.is_complete = true;
+        }
+
+        result
     }
 }
 
@@ -187,10 +203,8 @@ mod tests {
         let checkpoint_file = &log_segment.checkpoint_parts[0];
         let manifest_file = checkpoint_file.location.clone();
 
-        let schema = crate::actions::get_commit_schema().project(&[crate::actions::ADD_NAME])?;
-
         let mut manifest_phase =
-            ManifestPhase::new(manifest_file, log_root.clone(), engine.clone(), schema)?;
+            ManifestPhase::new(manifest_file, log_root.clone(), engine.clone())?;
 
         // Count batches and collect results
         let mut batch_count = 0;
@@ -242,13 +256,13 @@ mod tests {
         let schema = crate::actions::get_commit_schema().project(&[crate::actions::ADD_NAME])?;
 
         let mut manifest_phase =
-            ManifestPhase::new(manifest_file, log_root.clone(), engine.clone(), schema)?;
+            ManifestPhase::new(manifest_file, log_root.clone(), engine.clone())?;
 
         // Drain the phase
         while manifest_phase.next().is_some() {}
 
         // Check if sidecars were collected
-        let next = manifest_phase.into_next()?;
+        let next = manifest_phase.finalize()?;
 
         match next {
             AfterManifest::Sidecars { sidecars } => {
