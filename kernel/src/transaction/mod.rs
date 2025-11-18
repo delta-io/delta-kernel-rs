@@ -863,7 +863,7 @@ impl Transaction {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    schema: SchemaRef,
+    logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
 }
@@ -871,13 +871,13 @@ pub struct WriteContext {
 impl WriteContext {
     fn new(
         target_dir: Url,
-        schema: SchemaRef,
+        logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
     ) -> Self {
         WriteContext {
             target_dir,
-            schema,
+            logical_schema,
             physical_schema,
             logical_to_physical,
         }
@@ -887,8 +887,8 @@ impl WriteContext {
         &self.target_dir
     }
 
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
+    pub fn logical_schema(&self) -> &SchemaRef {
+        &self.logical_schema
     }
 
     pub fn physical_schema(&self) -> &SchemaRef {
@@ -1121,7 +1121,7 @@ mod tests {
             .with_engine_info("default engine");
 
         let write_context = txn.get_write_context();
-        let logical_schema = write_context.schema();
+        let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
         // Logical schema should include the partition column
