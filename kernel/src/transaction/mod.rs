@@ -26,6 +26,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
+use crate::table_features::TableFeature;
 use crate::utils::current_time_ms;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -520,7 +521,7 @@ impl Transaction {
             .read_snapshot
             .table_configuration()
             .protocol()
-            .has_table_feature(&crate::table_features::TableFeature::MaterializePartitionColumns);
+            .has_table_feature(&TableFeature::MaterializePartitionColumns);
 
         let fields = schema
             .fields()
@@ -1094,8 +1095,6 @@ mod tests {
     #[test]
     fn test_materialize_partition_columns_in_write_context(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::table_features::TableFeature;
-
         let engine = SyncEngine::new();
 
         // Test 1: Use basic_partitioned table (without materializePartitionColumns feature)
