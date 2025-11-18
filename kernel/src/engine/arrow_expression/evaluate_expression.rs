@@ -380,7 +380,6 @@ pub fn evaluate_predicate(
                     }
                 }
                 (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                    #[allow(deprecated)]
                     let exists = ad.array_elements().contains(lit);
                     Ok(BooleanArray::from(vec![exists]))
                 }

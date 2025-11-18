@@ -148,8 +148,10 @@ void visit_array(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  // NOTE: we truncate to the max int size because the format specifier "%.*s" requires an int length specifier
+  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
+  int wrote = snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
+  snprintf(name_ptr + wrote, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
@@ -166,8 +168,10 @@ void visit_map(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  snprintf(name_ptr, name.len + 1, "%s", name.ptr);
-  snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  // NOTE: we truncate to the max int size because the format specifier "%.*s" requires an int length specifier
+  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
+  int wrote = snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
+  snprintf(name_ptr + wrote, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
