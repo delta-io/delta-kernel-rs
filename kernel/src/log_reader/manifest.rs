@@ -5,17 +5,17 @@ use std::sync::{Arc, LazyLock};
 use itertools::Itertools;
 use url::Url;
 
-use crate::actions::{get_all_actions_schema, visitors::SidecarVisitor, SIDECAR_NAME};
-use crate::actions::{get_commit_schema, Sidecar, ADD_NAME};
-use crate::expressions::Transform;
+use crate::actions::{get_commit_schema, ADD_NAME};
+use crate::actions::{visitors::SidecarVisitor, SIDECAR_NAME};
 use crate::log_replay::ActionsBatch;
-use crate::schema::{Schema, SchemaRef, StructField, ToSchema};
+use crate::schema::SchemaRef;
 use crate::utils::require;
-use crate::{DeltaResult, Engine, Error, Expression, ExpressionEvaluator, FileMeta, RowVisitor};
+use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 
 /// Phase that processes single-part checkpoint manifest files.
 ///
 /// Extracts sidecar references while processing the manifest.
+#[allow(unused)]
 pub(crate) struct ManifestPhase {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     sidecar_visitor: SidecarVisitor,
@@ -25,6 +25,7 @@ pub(crate) struct ManifestPhase {
 }
 
 /// Possible transitions after ManifestPhase completes.
+#[allow(unused)]
 pub(crate) enum AfterManifest {
     /// Has sidecars → return sidecar files
     Sidecars { sidecars: Vec<FileMeta> },
@@ -42,7 +43,8 @@ impl ManifestPhase {
     /// - `manifest_file`: The checkpoint manifest file to process
     /// - `log_root`: Root URL for resolving sidecar paths
     /// - `engine`: Engine for reading files
-    pub fn new(
+    #[allow(unused)]
+    pub(crate) fn new(
         manifest_file: FileMeta,
         log_root: Url,
         engine: Arc<dyn Engine>,
@@ -99,6 +101,7 @@ impl ManifestPhase {
     /// Returns an enum indicating what comes next:
     /// - `Sidecars`: Extracted sidecar files
     /// - `Done`: No sidecars found
+    #[allow(unused)]
     pub(crate) fn finalize(self) -> DeltaResult<AfterManifest> {
         require!(
             self.is_complete,
