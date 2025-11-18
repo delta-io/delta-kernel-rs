@@ -148,7 +148,8 @@ void visit_array(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  snprintf(name_ptr, name.len + 1, "%s", name.ptr);
+  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
+  snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
   snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
@@ -166,7 +167,8 @@ void visit_map(
 {
   SchemaBuilder* builder = data;
   char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  snprintf(name_ptr, name.len + 1, "%s", name.ptr);
+  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
+  snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
   snprintf(name_ptr + name.len, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
