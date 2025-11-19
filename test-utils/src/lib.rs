@@ -325,6 +325,9 @@ pub async fn create_table(
                 json!("1612345678"),
             );
         }
+        if writer_features.contains(&"changeDataFeed") {
+            config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
+        }
 
         config
     };
