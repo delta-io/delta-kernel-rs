@@ -590,11 +590,6 @@ impl Protocol {
     /// Check if writing to a table with this protocol is supported. That is: does the kernel
     /// support the specified protocol writer version and all enabled writer features?
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
-        #[cfg(feature = "catalog-managed")]
-        require!(
-            !self.is_catalog_managed(),
-            Error::unsupported("Writes are not yet supported for catalog-managed tables")
-        );
         match &self.writer_features {
             Some(writer_features) if self.min_writer_version == 7 => {
                 // if we're on version 7, make sure we support all the specified features
@@ -1610,7 +1605,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Found unsupported TableFeatures: "identityColumns". Supported TableFeatures: "changeDataFeed", "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Found unsupported TableFeatures: "identityColumns". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
 
         // Unknown writer features are allowed during creation for forward compatibility,
@@ -1624,7 +1619,7 @@ mod tests {
         .unwrap();
         assert_result_error_with_message(
             protocol.ensure_write_supported(),
-            r#"Unsupported: Found unsupported TableFeatures: "unsupported writer". Supported TableFeatures: "changeDataFeed", "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#,
+            r#"Unsupported: Found unsupported TableFeatures: "unsupported writer". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#,
         );
     }
 
@@ -1680,8 +1675,9 @@ mod tests {
         assert_eq!(parse_features::<TableFeature>(features), expected);
     }
 
+    #[cfg(feature = "catalog-managed")]
     #[test]
-    fn test_no_catalog_managed_writes() {
+    fn test_catalog_managed_writes() {
         let protocol = Protocol::try_new(
             3,
             7,
@@ -1689,7 +1685,7 @@ mod tests {
             Some([TableFeature::CatalogManaged]),
         )
         .unwrap();
-        assert!(protocol.ensure_write_supported().is_err());
+        assert!(protocol.ensure_write_supported().is_ok());
         let protocol = Protocol::try_new(
             3,
             7,
@@ -1697,7 +1693,7 @@ mod tests {
             Some([TableFeature::CatalogOwnedPreview]),
         )
         .unwrap();
-        assert!(protocol.ensure_write_supported().is_err());
+        assert!(protocol.ensure_write_supported().is_ok());
     }
 
     #[test]

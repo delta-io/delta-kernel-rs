@@ -450,6 +450,9 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     read_support: KernelSupport::Supported,
     #[cfg(not(feature = "catalog-managed"))]
     read_support: KernelSupport::NotSupported,
+    #[cfg(feature = "catalog-managed")]
+    write_support: KernelSupport::Supported,
+    #[cfg(not(feature = "catalog-managed"))]
     write_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -465,6 +468,9 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     read_support: KernelSupport::Supported,
     #[cfg(not(feature = "catalog-managed"))]
     read_support: KernelSupport::NotSupported,
+    #[cfg(feature = "catalog-managed")]
+    write_support: KernelSupport::Supported,
+    #[cfg(not(feature = "catalog-managed"))]
     write_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -554,7 +560,7 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -717,12 +723,18 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyL
     vec![
         TableFeature::ChangeDataFeed,
         TableFeature::AppendOnly,
+        #[cfg(feature = "catalog-managed")]
+        TableFeature::CatalogManaged,
+        #[cfg(feature = "catalog-managed")]
+        TableFeature::CatalogOwnedPreview,
         TableFeature::DeletionVectors,
         TableFeature::DomainMetadata,
         TableFeature::InCommitTimestamp,
         TableFeature::Invariants,
         TableFeature::RowTracking,
         TableFeature::TimestampWithoutTimezone,
+        TableFeature::V2Checkpoint,
+        TableFeature::VacuumProtocolCheck,
         TableFeature::VariantType,
         TableFeature::VariantTypePreview,
         TableFeature::VariantShreddingPreview,

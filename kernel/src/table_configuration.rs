@@ -702,7 +702,7 @@ mod test {
                     &["delta.enableChangeDataFeed", "delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(r#"Found unsupported TableFeatures: "columnMapping". Supported TableFeatures: "changeDataFeed", "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#)),
+                Err(Error::unsupported(r#"Found unsupported TableFeatures: "columnMapping". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#)),
             ),
             (
                 // The table does not require writing CDC files, so it is safe to write to it.
@@ -710,7 +710,7 @@ mod test {
                     &["delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(r#"Found unsupported TableFeatures: "columnMapping". Supported TableFeatures: "changeDataFeed", "appendOnly", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "variantType", "variantType-preview", "variantShredding-preview""#)),
+                Err(Error::unsupported(r#"Found unsupported TableFeatures: "columnMapping". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#)),
             ),
             (
                 // Should succeed since change data feed is not enabled
