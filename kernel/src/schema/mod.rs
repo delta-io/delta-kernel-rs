@@ -823,21 +823,18 @@ impl StructType {
 }
 
 fn write_indent(f: &mut Formatter<'_>, levels: &[bool]) -> std::fmt::Result {
-    // All except last decide between "│  " and "   "
-    for &is_last in &levels[..levels.len().saturating_sub(1)] {
-        if is_last {
-            write!(f, "   ")?;
-        } else {
-            write!(f, "│  ")?;
-        }
-    }
+    let mut it = levels.iter().peekable();
 
-    // The last level prints the branch ├─ or └─
-    if let Some(&is_last) = levels.last() {
-        if is_last {
-            write!(f, "└─")?;
-        } else {
-            write!(f, "├─")?;
+    while let Some(is_last) = it.next() {
+        let final_level = it.peek().is_none();
+
+        // Final level → draw branch
+        if final_level {
+            write!(f, "{}", if *is_last { "└─" } else { "├─" })?;
+        }
+        // Parent levels → vertical line or empty space
+        else {
+            write!(f, "{}", if *is_last { "   " } else { "│  " })?;
         }
     }
 
