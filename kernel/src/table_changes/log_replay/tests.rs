@@ -314,6 +314,186 @@ async fn incompatible_schemas_fail() {
     assert_incompatible_schema(schema, get_schema()).await;
 }
 
+// This test demonstrates various schema evolution scenarios that currently fail
+// but could be supported in the future. See: https://github.com/delta-io/delta-kernel-rs/issues/523
+//
+// Run this test to see how schema evolution currently fails during CDF reads.
+// The test will PANIC with detailed error messages showing exactly why each scenario fails.
+#[tokio::test]
+#[should_panic(expected = "Schema evolution failed")]
+async fn demonstration_schema_evolution_failures() {
+    async fn test_schema_evolution(
+        initial_schema: StructType,
+        evolved_schema: StructType,
+        description: &str,
+    ) {
+        let engine = Arc::new(SyncEngine::new());
+        let mut mock_table = LocalMockTable::new();
+
+        // Create initial commit with initial schema
+        mock_table
+            .commit([
+                Action::Metadata(
+                    Metadata::try_new(
+                        None,
+                        None,
+                        initial_schema.clone(),
+                        vec![],
+                        0,
+                        HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+                    )
+                    .unwrap(),
+                ),
+                Action::Protocol(
+                    Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap(),
+                ),
+            ])
+            .await;
+
+        // Add some data with initial schema
+        mock_table
+            .commit([Action::Add(Add {
+                path: "file1.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            })])
+            .await;
+
+        // Evolve the schema
+        mock_table
+            .commit([Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    evolved_schema.clone(),
+                    vec![],
+                    0,
+                    HashMap::from([("delta.enableChangeDataFeed".to_string(), "true".to_string())]),
+                )
+                .unwrap(),
+            )])
+            .await;
+
+        // Add data with evolved schema
+        mock_table
+            .commit([Action::Add(Add {
+                path: "file2.parquet".into(),
+                data_change: true,
+                ..Default::default()
+            })])
+            .await;
+
+        let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+            .unwrap()
+            .into_iter();
+
+        let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+        let table_config = get_default_table_config(&table_root_url);
+        
+        // Print schemas before consuming them
+        println!("\n=== Schema Evolution Test: {} ===", description);
+        println!("Initial schema: {:?}", initial_schema);
+        println!("Evolved schema: {:?}", evolved_schema);
+        
+        // Try to read CDF using the evolved schema - this currently fails
+        let res: DeltaResult<Vec<_>> = table_changes_action_iter(
+            engine,
+            table_config,
+            commits,
+            evolved_schema.into(),
+            None,
+        )
+        .unwrap()
+        .try_collect();
+
+        // This currently fails with ChangeDataFeedIncompatibleSchema error
+        match res {
+            Err(Error::ChangeDataFeedIncompatibleSchema(expected, actual)) => {
+                println!("❌ Failed with ChangeDataFeedIncompatibleSchema error");
+                println!("   Expected: {:?}", expected);
+                println!("   Actual:   {:?}", actual);
+                panic!(
+                    "Schema evolution failed for: {}\n\
+                     Expected schema: {:?}\n\
+                     Actual schema:   {:?}\n\
+                     \n\
+                     This scenario should eventually be supported. See: https://github.com/delta-io/delta-kernel-rs/issues/523",
+                    description, expected, actual
+                );
+            }
+            Ok(_) => {
+                println!("✅ Schema evolution succeeded! This scenario is now supported.");
+            }
+            Err(e) => {
+                println!("❌ Failed with unexpected error: {:?}", e);
+                panic!("Unexpected error for {}: {:?}", description, e);
+            }
+        }
+    }
+
+    println!("\n╔════════════════════════════════════════════════════════════════════════╗");
+    println!("║  Demonstration: Schema Evolution Scenarios That Currently Fail         ║");
+    println!("║  See: https://github.com/delta-io/delta-kernel-rs/issues/523          ║");
+    println!("╚════════════════════════════════════════════════════════════════════════╝");
+
+    // Scenario 1: Adding a nullable column (safe evolution)
+    // Initial: {id: int, value: string}
+    // Evolved: {id: int, value: string, new_col: int?}
+    let initial = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let evolved = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+        StructField::nullable("new_col", DataType::INTEGER),
+    ]);
+    test_schema_evolution(
+        initial,
+        evolved,
+        "Adding a nullable column (SHOULD BE SAFE)"
+    ).await;
+
+    // Scenario 2: Type widening (int -> long) - supported by type widening feature
+    // Initial: {id: int, value: string}
+    // Evolved: {id: long, value: string}
+    let initial = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let evolved = StructType::new_unchecked([
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    test_schema_evolution(
+        initial,
+        evolved,
+        "Type widening int -> long (REQUIRES TYPE WIDENING SUPPORT)"
+    ).await;
+
+    // Scenario 3: Changing nullability from non-null to nullable (safe evolution)
+    // Initial: {id: int!, value: string}
+    // Evolved: {id: int?, value: string}
+    let initial = StructType::new_unchecked([
+        StructField::not_null("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    let evolved = StructType::new_unchecked([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ]);
+    test_schema_evolution(
+        initial,
+        evolved,
+        "Relaxing nullability constraint (SHOULD BE SAFE)"
+    ).await;
+
+    // If we get here, all scenarios succeeded - update the issue!
+    println!("\n╔════════════════════════════════════════════════════════════════════════╗");
+    println!("║  🎉 All schema evolution scenarios PASSED! Update issue #523!          ║");
+    println!("╚════════════════════════════════════════════════════════════════════════╝\n");
+}
+
 #[tokio::test]
 async fn add_remove() {
     let engine = Arc::new(SyncEngine::new());
