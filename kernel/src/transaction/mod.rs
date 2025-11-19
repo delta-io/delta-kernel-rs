@@ -1050,68 +1050,59 @@ impl Transaction {
         let evaluation_handler = engine.evaluation_handler();
 
         // Create the transform expression once, since it only contains literals and column references
-        let mut transform = Expression::transform(
-            Transform::new_top_level()
-                // deletionTimestamp
-                .with_inserted_field(
-                    Some("path"),
-                    Expression::literal(self.commit_timestamp).into(),
-                )
-                // dataChange
-                .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
-                .with_inserted_field(
-                    // extended_file_metadata
-                    Some("path"),
-                    Expression::literal(true).into(),
-                )
-                .with_inserted_field(
-                    Some("path"),
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
-                )
-                // tags
-                .with_inserted_field(
-                    Some("stats"),
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
-                )
-                .with_inserted_field(
-                    Some("deletionVector"),
-                    Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
-                )
-                .with_inserted_field(
-                    Some("deletionVector"),
-                    Expression::column([
-                        FILE_CONSTANT_VALUES_NAME,
-                        DEFAULT_ROW_COMMIT_VERSION_NAME,
-                    ])
+        let mut transform = Transform::new_top_level()
+            // deletionTimestamp
+            .with_inserted_field(
+                Some("path"),
+                Expression::literal(self.commit_timestamp).into(),
+            )
+            // dataChange
+            .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
+            .with_inserted_field(
+                // extended_file_metadata
+                Some("path"),
+                Expression::literal(true).into(),
+            )
+            .with_inserted_field(
+                Some("path"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
+            )
+            // tags
+            .with_inserted_field(
+                Some("stats"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
+            )
+            .with_inserted_field(
+                Some("deletionVector"),
+                Expression::column([FILE_CONSTANT_VALUES_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME])
                     .into(),
-                )
-                .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
-                .with_dropped_field("modificationTime"),
-        );
+            )
+            .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+            .with_dropped_field("modificationTime");
+
         // Drop any additional columns specified in columns_to_drop
         for column_to_drop in columns_to_drop {
             transform = transform.with_dropped_field(*column_to_drop);
         }
 
-
-        let expr = Arc::new(Expression::struct_from([transform]));
+        let expr = Arc::new(Expression::struct_from([Expression::transform(transform)]));
         let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
             input_schema.clone(),
             expr.clone(),
             target_schema.clone().into(),
         )?);
 
-        Ok(self
-            .remove_files_metadata
-            .iter()
-            .map(move |file_metadata_batch| {
-                let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
-                FilteredEngineData::try_new(
-                    updated_engine_data,
-                    file_metadata_batch.selection_vector().to_vec(),
-                )
-            },
-        ))
+        Ok(remove_files_metadata.map(move |file_metadata_batch| {
+            let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
+            FilteredEngineData::try_new(
+                updated_engine_data,
+                file_metadata_batch.selection_vector().to_vec(),
+            )
+        }))
     }
 
     /// Generate remove/add action pairs for files with DV updates.

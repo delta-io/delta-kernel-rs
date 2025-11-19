@@ -36,8 +36,8 @@ use tempfile::tempdir;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_default_engine, create_add_files_metadata, create_table,
-    engine_store_setup, setup_test_tables, test_read,
+    assert_result_error_with_message, copy_directory, create_add_files_metadata,
+    create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
 };
 
 mod common;
@@ -2094,7 +2094,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     copy_directory(&source_path, &tmp_table_path)?;
 
     let table_url = url::Url::from_directory_path(&tmp_table_path).unwrap();
-    let engine = DefaultEngine::new_local();
+    let engine = create_default_engine(&table_url)?;
 
     let snapshot = Snapshot::builder_for(table_url.clone())
         .at_version(1)
