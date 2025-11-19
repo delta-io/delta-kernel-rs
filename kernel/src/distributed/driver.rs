@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use delta_kernel_derive::internal_api;
+
 use crate::actions::get_commit_schema;
 use crate::log_reader::commit::CommitReader;
 use crate::log_reader::manifest::{AfterManifest, ManifestPhase};
@@ -249,13 +251,12 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
-    use std::sync::Arc as StdArc;
 
     fn load_test_table(
         table_name: &str,
     ) -> DeltaResult<(
-        StdArc<DefaultEngine<TokioBackgroundExecutor>>,
-        StdArc<crate::Snapshot>,
+        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        Arc<crate::Snapshot>,
         url::Url,
     )> {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -268,8 +269,8 @@ mod tests {
         let url = url::Url::from_directory_path(path)
             .map_err(|_| crate::Error::Generic("Failed to create URL from path".to_string()))?;
 
-        let store = StdArc::new(LocalFileSystem::new());
-        let engine = StdArc::new(DefaultEngine::new(store));
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = Arc::new(DefaultEngine::new(store));
         let snapshot = crate::Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
 
         Ok((engine, snapshot, url))
@@ -278,9 +279,9 @@ mod tests {
     #[test]
     fn test_driver_v2_with_commits_only() -> DeltaResult<()> {
         let (engine, snapshot, _url) = load_test_table("table-without-dv-small")?;
-        let log_segment = StdArc::new(snapshot.log_segment().clone());
+        let log_segment = Arc::new(snapshot.log_segment().clone());
 
-        let state_info = StdArc::new(StateInfo::try_new(
+        let state_info = Arc::new(StateInfo::try_new(
             snapshot.schema(),
             snapshot.table_configuration(),
             None,
@@ -336,9 +337,9 @@ mod tests {
     #[test]
     fn test_driver_v2_with_sidecars() -> DeltaResult<()> {
         let (engine, snapshot, _url) = load_test_table("v2-checkpoints-json-with-sidecars")?;
-        let log_segment = StdArc::new(snapshot.log_segment().clone());
+        let log_segment = Arc::new(snapshot.log_segment().clone());
 
-        let state_info = StdArc::new(StateInfo::try_new(
+        let state_info = Arc::new(StateInfo::try_new(
             snapshot.schema(),
             snapshot.table_configuration(),
             None,
@@ -415,6 +416,208 @@ mod tests {
             DriverPhaseResult::Complete(_processor) => {
                 panic!("Expected NeedsExecutorPhase for table with sidecars");
             }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_distributed_scan_serialization() -> DeltaResult<()> {
+        let (engine, snapshot, _url) = load_test_table("table-without-dv-small")?;
+        let log_segment = Arc::new(snapshot.log_segment().clone());
+
+        let state_info = Arc::new(StateInfo::try_new(
+            snapshot.schema(),
+            snapshot.table_configuration(),
+            None,
+            (),
+        )?);
+
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info.clone())?;
+        
+        // Serialize the processor (takes ownership)
+        let (serialized_state, deduplicator) = processor.serialize()?;
+        
+        // Verify we can reconstruct the processor
+        let reconstructed = ScanLogReplayProcessor::from_serialized(
+            engine.as_ref(),
+            serialized_state,
+            deduplicator,
+        )?;
+
+        // Verify schemas match (compare against original state_info)
+        assert_eq!(
+            state_info.logical_schema,
+            reconstructed.state_info.logical_schema,
+            "Logical schemas should match after serialization"
+        );
+        assert_eq!(
+            state_info.physical_schema,
+            reconstructed.state_info.physical_schema,
+            "Physical schemas should match after serialization"
+        );
+        
+        // Verify transform spec matches
+        match (&state_info.transform_spec, &reconstructed.state_info.transform_spec) {
+            (Some(original), Some(reconstructed)) => {
+                assert_eq!(
+                    **original,
+                    **reconstructed,
+                    "Transform spec should be equal after serialization"
+                );
+            }
+            (None, None) => {
+                // Both None - correct
+            }
+            _ => panic!("Transform spec presence mismatch after serialization"),
+        }
+        
+        // Verify column mapping mode matches
+        assert_eq!(
+            state_info.column_mapping_mode,
+            reconstructed.state_info.column_mapping_mode,
+            "Column mapping mode should match after serialization"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_distributed_scan_with_sidecars() -> DeltaResult<()> {
+        let (engine, snapshot, _url) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        
+        // Create a scan
+        let scan = crate::scan::ScanBuilder::new(snapshot.clone())
+            .build()?;
+
+        // Get distributed driver
+        let mut driver = scan.scan_metadata_distributed(engine.clone())?;
+
+        let mut driver_batch_count = 0;
+        let mut driver_file_paths = Vec::new();
+
+        // Process driver-side batches
+        while let Some(result) = driver.next() {
+            let metadata = result?;
+            let paths = metadata.visit_scan_files(
+                vec![],
+                |ps: &mut Vec<String>, path, _, _, _, _, _| {
+                    ps.push(path.to_string());
+                },
+            )?;
+            driver_file_paths.extend(paths);
+            driver_batch_count += 1;
+        }
+
+        // Driver should process commits but find no files (all in sidecars)
+        assert_eq!(
+            driver_file_paths.len(), 0,
+            "Driver should find 0 files (all adds are in checkpoint sidecars)"
+        );
+
+        // Should have executor phase with sidecars
+        let result = driver.finish()?;
+        match result {
+            crate::distributed::DriverPhaseResult::NeedsExecutorPhase {
+                processor,
+                files,
+            } => {
+                assert_eq!(
+                    files.len(),
+                    2,
+                    "Should have exactly 2 sidecar files for distribution"
+                );
+
+                // Serialize processor for distribution
+                let (serialized_state, deduplicator) = processor.serialize()?;
+
+                // Verify the serialized state can be reconstructed
+                let _reconstructed = ScanLogReplayProcessor::from_serialized(
+                    engine.as_ref(),
+                    serialized_state,
+                    deduplicator,
+                )?;
+
+                // Verify sidecar file paths
+                let mut collected_paths: Vec<String> = files
+                    .iter()
+                    .map(|fm| {
+                        fm.location
+                            .path_segments()
+                            .and_then(|segments| segments.last())
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
+
+                collected_paths.sort();
+
+                assert_eq!(collected_paths[0], "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet");
+                assert_eq!(collected_paths[1], "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet");
+            }
+            crate::distributed::DriverPhaseResult::Complete(_processor) => {
+                panic!("Expected NeedsExecutorPhase for table with sidecars");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_deduplicator_state_preserved() -> DeltaResult<()> {
+        let (engine, snapshot, _url) = load_test_table("v2-checkpoints-json-with-sidecars")?;
+        let log_segment = Arc::new(snapshot.log_segment().clone());
+
+        let state_info = Arc::new(StateInfo::try_new(
+            snapshot.schema(),
+            snapshot.table_configuration(),
+            None,
+            (),
+        )?);
+
+        let mut processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info.clone())?;
+        
+        // Process some actions to populate the deduplicator
+        let mut driver = DriverPhase::try_new(processor, log_segment, engine.clone())?;
+        
+        // Process all driver batches
+        while let Some(_) = driver.next() {}
+        
+        let result = driver.finish()?;
+        let processor = match result {
+            crate::distributed::DriverPhaseResult::Complete(p) => p,
+            crate::distributed::DriverPhaseResult::NeedsExecutorPhase { processor, .. } => processor,
+        };
+
+        let initial_dedup_count = processor.seen_file_keys.len();
+        
+        // Serialize and reconstruct (serialize takes ownership)
+        let (serialized_state, deduplicator) = processor.serialize()?;
+        assert_eq!(
+            deduplicator.len(),
+            initial_dedup_count,
+            "Deduplicator size should be preserved during serialization"
+        );
+
+        let reconstructed = ScanLogReplayProcessor::from_serialized(
+            engine.as_ref(),
+            serialized_state,
+            deduplicator.clone(),
+        )?;
+
+        assert_eq!(
+            reconstructed.seen_file_keys.len(),
+            initial_dedup_count,
+            "Reconstructed processor should have same deduplicator size"
+        );
+        
+        // Verify the deduplicator contents match (compare against returned deduplicator)
+        for key in &deduplicator {
+            assert!(
+                reconstructed.seen_file_keys.contains(key),
+                "Reconstructed deduplicator should contain key: {:?}",
+                key
+            );
         }
 
         Ok(())
