@@ -279,21 +279,19 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
             let first_record_batch: RecordBatch = (*first_arrow).into();
 
-            // Collect remaining batches
-            let mut batches = vec![first_record_batch];
+            let object_writer = ParquetObjectWriter::new(store, path);
+            let schema = first_record_batch.schema();
+            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
+
+            // Write the first batch
+            writer.write(&first_record_batch).await?;
+
+            // Write remaining batches
             for result in data {
                 let engine_data = result?;
                 let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
                 let batch: RecordBatch = (*arrow_data).into();
-                batches.push(batch);
-            }
-
-            let object_writer = ParquetObjectWriter::new(store, path);
-            let schema = batches[0].schema();
-            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
-
-            for batch in &batches {
-                writer.write(batch).await?;
+                writer.write(&batch).await?;
             }
 
             writer.finish().await?;
