@@ -717,7 +717,9 @@ mod tests {
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
         // Test with a non-existent file
-        let url = Url::from_file_path("/tmp/non_existent_file_for_test.parquet").unwrap();
+        let mut temp_path = std::env::temp_dir();
+        temp_path.push("non_existent_file_for_test.parquet");
+        let url = Url::from_file_path(temp_path).unwrap();
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
