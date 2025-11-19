@@ -146,6 +146,27 @@ pub(crate) enum PhysicalPredicate {
     None,
 }
 
+/// Serializable representation of PhysicalPredicate (skipping the predicate expression itself)
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+enum SerializablePhysicalPredicate {
+    /// Has a predicate and schema (but we skip serializing the predicate itself)
+    Some { schema: crate::schema::StructType },
+    StaticSkipAll,
+    None,
+}
+
+impl From<&PhysicalPredicate> for SerializablePhysicalPredicate {
+    fn from(pred: &PhysicalPredicate) -> Self {
+        match pred {
+            PhysicalPredicate::Some(_pred, schema) => SerializablePhysicalPredicate::Some {
+                schema: (**schema).clone(),
+            },
+            PhysicalPredicate::StaticSkipAll => SerializablePhysicalPredicate::StaticSkipAll,
+            PhysicalPredicate::None => SerializablePhysicalPredicate::None,
+        }
+    }
+}
+
 impl PhysicalPredicate {
     /// If we have a predicate, verify the columns it references and apply column mapping. First, get
     /// the set of references; use that to filter the schema to only the columns of interest (and
@@ -402,6 +423,68 @@ impl Scan {
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+    }
+
+    /// Get a distributed driver phase for processing scan metadata.
+    ///
+    /// This method returns a [`DriverPhase`] that can be used for distributed execution.
+    /// The driver processes commits and single-part checkpoint manifests, then returns
+    /// the processor state and files that need to be distributed to executors.
+    ///
+    /// # Distributed Execution Pattern
+    ///
+    /// 1. **Driver phase**: Process commits and manifests on the coordinator
+    /// 2. **Serialize state**: Extract processor state and deduplicator
+    /// 3. **Distribute**: Send state + files to executors
+    /// 4. **Executor phase**: Each executor processes its assigned files
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // On driver/coordinator
+    /// let mut driver = scan.scan_metadata_distributed(engine.clone())?;
+    ///
+    /// // Process driver-side batches
+    /// for batch in driver.by_ref() {
+    ///     let scan_metadata = batch?;
+    ///     // Handle scan metadata from commits/manifest
+    /// }
+    ///
+    /// // Check if executor phase is needed
+    /// match driver.finish()? {
+    ///     DriverPhaseResult::Complete(_processor) => {
+    ///         // All done! No executor phase needed
+    ///     }
+    ///     DriverPhaseResult::NeedsExecutorPhase { processor, files } => {
+    ///         // Serialize for distribution
+    ///         let (state, deduplicator) = processor.serialize()?;
+    ///        
+    ///         // Partition files and distribute to executors
+    ///         for (executor, file_partition) in partition(files) {
+    ///             executor.send(state.clone(), deduplicator.clone(), file_partition);
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// [`DriverPhase`]: crate::distributed::DriverPhase
+    pub(crate) fn scan_metadata_distributed(
+        &self,
+        engine: Arc<dyn Engine>,
+    ) -> DeltaResult<crate::distributed::DriverPhase<log_replay::ScanLogReplayProcessor>> {
+        use crate::distributed::DriverPhase;
+        
+        // Create the processor
+        let processor = log_replay::ScanLogReplayProcessor::new(
+            engine.as_ref(),
+            self.state_info.clone(),
+        )?;
+        
+        // Get log segment
+        let log_segment = Arc::new(self.snapshot.log_segment().clone());
+        
+        // Create and return driver phase
+        DriverPhase::try_new(processor, log_segment, engine)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
