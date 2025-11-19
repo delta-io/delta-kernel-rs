@@ -267,26 +267,27 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         location: url::Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
     ) -> DeltaResult<FileMeta> {
-        let path = Path::from_url_path(location.path())?;
         let store = self.store.clone();
 
-        // Get first batch to initialize writer with schema
-        let first_batch = data.next().ok_or_else(|| {
-            Error::generic("Cannot write parquet file with empty data iterator")
-        })??;
-        let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
-        let first_record_batch: RecordBatch = (*first_arrow).into();
-
-        // Collect remaining batches
-        let mut batches = vec![first_record_batch];
-        for result in data {
-            let engine_data = result?;
-            let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
-            let batch: RecordBatch = (*arrow_data).into();
-            batches.push(batch);
-        }
-
         self.task_executor.block_on(async move {
+            let path = Path::from_url_path(location.path())?;
+
+            // Get first batch to initialize writer with schema
+            let first_batch = data.next().ok_or_else(|| {
+                Error::generic("Cannot write parquet file with empty data iterator")
+            })??;
+            let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
+            let first_record_batch: RecordBatch = (*first_arrow).into();
+
+            // Collect remaining batches
+            let mut batches = vec![first_record_batch];
+            for result in data {
+                let engine_data = result?;
+                let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
+                let batch: RecordBatch = (*arrow_data).into();
+                batches.push(batch);
+            }
+
             let object_writer = ParquetObjectWriter::new(store, path);
             let schema = batches[0].schema();
             let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
@@ -335,16 +336,15 @@ impl ParquetOpener {
 
 impl FileOpener for ParquetOpener {
     fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
-        let path = Path::from_url_path(file_meta.location.path())?;
         let store = self.store.clone();
-
         let batch_size = self.batch_size;
-        // let projection = self.projection.clone();
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
         let limit = self.limit;
 
         Ok(Box::pin(async move {
+            let path = Path::from_url_path(file_meta.location.path())?;
+
             let mut reader = {
                 use object_store::ObjectStoreScheme;
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
