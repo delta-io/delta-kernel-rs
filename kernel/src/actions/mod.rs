@@ -554,78 +554,6 @@ impl Protocol {
         }
     }
 
-<<<<<<< HEAD
-    /// Check if reading a table with this protocol is supported. That is: does the kernel support
-    /// the specified protocol reader version and all enabled reader features? If yes, returns unit
-    /// type, otherwise will return an error.
-    pub(crate) fn ensure_read_supported(&self) -> DeltaResult<()> {
-        match &self.reader_features {
-            // if min_reader_version = 3 and all reader features are subset of supported => OK
-            Some(reader_features) if self.min_reader_version == 3 => {
-                ensure_supported_features(reader_features, &SUPPORTED_READER_FEATURES)
-            }
-            // if min_reader_version = 3 and no reader features => ERROR
-            // NOTE this is caught by the protocol parsing.
-            None if self.min_reader_version == 3 => Err(Error::internal_error(
-                "Reader features must be present when minimum reader version = 3",
-            )),
-            // if min_reader_version = 1,2 and there are no reader features => OK
-            None if self.min_reader_version == 1 || self.min_reader_version == 2 => Ok(()),
-            // if min_reader_version = 1,2 and there are reader features => ERROR
-            // NOTE this is caught by the protocol parsing.
-            Some(_) if self.min_reader_version == 1 || self.min_reader_version == 2 => {
-                Err(Error::internal_error(
-                    "Reader features must not be present when minimum reader version = 1 or 2",
-                ))
-            }
-            // any other min_reader_version is not supported
-            _ => Err(Error::Unsupported(format!(
-                "Unsupported minimum reader version {}",
-                self.min_reader_version
-            ))),
-        }
-    }
-
-    /// Check if writing to a table with this protocol is supported. That is: does the kernel
-    /// support the specified protocol writer version and all enabled writer features?
-    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
-        match &self.writer_features {
-            Some(writer_features) if self.min_writer_version == 7 => {
-                // if we're on version 7, make sure we support all the specified features
-                ensure_supported_features(writer_features, &SUPPORTED_WRITER_FEATURES)?;
-
-                // ensure that there is no illegal combination of features
-                if writer_features.contains(&TableFeature::RowTracking)
-                    && !writer_features.contains(&TableFeature::DomainMetadata)
-                {
-                    Err(Error::invalid_protocol(
-                        "rowTracking feature requires domainMetadata to also be enabled",
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            Some(_) => {
-                // there are features, but we're not on 7, so the protocol is actually broken
-                Err(Error::unsupported(
-                    "Tables with min writer version != 7 should not have table features.",
-                ))
-            }
-            None => {
-                // no features, we currently only support version 1 or 2 in this case
-                require!(
-                    self.min_writer_version == 1 || self.min_writer_version == 2,
-                    Error::unsupported(
-                        "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"
-                    )
-                );
-                Ok(())
-            }
-        }
-    }
-
-=======
->>>>>>> d37f5e9 (prot)
     #[cfg(feature = "catalog-managed")]
     pub(crate) fn is_catalog_managed(&self) -> bool {
         self.has_table_feature(&TableFeature::CatalogManaged)
@@ -1611,13 +1539,8 @@ mod tests {
         .unwrap();
         let config = create_table_config_for_protocol(protocol).unwrap();
         assert_result_error_with_message(
-<<<<<<< HEAD
-            protocol.ensure_write_supported(),
-            r#"Unsupported: Found unsupported TableFeatures: "identityColumns". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#,
-=======
             config.ensure_write_supported(),
             r#"Feature 'typeWidening' not supported for writes"#,
->>>>>>> d37f5e9 (prot)
         );
 
         // Unknown writer features are allowed during Protocol creation for forward compatibility,
@@ -1630,13 +1553,8 @@ mod tests {
         )
         .unwrap();
         assert_result_error_with_message(
-<<<<<<< HEAD
-            protocol.ensure_write_supported(),
-            r#"Unsupported: Found unsupported TableFeatures: "unsupported writer". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#,
-=======
             create_table_config_for_protocol(protocol),
             r#"Unsupported: Unknown feature 'unsupported feature'"#,
->>>>>>> d37f5e9 (prot)
         );
     }
 
@@ -1699,13 +1617,9 @@ mod tests {
             Some([TableFeature::CatalogManaged]),
         )
         .unwrap();
-<<<<<<< HEAD
-        assert!(protocol.ensure_write_supported().is_ok());
-=======
         let config = create_table_config_for_protocol(protocol).unwrap();
-        assert!(config.ensure_write_supported().is_err());
+        assert!(config.ensure_write_supported().is_ok());
 
->>>>>>> d37f5e9 (prot)
         let protocol = Protocol::try_new(
             3,
             7,
@@ -1713,12 +1627,8 @@ mod tests {
             Some([TableFeature::CatalogOwnedPreview]),
         )
         .unwrap();
-<<<<<<< HEAD
-        assert!(protocol.ensure_write_supported().is_ok());
-=======
         let config = create_table_config_for_protocol(protocol).unwrap();
-        assert!(config.ensure_write_supported().is_err());
->>>>>>> d37f5e9 (prot)
+        assert!(config.ensure_write_supported().is_ok());
     }
 
     #[test]
