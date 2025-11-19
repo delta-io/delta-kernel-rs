@@ -676,4 +676,55 @@ mod tests {
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
     }
+
+    #[test]
+    fn test_get_parquet_schema() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        // Test with an existing Parquet file
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
+        ))
+        .unwrap();
+        let url = Url::from_file_path(path).unwrap();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        // Get the schema
+        let schema = handler.get_parquet_schema(&file_meta).unwrap();
+
+        // Verify the schema has fields
+        assert!(
+            schema.fields().count() > 0,
+            "Schema should have at least one field"
+        );
+
+        // Verify we can access field properties
+        for field in schema.fields() {
+            assert!(!field.name().is_empty(), "Field name should not be empty");
+            let _data_type = field.data_type(); // Should not panic
+        }
+    }
+
+    #[test]
+    fn test_get_parquet_schema_invalid_file() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        // Test with a non-existent file
+        let url = Url::from_file_path("/tmp/non_existent_file_for_test.parquet").unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let result = handler.get_parquet_schema(&file_meta);
+        assert!(result.is_err(), "Should error on non-existent file");
+    }
 }

@@ -703,23 +703,6 @@ pub trait ParquetHandler: AsAny {
     /// which is useful for schema inspection, compatibility checking, and determining whether
     /// parsed statistics columns are present and compatible with the current table schema.
     ///
-    /// # Use Case
-    ///
-    /// This method is primarily used for checking whether a checkpoint file contains a
-    /// `stats_parsed` column with a compatible schema before attempting to read it.
-    /// Schema compatibility checking allows the kernel to:
-    /// - Determine if parsed stats are available
-    /// - Validate that the stats schema matches the current table schema
-    /// - Decide whether to use parsed stats or fall back to JSON stats
-    ///
-    /// # Performance
-    ///
-    /// Reading the footer is efficient as it:
-    /// - Requires only a single I/O operation
-    /// - Reads a small amount of data (typically 10KB - 1MB)
-    /// - Does not require decompression or data scanning
-    /// - Much faster than reading actual file data
-    ///
     /// # Parameters
     ///
     /// - `file` - File metadata for the Parquet file whose schema should be read.
