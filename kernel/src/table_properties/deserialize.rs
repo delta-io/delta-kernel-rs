@@ -66,6 +66,8 @@ fn try_parse(props: &mut TableProperties, k: &str, v: &str) -> Option<()> {
         "delta.enableChangeDataFeed" => props.enable_change_data_feed = Some(parse_bool(v)?),
         "delta.enableDeletionVectors" => props.enable_deletion_vectors = Some(parse_bool(v)?),
         "delta.enableTypeWidening" => props.enable_type_widening = Some(parse_bool(v)?),
+        "delta.enableIcebergCompatV1" => props.enable_iceberg_compat_v1 = Some(parse_bool(v)?),
+        "delta.enableIcebergCompatV2" => props.enable_iceberg_compat_v2 = Some(parse_bool(v)?),
         "delta.isolationLevel" => props.isolation_level = IsolationLevel::try_from(v).ok(),
         "delta.logRetentionDuration" => props.log_retention_duration = Some(parse_interval(v)?),
         "delta.enableExpiredLogCleanup" => props.enable_expired_log_cleanup = Some(parse_bool(v)?),

@@ -13,8 +13,8 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateE
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
-use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -93,9 +93,7 @@ impl ScanLogReplayProcessor {
 struct AddRemoveDedupVisitor<'seen> {
     deduplicator: FileActionDeduplicator<'seen>,
     selection_vector: Vec<bool>,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    transform_spec: Option<Arc<TransformSpec>>,
+    state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
@@ -113,9 +111,7 @@ impl AddRemoveDedupVisitor<'_> {
     fn new(
         seen: &mut HashSet<FileActionKey>,
         selection_vector: Vec<bool>,
-        logical_schema: SchemaRef,
-        physical_schema: SchemaRef,
-        transform_spec: Option<Arc<TransformSpec>>,
+        state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
@@ -129,9 +125,7 @@ impl AddRemoveDedupVisitor<'_> {
                 Self::REMOVE_DV_START_INDEX,
             ),
             selection_vector,
-            logical_schema,
-            physical_schema,
-            transform_spec,
+            state_info,
             partition_filter,
             row_transform_exprs: Vec::new(),
         }
@@ -179,12 +173,16 @@ impl AddRemoveDedupVisitor<'_> {
         // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
         // removes), because they are needed to suppress earlier incompatible adds we might
         // encounter if the table's schema was replaced after the most recent checkpoint.
-        let partition_values = match &self.transform_spec {
+        let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values =
-                    parse_partition_values(&self.logical_schema, transform, &partition_values)?;
+                let partition_values = parse_partition_values(
+                    &self.state_info.logical_schema,
+                    transform,
+                    &partition_values,
+                    self.state_info.column_mapping_mode,
+                )?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -200,13 +198,14 @@ impl AddRemoveDedupVisitor<'_> {
         let base_row_id: Option<i64> =
             getters[Self::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
         let transform = self
+            .state_info
             .transform_spec
             .as_ref()
             .map(|transform| {
                 get_transform_expr(
                     transform,
                     partition_values,
-                    &self.physical_schema,
+                    &self.state_info.physical_schema,
                     base_row_id,
                 )
             })
@@ -273,6 +272,11 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
     }
 }
 
+pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
+pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
+pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
+pub(crate) static TAGS_NAME: &str = "tags";
+
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
@@ -281,7 +285,16 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values = StructType::new_unchecked([
         StructField::nullable("partitionValues", partition_values),
-        StructField::nullable("baseRowId", DataType::LONG),
+        StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+        StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+        StructField::nullable(
+            "tags",
+            MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                /*valueContainsNull*/ true,
+            ),
+        ),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -289,7 +302,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable("modificationTime", DataType::LONG),
         StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-        StructField::nullable("fileConstantValues", file_constant_values),
+        StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
     ]))
 });
 
@@ -308,6 +321,8 @@ fn get_add_transform_expr() -> ExpressionRef {
             Arc::new(Expression::Struct(vec![
                 column_expr_ref!("add.partitionValues"),
                 column_expr_ref!("add.baseRowId"),
+                column_expr_ref!("add.defaultRowCommitVersion"),
+                column_expr_ref!("add.tags"),
             ])),
         ]))
     });
@@ -326,8 +341,10 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("size"),
                 column_expr_ref!("modificationTime"),
                 column_expr_ref!("stats"),
+                column_expr_ref!("fileConstantValues.tags"),
                 column_expr_ref!("deletionVector"),
                 column_expr_ref!("fileConstantValues.baseRowId"),
+                column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
             ],
         ))]))
     });
@@ -351,9 +368,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let mut visitor = AddRemoveDedupVisitor::new(
             &mut self.seen_file_keys,
             selection_vector,
-            self.state_info.logical_schema.clone(),
-            self.state_info.physical_schema.clone(),
-            self.state_info.transform_spec.clone(),
+            self.state_info.clone(),
             self.partition_filter.clone(),
             is_log_batch,
         );
@@ -407,6 +422,7 @@ mod tests {
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
+    use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
         engine::sync::SyncEngine,
@@ -471,6 +487,7 @@ mod tests {
             physical_schema: logical_schema.clone(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
