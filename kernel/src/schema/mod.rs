@@ -578,6 +578,10 @@ impl StructTypeBuilder {
     pub fn build(self) -> DeltaResult<StructType> {
         StructType::try_new(self.fields.into_values())
     }
+
+    pub fn build_unchecked(self) -> StructType {
+        StructType::new_unchecked(self.fields.into_values())
+    }
 }
 
 impl StructType {
@@ -3211,8 +3215,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(schema.num_fields(), 2);
-        assert!(schema.contains("id"));
-        assert!(schema.contains("name"));
+        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(schema.field_at_index(1).unwrap().name(), "name");
     }
 
     #[test]
@@ -3226,7 +3230,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(extended_schema.num_fields(), 2);
-        assert!(extended_schema.contains("id"));
-        assert!(extended_schema.contains("name"));
+        assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
     }
 }
