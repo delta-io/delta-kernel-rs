@@ -88,6 +88,7 @@ mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
 pub mod committer;
+mod distributed;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
