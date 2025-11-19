@@ -113,6 +113,7 @@ pub struct TableChanges {
     end_snapshot: SnapshotRef,
     start_version: Version,
     schema: Schema,
+    start_table_config: TableConfiguration,
 }
 
 impl TableChanges {
@@ -204,6 +205,7 @@ impl TableChanges {
             log_segment,
             start_version,
             schema,
+            start_table_config: start_snapshot.table_configuration().clone(),
         })
     }
 
