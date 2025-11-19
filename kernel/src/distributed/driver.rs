@@ -71,6 +71,14 @@ enum DriverState {
     Done,
 }
 
+/// Result of driver phase processing.
+pub(crate) enum DriverPhaseResult<P> {
+    /// All processing complete on driver - no executor phase needed.
+    Complete(P),
+    /// Executor phase needed - distribute files to executors for parallel processing.
+    NeedsExecutorPhase { processor: P, files: Vec<FileMeta> },
+}
+
 impl<P: LogReplayProcessor> DriverPhase<P> {
     /// Create a new driver-side log replay.
     ///
@@ -206,12 +214,12 @@ impl<P: LogReplayProcessor> DriverPhase<P> {
     /// Must be called after the iterator is exhausted.
     ///
     /// # Returns
-    /// - `Some((processor, files))`: Executor phase needed - distribute files to executors
-    /// - `None`: No executor phase needed - all processing complete on driver
+    /// - `Complete`: All processing done on driver - no executor phase needed
+    /// - `NeedsExecutorPhase`: Executor phase needed - distribute files to executors
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
-    pub(crate) fn finish(self) -> DeltaResult<Option<(P, Vec<FileMeta>)>> {
+    pub(crate) fn finish(self) -> DeltaResult<DriverPhaseResult<P>> {
         if !self.is_finished {
             return Err(Error::generic(
                 "Must exhaust iterator before calling finish()",
@@ -219,8 +227,13 @@ impl<P: LogReplayProcessor> DriverPhase<P> {
         }
 
         match self.state {
-            Some(DriverState::ExecutorPhase { files }) => Ok(Some((self.processor, files))),
-            Some(DriverState::Done) | None => Ok(None),
+            Some(DriverState::ExecutorPhase { files }) => {
+                Ok(DriverPhaseResult::NeedsExecutorPhase {
+                    processor: self.processor,
+                    files,
+                })
+            }
+            Some(DriverState::Done) | None => Ok(DriverPhaseResult::Complete(self.processor)),
             _ => Err(Error::generic("Unexpected state after iterator exhaustion")),
         }
     }
@@ -308,10 +321,14 @@ mod tests {
 
         // No executor phase needed for commits-only table
         let result = driver.finish()?;
-        assert!(
-            result.is_none(),
-            "DriverPhase should return None for commits-only table (no executor phase needed)"
-        );
+        match result {
+            DriverPhaseResult::Complete(_processor) => {
+                // Expected - no executor phase needed
+            }
+            DriverPhaseResult::NeedsExecutorPhase { .. } => {
+                panic!("Expected Complete, but got NeedsExecutorPhase for commits-only table");
+            }
+        }
 
         Ok(())
     }
@@ -365,36 +382,40 @@ mod tests {
 
         // Should have executor phase with sidecars from the checkpoint
         let result = driver.finish()?;
-        assert!(
-            result.is_some(),
-            "DriverPhase should return Some for table with sidecars (executor phase needed)"
-        );
+        match result {
+            DriverPhaseResult::NeedsExecutorPhase {
+                processor: _processor,
+                files,
+            } => {
+                assert_eq!(
+                    files.len(),
+                    2,
+                    "DriverPhase should collect exactly 2 sidecar files from checkpoint for distribution"
+                );
 
-        let (_processor, files) = result.unwrap();
-        assert_eq!(
-            files.len(),
-            2,
-            "DriverPhase should collect exactly 2 sidecar files from checkpoint for distribution"
-        );
+                // Extract and verify the sidecar file paths
+                let mut collected_paths: Vec<String> = files
+                    .iter()
+                    .map(|fm| {
+                        // Get the filename from the URL path
+                        fm.location
+                            .path_segments()
+                            .and_then(|segments| segments.last())
+                            .unwrap_or("")
+                            .to_string()
+                    })
+                    .collect();
 
-        // Extract and verify the sidecar file paths
-        let mut collected_paths: Vec<String> = files
-            .iter()
-            .map(|fm| {
-                // Get the filename from the URL path
-                fm.location
-                    .path_segments()
-                    .and_then(|segments| segments.last())
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .collect();
+                collected_paths.sort();
 
-        collected_paths.sort();
-
-        // Verify they're the expected sidecar files for version 6
-        assert_eq!(collected_paths[0], "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet");
-        assert_eq!(collected_paths[1], "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet");
+                // Verify they're the expected sidecar files for version 6
+                assert_eq!(collected_paths[0], "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet");
+                assert_eq!(collected_paths[1], "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet");
+            }
+            DriverPhaseResult::Complete(_processor) => {
+                panic!("Expected NeedsExecutorPhase for table with sidecars");
+            }
+        }
 
         Ok(())
     }
