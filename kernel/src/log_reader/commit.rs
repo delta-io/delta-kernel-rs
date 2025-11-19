@@ -55,13 +55,13 @@ mod tests {
     use crate::scan::COMMIT_READ_SCHEMA;
     use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
-    use std::sync::Arc as StdArc;
+    use std::sync::Arc;
 
     fn load_test_table(
         table_name: &str,
     ) -> DeltaResult<(
-        StdArc<DefaultEngine<TokioBackgroundExecutor>>,
-        StdArc<crate::Snapshot>,
+        Arc<DefaultEngine<TokioBackgroundExecutor>>,
+        Arc<crate::Snapshot>,
         url::Url,
     )> {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -74,8 +74,8 @@ mod tests {
         let url = url::Url::from_directory_path(path)
             .map_err(|_| crate::Error::Generic("Failed to create URL from path".to_string()))?;
 
-        let store = StdArc::new(LocalFileSystem::new());
-        let engine = StdArc::new(DefaultEngine::new(store));
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = Arc::new(DefaultEngine::new(store));
         let snapshot = crate::Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
 
         Ok((engine, snapshot, url))
@@ -84,9 +84,9 @@ mod tests {
     #[test]
     fn test_commit_phase_processes_commits() -> DeltaResult<()> {
         let (engine, snapshot, _url) = load_test_table("table-without-dv-small")?;
-        let log_segment = StdArc::new(snapshot.log_segment().clone());
+        let log_segment = Arc::new(snapshot.log_segment().clone());
 
-        let state_info = StdArc::new(StateInfo::try_new(
+        let state_info = Arc::new(StateInfo::try_new(
             snapshot.schema(),
             snapshot.table_configuration(),
             None,
