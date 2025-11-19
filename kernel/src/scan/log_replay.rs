@@ -18,8 +18,8 @@ use crate::log_replay::{
     ParallelizableLogReplayProcessor,
 };
 use crate::scan::Scalar;
-use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::schema::{SchemaRef, ToSchema as _};
 use crate::table_features::ColumnMappingMode;
 use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
