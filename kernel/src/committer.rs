@@ -255,7 +255,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
+<<<<<<< HEAD
             crate::Error::Generic(e) if e.contains("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
+=======
+            crate::Error::Unsupported(e) if e.contains("Feature 'catalogManaged' not supported for writes")
+>>>>>>> d37f5e9 (prot)
         ));
     }
 }
