@@ -525,23 +525,16 @@ impl StructField {
 
 impl Display for StructField {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let metadata_str = if self.metadata.is_empty() {
-            "{}".to_string()
-        } else {
-            let mut s = String::from("{");
-
-            let mut first = true;
-            for (k, v) in self.metadata.iter() {
-                if !first {
-                    s.push_str(", ");
-                }
-                first = false;
-                s.push_str(&format!("{}: {:?}", k, v));
+        let mut metadata_str = String::from("{");
+        let mut first = true;
+        for (k, v) in self.metadata.iter() {
+            if !first {
+                metadata_str.push_str(", ");
             }
-
-            s.push('}');
-            s
-        };
+            first = false;
+            metadata_str.push_str(&format!("{}: {:?}", k, v));
+        }
+        metadata_str.push('}');
         write!(
             f,
             "{}: {} (is nullable: {}, metadata: {})",
@@ -829,20 +822,24 @@ impl StructType {
     }
 }
 
+fn write_struct_type(st: &StructType, f: &mut Formatter<'_>, indent: &str) -> std::fmt::Result {
+    let mut iter = st.fields.iter().peekable();
+    while let Some((_, field)) = iter.next() {
+        let is_last = iter.peek().is_none();
+        let branch = if is_last { "└─" } else { "├─" };
+
+        writeln!(f, "{}{} {}", indent, branch, field)?;
+
+        // print recursive nested types if exist
+        field.data_type.fmt_recursive(f, indent, is_last)?;
+    }
+    Ok(())
+}
+
 impl Display for StructType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}:", self.type_name)?;
-        for (i, (_name, field)) in self.fields.iter().enumerate() {
-            let is_last = i == self.fields.len() - 1;
-            let branch = if is_last { "└─" } else { "├─" };
-
-            writeln!(f, "{} {}", branch, field)?;
-
-            // print recursive nested types if exist
-            field.data_type.fmt_recursive(f, "", is_last)?;
-        }
-
-        Ok(())
+        write_struct_type(self, f, "")
     }
 }
 
@@ -1475,18 +1472,7 @@ impl DataType {
         };
 
         match self {
-            DataType::Struct(inner) => {
-                for (i, (_, field)) in inner.fields.iter().enumerate() {
-                    let last = i == inner.fields.len() - 1;
-                    let branch = if last { "└─" } else { "├─" };
-
-                    write!(f, "{}{} {}", next_indent, branch, field)?;
-                    writeln!(f)?;
-
-                    field.data_type.fmt_recursive(f, &indent, last)?;
-                }
-                Ok(())
-            }
+            DataType::Struct(inner) => write_struct_type(inner, f, &next_indent),
 
             DataType::Array(inner) => {
                 write!(
@@ -3094,22 +3080,13 @@ mod tests {
     fn test_display_struct_type_stable_output() -> DeltaResult<()> {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
-        let nested_struct = StructType {
-            type_name: "struct".into(),
-            fields: [
-                (
-                    nested_field_with_metadata.name.clone(),
-                    nested_field_with_metadata,
-                ),
-                (
-                    "simple_x".to_string(),
-                    StructField::new("x", DataType::DOUBLE, true),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            metadata_columns: HashMap::new(),
-        };
+        let inner_struct = StructType::new_unchecked([StructField::new("q", DataType::LONG, false)]);
+        let nested_struct = StructType::new_unchecked(
+            [
+                nested_field_with_metadata,
+                StructField::new("x", DataType::DOUBLE, true),
+                StructField::new("inner_struct", DataType::Struct(Box::new(inner_struct)), false),
+            ]);
         let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
         let map_type = MapType::new(
             DataType::Struct(Box::new(nested_struct.clone())),
@@ -3120,29 +3097,40 @@ mod tests {
             StructField::new("x", DataType::DOUBLE, true),
             StructField::new("y", DataType::FLOAT, false),
             StructField::new("z", DataType::LONG, true),
+            StructField::new("s", nested_struct.clone(), false),
             StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
             StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
         ];
 
         let struct_type = StructType::new_unchecked(fields);
-        println!("{}", struct_type);
         assert_eq!(
             struct_type.to_string(),
             "struct:
 ├─ x: double (is nullable: true, metadata: {})
 ├─ y: float (is nullable: false, metadata: {})
 ├─ z: long (is nullable: true, metadata: {})
-├─ array_col: array<struct<nested_row_index: long, x: double>> (is nullable: true, metadata: {})
-│  └─ array_element: struct<nested_row_index: long, x: double>
+├─ s: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>> (is nullable: false, metadata: {})
+│  ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│  ├─ x: double (is nullable: true, metadata: {})
+│  └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│     └─ q: long (is nullable: false, metadata: {})
+├─ array_col: array<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
+│  └─ array_element: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
 │     ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-│     └─ x: double (is nullable: true, metadata: {})
-└─ map_col: map<struct<nested_row_index: long, x: double>, struct<nested_row_index: long, x: double>> (is nullable: true, metadata: {})
-   ├─ map_key: struct<nested_row_index: long, x: double>
+│     ├─ x: double (is nullable: true, metadata: {})
+│     └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│        └─ q: long (is nullable: false, metadata: {})
+└─ map_col: map<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>, struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
+   ├─ map_key: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
    │  ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-   │  └─ x: double (is nullable: true, metadata: {})
-   └─ map_value: struct<nested_row_index: long, x: double>
+   │  ├─ x: double (is nullable: true, metadata: {})
+   │  └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
+   │     └─ q: long (is nullable: false, metadata: {})
+   └─ map_value: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
       ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-      └─ x: double (is nullable: true, metadata: {})
+      ├─ x: double (is nullable: true, metadata: {})
+      └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
+         └─ q: long (is nullable: false, metadata: {})
 "
         );
 
