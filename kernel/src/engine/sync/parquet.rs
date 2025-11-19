@@ -1,17 +1,21 @@
 use std::fs::File;
+use std::sync::Arc;
 
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 
 use super::read_files;
+use crate::engine::arrow_conversion::TryFromArrow as _;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
     RowIndexBuilder,
 };
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::schema::SchemaRef;
-use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
+use crate::schema::{SchemaRef, StructType};
+use crate::{
+    DeltaResult, Error, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef,
+};
 
 pub(crate) struct SyncParquetHandler;
 
@@ -51,5 +55,25 @@ impl ParquetHandler for SyncParquetHandler {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_parquet)
+    }
+
+    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
+        // Convert URL to file path
+        let path = file
+            .location
+            .to_file_path()
+            .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
+
+        // Open the file
+        let file = File::open(path)?;
+
+        // Load metadata from the file
+        let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
+        let arrow_schema = metadata.schema();
+
+        // Convert Arrow schema to Kernel schema
+        StructType::try_from_arrow(arrow_schema.as_ref())
+            .map(Arc::new)
+            .map_err(Error::Arrow)
     }
 }
