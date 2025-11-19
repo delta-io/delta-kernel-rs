@@ -267,17 +267,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Custom(|_protocol, properties, _operation| {
-        // Kernel supports writing to CDF-enabled tables only if AppendOnly is also enabled
-        // because we don't yet support writing .cdc files for DML operations
-        if properties.enable_change_data_feed == Some(true) && properties.append_only != Some(true)
-        {
-            return Err(Error::unsupported(
-                "Writing to table with Change Data Feed is only supported if append only mode is enabled",
-            ));
-        }
-        Ok(())
-    }),
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_change_data_feed == Some(true)
     }),
@@ -498,7 +488,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    // We support writing to tables with DeletionVectors enabled, but we never write DV files
+    // ourselves (no DML). The kernel only performs append operations.
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
     }),
