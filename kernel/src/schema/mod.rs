@@ -822,16 +822,45 @@ impl StructType {
     }
 }
 
-fn write_struct_type(st: &StructType, f: &mut Formatter<'_>, indent: &str) -> std::fmt::Result {
-    let mut iter = st.fields.iter().peekable();
-    while let Some((_, field)) = iter.next() {
-        let is_last = iter.peek().is_none();
-        let branch = if is_last { "└─" } else { "├─" };
+fn write_indent(f: &mut Formatter<'_>, levels: &[bool]) -> std::fmt::Result {
+    // All except last decide between "│  " and "   "
+    for &is_last in &levels[..levels.len().saturating_sub(1)] {
+        if is_last {
+            write!(f, "   ")?;
+        } else {
+            write!(f, "│  ")?;
+        }
+    }
 
-        writeln!(f, "{}{} {}", indent, branch, field)?;
+    // The last level prints the branch ├─ or └─
+    if let Some(&is_last) = levels.last() {
+        if is_last {
+            write!(f, "└─")?;
+        } else {
+            write!(f, "├─")?;
+        }
+    }
 
-        // print recursive nested types if exist
-        field.data_type.fmt_recursive(f, indent, is_last)?;
+    Ok(())
+}
+
+fn write_struct_type(
+    st: &StructType,
+    f: &mut Formatter<'_>,
+    levels: &mut Vec<bool>,
+) -> std::fmt::Result {
+    let len = st.fields.len();
+
+    for (i, (_, field)) in st.fields.iter().enumerate() {
+        let is_last = i + 1 == len;
+        levels.push(is_last);
+
+        write_indent(f, levels)?;
+        writeln!(f, "{}", field)?;
+
+        field.data_type.fmt_recursive(f, levels)?;
+
+        levels.pop();
     }
     Ok(())
 }
@@ -839,7 +868,8 @@ fn write_struct_type(st: &StructType, f: &mut Formatter<'_>, indent: &str) -> st
 impl Display for StructType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}:", self.type_name)?;
-        write_struct_type(self, f, "")
+        let mut levels = Vec::new();
+        write_struct_type(self, f, &mut levels)
     }
 }
 
@@ -1459,42 +1489,34 @@ impl DataType {
         }
     }
 
-    fn fmt_recursive(
-        &self,
-        f: &mut Formatter<'_>,
-        indent: &str,
-        is_last: bool,
-    ) -> std::fmt::Result {
-        let next_indent = if is_last {
-            format!("{}   ", indent)
-        } else {
-            format!("{}│  ", indent)
-        };
-
+    fn fmt_recursive(&self, f: &mut Formatter<'_>, levels: &mut Vec<bool>) -> std::fmt::Result {
         match self {
-            DataType::Struct(inner) => write_struct_type(inner, f, &next_indent),
+            DataType::Struct(inner) => write_struct_type(inner, f, levels),
 
             DataType::Array(inner) => {
-                write!(
-                    f,
-                    "{}{} array_element: {}",
-                    next_indent, "└─", inner.element_type
-                )?;
-                writeln!(f)?;
-
-                inner.element_type.fmt_recursive(f, &next_indent, true)
+                levels.push(true); // only one child → last
+                write_indent(f, levels)?;
+                writeln!(f, "array_element: {}", inner.element_type)?;
+                inner.element_type.fmt_recursive(f, levels)?;
+                levels.pop();
+                Ok(())
             }
 
             DataType::Map(inner) => {
-                write!(f, "{}{} map_key: {}", next_indent, "├─", inner.key_type)?;
-                writeln!(f)?;
-                inner.key_type.fmt_recursive(f, &next_indent, false)?;
-                write!(f, "{}└─ map_value: {}", next_indent, inner.value_type)?;
-                writeln!(f)?;
+                // key
+                levels.push(false); // map_key is NOT last
+                write_indent(f, levels)?;
+                writeln!(f, "map_key: {}", inner.key_type)?;
+                inner.key_type.fmt_recursive(f, levels)?;
+                levels.pop();
 
-                inner
-                    .value_type
-                    .fmt_recursive(f, &format!("{}   ", indent), true)
+                // value
+                levels.push(true); // map_value IS last
+                write_indent(f, levels)?;
+                writeln!(f, "map_value: {}", inner.value_type)?;
+                inner.value_type.fmt_recursive(f, levels)?;
+                levels.pop();
+                Ok(())
             }
 
             _ => Ok(()),
@@ -3080,13 +3102,17 @@ mod tests {
     fn test_display_struct_type_stable_output() -> DeltaResult<()> {
         let nested_field_with_metadata =
             StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
-        let inner_struct = StructType::new_unchecked([StructField::new("q", DataType::LONG, false)]);
-        let nested_struct = StructType::new_unchecked(
-            [
-                nested_field_with_metadata,
-                StructField::new("x", DataType::DOUBLE, true),
-                StructField::new("inner_struct", DataType::Struct(Box::new(inner_struct)), false),
-            ]);
+        let inner_struct =
+            StructType::new_unchecked([StructField::new("q", DataType::LONG, false)]);
+        let nested_struct = StructType::new_unchecked([
+            nested_field_with_metadata,
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new(
+                "inner_struct",
+                DataType::Struct(Box::new(inner_struct)),
+                false,
+            ),
+        ]);
         let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
         let map_type = MapType::new(
             DataType::Struct(Box::new(nested_struct.clone())),
@@ -3100,37 +3126,39 @@ mod tests {
             StructField::new("s", nested_struct.clone(), false),
             StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
             StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+            StructField::new("a", DataType::LONG, true),
         ];
 
         let struct_type = StructType::new_unchecked(fields);
         assert_eq!(
             struct_type.to_string(),
             "struct:
-├─ x: double (is nullable: true, metadata: {})
-├─ y: float (is nullable: false, metadata: {})
-├─ z: long (is nullable: true, metadata: {})
-├─ s: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>> (is nullable: false, metadata: {})
-│  ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-│  ├─ x: double (is nullable: true, metadata: {})
-│  └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
-│     └─ q: long (is nullable: false, metadata: {})
-├─ array_col: array<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
-│  └─ array_element: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
-│     ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-│     ├─ x: double (is nullable: true, metadata: {})
-│     └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
-│        └─ q: long (is nullable: false, metadata: {})
-└─ map_col: map<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>, struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
-   ├─ map_key: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
-   │  ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-   │  ├─ x: double (is nullable: true, metadata: {})
-   │  └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
-   │     └─ q: long (is nullable: false, metadata: {})
-   └─ map_value: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
-      ├─ nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-      ├─ x: double (is nullable: true, metadata: {})
-      └─ inner_struct: struct<q: long> (is nullable: false, metadata: {})
-         └─ q: long (is nullable: false, metadata: {})
+├─x: double (is nullable: true, metadata: {})
+├─y: float (is nullable: false, metadata: {})
+├─z: long (is nullable: true, metadata: {})
+├─s: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>> (is nullable: false, metadata: {})
+│  ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│  ├─x: double (is nullable: true, metadata: {})
+│  └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│     └─q: long (is nullable: false, metadata: {})
+├─array_col: array<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
+│  └─array_element: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
+│     ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│     ├─x: double (is nullable: true, metadata: {})
+│     └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│        └─q: long (is nullable: false, metadata: {})
+├─map_col: map<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>, struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
+│  ├─map_key: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
+│  │  ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│  │  ├─x: double (is nullable: true, metadata: {})
+│  │  └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│  │     └─q: long (is nullable: false, metadata: {})
+│  └─map_value: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
+│     ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│     ├─x: double (is nullable: true, metadata: {})
+│     └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│        └─q: long (is nullable: false, metadata: {})
+└─a: long (is nullable: true, metadata: {})
 "
         );
 
@@ -3139,12 +3167,11 @@ mod tests {
             .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
             .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
             .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?;
-        println!("{}", schema);
         assert_eq!(schema.to_string(), "struct:
-├─ regular_col: string (is nullable: true, metadata: {})
-├─ row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
-├─ row_id: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_id\")})
-└─ row_commit_version: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_commit_version\")})
+├─regular_col: string (is nullable: true, metadata: {})
+├─row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+├─row_id: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_id\")})
+└─row_commit_version: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_commit_version\")})
 ");
         Ok(())
     }
