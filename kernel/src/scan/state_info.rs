@@ -172,7 +172,9 @@ impl StateInfo {
                     Some(MetadataColumnSpec::RowCommitVersion) => {
                         return Err(Error::unsupported("Row commit versions not supported"));
                     }
-                    Some(MetadataColumnSpec::RowIndex) | Some(MetadataColumnSpec::FileName) | None => {
+                    Some(MetadataColumnSpec::RowIndex)
+                    | Some(MetadataColumnSpec::FileName)
+                    | None => {
                         // note that RowIndex and FileName are handled in the parquet reader so we just add them as
                         // if they're normal physical columns
                         let physical_field = logical_field.make_physical(column_mapping_mode);

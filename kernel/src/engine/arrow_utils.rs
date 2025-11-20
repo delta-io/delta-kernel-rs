@@ -893,9 +893,8 @@ pub(crate) fn reorder_struct_array(
                         ));
                     };
                     // Create an array with the file path repeated for each row
-                    let file_name_array = StringArray::from_iter_values(
-                        std::iter::repeat(file_path).take(num_rows)
-                    );
+                    let file_name_array =
+                        StringArray::from_iter_values(std::iter::repeat(file_path).take(num_rows));
                     final_fields_cols[reorder_index.index] =
                         Some((Arc::clone(field), Arc::new(file_name_array)));
                 }
@@ -1902,11 +1901,11 @@ mod tests {
         let (mask_indices, reorder_indices) =
             get_requested_indices(&requested_schema, &parquet_schema).unwrap();
         let expect_mask = vec![0, 1];
-        let mut arrow_file_name_field =
-            ArrowField::new("_file", ArrowDataType::Utf8, false);
-        arrow_file_name_field.set_metadata(HashMap::from([
-            ("delta.metadataSpec".to_string(), "_file".to_string()),
-        ]));
+        let mut arrow_file_name_field = ArrowField::new("_file", ArrowDataType::Utf8, false);
+        arrow_file_name_field.set_metadata(HashMap::from([(
+            "delta.metadataSpec".to_string(),
+            "_file".to_string(),
+        )]));
         let expect_reorder = vec![
             ReorderIndex::identity(0),
             ReorderIndex::identity(2),

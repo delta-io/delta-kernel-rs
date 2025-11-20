@@ -342,7 +342,12 @@ impl FileOpener for ParquetOpener {
             let stream = builder.with_batch_size(batch_size).build()?;
 
             let stream = stream.map(move |rbr| {
-                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut(), Some(&file_location))
+                fixup_parquet_read(
+                    rbr?,
+                    &requested_ordering,
+                    row_indexes.as_mut(),
+                    Some(&file_location),
+                )
             });
             Ok(stream.boxed())
         }))
@@ -420,7 +425,12 @@ impl FileOpener for PresignedUrlOpener {
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
-                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut(), Some(&file_location))
+                fixup_parquet_read(
+                    rbr?,
+                    &requested_ordering,
+                    row_indexes.as_mut(),
+                    Some(&file_location),
+                )
             });
             Ok(stream.boxed())
         }))

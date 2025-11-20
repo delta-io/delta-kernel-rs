@@ -41,7 +41,14 @@ fn try_create_from_parquet(
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
-    Ok(stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut(), Some(&file_location))))
+    Ok(stream.map(move |rbr| {
+        fixup_parquet_read(
+            rbr?,
+            &requested_ordering,
+            row_indexes.as_mut(),
+            Some(&file_location),
+        )
+    }))
 }
 
 impl ParquetHandler for SyncParquetHandler {
