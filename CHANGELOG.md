@@ -6,10 +6,10 @@
 
 ### 🏗️ Breaking changes
 1. New Engine StorageHandler head API ([#1465])
-   - Engine API implementers must add the `head` API to StorageHandler
+   - Engine API implementers must add the `head` API to StorageHandler which fetches metadata about a file in storage
 2. Add remove_files API ([#1353])
-   - The schema for scan rows in Transaction has been updated. Ensure that a connector
-   that performs writes uses the new APIs.
+   - The schema for scan rows (from `Scan::scan_metadata`) has been updated to include two
+     new fields: `fileConstantValues.tags` and `fileConstantValues.defaultRowCommitVersion`.
 
 ### 🚀 Features / new APIs
 
@@ -19,7 +19,7 @@
 4. Add Table Feature Info ([#1462])
 5. *(FFI)* Snapshot log tail FFI ([#1379])
 6. Add generic is_feature_supported and is_feature_enabled methods to TableConfiguration ([#1405])
-7. Undepracate ArrayData.array_elements() ([#1493])
+7. Un-deprecate ArrayData.array_elements() ([#1493])
 8. Allow writes to CDF tables for add-only, remove-only, and non-data-change transactions ([#1490])
 9. *(catalog-managed)* UCCommitter ([#1418])
 
@@ -41,11 +41,6 @@
 ### 🧪 Testing
 
 1. Add tests for StructField.physical_name ([#1469])
-
-### ⚙️ Chores/CI
-
-1. Sync 0.17.1 release ([#1474])
-
 
 [#1466]: https://github.com/delta-io/delta-kernel-rs/pull/1466
 [#1403]: https://github.com/delta-io/delta-kernel-rs/pull/1403
