@@ -18,6 +18,7 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 ///
 /// Generic over the inner iterator type and item type.
 /// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate MetricEvent.
+/// Metrics are emitted either when the iterator is exhausted or when dropped.
 struct MetricsIterator<I, T>
 where
     I: Iterator<Item = DeltaResult<T>>,
@@ -155,6 +156,7 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
+        let start = Instant::now();
         // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
         // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
         // because it strips trailing /, so we're reduced to manually checking the original URL.
@@ -220,7 +222,6 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
             }
         });
 
-        let start = Instant::now();
         let reporter = self.reporter.clone();
 
         if !has_ordered_listing {
@@ -261,8 +262,8 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let store = self.inner.clone();
         let start = Instant::now();
+        let store = self.inner.clone();
 
         // This channel will become the output iterator.
         // Because there will already be buffering in the stream, we set the

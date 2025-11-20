@@ -19,6 +19,7 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::metrics::MetricsReporter;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
@@ -40,7 +41,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
-    reporter: Option<Arc<dyn crate::metrics::MetricsReporter>>,
+    reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
@@ -60,18 +61,12 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     }
 
     /// Create a new [`DefaultEngine`] instance with the default executor and metrics reporting.
-    ///
-    /// Uses `TokioBackgroundExecutor` as the default executor.
-    /// For custom executors, use [`DefaultEngine::new_with_executor_and_metrics_reporter`].
-    ///
-    /// # Parameters
-    ///
-    /// - `object_store`: The object store to use.
-    /// - `reporter`: Metrics reporter for tracking operation metrics.
+    /// TODO: Switch to Builder pattern to avoid explosion of constructor methods.
+    #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn new_with_metrics_reporter(
         object_store: Arc<DynObjectStore>,
-        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+        reporter: Arc<dyn MetricsReporter>,
     ) -> Self {
         Self::new_with_executor_and_metrics_reporter(
             object_store,
@@ -113,24 +108,13 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     }
 
     /// Create a new [`DefaultEngine`] instance with a custom executor and metrics reporting.
-    ///
-    /// Most users should use [`DefaultEngine::new`] instead. This method is only
-    /// needed for specialized testing scenarios (e.g., multi-threaded executors) with metrics.
-    ///
-    /// # Parameters
-    ///
-    /// - `object_store`: The object store to use.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    /// - `reporter`: Metrics reporter for tracking operation metrics.
-    ///
-    /// # TODO
-    ///
-    /// Switch to Builder pattern to avoid explosion of constructor methods.
+    /// TODO: Switch to Builder pattern to avoid explosion of constructor methods.
+    #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn new_with_executor_and_metrics_reporter(
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
-        reporter: Arc<dyn crate::metrics::MetricsReporter>,
+        reporter: Arc<dyn MetricsReporter>,
     ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
@@ -194,7 +178,7 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
         self.parquet.clone()
     }
 
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn crate::metrics::MetricsReporter>> {
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
         self.reporter.clone()
     }
 }

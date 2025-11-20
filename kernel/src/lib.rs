@@ -155,6 +155,7 @@ pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
+pub use metrics::MetricsReporter;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 
@@ -717,11 +718,11 @@ pub trait Engine: AsAny {
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
 
-    /// Get the connector provided [`metrics::MetricsReporter`] for metrics collection.
+    /// Get the connector provided [`MetricsReporter`] for metrics collection.
     ///
     /// Returns an optional reporter that will receive metric events from Delta operations.
     /// The default implementation returns None (no metrics reporting).
-    fn get_metrics_reporter(&self) -> Option<Arc<dyn crate::metrics::MetricsReporter>> {
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
         None
     }
 }

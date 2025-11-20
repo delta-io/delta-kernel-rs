@@ -267,8 +267,8 @@ impl Snapshot {
     ) -> DeltaResult<Arc<Self>> {
         let operation_id = operation_id.unwrap_or_default();
         let reporter = engine.get_metrics_reporter();
-        let start = Instant::now();
 
+        let start = Instant::now();
         let result =
             Self::try_new_from_impl(existing_snapshot, log_tail, engine, version, operation_id);
         let snapshot_duration = start.elapsed();
@@ -298,15 +298,29 @@ impl Snapshot {
 
     /// Implementation of snapshot creation from log segment.
     ///
-    /// Calls `build_table_configuration` which reports `ProtocolMetadataLoaded`.
+    /// Reports metrics: `ProtocolMetadataLoaded`.
     fn try_new_from_log_segment_impl(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
         operation_id: MetricId,
     ) -> DeltaResult<Self> {
+        let reporter = engine.get_metrics_reporter();
+
+        let start = Instant::now();
+        let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        let read_metadata_duration = start.elapsed();
+
+        reporter.as_ref().inspect(|r| {
+            r.report(MetricEvent::ProtocolMetadataLoaded {
+                operation_id,
+                duration: read_metadata_duration,
+            });
+        });
+
         let table_configuration =
-            Self::build_table_configuration(&log_segment, engine, location, operation_id)?;
+            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+
         Ok(Self {
             log_segment,
             table_configuration,
@@ -324,8 +338,8 @@ impl Snapshot {
     ) -> DeltaResult<Self> {
         let operation_id = operation_id.unwrap_or_default();
         let reporter = engine.get_metrics_reporter();
-        let start = Instant::now();
 
+        let start = Instant::now();
         let result =
             Self::try_new_from_log_segment_impl(location, log_segment, engine, operation_id);
         let snapshot_duration = start.elapsed();
@@ -515,33 +529,6 @@ impl Snapshot {
             }
             None => Err(Error::generic("Last commit file not found in log segment")),
         }
-    }
-
-    /// Build table configuration from log segment.
-    ///
-    /// Reports metrics: `ProtocolMetadataLoaded`.
-    fn build_table_configuration(
-        log_segment: &LogSegment,
-        engine: &dyn Engine,
-        location: Url,
-        operation_id: MetricId,
-    ) -> DeltaResult<TableConfiguration> {
-        let start = Instant::now();
-        let reporter = engine.get_metrics_reporter();
-        let (metadata, protocol) = log_segment.read_metadata(engine)?;
-        let read_metadata_duration = start.elapsed();
-
-        reporter.as_ref().inspect(|r| {
-            r.report(MetricEvent::ProtocolMetadataLoaded {
-                operation_id,
-                duration: read_metadata_duration,
-            });
-        });
-
-        let table_configuration =
-            TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
-
-        Ok(table_configuration)
     }
 }
 
