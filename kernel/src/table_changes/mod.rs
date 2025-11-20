@@ -41,7 +41,7 @@ use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -258,13 +258,6 @@ fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult
         table_properties.enable_change_data_feed.unwrap_or(false),
         Error::unsupported("Change data feed is not enabled")
     );
-    require!(
-        matches!(
-            table_properties.column_mapping_mode,
-            None | Some(ColumnMappingMode::None)
-        ),
-        Error::unsupported("Change data feed not supported when column mapping is enabled")
-    );
     Ok(())
 }
 
@@ -280,6 +273,8 @@ fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
         }
         // if min_reader_version = 1 and there are no reader features => OK
         None if protocol.min_reader_version() == 1 => Ok(()),
+        // if min_reader_version = 2 (column mapping) and there are no reader features => OK
+        None if protocol.min_reader_version() == 2 => Ok(()),
         // any other protocol is not supported
         _ => Err(Error::unsupported(
             "Change data feed not supported on this protocol",
