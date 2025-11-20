@@ -17,12 +17,6 @@ use crate::schema::{DataType, StructField};
 /// The minValues, maxValues, and nullCount fields contain dynamic structs
 /// whose schema matches the table's data columns (using physical column names).
 ///
-/// # Usage
-///
-/// This type is used when reading checkpoint parquet files that contain the
-/// `stats_parsed` column. It provides direct access to statistics without
-/// needing to parse JSON strings, improving performance for data skipping.
-///
 /// # Schema
 ///
 /// The stats_parsed schema in checkpoints is:
@@ -34,30 +28,6 @@ use crate::schema::{DataType, StructField};
 ///   nullCount: struct<col1: long, col2: long, ...>,    // Dynamic per table
 ///   tightBounds: boolean
 /// >
-/// ```
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use delta_kernel::statistics::StatsParsed;
-/// use std::collections::HashMap;
-///
-/// let stats = StatsParsed {
-///     num_records: Some(1000),
-///     min_values: Some(HashMap::from([
-///         ("id".to_string(), Scalar::Integer(1)),
-///         ("name".to_string(), Scalar::String("alice".to_string())),
-///     ])),
-///     max_values: Some(HashMap::from([
-///         ("id".to_string(), Scalar::Integer(1000)),
-///         ("name".to_string(), Scalar::String("zoe".to_string())),
-///     ])),
-///     null_count: Some(HashMap::from([
-///         ("id".to_string(), 0),
-///         ("name".to_string(), 5),
-///     ])),
-///     tight_bounds: Some(true),
-/// };
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsParsed {
@@ -79,14 +49,23 @@ pub struct StatsParsed {
     pub tight_bounds: Option<bool>,
 }
 
-// Manual implementation of Eq for StatsParsed
-// Note: This is a shallow equality check. For HashMap<String, Scalar>, we use PartialEq
-// even though Scalar doesn't implement Eq, we can still provide this for compatibility.
+/// Manual implementation of Eq for StatsParsed
+///
+/// Note: This is a shallow equality check. For HashMap<String, Scalar>, we use PartialEq
+/// even though Scalar doesn't implement Eq, we can still provide this for compatibility.
 impl Eq for StatsParsed {}
 
-// Implementation of ToDataType for schema derivation
-// Returns a base schema structure for stats_parsed. The actual minValues/maxValues/nullCount
-// schemas are dynamic and depend on the table schema.
+/// ToDataType trait implementation for StatsParsed
+///
+/// `ToDataType` is a kernel trait that converts a Rust type into its corresponding Delta `DataType`.
+/// This is used during schema generation and validation when reading/writing checkpoint parquet files.
+///
+/// For `StatsParsed`, we return a struct schema with empty inner structs for minValues, maxValues,
+/// and nullCount because their actual schemas are table-dependent and determined at runtime based
+/// on the specific columns in the table.
+///
+/// The returned schema serves as a template that checkpoint readers/writers can use to understand
+/// the structure, even though the inner struct fields will vary per table.
 impl ToDataType for StatsParsed {
     fn to_data_type() -> DataType {
         // Return the stats_parsed schema structure
