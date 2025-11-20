@@ -134,7 +134,6 @@ impl AddVisitor {
             modification_time,
             data_change,
             stats,
-            stats_parsed: None, // TODO: Extract stats_parsed from checkpoint parquet when available
             tags: None,
             deletion_vector,
             base_row_id,
@@ -212,7 +211,6 @@ impl RemoveVisitor {
             partition_values,
             size,
             stats,
-            stats_parsed: None, // TODO: Extract stats_parsed from checkpoint parquet when available
             tags: None,
             deletion_vector,
             base_row_id,
