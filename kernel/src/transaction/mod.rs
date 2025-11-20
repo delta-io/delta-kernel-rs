@@ -26,7 +26,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
 use crate::snapshot::SnapshotRef;
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, require};
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
     RowVisitor, SchemaTransform, Version,
@@ -232,6 +232,31 @@ impl Transaction {
                 dup.app_id
             )));
         }
+
+        // If there are add and remove files with data change in the same transaction, we block it.
+        // This is because kernel does not yet have a way to discern DML operations. For DML
+        // operations that perform updates on rows, ChangeDataFeed requires that a `cdc` file be
+        // written to the delta log.
+        if !self.add_files_metadata.is_empty()
+            && !self.remove_files_metadata.is_empty()
+            && self.data_change
+        {
+            let cdf_enabled = self
+                .read_snapshot
+                .table_configuration()
+                .table_properties()
+                .enable_change_data_feed
+                .unwrap_or(false);
+            require!(
+                !cdf_enabled,
+                Error::generic(
+                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+                     This would require writing CDC files for DML operations, which is not yet supported. \
+                     Consider using separate transactions: one to add files, another to remove files."
+                )
+            );
+        }
+
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
@@ -291,7 +316,7 @@ impl Transaction {
             return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
         }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
-        let commit_metadata = CommitMetadata::new(log_root, commit_version);
+        let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
