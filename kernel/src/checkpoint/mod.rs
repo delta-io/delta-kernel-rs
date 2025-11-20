@@ -106,7 +106,9 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 
 use url::Url;
 
+#[cfg(feature = "arrow")]
 mod stats_transformer;
+#[cfg(feature = "arrow")]
 use self::stats_transformer::StatsTransformationProcessor;
 
 #[cfg(test)]
@@ -273,12 +275,14 @@ impl CheckpointWriter {
 
         // Read table properties for stats configuration
         // Default to true (match DBR behavior) for both properties
+        #[allow(unused_variables)]
         let write_stats_as_json = self
             .snapshot
             .table_properties()
             .checkpoint_write_stats_as_json
             .unwrap_or(true);
 
+        #[allow(unused_variables)]
         let write_stats_as_struct = self
             .snapshot
             .table_properties()
@@ -301,6 +305,7 @@ impl CheckpointWriter {
         // Transform actions based on table properties:
         // - write_stats_as_json: Whether to keep JSON stats field
         // - write_stats_as_struct: Whether to populate stats_parsed field
+        #[cfg(feature = "arrow")]
         let checkpoint_data: Box<
             dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
         > = if write_stats_as_struct || !write_stats_as_json {
@@ -318,6 +323,11 @@ impl CheckpointWriter {
             // Both false or only JSON enabled - no transformation needed
             Box::new(checkpoint_data)
         };
+
+        #[cfg(not(feature = "arrow"))]
+        let checkpoint_data: Box<
+            dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send,
+        > = Box::new(checkpoint_data);
 
         let checkpoint_metadata =
             is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));

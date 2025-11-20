@@ -7,12 +7,15 @@
 use std::sync::Arc;
 
 use crate::action_reconciliation::log_replay::ActionReconciliationBatch;
-use crate::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::DataType as ArrowDataType;
-use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine_data::FilteredEngineData;
 use crate::schema::{DataType, StructType};
 use crate::{DeltaResult, Error};
+
+#[cfg(feature = "arrow")]
+use {
+    arrow_array::{Array, ArrayRef, RecordBatch, StringArray, StructArray},
+    arrow_schema::DataType as ArrowDataType,
+};
 
 /// Transforms checkpoint actions to control stats fields based on table properties.
 ///
@@ -100,6 +103,7 @@ impl StatsTransformationProcessor {
     /// This method finds the `add` struct column, extracts the `stats` string field,
     /// parses each JSON string, and replaces the null `stats_parsed` field with
     /// the populated struct data.
+    #[cfg(feature = "arrow")]
     fn transform_record_batch(&self, record_batch: &RecordBatch) -> DeltaResult<RecordBatch> {
         // Find the 'add' column (it's a struct)
         let add_column_idx = record_batch

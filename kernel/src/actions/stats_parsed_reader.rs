@@ -182,7 +182,7 @@ fn read_scalar_from_parquet<'a>(
             // TODO: Implement decimal reading
             Ok(None)
         }
-        DataType::Struct(nested_schema) => {
+        DataType::Struct(_nested_schema) => {
             // For nested structs, we'd need to recursively parse
             // For now, return None
             // TODO: Implement recursive struct parsing

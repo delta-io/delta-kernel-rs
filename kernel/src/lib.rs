@@ -87,6 +87,8 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+#[cfg(feature = "arrow")]
+mod checkpoint_stats_reader;
 pub mod committer;
 pub mod engine_data;
 pub mod error;
@@ -95,6 +97,7 @@ mod log_compaction;
 mod log_path;
 pub mod scan;
 pub mod schema;
+mod schema_reconciliation;
 pub mod snapshot;
 pub mod statistics;
 pub mod stats_schema;
@@ -693,6 +696,24 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Read the Parquet schema from the footer metadata without reading the data.
+    ///
+    /// This method reads only the Parquet footer (typically 10KB-1MB) to extract the
+    /// Arrow schema, which is then converted to a kernel SchemaRef. This is useful for
+    /// operations that need to inspect the schema without reading the actual data,
+    /// such as checkpoint schema reconciliation for parsed statistics.
+    ///
+    /// # Parameters
+    /// - `file` - File metadata for the Parquet file to inspect
+    ///
+    /// # Returns
+    /// A [`DeltaResult`] containing the [`SchemaRef`] from the Parquet file.
+    ///
+    /// # Performance
+    /// This operation typically completes in <10ms as it only reads the footer metadata,
+    /// avoiding the overhead of reading and decompressing the actual data.
+    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

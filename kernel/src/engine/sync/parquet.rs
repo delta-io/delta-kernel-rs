@@ -52,4 +52,29 @@ impl ParquetHandler for SyncParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_parquet)
     }
+
+    fn get_parquet_schema(&self, file_meta: &FileMeta) -> DeltaResult<SchemaRef> {
+        use crate::engine::arrow_conversion::TryFromArrow as _;
+        use crate::schema::StructType;
+        use crate::Error;
+        use std::sync::Arc;
+
+        // Open the file for reading
+        let file = File::open(file_meta.location.as_str()).map_err(|e| {
+            Error::generic(format!("Failed to open file {}: {}", file_meta.location, e))
+        })?;
+
+        // Load just the metadata (footer) from the file
+        let metadata = ArrowReaderMetadata::load(&file, Default::default())
+            .map_err(|e| Error::generic(format!("Failed to load parquet metadata: {}", e)))?;
+
+        // Get the Arrow schema from metadata
+        let arrow_schema = metadata.schema();
+
+        // Convert Arrow schema to kernel schema
+        let kernel_schema = StructType::try_from_arrow(arrow_schema.as_ref())
+            .map_err(|e| Error::generic(format!("Failed to convert schema: {}", e)))?;
+
+        Ok(Arc::new(kernel_schema) as SchemaRef)
+    }
 }
