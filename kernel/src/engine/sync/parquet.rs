@@ -103,8 +103,6 @@ mod tests {
         // Get the schema
         let schema = handler.get_parquet_schema(&file_meta)?;
 
-        println!("schema: {:?}", schema);
-
         // Verify the schema has fields
         assert!(
             schema.fields().count() > 0,

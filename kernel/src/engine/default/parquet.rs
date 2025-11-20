@@ -706,11 +706,26 @@ mod tests {
 
         // Verify this is a checkpoint schema with expected fields
         let field_names: Vec<&str> = schema.fields().map(|f| f.name()).collect();
-        assert!(field_names.contains(&"txn"), "Checkpoint should have 'txn' field");
-        assert!(field_names.contains(&"add"), "Checkpoint should have 'add' field");
-        assert!(field_names.contains(&"remove"), "Checkpoint should have 'remove' field");
-        assert!(field_names.contains(&"metaData"), "Checkpoint should have 'metaData' field");
-        assert!(field_names.contains(&"protocol"), "Checkpoint should have 'protocol' field");
+        assert!(
+            field_names.contains(&"txn"),
+            "Checkpoint should have 'txn' field"
+        );
+        assert!(
+            field_names.contains(&"add"),
+            "Checkpoint should have 'add' field"
+        );
+        assert!(
+            field_names.contains(&"remove"),
+            "Checkpoint should have 'remove' field"
+        );
+        assert!(
+            field_names.contains(&"metaData"),
+            "Checkpoint should have 'metaData' field"
+        );
+        assert!(
+            field_names.contains(&"protocol"),
+            "Checkpoint should have 'protocol' field"
+        );
 
         // Verify we can access field properties
         for field in schema.fields() {
