@@ -6,8 +6,6 @@
 use std::collections::HashMap;
 
 use crate::expressions::Scalar;
-use crate::schema::derive_macro_utils::ToDataType;
-use crate::schema::{DataType, StructField};
 
 /// Parsed statistics for a file (alternative to JSON stats string)
 ///
@@ -47,30 +45,4 @@ pub struct StatsParsed {
 
     /// Whether statistics are exact (tight bounds)
     pub tight_bounds: Option<bool>,
-}
-
-/// ToDataType trait implementation for StatsParsed
-///
-/// `ToDataType` is a kernel trait that converts a Rust type into its corresponding Delta `DataType`.
-/// This is used during schema generation and validation when reading/writing checkpoint parquet files.
-///
-/// For `StatsParsed`, we return a struct schema with empty inner structs for minValues, maxValues,
-/// and nullCount because their actual schemas are table-dependent and determined at runtime based
-/// on the specific columns in the table.
-///
-/// The returned schema serves as a template that checkpoint readers/writers can use to understand
-/// the structure, even though the inner struct fields will vary per table.
-impl ToDataType for StatsParsed {
-    fn to_data_type() -> DataType {
-        // Return the stats_parsed schema structure
-        // The inner struct schemas (minValues, maxValues, nullCount) are table-dependent
-        // and will be determined at runtime during checkpoint reading/writing
-        DataType::struct_type_unchecked(vec![
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])), // Dynamic
-            StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])), // Dynamic
-            StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])), // Dynamic
-            StructField::nullable("tightBounds", DataType::BOOLEAN),
-        ])
-    }
 }
