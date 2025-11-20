@@ -682,9 +682,9 @@ mod tests {
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-        // Test with an existing Parquet file
+        // Use a checkpoint parquet file
         let path = std::fs::canonicalize(PathBuf::from(
-            "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
+            "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
         ))
         .unwrap();
         let url = Url::from_file_path(path).unwrap();
@@ -703,6 +703,14 @@ mod tests {
             schema.fields().count() > 0,
             "Schema should have at least one field"
         );
+
+        // Verify this is a checkpoint schema with expected fields
+        let field_names: Vec<&str> = schema.fields().map(|f| f.name()).collect();
+        assert!(field_names.contains(&"txn"), "Checkpoint should have 'txn' field");
+        assert!(field_names.contains(&"add"), "Checkpoint should have 'add' field");
+        assert!(field_names.contains(&"remove"), "Checkpoint should have 'remove' field");
+        assert!(field_names.contains(&"metaData"), "Checkpoint should have 'metaData' field");
+        assert!(field_names.contains(&"protocol"), "Checkpoint should have 'protocol' field");
 
         // Verify we can access field properties
         for field in schema.fields() {

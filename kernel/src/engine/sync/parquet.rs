@@ -77,3 +77,87 @@ impl ParquetHandler for SyncParquetHandler {
             .map_err(Error::Arrow)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use url::Url;
+
+    #[test]
+    fn test_sync_get_parquet_schema() -> DeltaResult<()> {
+        let handler = SyncParquetHandler;
+
+        // Use a checkpoint parquet file
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
+        ))?;
+        let url = Url::from_file_path(path).unwrap();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        // Get the schema
+        let schema = handler.get_parquet_schema(&file_meta)?;
+
+        println!("schema: {:?}", schema);
+
+        // Verify the schema has fields
+        assert!(
+            schema.fields().count() > 0,
+            "Schema should have at least one field"
+        );
+
+        // Verify this is a checkpoint schema with expected fields
+        let field_names: Vec<&str> = schema.fields().map(|f| f.name()).collect();
+        assert!(
+            field_names.contains(&"txn"),
+            "Checkpoint should have 'txn' field"
+        );
+        assert!(
+            field_names.contains(&"add"),
+            "Checkpoint should have 'add' field"
+        );
+        assert!(
+            field_names.contains(&"remove"),
+            "Checkpoint should have 'remove' field"
+        );
+        assert!(
+            field_names.contains(&"metaData"),
+            "Checkpoint should have 'metaData' field"
+        );
+        assert!(
+            field_names.contains(&"protocol"),
+            "Checkpoint should have 'protocol' field"
+        );
+
+        // Verify we can access field properties
+        for field in schema.fields() {
+            assert!(!field.name().is_empty(), "Field name should not be empty");
+            let _data_type = field.data_type(); // Should not panic
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_get_parquet_schema_invalid_file() {
+        let handler = SyncParquetHandler;
+
+        // Test with a non-existent file
+        let mut temp_path = std::env::temp_dir();
+        temp_path.push("non_existent_file_for_sync_test.parquet");
+        let url = Url::from_file_path(temp_path).unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let result = handler.get_parquet_schema(&file_meta);
+        assert!(result.is_err(), "Should error on non-existent file");
+    }
+}
