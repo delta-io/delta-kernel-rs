@@ -18,7 +18,7 @@ use crate::{
 
 use crate::arrow::array::{
     cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
@@ -892,11 +892,20 @@ pub(crate) fn reorder_struct_array(
                             "File name column requested but file location not provided",
                         ));
                     };
-                    // Create an array with the file path repeated for each row
-                    let file_name_array =
-                        StringArray::from_iter_values(std::iter::repeat(file_path).take(num_rows));
+                    // Use run-end encoding for efficiency since the file name is constant for all rows
+                    // Run-end encoding stores: [run_ends: [num_rows], values: [file_path]]
+                    let run_ends = PrimitiveArray::<Int64Type>::from_iter_values([num_rows as i64]);
+                    let values = StringArray::from_iter_values([file_path]);
+                    let file_name_array = RunArray::try_new(&run_ends, &values)?;
+
+                    // Create a field with the RunEndEncoded data type to match the array
+                    let ree_field = Arc::new(ArrowField::new(
+                        field.name(),
+                        file_name_array.data_type().clone(),
+                        field.is_nullable(),
+                    ));
                     final_fields_cols[reorder_index.index] =
-                        Some((Arc::clone(field), Arc::new(file_name_array)));
+                        Some((ree_field, Arc::new(file_name_array)));
                 }
             }
         }
@@ -1931,12 +1940,27 @@ mod tests {
         let ordered = reorder_struct_array(arry, &reorder, None, Some(file_location)).unwrap();
         assert_eq!(ordered.column_names(), vec!["b", "_file"]);
 
-        // Verify the file name column contains the expected values
-        let file_name_col = ordered.column(1).as_string::<i32>();
-        assert_eq!(file_name_col.len(), 4);
-        for i in 0..4 {
-            assert_eq!(file_name_col.value(i), file_location);
-        }
+        // Verify the file name column is run-end encoded and contains the expected value
+        let file_name_col = ordered.column(1);
+
+        // Check it's a RunArray<Int64Type, StringArray>
+        let run_array = file_name_col
+            .as_any()
+            .downcast_ref::<RunArray<Int64Type>>()
+            .expect("Expected RunArray");
+
+        // Verify it has 4 logical rows (same as input)
+        assert_eq!(run_array.len(), 4);
+
+        // Verify the physical representation is efficient: 1 run with value at end position 4
+        let run_ends = run_array.run_ends().values();
+        assert_eq!(run_ends.len(), 1, "Should have only 1 run");
+        assert_eq!(run_ends[0], 4, "Run should end at position 4");
+
+        // Verify the value
+        let values = run_array.values().as_string::<i32>();
+        assert_eq!(values.len(), 1, "Should have only 1 unique value");
+        assert_eq!(values.value(0), file_location);
     }
 
     #[test]
