@@ -66,11 +66,9 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
     );
 
-    Arc::new(
-        StructTypeBuilder::from_schema(mandatory_add_file_schema())
-            .add_field(stats)
-            .build_unchecked(),
-    )
+    StructTypeBuilder::from_schema(mandatory_add_file_schema())
+        .add_field(stats)
+        .build_arc_unchecked()
 });
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
@@ -94,26 +92,22 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
-    Arc::new(
-        StructTypeBuilder::from_schema(schema)
-            .add_field(StructField::nullable("stats", DataType::STRING))
-            .build_unchecked(),
-    )
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("stats", DataType::STRING))
+        .build_arc_unchecked()
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
-    Arc::new(
-        StructTypeBuilder::from_schema(schema)
-            .add_field(StructField::nullable("baseRowId", DataType::LONG))
-            .add_field(StructField::nullable(
-                "defaultRowCommitVersion",
-                DataType::LONG,
-            ))
-            .build_unchecked(),
-    )
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("baseRowId", DataType::LONG))
+        .add_field(StructField::nullable(
+            "defaultRowCommitVersion",
+            DataType::LONG,
+        ))
+        .build_arc_unchecked()
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
