@@ -106,11 +106,7 @@ mod tests {
         ));
 
         // Without column mapping
-        assert!(!can_use_column_mapping_fast_path(
-            &[],
-            100,
-            Some(50)
-        ));
+        assert!(!can_use_column_mapping_fast_path(&[], 100, Some(50)));
 
         // Column mapping enabled after checkpoint
         assert!(!can_use_column_mapping_fast_path(
