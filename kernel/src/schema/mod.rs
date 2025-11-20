@@ -826,10 +826,8 @@ fn write_indent(f: &mut Formatter<'_>, levels: &[bool]) -> std::fmt::Result {
     let mut it = levels.iter().peekable();
 
     while let Some(is_last) = it.next() {
-        let final_level = it.peek().is_none();
-
         // Final level → draw branch
-        if final_level {
+        if it.peek().is_none() {
             write!(f, "{}", if *is_last { "└─" } else { "├─" })?;
         }
         // Parent levels → vertical line or empty space
@@ -1508,7 +1506,7 @@ impl DataType {
                 levels.pop();
 
                 // value
-                levels.push(true); // map_value IS last
+                levels.push(true); // map_value IS last at this level
                 write_indent(f, levels)?;
                 writeln!(f, "map_value: {}", inner.value_type)?;
                 inner.value_type.fmt_recursive(f, levels)?;
