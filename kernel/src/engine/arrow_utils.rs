@@ -168,15 +168,17 @@ impl RowIndexBuilder {
 /// ensure schema compatibility, as well as `fix_nested_null_masks` to ensure that leaf columns have
 /// accurate null masks that row visitors rely on for correctness.
 /// `row_indexes` are passed through to `reorder_struct_array`.
+/// `file_location` is used to populate file metadata columns if requested.
 pub(crate) fn fixup_parquet_read<T>(
     batch: RecordBatch,
     requested_ordering: &[ReorderIndex],
     row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
+    file_location: Option<&str>,
 ) -> DeltaResult<T>
 where
     StructArray: Into<T>,
 {
-    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes)?;
+    let data = reorder_struct_array(batch.into(), requested_ordering, row_indexes, file_location)?;
     let data = fix_nested_null_masks(data);
     Ok(data.into())
 }
@@ -306,6 +308,8 @@ pub(crate) enum ReorderIndexTransform {
     Missing(ArrowFieldRef),
     /// Row index column requested, compute it
     RowIndex(ArrowFieldRef),
+    /// File name column requested, populate with file path
+    FileName(ArrowFieldRef),
 }
 
 impl ReorderIndex {
@@ -333,14 +337,19 @@ impl ReorderIndex {
         ReorderIndex::new(index, ReorderIndexTransform::RowIndex(field))
     }
 
+    fn file_name(index: usize, field: ArrowFieldRef) -> Self {
+        ReorderIndex::new(index, ReorderIndexTransform::FileName(field))
+    }
+
     /// Check if this reordering requires a transformation anywhere. See comment below on
     /// [`ordering_needs_transform`] to understand why this is needed.
     fn needs_transform(&self) -> bool {
         match self.transform {
-            // if we're casting, inserting null, or generating row index, we need to transform
+            // if we're casting, inserting null, or generating row index/file name, we need to transform
             ReorderIndexTransform::Cast(_)
             | ReorderIndexTransform::Missing(_)
-            | ReorderIndexTransform::RowIndex(_) => true,
+            | ReorderIndexTransform::RowIndex(_)
+            | ReorderIndexTransform::FileName(_) => true,
             // if our nested ordering needs a transform, we need a transform
             ReorderIndexTransform::Nested(ref children) => ordering_needs_transform(children),
             // no transform needed
@@ -595,6 +604,13 @@ fn get_indices(
                             Arc::new(field.try_into_arrow()?),
                         ));
                     }
+                    Some(MetadataColumnSpec::FileName) => {
+                        debug!("Inserting a file name column: {}", field.name());
+                        reorder_indices.push(ReorderIndex::file_name(
+                            requested_position,
+                            Arc::new(field.try_into_arrow()?),
+                        ));
+                    }
                     Some(metadata_spec) => {
                         return Err(Error::Generic(format!(
                             "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
@@ -765,10 +781,13 @@ type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 ///
 /// If the requested ordering contains a [`ReorderIndexTransform::RowIndex`], `row_indexes`
 /// must not be `None` to append a row index column to the output.
+/// If the requested ordering contains a [`ReorderIndexTransform::FileName`], `file_location`
+/// must not be `None` to append a file name column to the output.
 pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
     mut row_indexes: Option<&mut FlattenedRangeIterator<i64>>,
+    file_location: Option<&str>,
 ) -> DeltaResult<StructArray> {
     debug!("Reordering {input_data:?} with ordering: {requested_ordering:?}");
     if !ordering_needs_transform(requested_ordering) {
@@ -806,6 +825,7 @@ pub(crate) fn reorder_struct_array(
                                 struct_array,
                                 children,
                                 None, // Nested structures don't need row indexes since metadata columns can't be nested
+                                None, // No file_location passed since metadata columns can't be nested
                             )?);
                             // create the new field specifying the correct order for the struct
                             let new_field = Arc::new(ArrowField::new_struct(
@@ -866,6 +886,19 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] =
                         Some((Arc::clone(field), Arc::new(row_index_array)));
                 }
+                ReorderIndexTransform::FileName(field) => {
+                    let Some(file_path) = file_location else {
+                        return Err(Error::generic(
+                            "File name column requested but file location not provided",
+                        ));
+                    };
+                    // Create an array with the file path repeated for each row
+                    let file_name_array = StringArray::from_iter_values(
+                        std::iter::repeat(file_path).take(num_rows)
+                    );
+                    final_fields_cols[reorder_index.index] =
+                        Some((Arc::clone(field), Arc::new(file_name_array)));
+                }
             }
         }
         let num_cols = final_fields_cols.len();
@@ -895,6 +928,7 @@ fn reorder_list<O: OffsetSizeTrait>(
             struct_array,
             children,
             None, // Nested structures don't need row indexes since metadata columns can't be nested
+            None, // No file_location passed since metadata columns can't be nested
         )?);
         let new_list_field = Arc::new(ArrowField::new_struct(
             list_field.name(),
@@ -930,6 +964,7 @@ fn reorder_map(
         struct_array,
         children,
         None, // Nested structures don't need row indexes since metadata columns can't be nested
+        None, // No file_location passed since metadata columns can't be nested
     )?;
     let result_fields = result_array.fields();
     let new_map_field = Arc::new(ArrowField::new_struct(
@@ -1793,7 +1828,7 @@ mod tests {
             ),
         ];
 
-        let result = reorder_struct_array(arry, &reorder, None);
+        let result = reorder_struct_array(arry, &reorder, None, None);
         assert_result_error_with_message(
             result,
             "Row index column requested but row index iterator not provided",
@@ -1816,7 +1851,7 @@ mod tests {
         #[allow(clippy::single_range_in_vec_init)]
         let mut row_indexes = vec![(0..4)].into_iter().flatten();
 
-        let ordered = reorder_struct_array(arry, &reorder, Some(&mut row_indexes)).unwrap();
+        let ordered = reorder_struct_array(arry, &reorder, Some(&mut row_indexes), None).unwrap();
         assert_eq!(ordered.column_names(), vec!["b", "row_idx"]);
 
         // Verify the row index column contains the expected values
@@ -1851,6 +1886,77 @@ mod tests {
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn simple_file_name_field() {
+        let requested_schema = Arc::new(StructType::new_unchecked([
+            StructField::not_null("i", DataType::INTEGER),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FileName),
+            StructField::nullable("i2", DataType::INTEGER),
+        ]));
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("i", ArrowDataType::Int32, false),
+            ArrowField::new("i2", ArrowDataType::Int32, true),
+        ]));
+        let (mask_indices, reorder_indices) =
+            get_requested_indices(&requested_schema, &parquet_schema).unwrap();
+        let expect_mask = vec![0, 1];
+        let mut arrow_file_name_field =
+            ArrowField::new("_file", ArrowDataType::Utf8, false);
+        arrow_file_name_field.set_metadata(HashMap::from([
+            ("delta.metadataSpec".to_string(), "_file".to_string()),
+        ]));
+        let expect_reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::identity(2),
+            ReorderIndex::file_name(1, Arc::new(arrow_file_name_field)),
+        ];
+        assert_eq!(mask_indices, expect_mask);
+        assert_eq!(reorder_indices, expect_reorder);
+    }
+
+    #[test]
+    fn test_reorder_struct_array_with_file_name() {
+        // Test that file names work when properly provided
+        let arry = make_struct_array();
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::file_name(
+                1,
+                Arc::new(ArrowField::new("_file", ArrowDataType::Utf8, false)),
+            ),
+        ];
+
+        let file_location = "s3://bucket/path/to/file.parquet";
+        let ordered = reorder_struct_array(arry, &reorder, None, Some(file_location)).unwrap();
+        assert_eq!(ordered.column_names(), vec!["b", "_file"]);
+
+        // Verify the file name column contains the expected values
+        let file_name_col = ordered.column(1).as_string::<i32>();
+        assert_eq!(file_name_col.len(), 4);
+        for i in 0..4 {
+            assert_eq!(file_name_col.value(i), file_location);
+        }
+    }
+
+    #[test]
+    fn test_reorder_struct_array_missing_file_name() {
+        // Test that error occurs when file name is requested but not provided
+        let arry = make_struct_array();
+        let reorder = vec![
+            ReorderIndex::identity(0),
+            ReorderIndex::file_name(
+                1,
+                Arc::new(ArrowField::new("_file", ArrowDataType::Utf8, false)),
+            ),
+        ];
+
+        let result = reorder_struct_array(arry, &reorder, None, None);
+        assert_result_error_with_message(
+            result,
+            "File name column requested but file location not provided",
+        );
     }
 
     #[test]
@@ -2530,7 +2636,7 @@ mod tests {
     fn simple_reorder_struct() {
         let arry = make_struct_array();
         let reorder = vec![ReorderIndex::identity(1), ReorderIndex::identity(0)];
-        let ordered = reorder_struct_array(arry, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(arry, &reorder, None, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["c", "b"]);
     }
 
@@ -2578,7 +2684,7 @@ mod tests {
                 ],
             ),
         ];
-        let ordered = reorder_struct_array(nested, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(nested, &reorder, None, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["struct2", "struct1"]);
         let ordered_s2 = ordered.column(0).as_struct();
         assert_eq!(ordered_s2.column_names(), vec!["b", "c", "s"]);
@@ -2625,7 +2731,7 @@ mod tests {
             0,
             vec![ReorderIndex::identity(1), ReorderIndex::identity(0)],
         )];
-        let ordered = reorder_struct_array(struct_array, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(struct_array, &reorder, None, None).unwrap();
         let ordered_list_col = ordered.column(0).as_list::<i32>();
         for i in 0..ordered_list_col.len() {
             let array_item = ordered_list_col.value(i);
@@ -2691,7 +2797,7 @@ mod tests {
                 ],
             ),
         ];
-        let ordered = reorder_struct_array(struct_array, &reorder, None).unwrap();
+        let ordered = reorder_struct_array(struct_array, &reorder, None, None).unwrap();
         assert_eq!(ordered.column_names(), vec!["map", "i"]);
         if let ArrowDataType::Map(field, _) = ordered.column(0).data_type() {
             if let ArrowDataType::Struct(fields) = field.data_type() {

@@ -278,6 +278,7 @@ impl FileOpener for ParquetOpener {
     fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
         let path = Path::from_url_path(file_meta.location.path())?;
         let store = self.store.clone();
+        let file_location = file_meta.location.to_string();
 
         let batch_size = self.batch_size;
         // let projection = self.projection.clone();
@@ -341,7 +342,7 @@ impl FileOpener for ParquetOpener {
             let stream = builder.with_batch_size(batch_size).build()?;
 
             let stream = stream.map(move |rbr| {
-                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())
+                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut(), Some(&file_location))
             });
             Ok(stream.boxed())
         }))
@@ -380,10 +381,11 @@ impl FileOpener for PresignedUrlOpener {
         let predicate = self.predicate.clone();
         let limit = self.limit;
         let client = self.client.clone(); // uses Arc internally according to reqwest docs
+        let file_location = file_meta.location.to_string();
 
         Ok(Box::pin(async move {
             // fetch the file from the interweb
-            let reader = client.get(file_meta.location).send().await?.bytes().await?;
+            let reader = client.get(&file_location).send().await?.bytes().await?;
             let metadata = ArrowReaderMetadata::load(&reader, Default::default())?;
             let parquet_schema = metadata.schema();
             let (indices, requested_ordering) =
@@ -418,7 +420,7 @@ impl FileOpener for PresignedUrlOpener {
             let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
             let stream = futures::stream::iter(reader);
             let stream = stream.map(move |rbr| {
-                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())
+                fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut(), Some(&file_location))
             });
             Ok(stream.boxed())
         }))
