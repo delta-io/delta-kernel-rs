@@ -658,7 +658,7 @@ pub trait ParquetHandler: AsAny {
     /// ## Row Index Column
     ///
     /// When a column in `physical_schema` is marked as a row index metadata column (via
-    /// [`StructField::create_metadata_column`] with [`MetadataColumnSpec::RowIndex`]), the
+    /// [`StructField::create_metadata_column`] with [`schema::MetadataColumnSpec::RowIndex`]), the
     /// ParquetHandler must populate it with the 0-based row position within the Parquet file:
     ///
     /// - **Column name**: User-specified (commonly `"row_index"` or `"_metadata.row_index"`)
