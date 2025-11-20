@@ -134,6 +134,7 @@ impl AddVisitor {
             modification_time,
             data_change,
             stats,
+            stats_parsed: None, // TODO: Phase 4 will extract this from checkpoint data
             tags: None,
             deletion_vector,
             base_row_id,
@@ -211,6 +212,7 @@ impl RemoveVisitor {
             partition_values,
             size,
             stats,
+            stats_parsed: None, // TODO: Phase 4 will extract this from checkpoint data
             tags: None,
             deletion_vector,
             base_row_id,

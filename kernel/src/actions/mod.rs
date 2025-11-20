@@ -782,6 +782,53 @@ impl IntoEngineData for CommitInfo {
     }
 }
 
+use crate::schema::derive_macro_utils::ToDataType;
+
+/// Parsed statistics for a file (alternative to JSON stats string)
+/// This represents the structured form of file statistics that can be stored
+/// directly in checkpoints as `stats_parsed` instead of as a JSON string.
+///
+/// The minValues, maxValues, and nullCount fields contain dynamic structs
+/// whose schema matches the table's data columns (using physical column names).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatsParsed {
+    /// Number of records in the file
+    pub num_records: Option<i64>,
+    /// Minimum values per column (physical column names)
+    /// Dynamic based on table schema
+    pub min_values: Option<HashMap<String, Scalar>>,
+    /// Maximum values per column (physical column names)
+    /// Dynamic based on table schema
+    pub max_values: Option<HashMap<String, Scalar>>,
+    /// Null count per column (physical column names)
+    pub null_count: Option<HashMap<String, i64>>,
+    /// Whether statistics are exact (tight bounds)
+    pub tight_bounds: Option<bool>,
+}
+
+// Manual implementation of Eq for StatsParsed
+// Note: This is a shallow equality check. For HashMap<String, Scalar>, we use PartialEq
+// even though Scalar doesn't implement Eq, we can still provide this for compatibility.
+impl Eq for StatsParsed {}
+
+// Implementation of ToDataType for schema derivation
+// Returns a base schema structure for stats_parsed. The actual minValues/maxValues/nullCount
+// schemas are dynamic and depend on the table schema.
+impl ToDataType for StatsParsed {
+    fn to_data_type() -> DataType {
+        // Return the stats_parsed schema structure
+        // The inner struct schemas (minValues, maxValues, nullCount) are table-dependent
+        // and will be determined at runtime during checkpoint reading/writing
+        DataType::struct_type_unchecked(vec![
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("minValues", DataType::struct_type_unchecked(vec![])), // Dynamic
+            StructField::nullable("maxValues", DataType::struct_type_unchecked(vec![])), // Dynamic
+            StructField::nullable("nullCount", DataType::struct_type_unchecked(vec![])), // Dynamic
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     test,
@@ -822,6 +869,14 @@ pub(crate) struct Add {
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub stats: Option<String>,
+
+    /// Parsed statistics for this file (alternative to JSON stats string).
+    /// When present, this field contains the same statistics as `stats` but in a structured format,
+    /// avoiding the need to parse JSON for data skipping operations.
+    /// TODO: In Phase 2-4, this will be properly integrated with schema and checkpoint reading.
+    /// For now, this is a placeholder for the parsed statistics structure.
+    #[cfg_attr(test, serde(skip))]
+    pub stats_parsed: Option<StatsParsed>,
 
     /// Map containing metadata about this logical file.
     /// Note: map values can be null.
@@ -895,6 +950,14 @@ pub(crate) struct Remove {
     /// [statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#Per-file-Statistics
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
     pub stats: Option<String>,
+
+    /// Parsed statistics for this file (alternative to JSON stats string).
+    /// When present, this field contains the same statistics as `stats` but in a structured format,
+    /// avoiding the need to parse JSON for data skipping operations.
+    /// TODO: In Phase 2-4, this will be properly integrated with schema and checkpoint reading.
+    /// For now, this is a placeholder for the parsed statistics structure.
+    #[cfg_attr(test, serde(skip))]
+    pub stats_parsed: Option<StatsParsed>,
 
     /// Map containing metadata about this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
