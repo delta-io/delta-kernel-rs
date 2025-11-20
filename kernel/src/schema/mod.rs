@@ -579,16 +579,8 @@ impl StructTypeBuilder {
         StructType::try_new(self.fields.into_values())
     }
 
-    pub fn build_unchecked(self) -> StructType {
-        StructType::new_unchecked(self.fields.into_values())
-    }
-
-    pub fn build_arc(self) -> DeltaResult<Arc<StructType>> {
-        self.build().map(Arc::new)
-    }
-
     pub fn build_arc_unchecked(self) -> Arc<StructType> {
-        Arc::new(self.build_unchecked())
+        Arc::new(StructType::new_unchecked(self.fields.into_values()))
     }
 }
 
