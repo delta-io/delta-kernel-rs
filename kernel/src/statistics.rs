@@ -49,12 +49,6 @@ pub struct StatsParsed {
     pub tight_bounds: Option<bool>,
 }
 
-/// Manual implementation of Eq for StatsParsed
-///
-/// Note: This is a shallow equality check. For HashMap<String, Scalar>, we use PartialEq
-/// even though Scalar doesn't implement Eq, we can still provide this for compatibility.
-impl Eq for StatsParsed {}
-
 /// ToDataType trait implementation for StatsParsed
 ///
 /// `ToDataType` is a kernel trait that converts a Rust type into its corresponding Delta `DataType`.
