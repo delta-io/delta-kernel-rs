@@ -873,8 +873,8 @@ pub(crate) struct Add {
     /// Parsed statistics for this file (alternative to JSON stats string).
     /// When present, this field contains the same statistics as `stats` but in a structured format,
     /// avoiding the need to parse JSON for data skipping operations.
-    /// TODO: In Phase 2-4, this will be properly integrated with schema and checkpoint reading.
-    /// For now, this is a placeholder for the parsed statistics structure.
+    /// TODO: Integrate with checkpoint reading to extract this field from parquet stats_parsed column.
+    /// TODO: Integrate with data skipping to prefer parsed stats over JSON when available.
     #[cfg_attr(test, serde(skip))]
     pub stats_parsed: Option<StatsParsed>,
 
@@ -954,8 +954,8 @@ pub(crate) struct Remove {
     /// Parsed statistics for this file (alternative to JSON stats string).
     /// When present, this field contains the same statistics as `stats` but in a structured format,
     /// avoiding the need to parse JSON for data skipping operations.
-    /// TODO: In Phase 2-4, this will be properly integrated with schema and checkpoint reading.
-    /// For now, this is a placeholder for the parsed statistics structure.
+    /// TODO: Integrate with checkpoint reading to extract this field from parquet stats_parsed column.
+    /// TODO: Integrate with data skipping to prefer parsed stats over JSON when available.
     #[cfg_attr(test, serde(skip))]
     pub stats_parsed: Option<StatsParsed>,
 
