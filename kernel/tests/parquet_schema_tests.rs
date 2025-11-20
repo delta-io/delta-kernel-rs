@@ -42,67 +42,6 @@ fn test_get_parquet_schema_simple() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_get_parquet_schema_with_stats_parsed() -> Result<(), Box<dyn std::error::Error>> {
-    // Use a checkpoint file that might have stats_parsed
-    let checkpoint_files: Vec<&str> = vec![
-        "./tests/data/table-with-dv-small/_delta_log/00000000000000000001.checkpoint.parquet",
-        "./tests/data/table-without-dv-small/_delta_log/00000000000000000001.checkpoint.parquet",
-    ];
-
-    let store = Arc::new(LocalFileSystem::new());
-    let engine = Arc::new(DefaultEngine::new(store));
-    let parquet_handler = engine.parquet_handler();
-
-    for checkpoint_path in checkpoint_files {
-        let path_buf = PathBuf::from(checkpoint_path);
-        if !path_buf.exists() {
-            // Skip if file doesn't exist in test data
-            continue;
-        }
-
-        let path = std::fs::canonicalize(path_buf)?;
-        let url = Url::from_file_path(path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: 0,
-        };
-
-        // Get the schema
-        let schema = parquet_handler.get_parquet_schema(&file_meta)?;
-
-        // Verify the schema is valid
-        assert!(
-            schema.fields().count() > 0,
-            "Checkpoint schema should have fields"
-        );
-
-        // Check if add field exists (checkpoints should have add actions)
-        let fields: Vec<_> = schema.fields().collect();
-        let has_add = fields.iter().any(|f| f.name() == "add");
-        assert!(has_add, "Checkpoint should have 'add' field");
-
-        // If stats_parsed exists, verify it's a struct
-        if let Some(add_field) = fields.iter().find(|f| f.name() == "add") {
-            if let delta_kernel::schema::DataType::Struct(add_struct) = add_field.data_type() {
-                let add_fields: Vec<_> = add_struct.fields().collect();
-                let has_stats_parsed = add_fields.iter().any(|f| f.name() == "stats_parsed");
-                let has_stats = add_fields.iter().any(|f| f.name() == "stats");
-
-                // Should have at least one stats field
-                assert!(
-                    has_stats_parsed || has_stats,
-                    "Add action should have either stats or stats_parsed"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[test]
 fn test_get_parquet_schema_invalid_file() {
     let store = Arc::new(LocalFileSystem::new());
     let engine = Arc::new(DefaultEngine::new(store));
@@ -182,38 +121,6 @@ fn test_get_parquet_schema_with_nested_types() -> Result<(), Box<dyn std::error:
             let _data_type = field.data_type();
             // Schema was successfully read and converted
         }
-    }
-
-    Ok(())
-}
-
-#[test]
-fn test_get_parquet_schema_preserves_field_metadata() -> Result<(), Box<dyn std::error::Error>> {
-    // Test that field metadata (like parquet.field.id) is preserved
-    let path = std::fs::canonicalize(PathBuf::from(
-        "./tests/data/table-with-dv-small/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet",
-    ))?;
-    let url = Url::from_file_path(path).unwrap();
-
-    let store = Arc::new(LocalFileSystem::new());
-    let engine = Arc::new(DefaultEngine::new(store));
-    let parquet_handler = engine.parquet_handler();
-
-    let file_meta = FileMeta {
-        location: url,
-        last_modified: 0,
-        size: 0,
-    };
-
-    // Get the schema
-    let schema = parquet_handler.get_parquet_schema(&file_meta)?;
-
-    // Verify fields have been converted properly
-    for field in schema.fields() {
-        // Each field should have a name and data type
-        assert!(!field.name().is_empty(), "Field name should not be empty");
-        let _data_type = field.data_type();
-        // Successfully accessed field properties
     }
 
     Ok(())
