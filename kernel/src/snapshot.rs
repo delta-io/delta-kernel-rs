@@ -100,14 +100,13 @@ impl Snapshot {
         }
     }
 
-    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
-    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
-    /// snapshot to a later version.
-    fn try_new_from(
+    /// Implementation of snapshot creation from existing snapshot.
+    fn try_new_from_impl(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
+        operation_id: MetricId,
     ) -> DeltaResult<Arc<Self>> {
         let old_log_segment = &existing_snapshot.log_segment;
         let old_version = existing_snapshot.version();
@@ -181,11 +180,11 @@ impl Snapshot {
 
         if new_log_segment.checkpoint_version.is_some() {
             // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
-            let snapshot = Self::try_new_from_log_segment(
+            let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
                 engine,
-                None,
+                operation_id,
             );
             return Ok(Arc::new(snapshot?));
         }
@@ -254,7 +253,69 @@ impl Snapshot {
         )))
     }
 
+    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
+    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
+    /// snapshot to a later version.
+    ///
+    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
+    fn try_new_from(
+        existing_snapshot: Arc<Snapshot>,
+        log_tail: Vec<ParsedLogPath>,
+        engine: &dyn Engine,
+        version: impl Into<Option<Version>>,
+        operation_id: Option<MetricId>,
+    ) -> DeltaResult<Arc<Self>> {
+        let operation_id = operation_id.unwrap_or_default();
+        let reporter = engine.get_metrics_reporter();
+        let start = Instant::now();
+
+        let result =
+            Self::try_new_from_impl(existing_snapshot, log_tail, engine, version, operation_id);
+        let snapshot_duration = start.elapsed();
+
+        match result {
+            Ok(snapshot) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotCompleted {
+                        operation_id,
+                        version: snapshot.version(),
+                        total_duration: snapshot_duration,
+                    });
+                });
+                Ok(snapshot)
+            }
+            Err(e) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotFailed {
+                        operation_id,
+                        duration: snapshot_duration,
+                    });
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Implementation of snapshot creation from log segment.
+    ///
+    /// Calls `build_table_configuration` which reports `ProtocolMetadataLoaded`.
+    fn try_new_from_log_segment_impl(
+        location: Url,
+        log_segment: LogSegment,
+        engine: &dyn Engine,
+        operation_id: MetricId,
+    ) -> DeltaResult<Self> {
+        let table_configuration =
+            Self::build_table_configuration(&log_segment, engine, location, operation_id)?;
+        Ok(Self {
+            log_segment,
+            table_configuration,
+        })
+    }
+
     /// Create a new [`Snapshot`] instance.
+    ///
+    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
     pub(crate) fn try_new_from_log_segment(
         location: Url,
         log_segment: LogSegment,
@@ -265,23 +326,20 @@ impl Snapshot {
         let reporter = engine.get_metrics_reporter();
         let start = Instant::now();
 
-        let table_configuration =
-            Self::build_table_configuration(&log_segment, engine, location, operation_id);
+        let result =
+            Self::try_new_from_log_segment_impl(location, log_segment, engine, operation_id);
         let snapshot_duration = start.elapsed();
 
-        match table_configuration {
-            Ok(table_configuration) => {
+        match result {
+            Ok(snapshot) => {
                 reporter.as_ref().inspect(|r| {
                     r.report(MetricEvent::SnapshotCompleted {
                         operation_id,
-                        version: table_configuration.version(),
+                        version: snapshot.table_configuration.version(),
                         total_duration: snapshot_duration,
                     });
                 });
-                Ok(Self {
-                    log_segment,
-                    table_configuration,
-                })
+                Ok(snapshot)
             }
             Err(e) => {
                 reporter.as_ref().inspect(|r| {
@@ -459,6 +517,9 @@ impl Snapshot {
         }
     }
 
+    /// Build table configuration from log segment.
+    ///
+    /// Reports metrics: `ProtocolMetadataLoaded`.
     fn build_table_configuration(
         log_segment: &LogSegment,
         engine: &dyn Engine,
@@ -1574,7 +1635,7 @@ mod tests {
             .build(&engine)?;
 
         // Test with empty log tail - should return same snapshot
-        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None)?;
+        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None, None)?;
         assert_eq!(result, base_snapshot);
 
         Ok(())
@@ -1642,7 +1703,7 @@ mod tests {
 
         // Create new snapshot from base to version 2 using try_new_from directly
         let new_snapshot =
-            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2))?;
+            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2), None)?;
 
         // Latest commit should now be version 2
         assert_eq!(
@@ -1691,11 +1752,13 @@ mod tests {
             .build(&engine)?;
 
         // Test requesting same version - should return same snapshot
-        let same_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1))?;
+        let same_version =
+            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1), None)?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
         // Test requesting older version - should error
-        let older_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0));
+        let older_version =
+            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0), None);
         assert!(matches!(
             older_version,
             Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")

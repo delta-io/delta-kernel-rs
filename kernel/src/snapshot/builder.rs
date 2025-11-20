@@ -137,30 +137,13 @@ impl SnapshotBuilder {
                 )
             })?;
 
-            let result = Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version);
-            let snapshot_building_duration = start.elapsed();
-
-            match result {
-                Ok(snapshot) => {
-                    reporter.as_ref().inspect(|r| {
-                        r.report(MetricEvent::SnapshotCompleted {
-                            operation_id,
-                            version: snapshot.version(),
-                            total_duration: snapshot_building_duration,
-                        });
-                    });
-                    Ok(snapshot)
-                }
-                Err(e) => {
-                    reporter.as_ref().inspect(|r| {
-                        r.report(MetricEvent::SnapshotFailed {
-                            operation_id,
-                            duration: snapshot_building_duration,
-                        });
-                    });
-                    Err(e)
-                }
-            }
+            Snapshot::try_new_from(
+                existing_snapshot,
+                log_tail,
+                engine,
+                self.version,
+                Some(operation_id),
+            )
         }
     }
 }
