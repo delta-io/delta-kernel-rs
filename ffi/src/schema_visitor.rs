@@ -50,12 +50,12 @@ pub fn unwrap_kernel_schema(
 
     if let DataType::Struct(struct_type) = schema_element.data_type {
         if !state.elements.is_empty() {
-            warn!("Didn't consume all visited fields, schema is invalid.");
+            warn!("Engine to kernel schema visitor did not consume all visited fields, schema is invalid.");
             return None;
         }
         Some(*struct_type)
     } else {
-        warn!("Final returned id was not a struct, schema is invalid");
+        warn!("Engine to kernel schema visitor returned an id that was not a struct. Schema is invalid");
         None
     }
 }
@@ -302,7 +302,7 @@ fn visit_field_map_impl(
 
     let value_field = unwrap_field(state, value_type_id)
         .ok_or_else(|| Error::generic(format!("Invalid value type ID {value_type_id} for map")))?;
-
+require!(!key_field.nullable, Error::generic("Delta Map keys may not be nullable"));
     let map_type = MapType::new(
         key_field.data_type,
         value_field.data_type,
@@ -988,7 +988,6 @@ mod tests {
         assert!(!level6a_key_fields[0].is_nullable());
     }
 
-    // // TODO: manndp review by hand (vibe-coded).
     #[test]
     fn test_nullability_combinations() {
         let mut state = KernelSchemaVisitorState::default();
@@ -998,12 +997,12 @@ mod tests {
         // struct<
         //   col_required_string: string NOT NULL,
         //   col_nullable_string: string NULL,
-        //   col_nullable_array_non_null_elements: array<string> NULL (elements NOT NULL),
-        //   col_non_null_array_nullable_elements: array<string> NOT NULL (elements NULL),
-        //   col_nullable_map_nullable_values: map<string, integer> NULL (values NULL),
-        //   col_non_null_map_non_null_values: map<string, integer> NOT NULL (values NOT NULL),
+        //   col_nullable_array_non_null_elements: array<string NOT NULL>,
+        //   col_non_null_array_nullable_elements: array<string> NOT NULL,
+        //   col_nullable_map_nullable_values: map<string, integer> ,
+        //   col_non_null_map_non_null_values: map<string, integer NOT NULL> NOT NULL,
         //   col_nullable_struct: struct<inner: string> NULL,
-        //   col_non_null_struct_nullable_field: struct<inner: string NULL> NOT NULL
+        //   col_non_null_struct_nullable_field: struct<inner: string> NOT NULL
         // >
 
         // Required string field

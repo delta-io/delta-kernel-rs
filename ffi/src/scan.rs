@@ -144,7 +144,7 @@ fn scan_impl(
         if schema.is_none() {
             warn!("Passed a schema to scan, but visiting it did not produce a valid schema");
         } else {
-            debug!("Got schema: {:#?}", schema);
+            debug!("FFI scan projection schema: {:#?}", schema);
         }
         scan_builder = scan_builder.with_schema_opt(schema.map(Arc::new));
     }
