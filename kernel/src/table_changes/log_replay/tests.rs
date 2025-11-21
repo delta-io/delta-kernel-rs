@@ -138,8 +138,8 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
+                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
             )
             .unwrap(),
         )])
