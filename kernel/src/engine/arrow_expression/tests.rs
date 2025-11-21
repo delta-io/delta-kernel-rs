@@ -7,6 +7,7 @@ use crate::arrow::array::{
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
@@ -673,11 +674,8 @@ fn test_null_row() {
         ],
     )
     .unwrap();
-    let result: RecordBatch = result
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .unwrap()
-        .into();
+
+    let result = result.try_into_record_batch().unwrap();
     assert_eq!(result, expected);
 }
 
@@ -698,11 +696,7 @@ fn test_null_row_err() {
 fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;
     let actual = handler.create_one(schema, values).unwrap();
-    let actual_rb: RecordBatch = actual
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .unwrap()
-        .into();
+    let actual_rb = actual.try_into_record_batch().unwrap();
     assert_eq!(actual_rb, expected);
 }
 
