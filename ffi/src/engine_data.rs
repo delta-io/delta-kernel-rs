@@ -7,7 +7,7 @@ use delta_kernel::arrow::array::{
     ArrayData, RecordBatch, StructArray,
 };
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::engine::arrow_data::{EngineDataArrowExt as _, ArrowEngineData};
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;

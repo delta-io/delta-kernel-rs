@@ -476,7 +476,9 @@ mod tests {
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
-        scan_results.map(EngineDataArrowExt::try_into_record_batch).try_collect()
+        scan_results
+            .map(EngineDataArrowExt::try_into_record_batch)
+            .try_collect()
     }
 
     fn filter_batches(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
