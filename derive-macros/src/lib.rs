@@ -169,7 +169,7 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         #[automatically_derived]
         impl crate::IntoEngineData for #struct_name
         where
-            #(#field_types: Into<crate::expressions::Scalar>),*
+            #(#field_types: crate::expressions::ToScalar),*
         {
             fn into_engine_data(
                 self,
@@ -178,8 +178,10 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
             -> crate::DeltaResult<Box<dyn crate::EngineData>> {
                 // NB: we `use` here to avoid polluting the caller's namespace
                 use crate::EvaluationHandlerExtension as _;
+                use crate::expressions::ToScalar as _;
+
                 let values = [
-                    #(self.#field_idents.into()),*
+                    #(self.#field_idents.to_scalar()?),*
                 ];
                 let evaluator = engine.evaluation_handler();
                 evaluator.create_one(schema, &values)
