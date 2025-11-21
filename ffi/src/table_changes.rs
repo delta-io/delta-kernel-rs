@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
-use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::EngineData;

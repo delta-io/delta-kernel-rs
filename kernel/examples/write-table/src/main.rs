@@ -317,9 +317,7 @@ async fn read_and_display_data(
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|data| -> DeltaResult<_> {
-            data?.try_into_record_batch()
-        })
+        .map(|data| -> DeltaResult<_> { data?.try_into_record_batch() })
         .try_collect()?;
 
     print_batches(&batches)?;

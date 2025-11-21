@@ -450,9 +450,7 @@ pub async fn setup_test_tables(
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(|data| -> DeltaResult<_> {
-            data?.try_into_record_batch()
-        })
+        .map(|data| -> DeltaResult<_> { data?.try_into_record_batch() })
         .try_collect()
 }
 
