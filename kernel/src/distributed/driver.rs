@@ -53,7 +53,7 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 /// ```
 pub(crate) struct DriverPhase<P> {
     processor: P,
-    state: DriverState,
+    state: Option<DriverState>,
     /// Pre-computed next state after commit for concurrent IO
     after_commit: Option<DriverState>,
     /// Whether the iterator has been fully exhausted
@@ -101,7 +101,7 @@ impl<P: LogReplayProcessor> DriverPhase<P> {
 
         Ok(Self {
             processor,
-            state: DriverState::Commit(commit),
+            state: Some(DriverState::Commit(commit)),
             after_commit: Some(after_commit),
             is_finished: false,
         })
@@ -144,7 +144,7 @@ impl<P: LogReplayProcessor> Iterator for DriverPhase<P> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // Try to get item from current phase
-            let batch_result = match &mut self.state {
+            let batch_result = match self.state.as_mut()? {
                 DriverState::Commit(phase) => phase.next(),
                 DriverState::Manifest(phase) => phase.next(),
                 DriverState::ExecutorPhase { .. } | DriverState::Done => {
@@ -160,9 +160,12 @@ impl<P: LogReplayProcessor> Iterator for DriverPhase<P> {
                 }
                 Some(Err(e)) => return Some(Err(e)),
                 None => {
+                    let Some(state) = self.state.take() else {
+                        return Some(Err(Error::generic("invalid")));
+                    };
                     // Transition to next state after commit. If there is no next state, this state
                     // machine is done
-                    self.state = match self.state {
+                    let new_state = match state {
                         DriverState::Commit(_) => {
                             self.after_commit.take().unwrap_or(DriverState::Done)
                         }
@@ -178,6 +181,7 @@ impl<P: LogReplayProcessor> Iterator for DriverPhase<P> {
                             DriverState::ExecutorPhase { files }
                         }
                     };
+                    self.state = Some(new_state);
                 }
             }
         }
