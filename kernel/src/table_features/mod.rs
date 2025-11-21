@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
@@ -118,13 +116,11 @@ pub(crate) enum TableFeature {
 
 /// ReaderWriter features that can be supported by legacy readers (min_reader_version < 3).
 /// Only ColumnMapping qualifies with min_reader_version = 2.
-#[allow(dead_code)]
-static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
+pub(crate) static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
 
 /// Writer and ReaderWriter features that can be supported by legacy writers (min_writer_version < 7).
 /// These are features with min_writer_version in range [1, 6].
-#[allow(dead_code)]
-static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
+pub(crate) static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
     // Writer-only features (min_writer < 7)
     TableFeature::AppendOnly,       // min_writer = 2
     TableFeature::Invariants,       // min_writer = 2
@@ -680,58 +676,6 @@ impl TableFeature {
         TableFeature::Unknown(s.to_string())
     }
 }
-
-pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-    vec![
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogManaged,
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogOwnedPreview,
-        TableFeature::ColumnMapping,
-        TableFeature::DeletionVectors,
-        TableFeature::TimestampWithoutTimezone,
-        TableFeature::TypeWidening,
-        TableFeature::TypeWideningPreview,
-        TableFeature::VacuumProtocolCheck,
-        TableFeature::V2Checkpoint,
-        TableFeature::VariantType,
-        TableFeature::VariantTypePreview,
-        // The default engine currently DOES NOT support shredded Variant reads and the parquet
-        // reader will reject the read if it sees a shredded schema in the parquet file. That being
-        // said, kernel does permit reconstructing shredded variants into the
-        // `STRUCT<metadata: BINARY, value: BINARY>` representation if parquet readers of
-        // third-party engines support it.
-        TableFeature::VariantShreddingPreview,
-    ]
-});
-
-/// The writer features have the following limitations:
-/// - We 'support' Invariants only insofar as we check that they are not present.
-/// - We support writing to tables that have Invariants enabled but not used.
-/// - We only support DeletionVectors in that we never write them (no DML).
-/// - We support writing to existing tables with row tracking, but we don't support creating
-///   tables with row tracking yet.
-pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-    vec![
-        TableFeature::ChangeDataFeed,
-        TableFeature::AppendOnly,
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogManaged,
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogOwnedPreview,
-        TableFeature::DeletionVectors,
-        TableFeature::DomainMetadata,
-        TableFeature::InCommitTimestamp,
-        TableFeature::Invariants,
-        TableFeature::RowTracking,
-        TableFeature::TimestampWithoutTimezone,
-        TableFeature::V2Checkpoint,
-        TableFeature::VacuumProtocolCheck,
-        TableFeature::VariantType,
-        TableFeature::VariantTypePreview,
-        TableFeature::VariantShreddingPreview,
-    ]
-});
 
 #[cfg(test)]
 mod tests {
