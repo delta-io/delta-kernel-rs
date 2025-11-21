@@ -716,7 +716,7 @@ pub trait ParquetHandler: AsAny {
         &self,
         location: url::Url,
         data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
-    ) -> DeltaResult<FileMeta>;
+    ) -> DeltaResult<()>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

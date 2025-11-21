@@ -261,12 +261,12 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] containing [`FileMeta`] with the file's location, size, and modification time.
+    /// A [`DeltaResult`] indicating success or failure.
     fn write_parquet_file(
         &self,
         location: url::Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
-    ) -> DeltaResult<FileMeta> {
+    ) -> DeltaResult<()> {
         let store = self.store.clone();
 
         self.task_executor.block_on(async move {
@@ -296,11 +296,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
 
             writer.finish().await?;
 
-            Ok(FileMeta {
-                location,
-                last_modified: 0,
-                size: writer.bytes_written() as u64,
-            })
+            Ok(())
         })
     }
 }

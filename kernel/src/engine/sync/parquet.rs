@@ -1,19 +1,13 @@
+use std::fs::File;
+
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
-use std::fs::File;
-use std::time::SystemTime;
-use url::Url;
-
-use super::read_files;
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::arrow_utils::{
-    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
-    RowIndexBuilder,
-};
-use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
+
+use url::Url;
 
 pub(crate) struct SyncParquetHandler;
 
@@ -68,12 +62,12 @@ impl ParquetHandler for SyncParquetHandler {
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] containing [`FileMeta`] with the file's location, size, and modification time.
+    /// A [`DeltaResult`] indicating success or failure.
     fn write_parquet_file(
         &self,
         location: Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn crate::EngineData>>> + Send>,
-    ) -> DeltaResult<FileMeta> {
+    ) -> DeltaResult<()> {
         // Convert URL to file path
         let path = location
             .to_file_path()
@@ -101,18 +95,7 @@ impl ParquetHandler for SyncParquetHandler {
 
         writer.close()?; // writer must be closed to write footer
 
-        let meta = file.metadata()?;
-        let last_modified = meta
-            .modified()?
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_err(|e| crate::Error::generic(format!("Invalid file timestamp: {}", e)))?
-            .as_millis() as i64;
-
-        Ok(FileMeta {
-            location,
-            last_modified,
-            size: meta.len(),
-        })
+        Ok(())
     }
 }
 
