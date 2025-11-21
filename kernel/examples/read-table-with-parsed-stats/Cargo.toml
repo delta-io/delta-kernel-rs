@@ -1,0 +1,15 @@
+[package]
+name = "read-table-with-parsed-stats"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+arrow = "53"
+arrow-array = "53"
+arrow-select = "53"
+clap = { version = "4", features = ["derive"] }
+delta_kernel = { path = "../../../kernel", features = ["default-engine-native-tls"] }
+env_logger = "0.11.3"
+url = "2"
+object_store = "0.11"

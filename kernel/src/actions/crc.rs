@@ -19,7 +19,7 @@ use delta_kernel_derive::ToSchema;
 ///
 /// [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
 #[allow(unused)] // TODO: remove after we complete CRC support
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, ToSchema)]
 pub(crate) struct Crc {
     /// A unique identifier for the transaction that produced this commit.
     pub(crate) txn_id: Option<String>,

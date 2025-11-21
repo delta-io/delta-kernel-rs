@@ -245,6 +245,70 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.readahead,
         )
     }
+
+    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
+        use crate::engine::arrow_conversion::TryFromArrow as _;
+        use crate::schema::StructType;
+
+        // Clone data needed for async block to avoid lifetime issues
+        let location = file.location.clone();
+        let is_presigned = location.is_presigned();
+        let store = self.store.clone();
+
+        // Block on the async operation using the task executor
+        self.task_executor.block_on(async move {
+            // Handle presigned URL vs object store path
+            if is_presigned {
+                // For presigned URLs, fetch the file and read metadata
+                let url = location.as_str();
+                let response = reqwest::get(url)
+                    .await
+                    .map_err(|e| Error::generic(format!("Failed to fetch presigned URL: {}", e)))?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
+
+                // Parse the metadata from the bytes
+                let metadata = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default())
+                    .map_err(|e| {
+                        Error::generic(format!("Failed to load parquet metadata: {}", e))
+                    })?;
+
+                // Get the Arrow schema from metadata
+                let arrow_schema = metadata.schema();
+
+                // Convert Arrow schema to kernel schema
+                let kernel_schema = StructType::try_from_arrow(arrow_schema.as_ref())
+                    .map_err(|e| Error::generic(format!("Failed to convert schema: {}", e)))?;
+
+                Ok(Arc::new(kernel_schema) as SchemaRef)
+            } else {
+                // Use object store to read just the footer
+                let path = Path::from_url_path(location.path())?;
+
+                // Create a ParquetObjectReader for the file
+                let mut reader = ParquetObjectReader::new(store, path);
+
+                // Load just the metadata (footer)
+                let metadata =
+                    ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::default())
+                        .await
+                        .map_err(|e| {
+                            Error::generic(format!("Failed to load parquet metadata: {}", e))
+                        })?;
+
+                // Get the Arrow schema from metadata
+                let arrow_schema = metadata.schema();
+
+                // Convert Arrow schema to kernel schema
+                let kernel_schema = StructType::try_from_arrow(arrow_schema.as_ref())
+                    .map_err(|e| Error::generic(format!("Failed to convert schema: {}", e)))?;
+
+                Ok(Arc::new(kernel_schema) as SchemaRef)
+            }
+        })
+    }
 }
 
 /// Implements [`FileOpener`] for a parquet file

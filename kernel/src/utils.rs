@@ -164,21 +164,98 @@ pub(crate) mod test_utils {
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
 
-    #[derive(Serialize)]
+    // Note: This is temporary for test compilation.
+    // Add and Remove no longer derive Serialize/Deserialize due to Scalar refactoring
+    // We manually serialize Add/Remove to JSON for testing
     pub(crate) enum Action {
-        #[serde(rename = "add")]
         Add(Add),
-        #[serde(rename = "remove")]
         Remove(Remove),
-        #[serde(rename = "cdc")]
         Cdc(Cdc),
-        #[serde(rename = "metaData")]
         Metadata(Metadata),
-        #[serde(rename = "protocol")]
         Protocol(Protocol),
         #[allow(unused)]
-        #[serde(rename = "commitInfo")]
         CommitInfo(CommitInfo),
+    }
+
+    impl Serialize for Action {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            use serde::ser::SerializeMap;
+            match self {
+                Action::Add(add) => {
+                    // Manually serialize Add action
+                    let mut map = serializer.serialize_map(None)?;
+                    map.serialize_entry("add", &serde_json::json!({
+                        "path": add.path,
+                        "partitionValues": add.partition_values,
+                        "size": add.size,
+                        "modificationTime": add.modification_time,
+                        "dataChange": add.data_change,
+                        "stats": add.stats,
+                        // Note: We don't serialize stats_parsed in JSON
+                        "tags": add.tags,
+                        "deletionVector": add.deletion_vector.as_ref().map(|dv| serde_json::json!({
+                            "storageType": dv.storage_type,
+                            "pathOrInlineDv": dv.path_or_inline_dv,
+                            "offset": dv.offset,
+                            "sizeInBytes": dv.size_in_bytes,
+                            "cardinality": dv.cardinality,
+                        })),
+                        "baseRowId": add.base_row_id,
+                        "defaultRowCommitVersion": add.default_row_commit_version,
+                        "clusteringProvider": add.clustering_provider,
+                    }))?;
+                    map.end()
+                }
+                Action::Remove(remove) => {
+                    // Manually serialize Remove action
+                    let mut map = serializer.serialize_map(None)?;
+                    map.serialize_entry("remove", &serde_json::json!({
+                        "path": remove.path,
+                        "deletionTimestamp": remove.deletion_timestamp,
+                        "dataChange": remove.data_change,
+                        "extendedFileMetadata": remove.extended_file_metadata,
+                        "partitionValues": remove.partition_values,
+                        "size": remove.size,
+                        "stats": remove.stats,
+                        // Note: We don't serialize stats_parsed in JSON
+                        "tags": remove.tags,
+                        "deletionVector": remove.deletion_vector.as_ref().map(|dv| serde_json::json!({
+                            "storageType": dv.storage_type,
+                            "pathOrInlineDv": dv.path_or_inline_dv,
+                            "offset": dv.offset,
+                            "sizeInBytes": dv.size_in_bytes,
+                            "cardinality": dv.cardinality,
+                        })),
+                        "baseRowId": remove.base_row_id,
+                        "defaultRowCommitVersion": remove.default_row_commit_version,
+                    }))?;
+                    map.end()
+                }
+                Action::Cdc(cdc) => {
+                    let mut map = serializer.serialize_map(None)?;
+                    map.serialize_entry("cdc", cdc)?;
+                    map.end()
+                }
+                Action::Metadata(metadata) => {
+                    let mut map = serializer.serialize_map(None)?;
+                    map.serialize_entry("metaData", metadata)?;
+                    map.end()
+                }
+                Action::Protocol(protocol) => {
+                    let mut map = serializer.serialize_map(None)?;
+                    map.serialize_entry("protocol", protocol)?;
+                    map.end()
+                }
+                Action::CommitInfo(commit_info) => {
+                    let mut map = serializer.serialize_map(None)?;
+                    map.serialize_entry("commitInfo", commit_info)?;
+                    map.end()
+                }
+            }
+        }
     }
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to

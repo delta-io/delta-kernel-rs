@@ -52,7 +52,10 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
 
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
-    select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
+    /// Evaluator for add.stats_parsed (STRUCT column) - used when available for better performance
+    select_parsed_stats_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
+    /// Evaluator for add.stats (JSON STRING column) - fallback when stats_parsed not available
+    select_json_stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
     json_handler: Arc<dyn JsonHandler>,
@@ -68,8 +71,10 @@ impl DataSkippingFilter {
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
     ) -> Option<Self> {
-        static STATS_EXPR: LazyLock<ExpressionRef> =
+        static JSON_STATS_EXPR: LazyLock<ExpressionRef> =
             LazyLock::new(|| Arc::new(column_expr!("add.stats")));
+        static PARSED_STATS_EXPR: LazyLock<ExpressionRef> =
+            LazyLock::new(|| Arc::new(column_expr!("add.stats_parsed")));
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
@@ -125,7 +130,9 @@ impl DataSkippingFilter {
 
         // Skipping happens in several steps:
         //
-        // 1. The stats selector fetches add.stats from the metadata
+        // 1. The stats selector fetches stats from the metadata:
+        //    - V2 (preferred): add.stats_parsed (STRUCT, no JSON parsing needed!)
+        //    - V1 (fallback): add.stats (JSON STRING, requires parsing)
         //
         // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
         //    can safely skip it. A value of true means the stats say we must keep the file, and
@@ -134,16 +141,27 @@ impl DataSkippingFilter {
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
         //    the predicate is true/null and false (= skip) when the predicate is false.
-        let select_stats_evaluator = engine
+
+        // Try to create evaluator for stats_parsed (V2 - no JSON parsing!)
+        let select_parsed_stats_evaluator = engine
             .evaluation_handler()
             .new_expression_evaluator(
                 get_log_add_schema().clone(),
-                STATS_EXPR.clone(),
+                PARSED_STATS_EXPR.clone(),
+                DataType::Struct(Box::new(stats_schema.as_ref().clone())),
+            )
+            .inspect_err(|e| debug!("stats_parsed column not available, will use JSON stats: {e}"))
+            .ok();
+
+        // Always create evaluator for JSON stats as fallback (V1)
+        let select_json_stats_evaluator = engine
+            .evaluation_handler()
+            .new_expression_evaluator(
+                get_log_add_schema().clone(),
+                JSON_STATS_EXPR.clone(),
                 DataType::STRING,
             )
-            // A stats expression failure here doesn't affect correctness
-            // as its a performance optimization so we log the error and continue.
-            .inspect_err(|e| error!("Failed to create select stats evaluator: {e}"))
+            .inspect_err(|e| error!("Failed to create select JSON stats evaluator: {e}"))
             .ok()?;
 
         let skipping_evaluator = engine
@@ -167,7 +185,8 @@ impl DataSkippingFilter {
 
         Some(Self {
             stats_schema,
-            select_stats_evaluator,
+            select_parsed_stats_evaluator,
+            select_json_stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
             json_handler: engine.json_handler(),
@@ -177,12 +196,31 @@ impl DataSkippingFilter {
     /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
     /// which can be applied to the actions to find those that passed data skipping.
     pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        // retrieve and parse stats from actions data
-        let stats = self.select_stats_evaluator.evaluate(actions)?;
-        assert_eq!(stats.len(), actions.len());
-        let parsed_stats = self
-            .json_handler
-            .parse_json(stats, self.stats_schema.clone())?;
+        // Try V2 first (stats_parsed - no JSON parsing!)
+        let parsed_stats = if let Some(ref evaluator) = self.select_parsed_stats_evaluator {
+            match evaluator.evaluate(actions) {
+                Ok(stats) => {
+                    debug!("Using stats_parsed for data skipping (V2 - no JSON parsing)");
+                    assert_eq!(stats.len(), actions.len());
+                    stats
+                }
+                Err(e) => {
+                    debug!("Failed to evaluate stats_parsed, falling back to JSON stats: {e}");
+                    // Fall back to V1 (JSON parsing)
+                    let stats = self.select_json_stats_evaluator.evaluate(actions)?;
+                    assert_eq!(stats.len(), actions.len());
+                    self.json_handler
+                        .parse_json(stats, self.stats_schema.clone())?
+                }
+            }
+        } else {
+            // No parsed stats evaluator, use JSON stats (V1)
+            debug!("Using JSON stats for data skipping (V1 - requires JSON parsing)");
+            let stats = self.select_json_stats_evaluator.evaluate(actions)?;
+            assert_eq!(stats.len(), actions.len());
+            self.json_handler
+                .parse_json(stats, self.stats_schema.clone())?
+        };
         assert_eq!(parsed_stats.len(), actions.len());
 
         // evaluate the predicate on the parsed stats, then convert to selection vector
