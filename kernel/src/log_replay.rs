@@ -318,9 +318,9 @@ pub(crate) trait LogReplayProcessor: Sized {
         action_iter
             .map(move |actions_batch| self.process_actions_batch(actions_batch?))
             .filter(|res| {
-                // TODO: Leverage .is_none_or() when msrv = 1.82
                 res.as_ref()
-                    .map_or(true, |result| result.has_selected_rows())
+                    .ok()
+                    .is_none_or(|result| result.has_selected_rows())
             })
     }
 

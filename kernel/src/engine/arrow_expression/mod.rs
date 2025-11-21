@@ -113,7 +113,6 @@ impl Scalar {
             Array(data) => {
                 let builder = builder_as!(array::ListBuilder<Box<dyn ArrayBuilder>>);
                 for _ in 0..num_rows {
-                    #[allow(deprecated)]
                     for value in data.array_elements() {
                         value.append_to(builder.values(), 1)?;
                     }
@@ -218,7 +217,6 @@ impl ArrayData {
     pub fn to_arrow(&self) -> DeltaResult<ArrayRef> {
         let arrow_data_type = ArrowDataType::try_from_kernel(self.array_type().element_type())?;
 
-        #[allow(deprecated)]
         let elements = self.array_elements();
         let mut builder = array::make_builder(&arrow_data_type, elements.len());
         for element in elements {
@@ -238,23 +236,23 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator> {
-        Arc::new(DefaultExpressionEvaluator {
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
+        Ok(Arc::new(DefaultExpressionEvaluator {
             input_schema: schema,
             expression,
             output_type,
-        })
+        }))
     }
 
     fn new_predicate_evaluator(
         &self,
         schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Arc<dyn PredicateEvaluator> {
-        Arc::new(DefaultPredicateEvaluator {
+    ) -> DeltaResult<Arc<dyn PredicateEvaluator>> {
+        Ok(Arc::new(DefaultPredicateEvaluator {
             input_schema: schema,
             predicate,
-        })
+        }))
     }
 
     /// Create a single-row array with all-null leaf values. Note that if a nested struct is

@@ -9,6 +9,7 @@ use crate::arrow::array::types::{Int32Type, Int64Type};
 use crate::arrow::array::{
     Array, ArrayRef, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch, StructArray,
 };
+use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef, Schema as ArrowSchema,
 };
@@ -237,6 +238,15 @@ impl EngineData for ArrowEngineData {
         let data = RecordBatch::try_new(combined_schema, combined_columns)?;
         Ok(Box::new(ArrowEngineData { data }))
     }
+
+    fn apply_selection_vector(
+        self: Box<Self>,
+        mut selection_vector: Vec<bool>,
+    ) -> DeltaResult<Box<dyn EngineData>> {
+        selection_vector.resize(self.len(), true);
+        let filtered = filter_record_batch(&self.data, &selection_vector.into())?;
+        Ok(Box::new(Self::new(filtered)))
+    }
 }
 
 impl ArrowEngineData {
@@ -301,6 +311,10 @@ impl ArrowEngineData {
                 debug!("Pushing string array for {}", ColumnName::new(path));
                 col.as_string_opt().map(|a| a as _).ok_or("string")
             }
+            &DataType::BINARY => {
+                debug!("Pushing binary array for {}", ColumnName::new(path));
+                col.as_binary_opt().map(|a| a as _).ok_or("binary")
+            }
             &DataType::INTEGER => {
                 debug!("Pushing int32 array for {}", ColumnName::new(path));
                 col.as_primitive_opt::<Int32Type>()
@@ -343,7 +357,7 @@ impl ArrowEngineData {
 mod tests {
     use std::sync::Arc;
 
-    use crate::actions::{get_log_schema, Metadata, Protocol};
+    use crate::actions::{get_commit_schema, Metadata, Protocol};
     use crate::arrow::array::types::Int32Type;
     use crate::arrow::array::{Array, AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{
@@ -352,7 +366,7 @@ mod tests {
     use crate::engine::sync::SyncEngine;
     use crate::expressions::ArrayData;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::{assert_result_error_with_message, string_array_to_engine_data};
     use crate::{DeltaResult, Engine as _, EngineData as _};
 
@@ -366,7 +380,7 @@ mod tests {
             r#"{"metaData":{"id":"aff5cb91-8cd9-4195-aef9-446908507302","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"c1\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c2\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}},{\"name\":\"c3\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["c1","c2"],"configuration":{},"createdTime":1670892997849}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -385,7 +399,7 @@ mod tests {
             r#"{"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["rw1"], "writerFeatures": ["rw1", "w2"]}}"#,
         ]
         .into();
-        let output_schema = get_log_schema().project(&["protocol"])?;
+        let output_schema = get_commit_schema().project(&["protocol"])?;
         let parsed = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap();
@@ -394,11 +408,11 @@ mod tests {
         assert_eq!(protocol.min_writer_version(), 7);
         assert_eq!(
             protocol.reader_features(),
-            Some([ReaderFeature::unknown("rw1")].as_slice())
+            Some([TableFeature::unknown("rw1")].as_slice())
         );
         assert_eq!(
             protocol.writer_features(),
-            Some([WriterFeature::unknown("rw1"), WriterFeature::unknown("w2")].as_slice())
+            Some([TableFeature::unknown("rw1"), TableFeature::unknown("w2")].as_slice())
         );
         Ok(())
     }
@@ -721,6 +735,140 @@ mod tests {
         assert_eq!(result_batch.num_columns(), 3);
         assert_eq!(result_batch.num_rows(), 3);
         assert_eq!(result_batch.schema().field(2).name(), "active");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_binary_column_extraction() -> DeltaResult<()> {
+        use crate::arrow::array::BinaryArray;
+        use crate::engine_data::{GetData, RowVisitor};
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Create a RecordBatch with binary data
+        let binary_data: Vec<Option<&[u8]>> = vec![
+            Some(b"hello"),
+            Some(b"world"),
+            None,
+            Some(b"\x00\x01\x02\x03"),
+        ];
+        let binary_array = BinaryArray::from(binary_data.clone());
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            ArrowDataType::Binary,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(binary_array)])?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        // Create a visitor to extract binary data
+        struct BinaryVisitor {
+            values: Vec<Option<Vec<u8>>>,
+        }
+
+        impl RowVisitor for BinaryVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::BINARY]);
+                (&NAMES, &TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                assert_eq!(getters.len(), 1);
+                let getter = getters[0];
+
+                for i in 0..row_count {
+                    self.values
+                        .push(getter.get_binary(i, "data")?.map(|b| b.to_vec()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = BinaryVisitor { values: vec![] };
+        arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor)?;
+
+        // Verify the extracted values
+        assert_eq!(visitor.values.len(), 4);
+        assert_eq!(visitor.values[0].as_deref(), Some(b"hello".as_ref()));
+        assert_eq!(visitor.values[1].as_deref(), Some(b"world".as_ref()));
+        assert_eq!(visitor.values[2], None);
+        assert_eq!(
+            visitor.values[3].as_deref(),
+            Some(b"\x00\x01\x02\x03".as_ref())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_binary_column_extraction_type_mismatch() -> DeltaResult<()> {
+        use crate::engine_data::{GetData, RowVisitor};
+        use crate::schema::ColumnName;
+        use std::sync::LazyLock;
+
+        // Create a RecordBatch with Int32 data (not binary)
+        let data: Vec<Option<i32>> = vec![Some(123)];
+        let int_array = Int32Array::from(data);
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            ArrowDataType::Int32,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(int_array)])?;
+        let arrow_data = ArrowEngineData::new(batch);
+
+        // Create a visitor that tries to extract binary data from an int column
+        struct BinaryVisitor {
+            values: Vec<Option<Vec<u8>>>,
+        }
+
+        impl RowVisitor for BinaryVisitor {
+            fn selected_column_names_and_types(
+                &self,
+            ) -> (&'static [ColumnName], &'static [DataType]) {
+                static NAMES: LazyLock<Vec<ColumnName>> =
+                    LazyLock::new(|| vec![ColumnName::new(["data"])]);
+                static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| vec![DataType::BINARY]);
+                (&NAMES, &TYPES)
+            }
+
+            fn visit<'a>(
+                &mut self,
+                row_count: usize,
+                getters: &[&'a dyn GetData<'a>],
+            ) -> DeltaResult<()> {
+                assert_eq!(getters.len(), 1);
+                let getter = getters[0];
+
+                for i in 0..row_count {
+                    self.values
+                        .push(getter.get_binary(i, "data")?.map(|b| b.to_vec()));
+                }
+                Ok(())
+            }
+        }
+
+        let mut visitor = BinaryVisitor { values: vec![] };
+        let result = arrow_data.visit_rows(&[ColumnName::new(["data"])], &mut visitor);
+
+        // Verify that we get a type mismatch error
+        assert_result_error_with_message(
+            result,
+            "Type mismatch on data: expected binary, got Int32",
+        );
 
         Ok(())
     }

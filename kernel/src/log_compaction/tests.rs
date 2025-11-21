@@ -107,12 +107,12 @@ fn test_compaction_data() {
     let iterator = result.unwrap();
 
     // Test iterator methods
-    assert_eq!(iterator.total_actions(), 0);
-    assert_eq!(iterator.total_add_actions(), 0);
+    assert_eq!(iterator.actions_count(), 0);
+    assert_eq!(iterator.add_actions_count(), 0);
 
     // Test debug implementation
     let debug_str = format!("{:?}", iterator);
-    assert!(debug_str.contains("LogCompactionDataIterator"));
+    assert!(debug_str.contains("ActionReconciliationIterator"));
     assert!(debug_str.contains("actions_count"));
     assert!(debug_str.contains("add_actions_count"));
 }
@@ -152,8 +152,8 @@ fn test_compaction_data_with_actual_iterator() {
     let mut iterator = writer.compaction_data(&engine).unwrap();
 
     let mut batch_count = 0;
-    let initial_actions = iterator.total_actions();
-    let initial_add_actions = iterator.total_add_actions();
+    let initial_actions = iterator.actions_count();
+    let initial_add_actions = iterator.add_actions_count();
 
     // Both should start at 0
     assert_eq!(initial_actions, 0);
@@ -164,8 +164,8 @@ fn test_compaction_data_with_actual_iterator() {
         assert!(batch_result.is_ok());
 
         // After processing some batches, the counts should be >= the initial counts
-        assert!(iterator.total_actions() >= initial_actions);
-        assert!(iterator.total_add_actions() >= initial_add_actions);
+        assert!(iterator.actions_count() >= initial_actions);
+        assert!(iterator.add_actions_count() >= initial_add_actions);
     }
 
     assert!(batch_count > 0, "Expected to process at least one batch");
@@ -223,7 +223,85 @@ fn test_version_filtering() {
         );
 
         let iterator = result.unwrap();
-        assert!(iterator.total_actions() >= 0);
-        assert!(iterator.total_add_actions() >= 0);
+        assert!(iterator.actions_count() >= 0);
+        assert!(iterator.add_actions_count() >= 0);
     }
+}
+
+#[test]
+fn test_no_compaction_staged_commits() {
+    use crate::actions::Add;
+    use crate::engine::default::DefaultEngine;
+    use object_store::{memory::InMemory, path::Path, ObjectStore};
+    use std::sync::Arc;
+
+    // Set up in-memory store
+    let store = Arc::new(InMemory::new());
+    let engine = DefaultEngine::new(store.clone());
+
+    // Create basic commits with proper metadata and protocol
+    use crate::actions::{Metadata, Protocol};
+    use crate::schema::{DataType as KernelDataType, StructField, StructType};
+    use crate::utils::test_utils::Action;
+
+    let metadata = Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            StructType::new_unchecked([StructField::nullable("value", KernelDataType::INTEGER)]),
+            vec![],
+            0,
+            std::collections::HashMap::new(),
+        )
+        .unwrap(),
+    );
+    let protocol = Action::Protocol(
+        Protocol::try_new(3, 7, Some(Vec::<String>::new()), Some(Vec::<String>::new())).unwrap(),
+    );
+
+    let metadata_action = serde_json::to_string(&metadata).unwrap();
+    let protocol_action = serde_json::to_string(&protocol).unwrap();
+
+    // Write version 0
+    let commit_0_path = Path::from("_delta_log/00000000000000000000.json");
+    futures::executor::block_on(async {
+        store
+            .put(
+                &commit_0_path,
+                format!("{}\n{}", metadata_action, protocol_action).into(),
+            )
+            .await
+            .unwrap();
+    });
+
+    // Write version 1
+    let add_action = serde_json::to_string(&Action::Add(Add::default())).unwrap();
+    let commit_1_path = Path::from("_delta_log/00000000000000000001.json");
+    futures::executor::block_on(async {
+        store
+            .put(&commit_1_path, add_action.clone().into())
+            .await
+            .unwrap();
+    });
+
+    // Write a staged commit (this would normally be filtered out during listing)
+    let staged_commit_path = Path::from(
+        "_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+    );
+    futures::executor::block_on(async {
+        store
+            .put(&staged_commit_path, add_action.into())
+            .await
+            .unwrap();
+    });
+
+    let table_root = url::Url::parse("memory:///").unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
+
+    // Normal compaction should work fine since staged commits are filtered during listing
+    let writer = LogCompactionWriter::try_new(snapshot, 0, 1);
+    assert!(writer.is_ok());
+
+    // The validation in LogCompactionWriter is a safety check for edge cases
+    // where staged commits might slip through the normal filtering
 }

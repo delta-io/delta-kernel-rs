@@ -160,7 +160,7 @@ mod tests {
     use roaring::RoaringTreemap;
 
     use crate::{
-        actions::deletion_vector::DeletionVectorDescriptor,
+        actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType},
         engine::sync::SyncEngine,
         scan::state::DvInfo,
         table_changes::scan_file::{CdfScanFile, CdfScanFileType},
@@ -178,7 +178,7 @@ mod tests {
         let buf = writer.into_inner();
         let inline_dv = z85::encode(&buf);
         DeletionVectorDescriptor {
-            storage_type: "i".into(),
+            storage_type: DeletionVectorStorageType::Inline,
             path_or_inline_dv: inline_dv,
             offset: None,
             size_in_bytes: buf.len().try_into().unwrap(),
@@ -210,7 +210,7 @@ mod tests {
         let table_root = url::Url::from_directory_path(path).unwrap();
 
         let deletion_vector = Some(DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
             offset: Some(1),
             size_in_bytes: 36,
@@ -240,7 +240,7 @@ mod tests {
         let table_root = url::Url::from_directory_path(path).unwrap();
 
         let deletion_vector = Some(DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
             offset: Some(1),
             size_in_bytes: 36,

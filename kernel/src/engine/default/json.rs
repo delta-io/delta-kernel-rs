@@ -126,6 +126,7 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
             while let Some(item) = stream.next().await {
                 if tx.send(item).is_err() {
                     warn!("read_json receiver end of channel dropped before sending completed");
+                    break;
                 }
             }
         });
@@ -199,7 +200,19 @@ impl JsonOpener {
                 let reader = ReaderBuilder::new(schema)
                     .with_batch_size(batch_size)
                     .build(BufReader::new(file))?;
-                Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
+
+                let mut seen_error = false;
+                Ok(futures::stream::iter(reader)
+                    .map_err(Error::from)
+                    .take_while(move |result| {
+                        // Emit exactly one error, then stop the stream. We check seen_error BEFORE
+                        // updating it so the first error passes through, but subsequent items don't.
+                        // This is necessary because Arrow's Reader loops the same error indefinitely.
+                        let return_this = !seen_error;
+                        seen_error = seen_error || result.is_err();
+                        futures::future::ready(return_this)
+                    })
+                    .boxed())
             }
             GetResultPayload::Stream(s) => {
                 let mut decoder = ReaderBuilder::new(schema)
@@ -252,7 +265,7 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
 
-    use crate::actions::get_log_schema;
+    use crate::actions::get_commit_schema;
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
@@ -271,6 +284,7 @@ mod tests {
         PutPayload, PutResult, Result,
     };
     use serde_json::json;
+    use tracing::info;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -488,7 +502,7 @@ mod tests {
             r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
             r#"{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableDeletionVectors":"true","delta.columnMapping.mode":"none"},"createdTime":1677811175819}}"#,
         ]);
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
 
         let batch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
@@ -503,7 +517,7 @@ mod tests {
         let json_strings = StringArray::from(vec![
             r#"{"add":{"path":"part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{},"size":635,"modificationTime":1677811178336,"dataChange":true,"stats":"{\"numRecords\":10,\"minValues\":{\"value\":0},\"maxValues\":{\"value\":9},\"nullCount\":{\"value\":0},\"tightBounds\":false}","tags":{"INSERTION_TIME":"1677811178336000","MIN_INSERTION_TIME":"1677811178336000","MAX_INSERTION_TIME":"1677811178336000","OPTIMIZE_TARGET_SIZE":"268435456"},"deletionVector":{"storageType":"u","pathOrInlineDv":"vBn[lx{q8@P<9BNH/isA","offset":1,"sizeInBytes":36,"cardinality":2, "maxRowId": 3}}}"#,
         ]);
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_commit_schema().clone();
 
         let batch: RecordBatch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
@@ -542,7 +556,7 @@ mod tests {
 
         let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_log_schema().clone(), None)
+            .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -554,7 +568,7 @@ mod tests {
         // limit batch size
         let handler = handler.with_batch_size(2);
         let data: Vec<RecordBatch> = handler
-            .read_json_files(files, get_log_schema().clone(), None)
+            .read_json_files(files, get_commit_schema().clone(), None)
             .unwrap()
             .map_ok(into_record_batch)
             .try_collect()
@@ -621,6 +635,67 @@ mod tests {
             ordered_paths.into_iter().collect_vec(),
             "Expected paths to complete in order"
         );
+    }
+
+    use crate::engine::default::DefaultEngine;
+    use crate::schema::StructType;
+    use crate::Engine;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn make_invalid_named_temp() -> (NamedTempFile, Url) {
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
+        let path = temp_file.path();
+        let file_url = Url::from_file_path(path).expect("Failed to create file URL");
+
+        info!("Created temporary malformed file at: {file_url}");
+        (temp_file, file_url)
+    }
+
+    #[test]
+    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt().try_init();
+        let (_temp_file1, file_url1) = make_invalid_named_temp();
+        let (_temp_file2, file_url2) = make_invalid_named_temp();
+        let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
+        let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
+        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
+
+        // Helper to check that we get expected number of errors then stream ends
+        let check_errors = |file_urls: Vec<_>, expected_errors: usize| {
+            let file_vec: Vec<_> = file_urls
+                .into_iter()
+                .map(|url| FileMeta::new(url, 1, 1))
+                .collect();
+
+            let mut iter = default_engine
+                .json_handler()
+                .read_json_files(&file_vec, schema.clone(), None)
+                .unwrap();
+
+            for _ in 0..expected_errors {
+                assert!(
+                    iter.next().unwrap().is_err(),
+                    "Read succeeded unexpectedly. The JSON should have been invalid."
+                );
+            }
+
+            assert!(
+                iter.next().is_none(),
+                "The stream should end once the read result fails"
+            );
+        };
+
+        // CASE 1: Single failing file
+        info!("\nAttempting to read single malformed JSON file...");
+        check_errors(vec![file_url1.clone()], 1);
+
+        // CASE 2: Two failing files
+        info!("\nAttempting to read two malformed JSON files...");
+        check_errors(vec![file_url1, file_url2], 2);
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

@@ -1,6 +1,6 @@
 use super::table_changes_action_iter;
 use super::TableChangesScanMetadata;
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::actions::{Add, Cdc, Metadata, Protocol, Remove};
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, BinaryPredicateOp, Scalar};
@@ -10,7 +10,7 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
-use crate::table_features::ReaderFeature;
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -79,8 +79,8 @@ async fn metadata_protocol() {
                 Protocol::try_new(
                     3,
                     7,
-                    Some([ReaderFeature::DeletionVectors]),
-                    Some([ReaderFeature::ColumnMapping]),
+                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors]),
                 )
                 .unwrap(),
             ),
@@ -138,8 +138,8 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([ReaderFeature::DeletionVectors, ReaderFeature::ColumnMapping]),
-                Some([""; 0]),
+                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
             )
             .unwrap(),
         )])
@@ -422,14 +422,14 @@ async fn dv() {
     let mut mock_table = LocalMockTable::new();
 
     let deletion_vector1 = DeletionVectorDescriptor {
-        storage_type: "u".to_string(),
+        storage_type: DeletionVectorStorageType::PersistedRelative,
         path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
         offset: Some(1),
         size_in_bytes: 36,
         cardinality: 2,
     };
     let deletion_vector2 = DeletionVectorDescriptor {
-        storage_type: "u".to_string(),
+        storage_type: DeletionVectorStorageType::PersistedRelative,
         path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
         offset: Some(1),
         size_in_bytes: 38,
@@ -488,7 +488,7 @@ async fn data_skipping_filter() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     let deletion_vector = Some(DeletionVectorDescriptor {
-        storage_type: "u".to_string(),
+        storage_type: DeletionVectorStorageType::PersistedRelative,
         path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
         offset: Some(1),
         size_in_bytes: 36,
@@ -539,10 +539,11 @@ async fn data_skipping_filter() {
         Scalar::from(4),
     );
     let logical_schema = get_schema();
-    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
-        Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
-        other => panic!("Unexpected result: {other:?}"),
-    };
+    let predicate =
+        match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
+            Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+            other => panic!("Unexpected result: {other:?}"),
+        };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
         .into_iter();
@@ -566,7 +567,7 @@ async fn failing_protocol() {
 
     let protocol = Protocol::try_new(
         3,
-        1,
+        7,
         ["fake_feature".to_string()].into(),
         ["fake_feature".to_string()].into(),
     )

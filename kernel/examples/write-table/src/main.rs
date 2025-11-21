@@ -14,12 +14,13 @@ use url::Url;
 use uuid::Uuid;
 
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
+use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
 
 /// An example program that writes to a Delta table and creates it if necessary.
@@ -75,11 +76,8 @@ async fn try_main() -> DeltaResult<()> {
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
-    let engine = DefaultEngine::try_new(
-        &url,
-        HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    use delta_kernel::engine::default::storage::store_from_url;
+    let engine = DefaultEngine::new(store_from_url(&url)?);
 
     // Create or get the table
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
@@ -88,37 +86,54 @@ async fn try_main() -> DeltaResult<()> {
     let sample_data = create_sample_data(&snapshot.schema(), cli.num_rows)?;
 
     // Write sample data to the table
+    let committer = Box::new(FileSystemCommitter::new());
     let mut txn = snapshot
-        .transaction()?
+        .transaction(committer)?
         .with_operation("INSERT".to_string())
-        .with_engine_info("default_engine/write-table-example");
+        .with_engine_info("default_engine/write-table-example")
+        .with_data_change(true);
 
     // Write the data using the engine
     let write_context = Arc::new(txn.get_write_context());
     let file_metadata = engine
-        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new(), true)
+        .write_parquet(&sample_data, write_context.as_ref(), HashMap::new())
         .await?;
 
     // Add the file metadata to the transaction
     txn.add_files(file_metadata);
 
-    // Commit the transaction
-    match txn.commit(&engine)? {
-        CommitResult::Committed { version, .. } => {
-            println!("✓ Committed transaction at version {version}");
-            println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
-
-            // Read and display the data
-            read_and_display_data(&url, engine).await?;
-            println!("✓ Successfully read data from the table");
-
-            Ok(())
+    // Commit the transaction (in a simple retry loop)
+    let mut retries = 0;
+    let committed = loop {
+        if retries > 5 {
+            return Err(Error::generic(
+                "Exceeded maximum 5 retries for committing transaction",
+            ));
         }
-        CommitResult::Conflict(_, conflicting_version) => {
-            println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
-            Err(Error::generic("Commit failed"))
-        }
-    }
+        txn = match txn.commit(&engine)? {
+            CommitResult::CommittedTransaction(committed) => break committed,
+            CommitResult::ConflictedTransaction(conflicted) => {
+                let conflicting_version = conflicted.conflict_version();
+                println!("✗ Failed to write data, transaction conflicted with version: {conflicting_version}");
+                return Err(Error::generic("Commit failed"));
+            }
+            CommitResult::RetryableTransaction(RetryableTransaction { transaction, error }) => {
+                println!("✗ Failed to commit, retrying... retryable error: {error}");
+                transaction
+            }
+        };
+        retries += 1;
+    };
+
+    let version = committed.commit_version();
+    println!("✓ Committed transaction at version {version}");
+    println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
+
+    // Read and display the data
+    read_and_display_data(&url, engine).await?;
+    println!("✓ Successfully read data from the table");
+
+    Ok(())
 }
 
 /// Creates a new Delta table or gets an existing one.
@@ -302,24 +317,13 @@ async fn read_and_display_data(
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
+        .map(|data| -> DeltaResult<_> {
+            let record_batch: RecordBatch = data?
                 .into_any()
                 .downcast::<ArrowEngineData>()
                 .map_err(|_| Error::EngineDataType("ArrowEngineData".to_string()))?
                 .into();
-
-            if let Some(mask) = mask {
-                Ok(arrow::compute::filter_record_batch(
-                    &record_batch,
-                    &mask.into(),
-                )?)
-            } else {
-                Ok(record_batch)
-            }
+            Ok(record_batch)
         })
         .try_collect()?;
 

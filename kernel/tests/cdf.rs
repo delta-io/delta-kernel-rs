@@ -1,18 +1,15 @@
 use std::error;
 
 use delta_kernel::arrow::array::RecordBatch;
-use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
 use itertools::Itertools;
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
-use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 
 mod common;
 
-use test_utils::DefaultEngineExtension;
 use test_utils::{load_test_data, to_arrow};
 
 fn read_cdf_for_table(
@@ -24,7 +21,7 @@ fn read_cdf_for_table(
     let test_dir = load_test_data("tests/data", test_name.as_ref()).unwrap();
     let test_path = test_dir.path().join(test_name.as_ref());
     let test_path = delta_kernel::try_parse_uri(test_path.to_str().expect("table path to string"))?;
-    let engine = DefaultEngine::new_local();
+    let engine = test_utils::create_default_engine(&test_path)?;
     let table_changes = TableChanges::try_new(
         test_path,
         engine.as_ref(),
@@ -50,17 +47,11 @@ fn read_cdf_for_table(
         ArrowSchema::try_from_kernel(scan.logical_schema().as_ref()).unwrap();
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
+        .map(|data| -> DeltaResult<_> {
+            let record_batch = to_arrow(data?)?;
             // Verify that the arrow record batches match the expected schema
             assert!(record_batch.schema().as_ref() == &scan_schema_as_arrow);
-            match mask {
-                Some(mask) => Ok(filter_record_batch(&record_batch, &mask.into())?),
-                None => Ok(record_batch),
-            }
+            Ok(record_batch)
         })
         .try_collect()?;
     Ok(batches)
@@ -411,7 +402,7 @@ fn invalid_range_end_before_start() {
 #[test]
 fn invalid_range_start_after_last_version_of_table() {
     let res = read_cdf_for_table("cdf-table-simple", 3, 4, None);
-    let expected_msg = "Expected the first commit to have version 3";
+    let expected_msg = "Expected the first commit to have version 3, got None";
     assert!(matches!(res, Err(Error::Generic(msg)) if msg == expected_msg));
 }
 

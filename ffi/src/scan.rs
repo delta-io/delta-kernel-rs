@@ -17,7 +17,8 @@ use crate::expressions::SharedExpression;
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
+    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
+    TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -367,7 +368,7 @@ pub unsafe extern "C" fn visit_string_map(
 /// Transformation expressions that need to be applied to each row `i` in ScanMetadata. You can use
 /// [`get_transform_for_row`] to get the transform for a particular row. If that returns an
 /// associated expression, it _must_ be applied to the data read from the file specified by the
-/// row. The resultant schema for this expression is guaranteed to be `Scan.schema()`. If
+/// row. The resultant schema for this expression is guaranteed to be [`scan_logical_schema()`]. If
 /// `get_transform_for_row` returns `NULL` no expression need be applied and the data read from disk
 /// is already in the correct logical state.
 ///
@@ -389,13 +390,14 @@ pub struct CTransforms {
 pub unsafe extern "C" fn get_transform_for_row(
     row: usize,
     transforms: &CTransforms,
-) -> Option<Handle<SharedExpression>> {
+) -> OptionalValue<Handle<SharedExpression>> {
     transforms
         .transforms
         .get(row)
         .cloned()
         .flatten()
         .map(Into::into)
+        .into()
 }
 
 /// Get a selection vector out of a [`DvInfo`] struct

@@ -50,7 +50,7 @@
 //! connectors are asked to provide the context information they require to execute the actual
 //! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
-#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
+#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_cfg))]
 #![warn(
     unreachable_pub,
     trivial_numeric_casts,
@@ -82,13 +82,12 @@ use std::{cmp::Ordering, ops::Range};
 use bytes::Bytes;
 use url::Url;
 
-use crate::path::ParsedLogPath;
-
 use self::schema::{DataType, SchemaRef};
 
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod committer;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
@@ -109,7 +108,7 @@ pub use log_path::LogPath;
 mod row_tracking;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
+#[cfg(any(feature = "arrow-55", feature = "arrow-56", feature = "arrow-57"))]
 pub use arrow_compat::*;
 
 pub mod kernel_predicates;
@@ -149,12 +148,12 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-pub use crate::engine_data::FilteredEngineData;
+pub use action_reconciliation::ActionReconciliationIterator;
 pub use delta_kernel_derive;
-pub use engine_data::{EngineData, RowVisitor};
+pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use log_compaction::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
+pub use log_compaction::{should_compact, LogCompactionWriter};
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 
@@ -427,7 +426,7 @@ pub trait EvaluationHandler: AsAny {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator>;
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>>;
 
     /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
     /// batches with the given [`Schema`] to produce a column of boolean results.
@@ -444,7 +443,7 @@ pub trait EvaluationHandler: AsAny {
         &self,
         input_schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Arc<dyn PredicateEvaluator>;
+    ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
     /// `output_schema`.
@@ -475,7 +474,8 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.try_into_expr()?;
 
-        let eval = self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into());
+        let eval =
+            self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
         eval.evaluate(null_row.as_ref())
     }
 }
@@ -535,6 +535,15 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    /// Copy a file atomically from source to destination. If the destination file already exists,
+    /// it must return Err(Error::FileAlreadyExists).
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
+
+    /// Perform a HEAD request for the given file at a Url, returning the file metadata.
+    ///
+    /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
+    fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.

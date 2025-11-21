@@ -6,18 +6,17 @@ use crate::action_reconciliation::{
 use crate::actions::{Add, Metadata, Protocol, Remove};
 use crate::arrow::array::{ArrayRef, StructArray};
 use crate::arrow::datatypes::{DataType, Schema};
-use crate::checkpoint::create_last_checkpoint_data;
-use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
-use crate::log_replay::HasSelectionVector;
-use crate::schema::{DataType as KernelDataType, StructField, StructType};
-use crate::utils::test_utils::Action;
-use crate::{DeltaResult, FileMeta, Snapshot};
-
-use arrow_56::{
+use crate::arrow::{
     array::{create_array, RecordBatch},
     datatypes::Field,
 };
+use crate::checkpoint::create_last_checkpoint_data;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::default::DefaultEngine;
+use crate::log_replay::HasSelectionVector;
+use crate::schema::{DataType as KernelDataType, StructField, StructType};
+use crate::utils::test_utils::Action;
+use crate::{DeltaResult, FileMeta, LogPath, Snapshot};
 
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json::{from_slice, json, Value};
@@ -60,7 +59,7 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
 #[test]
 fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -116,7 +115,7 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     let add_actions_counter = 75;
     let size_in_bytes: i64 = 1024 * 1024; // 1MB
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // Create last checkpoint metadata
     let last_checkpoint_batch = create_last_checkpoint_data(
@@ -181,11 +180,11 @@ fn write_commit_to_store(
         .collect();
     let content = json_lines.join("\n");
 
-    let commit_path = format!("_delta_log/{}", delta_path_for_version(version, "json"));
+    let commit_path = delta_path_for_version(version, "json");
 
     tokio::runtime::Runtime::new()
         .expect("create tokio runtime")
-        .block_on(async { store.put(&Path::from(commit_path), content.into()).await })?;
+        .block_on(async { store.put(&commit_path, content.into()).await })?;
 
     Ok(())
 }
@@ -277,7 +276,7 @@ fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> {
 #[test]
 fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // 1st commit: adds `fake_path_1`
     write_commit_to_store(&store, vec![create_add_action("fake_path_1")], 0)?;
@@ -347,7 +346,7 @@ fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 #[test]
 fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -409,7 +408,7 @@ fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
 #[test]
 fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
     write_commit_to_store(
@@ -451,7 +450,7 @@ fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaR
 #[test]
 fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // 1st commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
@@ -517,5 +516,49 @@ fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // - sizeInBytes: passed to finalize (10)
     assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes)?;
 
+    Ok(())
+}
+
+#[test]
+fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone());
+
+    // normal commit
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_action(), create_basic_protocol_action()],
+        0,
+    )?;
+
+    // staged commit
+    let staged_commit_path = Path::from(
+        "_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
+    );
+    futures::executor::block_on(async {
+        let add_action = Action::Add(Add::default());
+        store
+            .put(
+                &staged_commit_path,
+                serde_json::to_string(&add_action).unwrap().into(),
+            )
+            .await
+            .unwrap()
+    });
+
+    let table_root = Url::parse("memory:///")?;
+    let staged_commit = FileMeta {
+        location: Url::parse("memory:///_delta_log/_staged_commits/00000000000000000001.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json")?,
+        last_modified: 0,
+        size: 100,
+    };
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .with_log_tail(vec![LogPath::try_new(staged_commit).unwrap()])
+        .build(&engine)?;
+
+    assert!(matches!(
+        snapshot.checkpoint().unwrap_err(),
+        crate::Error::Generic(e) if e == "Found staged commit file in log segment"
+    ));
     Ok(())
 }

@@ -94,9 +94,6 @@ impl ArrayData {
         &self.tpe
     }
 
-    #[deprecated(
-        note = "These fields will be removed eventually and are unstable. See https://github.com/delta-io/delta-kernel-rs/issues/291"
-    )]
     pub fn array_elements(&self) -> &[Scalar] {
         &self.elements
     }
@@ -546,6 +543,12 @@ impl From<&[u8]> for Scalar {
     }
 }
 
+impl From<bytes::Bytes> for Scalar {
+    fn from(b: bytes::Bytes) -> Self {
+        Self::Binary(b.into())
+    }
+}
+
 impl<T> TryFrom<Vec<T>> for Scalar
 where
     T: Into<Scalar> + ToDataType,
@@ -917,7 +920,6 @@ mod tests {
 
     #[test]
     fn test_arrays() {
-        #[allow(deprecated)]
         let array = Scalar::Array(ArrayData {
             tpe: ArrayType::new(DataType::INTEGER, false),
             elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
@@ -1167,7 +1169,6 @@ mod tests {
         let Scalar::Array(array_data) = scalar else {
             panic!("Expected Array scalar");
         };
-        #[allow(deprecated)]
         let elements = array_data.array_elements();
         assert_eq!(elements.len(), 3);
         assert!(!array_data.array_type().contains_null());
@@ -1200,7 +1201,6 @@ mod tests {
             panic!("Expected Array scalar");
         };
 
-        #[allow(deprecated)]
         let elements = array_data.array_elements();
         assert_eq!(elements.len(), 3);
         assert!(array_data.array_type().contains_null());
@@ -1238,5 +1238,36 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_bytes_conversion() {
+        // Test with non-empty bytes
+        let bytes = bytes::Bytes::from(vec![1, 2, 3, 4, 5]);
+        let scalar: Scalar = bytes.into();
+
+        // Verify the scalar is of Binary type
+        assert!(matches!(scalar, Scalar::Binary(_)));
+
+        // Verify the data type
+        assert_eq!(scalar.data_type(), DataType::BINARY);
+
+        // Extract the binary data and verify contents
+        if let Scalar::Binary(data) = scalar {
+            assert_eq!(data, vec![1, 2, 3, 4, 5]);
+        } else {
+            panic!("Expected Binary scalar");
+        }
+
+        // Test with empty bytes
+        let empty_bytes = bytes::Bytes::new();
+        let empty_scalar: Scalar = empty_bytes.into();
+
+        assert!(matches!(empty_scalar, Scalar::Binary(_)));
+        if let Scalar::Binary(data) = empty_scalar {
+            assert!(data.is_empty());
+        } else {
+            panic!("Expected Binary scalar");
+        }
     }
 }
