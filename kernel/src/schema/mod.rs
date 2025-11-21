@@ -176,18 +176,6 @@ impl FromStr for MetadataColumnSpec {
     }
 }
 
-impl Display for MetadataColumnSpec {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "MetadataColumn({}, {}, {})",
-            self.text_value(),
-            self.data_type(),
-            self.nullable()
-        )
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 pub struct StructField {
     /// Name of this (possibly nested) column
