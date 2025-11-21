@@ -1457,7 +1457,12 @@ mod test {
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
         assert!(config.ensure_read_supported().is_ok());
 
-        let config = create_mock_table_config_with_version(&[], None, 2, 2);
+        let config = create_mock_table_config_with_version(
+            &[],
+            Some(&[TableFeature::InCommitTimestamp]),
+            2,
+            7,
+        );
         assert!(config.ensure_read_supported().is_ok());
     }
 
@@ -1475,12 +1480,14 @@ mod test {
         );
         assert!(config.ensure_write_supported().is_ok());
 
+        // Type Widening is not supported for writes
         let config = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
         assert_result_error_with_message(
             config.ensure_write_supported(),
             r#"Feature 'typeWidening' not supported for writes"#,
         );
 
+        // Unknown feature is not supported for writes
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
