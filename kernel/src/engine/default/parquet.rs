@@ -257,7 +257,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
-    /// - `data` - An iterator of engine data to write to the Parquet file.
+    /// - `data` - An iterator of engine data to be written to the Parquet file..
     ///
     /// # Returns
     ///
