@@ -12,11 +12,33 @@ use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, Pre
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
-use crate::schema::ToSchema as _;
+use crate::schema::{SchemaRef, ToSchema as _};
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
-use crate::transforms::{get_transform_expr, parse_partition_values};
+use crate::table_features::ColumnMappingMode;
+use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+
+/// Internal serializable state (schemas, transform spec, column mapping, etc.)
+/// This is opaque to the engine - just passed through as a blob.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct InternalState {
+    logical_schema: StructType,
+    physical_schema: StructType,
+    transform_spec: Option<TransformSpec>,
+    column_mapping_mode: ColumnMappingMode,
+}
+
+/// Public-facing serialized processor state for distribution to executors.
+/// The engine passes everything needed as Arc references, plus an opaque internal state blob.
+#[derive(Clone)]
+pub struct SerializedScanState {
+    /// Optional predicate for data skipping (if provided)
+    pub predicate: Option<PredicateRef>,
+    /// Opaque internal state blob (JSON for now)
+    pub internal_state_blob: Vec<u8>,
+}
+
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
@@ -44,16 +66,16 @@ pub(crate) struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
-    state_info: Arc<StateInfo>,
+    pub(crate) state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
-    seen_file_keys: HashSet<FileActionKey>,
+    pub(crate) seen_file_keys: HashSet<FileActionKey>,
 }
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -83,6 +105,91 @@ impl ScanLogReplayProcessor {
             seen_file_keys: Default::default(),
             state_info,
         })
+    }
+
+    /// Serialize the processor state for distribution to executors.
+    ///
+    /// Consumes the processor and returns:
+    /// - `SerializedScanState`: Public-facing state with predicate and internal blob
+    /// - `HashSet<FileActionKey>`: The deduplication set (moved for independent use on executors)
+    ///
+    /// Executors can use `from_serialized` to reconstruct the processor with this state.
+    pub(crate) fn serialize(self) -> DeltaResult<(SerializedScanState, HashSet<FileActionKey>)> {
+        // Serialize internal state to JSON blob (schemas, transform spec, and column mapping mode)
+        let internal_state = InternalState {
+            logical_schema: (*self.state_info.logical_schema).clone(),
+            physical_schema: (*self.state_info.physical_schema).clone(),
+            transform_spec: self.state_info.transform_spec.as_ref().map(|ts| (**ts).clone()),
+            column_mapping_mode: self.state_info.column_mapping_mode,
+        };
+        let internal_state_blob = serde_json::to_vec(&internal_state)
+            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
+
+        // Extract predicate from PhysicalPredicate
+        let predicate = match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(pred, _schema) => Some(pred.clone()),
+            _ => None,
+        };
+
+        let state = SerializedScanState {
+            predicate,
+            internal_state_blob,
+        };
+
+        Ok((state, self.seen_file_keys))
+    }
+
+    /// Reconstruct a processor from serialized state.
+    ///
+    /// Creates a new processor with the provided state and seen_file_keys.
+    /// All other fields (partition_filter, data_skipping_filter, add_transform) are
+    /// reconstructed from the state and engine.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for creating evaluators and filters
+    /// - `state`: The serialized state from serialization
+    /// - `seen_file_keys`: The deduplication set from serialization
+    pub(crate) fn from_serialized(
+        engine: &dyn Engine,
+        state: SerializedScanState,
+        seen_file_keys: HashSet<FileActionKey>,
+    ) -> DeltaResult<Self> {
+        // Deserialize internal state
+        let internal_state: InternalState = serde_json::from_slice(&state.internal_state_blob)
+            .map_err(|e| Error::generic(format!("Failed to deserialize internal state: {}", e)))?;
+
+        // Convert schemas to Arc
+        let logical_schema = Arc::new(internal_state.logical_schema);
+        let physical_schema = Arc::new(internal_state.physical_schema);
+
+        // Reconstruct PhysicalPredicate from predicate and schema
+        let physical_predicate = match state.predicate {
+            Some(pred) => PhysicalPredicate::Some(pred, physical_schema.clone()),
+            None => PhysicalPredicate::None,
+        };
+
+        // Reconstruct StateInfo
+        let state_info = Arc::new(StateInfo {
+            logical_schema,
+            physical_schema,
+            physical_predicate,
+            transform_spec: internal_state.transform_spec.map(Arc::new),
+            column_mapping_mode: internal_state.column_mapping_mode,
+        });
+
+        // Create processor and set seen_file_keys
+        let mut processor = Self::new(engine, state_info)?;
+        processor.seen_file_keys = seen_file_keys;
+        Ok(processor)
+    }
+
+    /// Get the projected schema needed to read checkpoint/sidecar files.
+    ///
+    /// Returns the schema that should be used when reading leaf checkpoint files
+    /// or sidecars during the executor phase.
+    pub(crate) fn get_projected_schema(&self) -> DeltaResult<crate::schema::SchemaRef> {
+        use crate::actions::ADD_NAME;
+        get_log_add_schema().project(&[ADD_NAME])
     }
 }
 
