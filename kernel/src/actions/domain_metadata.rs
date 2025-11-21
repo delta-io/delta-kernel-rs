@@ -4,15 +4,15 @@
 //! For now, this module only exposes the ability to read a single domain at once from the log. In
 //! the future this should allow for reading all domains from the log at once.
 
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-
 use crate::actions::get_log_domain_metadata_schema;
 use crate::actions::visitors::DomainMetadataVisitor;
 use crate::actions::{DomainMetadata, DOMAIN_METADATA_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::{DeltaResult, Engine, Expression as Expr, PredicateRef, RowVisitor as _};
+use delta_kernel_derive::internal_api;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 const DOMAIN_METADATA_DOMAIN_FIELD: &str = "domain";
 
@@ -33,6 +33,16 @@ pub(crate) fn domain_metadata_configuration(
     Ok(domain_metadatas
         .remove(domain)
         .map(|domain_metadata| domain_metadata.configuration))
+}
+
+#[allow(unused)]
+#[internal_api]
+pub(crate) fn all_domain_metadata_configuration(
+    log_segment: &LogSegment,
+    engine: &dyn Engine,
+) -> DeltaResult<Vec<DomainMetadata>> {
+    let domain_metadatas = scan_domain_metadatas(log_segment, None, engine)?;
+    Ok(domain_metadatas.into_values().collect())
 }
 
 /// Scan the entire log for all domain metadata actions but terminate early if a specific domain

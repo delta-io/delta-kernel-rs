@@ -314,17 +314,26 @@ impl StructField {
 
     /// Get the physical name for this field as it should be read from parquet.
     ///
+    /// When `column_mapping_mode` is `None`, always returns the logical name (even if physical
+    /// name metadata is present). When mode is `Id` or `Name`, returns the physical name from
+    /// metadata if present, otherwise returns the logical name.
+    ///
     /// NOTE: Caller affirms that the schema was already validated by
     /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     #[internal_api]
-    pub(crate) fn physical_name(&self) -> &str {
-        match self
-            .metadata
-            .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-        {
-            Some(MetadataValue::String(physical_name)) => physical_name,
-            _ => &self.name,
+    pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
+        match column_mapping_mode {
+            ColumnMappingMode::None => &self.name,
+            ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                match self
+                    .metadata
+                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                {
+                    Some(MetadataValue::String(physical_name)) => physical_name,
+                    _ => &self.name,
+                }
+            }
         }
     }
 
@@ -422,7 +431,7 @@ impl StructField {
                                     .is_some_and(|x| matches!(x, MetadataValue::String(_))));
                             }
                         }
-                        field.physical_name().to_owned()
+                        field.physical_name(self.column_mapping_mode).to_owned()
                     }
                 };
 
@@ -1681,6 +1690,7 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -1901,7 +1911,7 @@ mod tests {
                 assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
                 assert!(matches!(id_start, MetadataValue::Number(num) if *num == 2147483648i64));
                 assert_eq!(
-                    field.physical_name(),
+                    field.physical_name(mode),
                     "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
                 );
                 let physical_field = field.make_physical(mode);
@@ -2886,5 +2896,88 @@ mod tests {
             Some(&3)
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_none() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.physicalName": "physical_name_col123"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::None, should return logical name even though physical name exists
+        assert_eq!(field.physical_name(ColumnMappingMode::None), "logical_name");
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_id() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 5,
+                "delta.columnMapping.physicalName": "physical_name_col123"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Id, should return physical name
+        assert_eq!(
+            field.physical_name(ColumnMappingMode::Id),
+            "physical_name_col123"
+        );
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_name() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.physicalName": "physical_name_col456"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Name, should return physical name
+        assert_eq!(
+            field.physical_name(ColumnMappingMode::Name),
+            "physical_name_col456"
+        );
+    }
+
+    #[test]
+    fn test_physical_name_fallback_id() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {}
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Id but no physical name, should fallback to logical name
+        assert_eq!(field.physical_name(ColumnMappingMode::Id), "logical_name");
+    }
+
+    #[test]
+    fn test_physical_name_fallback_name() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {}
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Name but no physical name, should fallback to logical name
+        assert_eq!(field.physical_name(ColumnMappingMode::Name), "logical_name");
     }
 }

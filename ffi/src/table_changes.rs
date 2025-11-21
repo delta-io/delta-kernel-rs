@@ -346,7 +346,7 @@ mod tests {
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::arrow::util::pretty::pretty_format_batches;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
-    use delta_kernel::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;
     use delta_kernel_ffi::engine_data::get_engine_data;
@@ -530,7 +530,7 @@ mod tests {
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let path = "memory:///";
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage);
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
@@ -617,7 +617,7 @@ mod tests {
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let path = "memory:///";
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage);
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
@@ -673,7 +673,7 @@ mod tests {
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let path = "memory:///";
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage);
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
@@ -753,7 +753,7 @@ mod tests {
         put_file(storage.as_ref(), PARQUET_FILE2.to_string(), &batch).await?;
 
         let path = "memory:///";
-        let engine = DefaultEngine::new(storage.clone(), Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(storage);
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
 
         let table_changes = ok_or_panic(unsafe {
