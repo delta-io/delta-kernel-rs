@@ -311,15 +311,17 @@ impl TableConfiguration {
 
             // Check read support
             match &info.read_support {
-                KernelSupport::Supported => Ok(()),
-                KernelSupport::NotSupported => Err(Error::unsupported(format!(
-                    "Feature '{}' not supported for reads",
-                    info.name
-                ))),
-                KernelSupport::Custom(check) => {
-                    check(&self.protocol, &self.table_properties, Operation::Scan)
+                KernelSupport::Supported => {}
+                KernelSupport::NotSupported => {
+                    return Err(Error::unsupported(format!(
+                        "Feature '{}' not supported for reads",
+                        info.name
+                    )))
                 }
-            }?;
+                KernelSupport::Custom(check) => {
+                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
+                }
+            };
 
             // Validate feature requirements
             self.validate_feature_requirements(info.name, info.feature_requirements)?;
@@ -350,15 +352,17 @@ impl TableConfiguration {
 
             // Check write support
             match &info.write_support {
-                KernelSupport::Supported => Ok(()),
-                KernelSupport::NotSupported => Err(Error::unsupported(format!(
-                    "Feature '{}' not supported for writes",
-                    info.name
-                ))),
-                KernelSupport::Custom(check) => {
-                    check(&self.protocol, &self.table_properties, Operation::Scan)
+                KernelSupport::Supported => {}
+                KernelSupport::NotSupported => {
+                    return Err(Error::unsupported(format!(
+                        "Feature '{}' not supported for writes",
+                        info.name
+                    )))
                 }
-            }?;
+                KernelSupport::Custom(check) => {
+                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
+                }
+            };
 
             // Validate feature requirements
             self.validate_feature_requirements(info.name, info.feature_requirements)?;
