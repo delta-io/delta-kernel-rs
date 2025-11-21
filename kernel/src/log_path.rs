@@ -44,23 +44,27 @@ impl LogPath {
         last_modified: i64,
         size: FileSize,
     ) -> DeltaResult<LogPath> {
-        // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
-        if !table_root.path().ends_with('/') {
-            return Err(Error::invalid_table_location(table_root));
-        }
-
-        let commit_path = table_root
-            .join("_delta_log/")
-            .and_then(|url| url.join("_staged_commits/"))
-            .and_then(|url| url.join(filename))
-            .map_err(|_| Error::invalid_table_location(table_root))?;
-
+        let commit_path = Self::staged_commit_url(table_root, filename)?;
         let file_meta = FileMeta {
             location: commit_path,
             last_modified,
             size,
         };
         LogPath::try_new(file_meta)
+    }
+
+    /// Create the URL for a staged commit file given the table root and filename. The table_root
+    /// must point to the root of the table and end with a '/'.
+    pub fn staged_commit_url(table_root: Url, filename: &str) -> DeltaResult<Url> {
+        // TODO: we should introduce TablePath/LogPath types which enforce checks like ending '/'
+        if !table_root.path().ends_with('/') {
+            return Err(Error::invalid_table_location(table_root));
+        }
+        table_root
+            .join("_delta_log/")
+            .and_then(|url| url.join("_staged_commits/"))
+            .and_then(|url| url.join(filename))
+            .map_err(|_| Error::invalid_table_location(table_root))
     }
 }
 

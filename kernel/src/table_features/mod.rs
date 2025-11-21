@@ -267,17 +267,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Custom(|_protocol, properties, _operation| {
-        // Kernel supports writing to CDF-enabled tables only if AppendOnly is also enabled
-        // because we don't yet support writing .cdc files for DML operations
-        if properties.enable_change_data_feed == Some(true) && properties.append_only != Some(true)
-        {
-            return Err(Error::unsupported(
-                "Writing to table with Change Data Feed is only supported if append only mode is enabled",
-            ));
-        }
-        Ok(())
-    }),
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_change_data_feed == Some(true)
     }),
@@ -450,6 +440,9 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     read_support: KernelSupport::Supported,
     #[cfg(not(feature = "catalog-managed"))]
     read_support: KernelSupport::NotSupported,
+    #[cfg(feature = "catalog-managed")]
+    write_support: KernelSupport::Supported,
+    #[cfg(not(feature = "catalog-managed"))]
     write_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -465,6 +458,9 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     read_support: KernelSupport::Supported,
     #[cfg(not(feature = "catalog-managed"))]
     read_support: KernelSupport::NotSupported,
+    #[cfg(feature = "catalog-managed")]
+    write_support: KernelSupport::Supported,
+    #[cfg(not(feature = "catalog-managed"))]
     write_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
@@ -492,7 +488,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    // We support writing to tables with DeletionVectors enabled, but we never write DV files
+    // ourselves (no DML). The kernel only performs append operations.
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
     }),
@@ -554,7 +552,7 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    write_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -717,12 +715,18 @@ pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyL
     vec![
         TableFeature::ChangeDataFeed,
         TableFeature::AppendOnly,
+        #[cfg(feature = "catalog-managed")]
+        TableFeature::CatalogManaged,
+        #[cfg(feature = "catalog-managed")]
+        TableFeature::CatalogOwnedPreview,
         TableFeature::DeletionVectors,
         TableFeature::DomainMetadata,
         TableFeature::InCommitTimestamp,
         TableFeature::Invariants,
         TableFeature::RowTracking,
         TableFeature::TimestampWithoutTimezone,
+        TableFeature::V2Checkpoint,
+        TableFeature::VacuumProtocolCheck,
         TableFeature::VariantType,
         TableFeature::VariantTypePreview,
         TableFeature::VariantShreddingPreview,

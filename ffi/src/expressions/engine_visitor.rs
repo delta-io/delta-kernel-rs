@@ -317,7 +317,6 @@ fn visit_expression_array(
     array: &ArrayData,
     sibling_list_id: usize,
 ) {
-    #[allow(deprecated)]
     let elements = array.array_elements();
     let child_list_id = call!(visitor, make_field_list, elements.len());
     for scalar in elements {

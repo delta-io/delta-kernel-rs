@@ -21,6 +21,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
+use crate::scan::log_replay::BASE_ROW_ID_NAME;
 use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -450,6 +451,8 @@ impl Scan {
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+            use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
+
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
             DataType::struct_type_unchecked(vec![StructField::nullable(
                 "add",
@@ -459,8 +462,13 @@ impl Scan {
                     StructField::not_null("size", DataType::LONG),
                     StructField::nullable("modificationTime", DataType::LONG),
                     StructField::nullable("stats", DataType::STRING),
+                    StructField::nullable(
+                        "tags",
+                        MapType::new(DataType::STRING, DataType::STRING, true),
+                    ),
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-                    StructField::nullable("baseRowId", DataType::LONG),
+                    StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+                    StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
                 ]),
             )])
         });
@@ -571,7 +579,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + use<'_>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -612,6 +620,8 @@ impl Scan {
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
 
+        let physical_schema = self.physical_schema().clone();
+        let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
@@ -635,19 +645,21 @@ impl Scan {
                 // TODO(#860): we disable predicate pushdown until we support row indexes.
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
-                    self.physical_schema().clone(),
+                    physical_schema.clone(),
                     None,
                 )?;
 
                 let engine = engine.clone(); // Arc clone
+                let physical_schema_inner = physical_schema.clone();
+                let logical_schema_inner = logical_schema.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        self.physical_schema(),
-                        self.logical_schema(),
+                        &physical_schema_inner,
+                        &logical_schema_inner,
                         scan_file.transform.clone(), // Arc clone
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
@@ -691,7 +703,9 @@ impl Scan {
 ///    },
 ///    fileConstantValues: {
 ///      partitionValues: map<string, string>,
-///      baseRowId: long
+///      tags: map<string, string>,
+///      baseRowId: long,
+///      defaultRowCommitVersion: long,
 ///    }
 /// }
 /// ```
