@@ -36,12 +36,10 @@ use std::sync::{Arc, LazyLock};
 use scan::TableChangesScanBuilder;
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};

@@ -8,11 +8,11 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Metadata, Protocol};
+use crate::actions::{Metadata, Protocol};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{

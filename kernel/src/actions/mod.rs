@@ -581,7 +581,7 @@ impl Protocol {
                 ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
             }
             // if min_reader_version = 1 or 2 and there are no reader features => OK
-            None => self.min_reader_version() == 1 || self.min_reader_version() == 2,
+            None => (1..=2).contains(&self.min_reader_version()),
             // any other protocol is not supported
             _ => false,
         }
