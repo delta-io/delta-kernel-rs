@@ -300,9 +300,13 @@ fn visit_field_map_impl(
     let key_field = unwrap_field(state, key_type_id)
         .ok_or_else(|| Error::generic(format!("Invalid key type ID {key_type_id} for map")))?;
 
+    if key_field.nullable {
+        return Err(Error::generic("Delta Map keys may not be nullable"));
+    }
+
     let value_field = unwrap_field(state, value_type_id)
         .ok_or_else(|| Error::generic(format!("Invalid value type ID {value_type_id} for map")))?;
-require!(!key_field.nullable, Error::generic("Delta Map keys may not be nullable"));
+
     let map_type = MapType::new(
         key_field.data_type,
         value_field.data_type,
@@ -1107,5 +1111,37 @@ mod tests {
 
         assert_struct(fields[6], DataType::STRING, false);
         assert_struct(fields[7], DataType::STRING, true);
+    }
+
+    #[test]
+    fn cannot_use_nullable_as_map_keys() {
+        // Error allocator for tests that panics when invoked. It is used in tests where we don't expect errors.
+        #[no_mangle]
+        extern "C" fn ensure_map_err(
+            _etype: KernelError,
+            msg: crate::KernelStringSlice,
+        ) -> *mut EngineError {
+            let msg = unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    msg.ptr as *const u8,
+                    msg.len,
+                ))
+            };
+            assert_eq!(msg, "Generic delta kernel error: Delta Map keys may not be nullable");
+            std::ptr::null_mut()
+        }
+
+        let mut state = KernelSchemaVisitorState::default();
+        let kf = visit_field!(string, state, "key", true); // should fail due to this being nullable
+        let vf = visit_field!(integer, state, "value", false);
+        let res = unsafe { visit_field_map(
+            &mut state,
+            KernelStringSlice::new_unsafe("map_check"),
+            kf,
+            vf,
+            false,
+            ensure_map_err,
+        ) };
+        assert!(res.is_err());
     }
 }
