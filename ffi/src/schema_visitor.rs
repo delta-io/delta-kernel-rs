@@ -47,17 +47,15 @@ pub fn unwrap_kernel_schema(
     schema_id: usize,
 ) -> Option<StructType> {
     let schema_element = state.elements.take(schema_id)?;
-
-    if let DataType::Struct(struct_type) = schema_element.data_type {
-        if !state.elements.is_empty() {
-            warn!("Engine to kernel schema visitor did not consume all visited fields, schema is invalid.");
-            return None;
-        }
-        Some(*struct_type)
-    } else {
-        warn!("Engine to kernel schema visitor returned an id that was not a struct. Schema is invalid");
-        None
+    let DataType::Struct(struct_type) = schema_element.data_type else {
+        warn!("Final returned id was not a struct, schema is invalid");
+        return None;
+    };
+    if !state.elements.is_empty() {
+        warn!("Didn't consume all visited fields, schema is invalid.");
+        return None;
     }
+    Some(*struct_type)
 }
 
 fn wrap_field(state: &mut KernelSchemaVisitorState, field: StructField) -> usize {
@@ -1127,21 +1125,26 @@ mod tests {
                     msg.len,
                 ))
             };
-            assert_eq!(msg, "Generic delta kernel error: Delta Map keys may not be nullable");
+            assert_eq!(
+                msg,
+                "Generic delta kernel error: Delta Map keys may not be nullable"
+            );
             std::ptr::null_mut()
         }
 
         let mut state = KernelSchemaVisitorState::default();
         let kf = visit_field!(string, state, "key", true); // should fail due to this being nullable
         let vf = visit_field!(integer, state, "value", false);
-        let res = unsafe { visit_field_map(
-            &mut state,
-            KernelStringSlice::new_unsafe("map_check"),
-            kf,
-            vf,
-            false,
-            ensure_map_err,
-        ) };
+        let res = unsafe {
+            visit_field_map(
+                &mut state,
+                KernelStringSlice::new_unsafe("map_check"),
+                kf,
+                vf,
+                false,
+                ensure_map_err,
+            )
+        };
         assert!(res.is_err());
     }
 }
