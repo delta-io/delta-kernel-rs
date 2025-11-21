@@ -502,7 +502,10 @@ mod tests {
 
         assert!(result.is_some());
         let (key, is_add) = result.unwrap();
-        assert!(key.dv_unique_id.is_some());
+        assert!(matches!(
+            key.dv_unique_id.as_deref(),
+            Some("s3path/to/dv@100")
+        ));
         assert!(is_add);
 
         Ok(())
