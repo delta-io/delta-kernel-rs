@@ -17,9 +17,11 @@ use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
-    ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureType, TableFeature,
+    ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
+    KernelSupport, Operation, TableFeature, LEGACY_READER_FEATURES, LEGACY_WRITER_FEATURES,
 };
 use crate::table_properties::TableProperties;
+use crate::utils::require;
 use crate::{DeltaResult, Error, Version};
 use delta_kernel_derive::internal_api;
 
@@ -85,8 +87,6 @@ impl TableConfiguration {
         table_root: Url,
         version: Version,
     ) -> DeltaResult<Self> {
-        protocol.ensure_read_supported()?;
-
         let schema = Arc::new(metadata.parse_schema()?);
         let table_properties = metadata.parse_table_properties();
         let column_mapping_mode = column_mapping_mode(&protocol, &table_properties);
@@ -98,7 +98,7 @@ impl TableConfiguration {
 
         validate_variant_type_feature_support(&schema, &protocol)?;
 
-        Ok(Self {
+        let table_config = Self {
             schema,
             metadata,
             protocol,
@@ -106,7 +106,12 @@ impl TableConfiguration {
             column_mapping_mode,
             table_root,
             version,
-        })
+        };
+
+        // Validate read support after construction so we have access to all fields
+        table_config.ensure_read_supported()?;
+
+        Ok(table_config)
     }
 
     pub(crate) fn try_new_from(
@@ -176,26 +181,213 @@ impl TableConfiguration {
         self.version
     }
 
+    /// Validates that all feature requirements for a given feature are satisfied.
+    fn validate_feature_requirements(
+        &self,
+        feature_name: &str,
+        requirements: &[FeatureRequirement],
+    ) -> DeltaResult<()> {
+        for req in requirements {
+            match req {
+                FeatureRequirement::Supported(dep) => {
+                    require!(
+                        self.is_feature_supported(dep),
+                        Error::invalid_protocol(format!(
+                            "{} requires {} to be supported",
+                            feature_name, dep
+                        ))
+                    );
+                }
+                FeatureRequirement::Enabled(dep) => {
+                    require!(
+                        self.is_feature_enabled(dep),
+                        Error::invalid_protocol(format!(
+                            "{} requires {} to be enabled",
+                            feature_name, dep
+                        ))
+                    );
+                }
+                FeatureRequirement::NotSupported(dep) => {
+                    require!(
+                        !self.is_feature_supported(dep),
+                        Error::invalid_protocol(format!(
+                            "{} requires {} to not be supported",
+                            feature_name, dep
+                        ))
+                    );
+                }
+                FeatureRequirement::NotEnabled(dep) => {
+                    require!(
+                        !self.is_feature_enabled(dep),
+                        Error::invalid_protocol(format!(
+                            "{} requires {} to not be enabled",
+                            feature_name, dep
+                        ))
+                    );
+                }
+                FeatureRequirement::Custom(check) => {
+                    check(&self.protocol, &self.table_properties)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns all reader features enabled for this table based on protocol version.
+    /// For table features protocol (v3), returns the explicit reader_features list.
+    /// For legacy protocol (v1-2), infers features from the version number.
+    fn get_enabled_reader_features(&self) -> Vec<TableFeature> {
+        match self.protocol.min_reader_version() {
+            3 => {
+                // Table features reader: use explicit reader_features list
+                self.protocol
+                    .reader_features()
+                    .map(|f| f.to_vec())
+                    .unwrap_or_default()
+            }
+            v if (1..=2).contains(&v) => {
+                // Legacy reader: infer features from version
+                LEGACY_READER_FEATURES
+                    .iter()
+                    .filter(|f| {
+                        f.info()
+                            .map(|info| v >= info.min_reader_version)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Returns all writer features enabled for this table based on protocol version.
+    /// For table features protocol (v7), returns the explicit writer_features list.
+    /// For legacy protocol (v1-6), infers features from the version number.
+    fn get_enabled_writer_features(&self) -> Vec<TableFeature> {
+        match self.protocol.min_writer_version() {
+            7 => {
+                // Table features writer: use explicit writer_features list
+                self.protocol
+                    .writer_features()
+                    .map(|f| f.to_vec())
+                    .unwrap_or_default()
+            }
+            v if (1..=6).contains(&v) => {
+                // Legacy writer: infer features from version
+                LEGACY_WRITER_FEATURES
+                    .iter()
+                    .filter(|f| {
+                        f.info()
+                            .map(|info| v >= info.min_writer_version)
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Returns `Ok` if the kernel supports reading from this table. This checks that the
+    /// protocol's reader features are all supported.
+    fn ensure_read_supported(&self) -> DeltaResult<()> {
+        // Version check
+        match self.protocol.min_reader_version() {
+            1..=3 => {}
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "Unsupported minimum reader version {}",
+                    self.protocol.min_reader_version()
+                )))
+            }
+        }
+
+        // Check all enabled reader features have kernel read support
+        for feature in self.get_enabled_reader_features() {
+            let Some(info) = feature.info() else {
+                return Err(Error::unsupported(format!("Unknown feature '{}'", feature)));
+            };
+
+            // Check read support
+            match &info.read_support {
+                KernelSupport::Supported => {}
+                KernelSupport::NotSupported => {
+                    return Err(Error::unsupported(format!(
+                        "Feature '{}' not supported for reads",
+                        info.name
+                    )))
+                }
+                KernelSupport::Custom(check) => {
+                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
+                }
+            };
+
+            // Validate feature requirements
+            self.validate_feature_requirements(info.name, info.feature_requirements)?;
+        }
+
+        Ok(())
+    }
+
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
     #[internal_api]
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
-        self.protocol.ensure_write_supported()?;
+        // Version check: We currently only support writing to tables with minWriterVersion 1, 2, or 7.
+        // Below is a mapping of unsupported writer versions and the features they enable:
+        //
+        // | Writer Version | Features Added                                    |
+        // |----------------|---------------------------------------------------|
+        // | 1              | (baseline)                                        |
+        // | 2              | appendOnly, invariants                            |
+        // | 3              | checkConstraints                                  |
+        // | 4              | changeDataFeed, generatedColumns                  |
+        // | 5              | columnMapping (ReaderWriter)                      |
+        // | 6              | identityColumns                                   |
+        // | 7              | (table features protocol - explicit feature list) |
+        //
+        // Once we add support for these features, we can enable the corresponding writer versions.
+        match self.protocol.min_writer_version() {
+            1 | 2 | 7 => {}
+            _ => {
+                return Err(Error::unsupported(
+                    "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7",
+                ))
+            }
+        }
 
-        // for now we don't allow invariants so although we support writer version 2 and the
-        // ColumnInvariant TableFeature we _must_ check here that they are not actually in use
-        if self.is_invariants_supported()
+        // Check all enabled writer features have kernel write support
+        for feature in self.get_enabled_writer_features() {
+            let Some(info) = feature.info() else {
+                return Err(Error::unsupported(format!("Unknown feature '{}'", feature)));
+            };
+
+            // Check write support
+            match &info.write_support {
+                KernelSupport::Supported => {}
+                KernelSupport::NotSupported => {
+                    return Err(Error::unsupported(format!(
+                        "Feature '{}' not supported for writes",
+                        info.name
+                    )))
+                }
+                KernelSupport::Custom(check) => {
+                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
+                }
+            };
+
+            // Validate feature requirements
+            self.validate_feature_requirements(info.name, info.feature_requirements)?;
+        }
+
+        // Schema-dependent validation for Invariants (can't be in FeatureInfo)
+        // TODO: Better story for schema validation for Invariants and other features
+        if self.is_feature_supported(&TableFeature::Invariants)
             && InvariantChecker::has_invariants(self.schema().as_ref())
         {
             return Err(Error::unsupported(
                 "Column invariants are not yet supported",
-            ));
-        }
-
-        // Fail if row tracking is both enabled and suspended
-        if self.is_row_tracking_enabled() && self.is_row_tracking_suspended() {
-            return Err(Error::unsupported(
-                "Row tracking cannot be both enabled and suspended",
             ));
         }
 
@@ -278,6 +470,7 @@ impl TableConfiguration {
     }
 
     /// Returns `true` if the table supports the column invariant table feature.
+    #[allow(unused)]
     pub(crate) fn is_invariants_supported(&self) -> bool {
         let protocol = &self.protocol;
         match protocol.min_writer_version() {
@@ -385,6 +578,7 @@ impl TableConfiguration {
     /// In order to enable row tracking the table must:
     /// - Support row tracking (see [`Self::is_row_tracking_supported`]).
     /// - Have the `delta.enableRowTracking` table property set to `true`.
+    #[allow(unused)]
     pub(crate) fn is_row_tracking_enabled(&self) -> bool {
         self.is_row_tracking_supported()
             && self.table_properties().enable_row_tracking.unwrap_or(false)
@@ -679,7 +873,7 @@ mod test {
                     (
                 // Should succeed since AppendOnly is enabled
                 create_mock_table_config(
-                    &["delta.delta.enableChangeDataFeed", "delta.appendOnly"],
+                    &["delta.enableChangeDataFeed", "delta.appendOnly"],
                     &[ChangeDataFeed, AppendOnly],
                 ),
                 Ok(()),
@@ -702,7 +896,7 @@ mod test {
                     &["delta.enableChangeDataFeed", "delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(r#"Found unsupported TableFeatures: "columnMapping". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#)),
+                Err(Error::unsupported("Feature 'columnMapping' not supported for writes")),
             ),
             (
                 // The table does not require writing CDC files, so it is safe to write to it.
@@ -710,7 +904,7 @@ mod test {
                     &["delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported(r#"Found unsupported TableFeatures: "columnMapping". Supported TableFeatures: "changeDataFeed", "appendOnly", "catalogManaged", "catalogOwned-preview", "deletionVectors", "domainMetadata", "inCommitTimestamp", "invariants", "rowTracking", "timestampNtz", "v2Checkpoint", "vacuumProtocolCheck", "variantType", "variantType-preview", "variantShredding-preview""#)),
+                Err(Error::unsupported("Feature 'columnMapping' not supported for writes")),
             ),
             (
                 // Should succeed since change data feed is not enabled
