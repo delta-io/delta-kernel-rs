@@ -334,7 +334,20 @@ impl TableConfiguration {
     /// protocol's writer features are all supported.
     #[internal_api]
     pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check
+        // Version check: We currently only support writing to tables with minWriterVersion 1, 2, or 7.
+        // Below is a mapping of unsupported writer versions and the features they enable:
+        //
+        // | Writer Version | Features Added                                    |
+        // |----------------|---------------------------------------------------|
+        // | 1              | (baseline)                                        |
+        // | 2              | appendOnly, invariants                            |
+        // | 3              | checkConstraints                                  |
+        // | 4              | changeDataFeed, generatedColumns                  |
+        // | 5              | columnMapping (ReaderWriter)                      |
+        // | 6              | identityColumns                                   |
+        // | 7              | (table features protocol - explicit feature list) |
+        //
+        // Once we add support for these features, we can enable the corresponding writer versions.
         match self.protocol.min_writer_version() {
             1 | 2 | 7 => {}
             _ => {
