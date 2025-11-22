@@ -99,7 +99,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
-        let output_schema = write_context.physical_schema();
+        let output_schema = write_context.schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
