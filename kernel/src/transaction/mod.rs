@@ -26,6 +26,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
+use crate::table_features::Operation;
 use crate::utils::{current_time_ms, require};
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -175,7 +176,7 @@ impl Transaction {
         // important! before a read/write to the table we must check it is supported
         read_snapshot
             .table_configuration()
-            .ensure_write_supported()?;
+            .ensure_write_supported(Operation::Scan)?;
 
         let commit_timestamp = current_time_ms()?;
 

@@ -330,7 +330,7 @@ impl TableConfiguration {
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
     #[internal_api]
-    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_write_supported(&self, operation: Operation) -> DeltaResult<()> {
         // Version check: We currently only support writing to tables with minWriterVersion 1, 2, or 7.
         // Below is a mapping of unsupported writer versions and the features they enable:
         //
@@ -370,7 +370,7 @@ impl TableConfiguration {
                     )))
                 }
                 KernelSupport::Custom(check) => {
-                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
+                    check(&self.protocol, &self.table_properties, operation)?;
                 }
             };
 
