@@ -108,9 +108,6 @@ impl TableConfiguration {
             version,
         };
 
-        // Validate read support after construction so we have access to all fields
-        table_config.ensure_read_supported()?;
-
         Ok(table_config)
     }
 
@@ -291,7 +288,7 @@ impl TableConfiguration {
 
     /// Returns `Ok` if the kernel supports reading from this table. This checks that the
     /// protocol's reader features are all supported.
-    fn ensure_read_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
         // Version check
         match self.protocol.min_reader_version() {
             1..=3 => {}
@@ -319,7 +316,7 @@ impl TableConfiguration {
                     )))
                 }
                 KernelSupport::Custom(check) => {
-                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
+                    check(&self.protocol, &self.table_properties, operation)?;
                 }
             };
 
@@ -333,7 +330,7 @@ impl TableConfiguration {
     /// Returns `true` if the kernel supports writing to this table. This checks that the
     /// protocol's writer features are all supported.
     #[internal_api]
-    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
+    pub(crate) fn ensure_write_supported(&self, operation: Operation) -> DeltaResult<()> {
         // Version check: We currently only support writing to tables with minWriterVersion 1, 2, or 7.
         // Below is a mapping of unsupported writer versions and the features they enable:
         //
@@ -373,7 +370,7 @@ impl TableConfiguration {
                     )))
                 }
                 KernelSupport::Custom(check) => {
-                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
+                    check(&self.protocol, &self.table_properties, operation)?;
                 }
             };
 
