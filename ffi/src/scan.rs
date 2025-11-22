@@ -12,13 +12,15 @@ use delta_kernel_ffi_macros::handle_descriptor;
 use tracing::debug;
 use url::Url;
 
-use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
+use crate::expressions::kernel_visitor::{
+    unwrap_kernel_predicate, KernelExpressionVisitorState,
+};
 use crate::expressions::SharedExpression;
 use crate::{
-    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
-    ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
-    NullableCvoid, OptionalValue, SharedExternEngine, SharedSchema, SharedSnapshot,
-    TryFromStringSlice,
+    kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn,
+    ExternEngine, ExternResult, IntoExternResult, KernelBoolSlice,
+    KernelRowIndexArray, KernelStringSlice, NullableCvoid, OptionalValue,
+    SharedExternEngine, SharedSchema, SharedSnapshot, TryFromStringSlice,
 };
 
 use super::handle::Handle;
@@ -45,8 +47,27 @@ pub struct SharedScanMetadata;
 #[repr(C)]
 pub struct EnginePredicate {
     pub predicate: *mut c_void,
-    pub visitor:
-        extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
+    pub visitor: extern "C" fn(
+        predicate: *mut c_void,
+        state: &mut KernelExpressionVisitorState,
+    ) -> usize,
+}
+
+/// An engine-provided expression along with a visitor function to convert
+/// it to a kernel expression.
+///
+/// The engine provides a pointer to its own expression representation, along
+/// with a visitor function that can convert it to a kernel expression by
+/// calling the appropriate visitor methods on the kernel's
+/// `KernelExpressionVisitorState`. The visitor function returns an expression
+/// ID that can be converted to a kernel expression handle.
+#[repr(C)]
+pub struct EngineExpression {
+    pub expression: *mut c_void,
+    pub visitor: extern "C" fn(
+        expression: *mut c_void,
+        state: &mut KernelExpressionVisitorState,
+    ) -> usize,
 }
 
 /// Drop a `SharedScanMetadata`.
@@ -55,7 +76,9 @@ pub struct EnginePredicate {
 ///
 /// Caller is responsible for passing a valid scan data handle.
 #[no_mangle]
-pub unsafe extern "C" fn free_scan_metadata(scan_metadata: Handle<SharedScanMetadata>) {
+pub unsafe extern "C" fn free_scan_metadata(
+    scan_metadata: Handle<SharedScanMetadata>,
+) {
     scan_metadata.drop_handle();
 }
 
@@ -69,7 +92,8 @@ pub unsafe extern "C" fn selection_vector_from_scan_metadata(
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<KernelBoolSlice> {
     let scan_metadata = unsafe { scan_metadata.as_ref() };
-    selection_vector_from_scan_metadata_impl(scan_metadata).into_extern_result(&engine.as_ref())
+    selection_vector_from_scan_metadata_impl(scan_metadata)
+        .into_extern_result(&engine.as_ref())
 }
 
 fn selection_vector_from_scan_metadata_impl(
@@ -110,7 +134,8 @@ fn scan_impl(
     let mut scan_builder = snapshot.scan_builder();
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::default();
-        let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
+        let pred_id =
+            (predicate.visitor)(predicate.predicate, &mut visitor_state);
         let predicate = unwrap_kernel_predicate(&mut visitor_state, pred_id);
         debug!("Got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
@@ -138,7 +163,9 @@ pub unsafe extern "C" fn scan_table_root(
 /// # Safety
 /// Engine is responsible for providing a valid `SharedScan` handle
 #[no_mangle]
-pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
+pub unsafe extern "C" fn scan_logical_schema(
+    scan: Handle<SharedScan>,
+) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.logical_schema().clone().into()
 }
@@ -149,7 +176,9 @@ pub unsafe extern "C" fn scan_logical_schema(scan: Handle<SharedScan>) -> Handle
 /// # Safety
 /// Engine is responsible for providing a valid `SharedScan` handle
 #[no_mangle]
-pub unsafe extern "C" fn scan_physical_schema(scan: Handle<SharedScan>) -> Handle<SharedSchema> {
+pub unsafe extern "C" fn scan_physical_schema(
+    scan: Handle<SharedScan>,
+) -> Handle<SharedSchema> {
     let scan = unsafe { scan.as_ref() };
     scan.physical_schema().clone().into()
 }
@@ -195,7 +224,8 @@ pub unsafe extern "C" fn scan_metadata_iter_init(
 ) -> ExternResult<Handle<SharedScanMetadataIterator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let scan = unsafe { scan.as_ref() };
-    scan_metadata_iter_init_impl(&engine, scan).into_extern_result(&engine.as_ref())
+    scan_metadata_iter_init_impl(&engine, scan)
+        .into_extern_result(&engine.as_ref())
 }
 
 fn scan_metadata_iter_init_impl(
@@ -262,7 +292,9 @@ fn scan_metadata_next_impl(
 // we should probably be consistent with drop vs. free on engine side (probably the latter is more
 // intuitive to non-rust code)
 #[no_mangle]
-pub unsafe extern "C" fn free_scan_metadata_iter(data: Handle<SharedScanMetadataIterator>) {
+pub unsafe extern "C" fn free_scan_metadata_iter(
+    data: Handle<SharedScanMetadataIterator>,
+) {
     data.drop_handle();
 }
 
@@ -412,7 +444,8 @@ pub unsafe extern "C" fn selection_vector_from_dv(
 ) -> ExternResult<KernelBoolSlice> {
     let engine = unsafe { engine.as_ref() };
     let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    selection_vector_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
+    selection_vector_from_dv_impl(dv_info, engine, root_url)
+        .into_extern_result(&engine)
 }
 
 fn selection_vector_from_dv_impl(
@@ -420,7 +453,9 @@ fn selection_vector_from_dv_impl(
     extern_engine: &dyn ExternEngine,
     root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelBoolSlice> {
-    match dv_info.get_selection_vector(extern_engine.engine().as_ref(), &root_url?)? {
+    match dv_info
+        .get_selection_vector(extern_engine.engine().as_ref(), &root_url?)?
+    {
         Some(v) => Ok(v.into()),
         None => Ok(KernelBoolSlice::empty()),
     }
@@ -438,7 +473,8 @@ pub unsafe extern "C" fn row_indexes_from_dv(
 ) -> ExternResult<KernelRowIndexArray> {
     let engine = unsafe { engine.as_ref() };
     let root_url = unsafe { unwrap_and_parse_path_as_url(root_url) };
-    row_indexes_from_dv_impl(dv_info, engine, root_url).into_extern_result(&engine)
+    row_indexes_from_dv_impl(dv_info, engine, root_url)
+        .into_extern_result(&engine)
 }
 
 fn row_indexes_from_dv_impl(
@@ -446,7 +482,9 @@ fn row_indexes_from_dv_impl(
     extern_engine: &dyn ExternEngine,
     root_url: DeltaResult<Url>,
 ) -> DeltaResult<KernelRowIndexArray> {
-    match dv_info.get_row_indexes(extern_engine.engine().as_ref(), &root_url?)? {
+    match dv_info
+        .get_row_indexes(extern_engine.engine().as_ref(), &root_url?)?
+    {
         Some(v) => Ok(v.into()),
         None => Ok(KernelRowIndexArray::empty()),
     }
@@ -525,7 +563,8 @@ mod tests {
         key: KernelStringSlice,
         value: KernelStringSlice,
     ) {
-        let map_ptr: *mut HashMap<String, String> = engine_context.unwrap().as_ptr().cast();
+        let map_ptr: *mut HashMap<String, String> =
+            engine_context.unwrap().as_ptr().cast();
         let key = unsafe { String::try_from_slice(&key).unwrap() };
         let value = unsafe { String::try_from_slice(&value).unwrap() };
         unsafe {
@@ -548,7 +587,8 @@ mod tests {
             let ptr = NonNull::new_unchecked(map_ptr.cast());
             super::visit_string_map(&cmap, Some(ptr), visit_entry);
         }
-        let final_map: HashMap<String, String> = *unsafe { Box::from_raw(map_ptr) };
+        let final_map: HashMap<String, String> =
+            *unsafe { Box::from_raw(map_ptr) };
         assert_eq!(test_map, final_map);
     }
 }
