@@ -1085,10 +1085,17 @@ pub struct RetryableTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::{Metadata, Protocol};
     use crate::engine::sync::SyncEngine;
-    use crate::schema::MapType;
+    use crate::error::Error;
+    use crate::schema::{DataType, MapType, StructField, StructType};
+    use crate::utils::current_time_ms;
     use crate::Snapshot;
+    use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use url::Url;
 
     // TODO: create a finer-grained unit tests for transactions (issue#1091)
     #[test]
@@ -1157,6 +1164,156 @@ mod tests {
         let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
         let abs_path3 = dv_path3.absolute_path()?;
         assert_ne!(abs_path2, abs_path3);
+
+        Ok(())
+    }
+
+    fn setup_snapshot() -> (TempDir, Arc<SyncEngine>, SnapshotRef) {
+        let source_path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path();
+
+        let log_dir = target_path.join("_delta_log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        std::fs::copy(
+            source_path.join("_delta_log/00000000000000000000.json"),
+            log_dir.join("00000000000000000000.json"),
+        )
+        .unwrap();
+        std::fs::copy(
+            source_path.join("_delta_log/00000000000000000001.json"),
+            log_dir.join("00000000000000000001.json"),
+        )
+        .unwrap();
+
+        let url = Url::from_directory_path(target_path).unwrap();
+        let engine = Arc::new(SyncEngine::new());
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(engine.as_ref())
+            .unwrap();
+
+        (temp_dir, engine, snapshot)
+    }
+
+    #[test]
+    fn test_transaction_update_metadata_only() -> DeltaResult<()> {
+        let (_temp_dir, engine, snapshot) = setup_snapshot();
+
+        let current_metadata = snapshot.table_configuration().metadata();
+        let new_metadata = Metadata::try_new(
+            current_metadata.name().map(|s| s.to_string()),
+            Some("Updated Description".to_string()),
+            current_metadata.parse_schema()?,
+            current_metadata.partition_columns().clone(),
+            current_time_ms()?,
+            current_metadata.configuration().clone(),
+        )?;
+
+        let transaction = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .update_metadata(new_metadata)
+            .with_data_change(false);
+
+        let result = transaction.commit(engine.as_ref());
+        assert!(
+            result.is_ok(),
+            "Metadata only commit failed: {:?}",
+            result.err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_validation_failure() -> DeltaResult<()> {
+        let (_temp_dir, engine, snapshot) = setup_snapshot();
+
+        let schema_with_ntz = StructType::new_unchecked(vec![
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("ts", DataType::TIMESTAMP_NTZ),
+        ]);
+
+        let invalid_metadata = Metadata::try_new(
+            None,
+            None,
+            schema_with_ntz,
+            vec![],
+            current_time_ms()?,
+            HashMap::new(),
+        )?;
+
+        let old_protocol = Protocol::try_new(1, 2, None::<Vec<String>>, None::<Vec<String>>)?;
+
+        let transaction = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .update_metadata(invalid_metadata)
+            .update_protocol(old_protocol);
+
+        let result = transaction.commit(engine.as_ref());
+
+        match result {
+            Ok(_) => panic!("Transaction should have failed validation"),
+            Err(Error::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("timestampNtz"),
+                    "Error message should mention timestampNtz, got: {}",
+                    msg
+                );
+            }
+            Err(e) => panic!("Expected Unsupported error, got: {:?}", e),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_valid_protocol_upgrade() -> DeltaResult<()> {
+        let (_temp_dir, engine, snapshot) = setup_snapshot();
+
+        let new_protocol = Protocol::try_new(1, 3, None::<Vec<String>>, None::<Vec<String>>)?;
+
+        let transaction = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .update_protocol(new_protocol)
+            .with_data_change(false);
+
+        let result = transaction.commit(engine.as_ref());
+        assert!(
+            result.is_ok(),
+            "Protocol upgrade failed: {:?}",
+            result.err()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transaction_update_protocol_and_metadata() -> DeltaResult<()> {
+        let (_temp_dir, engine, snapshot) = setup_snapshot();
+
+        let current_metadata = snapshot.table_configuration().metadata();
+        let new_metadata = Metadata::try_new(
+            current_metadata.name().map(|s| s.to_string()),
+            Some("Updated Description".to_string()),
+            current_metadata.parse_schema()?,
+            current_metadata.partition_columns().clone(),
+            current_time_ms()?,
+            current_metadata.configuration().clone(),
+        )?;
+
+        let new_protocol = Protocol::try_new(1, 3, None::<Vec<String>>, None::<Vec<String>>)?;
+
+        let transaction = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .update_metadata(new_metadata)
+            .update_protocol(new_protocol)
+            .with_data_change(false);
+
+        let result = transaction.commit(engine.as_ref());
+        assert!(result.is_ok(), "Combined update failed: {:?}", result.err());
 
         Ok(())
     }
