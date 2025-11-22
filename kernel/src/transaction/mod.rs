@@ -24,7 +24,7 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
 use crate::utils::{current_time_ms, require};
 use crate::{
@@ -66,9 +66,9 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
     );
 
-    Arc::new(StructType::new_unchecked(
-        mandatory_add_file_schema().fields().cloned().chain([stats]),
-    ))
+    StructTypeBuilder::from_schema(mandatory_add_file_schema())
+        .add_field(stats)
+        .build_arc_unchecked()
 });
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
@@ -86,30 +86,28 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
     Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
 });
 
-// NOTE: The following two methods are a workaround for the fact that we do not have a proper SchemaBuilder yet.
-// See https://github.com/delta-io/delta-kernel-rs/issues/1284
 /// Extend a schema with a statistics column and return a new SchemaRef.
 ///
 /// The stats column is of type string as required by the spec.
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
-    let fields = schema
-        .fields()
-        .cloned()
-        .chain([StructField::nullable("stats", DataType::STRING)]);
-    Arc::new(StructType::new_unchecked(fields))
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("stats", DataType::STRING))
+        .build_arc_unchecked()
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
-    let fields = schema.fields().cloned().chain([
-        StructField::nullable("baseRowId", DataType::LONG),
-        StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-    ]);
-    Arc::new(StructType::new_unchecked(fields))
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("baseRowId", DataType::LONG))
+        .add_field(StructField::nullable(
+            "defaultRowCommitVersion",
+            DataType::LONG,
+        ))
+        .build_arc_unchecked()
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
