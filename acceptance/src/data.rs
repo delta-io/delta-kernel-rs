@@ -4,11 +4,12 @@ use delta_kernel::arrow::array::{Array, RecordBatch};
 use delta_kernel::arrow::compute::{concat_batches, lexsort_to_indices, take, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, Schema};
 
+use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
 use delta_kernel::snapshot::Snapshot;
-use delta_kernel::{engine::arrow_data::ArrowEngineData, DeltaResult, Engine, Error};
+use delta_kernel::{DeltaResult, Engine, Error};
 use futures::{stream::TryStreamExt, StreamExt};
 use itertools::Itertools;
 use object_store::{local::LocalFileSystem, ObjectStore};
@@ -119,11 +120,7 @@ pub async fn assert_scan_metadata(
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| -> DeltaResult<_> {
-            let record_batch: RecordBatch = data?
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .unwrap()
-                .into();
+            let record_batch = data?.try_into_record_batch()?;
             if schema.is_none() {
                 schema = Some(record_batch.schema());
             }

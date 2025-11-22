@@ -268,7 +268,7 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
@@ -522,9 +522,7 @@ mod tests {
         let batch: RecordBatch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .map(|sd| sd.into())
+            .try_into_record_batch()
             .unwrap();
         assert_eq!(batch.column(0).len(), 1);
         let add_array = batch.column_by_name("add").unwrap().as_struct();
