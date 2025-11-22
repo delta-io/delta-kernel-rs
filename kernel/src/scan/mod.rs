@@ -13,7 +13,7 @@ use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME, SIDECAR_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -41,7 +41,7 @@ pub(crate) mod state_info;
 
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]
-static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     get_commit_schema()
         .project(&[ADD_NAME, REMOVE_NAME])
         .unwrap()
