@@ -97,6 +97,26 @@ impl ColumnName {
     pub fn into_inner(self) -> Vec<String> {
         self.path
     }
+
+    /// Returns the parent of this column name, or `None` if this is a top-level column.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use delta_kernel::expressions::ColumnName;
+    /// let path = ColumnName::new(["user", "address", "street"]);
+    /// assert_eq!(path.parent(), Some(ColumnName::new(["user", "address"])));
+    ///
+    /// let path = ColumnName::new(["user"]);
+    /// assert_eq!(path.parent(), None);
+    /// ```
+    pub fn parent(&self) -> Option<ColumnName> {
+        if self.path.len() > 1 {
+            Some(ColumnName::new(&self.path[..self.path.len() - 1]))
+        } else {
+            None
+        }
+    }
 }
 
 /// Creates a new column name from a path of field names. Each field name is taken as-is, and may
