@@ -241,7 +241,7 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         let physical_name = field.physical_name(self.column_mapping_mode);
-        self.logical_path.push(field.name.clone());
+        self.logical_path.push(field.name().clone());
         self.physical_path.push(physical_name.to_string());
         let field = self.recurse_into_struct_field(field);
         self.logical_path.pop();

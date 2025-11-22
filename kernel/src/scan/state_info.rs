@@ -174,7 +174,7 @@ impl StateInfo {
                         // if it's a normal physical column
                         let physical_field = logical_field.make_physical(column_mapping_mode);
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                        let physical_name = physical_field.name.clone();
+                        let physical_name = physical_field.name().clone();
 
                         if !logical_field.is_metadata_column()
                             && metadata_info.metadata_field_names.contains(&physical_name)
