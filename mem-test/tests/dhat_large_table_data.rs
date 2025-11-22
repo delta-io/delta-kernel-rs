@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use delta_kernel::arrow::array::{ArrayRef, Int64Array, StringArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
@@ -138,11 +138,7 @@ fn test_dhat_large_table_data() -> Result<(), Box<dyn std::error::Error>> {
     // Step 5: Execute the scan and read data
     let mut row_count = 0;
     for data in scan.execute(engine)? {
-        let batch: RecordBatch = data?
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-            .into();
+        let batch = data?.try_into_record_batch()?;
         row_count += batch.num_rows();
     }
 

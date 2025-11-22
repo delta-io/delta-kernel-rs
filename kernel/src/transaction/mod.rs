@@ -24,7 +24,7 @@ use crate::scan::log_replay::{
     BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::scan_row_schema;
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
 use crate::utils::{current_time_ms, require};
 use crate::{
@@ -66,9 +66,9 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
     );
 
-    Arc::new(StructType::new_unchecked(
-        mandatory_add_file_schema().fields().cloned().chain([stats]),
-    ))
+    StructTypeBuilder::from_schema(mandatory_add_file_schema())
+        .add_field(stats)
+        .build_arc_unchecked()
 });
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
@@ -86,30 +86,28 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
     Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
 });
 
-// NOTE: The following two methods are a workaround for the fact that we do not have a proper SchemaBuilder yet.
-// See https://github.com/delta-io/delta-kernel-rs/issues/1284
 /// Extend a schema with a statistics column and return a new SchemaRef.
 ///
 /// The stats column is of type string as required by the spec.
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
-    let fields = schema
-        .fields()
-        .cloned()
-        .chain([StructField::nullable("stats", DataType::STRING)]);
-    Arc::new(StructType::new_unchecked(fields))
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("stats", DataType::STRING))
+        .build_arc_unchecked()
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
-    let fields = schema.fields().cloned().chain([
-        StructField::nullable("baseRowId", DataType::LONG),
-        StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-    ]);
-    Arc::new(StructType::new_unchecked(fields))
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("baseRowId", DataType::LONG))
+        .add_field(StructField::nullable(
+            "defaultRowCommitVersion",
+            DataType::LONG,
+        ))
+        .build_arc_unchecked()
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -557,23 +555,9 @@ impl Transaction {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
-
-        // Compute physical schema: exclude partition columns since they're stored in the path
-        let partition_columns = self
-            .read_snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
-        let physical_fields = snapshot_schema
-            .fields()
-            .filter(|f| !partition_columns.contains(f.name()))
-            .cloned();
-        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
-
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
-            physical_schema,
             Arc::new(logical_to_physical),
         )
     }
@@ -888,22 +872,15 @@ impl Transaction {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
+    schema: SchemaRef,
     logical_to_physical: ExpressionRef,
 }
 
 impl WriteContext {
-    fn new(
-        target_dir: Url,
-        logical_schema: SchemaRef,
-        physical_schema: SchemaRef,
-        logical_to_physical: ExpressionRef,
-    ) -> Self {
+    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: ExpressionRef) -> Self {
         WriteContext {
             target_dir,
-            logical_schema,
-            physical_schema,
+            schema,
             logical_to_physical,
         }
     }
@@ -912,12 +889,8 @@ impl WriteContext {
         &self.target_dir
     }
 
-    pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
-    }
-
-    pub fn physical_schema(&self) -> &SchemaRef {
-        &self.physical_schema
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
@@ -1131,46 +1104,6 @@ mod tests {
         let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
         let abs_path3 = dv_path3.absolute_path()?;
         assert_ne!(abs_path2, abs_path3);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
-        let engine = SyncEngine::new();
-        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
-        let url = url::Url::from_directory_path(path).unwrap();
-        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
-        let txn = snapshot
-            .transaction(Box::new(FileSystemCommitter::new()))?
-            .with_engine_info("default engine");
-
-        let write_context = txn.get_write_context();
-        let logical_schema = write_context.logical_schema();
-        let physical_schema = write_context.physical_schema();
-
-        // Logical schema should include the partition column
-        assert!(
-            logical_schema.contains("letter"),
-            "Logical schema should contain partition column 'letter'"
-        );
-
-        // Physical schema should exclude the partition column
-        assert!(
-            !physical_schema.contains("letter"),
-            "Physical schema should not contain partition column 'letter' (stored in path)"
-        );
-
-        // Both should contain the non-partition columns
-        assert!(
-            logical_schema.contains("number"),
-            "Logical schema should contain data column 'number'"
-        );
-
-        assert!(
-            physical_schema.contains("number"),
-            "Physical schema should contain data column 'number'"
-        );
 
         Ok(())
     }

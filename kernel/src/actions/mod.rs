@@ -559,6 +559,33 @@ impl Protocol {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
+
+    pub(crate) fn is_cdf_supported(&self) -> bool {
+        // TODO: we should probably expand this to ~all supported reader features instead of gating
+        // on a subset here. missing ones are:
+        // - variantType
+        // - typeWidening
+        // - catalogManaged
+        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
+            vec![
+                TableFeature::DeletionVectors,
+                TableFeature::ColumnMapping,
+                TableFeature::TimestampWithoutTimezone,
+                TableFeature::V2Checkpoint,
+                TableFeature::VacuumProtocolCheck,
+            ]
+        });
+        match self.reader_features() {
+            // if min_reader_version = 3 and all reader features are subset of supported => OK
+            Some(reader_features) if self.min_reader_version() == 3 => {
+                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
+            }
+            // if min_reader_version = 1 or 2 and there are no reader features => OK
+            None => (1..=2).contains(&self.min_reader_version()),
+            // any other protocol is not supported
+            _ => false,
+        }
+    }
 }
 
 // TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
@@ -1017,13 +1044,15 @@ impl DomainMetadata {
 mod tests {
     use super::*;
     use crate::{
-        arrow::array::{
-            Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
-            MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+        arrow::{
+            array::{
+                Array, BooleanArray, Int32Array, Int64Array, ListArray, ListBuilder, MapBuilder,
+                MapFieldNames, RecordBatch, StringArray, StringBuilder, StructArray,
+            },
+            datatypes::{DataType as ArrowDataType, Field, Schema},
+            json::ReaderBuilder,
         },
-        arrow::datatypes::{DataType as ArrowDataType, Field, Schema},
-        arrow::json::ReaderBuilder,
-        engine::{arrow_data::ArrowEngineData, arrow_expression::ArrowEvaluationHandler},
+        engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
         Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
     };
@@ -1643,13 +1672,7 @@ mod tests {
 
         let engine_data =
             set_transaction.into_engine_data(SetTransaction::to_schema().into(), &engine);
-
-        let record_batch: RecordBatch = engine_data
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("appId", ArrowDataType::Utf8, false),
@@ -1678,13 +1701,7 @@ mod tests {
         let commit_info_txn_id = commit_info.txn_id.clone();
 
         let engine_data = commit_info.into_engine_data(CommitInfo::to_schema().into(), &engine);
-
-        let record_batch: RecordBatch = engine_data
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         let mut map_builder = create_string_map_builder(false);
         map_builder.append(true).unwrap();
@@ -1719,13 +1736,7 @@ mod tests {
 
         let engine_data =
             domain_metadata.into_engine_data(DomainMetadata::to_schema().into(), &engine);
-
-        let record_batch: RecordBatch = engine_data
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         let expected = RecordBatch::try_new(
             record_batch.schema(),
@@ -1878,14 +1889,11 @@ mod tests {
 
         // have to get the id since it's random
         let test_id = test_metadata.id.clone();
-
-        let actual: RecordBatch = test_metadata
+        let actual = test_metadata
             .into_engine_data(Metadata::to_schema().into(), &engine)
             .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+            .try_into_record_batch()
+            .unwrap();
 
         let expected_json = json!({
             "id": test_id,
@@ -1931,13 +1939,11 @@ mod tests {
 
         // test with the full log schema that wraps metadata in a "metaData" field
         let commit_schema = get_commit_schema().project(&[METADATA_NAME]).unwrap();
-        let actual: RecordBatch = metadata
+        let actual = metadata
             .into_engine_data(commit_schema, &engine)
             .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+            .try_into_record_batch()
+            .unwrap();
 
         let expected_json = json!({
             "metaData": {
@@ -1977,12 +1983,7 @@ mod tests {
         let engine_data = protocol
             .clone()
             .into_engine_data(Protocol::to_schema().into(), &engine);
-        let record_batch: RecordBatch = engine_data
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         let list_field = Arc::new(Field::new("element", ArrowDataType::Utf8, false));
         let protocol_fields = vec![
@@ -2069,12 +2070,7 @@ mod tests {
         )
         .unwrap();
 
-        let record_batch: RecordBatch = engine_data
-            .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         assert_eq!(record_batch, expected);
     }
@@ -2089,11 +2085,7 @@ mod tests {
         let engine_data = protocol
             .into_engine_data(Protocol::to_schema().into(), &engine)
             .unwrap();
-        let record_batch: RecordBatch = engine_data
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         assert_eq!(record_batch.num_rows(), 1);
         assert_eq!(record_batch.num_columns(), 4);
@@ -2123,11 +2115,7 @@ mod tests {
         let engine_data = protocol
             .into_engine_data(Protocol::to_schema().into(), &engine)
             .unwrap();
-        let record_batch: RecordBatch = engine_data
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .unwrap()
-            .into();
+        let record_batch = engine_data.try_into_record_batch().unwrap();
 
         assert_eq!(record_batch.num_rows(), 1);
         assert_eq!(record_batch.num_columns(), 4);
