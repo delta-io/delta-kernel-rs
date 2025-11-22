@@ -1487,7 +1487,7 @@ mod test {
             r#"Feature 'typeWidening' not supported for writes"#,
         );
 
-        // Unknown feature is not supported for writes
+        // Unknown feature is not supported for reads
         let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(
@@ -1520,6 +1520,28 @@ mod test {
         assert_result_error_with_message(
             config.ensure_write_supported(),
             "rowTracking requires domainMetadata to be supported",
+        );
+    }
+
+    #[test]
+    fn test_row_tracking_with_domain_metadata_requirement() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(
+            config.ensure_write_supported().is_ok(),
+            "RowTracking with DomainMetadata should be supported for writes"
         );
     }
 
