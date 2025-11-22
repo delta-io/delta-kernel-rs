@@ -19,6 +19,14 @@ type Handlers = HashMap<String, HandlerClosure>;
 /// The URL_REGISTRY contains the custom URL scheme handlers that will parse URL options
 static URL_REGISTRY: LazyLock<RwLock<Handlers>> = LazyLock::new(|| RwLock::new(HashMap::default()));
 
+/// Object store option for conditional copy operations.
+/// Required by the object_store library.
+const COPY_IF_NOT_EXISTS: &str = "copy_if_not_exists";
+
+/// S3 conditional copy header value.
+/// Required by AWS S3 client for copy_if_not_exists operations.
+const COPY_IF_NOT_EXISTS_HEADER: &str = "header:If-None-Match:*";
+
 /// Insert a new URL handler for [store_from_url_opts] with the given `scheme`. This allows
 /// users to provide their own custom URL handler to plug new [object_store::ObjectStore]
 /// instances into delta-kernel, which is used by [store_from_url_opts] to parse the URL.
@@ -97,10 +105,10 @@ where
     // For S3 URLs, set copy_if_not_exists header strategy by default
     // This ensures atomic copy operations work correctly with S3
     // Users can override this by explicitly passing the option
-    if url.scheme() == "s3" && !opts.contains_key("copy_if_not_exists") {
+    if url.scheme() == "s3" && !opts.contains_key(COPY_IF_NOT_EXISTS) {
         opts.insert(
-            "copy_if_not_exists".to_string(),
-            "header:If-None-Match:*".to_string(),
+            COPY_IF_NOT_EXISTS.to_string(),
+            COPY_IF_NOT_EXISTS_HEADER.to_string(),
         );
     }
 
