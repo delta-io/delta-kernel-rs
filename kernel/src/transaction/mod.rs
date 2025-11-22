@@ -9,8 +9,9 @@ use url::Url;
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
-    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
+    get_log_domain_metadata_schema, get_log_metadata_schema, get_log_protocol_schema,
+    get_log_remove_schema, get_log_txn_schema, CommitInfo, DomainMetadata, Metadata, Protocol,
+    SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -26,6 +27,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
+use crate::table_configuration::TableConfiguration;
 use crate::utils::{current_time_ms, require};
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -147,6 +149,10 @@ pub struct Transaction {
     domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // New protocol to be committed in this transaction.
+    new_protocol: Option<Protocol>,
+    // New metadata to be committed in this transaction.
+    new_metadata: Option<Metadata>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -191,6 +197,8 @@ impl Transaction {
             domain_metadata_additions: vec![],
             domain_removals: vec![],
             data_change: true,
+            new_protocol: None,
+            new_metadata: None,
         })
     }
 
@@ -262,7 +270,29 @@ impl Transaction {
             .into_iter()
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
-        // Step 2: Construct commit info with ICT if enabled
+        // Step 2: Validate Protocol and Metadata updates if present
+        let commit_version = self.read_snapshot.version() + 1;
+        let new_protocol = self.new_protocol.clone();
+        let new_metadata = self.new_metadata.clone();
+        if new_protocol.is_some() || new_metadata.is_some() {
+            let final_protocol = new_protocol
+                .as_ref()
+                .unwrap_or_else(|| self.read_snapshot.table_configuration().protocol())
+                .clone();
+            let final_metadata = new_metadata
+                .as_ref()
+                .unwrap_or_else(|| self.read_snapshot.table_configuration().metadata())
+                .clone();
+
+            TableConfiguration::try_new(
+                final_metadata,
+                final_protocol,
+                self.read_snapshot.table_root().clone(),
+                commit_version,
+            )?;
+        }
+
+        // Step 3: Construct commit info with ICT if enabled
         let in_commit_timestamp =
             self.read_snapshot
                 .get_in_commit_timestamp(engine)?
@@ -281,19 +311,28 @@ impl Transaction {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
-        let commit_version = self.read_snapshot.version() + 1;
+        // Step 4: Convert Protocol and Metadata to EngineData if present
+        let protocol_action = new_protocol
+            .map(|p| p.into_engine_data(get_log_protocol_schema().clone(), engine))
+            .transpose()?;
+        let metadata_action = new_metadata
+            .map(|m| m.into_engine_data(get_log_metadata_schema().clone(), engine))
+            .transpose()?;
+
+        // Step 5: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
 
-        // Step 4: Generate all domain metadata actions (user and system domains)
+        // Step 6: Generate all domain metadata actions (user and system domains)
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Generate remove actions
+        // Step 7: Generate remove actions
         let remove_actions = self.generate_remove_actions(engine)?;
 
         let actions = iter::once(commit_info_action)
+            .chain(protocol_action.into_iter().map(Ok))
+            .chain(metadata_action.into_iter().map(Ok))
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
@@ -302,7 +341,7 @@ impl Transaction {
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
             .chain(remove_actions);
 
-        // Step 6: Commit via the committer
+        // Step 8: Commit via the committer
         #[cfg(feature = "catalog-managed")]
         if self.committer.any_ref().is::<FileSystemCommitter>()
             && self
@@ -403,6 +442,20 @@ impl Transaction {
     /// Removing metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
         self.domain_removals.push(domain);
+        self
+    }
+
+    /// Update the protocol for this transaction.
+    /// The new protocol will be validated during commit to ensure it is compatible with the metadata.
+    pub fn update_protocol(mut self, protocol: Protocol) -> Self {
+        self.new_protocol = Some(protocol);
+        self
+    }
+
+    /// Update the metadata for this transaction.
+    /// The new metadata will be validated during commit to ensure it is compatible with the protocol.
+    pub fn update_metadata(mut self, metadata: Metadata) -> Self {
+        self.new_metadata = Some(metadata);
         self
     }
 

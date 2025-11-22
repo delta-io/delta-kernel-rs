@@ -123,6 +123,20 @@ static LOG_DOMAIN_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+static LOG_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        METADATA_NAME,
+        Metadata::to_schema(),
+    )]))
+});
+
+static LOG_PROTOCOL_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        PROTOCOL_NAME,
+        Protocol::to_schema(),
+    )]))
+});
+
 #[internal_api]
 /// Gets the schema for all actions that can appear in commits
 /// logs.  This excludes actions that can only appear in checkpoints.
@@ -156,6 +170,14 @@ pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_domain_metadata_schema() -> &'static SchemaRef {
     &LOG_DOMAIN_METADATA_SCHEMA
+}
+
+pub(crate) fn get_log_metadata_schema() -> &'static SchemaRef {
+    &LOG_METADATA_SCHEMA
+}
+
+pub(crate) fn get_log_protocol_schema() -> &'static SchemaRef {
+    &LOG_PROTOCOL_SCHEMA
 }
 
 /// Returns true if the schema contains file actions (add or remove)
