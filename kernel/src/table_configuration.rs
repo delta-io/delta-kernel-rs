@@ -452,67 +452,6 @@ impl TableConfiguration {
                 .unwrap_or(false)
     }
 
-    /// Returns `true` if the table supports the appendOnly table feature. To support this feature:
-    /// - The table must have a writer version between 2 and 7 (inclusive)
-    /// - If the table is on writer version 7, it must have the [`TableFeature::AppendOnly`]
-    ///   writer feature.
-    pub(crate) fn is_append_only_supported(&self) -> bool {
-        let protocol = &self.protocol;
-        match protocol.min_writer_version() {
-            7 if protocol.has_table_feature(&TableFeature::AppendOnly) => true,
-            version => (2..=6).contains(&version),
-        }
-    }
-
-    #[allow(unused)]
-    pub(crate) fn is_append_only_enabled(&self) -> bool {
-        self.is_append_only_supported() && self.table_properties.append_only.unwrap_or(false)
-    }
-
-    /// Returns `true` if the table supports the column invariant table feature.
-    #[allow(unused)]
-    pub(crate) fn is_invariants_supported(&self) -> bool {
-        let protocol = &self.protocol;
-        match protocol.min_writer_version() {
-            7 if protocol.has_table_feature(&TableFeature::Invariants) => true,
-            version => (2..=6).contains(&version),
-        }
-    }
-
-    /// Returns `true` if V2 checkpoint is supported on this table. To support V2 checkpoint,
-    /// a table must support reader version 3, writer version 7, and the v2Checkpoint feature in
-    /// both the protocol's readerFeatures and writerFeatures.
-    ///
-    /// See: <https://github.com/delta-io/delta/blob/master/PROTOCOL.md#v2-checkpoint-table-feature>
-    pub(crate) fn is_v2_checkpoint_write_supported(&self) -> bool {
-        self.protocol()
-            .has_table_feature(&TableFeature::V2Checkpoint)
-    }
-
-    /// Returns `true` if the table supports writing in-commit timestamps.
-    ///
-    /// To support this feature the table must:
-    /// - Have a min_writer_version of 7
-    /// - Have the [`TableFeature::InCommitTimestamp`] writer feature.
-    #[allow(unused)]
-    pub(crate) fn is_in_commit_timestamps_supported(&self) -> bool {
-        self.protocol().min_writer_version() == 7
-            && self
-                .protocol()
-                .has_table_feature(&TableFeature::InCommitTimestamp)
-    }
-
-    /// Returns `true` if in-commit timestamps is supported and it is enabled. In-commit timestamps
-    /// is enabled when the `delta.enableInCommitTimestamps` configuration is set to `true`.
-    #[allow(unused)]
-    pub(crate) fn is_in_commit_timestamps_enabled(&self) -> bool {
-        self.is_in_commit_timestamps_supported()
-            && self
-                .table_properties()
-                .enable_in_commit_timestamps
-                .unwrap_or(false)
-    }
-
     /// Returns information about in-commit timestamp enablement state.
     ///
     /// Returns an error if only one of the enablement properties is present, as this indicates
@@ -521,7 +460,7 @@ impl TableConfiguration {
     pub(crate) fn in_commit_timestamp_enablement(
         &self,
     ) -> DeltaResult<InCommitTimestampEnablement> {
-        if !self.is_in_commit_timestamps_enabled() {
+        if !self.is_feature_enabled(&TableFeature::InCommitTimestamp) {
             return Ok(InCommitTimestampEnablement::NotEnabled);
         }
 
@@ -548,42 +487,6 @@ impl TableConfiguration {
         }
     }
 
-    /// Returns `true` if the table supports writing domain metadata.
-    ///
-    /// To support this feature the table must:
-    /// - Have a min_writer_version of 7.
-    /// - Have the [`TableFeature::DomainMetadata`] writer feature.
-    #[allow(unused)]
-    pub(crate) fn is_domain_metadata_supported(&self) -> bool {
-        self.protocol().min_writer_version() == 7
-            && self
-                .protocol()
-                .has_table_feature(&TableFeature::DomainMetadata)
-    }
-
-    /// Returns `true` if the table supports writing row tracking metadata.
-    ///
-    /// To support this feature the table must:
-    /// - Have a min_writer_version of 7.
-    /// - Have the [`TableFeature::RowTracking`] writer feature.
-    pub(crate) fn is_row_tracking_supported(&self) -> bool {
-        self.protocol().min_writer_version() == 7
-            && self
-                .protocol()
-                .has_table_feature(&TableFeature::RowTracking)
-    }
-
-    /// Returns `true` if row tracking is enabled for this table.
-    ///
-    /// In order to enable row tracking the table must:
-    /// - Support row tracking (see [`Self::is_row_tracking_supported`]).
-    /// - Have the `delta.enableRowTracking` table property set to `true`.
-    #[allow(unused)]
-    pub(crate) fn is_row_tracking_enabled(&self) -> bool {
-        self.is_row_tracking_supported()
-            && self.table_properties().enable_row_tracking.unwrap_or(false)
-    }
-
     /// Returns `true` if row tracking is suspended for this table.
     ///
     /// Row tracking is suspended when the `delta.rowTrackingSuspended` table property is set to `true`.
@@ -605,7 +508,7 @@ impl TableConfiguration {
     /// Note: We ignore [`is_row_tracking_enabled`] at this point because Kernel does not
     /// preserve row IDs and row commit versions yet.
     pub(crate) fn should_write_row_tracking(&self) -> bool {
-        self.is_row_tracking_supported() && !self.is_row_tracking_suspended()
+        self.is_feature_supported(&TableFeature::RowTracking) && !self.is_row_tracking_suspended()
     }
 
     /// Returns true if the protocol uses legacy reader version (< 3)
@@ -949,8 +852,8 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
+        assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         // When ICT is enabled from table creation (version 0), it's perfectly normal
         // for enablement properties to be missing
         let info = table_config.in_commit_timestamp_enablement().unwrap();
@@ -993,8 +896,8 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
+        assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
         assert_eq!(
             info,
@@ -1034,8 +937,8 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(table_config.is_in_commit_timestamps_enabled());
+        assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
+        assert!(table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         assert!(matches!(
             table_config.in_commit_timestamp_enablement(),
             Err(Error::Generic(msg)) if msg.contains("In-commit timestamp enabled, but enablement timestamp is missing")
@@ -1054,8 +957,8 @@ mod test {
         .unwrap();
         let table_root = Url::try_from("file:///").unwrap();
         let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
-        assert!(table_config.is_in_commit_timestamps_supported());
-        assert!(!table_config.is_in_commit_timestamps_enabled());
+        assert!(table_config.is_feature_supported(&TableFeature::InCommitTimestamp));
+        assert!(!table_config.is_feature_enabled(&TableFeature::InCommitTimestamp));
         let info = table_config.in_commit_timestamp_enablement().unwrap();
         assert_eq!(info, InCommitTimestampEnablement::NotEnabled);
     }
