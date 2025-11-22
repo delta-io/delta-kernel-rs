@@ -547,6 +547,43 @@ pub struct StructType {
     metadata_columns: HashMap<MetadataColumnSpec, usize>,
 }
 
+pub struct StructTypeBuilder {
+    fields: IndexMap<String, StructField>,
+}
+
+impl Default for StructTypeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StructTypeBuilder {
+    pub fn new() -> Self {
+        Self {
+            fields: IndexMap::new(),
+        }
+    }
+
+    pub fn from_schema(schema: &StructType) -> Self {
+        Self {
+            fields: schema.fields.clone(),
+        }
+    }
+
+    pub fn add_field(mut self, field: StructField) -> Self {
+        self.fields.insert(field.name.clone(), field);
+        self
+    }
+
+    pub fn build(self) -> DeltaResult<StructType> {
+        StructType::try_new(self.fields.into_values())
+    }
+
+    pub fn build_arc_unchecked(self) -> Arc<StructType> {
+        Arc::new(StructType::new_unchecked(self.fields.into_values()))
+    }
+}
+
 impl StructType {
     /// Creates a new [`StructType`] from the given fields.
     ///
@@ -598,6 +635,10 @@ impl StructType {
             .into_iter()
             .map(|result| result.map_err(Into::into))
             .process_results(|iter| Self::try_new(iter))?
+    }
+
+    pub fn builder() -> StructTypeBuilder {
+        StructTypeBuilder::new()
     }
 
     /// Creates a new [`StructType`] from the given fields without validating them.
@@ -3157,5 +3198,39 @@ mod tests {
 └─row_commit_version: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_commit_version\")})
 ");
         Ok(())
+    }
+
+    #[test]
+    fn test_builder_empty() {
+        let schema = StructType::builder().build().unwrap();
+        assert_eq!(schema.num_fields(), 0)
+    }
+
+    #[test]
+    fn test_builder_add_fields() {
+        let schema = StructType::builder()
+            .add_field(StructField::new("id", DataType::INTEGER, false))
+            .add_field(StructField::new("name", DataType::STRING, true))
+            .build()
+            .unwrap();
+
+        assert_eq!(schema.num_fields(), 2);
+        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_builder_from_schema() {
+        let base_schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+
+        let extended_schema = StructTypeBuilder::from_schema(&base_schema)
+            .add_field(StructField::new("name", DataType::STRING, true))
+            .build()
+            .unwrap();
+
+        assert_eq!(extended_schema.num_fields(), 2);
+        assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
     }
 }
