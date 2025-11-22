@@ -447,14 +447,18 @@ impl Transaction {
 
     /// Update the protocol for this transaction.
     /// The new protocol will be validated during commit to ensure it is compatible with the metadata.
-    pub fn update_protocol(mut self, protocol: Protocol) -> Self {
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn update_protocol(mut self, protocol: Protocol) -> Self {
         self.new_protocol = Some(protocol);
         self
     }
 
     /// Update the metadata for this transaction.
     /// The new metadata will be validated during commit to ensure it is compatible with the protocol.
-    pub fn update_metadata(mut self, metadata: Metadata) -> Self {
+    #[internal_api]
+    #[allow(dead_code)]
+    pub(crate) fn update_metadata(mut self, metadata: Metadata) -> Self {
         self.new_metadata = Some(metadata);
         self
     }
