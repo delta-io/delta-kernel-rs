@@ -11,6 +11,7 @@ use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -28,7 +29,7 @@ use url::Url;
 
 mod common;
 
-use test_utils::{load_test_data, to_arrow};
+use test_utils::load_test_data;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
@@ -172,7 +173,7 @@ async fn latest_snapshot_test(
     let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
-        .map(|result| -> DeltaResult<_> { to_arrow(result?) })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;

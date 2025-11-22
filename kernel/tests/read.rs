@@ -7,6 +7,7 @@ use delta_kernel::arrow::array::AsArray as _;
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
@@ -23,8 +24,8 @@ use itertools::Itertools;
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use test_utils::{
     actions_to_string, add_commit, generate_batch, generate_simple_batch, into_record_batch,
-    load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, to_arrow,
-    IntoArray, TestAction, METADATA,
+    load_test_data, read_scan, record_batch_to_bytes, record_batch_to_bytes_with_props, IntoArray,
+    TestAction, METADATA,
 };
 use url::Url;
 
@@ -389,7 +390,7 @@ fn read_with_scan_metadata(
                 scan_file.transform.clone(),
             )
             .unwrap();
-            let record_batch = to_arrow(logical).unwrap();
+            let record_batch = logical.try_into_record_batch()?;
             let rest = split_vector(selection_vector.as_mut(), len, Some(true));
             let batch = if let Some(mask) = selection_vector.clone() {
                 // apply the selection vector

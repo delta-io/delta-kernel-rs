@@ -3,9 +3,9 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use delta_kernel::arrow::array::{Array, ArrayData, RecordBatch, StructArray};
+use delta_kernel::arrow::array::{Array, ArrayData, StructArray};
 use delta_kernel::arrow::ffi::to_ffi;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::scan::TableChangesScan;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::EngineData;
@@ -319,11 +319,7 @@ fn scan_table_changes_next_impl(data: &ScanTableChangesIterator) -> DeltaResult<
         return Ok(ArrowFFIData::empty());
     };
 
-    let record_batch: RecordBatch = data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into();
+    let record_batch = data.try_into_record_batch()?;
 
     let batch_struct_array: StructArray = record_batch.into();
     let array_data: ArrayData = batch_struct_array.into_data();
@@ -346,6 +342,7 @@ mod tests {
     use delta_kernel::arrow::record_batch::RecordBatch;
     use delta_kernel::arrow::util::pretty::pretty_format_batches;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
+    use delta_kernel::engine::arrow_data::ArrowEngineData;
     use delta_kernel::engine::default::DefaultEngine;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;
@@ -355,7 +352,7 @@ mod tests {
     use std::sync::Arc;
     use test_utils::{
         actions_to_string_with_metadata, add_commit, generate_batch, record_batch_to_bytes,
-        to_arrow, IntoArray as _, TestAction,
+        IntoArray as _, TestAction,
     };
 
     const PARQUET_FILE1: &str =
@@ -480,7 +477,7 @@ mod tests {
     ) -> DeltaResult<Vec<RecordBatch>> {
         let scan_results = scan.execute(engine)?;
         scan_results
-            .map(|data| -> DeltaResult<_> { to_arrow(data?) })
+            .map(EngineDataArrowExt::try_into_record_batch)
             .try_collect()
     }
 
@@ -699,7 +696,7 @@ mod tests {
             }
             let engine_data =
                 ok_or_panic(unsafe { get_engine_data(data.array, &data.schema, allocate_err) });
-            let record_batch = unsafe { to_arrow(engine_data.into_inner()) }?;
+            let record_batch = unsafe { engine_data.into_inner().try_into_record_batch() }?;
 
             println!("Batch ({i}) num rows {:?}", record_batch.num_rows());
             batches.push(record_batch);

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::{DeltaResult, Snapshot};
 
 use clap::Parser;
@@ -49,15 +49,7 @@ fn try_main() -> DeltaResult<()> {
     let mut rows_so_far = 0;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|data| -> DeltaResult<_> {
-            // extract the batches and filter them if they have deletion vectors
-            let record_batch: RecordBatch = data?
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-                .into();
-            Ok(record_batch)
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .scan(&mut rows_so_far, |rows_so_far, record_batch| {
             // handle truncation if we've specified a limit
             let Ok(batch) = record_batch else {
