@@ -102,14 +102,6 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    if fields.len() != output_schema.num_fields() {
-        return Err(Error::generic(format!(
-            "Struct expression field count mismatch: {} fields in expression but {} in schema",
-            fields.len(),
-            output_schema.num_fields()
-        )));
-    }
-
     let output_cols: Vec<ArrayRef> = fields
         .iter()
         .zip(output_schema.fields())
@@ -937,49 +929,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Data type is required"));
-    }
-
-    #[test]
-    fn test_struct_expression_schema_validation() {
-        let batch = create_test_batch();
-
-        let test_cases = vec![
-            (
-                "too many schema fields",
-                Expr::Struct(vec![column_expr_ref!("a"), column_expr_ref!("b")]),
-                StructType::new_unchecked(vec![
-                    StructField::not_null("a", DataType::INTEGER),
-                    StructField::not_null("b", DataType::INTEGER),
-                    StructField::not_null("c", DataType::INTEGER),
-                ]),
-            ),
-            (
-                "too few schema fields",
-                Expr::Struct(vec![
-                    column_expr_ref!("a"),
-                    column_expr_ref!("b"),
-                    column_expr_ref!("c"),
-                ]),
-                StructType::new_unchecked(vec![
-                    StructField::not_null("a", DataType::INTEGER),
-                    StructField::not_null("b", DataType::INTEGER),
-                ]),
-            ),
-        ];
-
-        for (name, expr, schema) in test_cases {
-            let result =
-                evaluate_expression(&expr, &batch, Some(&DataType::Struct(Box::new(schema))));
-            assert!(result.is_err(), "Test case '{}' should fail", name);
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("field count mismatch"),
-                "Test case '{}' should contain 'field count mismatch' error",
-                name
-            );
-        }
     }
 
     #[test]
