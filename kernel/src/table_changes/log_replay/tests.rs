@@ -138,8 +138,8 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
+                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
             )
             .unwrap(),
         )])
@@ -157,7 +157,7 @@ async fn unsupported_reader_feature() {
     assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
 }
 #[tokio::test]
-async fn column_mapping_should_fail() {
+async fn column_mapping_should_succeed() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
@@ -190,7 +190,8 @@ async fn column_mapping_should_fail() {
             .unwrap()
             .try_collect();
 
-    assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
+    // Column mapping with CDF should now succeed
+    assert!(res.is_ok(), "CDF should now support column mapping");
 }
 
 // Note: This should be removed once type widening support is added for CDF
