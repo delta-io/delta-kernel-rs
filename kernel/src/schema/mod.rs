@@ -132,7 +132,7 @@ pub enum MetadataColumnSpec {
     RowIndex,
     RowId,
     RowCommitVersion,
-    FileName,
+    FilePath,
 }
 
 impl MetadataColumnSpec {
@@ -142,7 +142,7 @@ impl MetadataColumnSpec {
             Self::RowIndex => "row_index",
             Self::RowId => "row_id",
             Self::RowCommitVersion => "row_commit_version",
-            Self::FileName => "_file",
+            Self::FilePath => "_file",
         }
     }
 
@@ -152,7 +152,7 @@ impl MetadataColumnSpec {
             Self::RowIndex => DataType::LONG,
             Self::RowId => DataType::LONG,
             Self::RowCommitVersion => DataType::LONG,
-            Self::FileName => DataType::STRING,
+            Self::FilePath => DataType::STRING,
         }
     }
 
@@ -162,14 +162,14 @@ impl MetadataColumnSpec {
             Self::RowIndex => false,
             Self::RowId => false,
             Self::RowCommitVersion => false,
-            Self::FileName => false,
+            Self::FilePath => false,
         }
     }
 
     /// The reserved field ID for the specified metadata column, if any.
     pub fn reserved_field_id(&self) -> Option<i64> {
         match self {
-            Self::FileName => Some(crate::reserved_field_ids::FILE_NAME),
+            Self::FilePath => Some(crate::reserved_field_ids::FILE_NAME),
             _ => None,
         }
     }
@@ -183,7 +183,7 @@ impl FromStr for MetadataColumnSpec {
             "row_index" => Ok(Self::RowIndex),
             "row_id" => Ok(Self::RowId),
             "row_commit_version" => Ok(Self::RowCommitVersion),
-            "_file" => Ok(Self::FileName),
+            "_file" => Ok(Self::FilePath),
             _ => Err(Error::Schema(format!("Unknown metadata column spec: {s}"))),
         }
     }

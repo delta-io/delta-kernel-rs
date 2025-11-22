@@ -695,9 +695,9 @@ pub trait ParquetHandler: AsAny {
     /// ])?;
     ///
     /// // Example 2: Schema with _file metadata column (using reserved field ID)
-    /// let schema_with_file_name = StructType::try_new([
+    /// let schema_with_file_path = StructType::try_new([
     ///     StructField::nullable("id", DataType::INTEGER),
-    ///     StructField::create_metadata_column("_file", MetadataColumnSpec::FileName),
+    ///     StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
     ///     StructField::nullable("value", DataType::STRING),
     /// ])?;
     /// ```

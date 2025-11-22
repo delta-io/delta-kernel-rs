@@ -79,7 +79,8 @@ where
         .into_iter()
         // Produces Iterator<DeltaResult<Iterator<DeltaResult<ArrowEngineData>>>>
         .map(move |file| {
-            let location = file.location.clone();
+            let location_string = file.location.to_string();
+            let location = file.location;
             debug!("Reading {location:#?} with schema {schema:#?} and predicate {predicate:#?}");
             let path = location
                 .to_file_path()
@@ -89,7 +90,7 @@ where
                 schema.clone(),
                 arrow_schema.clone(),
                 predicate.clone(),
-                location.to_string(),
+                location_string,
             )
         })
         // Flatten to Iterator<DeltaResult<DeltaResult<ArrowEngineData>>>

@@ -81,8 +81,8 @@ fn validate_metadata_columns<'a>(
                 metadata_info.materialized_row_id_column_name = Some(row_id_col);
             }
             Some(MetadataColumnSpec::RowCommitVersion) => {}
-            Some(MetadataColumnSpec::FileName) => {
-                // FileName metadata column is handled by the parquet reader
+            Some(MetadataColumnSpec::FilePath) => {
+                // FilePath metadata column is handled by the parquet reader
             }
             None => {}
         }
@@ -173,9 +173,9 @@ impl StateInfo {
                         return Err(Error::unsupported("Row commit versions not supported"));
                     }
                     Some(MetadataColumnSpec::RowIndex)
-                    | Some(MetadataColumnSpec::FileName)
+                    | Some(MetadataColumnSpec::FilePath)
                     | None => {
-                        // note that RowIndex and FileName are handled in the parquet reader so we just add them as
+                        // note that RowIndex and FilePath are handled in the parquet reader so we just add them as
                         // if they're normal physical columns
                         let physical_field = logical_field.make_physical(column_mapping_mode);
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");

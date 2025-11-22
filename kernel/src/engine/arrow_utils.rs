@@ -308,8 +308,8 @@ pub(crate) enum ReorderIndexTransform {
     Missing(ArrowFieldRef),
     /// Row index column requested, compute it
     RowIndex(ArrowFieldRef),
-    /// File name column requested, populate with file path
-    FileName(ArrowFieldRef),
+    /// File path column requested, populate with file path
+    FilePath(ArrowFieldRef),
 }
 
 impl ReorderIndex {
@@ -337,19 +337,19 @@ impl ReorderIndex {
         ReorderIndex::new(index, ReorderIndexTransform::RowIndex(field))
     }
 
-    fn file_name(index: usize, field: ArrowFieldRef) -> Self {
-        ReorderIndex::new(index, ReorderIndexTransform::FileName(field))
+    fn file_path(index: usize, field: ArrowFieldRef) -> Self {
+        ReorderIndex::new(index, ReorderIndexTransform::FilePath(field))
     }
 
     /// Check if this reordering requires a transformation anywhere. See comment below on
     /// [`ordering_needs_transform`] to understand why this is needed.
     fn needs_transform(&self) -> bool {
         match self.transform {
-            // if we're casting, inserting null, or generating row index/file name, we need to transform
+            // if we're casting, inserting null, or generating row index/file path, we need to transform
             ReorderIndexTransform::Cast(_)
             | ReorderIndexTransform::Missing(_)
             | ReorderIndexTransform::RowIndex(_)
-            | ReorderIndexTransform::FileName(_) => true,
+            | ReorderIndexTransform::FilePath(_) => true,
             // if our nested ordering needs a transform, we need a transform
             ReorderIndexTransform::Nested(ref children) => ordering_needs_transform(children),
             // no transform needed
@@ -604,9 +604,9 @@ fn get_indices(
                             Arc::new(field.try_into_arrow()?),
                         ));
                     }
-                    Some(MetadataColumnSpec::FileName) => {
-                        debug!("Inserting a file name column: {}", field.name());
-                        reorder_indices.push(ReorderIndex::file_name(
+                    Some(MetadataColumnSpec::FilePath) => {
+                        debug!("Inserting a file path column: {}", field.name());
+                        reorder_indices.push(ReorderIndex::file_path(
                             requested_position,
                             Arc::new(field.try_into_arrow()?),
                         ));
@@ -781,8 +781,8 @@ type FieldArrayOpt = Option<(Arc<ArrowField>, Arc<dyn ArrowArray>)>;
 ///
 /// If the requested ordering contains a [`ReorderIndexTransform::RowIndex`], `row_indexes`
 /// must not be `None` to append a row index column to the output.
-/// If the requested ordering contains a [`ReorderIndexTransform::FileName`], `file_location`
-/// must not be `None` to append a file name column to the output.
+/// If the requested ordering contains a [`ReorderIndexTransform::FilePath`], `file_location`
+/// must not be `None` to append a file path column to the output.
 pub(crate) fn reorder_struct_array(
     input_data: StructArray,
     requested_ordering: &[ReorderIndex],
@@ -886,26 +886,26 @@ pub(crate) fn reorder_struct_array(
                     final_fields_cols[reorder_index.index] =
                         Some((Arc::clone(field), Arc::new(row_index_array)));
                 }
-                ReorderIndexTransform::FileName(field) => {
+                ReorderIndexTransform::FilePath(field) => {
                     let Some(file_path) = file_location else {
                         return Err(Error::generic(
-                            "File name column requested but file location not provided",
+                            "File path column requested but file location not provided",
                         ));
                     };
-                    // Use run-end encoding for efficiency since the file name is constant for all rows
+                    // Use run-end encoding for efficiency since the file path is constant for all rows
                     // Run-end encoding stores: [run_ends: [num_rows], values: [file_path]]
                     let run_ends = PrimitiveArray::<Int64Type>::from_iter_values([num_rows as i64]);
                     let values = StringArray::from_iter_values([file_path]);
-                    let file_name_array = RunArray::try_new(&run_ends, &values)?;
+                    let file_path_array = RunArray::try_new(&run_ends, &values)?;
 
                     // Create a field with the RunEndEncoded data type to match the array
                     let ree_field = Arc::new(ArrowField::new(
                         field.name(),
-                        file_name_array.data_type().clone(),
+                        file_path_array.data_type().clone(),
                         field.is_nullable(),
                     ));
                     final_fields_cols[reorder_index.index] =
-                        Some((ree_field, Arc::new(file_name_array)));
+                        Some((ree_field, Arc::new(file_path_array)));
                 }
             }
         }
@@ -1897,10 +1897,10 @@ mod tests {
     }
 
     #[test]
-    fn simple_file_name_field() {
+    fn simple_file_path_field() {
         let requested_schema = Arc::new(StructType::new_unchecked([
             StructField::not_null("i", DataType::INTEGER),
-            StructField::create_metadata_column("_file", MetadataColumnSpec::FileName),
+            StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
             StructField::nullable("i2", DataType::INTEGER),
         ]));
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
@@ -1910,27 +1910,27 @@ mod tests {
         let (mask_indices, reorder_indices) =
             get_requested_indices(&requested_schema, &parquet_schema).unwrap();
         let expect_mask = vec![0, 1];
-        let mut arrow_file_name_field = ArrowField::new("_file", ArrowDataType::Utf8, false);
-        arrow_file_name_field.set_metadata(HashMap::from([(
+        let mut arrow_file_path_field = ArrowField::new("_file", ArrowDataType::Utf8, false);
+        arrow_file_path_field.set_metadata(HashMap::from([(
             "delta.metadataSpec".to_string(),
             "_file".to_string(),
         )]));
         let expect_reorder = vec![
             ReorderIndex::identity(0),
             ReorderIndex::identity(2),
-            ReorderIndex::file_name(1, Arc::new(arrow_file_name_field)),
+            ReorderIndex::file_path(1, Arc::new(arrow_file_path_field)),
         ];
         assert_eq!(mask_indices, expect_mask);
         assert_eq!(reorder_indices, expect_reorder);
     }
 
     #[test]
-    fn test_reorder_struct_array_with_file_name() {
-        // Test that file names work when properly provided
+    fn test_reorder_struct_array_with_file_path() {
+        // Test that file paths work when properly provided
         let arry = make_struct_array();
         let reorder = vec![
             ReorderIndex::identity(0),
-            ReorderIndex::file_name(
+            ReorderIndex::file_path(
                 1,
                 Arc::new(ArrowField::new("_file", ArrowDataType::Utf8, false)),
             ),
@@ -1940,11 +1940,11 @@ mod tests {
         let ordered = reorder_struct_array(arry, &reorder, None, Some(file_location)).unwrap();
         assert_eq!(ordered.column_names(), vec!["b", "_file"]);
 
-        // Verify the file name column is run-end encoded and contains the expected value
-        let file_name_col = ordered.column(1);
+        // Verify the file path column is run-end encoded and contains the expected value
+        let file_path_col = ordered.column(1);
 
         // Check it's a RunArray<Int64Type, StringArray>
-        let run_array = file_name_col
+        let run_array = file_path_col
             .as_any()
             .downcast_ref::<RunArray<Int64Type>>()
             .expect("Expected RunArray");
@@ -1964,12 +1964,12 @@ mod tests {
     }
 
     #[test]
-    fn test_reorder_struct_array_missing_file_name() {
-        // Test that error occurs when file name is requested but not provided
+    fn test_reorder_struct_array_missing_file_path() {
+        // Test that error occurs when file path is requested but not provided
         let arry = make_struct_array();
         let reorder = vec![
             ReorderIndex::identity(0),
-            ReorderIndex::file_name(
+            ReorderIndex::file_path(
                 1,
                 Arc::new(ArrowField::new("_file", ArrowDataType::Utf8, false)),
             ),
@@ -1978,7 +1978,7 @@ mod tests {
         let result = reorder_struct_array(arry, &reorder, None, None);
         assert_result_error_with_message(
             result,
-            "File name column requested but file location not provided",
+            "File path column requested but file location not provided",
         );
     }
 
