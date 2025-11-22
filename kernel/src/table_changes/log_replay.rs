@@ -19,8 +19,8 @@ use crate::schema::{
     ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
     ToSchema as _,
 };
+use crate::table_changes::check_cdf_table_properties;
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
@@ -180,8 +180,10 @@ impl LogReplayScanner {
             visitor.visit_rows_of(actions.as_ref())?;
 
             if let Some(protocol) = visitor.protocol {
-                ensure_cdf_read_supported(&protocol)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
+                protocol
+                    .is_cdf_supported()
+                    .then_some(())
+                    .ok_or_else(|| Error::change_data_feed_unsupported(commit_file.version))?;
             }
             if let Some((schema, configuration)) = visitor.metadata_info {
                 let schema: StructType = serde_json::from_str(&schema)?;

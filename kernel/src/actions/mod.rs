@@ -559,6 +559,33 @@ impl Protocol {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
+
+    pub(crate) fn is_cdf_supported(&self) -> bool {
+        // TODO: we should probably expand this to ~all supported reader features instead of gating
+        // on a subset here. missing ones are:
+        // - variantType
+        // - typeWidening
+        // - catalogManaged
+        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
+            vec![
+                TableFeature::DeletionVectors,
+                TableFeature::ColumnMapping,
+                TableFeature::TimestampWithoutTimezone,
+                TableFeature::V2Checkpoint,
+                TableFeature::VacuumProtocolCheck,
+            ]
+        });
+        match self.reader_features() {
+            // if min_reader_version = 3 and all reader features are subset of supported => OK
+            Some(reader_features) if self.min_reader_version() == 3 => {
+                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
+            }
+            // if min_reader_version = 1 or 2 and there are no reader features => OK
+            None => (1..=2).contains(&self.min_reader_version()),
+            // any other protocol is not supported
+            _ => false,
+        }
+    }
 }
 
 // TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)

@@ -36,12 +36,10 @@ use std::sync::{Arc, LazyLock};
 use scan::TableChangesScanBuilder;
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -253,38 +251,13 @@ impl TableChanges {
 
 /// Ensures that change data feed is enabled in `table_properties`. See the documentation
 /// of [`TableChanges`] for more details.
+// TODO: move to TableProperties and normalize with the check in TableConfiguration
 fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult<()> {
     require!(
         table_properties.enable_change_data_feed.unwrap_or(false),
         Error::unsupported("Change data feed is not enabled")
     );
-    require!(
-        matches!(
-            table_properties.column_mapping_mode,
-            None | Some(ColumnMappingMode::None)
-        ),
-        Error::unsupported("Change data feed not supported when column mapping is enabled")
-    );
     Ok(())
-}
-
-/// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
-/// See the documentation of [`TableChanges`] for more details.
-fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
-    static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> =
-        LazyLock::new(|| vec![TableFeature::DeletionVectors]);
-    match &protocol.reader_features() {
-        // if min_reader_version = 3 and all reader features are subset of supported => OK
-        Some(reader_features) if protocol.min_reader_version() == 3 => {
-            ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES)
-        }
-        // if min_reader_version = 1 and there are no reader features => OK
-        None if protocol.min_reader_version() == 1 => Ok(()),
-        // any other protocol is not supported
-        _ => Err(Error::unsupported(
-            "Change data feed not supported on this protocol",
-        )),
-    }
 }
 
 #[cfg(test)]
