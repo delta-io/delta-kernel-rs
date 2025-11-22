@@ -16,7 +16,7 @@ use uuid::Uuid;
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
@@ -317,7 +317,7 @@ async fn read_and_display_data(
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|data| -> DeltaResult<_> { data?.try_into_record_batch() })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
     print_batches(&batches)?;
