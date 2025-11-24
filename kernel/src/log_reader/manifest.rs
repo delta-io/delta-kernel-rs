@@ -1,4 +1,4 @@
-//! Manifest phase for log replay - processes single-part checkpoint manifest files.
+//! Manifest phase for log replay - processes single-part checkpoints and manifest checkpoints.
 
 use std::sync::{Arc, LazyLock};
 
@@ -14,9 +14,8 @@ use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 
-/// Phase that processes single-part checkpoint manifest files.
-///
-/// Extracts sidecar references while processing the manifest.
+/// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
+/// and extracts the sidecar actions during iteration.
 #[allow(unused)]
 pub(crate) struct ManifestPhase {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
@@ -28,8 +27,8 @@ pub(crate) struct ManifestPhase {
 /// Possible transitions after ManifestPhase completes.
 #[allow(unused)]
 pub(crate) enum AfterManifest {
-    /// Has sidecars → return sidecar files
-    Sidecars { sidecars: Vec<FileMeta> },
+    /// Sidecars extracted from the manifest phase
+    Sidecars(Vec<FileMeta>),
     /// No sidecars
     Done,
 }
@@ -108,7 +107,7 @@ impl ManifestPhase {
         if sidecars.is_empty() {
             Ok(AfterManifest::Done)
         } else {
-            Ok(AfterManifest::Sidecars { sidecars })
+            Ok(AfterManifest::Sidecars(sidecars))
         }
     }
 }
@@ -139,8 +138,10 @@ mod tests {
         assert_result_error_with_message, create_engine_and_snapshot_from_path,
         load_extracted_test_table,
     };
+
     use crate::SnapshotRef;
     use std::sync::Arc;
+    use test_utils::load_test_data;
 
     /// Core helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(
@@ -154,18 +155,10 @@ mod tests {
         use itertools::Itertools;
 
         let log_segment = snapshot.log_segment();
-
-        if log_segment.checkpoint_parts.is_empty() {
-            panic!("Test table has no checkpoint parts");
-        }
-
+        let log_root = log_segment.log_root.clone();
+        assert_eq!(log_segment.checkpoint_parts.len(), 1);
         let checkpoint_file = &log_segment.checkpoint_parts[0];
-
-        let mut manifest_phase = ManifestPhase::try_new(
-            checkpoint_file,
-            snapshot.log_segment().log_root.clone(),
-            engine.clone(),
-        )?;
+        let mut manifest_phase = ManifestPhase::try_new(checkpoint_file, log_root, engine.clone())?;
 
         // Extract add file paths and verify expectations
         let mut file_paths = vec![];
@@ -180,9 +173,6 @@ mod tests {
             let record_batch = actions.try_into_record_batch()?;
             let add = record_batch.column_by_name("add").unwrap();
             let add_struct = add.as_any().downcast_ref::<StructArray>().unwrap();
-
-            // If we expect no add paths (they're in sidecars), verify all adds are null
-            // Extract add paths
             let path = add_struct
                 .column_by_name("path")
                 .unwrap()
@@ -205,14 +195,14 @@ mod tests {
         let next = manifest_phase.finalize()?;
 
         match (next, expected_sidecars) {
-            (AfterManifest::Sidecars { .. }, []) => {
-                panic!("Expected to be Done, but found Sidecars")
+            (AfterManifest::Sidecars(sidecars), []) => {
+                panic!("Expected to be Done, but found Sidecars: {:?}", sidecars)
             }
             (AfterManifest::Done, []) => { /* Empty expected sidecars is Done */ }
             (AfterManifest::Done, sidecars) => {
                 panic!("Expected manifest phase to be Done, but got {:?}", sidecars)
             }
-            (AfterManifest::Sidecars { sidecars }, expected_sidecars) => {
+            (AfterManifest::Sidecars(sidecars), expected_sidecars) => {
                 assert_eq!(
                     sidecars.len(),
                     expected_sidecars.len(),
@@ -224,7 +214,6 @@ mod tests {
                 let mut collected_paths: Vec<String> = sidecars
                     .iter()
                     .map(|fm| {
-                        // Get the filename from the URL path
                         fm.location
                             .path_segments()
                             .and_then(|mut segments| segments.next_back())
@@ -250,19 +239,17 @@ mod tests {
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
         // Try loading as compressed table first, fall back to extracted
-        let (engine, snapshot, _tempdir) =
-            match test_utils::load_test_data("tests/data", table_name) {
-                Ok(test_dir) => {
-                    let test_path = test_dir.path().join(table_name);
-                    let (engine, snapshot) = create_engine_and_snapshot_from_path(&test_path)?;
-                    (engine, snapshot, Some(test_dir))
-                }
-                Err(_) => {
-                    let (engine, snapshot) =
-                        load_extracted_test_table(env!("CARGO_MANIFEST_DIR"), table_name)?;
-                    (engine, snapshot, None)
-                }
-            };
+        let (engine, snapshot, _tempdir) = match load_test_data("tests/data", table_name) {
+            Ok(test_dir) => {
+                let test_path = test_dir.path().join(table_name);
+                let (engine, snapshot) = create_engine_and_snapshot_from_path(&test_path)?;
+                (engine, snapshot, Some(test_dir))
+            }
+            Err(_) => {
+                let (engine, snapshot) = load_extracted_test_table(table_name)?;
+                (engine, snapshot, None)
+            }
+        };
 
         verify_manifest_phase(engine, snapshot, expected_add_paths, expected_sidecars)
     }
@@ -278,10 +265,7 @@ mod tests {
 
     #[test]
     fn test_manifest_phase_early_finalize_error() -> DeltaResult<()> {
-        let (engine, snapshot) = load_extracted_test_table(
-            env!("CARGO_MANIFEST_DIR"),
-            "with_checkpoint_no_last_checkpoint",
-        )?;
+        let (engine, snapshot) = load_extracted_test_table("with_checkpoint_no_last_checkpoint")?;
 
         let manifest_phase = ManifestPhase::try_new(
             &snapshot.log_segment().checkpoint_parts[0],
@@ -289,12 +273,8 @@ mod tests {
             engine.clone(),
         )?;
 
-        // Attempt to finalize without draining the iterator
         let result = manifest_phase.finalize();
-
-        // Should get an error about not being exhausted
         assert_result_error_with_message(result, "not exausted");
-
         Ok(())
     }
 
