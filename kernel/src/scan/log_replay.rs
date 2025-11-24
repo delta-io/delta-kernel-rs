@@ -15,7 +15,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateE
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
-    ParallelizableLogReplayProcessor,
+    ParallelLogReplayProcessor,
 };
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
@@ -491,7 +491,7 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     EXPR.clone()
 }
 
-impl ParallelizableLogReplayProcessor for ScanLogReplayProcessor {
+impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     type Output = <ScanLogReplayProcessor as LogReplayProcessor>::Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
