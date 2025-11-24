@@ -161,6 +161,7 @@ pub(crate) mod test_utils {
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use serde::Serialize;
+    use std::path::PathBuf;
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
@@ -303,11 +304,9 @@ pub(crate) mod test_utils {
     /// Load an already-extracted test table from the filesystem.
     /// Returns (engine, snapshot) tuple.
     pub(crate) fn load_extracted_test_table(
-        manifest_dir: &str,
         table_name: &str,
     ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef)> {
-        use std::path::PathBuf;
-
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let mut path = PathBuf::from(manifest_dir);
         path.push("tests/data");
         path.push(table_name);

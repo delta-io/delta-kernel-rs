@@ -54,7 +54,7 @@ mod tests {
 
     #[test]
     fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snapshot) = load_extracted_test_table(env!("CARGO_MANIFEST_DIR"), "app-txn-no-checkpoint")?;
+        let (engine, snapshot) = load_extracted_test_table("app-txn-no-checkpoint")?;
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
         let schema = COMMIT_READ_SCHEMA.clone();
