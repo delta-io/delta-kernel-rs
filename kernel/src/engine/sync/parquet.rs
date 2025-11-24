@@ -1,6 +1,11 @@
 use std::fs::File;
 
 use crate::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::arrow_utils::{
+    fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
+    RowIndexBuilder,
+};
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ParquetRecordBatchReaderBuilder};
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -8,6 +13,8 @@ use crate::schema::SchemaRef;
 use crate::{DeltaResult, FileDataReadResultIterator, FileMeta, ParquetHandler, PredicateRef};
 
 use url::Url;
+
+use super::read_files;
 
 pub(crate) struct SyncParquetHandler;
 
