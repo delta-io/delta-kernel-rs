@@ -1,6 +1,6 @@
 # Changelog
 
-## [v0.18.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.1/) (2025-11-22)
+## [v0.18.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.1/) (2025-11-24)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.0...v0.18.1)
 
