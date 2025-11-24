@@ -8,7 +8,7 @@ use delta_kernel::arrow::array::{
 
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngine;
@@ -447,21 +447,10 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
-}
-
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(|data| -> DeltaResult<_> {
-            let data = data?;
-            to_arrow(data)
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()
 }
 
