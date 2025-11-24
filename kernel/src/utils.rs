@@ -401,6 +401,7 @@ pub(crate) mod test_utils {
         let store = Arc::new(LocalFileSystem::new());
         let engine = Arc::new(DefaultEngineBuilder::new(store).build());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
         Ok((engine, snapshot, tempdir))
     }
 }
