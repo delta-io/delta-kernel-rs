@@ -22,6 +22,7 @@ pub(crate) struct ManifestPhase {
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
+    manifest_file: FileMeta,
 }
 
 /// Possible transitions after ManifestPhase completes.
@@ -70,8 +71,7 @@ impl ManifestPhase {
             )?,
             extension => {
                 return Err(Error::generic(format!(
-                    "Unsupported checkpoint extension: {}",
-                    extension
+                    "Unsupported checkpoint extension: {extension}",
                 )));
             }
         };
@@ -82,6 +82,7 @@ impl ManifestPhase {
             sidecar_visitor: SidecarVisitor::default(),
             log_root,
             is_complete: false,
+            manifest_file: manifest.location.clone(),
         })
     }
 
@@ -94,7 +95,10 @@ impl ManifestPhase {
     pub(crate) fn finalize(self) -> DeltaResult<AfterManifest> {
         require!(
             self.is_complete,
-            Error::generic("Finalize called on manifest reader but it was not exausted")
+            Error::generic(format!(
+                "Cannot finalize in-progress ManifestReader for file: {}",
+                self.manifest_file.location
+            ))
         );
 
         let sidecars: Vec<_> = self
@@ -117,10 +121,9 @@ impl Iterator for ManifestPhase {
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = self.actions.next().map(|batch_result| {
-            batch_result.and_then(|batch| {
-                self.sidecar_visitor.visit_rows_of(batch.actions())?;
-                Ok(batch)
-            })
+            let batch = batch_result?;
+            self.sidecar_visitor.visit_rows_of(batch.actions())?;
+            Ok(batch)
         });
 
         if result.is_none() {
@@ -134,12 +137,15 @@ impl Iterator for ManifestPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::array::{Array, StringArray, StructArray};
+    use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::utils::test_utils::{
         assert_result_error_with_message, create_engine_and_snapshot_from_path,
         load_extracted_test_table,
     };
-
     use crate::SnapshotRef;
+
+    use itertools::Itertools;
     use std::sync::Arc;
     use test_utils::load_test_data;
 
@@ -150,10 +156,6 @@ mod tests {
         expected_add_paths: &[&str],
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
-        use crate::arrow::array::{Array, StringArray, StructArray};
-        use crate::engine::arrow_data::EngineDataArrowExt as _;
-        use itertools::Itertools;
-
         let log_segment = snapshot.log_segment();
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.checkpoint_parts.len(), 1);
@@ -274,7 +276,10 @@ mod tests {
         )?;
 
         let result = manifest_phase.finalize();
-        assert_result_error_with_message(result, "not exausted");
+        assert_result_error_with_message(
+            result,
+            "Cannot finalize in-progress ManifestReader for file",
+        );
         Ok(())
     }
 
