@@ -17,7 +17,7 @@ use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
 /// and extracts the sidecar actions during iteration.
 #[allow(unused)]
-pub(crate) struct ManifestPhase {
+pub(crate) struct CheckpointManifestReader {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
@@ -25,7 +25,7 @@ pub(crate) struct ManifestPhase {
     manifest_file: FileMeta,
 }
 
-/// Possible transitions after ManifestPhase completes.
+/// Possible transitions after CheckpointManifestReader completes.
 #[allow(unused)]
 pub(crate) enum AfterManifest {
     /// Sidecars extracted from the manifest phase
@@ -34,7 +34,7 @@ pub(crate) enum AfterManifest {
     Done,
 }
 
-impl ManifestPhase {
+impl CheckpointManifestReader {
     /// Create a new manifest phase for a single-part checkpoint.
     ///
     /// The schema is automatically augmented with the sidecar column since the manifest
@@ -116,7 +116,7 @@ impl ManifestPhase {
     }
 }
 
-impl Iterator for ManifestPhase {
+impl Iterator for CheckpointManifestReader {
     type Item = DeltaResult<ActionsBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -160,7 +160,8 @@ mod tests {
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.checkpoint_parts.len(), 1);
         let checkpoint_file = &log_segment.checkpoint_parts[0];
-        let mut manifest_phase = ManifestPhase::try_new(checkpoint_file, log_root, engine.clone())?;
+        let mut manifest_phase =
+            CheckpointManifestReader::try_new(checkpoint_file, log_root, engine.clone())?;
 
         // Extract add file paths and verify expectations
         let mut file_paths = vec![];
@@ -190,7 +191,7 @@ mod tests {
         file_paths.sort();
         assert_eq!(
             file_paths, expected_add_paths,
-            "ManifestPhase should extract expected Add file paths from checkpoint"
+            "CheckpointManifestReader should extract expected Add file paths from checkpoint"
         );
 
         // Check sidecars
@@ -269,7 +270,7 @@ mod tests {
     fn test_manifest_phase_early_finalize_error() -> DeltaResult<()> {
         let (engine, snapshot) = load_extracted_test_table("with_checkpoint_no_last_checkpoint")?;
 
-        let manifest_phase = ManifestPhase::try_new(
+        let manifest_phase = CheckpointManifestReader::try_new(
             &snapshot.log_segment().checkpoint_parts[0],
             snapshot.log_segment().log_root.clone(),
             engine.clone(),
