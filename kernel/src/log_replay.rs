@@ -21,6 +21,7 @@ use crate::{DeltaResult, EngineData};
 use delta_kernel_derive::internal_api;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use tracing::debug;
 
@@ -205,9 +206,20 @@ impl ActionsBatch {
 
 #[internal_api]
 #[allow(unused)]
-pub(crate) trait ParallelizableLogReplayProcessor {
+pub(crate) trait ParallelLogReplayProcessor {
     type Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
+}
+
+impl<T> ParallelLogReplayProcessor for Arc<T>
+where
+    T: ParallelLogReplayProcessor,
+{
+    type Output = T::Output;
+
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        self.as_ref().process_actions_batch(actions_batch)
+    }
 }
 
 /// A trait for processing batches of actions from Delta transaction logs during log replay.
