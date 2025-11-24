@@ -5,7 +5,7 @@ use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
 use crate::{DeltaResult, Engine};
 
-/// Phase that processes JSON commit files as [`ActionsBatch`]
+/// Phase that processes JSON commit files into [`ActionsBatch`]s
 pub(crate) struct CommitReader {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
 }
@@ -50,7 +50,7 @@ mod tests {
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::DefaultEngine;
     use crate::scan::COMMIT_READ_SCHEMA;
-    use crate::{Error, Snapshot};
+    use crate::{Error, Snapshot, SnapshotRef};
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
@@ -61,7 +61,7 @@ mod tests {
         table_name: &str,
     ) -> DeltaResult<(
         Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        Arc<Snapshot>,
+        SnapshotRef,
         url::Url,
     )> {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -109,19 +109,20 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .unwrap();
 
-            let batch_paths = path.iter().flatten().map(|s| s.to_string()).collect_vec();
+            let batch_paths = path.iter().flatten().map(ToString::to_string).collect_vec();
             file_paths.extend(batch_paths);
         }
 
         file_paths.sort();
-        let mut expected_files =
-            vec!["modified=2021-02-02/part-00001-9a16b9f6-c12a-4609-a9c4-828eacb9526a-c000.snappy.parquet", "modified=2021-02-01/part-00001-8ebcaf8b-0f48-4213-98c9-5c2156d20a7e-c000.snappy.parquet"
-                ,"modified=2021-02-02/part-00001-bfac5c74-426e-410f-ab74-21a64e518e9c-c000.snappy.parquet","modified=2021-02-01/part-00001-80996595-a345-43b7-b213-e247d6f091f7-c000.snappy.parquet"
-            ];
-        expected_files.sort();
+        let expected_files = vec![
+            "modified=2021-02-01/part-00001-80996595-a345-43b7-b213-e247d6f091f7-c000.snappy.parquet",
+            "modified=2021-02-01/part-00001-8ebcaf8b-0f48-4213-98c9-5c2156d20a7e-c000.snappy.parquet",
+            "modified=2021-02-02/part-00001-9a16b9f6-c12a-4609-a9c4-828eacb9526a-c000.snappy.parquet",
+            "modified=2021-02-02/part-00001-bfac5c74-426e-410f-ab74-21a64e518e9c-c000.snappy.parquet",
+        ];
         assert_eq!(
             file_paths, expected_files,
-            "CommitReader should find exactly the expected file"
+            "CommitReader should find exactly the expected files"
         );
 
         Ok(())
