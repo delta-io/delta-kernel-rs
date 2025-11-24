@@ -152,9 +152,10 @@ pub(crate) mod test_utils {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::Engine;
-    use crate::EngineData;
+    use crate::{DeltaResult, EngineData, Error, SnapshotRef};
+    use crate::{Engine, Snapshot};
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
@@ -163,6 +164,7 @@ pub(crate) mod test_utils {
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
+    use url::Url;
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -282,6 +284,38 @@ pub(crate) mod test_utils {
                 );
             }
         }
+    }
+
+    /// Helper to create engine and snapshot from a path.
+    /// Returns (engine, snapshot) tuple.
+    pub(crate) fn create_engine_and_snapshot_from_path(
+        path: &Path,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef)> {
+        let url = Url::from_directory_path(path)
+            .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
+
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = Arc::new(DefaultEngine::new(store));
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+        Ok((engine, snapshot))
+    }
+
+    /// Load an already-extracted test table from the filesystem.
+    /// Returns (engine, snapshot) tuple.
+    pub(crate) fn load_extracted_test_table(
+        manifest_dir: &str,
+        table_name: &str,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef)> {
+        use std::path::PathBuf;
+
+        let mut path = PathBuf::from(manifest_dir);
+        path.push("tests/data");
+        path.push(table_name);
+
+        let path = std::fs::canonicalize(path)
+            .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+
+        create_engine_and_snapshot_from_path(&path)
     }
 }
 
