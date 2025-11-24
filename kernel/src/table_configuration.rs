@@ -8,11 +8,11 @@
 //! [`TableProperties`].
 //!
 //! [`Schema`]: crate::schema::Schema
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Metadata, Protocol};
+use crate::actions::{Metadata, Protocol};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef};
 use crate::table_features::{
@@ -400,27 +400,12 @@ impl TableConfiguration {
     /// [`TableChanges`]: crate::table_changes::TableChanges
     #[internal_api]
     pub(crate) fn is_cdf_read_supported(&self) -> bool {
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> =
-            LazyLock::new(|| vec![TableFeature::DeletionVectors]);
-        let protocol_supported = match self.protocol.reader_features() {
-            // if min_reader_version = 3 and all reader features are subset of supported => OK
-            Some(reader_features) if self.protocol.min_reader_version() == 3 => {
-                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
-            }
-            // if min_reader_version = 1 and there are no reader features => OK
-            None => self.protocol.min_reader_version() == 1,
-            // any other protocol is not supported
-            _ => false,
-        };
+        let protocol_supported = self.protocol.is_cdf_supported();
         let cdf_enabled = self
             .table_properties
             .enable_change_data_feed
             .unwrap_or(false);
-        let column_mapping_disabled = matches!(
-            self.table_properties.column_mapping_mode,
-            None | Some(ColumnMappingMode::None)
-        );
-        protocol_supported && cdf_enabled && column_mapping_disabled
+        protocol_supported && cdf_enabled
     }
 
     /// Returns `true` if deletion vectors is supported on this table. To support deletion vectors,
