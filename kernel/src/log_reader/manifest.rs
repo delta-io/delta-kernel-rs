@@ -6,9 +6,10 @@ use itertools::Itertools;
 use url::Url;
 
 use crate::actions::visitors::SidecarVisitor;
-use crate::actions::SIDECAR_NAME;
-use crate::actions::{Add, Sidecar, ADD_NAME};
+use crate::actions::{Add, Remove, Sidecar, ADD_NAME};
+use crate::actions::{REMOVE_NAME, SIDECAR_NAME};
 use crate::log_replay::ActionsBatch;
+use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
@@ -20,7 +21,6 @@ use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 pub(crate) struct ManifestPhase {
     actions: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
     sidecar_visitor: SidecarVisitor,
-    manifest_file: FileMeta,
     log_root: Url,
     is_complete: bool,
 }
@@ -45,54 +45,43 @@ impl ManifestPhase {
     /// - `log_root`: Root URL for resolving sidecar paths
     /// - `engine`: Engine for reading files
     #[allow(unused)]
-    pub(crate) fn new(
-        manifest_file: FileMeta,
+    pub(crate) fn try_new(
+        manifest: &ParsedLogPath,
         log_root: Url,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
         static MANIFEST_READ_SCHMEA: LazyLock<SchemaRef> = LazyLock::new(|| {
             Arc::new(StructType::new_unchecked([
                 StructField::nullable(ADD_NAME, Add::to_schema()),
+                StructField::nullable(REMOVE_NAME, Remove::to_schema()),
                 StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
             ]))
         });
 
-        let files = vec![manifest_file.clone()];
-
-        // Determine file type from extension
-        let extension = manifest_file
-            .location
-            .path()
-            .rsplit('.')
-            .next()
-            .unwrap_or("");
-
-        let actions = match extension {
-            "json" => {
-                engine
-                    .json_handler()
-                    .read_json_files(&files, MANIFEST_READ_SCHMEA.clone(), None)?
-            }
-            "parquet" => engine.parquet_handler().read_parquet_files(
-                &files,
+        let actions = match manifest.extension.as_str() {
+            "json" => engine.json_handler().read_json_files(
+                std::slice::from_ref(&manifest.location),
                 MANIFEST_READ_SCHMEA.clone(),
                 None,
             )?,
-            ext => {
+            "parquet" => engine.parquet_handler().read_parquet_files(
+                std::slice::from_ref(&manifest.location),
+                MANIFEST_READ_SCHMEA.clone(),
+                None,
+            )?,
+            extension => {
                 return Err(Error::generic(format!(
                     "Unsupported checkpoint extension: {}",
-                    ext
-                )))
+                    extension
+                )));
             }
         };
 
-        let actions = actions.map(|batch| batch.map(|b| ActionsBatch::new(b, false)));
-
+        let actions = Box::new(actions.map(|batch_res| Ok(ActionsBatch::new(batch_res?, false))));
         Ok(Self {
-            actions: Box::new(actions),
+            actions,
             sidecar_visitor: SidecarVisitor::default(),
             log_root,
-            manifest_file,
             is_complete: false,
         })
     }
@@ -106,10 +95,7 @@ impl ManifestPhase {
     pub(crate) fn finalize(self) -> DeltaResult<AfterManifest> {
         require!(
             self.is_complete,
-            Error::generic(format!(
-                "Finalized called on ManifestReader for file {:?}",
-                self.manifest_file.location
-            ))
+            Error::generic("Finalize called on manifest reader but it was not exausted")
         );
 
         let sidecars: Vec<_> = self
@@ -149,115 +135,89 @@ impl Iterator for ManifestPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::default::DefaultEngine;
-    use crate::log_replay::LogReplayProcessor;
-    use crate::scan::log_replay::ScanLogReplayProcessor;
-    use crate::scan::state_info::StateInfo;
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, create_engine_and_snapshot_from_path,
+        load_extracted_test_table,
+    };
     use crate::SnapshotRef;
-    use object_store::local::LocalFileSystem;
     use std::sync::Arc;
-    use tempfile::TempDir;
 
-    fn load_test_table(
-        table_name: &str,
-    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Url, TempDir)> {
-        let test_dir = test_utils::load_test_data("tests/data", table_name)
-            .map_err(|e| crate::Error::Generic(format!("Failed to load test data: {}", e)))?;
-        let test_path = test_dir.path().join(table_name);
+    /// Core helper function to test manifest phase with expected add paths and sidecars
+    fn verify_manifest_phase(
+        engine: Arc<dyn Engine>,
+        snapshot: SnapshotRef,
+        expected_add_paths: &[&str],
+        expected_sidecars: &[&str],
+    ) -> DeltaResult<()> {
+        use crate::arrow::array::{Array, StringArray, StructArray};
+        use crate::engine::arrow_data::EngineDataArrowExt as _;
+        use itertools::Itertools;
 
-        let url = url::Url::from_directory_path(&test_path)
-            .map_err(|_| crate::Error::Generic("Failed to create URL from path".to_string()))?;
-
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(DefaultEngine::new(store));
-        let snapshot = crate::Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
-
-        Ok((engine, snapshot, url, test_dir))
-    }
-
-    #[test]
-    fn test_manifest_phase_with_checkpoint() -> DeltaResult<()> {
-        // Use a table with v2 checkpoints where adds might be in sidecars
-        let (engine, snapshot, log_root, _tempdir) =
-            load_test_table("v2-checkpoints-json-with-sidecars")?;
         let log_segment = snapshot.log_segment();
 
-        // Check if there are any checkpoint parts
         if log_segment.checkpoint_parts.is_empty() {
-            println!("Test table has no checkpoint parts, skipping");
-            return Ok(());
+            panic!("Test table has no checkpoint parts");
         }
 
-        let state_info = Arc::new(StateInfo::try_new(
-            snapshot.schema(),
-            snapshot.table_configuration(),
-            None,
-            (),
-        )?);
-
-        let mut processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-
-        // Get the first checkpoint part
         let checkpoint_file = &log_segment.checkpoint_parts[0];
-        let manifest_file = checkpoint_file.location.clone();
 
-        let mut manifest_phase =
-            ManifestPhase::new(manifest_file, log_root.clone(), engine.clone())?;
+        let mut manifest_phase = ManifestPhase::try_new(
+            checkpoint_file,
+            snapshot.log_segment().log_root.clone(),
+            engine.clone(),
+        )?;
 
-        // Count batches and collect results
-        let mut file_paths = Vec::new();
-
-        for result in manifest_phase {
+        // Extract add file paths and verify expectations
+        let mut file_paths = vec![];
+        for result in manifest_phase.by_ref() {
             let batch = result?;
-            let metadata = processor.process_actions_batch(batch)?;
-            let paths = metadata.visit_scan_files(
-                vec![],
-                |ps: &mut Vec<String>, path, _, _, _, _, _| {
-                    ps.push(path.to_string());
-                },
-            )?;
-            file_paths.extend(paths);
+            let ActionsBatch {
+                actions,
+                is_log_batch,
+            } = batch;
+            assert!(!is_log_batch, "Manifest should not be a log batch");
+
+            let record_batch = actions.try_into_record_batch()?;
+            let add = record_batch.column_by_name("add").unwrap();
+            let add_struct = add.as_any().downcast_ref::<StructArray>().unwrap();
+
+            // If we expect no add paths (they're in sidecars), verify all adds are null
+            // Extract add paths
+            let path = add_struct
+                .column_by_name("path")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+
+            let batch_paths = path.iter().flatten().map(ToString::to_string).collect_vec();
+            file_paths.extend(batch_paths);
         }
-        // Verify the manifest itself contains no add files (they're all in sidecars)
+
+        // Verify collected add paths
+        file_paths.sort();
         assert_eq!(
-            file_paths.len(), 0,
-            "For this v2 checkpoint with sidecars, manifest should contain 0 add files (all in sidecars)"
+            file_paths, expected_add_paths,
+            "ManifestPhase should extract expected Add file paths from checkpoint"
         );
 
-        Ok(())
-    }
-
-    #[test]
-    fn test_manifest_phase_collects_sidecars() -> DeltaResult<()> {
-        let (engine, snapshot, log_root, _tempdir) =
-            load_test_table("v2-checkpoints-json-with-sidecars")?;
-        let log_segment = snapshot.log_segment();
-
-        if log_segment.checkpoint_parts.is_empty() {
-            println!("Test table has no checkpoint parts, skipping");
-            return Ok(());
-        }
-
-        let checkpoint_file = &log_segment.checkpoint_parts[0];
-        let manifest_file = checkpoint_file.location.clone();
-
-        let mut manifest_phase =
-            ManifestPhase::new(manifest_file, log_root.clone(), engine.clone())?;
-
-        // Drain the phase
-        while manifest_phase.next().is_some() {}
-
-        // Check if sidecars were collected
+        // Check sidecars
         let next = manifest_phase.finalize()?;
 
-        match next {
-            AfterManifest::Sidecars { sidecars } => {
-                // For the v2-checkpoints-json-with-sidecars test table at version 6,
-                // there are exactly 2 sidecar files
+        match (next, expected_sidecars) {
+            (AfterManifest::Sidecars { .. }, []) => {
+                panic!("Expected to be Done, but found Sidecars")
+            }
+            (AfterManifest::Done, []) => { /* Empty expected sidecars is Done */ }
+            (AfterManifest::Done, sidecars) => {
+                panic!("Expected manifest phase to be Done, but got {:?}", sidecars)
+            }
+            (AfterManifest::Sidecars { sidecars }, expected_sidecars) => {
                 assert_eq!(
                     sidecars.len(),
-                    2,
-                    "Should collect exactly 2 sidecars for checkpoint at version 6"
+                    expected_sidecars.len(),
+                    "Should collect exactly {} sidecars",
+                    expected_sidecars.len()
                 );
 
                 // Extract and verify the sidecar paths
@@ -267,23 +227,98 @@ mod tests {
                         // Get the filename from the URL path
                         fm.location
                             .path_segments()
-                            .and_then(|segments| segments.last())
+                            .and_then(|mut segments| segments.next_back())
                             .unwrap_or("")
                             .to_string()
                     })
                     .collect();
 
                 collected_paths.sort();
-
-                // Verify they're the expected sidecar files for version 6
-                assert_eq!(collected_paths[0], "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet");
-                assert_eq!(collected_paths[1], "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet");
-            }
-            AfterManifest::Done => {
-                panic!("Expected sidecars for v2-checkpoints-json-with-sidecars table");
+                // Verify they're the expected sidecar files
+                assert_eq!(collected_paths, expected_sidecars.to_vec());
             }
         }
 
         Ok(())
+    }
+
+    /// Helper function to test manifest phase with expected add paths and sidecars.
+    /// Works with both compressed (tar.zst) and already-extracted test tables.
+    fn test_manifest_phase(
+        table_name: &str,
+        expected_add_paths: &[&str],
+        expected_sidecars: &[&str],
+    ) -> DeltaResult<()> {
+        // Try loading as compressed table first, fall back to extracted
+        let (engine, snapshot, _tempdir) =
+            match test_utils::load_test_data("tests/data", table_name) {
+                Ok(test_dir) => {
+                    let test_path = test_dir.path().join(table_name);
+                    let (engine, snapshot) = create_engine_and_snapshot_from_path(&test_path)?;
+                    (engine, snapshot, Some(test_dir))
+                }
+                Err(_) => {
+                    let (engine, snapshot) =
+                        load_extracted_test_table(env!("CARGO_MANIFEST_DIR"), table_name)?;
+                    (engine, snapshot, None)
+                }
+            };
+
+        verify_manifest_phase(engine, snapshot, expected_add_paths, expected_sidecars)
+    }
+
+    #[test]
+    fn test_manifest_phase_extracts_file_paths() -> DeltaResult<()> {
+        test_manifest_phase(
+            "with_checkpoint_no_last_checkpoint",
+            &["part-00000-a190be9e-e3df-439e-b366-06a863f51e99-c000.snappy.parquet"],
+            &[], // No sidecars
+        )
+    }
+
+    #[test]
+    fn test_manifest_phase_early_finalize_error() -> DeltaResult<()> {
+        let (engine, snapshot) = load_extracted_test_table(
+            env!("CARGO_MANIFEST_DIR"),
+            "with_checkpoint_no_last_checkpoint",
+        )?;
+
+        let manifest_phase = ManifestPhase::try_new(
+            &snapshot.log_segment().checkpoint_parts[0],
+            snapshot.log_segment().log_root.clone(),
+            engine.clone(),
+        )?;
+
+        // Attempt to finalize without draining the iterator
+        let result = manifest_phase.finalize();
+
+        // Should get an error about not being exhausted
+        assert_result_error_with_message(result, "not exausted");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_manifest_phase_collects_sidecars() -> DeltaResult<()> {
+        test_manifest_phase(
+            "v2-checkpoints-json-with-sidecars",
+            &[], // No add paths in manifest (they're in sidecars)
+            &[
+                "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet",
+                "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet",
+            ],
+        )
+    }
+
+    #[test]
+    fn test_manifest_phase_collects_sidecars_parquet() -> DeltaResult<()> {
+        test_manifest_phase(
+            "v2-checkpoints-parquet-with-sidecars",
+            &[], // No add paths in manifest (they're in sidecars)
+            &[
+                "00000000000000000006.checkpoint.0000000001.0000000002.76931b15-ead3-480d-b86c-afe55a577fc3.parquet",
+                "00000000000000000006.checkpoint.0000000002.0000000002.4367b29c-0e87-447f-8e81-9814cc01ad1f.parquet",
+            ],
+        )
     }
 }
