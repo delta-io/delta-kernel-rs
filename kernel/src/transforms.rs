@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 
 use crate::expressions::{
     BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform, VariadicExpressionOp,
@@ -23,7 +24,7 @@ pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 ///
 /// These transformations are "sparse" - they only specify what changes, while unchanged fields
 /// pass through implicitly in their original order.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) enum FieldTransformSpec {
     /// Insert the given expression after the named input column (None = prepend instead)
     // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
