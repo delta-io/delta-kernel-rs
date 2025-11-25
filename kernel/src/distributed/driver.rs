@@ -116,23 +116,18 @@ impl<P: LogReplayProcessor> Iterator for DriverProcessor<P> {
     type Item = DeltaResult<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next = if let Some(next) = self.commit_phase.next() {
-            Some(next)
-        } else if let Some(manifest_reader) = self.checkpoint_manifest_phase.as_mut() {
-            manifest_reader.next()
-        } else {
-            None
-        };
+        let next = self
+            .commit_phase
+            .next()
+            .or_else(|| self.checkpoint_manifest_phase.as_mut()?.next());
 
-        match next {
-            Some(batch_res) => {
-                Some(batch_res.and_then(|batch| self.processor.process_actions_batch(batch)))
-            }
-            None => {
-                self.is_finished = true;
-                None
-            }
+        if next.is_none() {
+            self.is_finished = true;
         }
+
+        next.map(|batch_res| {
+            batch_res.and_then(|batch| self.processor.process_actions_batch(batch))
+        })
     }
 }
 
