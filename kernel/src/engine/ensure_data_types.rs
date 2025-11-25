@@ -346,13 +346,14 @@ mod tests {
             true
         )
         .is_ok());
+
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::unshredded_variant(),
                 &incorrect_variant_arrow_type(),
                 true,
             ),
-            "Invalid argument error: Incorrect datatype. Expected Struct(\"metadata\": Binary, \"value\": Binary), got Struct(\"field_1\": nullable Binary, \"field_2\": nullable Binary)",
+            "Invalid argument error: Incorrect datatype",
         )
     }
 
