@@ -25,15 +25,6 @@ pub(crate) struct CheckpointManifestReader {
     manifest_file: FileMeta,
 }
 
-/// Possible transitions after CheckpointManifestReader completes.
-#[allow(unused)]
-pub(crate) enum AfterManifest {
-    /// Sidecars extracted from the manifest phase
-    Sidecars(Vec<FileMeta>),
-    /// No sidecars
-    Done,
-}
-
 impl CheckpointManifestReader {
     /// Create a new manifest phase for a single-part checkpoint.
     ///
@@ -86,17 +77,14 @@ impl CheckpointManifestReader {
         })
     }
 
-    /// Transition to the next phase.
-    ///
-    /// Returns an enum indicating what comes next:
-    /// - `Sidecars`: Extracted sidecar files
-    /// - `Done`: No sidecars found
+    /// Extract the sidecars from the manifest file if there were any.
+    /// NOTE: The iterator must be completely exhausted before calling this
     #[allow(unused)]
-    pub(crate) fn finalize(self) -> DeltaResult<AfterManifest> {
+    pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
         require!(
             self.is_complete,
             Error::generic(format!(
-                "Cannot finalize in-progress ManifestReader for file: {}",
+                "Cannot extract sidecars from in-progress ManifestReader for file: {}",
                 self.manifest_file.location
             ))
         );
@@ -108,11 +96,7 @@ impl CheckpointManifestReader {
             .map(|s| s.to_filemeta(&self.log_root))
             .try_collect()?;
 
-        if sidecars.is_empty() {
-            Ok(AfterManifest::Done)
-        } else {
-            Ok(AfterManifest::Sidecars(sidecars))
-        }
+        Ok(sidecars)
     }
 }
 
@@ -195,41 +179,30 @@ mod tests {
         );
 
         // Check sidecars
-        let next = manifest_phase.finalize()?;
+        let actual_sidecars = manifest_phase.extract_sidecars()?;
 
-        match (next, expected_sidecars) {
-            (AfterManifest::Sidecars(sidecars), []) => {
-                panic!("Expected to be Done, but found Sidecars: {:?}", sidecars)
-            }
-            (AfterManifest::Done, []) => { /* Empty expected sidecars is Done */ }
-            (AfterManifest::Done, sidecars) => {
-                panic!("Expected manifest phase to be Done, but got {:?}", sidecars)
-            }
-            (AfterManifest::Sidecars(sidecars), expected_sidecars) => {
-                assert_eq!(
-                    sidecars.len(),
-                    expected_sidecars.len(),
-                    "Should collect exactly {} sidecars",
-                    expected_sidecars.len()
-                );
+        assert_eq!(
+            actual_sidecars.len(),
+            expected_sidecars.len(),
+            "Should collect exactly {} actual_sidecars",
+            expected_sidecars.len()
+        );
 
-                // Extract and verify the sidecar paths
-                let mut collected_paths: Vec<String> = sidecars
-                    .iter()
-                    .map(|fm| {
-                        fm.location
-                            .path_segments()
-                            .and_then(|mut segments| segments.next_back())
-                            .unwrap_or("")
-                            .to_string()
-                    })
-                    .collect();
+        // Extract and verify the sidecar paths
+        let mut collected_paths: Vec<String> = actual_sidecars
+            .iter()
+            .map(|fm| {
+                fm.location
+                    .path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
 
-                collected_paths.sort();
-                // Verify they're the expected sidecar files
-                assert_eq!(collected_paths, expected_sidecars.to_vec());
-            }
-        }
+        collected_paths.sort();
+        // Verify they're the expected sidecar files
+        assert_eq!(collected_paths, expected_sidecars.to_vec());
 
         Ok(())
     }
@@ -276,10 +249,10 @@ mod tests {
             engine.clone(),
         )?;
 
-        let result = manifest_phase.finalize();
+        let result = manifest_phase.extract_sidecars();
         assert_result_error_with_message(
             result,
-            "Cannot finalize in-progress ManifestReader for file",
+            "Cannot extract sidecars from in-progress ManifestReader for file",
         );
         Ok(())
     }
