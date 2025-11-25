@@ -52,6 +52,11 @@ jobs:
               elif [ "$example_dir" = "read-table-changes" ]; then
                 echo "Building read-table-changes (skipping run - requires CDF-enabled table)"
                 cargo build --manifest-path "$example_dir/Cargo.toml" --release
+              # Special case for s3-copy-atomic: skip running it in CI as it requires AWS credentials
+              # but still verify it compiles
+              elif [ "$example_dir" = "s3-copy-atomic" ]; then
+                echo "Building s3-copy-atomic (skipping run - requires AWS credentials)"
+                cargo build --manifest-path "$example_dir/Cargo.toml" --release
               else
                 # All other examples run with the test table path
                 cargo run --manifest-path "$example_dir/Cargo.toml" --release -- ../tests/data/table-without-dv-small
