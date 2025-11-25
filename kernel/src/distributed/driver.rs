@@ -7,11 +7,14 @@
 
 use std::sync::Arc;
 
+use itertools::Itertools;
+
 use crate::actions::get_commit_schema;
+use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
 use crate::log_reader::commit::CommitReader;
-use crate::log_reader::manifest::{AfterManifest, ManifestPhase};
 use crate::log_replay::LogReplayProcessor;
-use crate::log_segment::{self, LogSegment};
+use crate::log_segment::LogSegment;
+use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
 
 /// Driver-side log replay (Phase 1) for distributed execution.
@@ -27,7 +30,7 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut driver = DriverPhase::try_new(processor, log_segment, engine)?;
+/// let mut driver = DriverProcessor::try_new(processor, log_segment, engine)?;
 ///
 /// // Iterate over driver-side batches
 /// for batch in driver {
@@ -51,35 +54,25 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 ///     }
 /// }
 /// ```
-pub(crate) struct DriverPhase<P> {
+pub(crate) struct DriverProcessor<P> {
     processor: P,
-    state: Option<DriverState>,
+    commit_phase: CommitReader,
     /// Pre-computed next state after commit for concurrent IO
-    after_commit: Option<DriverState>,
+    checkpoint_manifest_phase: Option<CheckpointManifestReader>,
     /// Whether the iterator has been fully exhausted
     is_finished: bool,
-}
-
-enum DriverState {
-    Commit(CommitReader),
-    Manifest(ManifestPhase),
-    /// Executor phase needed - has files to distribute
-    ExecutorPhase {
-        files: Vec<FileMeta>,
-    },
-    /// Done - no more work needed
-    Done,
+    log_segment: Arc<LogSegment>,
 }
 
 /// Result of driver phase processing.
-pub(crate) enum DriverPhaseResult<P> {
+pub(crate) enum DriverProcessorResult<P> {
     /// All processing complete on driver - no executor phase needed.
     Complete(P),
     /// Executor phase needed - distribute files to executors for parallel processing.
     NeedsExecutorPhase { processor: P, files: Vec<FileMeta> },
 }
 
-impl<P: LogReplayProcessor> DriverPhase<P> {
+impl<P: LogReplayProcessor> DriverProcessor<P> {
     /// Create a new driver-side log replay.
     ///
     /// Works for streaming operations via `LogReplayProcessor`.
@@ -93,96 +86,51 @@ impl<P: LogReplayProcessor> DriverPhase<P> {
         log_segment: Arc<LogSegment>,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
-        let commit =
+        let commit_phase =
             CommitReader::try_new(engine.as_ref(), &log_segment, get_commit_schema().clone())?;
 
-        // Concurrently compute the next state after commit for parallel IO
-        let after_commit = Self::compute_state_after_commit(&log_segment, engine.clone())?;
+        // Concurrently compute the next state after commit. Only create a checkpoint manifest
+        // reader if the checkpoint is single-part
+        let checkpoint_manifest_phase =
+            if let [single_part] = log_segment.checkpoint_parts.as_slice() {
+                Some(CheckpointManifestReader::try_new(
+                    single_part,
+                    log_segment.log_root.clone(),
+                    engine,
+                )?)
+            } else {
+                None
+            };
 
         Ok(Self {
             processor,
-            state: Some(DriverState::Commit(commit)),
-            after_commit: Some(after_commit),
+            commit_phase,
+            checkpoint_manifest_phase,
             is_finished: false,
+            log_segment,
         })
-    }
-
-    /// Compute the next state after CommitReader is exhausted.
-    ///
-    /// This is called during construction to enable concurrent IO initialization.
-    /// Returns the appropriate DriverState based on checkpoint configuration:
-    /// - Single-part checkpoint → Manifest phase (pre-initialized)
-    /// - Multi-part checkpoint → ExecutorPhase with all parts
-    /// - No checkpoint → Done
-    fn compute_state_after_commit(
-        log_segment: &LogSegment,
-        engine: Arc<dyn Engine>,
-    ) -> DeltaResult<DriverState> {
-        match log_segment.checkpoint_parts.as_slice() {
-            [] => Ok(DriverState::Done),
-            [single_part] => {
-                // Single-part checkpoint: create manifest phase
-                let manifest = ManifestPhase::new(
-                    single_part.location.clone(),
-                    log_segment.log_root.clone(),
-                    engine,
-                )?;
-                Ok(DriverState::Manifest(manifest))
-            }
-            multi_part => {
-                // Multi-part checkpoint: all parts are leaf files
-                let files: Vec<_> = multi_part.iter().map(|p| p.location.clone()).collect();
-                Ok(DriverState::ExecutorPhase { files })
-            }
-        }
     }
 }
 
-impl<P: LogReplayProcessor> Iterator for DriverPhase<P> {
+impl<P: LogReplayProcessor> Iterator for DriverProcessor<P> {
     type Item = DeltaResult<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Try to get item from current phase
-            let batch_result = match self.state.as_mut()? {
-                DriverState::Commit(phase) => phase.next(),
-                DriverState::Manifest(phase) => phase.next(),
-                DriverState::ExecutorPhase { .. } | DriverState::Done => {
-                    self.is_finished = true;
-                    return None;
-                }
-            };
+        let next = if let Some(next) = self.commit_phase.next() {
+            Some(next)
+        } else if let Some(manifest_reader) = self.checkpoint_manifest_phase.as_mut() {
+            manifest_reader.next()
+        } else {
+            None
+        };
 
-            match batch_result {
-                Some(Ok(batch)) => {
-                    // Process the batch through the processor
-                    return Some(self.processor.process_actions_batch(batch));
-                }
-                Some(Err(e)) => return Some(Err(e)),
-                None => {
-                    let Some(state) = self.state.take() else {
-                        return Some(Err(Error::generic("invalid")));
-                    };
-                    // Transition to next state after commit. If there is no next state, this state
-                    // machine is done
-                    let new_state = match state {
-                        DriverState::Commit(_) => {
-                            self.after_commit.take().unwrap_or(DriverState::Done)
-                        }
-                        DriverState::Manifest(manifest_phase) => match manifest_phase.finalize() {
-                            Ok(AfterManifest::Done) => DriverState::Done,
-                            Ok(AfterManifest::Sidecars(sidecars)) => {
-                                DriverState::ExecutorPhase { files: sidecars }
-                            }
-                            Err(err) => return Some(Err(err)),
-                        },
-                        DriverState::Done => DriverState::Done,
-                        DriverState::ExecutorPhase { files } => {
-                            DriverState::ExecutorPhase { files }
-                        }
-                    };
-                    self.state = Some(new_state);
-                }
+        match next {
+            Some(batch_res) => {
+                Some(batch_res.and_then(|batch| self.processor.process_actions_batch(batch)))
+            }
+            None => {
+                self.is_finished = true;
+                None
             }
         }
     }
@@ -192,7 +140,7 @@ impl<P: LogReplayProcessor> Iterator for DriverPhase<P> {
 // Streaming API: available when P implements LogReplayProcessor
 // ============================================================================
 
-impl<P: LogReplayProcessor> DriverPhase<P> {
+impl<P: LogReplayProcessor> DriverProcessor<P> {
     /// Complete driver phase and extract processor + files for distribution.
     ///
     /// Must be called after the iterator is exhausted.
@@ -203,22 +151,36 @@ impl<P: LogReplayProcessor> DriverPhase<P> {
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
-    pub(crate) fn finish(self) -> DeltaResult<DriverPhaseResult<P>> {
+    pub(crate) fn finish(self) -> DeltaResult<DriverProcessorResult<P>> {
         if !self.is_finished {
             return Err(Error::generic(
                 "Must exhaust iterator before calling finish()",
             ));
         }
 
-        match self.state {
-            Some(DriverState::ExecutorPhase { files }) => {
-                Ok(DriverPhaseResult::NeedsExecutorPhase {
-                    processor: self.processor,
-                    files,
-                })
+        let executor_files = match self.checkpoint_manifest_phase {
+            Some(manifest_reader) => manifest_reader.extract_sidecars()?,
+            None => {
+                let parts = &self.log_segment.checkpoint_parts;
+                require!(
+                    parts.len() != 1,
+                    Error::generic(
+                        "Invariant violation: If there is exactly one checkpoint part,
+                        there must be a manifest reader"
+                    )
+                );
+                // If this is a mult-part checkpoint, use the checkpoint parts for executor phase
+                parts.iter().map(|path| path.location.clone()).collect_vec()
             }
-            Some(DriverState::Done) | None => Ok(DriverPhaseResult::Complete(self.processor)),
-            _ => Err(Error::generic("Unexpected state after iterator exhaustion")),
+        };
+
+        if executor_files.is_empty() {
+            Ok(DriverProcessorResult::Complete(self.processor))
+        } else {
+            Ok(DriverProcessorResult::NeedsExecutorPhase {
+                processor: self.processor,
+                files: executor_files,
+            })
         }
     }
 }
@@ -271,7 +233,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut driver = DriverPhase::try_new(processor, log_segment, engine.clone())?;
+        let mut driver = DriverProcessor::try_new(processor, log_segment, engine.clone())?;
 
         let mut batch_count = 0;
         let mut file_paths = Vec::new();
@@ -291,7 +253,7 @@ mod tests {
         // table-without-dv-small has exactly 1 commit
         assert_eq!(
             batch_count, 1,
-            "DriverPhase should process exactly 1 batch for table-without-dv-small"
+            "DriverProcessor should process exactly 1 batch for table-without-dv-small"
         );
 
         file_paths.sort();
@@ -299,16 +261,16 @@ mod tests {
             vec!["part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"];
         assert_eq!(
             file_paths, expected_files,
-            "DriverPhase should find exactly the expected file"
+            "DriverProcessor should find exactly the expected file"
         );
 
         // No executor phase needed for commits-only table
         let result = driver.finish()?;
         match result {
-            DriverPhaseResult::Complete(_processor) => {
+            DriverProcessorResult::Complete(_processor) => {
                 // Expected - no executor phase needed
             }
-            DriverPhaseResult::NeedsExecutorPhase { .. } => {
+            DriverProcessorResult::NeedsExecutorPhase { .. } => {
                 panic!("Expected Complete, but got NeedsExecutorPhase for commits-only table");
             }
         }
@@ -329,7 +291,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut driver = DriverPhase::try_new(processor, log_segment, engine.clone())?;
+        let mut driver = DriverProcessor::try_new(processor, log_segment, engine.clone())?;
 
         let mut driver_batch_count = 0;
         let mut driver_file_paths = Vec::new();
@@ -353,27 +315,27 @@ mod tests {
         // Note: A single batch may contain multiple commits
         assert!(
             driver_batch_count >= 1,
-            "DriverPhase should process at least 1 batch"
+            "DriverProcessor should process at least 1 batch"
         );
 
         // The driver should process 0 files (all adds are in the checkpoint sidecars, commits after checkpoint have no new adds)
         driver_file_paths.sort();
         assert_eq!(
             driver_file_paths.len(), 0,
-            "DriverPhase should find 0 files (all adds are in checkpoint sidecars, commits 7-12 have no new add actions)"
+            "DriverProcessor should find 0 files (all adds are in checkpoint sidecars, commits 7-12 have no new add actions)"
         );
 
         // Should have executor phase with sidecars from the checkpoint
         let result = driver.finish()?;
         match result {
-            DriverPhaseResult::NeedsExecutorPhase {
+            DriverProcessorResult::NeedsExecutorPhase {
                 processor: _processor,
                 files,
             } => {
                 assert_eq!(
                     files.len(),
                     2,
-                    "DriverPhase should collect exactly 2 sidecar files from checkpoint for distribution"
+                    "DriverProcessor should collect exactly 2 sidecar files from checkpoint for distribution"
                 );
 
                 // Extract and verify the sidecar file paths
@@ -395,7 +357,7 @@ mod tests {
                 assert_eq!(collected_paths[0], "00000000000000000006.checkpoint.0000000001.0000000002.19af1366-a425-47f4-8fa6-8d6865625573.parquet");
                 assert_eq!(collected_paths[1], "00000000000000000006.checkpoint.0000000002.0000000002.5008b69f-aa8a-4a66-9299-0733a56a7e63.parquet");
             }
-            DriverPhaseResult::Complete(_processor) => {
+            DriverProcessorResult::Complete(_processor) => {
                 panic!("Expected NeedsExecutorPhase for table with sidecars");
             }
         }
