@@ -124,14 +124,12 @@ mod tests {
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::utils::test_utils::{
-        assert_result_error_with_message, create_engine_and_snapshot_from_path,
-        load_extracted_test_table,
+        assert_result_error_with_message, load_extracted_test_table, load_test_table_with_data,
     };
     use crate::SnapshotRef;
 
     use itertools::Itertools;
     use std::sync::Arc;
-    use test_utils::load_test_data;
 
     /// Core helper function to test manifest phase with expected add paths and sidecars
     fn verify_manifest_phase(
@@ -214,19 +212,8 @@ mod tests {
         expected_add_paths: &[&str],
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
-        // Try loading as compressed table first, fall back to extracted
-        let (engine, snapshot, _tempdir) = match load_test_data("tests/data", table_name) {
-            Ok(test_dir) => {
-                let test_path = test_dir.path().join(table_name);
-                let (engine, snapshot) = create_engine_and_snapshot_from_path(&test_path)?;
-                (engine, snapshot, Some(test_dir))
-            }
-            Err(_) => {
-                let (engine, snapshot) = load_extracted_test_table(table_name)?;
-                (engine, snapshot, None)
-            }
-        };
-
+        let (engine, snapshot, _tempdir) =
+            load_test_table_with_data("tests/data", table_name)?;
         verify_manifest_phase(engine, snapshot, expected_add_paths, expected_sidecars)
     }
 

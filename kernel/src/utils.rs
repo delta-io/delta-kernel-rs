@@ -316,6 +316,33 @@ pub(crate) mod test_utils {
 
         create_engine_and_snapshot_from_path(&path)
     }
+
+    /// Load test table from either compressed (tar.zst) or already-extracted location.
+    /// Tries loading compressed first, falls back to extracted.
+    /// Returns (engine, snapshot, optional tempdir) tuple.
+    /// The tempdir must be kept alive for the duration of the test.
+    pub(crate) fn load_test_table_with_data(
+        test_dir: &str,
+        table_name: &str,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Option<tempfile::TempDir>)> {
+        use test_utils::load_test_data;
+
+        match load_test_data(test_dir, table_name) {
+            Ok(test_dir_temp) => {
+                let mut test_path = test_dir_temp.path().join(table_name);
+                // For golden_data, append "/delta" to path
+                if test_dir.contains("golden_data") {
+                    test_path = test_path.join("delta");
+                }
+                let (engine, snapshot) = create_engine_and_snapshot_from_path(&test_path)?;
+                Ok((engine, snapshot, Some(test_dir_temp)))
+            }
+            Err(_) => {
+                let (engine, snapshot) = load_extracted_test_table(table_name)?;
+                Ok((engine, snapshot, None))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
