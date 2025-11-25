@@ -93,6 +93,7 @@ pub mod error;
 pub mod expressions;
 mod log_compaction;
 mod log_path;
+mod log_reader;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
