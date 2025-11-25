@@ -41,7 +41,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
-    reporter: Option<Arc<dyn MetricsReporter>>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
@@ -60,19 +60,15 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         )
     }
 
-    /// Create a new [`DefaultEngine`] instance with the default executor and metrics reporting.
-    /// TODO: Switch to Builder pattern to avoid explosion of constructor methods.
-    #[allow(dead_code)]
+    /// Set a metrics reporter for the engine to collect events and metrics during operations.
+    ///
+    /// # Parameters
+    ///
+    /// - `reporter`: An implementation of the [`MetricsReporter`] trait which will be used to
+    /// report metrics.
     #[internal_api]
-    pub(crate) fn new_with_metrics_reporter(
-        object_store: Arc<DynObjectStore>,
-        reporter: Arc<dyn MetricsReporter>,
-    ) -> Self {
-        Self::new_with_executor_and_metrics_reporter(
-            object_store,
-            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
-            reporter,
-        )
+    pub(crate) fn set_metrics_reporter(&mut self, reporter: Arc<dyn MetricsReporter>) {
+        self.metrics_reporter = Some(reporter);
     }
 }
 
@@ -103,36 +99,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
-            reporter: None,
-        }
-    }
-
-    /// Create a new [`DefaultEngine`] instance with a custom executor and metrics reporting.
-    /// TODO: Switch to Builder pattern to avoid explosion of constructor methods.
-    #[allow(dead_code)]
-    #[internal_api]
-    pub(crate) fn new_with_executor_and_metrics_reporter(
-        object_store: Arc<DynObjectStore>,
-        task_executor: Arc<E>,
-        reporter: Arc<dyn MetricsReporter>,
-    ) -> Self {
-        Self {
-            storage: Arc::new(ObjectStoreStorageHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-                Some(reporter.clone()),
-            )),
-            json: Arc::new(DefaultJsonHandler::new(
-                object_store.clone(),
-                task_executor.clone(),
-            )),
-            parquet: Arc::new(DefaultParquetHandler::new(
-                object_store.clone(),
-                task_executor,
-            )),
-            object_store,
-            evaluation: Arc::new(ArrowEvaluationHandler {}),
-            reporter: Some(reporter),
+            metrics_reporter: None,
         }
     }
 
@@ -179,7 +146,7 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
     }
 
     fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
-        self.reporter.clone()
+        self.metrics_reporter.clone()
     }
 }
 
