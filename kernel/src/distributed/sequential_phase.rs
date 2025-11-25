@@ -75,8 +75,6 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     log_segment: Arc<LogSegment>,
 }
 
-unsafe impl<P: LogReplayProcessor> Send for SequentialPhase<P> {}
-
 /// Result of sequential log replay processing.
 #[allow(unused)]
 pub(crate) enum AfterSequential<P: LogReplayProcessor> {
