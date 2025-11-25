@@ -1424,4 +1424,119 @@ mod test {
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
         assert!(!config.is_feature_info_enabled(&feature, &custom_feature_info));
     }
+
+    #[test]
+    fn test_v2_checkpoint_supported() {
+        let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
+        assert!(config.is_v2_checkpoint_write_supported());
+    }
+
+    #[test]
+    fn test_ensure_read_supported() {
+        let config = create_mock_table_config(&[], &[]);
+        assert!(config.ensure_read_supported().is_ok());
+
+        let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
+        assert!(config.ensure_read_supported().is_ok());
+
+        let config = create_mock_table_config_with_version(&[], None, 1, 2);
+        assert!(config.ensure_read_supported().is_ok());
+
+        let config = create_mock_table_config_with_version(
+            &[],
+            Some(&[TableFeature::InCommitTimestamp]),
+            2,
+            7,
+        );
+        assert!(config.ensure_read_supported().is_ok());
+    }
+
+    #[test]
+    fn test_ensure_write_supported() {
+        let config = create_mock_table_config(
+            &[],
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::DeletionVectors,
+                TableFeature::DomainMetadata,
+                TableFeature::Invariants,
+                TableFeature::RowTracking,
+            ],
+        );
+        assert!(config.ensure_write_supported().is_ok());
+
+        // Type Widening is not supported for writes
+        let config = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
+        assert_result_error_with_message(
+            config.ensure_write_supported(),
+            r#"Feature 'typeWidening' not supported for writes"#,
+        );
+
+        // Unknown feature is not supported for reads
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some([TableFeature::Unknown("unsupported feature".to_string())]),
+            Some([TableFeature::Unknown("unsupported feature".to_string())]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        assert_result_error_with_message(
+            TableConfiguration::try_new(metadata, protocol, table_root, 0),
+            r#"Unsupported: Unknown feature 'unsupported feature'"#,
+        );
+    }
+
+    #[test]
+    fn test_illegal_writer_feature_combination() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![TableFeature::RowTracking]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert_result_error_with_message(
+            config.ensure_write_supported(),
+            "rowTracking requires domainMetadata to be supported",
+        );
+    }
+
+    #[test]
+    fn test_row_tracking_with_domain_metadata_requirement() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(
+            config.ensure_write_supported().is_ok(),
+            "RowTracking with DomainMetadata should be supported for writes"
+        );
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_writes() {
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
+        assert!(config.ensure_write_supported().is_ok());
+
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
+        assert!(config.ensure_write_supported().is_ok());
+    }
 }
