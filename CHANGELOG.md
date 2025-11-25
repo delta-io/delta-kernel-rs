@@ -1,5 +1,33 @@
 # Changelog
 
+## [v0.18.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.1/) (2025-11-24)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.0...v0.18.1)
+
+
+### 🚀 Features / new APIs
+
+1. Scan::execute no longer requires lifetime bound  ([#1515])
+2. Migrate protocol validation to table_configuration ([#1411])
+3. Add Display for StructType, StructField, and MetadataColumnSpec ([#1494])
+5. Add EngineDataArrowExt and use it everywhere ([#1516])
+6. Implement builder for StructType ([#1492])
+7. Enable CDF for column-mapped tables ([#1510])
+
+### 🧪 Testing
+
+1. Extract File Action tests ([#1365])
+
+
+[#1515]: https://github.com/delta-io/delta-kernel-rs/pull/1515
+[#1365]: https://github.com/delta-io/delta-kernel-rs/pull/1365
+[#1411]: https://github.com/delta-io/delta-kernel-rs/pull/1411
+[#1494]: https://github.com/delta-io/delta-kernel-rs/pull/1494
+[#1516]: https://github.com/delta-io/delta-kernel-rs/pull/1516
+[#1492]: https://github.com/delta-io/delta-kernel-rs/pull/1492
+[#1510]: https://github.com/delta-io/delta-kernel-rs/pull/1510
+
+
 ## [v0.18.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.0/) (2025-11-19)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.17.1...v0.18.0)
