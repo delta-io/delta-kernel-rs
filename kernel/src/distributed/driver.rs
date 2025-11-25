@@ -171,7 +171,7 @@ impl<P: LogReplayProcessor> Iterator for DriverPhase<P> {
                         }
                         DriverState::Manifest(manifest_phase) => match manifest_phase.finalize() {
                             Ok(AfterManifest::Done) => DriverState::Done,
-                            Ok(AfterManifest::Sidecars { sidecars }) => {
+                            Ok(AfterManifest::Sidecars(sidecars)) => {
                                 DriverState::ExecutorPhase { files: sidecars }
                             }
                             Err(err) => return Some(Err(err)),
