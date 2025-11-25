@@ -66,6 +66,7 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     ///
     /// - `reporter`: An implementation of the [`MetricsReporter`] trait which will be used to
     /// report metrics.
+    #[allow(dead_code)]
     #[internal_api]
     pub(crate) fn set_metrics_reporter(&mut self, reporter: Arc<dyn MetricsReporter>) {
         self.metrics_reporter = Some(reporter);
