@@ -346,7 +346,6 @@ mod tests {
             true
         )
         .is_ok());
-
         assert_result_error_with_message(
             ensure_data_types(
                 &DataType::unshredded_variant(),
