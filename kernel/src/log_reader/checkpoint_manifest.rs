@@ -212,8 +212,7 @@ mod tests {
         expected_add_paths: &[&str],
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) =
-            load_test_table_with_data("tests/data", table_name)?;
+        let (engine, snapshot, _tempdir) = load_test_table_with_data("tests/data", table_name)?;
         verify_manifest_phase(engine, snapshot, expected_add_paths, expected_sidecars)
     }
 
