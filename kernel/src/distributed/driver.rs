@@ -1,11 +1,12 @@
-//! Driver (Phase 1) log replay processor for distributed execution.
+//! Sequential log replay processor that happens before the distributed phase.
 //!
-//! This module provides driver-side execution that processes commits and single-part
-//! checkpoint manifests, then returns the processor and any files (sidecars or multi-part
-//! checkpoint parts) for distribution to executors.
+//! This module provides sequential phase log replay that processes commits and
+//! single-part checkpoint manifests, then returns the processor and any files (sidecars or
+//! multi-part checkpoint parts) for parallel processing by the distributed phase. This phase
+//! must be completed before the distributed phase can start.
 //!
-//! For multi-part checkpoints, the driver skips manifest processing and returns the
-//! checkpoint parts for parallel executor processing.
+//! For multi-part checkpoints, the sequential phase skips manifest processing and returns
+//! the checkpoint parts for parallel processing.
 
 use std::sync::Arc;
 
@@ -19,15 +20,15 @@ use crate::log_segment::LogSegment;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta};
 
-/// Driver-side log replay (Phase 1) for distributed execution.
+/// Sequential log replay processor for distributed execution.
 ///
-/// This iterator processes:
+/// This iterator processes log replay sequentially:
 /// 1. Commit files (JSON)
 /// 2. Manifest (single-part checkpoint, if present)
 ///
 /// After exhaustion, call `finish()` to extract:
 /// - The processor (for serialization and distribution)
-/// - Files to distribute (sidecars or multi-part checkpoint parts)
+/// - Files to distribute (sidecars or multi-part checkpoint parts) for parallel processing
 ///
 /// # Type Parameters
 /// - `P`: A [`LogReplayProcessor`] implementation that processes action batches
@@ -35,32 +36,32 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut driver = DriverProcessor::try_new(processor, log_segment, engine)?;
+/// let mut sequential = SequentialPhase::try_new(processor, log_segment, engine)?;
 ///
-/// // Iterate over driver-side batches
-/// for batch in driver.by_ref() {
+/// // Iterate over sequential batches
+/// for batch in sequential.by_ref() {
 ///     let metadata = batch?;
 ///     // Process metadata
 /// }
 ///
 /// // Extract processor and files for distribution (if needed)
-/// match driver.finish()? {
-///     DriverProcessorResult::NeedsExecutorPhase { processor, files } => {
-///         // Executor phase needed - distribute files to executors
+/// match sequential.finish()? {
+///     AfterSequential::Distributed { processor, files } => {
+///         // Distributed phase needed - distribute files for parallel processing
 ///         let serialized = processor.serialize()?;
-///         let partitions = partition_files(files, num_executors);
-///         for (executor, partition) in partitions {
-///             executor.send(serialized.clone(), partition)?;
+///         let partitions = partition_files(files, num_workers);
+///         for (worker, partition) in partitions {
+///             worker.send(serialized.clone(), partition)?;
 ///         }
 ///     }
-///     DriverProcessorResult::Complete(processor) => {
-///         // No executor phase needed - all processing complete on driver
-///         println!("Log replay complete on driver");
+///     AfterSequential::Done(processor) => {
+///         // No distributed phase needed - all processing complete sequentially
+///         println!("Log replay complete");
 ///     }
 /// }
 /// ```
 #[allow(unused)]
-pub(crate) struct DriverProcessor<P: LogReplayProcessor> {
+pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
     processor: P,
     // The commit reader that will be used to read the commit files
@@ -74,23 +75,23 @@ pub(crate) struct DriverProcessor<P: LogReplayProcessor> {
     log_segment: Arc<LogSegment>,
 }
 
-/// Result of driver phase processing.
-#[allow(unused)] 
-pub(crate) enum DriverProcessorResult<P: LogReplayProcessor> {
-    /// All processing complete on driver - no executor phase needed.
-    Complete(P),
-    /// Executor phase needed - distribute files to executors for parallel processing.
-    NeedsExecutorPhase { processor: P, files: Vec<FileMeta> },
+/// Result of sequential log replay processing.
+#[allow(unused)]
+pub(crate) enum AfterSequential<P: LogReplayProcessor> {
+    /// All processing complete sequentially - no distributed phase needed.
+    Done(P),
+    /// Distributed phase needed - distribute files for parallel processing.
+    Distributed { processor: P, files: Vec<FileMeta> },
 }
 
-impl<P: LogReplayProcessor> DriverProcessor<P> {
+impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// Create a new driver-side log replay.
     ///
     /// # Parameters
     /// - `processor`: The log replay processor
     /// - `log_segment`: The log segment to process
     /// - `engine`: Engine for reading files
-    #[allow(unused)] 
+    #[allow(unused)]
     pub(crate) fn try_new(
         processor: P,
         log_segment: Arc<LogSegment>,
@@ -99,8 +100,8 @@ impl<P: LogReplayProcessor> DriverProcessor<P> {
         let commit_phase =
             CommitReader::try_new(engine.as_ref(), &log_segment, get_commit_schema().clone())?;
 
-        // Concurrently compute the next state after commit. Only create a checkpoint manifest
-        // reader if the checkpoint is single-part
+        // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
+        // reader if the checkpoint is single-part.
         let checkpoint_manifest_phase =
             if let [single_part] = log_segment.checkpoint_parts.as_slice() {
                 Some(CheckpointManifestReader::try_new(
@@ -120,19 +121,19 @@ impl<P: LogReplayProcessor> DriverProcessor<P> {
             log_segment,
         })
     }
-    
+
     /// Complete driver phase and extract processor + files for distribution.
     ///
     /// Must be called after the iterator is exhausted.
     ///
     /// # Returns
     /// - `Complete`: All processing done on driver - no executor phase needed
-    /// - `NeedsExecutorPhase`: Executor phase needed - distribute files to executors
+    /// - `NeedsDistributedPhase`: Executor phase needed - distribute files to executors
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
     #[allow(unused)]
-    pub(crate) fn finish(self) -> DeltaResult<DriverProcessorResult<P>> {
+    pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
         if !self.is_finished {
             return Err(Error::generic(
                 "Must exhaust iterator before calling finish()",
@@ -156,9 +157,9 @@ impl<P: LogReplayProcessor> DriverProcessor<P> {
         };
 
         if executor_files.is_empty() {
-            Ok(DriverProcessorResult::Complete(self.processor))
+            Ok(AfterSequential::Done(self.processor))
         } else {
-            Ok(DriverProcessorResult::NeedsExecutorPhase {
+            Ok(AfterSequential::Distributed {
                 processor: self.processor,
                 files: executor_files,
             })
@@ -166,7 +167,7 @@ impl<P: LogReplayProcessor> DriverProcessor<P> {
     }
 }
 
-impl<P: LogReplayProcessor> Iterator for DriverProcessor<P> {
+impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
     type Item = DeltaResult<P::Output>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -190,17 +191,20 @@ mod tests {
     use super::*;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state_info::StateInfo;
-    use crate::utils::test_utils::{assert_result_error_with_message, load_extracted_test_table, load_test_table_with_data};
+    use crate::utils::test_utils::{
+        assert_result_error_with_message, load_extracted_test_table, load_test_table_with_data,
+    };
     use crate::{Engine, SnapshotRef};
     use std::sync::Arc;
 
     /// Core helper function to verify driver processing with expected adds and sidecars.
     fn verify_driver_processing(
-        engine: Arc<dyn Engine>,
-        snapshot: SnapshotRef,
+        table_name: &str,
+        test_dir: &str,
         expected_adds: &[&str],
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
+        let (engine, snapshot, _tempdir) = load_test_table_with_data(test_dir, table_name)?;
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
         let state_info = Arc::new(StateInfo::try_new(
@@ -211,7 +215,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut driver = DriverProcessor::try_new(processor, log_segment, engine.clone())?;
+        let mut driver = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Process all batches and collect Add file paths
         let mut file_paths = Vec::new();
@@ -235,14 +239,14 @@ mod tests {
         // Call finish() and verify result based on expected sidecars
         let result = driver.finish()?;
         match (expected_sidecars, result) {
-            ([], DriverProcessorResult::Complete(_)) => { /* expected */ }
-            ([], DriverProcessorResult::NeedsExecutorPhase { files, .. }) => {
-                panic!(
-                    "Expected Complete, but got NeedsExecutorPhase with {} files",
-                    files.len()
+            (sidecars, AfterSequential::Done(_)) => {
+                assert!(
+                    sidecars.is_empty(),
+                    "Expected Done but got sidecras {:?}",
+                    sidecars
                 );
             }
-            (expected_sidecars, DriverProcessorResult::NeedsExecutorPhase { files, .. }) => {
+            (expected_sidecars, AfterSequential::Distributed { files, .. }) => {
                 assert_eq!(
                     files.len(),
                     expected_sidecars.len(),
@@ -265,32 +269,14 @@ mod tests {
                 collected_paths.sort();
                 assert_eq!(collected_paths, expected_sidecars);
             }
-            (sidecars, DriverProcessorResult::Complete(_)) => {
-                panic!(
-                    "Expected NeedsExecutorPhase with sidecars {:?}, but got Complete",
-                    sidecars
-                );
-            }
         }
 
         Ok(())
     }
 
-    /// Helper function to test driver processing with expected adds and sidecars.
-    /// Works with both compressed (tar.zst) and already-extracted test tables.
-    fn test_driver_processing(
-        table_name: &str,
-        test_dir: &str,
-        expected_adds: &[&str],
-        expected_sidecars: &[&str],
-    ) -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table_with_data(test_dir, table_name)?;
-        verify_driver_processing(engine, snapshot, expected_adds, expected_sidecars)
-    }
-
     #[test]
     fn test_driver_v2_with_commits_only() -> DeltaResult<()> {
-        test_driver_processing(
+        verify_driver_processing(
             "table-without-dv-small",
             "tests/data",
             &["part-00000-517f5d32-9c95-48e8-82b4-0229cc194867-c000.snappy.parquet"],
@@ -300,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_driver_v2_with_sidecars() -> DeltaResult<()> {
-        test_driver_processing(
+        verify_driver_processing(
             "v2-checkpoints-json-with-sidecars",
             "tests/data",
             &[], // No adds on driver (all in checkpoint sidecars)
@@ -313,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_driver_multi_part_checkpoint() -> DeltaResult<()> {
-        test_driver_processing(
+        verify_driver_processing(
             "multi-part-checkpoint",
             "tests/golden_data",
             &[], // No adds on driver
@@ -338,7 +324,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut driver = DriverProcessor::try_new(processor, log_segment, engine.clone())?;
+        let mut driver = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Call next() once but don't exhaust the iterator
         if let Some(result) = driver.next() {
@@ -354,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_driver_checkpoint_without_sidecars() -> DeltaResult<()> {
-        test_driver_processing(
+        verify_driver_processing(
             "v2-checkpoints-json-without-sidecars",
             "tests/data",
             &[
@@ -369,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_driver_parquet_checkpoint_with_sidecars() -> DeltaResult<()> {
-        test_driver_processing(
+        verify_driver_processing(
             "v2-checkpoints-parquet-with-sidecars",
             "tests/data",
             &[], // No adds on driver
@@ -383,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_driver_checkpoint_no_commits() -> DeltaResult<()> {
-        test_driver_processing(
+        verify_driver_processing(
             "with_checkpoint_no_last_checkpoint",
             "tests/data",
             &["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"], // Add from commit 3
