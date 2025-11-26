@@ -75,6 +75,8 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     log_segment: Arc<LogSegment>,
 }
 
+unsafe impl<P: LogReplayProcessor> Send for SequentialPhase<P> {}
+
 /// Result of sequential log replay processing.
 #[allow(unused)]
 pub(crate) enum AfterSequential<P: LogReplayProcessor> {
@@ -194,7 +196,6 @@ mod tests {
     use crate::utils::test_utils::{
         assert_result_error_with_message, load_extracted_test_table, load_test_table_with_data,
     };
-    use crate::{Engine, SnapshotRef};
     use std::sync::Arc;
 
     /// Core helper function to verify driver processing with expected adds and sidecars.
@@ -255,7 +256,7 @@ mod tests {
                 );
 
                 // Extract and verify sidecar file paths
-                let mut collected_paths: Vec<String> = files
+                let mut collected_paths = files
                     .iter()
                     .map(|fm| {
                         fm.location
@@ -264,7 +265,7 @@ mod tests {
                             .unwrap_or("")
                             .to_string()
                     })
-                    .collect();
+                    .collect_vec();
 
                 collected_paths.sort();
                 assert_eq!(collected_paths, expected_sidecars);
