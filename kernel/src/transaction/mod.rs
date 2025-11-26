@@ -173,10 +173,10 @@ impl Transaction {
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
-        // important! before a read/write to the table we must check it is supported
+        // important! before writing to the table we must check it is supported
         read_snapshot
             .table_configuration()
-            .ensure_write_supported(Operation::Scan)?;
+            .ensure_operation_supported(Operation::Write)?;
 
         let commit_timestamp = current_time_ms()?;
 
