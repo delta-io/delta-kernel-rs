@@ -23,10 +23,16 @@ impl CommitReader {
         schema: SchemaRef,
     ) -> DeltaResult<Self> {
         let commit_files = log_segment.find_commit_cover();
-        let actions = engine
-            .json_handler()
-            .read_json_files(&commit_files, schema, None)?
-            .map(|batch| batch.map(|b| ActionsBatch::new(b, true)));
+        let actions = if commit_files.is_empty() {
+            Box::new(std::iter::empty())
+                as Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>
+        } else {
+            let actions = engine
+                .json_handler()
+                .read_json_files(&commit_files, schema, None)?
+                .map(|batch| batch.map(|b| ActionsBatch::new(b, true)));
+            Box::new(actions)
+        };
 
         Ok(Self {
             actions: Box::new(actions),
