@@ -14,6 +14,7 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
+use crate::distributed::sequential_phase::SequentialPhase;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -21,7 +22,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
-use crate::scan::log_replay::BASE_ROW_ID_NAME;
+use crate::scan::log_replay::{ScanLogReplayProcessor, BASE_ROW_ID_NAME};
 use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -150,7 +151,9 @@ pub(crate) enum PhysicalPredicate {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 enum SerializablePhysicalPredicate {
     /// Has a predicate and schema (but we skip serializing the predicate itself)
-    Some { schema: crate::schema::StructType },
+    Some {
+        schema: crate::schema::StructType,
+    },
     StaticSkipAll,
     None,
 }
@@ -458,7 +461,7 @@ impl Scan {
     ///     DriverPhaseResult::NeedsExecutorPhase { processor, files } => {
     ///         // Serialize for distribution
     ///         let (state, deduplicator) = processor.serialize()?;
-    ///        
+    ///
     ///         // Partition files and distribute to executors
     ///         for (executor, file_partition) in partition(files) {
     ///             executor.send(state.clone(), deduplicator.clone(), file_partition);
@@ -471,20 +474,15 @@ impl Scan {
     pub(crate) fn scan_metadata_distributed(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<crate::distributed::DriverPhase<log_replay::ScanLogReplayProcessor>> {
-        use crate::distributed::DriverPhase;
-        
+    ) -> DeltaResult<SequentialPhase<ScanLogReplayProcessor>> {
         // Create the processor
-        let processor = log_replay::ScanLogReplayProcessor::new(
-            engine.as_ref(),
-            self.state_info.clone(),
-        )?;
-        
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), self.state_info.clone())?;
+
         // Get log segment
         let log_segment = Arc::new(self.snapshot.log_segment().clone());
-        
+
         // Create and return driver phase
-        DriverPhase::try_new(processor, log_segment, engine)
+        SequentialPhase::try_new(processor, log_segment, engine)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
