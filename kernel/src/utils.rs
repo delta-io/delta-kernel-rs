@@ -152,17 +152,20 @@ pub(crate) mod test_utils {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::Engine;
-    use crate::EngineData;
+    use crate::{DeltaResult, EngineData, Error, SnapshotRef};
+    use crate::{Engine, Snapshot};
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use serde::Serialize;
+    use std::path::PathBuf;
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
+    use url::Url;
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -280,6 +283,63 @@ pub(crate) mod test_utils {
                     error_str.contains(message),
                     "Error message does not contain the expected message.\nExpected message:\t{message}\nActual message:\t\t{error_str}"
                 );
+            }
+        }
+    }
+
+    /// Helper to create engine and snapshot from a path.
+    /// Returns (engine, snapshot) tuple.
+    pub(crate) fn create_engine_and_snapshot_from_path(
+        path: &Path,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef)> {
+        let url = Url::from_directory_path(path)
+            .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
+
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = Arc::new(DefaultEngine::new(store));
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+        Ok((engine, snapshot))
+    }
+
+    /// Load an already-extracted test table from the filesystem.
+    /// Returns (engine, snapshot) tuple.
+    pub(crate) fn load_extracted_test_table(
+        table_name: &str,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef)> {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mut path = PathBuf::from(manifest_dir);
+        path.push("tests/data");
+        path.push(table_name);
+
+        let path = std::fs::canonicalize(path)
+            .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+
+        create_engine_and_snapshot_from_path(&path)
+    }
+
+    /// Load test table from either compressed (tar.zst) or already-extracted location.
+    /// Tries loading compressed first, falls back to extracted.
+    /// Returns (engine, snapshot, optional tempdir) tuple.
+    /// The tempdir must be kept alive for the duration of the test.
+    pub(crate) fn load_test_table_with_data(
+        test_dir: &str,
+        table_name: &str,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Option<tempfile::TempDir>)> {
+        use test_utils::load_test_data;
+
+        match load_test_data(test_dir, table_name) {
+            Ok(test_dir_temp) => {
+                let mut test_path = test_dir_temp.path().join(table_name);
+                // For golden_data, append "/delta" to path
+                if test_dir.contains("golden_data") {
+                    test_path = test_path.join("delta");
+                }
+                let (engine, snapshot) = create_engine_and_snapshot_from_path(&test_path)?;
+                Ok((engine, snapshot, Some(test_dir_temp)))
+            }
+            Err(_) => {
+                let (engine, snapshot) = load_extracted_test_table(table_name)?;
+                Ok((engine, snapshot, None))
             }
         }
     }
