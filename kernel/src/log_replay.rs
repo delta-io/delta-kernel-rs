@@ -13,8 +13,8 @@
 //! This module provides structures for efficient batch processing, focusing on file action
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::{GetData, TypedGetData};
+use crate::engine_data::GetData;
+use crate::log_replay::deduplicator::Deduplicator;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
@@ -23,6 +23,8 @@ use delta_kernel_derive::internal_api;
 use std::collections::HashSet;
 
 use tracing::debug;
+
+pub(crate) mod deduplicator;
 
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
@@ -56,7 +58,8 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     seen_file_keys: &'seen mut HashSet<FileActionKey>,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
-    /// Whether we're processing a log batch (as opposed to a checkpoint)
+    /// Whether we're processing a commit log JSON file (`true`) or a checkpoint file (`false`).
+    /// When `true`, file actions are added to `seen_file_keys` as they're processed.
     is_log_batch: bool,
     /// Index of the getter containing the add.path column
     add_path_index: usize,
@@ -86,12 +89,14 @@ impl<'seen> FileActionDeduplicator<'seen> {
             remove_dv_start_index,
         }
     }
+}
 
+impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
     /// Checks if log replay already processed this logical file (in which case the current action
     /// should be ignored). If not already seen, register it so we can recognize future duplicates.
     /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
     /// and should process it.
-    pub(crate) fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
+    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
         // Note: each (add.path + add.dv_unique_id()) pair has a
         // unique Add + Remove pair in the log. For example:
         // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
@@ -117,35 +122,6 @@ impl<'seen> FileActionDeduplicator<'seen> {
         }
     }
 
-    /// Extracts the deletion vector unique ID if it exists.
-    ///
-    /// This function retrieves the necessary fields for constructing a deletion vector unique ID
-    /// by accessing `getters` at `dv_start_index` and the following two indices. Specifically:
-    /// - `dv_start_index` retrieves the storage type (`deletionVector.storageType`).
-    /// - `dv_start_index + 1` retrieves the path or inline deletion vector (`deletionVector.pathOrInlineDv`).
-    /// - `dv_start_index + 2` retrieves the optional offset (`deletionVector.offset`).
-    fn extract_dv_unique_id<'a>(
-        &self,
-        i: usize,
-        getters: &[&'a dyn GetData<'a>],
-        dv_start_index: usize,
-    ) -> DeltaResult<Option<String>> {
-        match getters[dv_start_index].get_opt(i, "deletionVector.storageType")? {
-            Some(storage_type) => {
-                let path_or_inline =
-                    getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
-                let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
-
-                Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
-                    storage_type,
-                    path_or_inline,
-                    offset,
-                )))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Extracts a file action key and determines if it's an add operation.
     /// This method examines the data at the given index using the provided getters
     /// to identify whether a file action exists and what type it is.
@@ -159,7 +135,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     /// - `Ok(Some((key, is_add)))`: When a file action is found, returns the key and whether it's an add operation
     /// - `Ok(None)`: When no file action is found
     /// - `Err(...)`: On any error during extraction
-    pub(crate) fn extract_file_action<'a>(
+    fn extract_file_action<'a>(
         &self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
@@ -190,7 +166,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     ///
     /// `true` indicates we are processing a batch from a commit file.
     /// `false` indicates we are processing a batch from a checkpoint.
-    pub(crate) fn is_log_batch(&self) -> bool {
+    fn is_log_batch(&self) -> bool {
         self.is_log_batch
     }
 }
