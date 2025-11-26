@@ -12,6 +12,7 @@ use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
+use crate::log_replay::deduplicator::Deduplicator;
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
@@ -80,6 +81,15 @@ pub(crate) struct ScanLogReplayProcessor {
 }
 
 impl ScanLogReplayProcessor {
+    // These index positions correspond to the order of columns defined in
+    // `selected_column_names_and_types()`
+    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
+    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
+    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
+
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
         Self::new_with_seen_files(engine, state_info, Default::default())
@@ -234,40 +244,23 @@ impl ScanLogReplayProcessor {
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
-struct AddRemoveDedupVisitor<'seen> {
-    deduplicator: FileActionDeduplicator<'seen>,
+struct AddRemoveDedupVisitor<D: Deduplicator> {
+    deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
-impl AddRemoveDedupVisitor<'_> {
-    // These index positions correspond to the order of columns defined in
-    // `selected_column_names_and_types()`
-    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
-    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
-    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
-
+impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
     fn new(
-        seen: &mut HashSet<FileActionKey>,
+        deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
-        is_log_batch: bool,
-    ) -> AddRemoveDedupVisitor<'_> {
+    ) -> AddRemoveDedupVisitor<D> {
         AddRemoveDedupVisitor {
-            deduplicator: FileActionDeduplicator::new(
-                seen,
-                is_log_batch,
-                Self::ADD_PATH_INDEX,
-                Self::REMOVE_PATH_INDEX,
-                Self::ADD_DV_START_INDEX,
-                Self::REMOVE_DV_START_INDEX,
-            ),
+            deduplicator,
             selection_vector,
             state_info,
             partition_filter,
@@ -319,8 +312,8 @@ impl AddRemoveDedupVisitor<'_> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values =
-                    getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
+                let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                    .get(i, "add.partitionValues")?;
                 let partition_values = parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -340,7 +333,7 @@ impl AddRemoveDedupVisitor<'_> {
             return Ok(false);
         }
         let base_row_id: Option<i64> =
-            getters[Self::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
+            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
         let transform = self
             .state_info
             .transform_spec
@@ -363,7 +356,7 @@ impl AddRemoveDedupVisitor<'_> {
     }
 }
 
-impl RowVisitor for AddRemoveDedupVisitor<'_> {
+impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
@@ -514,12 +507,19 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let selection_vector = self.build_selection_vector(actions.as_ref())?;
         assert_eq!(selection_vector.len(), actions.len());
 
-        let mut visitor = AddRemoveDedupVisitor::new(
+        let deduplicator = FileActionDeduplicator::new(
             &mut self.seen_file_keys,
+            is_log_batch,
+            Self::ADD_PATH_INDEX,
+            Self::REMOVE_PATH_INDEX,
+            Self::ADD_DV_START_INDEX,
+            Self::REMOVE_DV_START_INDEX,
+        );
+        let mut visitor = AddRemoveDedupVisitor::new(
+            deduplicator,
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
-            is_log_batch,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
