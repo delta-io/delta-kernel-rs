@@ -32,12 +32,14 @@ use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
+use self::stats_schema::StatsParsedInfo;
 
 pub(crate) mod data_skipping;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
 pub(crate) mod state_info;
+pub(crate) mod stats_schema;
 
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]
@@ -50,6 +52,25 @@ static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+
+/// Build a checkpoint read schema that includes stats_parsed if available.
+///
+/// When `stats_parsed_schema` is provided, the returned schema includes `add.stats_parsed`
+/// which allows reading parsed statistics directly from checkpoint files.
+fn build_checkpoint_read_schema(stats_parsed_schema: Option<&SchemaRef>) -> SchemaRef {
+    use crate::scan::stats_schema::build_add_schema_with_stats_parsed;
+
+    match stats_parsed_schema {
+        Some(stats_schema) => {
+            // Build Add schema with stats_parsed included
+            let add_with_stats = build_add_schema_with_stats_parsed(Some(stats_schema.as_ref()));
+            Arc::new(crate::schema::StructType::new_unchecked([
+                StructField::nullable(ADD_NAME, add_with_stats),
+            ]))
+        }
+        None => CHECKPOINT_READ_SCHEMA.clone(),
+    }
+}
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -397,7 +418,26 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        // Extract predicate schema - only columns referenced by the predicate.
+        // This optimizes stats_parsed reading to only reconcile and read stats for
+        // columns that data skipping actually needs.
+        let predicate_schema = match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(_, schema) => Some(schema.as_ref()),
+            _ => None,
+        };
+
+        // Get stats_parsed info using predicate schema (or None if no predicate)
+        let stats_parsed_info = self
+            .snapshot
+            .log_segment()
+            .get_stats_parsed_info(engine.parquet_handler().as_ref(), predicate_schema);
+
+        // Build checkpoint read schema with stats_parsed if available
+        let checkpoint_schema =
+            build_checkpoint_read_schema(stats_parsed_info.stats_parsed_schema.as_ref());
+
+        let action_iter = self.replay_for_scan_metadata_with_schema(engine, checkpoint_schema)?;
+        self.scan_metadata_inner(engine, action_iter, stats_parsed_info)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -499,7 +539,12 @@ impl Scan {
         // to apply file skipping and provide the required transformations.
         if existing_version == self.snapshot.version() {
             let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            // No checkpoint in this path, so stats_parsed is not available
+            return Ok(Box::new(self.scan_metadata_inner(
+                engine,
+                scan,
+                StatsParsedInfo::not_available(),
+            )?));
         }
 
         let log_segment = self.snapshot.log_segment();
@@ -538,25 +583,47 @@ impl Scan {
             )?
             .chain(existing_data.into_iter().map(apply_transform));
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        // The new_log_segment has no checkpoint parts, so stats_parsed is not available
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            it,
+            StatsParsedInfo::not_available(),
+        )?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        stats_parsed_info: StatsParsedInfo,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            action_batch_iter,
+            self.state_info.clone(),
+            stats_parsed_info,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
-    // Factored out to facilitate testing
+    // Replay log segment to get actions (for testing purposes).
+    // Uses the default checkpoint schema without stats_parsed.
+    #[cfg(test)]
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        self.replay_for_scan_metadata_with_schema(engine, CHECKPOINT_READ_SCHEMA.clone())
+    }
+
+    // Replay with a custom checkpoint read schema (for stats_parsed support)
+    fn replay_for_scan_metadata_with_schema(
+        &self,
+        engine: &dyn Engine,
+        checkpoint_schema: SchemaRef,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
@@ -565,7 +632,7 @@ impl Scan {
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
+                checkpoint_schema,
                 None,
             )
     }
@@ -747,6 +814,7 @@ pub(crate) mod test_utils {
 
     use super::state::ScanCallback;
     use super::PhysicalPredicate;
+    use super::StatsParsedInfo;
     use crate::table_features::ColumnMappingMode;
     use crate::transforms::TransformSpec;
 
@@ -870,6 +938,7 @@ pub(crate) mod test_utils {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            StatsParsedInfo::not_available(),
         )
         .unwrap();
         let mut batch_count = 0;

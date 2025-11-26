@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
-use crate::engine::arrow_conversion::TryIntoArrow as _;
+use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
@@ -29,7 +29,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -244,6 +244,41 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files,
             self.readahead,
         )
+    }
+
+    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
+        let store = self.store.clone();
+        let location = file.location.clone();
+
+        self.task_executor.block_on(async move {
+            let arrow_schema =
+                if location.is_presigned() {
+                    // Handle presigned URLs by fetching the file via HTTP
+                    let client = reqwest::Client::new();
+                    let response = client.get(location.as_str()).send().await.map_err(|e| {
+                        Error::generic(format!("Failed to fetch presigned URL: {}", e))
+                    })?;
+                    let bytes = response.bytes().await.map_err(|e| {
+                        Error::generic(format!("Failed to read response bytes: {}", e))
+                    })?;
+
+                    // Load metadata from bytes
+                    let metadata = ArrowReaderMetadata::load(&bytes, Default::default())?;
+                    metadata.schema().clone()
+                } else {
+                    // Handle object store paths
+                    let path = Path::from_url_path(location.path())?;
+                    let mut reader = ParquetObjectReader::new(store, path);
+                    let metadata =
+                        ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+                    metadata.schema().clone()
+                };
+
+            // Convert Arrow schema to Kernel schema
+            StructType::try_from_arrow(arrow_schema.as_ref())
+                .map(Arc::new)
+                .map_err(Error::Arrow)
+        })
     }
 }
 

@@ -175,6 +175,91 @@ impl RetentionCalculator for CheckpointWriter {
 }
 
 impl CheckpointWriter {
+    /// Check if stats should be written as struct format (stats_parsed column).
+    ///
+    /// Returns true if `delta.checkpoint.writeStatsAsStruct` is explicitly enabled,
+    /// or if the default behavior applies (defaults to false for backward compatibility).
+    pub fn should_write_stats_as_struct(&self) -> bool {
+        self.snapshot
+            .table_properties()
+            .checkpoint_write_stats_as_struct
+            .unwrap_or(false)
+    }
+
+    /// Check if stats should be written as JSON format (stats column).
+    ///
+    /// Returns true if `delta.checkpoint.writeStatsAsJson` is explicitly enabled,
+    /// or if the default behavior applies (defaults to true for backward compatibility).
+    pub fn should_write_stats_as_json(&self) -> bool {
+        self.snapshot
+            .table_properties()
+            .checkpoint_write_stats_as_json
+            .unwrap_or(true)
+    }
+
+    /// Get the stats_parsed schema for checkpoint writing.
+    ///
+    /// Returns the schema for the `add.stats_parsed` column based on the table's data schema.
+    /// This schema can be used by the engine to transform JSON stats into struct format
+    /// when writing checkpoints.
+    ///
+    /// Returns `None` if:
+    /// - `should_write_stats_as_struct()` returns false
+    /// - The stats schema cannot be built from the table schema
+    pub fn get_stats_parsed_schema(&self) -> Option<SchemaRef> {
+        if !self.should_write_stats_as_struct() {
+            return None;
+        }
+        let table_schema = self.snapshot.schema();
+        crate::actions::build_stats_schema(&table_schema).map(|s| Arc::new(s) as SchemaRef)
+    }
+
+    /// Get the checkpoint write schema including stats_parsed if enabled.
+    ///
+    /// Returns the schema that should be used when writing checkpoint files. This schema
+    /// includes all standard action types, and if `checkpoint.writeStatsAsStruct` is enabled,
+    /// the Add action schema will include the `stats_parsed` column.
+    ///
+    /// Engines should use this schema to:
+    /// 1. Determine the output schema for checkpoint parquet files
+    /// 2. If stats_parsed is included, transform JSON stats to struct format during write
+    ///
+    /// # Example Usage
+    ///
+    /// ```ignore
+    /// let writer = snapshot.checkpoint()?;
+    /// let checkpoint_schema = writer.checkpoint_write_schema();
+    ///
+    /// // If stats_parsed is included, engine needs to transform:
+    /// // 1. Read add.stats (JSON string)
+    /// // 2. Parse JSON and write to add.stats_parsed (struct)
+    /// ```
+    pub fn checkpoint_write_schema(&self) -> SchemaRef {
+        use crate::actions::{
+            get_add_schema_for_checkpoint, Metadata, Protocol, Remove, SetTransaction, Sidecar,
+            ADD_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME, SET_TRANSACTION_NAME,
+            SIDECAR_NAME,
+        };
+
+        let stats_schema = if self.should_write_stats_as_struct() {
+            let table_schema = self.snapshot.schema();
+            crate::actions::build_stats_schema(&table_schema)
+        } else {
+            None
+        };
+
+        let add_schema = get_add_schema_for_checkpoint(stats_schema.as_ref());
+
+        Arc::new(StructType::new_unchecked([
+            StructField::nullable(ADD_NAME, add_schema),
+            StructField::nullable(REMOVE_NAME, Remove::to_schema()),
+            StructField::nullable(METADATA_NAME, Metadata::to_schema()),
+            StructField::nullable(PROTOCOL_NAME, Protocol::to_schema()),
+            StructField::nullable(SET_TRANSACTION_NAME, SetTransaction::to_schema()),
+            StructField::nullable(SIDECAR_NAME, Sidecar::to_schema()),
+        ]))
+    }
+
     /// Creates a new [`CheckpointWriter`] for the given snapshot.
     pub(crate) fn try_new(snapshot: SnapshotRef) -> DeltaResult<Self> {
         let version = i64::try_from(snapshot.version()).map_err(|e| {

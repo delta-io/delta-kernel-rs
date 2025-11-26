@@ -52,8 +52,15 @@ pub(crate) struct ScanLogReplayProcessor {
 }
 
 impl ScanLogReplayProcessor {
-    /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    /// Create a new [`ScanLogReplayProcessor`] instance.
+    ///
+    /// The `stats_parsed_info` contains information about whether parsed stats are available
+    /// and which columns may have incompatible stats that should be nulled in predicates.
+    fn new(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        stats_parsed_info: super::stats_schema::StatsParsedInfo,
+    ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -74,7 +81,11 @@ impl ScanLogReplayProcessor {
         };
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            data_skipping_filter: DataSkippingFilter::new(
+                engine,
+                physical_predicate,
+                stats_parsed_info,
+            ),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
@@ -396,12 +407,19 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
+///
+/// The `stats_parsed_info` contains information about whether parsed stats are available
+/// and which columns may have incompatible stats that should be nulled in predicates.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    stats_parsed_info: super::stats_schema::StatsParsedInfo,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(
+        ScanLogReplayProcessor::new(engine, state_info, stats_parsed_info)?
+            .process_actions_iter(action_iter),
+    )
 }
 
 #[cfg(test)]
@@ -495,6 +513,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            crate::scan::stats_schema::StatsParsedInfo::not_available(),
         )
         .unwrap();
         for res in iter {
@@ -521,6 +540,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            crate::scan::stats_schema::StatsParsedInfo::not_available(),
         )
         .unwrap();
 
@@ -599,6 +619,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            crate::scan::stats_schema::StatsParsedInfo::not_available(),
         )
         .unwrap();
 

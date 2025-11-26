@@ -1,6 +1,7 @@
 //! Provides parsing and manipulation of the various actions defined in the [Delta
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
@@ -10,7 +11,8 @@ use std::sync::{Arc, LazyLock};
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{ArrayData, MapData, Scalar, StructData};
 use crate::schema::{
-    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
+    ArrayType, DataType, MapType, PrimitiveType, SchemaRef, SchemaTransform, StructField,
+    StructType, ToSchema as _,
 };
 use crate::table_features::{FeatureType, TableFeature};
 use crate::table_properties::TableProperties;
@@ -63,6 +65,8 @@ pub(crate) const SIDECAR_NAME: &str = "sidecar";
 pub(crate) const CHECKPOINT_METADATA_NAME: &str = "checkpointMetadata";
 #[internal_api]
 pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
+#[internal_api]
+pub(crate) const STATS_PARSED_NAME: &str = "stats_parsed";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
@@ -1037,6 +1041,100 @@ impl DomainMetadata {
     #[internal_api]
     pub(crate) fn configuration(&self) -> &str {
         &self.configuration
+    }
+}
+
+/// Build the schema for `stats_parsed` from a data schema.
+///
+/// The stats_parsed schema structure is:
+/// ```text
+/// stats_parsed: struct<
+///   numRecords: long,
+///   minValues: struct<...>,
+///   maxValues: struct<...>,
+///   nullCount: struct<...>,
+/// >
+/// ```
+///
+/// All fields are nullable since stats may not be available for all columns.
+/// The `nullCount` fields are all converted to LONG type.
+#[internal_api]
+pub(crate) fn build_stats_schema(data_schema: &StructType) -> Option<StructType> {
+    // Transform to make all fields nullable
+    struct NullableStatsTransform;
+    impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+        fn transform_struct_field(
+            &mut self,
+            field: &'a StructField,
+        ) -> Option<Cow<'a, StructField>> {
+            use Cow::*;
+            let field = match self.transform(&field.data_type)? {
+                Borrowed(_) if field.is_nullable() => Borrowed(field),
+                data_type => Owned(StructField {
+                    name: field.name.clone(),
+                    data_type: data_type.into_owned(),
+                    nullable: true,
+                    metadata: field.metadata.clone(),
+                }),
+            };
+            Some(field)
+        }
+    }
+
+    // Transform to convert all leaf fields to LONG for null counts
+    struct NullCountStatsTransform;
+    impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
+        fn transform_primitive(
+            &mut self,
+            _ptype: &'a PrimitiveType,
+        ) -> Option<Cow<'a, PrimitiveType>> {
+            Some(Cow::Owned(PrimitiveType::Long))
+        }
+    }
+
+    let stats_schema = NullableStatsTransform
+        .transform_struct(data_schema)?
+        .into_owned();
+    let nullcount_schema = NullCountStatsTransform
+        .transform_struct(&stats_schema)?
+        .into_owned();
+
+    Some(StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable("minValues", stats_schema.clone()),
+        StructField::nullable("maxValues", stats_schema),
+        StructField::nullable("nullCount", nullcount_schema),
+    ]))
+}
+
+/// Build the Add action schema with an optional stats_parsed column for checkpoint writing.
+///
+/// When `stats_schema` is provided (i.e., when `checkpoint.writeStatsAsStruct` is enabled),
+/// the returned schema includes the `stats_parsed` column in addition to the regular Add fields.
+///
+/// # Arguments
+///
+/// * `stats_schema` - Optional schema for the stats_parsed column. If None, returns the
+///   standard Add schema without stats_parsed.
+///
+/// # Returns
+///
+/// The Add action schema, optionally including stats_parsed.
+#[internal_api]
+pub(crate) fn get_add_schema_for_checkpoint(stats_schema: Option<&StructType>) -> StructType {
+    let base_schema = Add::to_schema();
+
+    match stats_schema {
+        Some(stats) => {
+            // Add stats_parsed field to the Add schema
+            let mut fields: Vec<StructField> = base_schema.into_fields().collect();
+            fields.push(StructField::nullable(
+                STATS_PARSED_NAME,
+                DataType::Struct(Box::new(stats.clone())),
+            ));
+            StructType::new_unchecked(fields)
+        }
+        None => base_schema,
     }
 }
 

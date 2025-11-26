@@ -11,7 +11,8 @@ use crate::actions::{
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::{SchemaRef, StructField, ToSchema as _};
+use crate::scan::stats_schema::StatsParsedInfo;
+use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
@@ -133,6 +134,85 @@ impl LogSegment {
             latest_crc_file,
             latest_commit_file,
         })
+    }
+
+    /// Get information about stats_parsed availability and compatibility for this checkpoint.
+    ///
+    /// This method reads the checkpoint parquet schema and performs schema reconciliation
+    /// to determine:
+    /// 1. Whether stats_parsed is available and should be used
+    /// 2. The schema to use for reading stats_parsed (only predicate-referenced columns)
+    ///
+    /// # Arguments
+    ///
+    /// * `parquet_handler` - Handler to read parquet schema
+    /// * `predicate_schema` - Optional schema containing only columns referenced by the predicate.
+    ///   If None, stats_parsed is not useful (no predicate means no data skipping).
+    ///
+    /// # Returns
+    ///
+    /// A `StatsParsedInfo` struct containing all information needed for reading stats_parsed.
+    /// Returns `StatsParsedInfo::not_available()` if:
+    /// - No predicate schema is provided (data skipping won't happen)
+    /// - There are no checkpoint files
+    /// - The checkpoint is not a parquet file
+    /// - The schema doesn't contain `add.stats_parsed`
+    /// - Any error occurs reading the schema (fails open)
+    #[internal_api]
+    pub(crate) fn get_stats_parsed_info(
+        &self,
+        parquet_handler: &dyn ParquetHandler,
+        predicate_schema: Option<&StructType>,
+    ) -> StatsParsedInfo {
+        use crate::actions::build_stats_schema;
+        use crate::scan::stats_schema::{
+            build_safe_read_schema, extract_stats_parsed_schema, StatsParsedInfo,
+        };
+
+        // If no predicate, stats_parsed isn't useful for data skipping
+        let Some(predicate_schema) = predicate_schema else {
+            return StatsParsedInfo::not_available();
+        };
+
+        let Some(checkpoint) = self.checkpoint_parts.first() else {
+            return StatsParsedInfo::not_available();
+        };
+
+        // Only parquet checkpoints can have stats_parsed
+        if checkpoint.extension != "parquet" {
+            return StatsParsedInfo::not_available();
+        }
+
+        // Read the checkpoint parquet schema
+        let file_meta = checkpoint.location.clone();
+        let checkpoint_schema = match parquet_handler.get_parquet_schema(&file_meta) {
+            Ok(schema) => schema,
+            Err(e) => {
+                debug!("Failed to read checkpoint schema for stats_parsed detection: {e}");
+                return StatsParsedInfo::not_available();
+            }
+        };
+
+        // Extract stats_parsed schema from checkpoint
+        let Some(checkpoint_stats_schema) = extract_stats_parsed_schema(&checkpoint_schema) else {
+            return StatsParsedInfo::not_available();
+        };
+
+        // Build expected stats schema from predicate columns (what we NEED)
+        let Some(needed_stats_schema) = build_stats_schema(predicate_schema) else {
+            debug!("Failed to build stats schema from predicate schema");
+            return StatsParsedInfo::not_available();
+        };
+
+        // Build safe read schema: intersection of (available & needed & compatible)
+        // Columns not in this schema will be NULL (parquet won't read them)
+        let Some(safe_read_schema) =
+            build_safe_read_schema(checkpoint_stats_schema, &needed_stats_schema)
+        else {
+            return StatsParsedInfo::not_available();
+        };
+
+        StatsParsedInfo::available(Arc::new(safe_read_schema))
     }
 
     /// Constructs a [`LogSegment`] to be used for [`Snapshot`]. For a `Snapshot` at version `n`:
