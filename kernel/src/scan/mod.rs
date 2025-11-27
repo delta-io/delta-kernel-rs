@@ -28,7 +28,7 @@ use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     ToSchema as _,
 };
-use crate::table_features::ColumnMappingMode;
+use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -120,6 +120,10 @@ impl ScanBuilder {
     pub fn build(self) -> DeltaResult<Scan> {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
+
+        self.snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Scan)?;
 
         let state_info = StateInfo::try_new(
             logical_schema,
