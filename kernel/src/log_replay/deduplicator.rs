@@ -18,6 +18,7 @@ use crate::{
     log_replay::FileActionKey,
     DeltaResult,
 };
+use crate::{engine_data::GetData, log_replay::FileActionKey, DeltaResult};
 
 pub(crate) trait Deduplicator {
     /// Key type for identifying file actions. JSON deduplicators use `FileActionKey`
