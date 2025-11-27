@@ -823,7 +823,7 @@ mod test {
             (
                 // Writing to CDF-enabled table is supported for writes
                 create_mock_table_config(&["delta.enableChangeDataFeed"], &[ChangeDataFeed]),
-                Ok(())
+                Ok(()),
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
@@ -831,9 +831,9 @@ mod test {
                     &["delta.enableChangeDataFeed"],
                     &[ChangeDataFeed, AppendOnly],
                 ),
-                Ok(())
+                Ok(()),
             ),
-                    (
+            (
                 // Should succeed since AppendOnly is enabled
                 create_mock_table_config(
                     &["delta.enableChangeDataFeed", "delta.appendOnly"],
@@ -841,14 +841,10 @@ mod test {
                 ),
                 Ok(()),
             ),
-
             (
-                // Fails since writes are not supported on min_writer_version=4. Once version 4 is
-                // supported, ensure that this still fails since ChangeDataFeed is enabled while
-                // append only is not enabled.
-                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"],None, 1, 4),
-                Err(Error::unsupported("Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"))
-
+                // Writer version > 7 is not supported
+                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"], None, 1, 8),
+                Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
             // NOTE: The following cases should be updated if column mapping for writes is
             // supported before cdc is.
@@ -859,7 +855,9 @@ mod test {
                     &["delta.enableChangeDataFeed", "delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported("Feature 'columnMapping' is not supported for writes")),
+                Err(Error::unsupported(
+                    "Feature 'columnMapping' is not supported for writes",
+                )),
             ),
             (
                 // The table does not require writing CDC files, so it is safe to write to it.
@@ -867,7 +865,9 @@ mod test {
                     &["delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported("Feature 'columnMapping' is not supported for writes")),
+                Err(Error::unsupported(
+                    "Feature 'columnMapping' is not supported for writes",
+                )),
             ),
             (
                 // Should succeed since change data feed is not enabled
