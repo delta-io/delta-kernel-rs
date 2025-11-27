@@ -12,8 +12,11 @@ use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
-use crate::log_replay::deduplicator::Deduplicator;
-use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
+use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
+use crate::log_replay::{
+    ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
+    ParallelizableLogReplayProcessor,
+};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
@@ -491,6 +494,47 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
         ))]))
     });
     EXPR.clone()
+}
+
+impl ParallelizableLogReplayProcessor for ScanLogReplayProcessor {
+    type Output = <ScanLogReplayProcessor as LogReplayProcessor>::Output;
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
+        let ActionsBatch {
+            actions,
+            is_log_batch,
+        } = actions_batch;
+        require!(
+            !is_log_batch,
+            Error::generic("Parallel checkpoint processor may only be applied to checkpoint files")
+        );
+
+        // Build an initial selection vector for the batch which has had the data skipping filter
+        // applied. The selection vector is further updated by the deduplication visitor to remove
+        // rows that are not valid adds.
+        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        assert_eq!(selection_vector.len(), actions.len());
+
+        let deduplicator = CheckpointDeduplicator::try_new(
+            &self.seen_file_keys,
+            Self::ADD_PATH_INDEX,
+            Self::ADD_DV_START_INDEX,
+        )?;
+        let mut visitor = AddRemoveDedupVisitor::new(
+            deduplicator,
+            selection_vector,
+            self.state_info.clone(),
+            self.partition_filter.clone(),
+        );
+        visitor.visit_rows_of(actions.as_ref())?;
+
+        // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
+        let result = self.add_transform.evaluate(actions.as_ref())?;
+        ScanMetadata::try_new(
+            result,
+            visitor.selection_vector,
+            visitor.row_transform_exprs,
+        )
+    }
 }
 
 impl LogReplayProcessor for ScanLogReplayProcessor {
