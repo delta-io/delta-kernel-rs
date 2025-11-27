@@ -328,15 +328,12 @@ impl TableConfiguration {
 
     /// Internal helper for read operations (Scan, Cdf)
     fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
-        // Version check
-        match self.protocol.min_reader_version() {
-            1..=3 => {}
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "Unsupported minimum reader version {}",
-                    self.protocol.min_reader_version()
-                )))
-            }
+        // Version check: kernel supports reader versions 1-3
+        if self.protocol.min_reader_version() > 3 {
+            return Err(Error::unsupported(format!(
+                "Unsupported minimum reader version {}",
+                self.protocol.min_reader_version()
+            )));
         }
 
         // Check all enabled reader features have kernel support
@@ -349,27 +346,12 @@ impl TableConfiguration {
 
     /// Internal helper for write operations
     fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: We currently only support writing to tables with minWriterVersion 1, 2, or 7.
-        // Below is a mapping of unsupported writer versions and the features they enable:
-        //
-        // | Writer Version | Features Added                                    |
-        // |----------------|---------------------------------------------------|
-        // | 1              | (baseline)                                        |
-        // | 2              | appendOnly, invariants                            |
-        // | 3              | checkConstraints                                  |
-        // | 4              | changeDataFeed, generatedColumns                  |
-        // | 5              | columnMapping (ReaderWriter)                      |
-        // | 6              | identityColumns                                   |
-        // | 7              | (table features protocol - explicit feature list) |
-        //
-        // Once we add support for these features, we can enable the corresponding writer versions.
-        match self.protocol.min_writer_version() {
-            1 | 2 | 7 => {}
-            _ => {
-                return Err(Error::unsupported(
-                    "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7",
-                ))
-            }
+        // Version check: kernel supports writer versions 1-7
+        if self.protocol.min_writer_version() > 7 {
+            return Err(Error::unsupported(format!(
+                "Unsupported minimum writer version {}",
+                self.protocol.min_writer_version()
+            )));
         }
 
         // Check all enabled writer features have kernel support
