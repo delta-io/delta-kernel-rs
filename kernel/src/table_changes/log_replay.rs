@@ -56,7 +56,14 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    use crate::scan::stats_schema::StatsParsedInfo;
+    // TODO: Detect stats_parsed availability for table changes
+    let filter = DataSkippingFilter::new(
+        engine.as_ref(),
+        physical_predicate,
+        StatsParsedInfo::not_available(),
+    )
+    .map(Arc::new);
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {

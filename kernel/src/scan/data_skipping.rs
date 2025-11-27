@@ -50,12 +50,23 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
     DataSkippingPredicateCreator.eval_sql_where(pred)
 }
 
+/// Indicates which stats format is being used for data skipping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatsSource {
+    /// Using JSON stats from `add.stats` column (requires JSON parsing).
+    Json,
+    /// Using parsed stats from `add.stats_parsed` column (direct struct access).
+    Parsed,
+}
+
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
     json_handler: Arc<dyn JsonHandler>,
+    /// The source of stats data (JSON or parsed).
+    stats_source: StatsSource,
 }
 
 impl DataSkippingFilter {
@@ -64,12 +75,21 @@ impl DataSkippingFilter {
     ///
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
+    ///
+    /// # Arguments
+    ///
+    /// * `engine` - The engine to use for creating evaluators.
+    /// * `physical_predicate` - The predicate and its referenced schema.
+    /// * `stats_parsed_info` - Information about stats_parsed availability and incompatible columns.
     pub(crate) fn new(
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
+        stats_parsed_info: super::stats_schema::StatsParsedInfo,
     ) -> Option<Self> {
-        static STATS_EXPR: LazyLock<ExpressionRef> =
+        static STATS_JSON_EXPR: LazyLock<ExpressionRef> =
             LazyLock::new(|| Arc::new(column_expr!("add.stats")));
+        static STATS_PARSED_EXPR: LazyLock<ExpressionRef> =
+            LazyLock::new(|| Arc::new(column_expr!("add.stats_parsed")));
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
@@ -125,7 +145,7 @@ impl DataSkippingFilter {
 
         // Skipping happens in several steps:
         //
-        // 1. The stats selector fetches add.stats from the metadata
+        // 1. The stats selector fetches add.stats (JSON) or add.stats_parsed (struct) from the metadata
         //
         // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
         //    can safely skip it. A value of true means the stats say we must keep the file, and
@@ -134,13 +154,20 @@ impl DataSkippingFilter {
         //
         // 3. The selection evaluator does DISTINCT(col(predicate), 'false') to produce true (= keep) when
         //    the predicate is true/null and false (= skip) when the predicate is false.
+
+        let (stats_source, stats_expr, output_type) = if stats_parsed_info.use_stats_parsed {
+            (
+                StatsSource::Parsed,
+                STATS_PARSED_EXPR.clone(),
+                DataType::Struct(Box::new(stats_schema.as_ref().clone())),
+            )
+        } else {
+            (StatsSource::Json, STATS_JSON_EXPR.clone(), DataType::STRING)
+        };
+
         let select_stats_evaluator = engine
             .evaluation_handler()
-            .new_expression_evaluator(
-                get_log_add_schema().clone(),
-                STATS_EXPR.clone(),
-                DataType::STRING,
-            )
+            .new_expression_evaluator(get_log_add_schema().clone(), stats_expr, output_type)
             // A stats expression failure here doesn't affect correctness
             // as its a performance optimization so we log the error and continue.
             .inspect_err(|e| error!("Failed to create select stats evaluator: {e}"))
@@ -171,19 +198,34 @@ impl DataSkippingFilter {
             skipping_evaluator,
             filter_evaluator,
             json_handler: engine.json_handler(),
+            stats_source,
         })
     }
 
     /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
     /// which can be applied to the actions to find those that passed data skipping.
     pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        // retrieve and parse stats from actions data
-        let stats = self.select_stats_evaluator.evaluate(actions)?;
-        assert_eq!(stats.len(), actions.len());
-        let parsed_stats = self
-            .json_handler
-            .parse_json(stats, self.stats_schema.clone())?;
-        assert_eq!(parsed_stats.len(), actions.len());
+        // Retrieve stats from actions data.
+        // For stats_parsed, the evaluator returns the struct directly.
+        // For JSON stats, we need to parse the JSON string.
+        let parsed_stats: Box<dyn EngineData> = match self.stats_source {
+            StatsSource::Parsed => {
+                // Direct struct access - no JSON parsing needed
+                let stats = self.select_stats_evaluator.evaluate(actions)?;
+                assert_eq!(stats.len(), actions.len());
+                stats
+            }
+            StatsSource::Json => {
+                // JSON path - need to parse the JSON string
+                let stats = self.select_stats_evaluator.evaluate(actions)?;
+                assert_eq!(stats.len(), actions.len());
+                let parsed = self
+                    .json_handler
+                    .parse_json(stats, self.stats_schema.clone())?;
+                assert_eq!(parsed.len(), actions.len());
+                parsed
+            }
+        };
 
         // evaluate the predicate on the parsed stats, then convert to selection vector
         let skipping_predicate = self.skipping_evaluator.evaluate(&*parsed_stats)?;
@@ -207,18 +249,24 @@ impl DataSkippingFilter {
     }
 }
 
+/// Creates data skipping predicates from user predicates.
+///
+/// This struct transforms predicates to use min/max/nullCount stats for file skipping.
+/// Incompatible columns are handled by the safe read schema - they're simply not included
+/// in the read schema, so their stats will be NULL when accessed. The predicate evaluator
+/// handles NULL stats correctly (treats them as unknown, so the file is not skipped).
 struct DataSkippingPredicateCreator;
 
 impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
     type Output = Pred;
     type ColumnStat = Expr;
 
-    /// Retrieves the minimum value of a column, if it exists and has the requested type.
+    /// Retrieves the minimum value of a column.
     fn get_min_stat(&self, col: &ColumnName, _data_type: &DataType) -> Option<Expr> {
         Some(joined_column_expr!("minValues", col))
     }
 
-    /// Retrieves the maximum value of a column, if it exists and has the requested type.
+    /// Retrieves the maximum value of a column.
     // TODO(#1002): we currently don't support file skipping on timestamp columns' max stat since
     // they are truncated to milliseconds in add.stats.
     fn get_max_stat(&self, col: &ColumnName, data_type: &DataType) -> Option<Expr> {
@@ -228,7 +276,7 @@ impl DataSkippingPredicateEvaluator for DataSkippingPredicateCreator {
         }
     }
 
-    /// Retrieves the null count of a column, if it exists.
+    /// Retrieves the null count of a column.
     fn get_nullcount_stat(&self, col: &ColumnName) -> Option<Expr> {
         Some(joined_column_expr!("nullCount", col))
     }

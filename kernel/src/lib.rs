@@ -698,6 +698,30 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Read the schema from a Parquet file's footer metadata without reading the data.
+    ///
+    /// This method reads only the Parquet file footer (metadata section) to extract the schema,
+    /// which is useful for schema inspection, compatibility checking, and determining whether
+    /// parsed statistics columns are present and compatible with the current table schema.
+    ///
+    /// # Parameters
+    ///
+    /// - `file` - File metadata for the Parquet file whose schema should be read.
+    ///
+    /// # Returns
+    ///
+    /// A [`DeltaResult`] containing a [`SchemaRef`] representing the Parquet file's schema,
+    /// converted to Delta Kernel's schema format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be accessed or does not exist
+    /// - The file is not a valid Parquet file
+    /// - The footer cannot be read or parsed
+    /// - The schema cannot be converted to Delta Kernel's format
+    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
