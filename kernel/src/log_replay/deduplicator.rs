@@ -32,3 +32,47 @@ pub(crate) trait Deduplicator {
     /// Returns `true` for commit log batches (updates hashmap), `false` for checkpoints (read-only).
     fn is_log_batch(&self) -> bool;
 }
+
+#[allow(unused)]
+pub(crate) struct CheckpointDeduplicator {
+    seen_file_keys: HashSet<String>,
+    add_path_index: usize,
+}
+impl CheckpointDeduplicator {
+    #[allow(unused)]
+    pub(crate) fn try_new(
+        seen_file_keys: HashSet<String>,
+        add_path_index: usize,
+    ) -> DeltaResult<Self> {
+        Ok(Self {
+            seen_file_keys,
+            add_path_index,
+        })
+    }
+}
+
+impl Deduplicator for CheckpointDeduplicator {
+    type Key = String;
+
+    fn extract_file_action<'a>(
+        &self,
+        i: usize,
+        getters: &[&'a dyn GetData<'a>],
+        _skip_removes: bool,
+    ) -> DeltaResult<Option<(Self::Key, bool)>> {
+        // Try to extract an add action by the required path column
+        if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
+            Ok(Some((path.to_string(), true)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn check_and_record_seen(&mut self, key: Self::Key) -> bool {
+        self.seen_file_keys.contains(&key)
+    }
+
+    fn is_log_batch(&self) -> bool {
+        false
+    }
+}
