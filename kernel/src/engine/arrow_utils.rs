@@ -431,13 +431,13 @@ fn get_indices(
         {
             // If the field is a variant, make sure the parquet schema matches the unshredded variant
             // representation. This is to ensure that shredded reads are not performed.
-            if requested_field.data_type == DataType::unshredded_variant() {
+            if requested_field.data_type().clone() == DataType::unshredded_variant() {
                 validate_parquet_variant(field)?;
             }
             match field.data_type() {
                 ArrowDataType::Struct(fields) => {
                     if let DataType::Struct(ref requested_schema)
-                    | DataType::Variant(ref requested_schema) = requested_field.data_type
+                    | DataType::Variant(ref requested_schema) = requested_field.data_type()
                     {
                         let (parquet_advance, children) = get_indices(
                             parquet_index + parquet_offset,
@@ -465,8 +465,8 @@ fn get_indices(
                     if let DataType::Array(array_type) = requested_field.data_type() {
                         let requested_schema = StructType::new_unchecked([StructField::new(
                             list_field.name().clone(), // so we find it in the inner call
-                            array_type.element_type.clone(),
-                            array_type.contains_null,
+                            array_type.element_type().clone(),
+                            array_type.contains_null(),
                         )]);
                         let (parquet_advance, mut children) = get_indices(
                             parquet_index + parquet_offset,
@@ -553,7 +553,7 @@ fn get_indices(
                     // parquet schema without causing issues in reading the data. We fix them up in
                     // expression evaluation later.
                     match super::ensure_data_types::ensure_data_types(
-                        &requested_field.data_type,
+                        requested_field.data_type(),
                         field.data_type(),
                         false,
                     )? {
@@ -600,7 +600,7 @@ fn get_indices(
                             "Metadata column {metadata_spec:?} is not supported by the default parquet reader"
                         )));
                     }
-                    None if field.nullable => {
+                    None if field.is_nullable() => {
                         debug!("Inserting missing and nullable field: {}", field.name());
                         reorder_indices.push(ReorderIndex::missing(
                             requested_position,

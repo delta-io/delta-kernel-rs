@@ -245,7 +245,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
         let metadata = CStringMap::default();
         visit_schema_item(
             "array_element",
-            &at.element_type,
+            at.element_type(),
             contains_null,
             &metadata,
             visitor,
@@ -263,7 +263,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
         let metadata = CStringMap::default();
         visit_schema_item(
             "map_key",
-            &mt.key_type,
+            mt.key_type(),
             false,
             &metadata,
             visitor,
@@ -271,7 +271,7 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
         );
         visit_schema_item(
             "map_value",
-            &mt.value_type,
+            mt.value_type(),
             value_contains_null,
             &metadata,
             visitor,
@@ -306,11 +306,14 @@ fn visit_schema_impl(schema: &StructType, visitor: &mut EngineSchemaVisitor) -> 
             DataType::Map(mt) => {
                 call!(
                     visit_map,
-                    visit_map_types(visitor, mt, mt.value_contains_null)
+                    visit_map_types(visitor, mt, mt.value_contains_null())
                 )
             }
             DataType::Array(at) => {
-                call!(visit_array, visit_array_item(visitor, at, at.contains_null))
+                call!(
+                    visit_array,
+                    visit_array_item(visitor, at, at.contains_null())
+                )
             }
             DataType::Primitive(PrimitiveType::Decimal(d)) => {
                 call!(visit_decimal, d.precision(), d.scale())

@@ -74,9 +74,9 @@ fn transform_struct(
                 let target_field = target_field.borrow();
                 let transformed_col = apply_schema_to(&sa_col, target_field.data_type())?;
                 let transformed_field = new_field_with_metadata(
-                    &target_field.name,
+                    target_field.name(),
                     transformed_col.data_type(),
-                    target_field.nullable,
+                    target_field.is_nullable(),
                     Some(target_field.metadata_with_string_values()),
                 );
                 Ok((transformed_field, transformed_col))
@@ -118,11 +118,11 @@ fn apply_schema_to_list(
     };
     let (field, offset_buffer, values, nulls) = la.clone().into_parts();
 
-    let transformed_values = apply_schema_to(&values, &target_inner_type.element_type)?;
+    let transformed_values = apply_schema_to(&values, target_inner_type.element_type())?;
     let transformed_field = ArrowField::new(
         field.name(),
         transformed_values.data_type().clone(),
-        target_inner_type.contains_null,
+        target_inner_type.contains_null(),
     );
     Ok(ListArray::try_new(
         Arc::new(transformed_field),
@@ -143,8 +143,8 @@ fn apply_schema_to_map(array: &dyn Array, kernel_map_type: &MapType) -> DeltaRes
     let target_fields = map_struct_array
         .fields()
         .iter()
-        .zip([&kernel_map_type.key_type, &kernel_map_type.value_type])
-        .zip([false, kernel_map_type.value_contains_null])
+        .zip([kernel_map_type.key_type(), kernel_map_type.value_type()])
+        .zip([false, kernel_map_type.value_contains_null()])
         .map(|((arrow_field, target_type), nullable)| {
             StructField::new(arrow_field.name(), target_type.clone(), nullable)
         });
