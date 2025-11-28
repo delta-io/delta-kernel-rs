@@ -15,6 +15,31 @@ use super::deletion_vector::DeletionVectorDescriptor;
 use super::domain_metadata::DomainMetadataMap;
 use super::*;
 
+/// Error type for visitor-specific failures when extracting action data
+#[derive(Debug, thiserror::Error)]
+pub enum VisitorError {
+    /// The visitor has an incorrect number of getters
+    #[error("Invalid getter count for {action_type}: expected {expected}, got {actual}")]
+    InvalidGetterCount {
+        action_type: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// Underlying delta kernel error
+    #[error("Delta error: {0}")]
+    Delta(#[from] Error),
+}
+
+impl From<VisitorError> for Error {
+    fn from(err: VisitorError) -> Self {
+        match err {
+            VisitorError::Delta(e) => e,
+            other => Error::InternalError(other.to_string()),
+        }
+    }
+}
+
 #[derive(Default)]
 #[internal_api]
 pub(crate) struct MetadataVisitor {
@@ -54,10 +79,12 @@ impl RowVisitor for SelectionVectorVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::InternalError(format!(
-                "Wrong number of SelectionVectorVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "SelectionVector".to_string(),
+                expected: 1,
+                actual: getters.len(),
+            }
+            .into()
         );
         for i in 0..row_count {
             self.selection_vector
@@ -103,13 +130,14 @@ impl AddVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Add> {
+    ) -> Result<Add, VisitorError> {
         require!(
             getters.len() == 15,
-            Error::InternalError(format!(
-                "Wrong number of AddVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Add".to_string(),
+                expected: 15,
+                actual: getters.len(),
+            }
         );
         let partition_values: HashMap<_, _> = getters[1].get(row_index, "add.partitionValues")?;
         let size: i64 = getters[2].get(row_index, "add.size")?;
@@ -176,13 +204,14 @@ impl RemoveVisitor {
         row_index: usize,
         path: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<Remove> {
+    ) -> Result<Remove, VisitorError> {
         require!(
             getters.len() == 15,
-            Error::InternalError(format!(
-                "Wrong number of RemoveVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Remove".to_string(),
+                expected: 15,
+                actual: getters.len(),
+            }
         );
         let deletion_timestamp: Option<i64> =
             getters[1].get_opt(row_index, "remove.deletionTimestamp")?;
@@ -272,10 +301,12 @@ impl RowVisitor for CdcVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 5,
-            Error::InternalError(format!(
-                "Wrong number of CdcVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Cdc".to_string(),
+                expected: 5,
+                actual: getters.len(),
+            }
+            .into()
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Cdc action
@@ -322,13 +353,14 @@ impl SetTransactionVisitor {
         row_index: usize,
         app_id: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<SetTransaction> {
+    ) -> Result<SetTransaction, VisitorError> {
         require!(
             getters.len() == 3,
-            Error::InternalError(format!(
-                "Wrong number of SetTransactionVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "SetTransaction".to_string(),
+                expected: 3,
+                actual: getters.len(),
+            }
         );
         let version: i64 = getters[1].get(row_index, "txn.version")?;
         let last_updated: Option<i64> = getters[2].get_opt(row_index, "txn.lastUpdated")?;
@@ -406,10 +438,12 @@ impl RowVisitor for SidecarVisitor {
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
             getters.len() == 4,
-            Error::InternalError(format!(
-                "Wrong number of SidecarVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "Sidecar".to_string(),
+                expected: 4,
+                actual: getters.len(),
+            }
+            .into()
         );
         for i in 0..row_count {
             // Since path column is required, use it to detect presence of a Sidecar action
@@ -449,13 +483,14 @@ impl DomainMetadataVisitor {
         row_index: usize,
         domain: String,
         getters: &[&'a dyn GetData<'a>],
-    ) -> DeltaResult<DomainMetadata> {
+    ) -> Result<DomainMetadata, VisitorError> {
         require!(
             getters.len() == 3,
-            Error::InternalError(format!(
-                "Wrong number of DomainMetadataVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "DomainMetadata".to_string(),
+                expected: 3,
+                actual: getters.len(),
+            }
         );
         let configuration: String = getters[1].get(row_index, "domainMetadata.configuration")?;
         let removed: bool = getters[2].get(row_index, "domainMetadata.removed")?;
@@ -538,13 +573,14 @@ pub(crate) fn visit_deletion_vector_at<'a>(
 pub(crate) fn visit_metadata_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<Metadata>> {
+) -> Result<Option<Metadata>, VisitorError> {
     require!(
         getters.len() == 9,
-        Error::InternalError(format!(
-            "Wrong number of MetadataVisitor getters: {}",
-            getters.len()
-        ))
+        VisitorError::InvalidGetterCount {
+            action_type: "Metadata".to_string(),
+            expected: 9,
+            actual: getters.len(),
+        }
     );
 
     // Since id column is required, use it to detect presence of a metadata action
@@ -586,13 +622,14 @@ pub(crate) fn visit_metadata_at<'a>(
 pub(crate) fn visit_protocol_at<'a>(
     row_index: usize,
     getters: &[&'a dyn GetData<'a>],
-) -> DeltaResult<Option<Protocol>> {
+) -> Result<Option<Protocol>, VisitorError> {
     require!(
         getters.len() == 4,
-        Error::InternalError(format!(
-            "Wrong number of ProtocolVisitor getters: {}",
-            getters.len()
-        ))
+        VisitorError::InvalidGetterCount {
+            action_type: "Protocol".to_string(),
+            expected: 4,
+            actual: getters.len(),
+        }
     );
     // Since minReaderVersion column is required, use it to detect presence of a Protocol action
     let Some(min_reader_version) = getters[0].get_opt(row_index, "protocol.min_reader_version")?
@@ -661,10 +698,12 @@ impl RowVisitor for InCommitTimestampVisitor {
     ) -> DeltaResult<()> {
         require!(
             getters.len() == 1,
-            Error::InternalError(format!(
-                "Wrong number of InCommitTimestampVisitor getters: {}",
-                getters.len()
-            ))
+            VisitorError::InvalidGetterCount {
+                action_type: "InCommitTimestamp".to_string(),
+                expected: 1,
+                actual: getters.len(),
+            }
+            .into()
         );
 
         // If the batch is empty, return
@@ -1199,6 +1238,147 @@ mod tests {
         run_timestamp_visitor_test(
             vec![commit_info_action(), add_action()],
             Some(1677811178585), // Retrieved ICT
+        );
+    }
+
+    // Empty mock GetData for testing error cases where we need wrong number of getters
+    struct MockGetter;
+    impl<'a> GetData<'a> for MockGetter {}
+
+    #[test]
+    fn test_add_visitor_wrong_getter_count() {
+        let json_strings: StringArray = vec![add_action()].into();
+        let batch = parse_json_batch(json_strings);
+
+        // Verify normal operation with correct number of getters
+        let mut visitor = AddVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.adds.len(), 1);
+
+        // Test error case: call visit_add with only 5 getters instead of required 15
+        let mock = MockGetter;
+        let wrong_getters: Vec<&dyn GetData<'_>> = vec![&mock, &mock, &mock, &mock, &mock];
+
+        let result = AddVisitor::visit_add(0, "test.parquet".to_string(), &wrong_getters);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                VisitorError::InvalidGetterCount {
+                    action_type,
+                    expected,
+                    actual,
+                } if action_type == "Add" && *expected == 15 && *actual == 5
+            ),
+            "Expected InvalidGetterCount with Add/15/5, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_remove_visitor_wrong_getter_count() {
+        // Parse real JSON to create proper Remove action data
+        let json_strings: StringArray = vec![
+            r#"{"remove":{"path":"test.parquet","deletionTimestamp":1670892998135,"dataChange":true}}"#,
+        ]
+        .into();
+        let batch = parse_json_batch(json_strings);
+
+        // Verify normal operation with correct number of getters
+        let mut visitor = RemoveVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.removes.len(), 1);
+
+        // Test error case: call visit_remove with only 3 getters instead of required 15
+        let mock = MockGetter;
+        let wrong_getters: Vec<&dyn GetData<'_>> = vec![&mock, &mock, &mock];
+
+        let result = RemoveVisitor::visit_remove(0, "test.parquet".to_string(), &wrong_getters);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                VisitorError::InvalidGetterCount {
+                    action_type,
+                    expected,
+                    actual,
+                } if action_type == "Remove" && *expected == 15 && *actual == 3
+            ),
+            "Expected InvalidGetterCount with Remove/15/3, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_add_missing_required_field_size() {
+        // Test that missing required field (size) is rejected during JSON parsing
+        // The Arrow parser enforces non-nullable fields before data reaches the visitor
+        let json_str = r#"{"add":{"path":"test.parquet","partitionValues":{},"modificationTime":1000,"dataChange":true}}"#;
+        let json_array: StringArray = vec![json_str].into();
+
+        // parse_json_batch should reject this because 'size' is a required non-nullable field
+        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
+
+        // Verify the parse fails (currently panics, which is expected behavior)
+        assert!(
+            result.is_err(),
+            "Expected parse to fail for missing required field 'size'"
+        );
+    }
+
+    #[test]
+    fn test_add_missing_required_field_modification_time() {
+        // Test that missing required field (modificationTime) is rejected during JSON parsing
+        // The Arrow parser enforces non-nullable fields before data reaches the visitor
+        let json_str =
+            r#"{"add":{"path":"test.parquet","partitionValues":{},"size":100,"dataChange":true}}"#;
+        let json_array: StringArray = vec![json_str].into();
+
+        // parse_json_batch should reject this because 'modificationTime' is a required non-nullable field
+        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
+
+        // Verify the parse fails (currently panics, which is expected behavior)
+        assert!(
+            result.is_err(),
+            "Expected parse to fail for missing required field 'modificationTime'"
+        );
+    }
+
+    #[test]
+    fn test_add_missing_required_field_data_change() {
+        // Test that missing required field (dataChange) is rejected during JSON parsing
+        // The Arrow parser enforces non-nullable fields before data reaches the visitor
+        let json_str = r#"{"add":{"path":"test.parquet","partitionValues":{},"size":100,"modificationTime":1000}}"#;
+        let json_array: StringArray = vec![json_str].into();
+
+        // parse_json_batch should reject this because 'dataChange' is a required non-nullable field
+        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
+
+        // Verify the parse fails (currently panics, which is expected behavior)
+        assert!(
+            result.is_err(),
+            "Expected parse to fail for missing required field 'dataChange'"
+        );
+    }
+
+    #[test]
+    fn test_remove_missing_required_field_data_change() {
+        // Test that Remove action missing dataChange field is rejected during JSON parsing
+        // The Arrow parser enforces non-nullable fields before data reaches the visitor
+        let json_str = r#"{"remove":{"path":"test.parquet"}}"#;
+        let json_array: StringArray = vec![json_str].into();
+
+        // parse_json_batch should reject this because 'dataChange' is a required non-nullable field
+        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
+
+        // Verify the parse fails (currently panics, which is expected behavior)
+        assert!(
+            result.is_err(),
+            "Expected parse to fail for missing required field 'dataChange'"
         );
     }
 }
