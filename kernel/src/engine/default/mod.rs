@@ -19,11 +19,13 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::metrics::MetricsReporter;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
+use delta_kernel_derive::internal_api;
 
 pub mod executor;
 pub mod file_stream;
@@ -39,6 +41,7 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
 impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
@@ -55,6 +58,18 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
             object_store,
             Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
         )
+    }
+
+    /// Set a metrics reporter for the engine to collect events and metrics during operations.
+    ///
+    /// # Parameters
+    ///
+    /// - `reporter`: An implementation of the [`MetricsReporter`] trait which will be used to
+    /// report metrics.
+    #[allow(dead_code)]
+    #[internal_api]
+    pub(crate) fn set_metrics_reporter(&mut self, reporter: Arc<dyn MetricsReporter>) {
+        self.metrics_reporter = Some(reporter);
     }
 }
 
@@ -73,6 +88,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
+                None,
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
@@ -84,6 +100,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
+            metrics_reporter: None,
         }
     }
 
@@ -127,6 +144,10 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        self.metrics_reporter.clone()
     }
 }
 
