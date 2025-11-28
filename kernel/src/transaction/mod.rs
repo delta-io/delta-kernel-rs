@@ -34,6 +34,8 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
+pub mod create_table;
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
