@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
-use crate::engine::arrow_conversion::TryIntoArrow as _;
+use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
@@ -29,7 +29,7 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
     PredicateRef,
@@ -244,6 +244,41 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             files,
             self.readahead,
         )
+    }
+
+    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
+        let store = self.store.clone();
+        let location = file.location.clone();
+
+        self.task_executor.block_on(async move {
+            let arrow_schema =
+                if location.is_presigned() {
+                    // Handle presigned URLs by fetching the file via HTTP
+                    let client = reqwest::Client::new();
+                    let response = client.get(location.as_str()).send().await.map_err(|e| {
+                        Error::generic(format!("Failed to fetch presigned URL: {}", e))
+                    })?;
+                    let bytes = response.bytes().await.map_err(|e| {
+                        Error::generic(format!("Failed to read response bytes: {}", e))
+                    })?;
+
+                    // Load metadata from bytes
+                    let metadata = ArrowReaderMetadata::load(&bytes, Default::default())?;
+                    metadata.schema().clone()
+                } else {
+                    // Handle object store paths
+                    let path = Path::from_url_path(location.path())?;
+                    let mut reader = ParquetObjectReader::new(store, path);
+                    let metadata =
+                        ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+                    metadata.schema().clone()
+                };
+
+            // Convert Arrow schema to Kernel schema
+            StructType::try_from_arrow(arrow_schema.as_ref())
+                .map(Arc::new)
+                .map_err(Error::Arrow)
+        })
     }
 }
 
@@ -640,5 +675,81 @@ mod tests {
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
+    }
+
+    #[test]
+    fn test_get_parquet_schema() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        // Use a checkpoint parquet file
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
+        ))
+        .unwrap();
+        let url = Url::from_file_path(path).unwrap();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        // Get the schema
+        let schema = handler.get_parquet_schema(&file_meta).unwrap();
+
+        // Verify the schema has fields
+        assert!(
+            schema.fields().count() > 0,
+            "Schema should have at least one field"
+        );
+
+        // Verify this is a checkpoint schema with expected fields
+        let field_names: Vec<&String> = schema.fields().map(|f| f.name()).collect();
+        assert!(
+            field_names.iter().any(|&name| name == "txn"),
+            "Checkpoint should have 'txn' field"
+        );
+        assert!(
+            field_names.iter().any(|&name| name == "add"),
+            "Checkpoint should have 'add' field"
+        );
+        assert!(
+            field_names.iter().any(|&name| name == "remove"),
+            "Checkpoint should have 'remove' field"
+        );
+        assert!(
+            field_names.iter().any(|&name| name == "metaData"),
+            "Checkpoint should have 'metaData' field"
+        );
+        assert!(
+            field_names.iter().any(|&name| name == "protocol"),
+            "Checkpoint should have 'protocol' field"
+        );
+
+        // Verify we can access field properties
+        for field in schema.fields() {
+            assert!(!field.name().is_empty(), "Field name should not be empty");
+            let _data_type = field.data_type(); // Should not panic
+        }
+    }
+
+    #[test]
+    fn test_get_parquet_schema_invalid_file() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        // Test with a non-existent file
+        let mut temp_path = std::env::temp_dir();
+        temp_path.push("non_existent_file_for_test.parquet");
+        let url = Url::from_file_path(temp_path).unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let result = handler.get_parquet_schema(&file_meta);
+        assert!(result.is_err(), "Should error on non-existent file");
     }
 }
