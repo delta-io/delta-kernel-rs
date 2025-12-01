@@ -343,7 +343,7 @@ mod tests {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
-        
+
         // Create a TableConfiguration for testing
         use crate::actions::{Metadata, Protocol};
         use crate::table_configuration::TableConfiguration;
@@ -360,8 +360,9 @@ mod tests {
         )
         .unwrap();
         let protocol = Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap();
-        let table_config = TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
-        
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
+
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
             table_config,

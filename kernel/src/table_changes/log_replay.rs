@@ -20,7 +20,6 @@ use crate::schema::{
 };
 use crate::table_changes::check_cdf_table_properties;
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_changes::{check_cdf_table_properties, ensure_cdf_read_supported};
 use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
@@ -189,8 +188,10 @@ impl LogReplayScanner {
 
             // Validate protocol and metadata if present
             if let Some(ref protocol) = protocol_opt {
-                ensure_cdf_read_supported(protocol)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
+                require!(
+                    protocol.is_cdf_supported(),
+                    Error::change_data_feed_unsupported(commit_file.version)
+                );
             }
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
