@@ -77,8 +77,13 @@ fn execute_table_changes(
     start_version: Version,
     end_version: Option<Version>,
 ) -> DeltaResult<Vec<TableChangesScanMetadata>> {
-    let commits = get_segment(engine.as_ref(), mock_table.table_root(), start_version, end_version)?
-        .into_iter();
+    let commits = get_segment(
+        engine.as_ref(),
+        mock_table.table_root(),
+        start_version,
+        end_version,
+    )?
+    .into_iter();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)?
