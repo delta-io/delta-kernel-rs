@@ -48,13 +48,13 @@ mod tests {
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::scan::COMMIT_READ_SCHEMA;
-    use crate::utils::test_utils::load_extracted_test_table;
+    use crate::utils::test_utils::load_test_table;
     use itertools::Itertools;
     use std::sync::Arc;
 
     #[test]
     fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snapshot) = load_extracted_test_table("app-txn-no-checkpoint")?;
+        let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
         let schema = COMMIT_READ_SCHEMA.clone();
