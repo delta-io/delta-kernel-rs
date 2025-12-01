@@ -22,6 +22,7 @@ use crate::{DeltaResult, EngineData};
 use delta_kernel_derive::internal_api;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use tracing::debug;
 
@@ -205,7 +206,8 @@ impl ActionsBatch {
     }
 }
 
-pub(crate) trait ParallelizableLogReplayProcessor: LogReplayProcessor {
+pub(crate) trait ParallelizableLogReplayProcessor {
+    type Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
 }
 
