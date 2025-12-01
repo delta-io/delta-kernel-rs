@@ -490,7 +490,11 @@ impl ParallelizableLogReplayProcessor for ScanLogReplayProcessor {
         let selection_vector = self.build_selection_vector(actions.as_ref())?;
         assert_eq!(selection_vector.len(), actions.len());
 
-        let deduplicator = CheckpointDeduplicator::try_new(&self.seen_file_keys, ADD_PATH_INDEX)?;
+        let deduplicator = CheckpointDeduplicator::try_new(
+            &self.seen_file_keys,
+            ADD_PATH_INDEX,
+            ADD_DV_START_INDEX,
+        )?;
         let mut visitor = AddRemoveDedupVisitor::new(
             deduplicator,
             selection_vector,

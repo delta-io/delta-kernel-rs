@@ -15,7 +15,7 @@
 //! to minimize memory usage for tables with extensive history.
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
-use crate::log_replay::deduplicator::Deduplicator;
+use crate::log_replay::deduplicator::{extract_dv_unique_id, Deduplicator};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
@@ -90,35 +90,6 @@ impl<'seen> FileActionDeduplicator<'seen> {
             remove_dv_start_index,
         }
     }
-
-    /// Extracts the deletion vector unique ID if it exists.
-    ///
-    /// This function retrieves the necessary fields for constructing a deletion vector unique ID
-    /// by accessing `getters` at `dv_start_index` and the following two indices. Specifically:
-    /// - `dv_start_index` retrieves the storage type (`deletionVector.storageType`).
-    /// - `dv_start_index + 1` retrieves the path or inline deletion vector (`deletionVector.pathOrInlineDv`).
-    /// - `dv_start_index + 2` retrieves the optional offset (`deletionVector.offset`).
-    fn extract_dv_unique_id<'a>(
-        &self,
-        i: usize,
-        getters: &[&'a dyn GetData<'a>],
-        dv_start_index: usize,
-    ) -> DeltaResult<Option<String>> {
-        match getters[dv_start_index].get_opt(i, "deletionVector.storageType")? {
-            Some(storage_type) => {
-                let path_or_inline =
-                    getters[dv_start_index + 1].get(i, "deletionVector.pathOrInlineDv")?;
-                let offset = getters[dv_start_index + 2].get_opt(i, "deletionVector.offset")?;
-
-                Ok(Some(DeletionVectorDescriptor::unique_id_from_parts(
-                    storage_type,
-                    path_or_inline,
-                    offset,
-                )))
-            }
-            None => Ok(None),
-        }
-    }
 }
 
 impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
@@ -174,7 +145,7 @@ impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
     ) -> DeltaResult<Option<(FileActionKey, bool)>> {
         // Try to extract an add action by the required path column
         if let Some(path) = getters[self.add_path_index].get_str(i, "add.path")? {
-            let dv_unique_id = self.extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
+            let dv_unique_id = extract_dv_unique_id(i, getters, self.add_dv_start_index)?;
             return Ok(Some((FileActionKey::new(path, dv_unique_id), true)));
         }
 
@@ -185,7 +156,7 @@ impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
 
         // Try to extract a remove action by the required path column
         if let Some(path) = getters[self.remove_path_index].get_str(i, "remove.path")? {
-            let dv_unique_id = self.extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
+            let dv_unique_id = extract_dv_unique_id(i, getters, self.remove_dv_start_index)?;
             return Ok(Some((FileActionKey::new(path, dv_unique_id), false)));
         }
 
