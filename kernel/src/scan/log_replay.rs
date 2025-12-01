@@ -479,6 +479,7 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
 }
 
 impl ParallelizableLogReplayProcessor for ScanLogReplayProcessor {
+    type Output = <ScanLogReplayProcessor as LogReplayProcessor>::Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
