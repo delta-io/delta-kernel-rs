@@ -45,9 +45,9 @@ pub(crate) enum InCommitTimestampEnablement {
 /// vector write enablement can be checked with [`TableConfiguration::is_deletion_vector_enabled`].
 ///
 /// [`TableConfiguration`] performs checks upon construction with `TableConfiguration::try_new`
-/// to validate that Metadata and Protocol are correctly formatted and mutually compatible. If
-/// `try_new` successfully returns `TableConfiguration`, it is also guaranteed that reading the
-/// table is supported.
+/// to validate that Metadata and Protocol are correctly formatted and mutually compatible.
+/// After construction, call `ensure_operation_supported` to verify that the kernel supports the
+/// required operations for the table's protocol features.
 #[internal_api]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableConfiguration {
@@ -107,9 +107,6 @@ impl TableConfiguration {
             table_root,
             version,
         };
-
-        // Validate read support after construction so we have access to all fields
-        table_config.ensure_read_supported()?;
 
         Ok(table_config)
     }
@@ -233,6 +230,33 @@ impl TableConfiguration {
         Ok(())
     }
 
+    /// Checks that kernel supports a feature for the given operation.
+    /// Returns an error if the feature is unknown, not supported, or fails validation.
+    fn check_feature_support(
+        &self,
+        feature: &TableFeature,
+        operation: Operation,
+    ) -> DeltaResult<()> {
+        let Some(info) = feature.info() else {
+            return Err(Error::unsupported(format!("Unknown feature '{}'", feature)));
+        };
+
+        match &info.kernel_support {
+            KernelSupport::Supported => {}
+            KernelSupport::NotSupported => {
+                return Err(Error::unsupported(format!(
+                    "Feature '{}' is not supported",
+                    info.name
+                )))
+            }
+            KernelSupport::Custom(check) => {
+                check(&self.protocol, &self.table_properties, operation)?;
+            }
+        };
+
+        self.validate_feature_requirements(info.name, info.feature_requirements)
+    }
+
     /// Returns all reader features enabled for this table based on protocol version.
     /// For table features protocol (v3), returns the explicit reader_features list.
     /// For legacy protocol (v1-2), infers features from the version number.
@@ -289,96 +313,50 @@ impl TableConfiguration {
         }
     }
 
-    /// Returns `Ok` if the kernel supports reading from this table. This checks that the
-    /// protocol's reader features are all supported.
-    fn ensure_read_supported(&self) -> DeltaResult<()> {
-        // Version check
-        match self.protocol.min_reader_version() {
-            1..=3 => {}
-            _ => {
-                return Err(Error::unsupported(format!(
-                    "Unsupported minimum reader version {}",
-                    self.protocol.min_reader_version()
-                )))
-            }
+    /// Returns `Ok` if the kernel supports the given operation on this table. This checks that
+    /// the protocol's features are all supported for the requested operation type.
+    ///
+    /// - For `Scan` and `Cdf` operations: checks reader version and reader features
+    /// - For `Write` operations: checks writer version and writer features
+    #[internal_api]
+    pub(crate) fn ensure_operation_supported(&self, operation: Operation) -> DeltaResult<()> {
+        match operation {
+            Operation::Scan | Operation::Cdf => self.ensure_read_supported(operation),
+            Operation::Write => self.ensure_write_supported(),
+        }
+    }
+
+    /// Internal helper for read operations (Scan, Cdf)
+    fn ensure_read_supported(&self, operation: Operation) -> DeltaResult<()> {
+        // Version check: kernel supports reader versions 1-3
+        if self.protocol.min_reader_version() > 3 {
+            return Err(Error::unsupported(format!(
+                "Unsupported minimum reader version {}",
+                self.protocol.min_reader_version()
+            )));
         }
 
-        // Check all enabled reader features have kernel read support
+        // Check all enabled reader features have kernel support
         for feature in self.get_enabled_reader_features() {
-            let Some(info) = feature.info() else {
-                return Err(Error::unsupported(format!("Unknown feature '{}'", feature)));
-            };
-
-            // Check read support
-            match &info.read_support {
-                KernelSupport::Supported => {}
-                KernelSupport::NotSupported => {
-                    return Err(Error::unsupported(format!(
-                        "Feature '{}' not supported for reads",
-                        info.name
-                    )))
-                }
-                KernelSupport::Custom(check) => {
-                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
-                }
-            };
-
-            // Validate feature requirements
-            self.validate_feature_requirements(info.name, info.feature_requirements)?;
+            self.check_feature_support(&feature, operation)?;
         }
 
         Ok(())
     }
 
-    /// Returns `true` if the kernel supports writing to this table. This checks that the
-    /// protocol's writer features are all supported.
-    #[internal_api]
-    pub(crate) fn ensure_write_supported(&self) -> DeltaResult<()> {
-        // Version check: We currently only support writing to tables with minWriterVersion 1, 2, or 7.
-        // Below is a mapping of unsupported writer versions and the features they enable:
-        //
-        // | Writer Version | Features Added                                    |
-        // |----------------|---------------------------------------------------|
-        // | 1              | (baseline)                                        |
-        // | 2              | appendOnly, invariants                            |
-        // | 3              | checkConstraints                                  |
-        // | 4              | changeDataFeed, generatedColumns                  |
-        // | 5              | columnMapping (ReaderWriter)                      |
-        // | 6              | identityColumns                                   |
-        // | 7              | (table features protocol - explicit feature list) |
-        //
-        // Once we add support for these features, we can enable the corresponding writer versions.
-        match self.protocol.min_writer_version() {
-            1 | 2 | 7 => {}
-            _ => {
-                return Err(Error::unsupported(
-                    "Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7",
-                ))
-            }
+    /// Internal helper for write operations
+    fn ensure_write_supported(&self) -> DeltaResult<()> {
+        // Version check: kernel supports writer versions 1-7
+        if self.protocol.min_writer_version() > 7 {
+            return Err(Error::unsupported(format!(
+                "Unsupported minimum writer version {}",
+                self.protocol.min_writer_version()
+            )));
         }
 
-        // Check all enabled writer features have kernel write support
+        // Check all enabled writer features have kernel support
         for feature in self.get_enabled_writer_features() {
-            let Some(info) = feature.info() else {
-                return Err(Error::unsupported(format!("Unknown feature '{}'", feature)));
-            };
-
-            // Check write support
-            match &info.write_support {
-                KernelSupport::Supported => {}
-                KernelSupport::NotSupported => {
-                    return Err(Error::unsupported(format!(
-                        "Feature '{}' not supported for writes",
-                        info.name
-                    )))
-                }
-                KernelSupport::Custom(check) => {
-                    check(&self.protocol, &self.table_properties, Operation::Scan)?;
-                }
-            };
-
-            // Validate feature requirements
-            self.validate_feature_requirements(info.name, info.feature_requirements)?;
+            self.check_feature_support(&feature, Operation::Write)?;
         }
 
         // Schema-dependent validation for Invariants (can't be in FeatureInfo)
@@ -696,7 +674,7 @@ mod test {
     use crate::actions::{Metadata, Protocol};
     use crate::schema::{DataType, StructField, StructType};
     use crate::table_features::{
-        EnablementCheck, FeatureInfo, FeatureType, KernelSupport, TableFeature,
+        EnablementCheck, FeatureInfo, FeatureType, KernelSupport, Operation, TableFeature,
     };
     use crate::table_properties::TableProperties;
     use crate::utils::test_utils::assert_result_error_with_message;
@@ -845,7 +823,7 @@ mod test {
             (
                 // Writing to CDF-enabled table is supported for writes
                 create_mock_table_config(&["delta.enableChangeDataFeed"], &[ChangeDataFeed]),
-                Ok(())
+                Ok(()),
             ),
             (
                 // Should succeed even if AppendOnly is supported but not enabled
@@ -853,9 +831,9 @@ mod test {
                     &["delta.enableChangeDataFeed"],
                     &[ChangeDataFeed, AppendOnly],
                 ),
-                Ok(())
+                Ok(()),
             ),
-                    (
+            (
                 // Should succeed since AppendOnly is enabled
                 create_mock_table_config(
                     &["delta.enableChangeDataFeed", "delta.appendOnly"],
@@ -863,14 +841,10 @@ mod test {
                 ),
                 Ok(()),
             ),
-
             (
-                // Fails since writes are not supported on min_writer_version=4. Once version 4 is
-                // supported, ensure that this still fails since ChangeDataFeed is enabled while
-                // append only is not enabled.
-                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"],None, 1, 4),
-                Err(Error::unsupported("Currently delta-kernel-rs can only write to tables with protocol.minWriterVersion = 1, 2, or 7"))
-
+                // Writer version > 7 is not supported
+                create_mock_table_config_with_version(&["delta.enableChangeDataFeed"], None, 1, 8),
+                Err(Error::unsupported("Unsupported minimum writer version 8")),
             ),
             // NOTE: The following cases should be updated if column mapping for writes is
             // supported before cdc is.
@@ -881,7 +855,9 @@ mod test {
                     &["delta.enableChangeDataFeed", "delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported("Feature 'columnMapping' not supported for writes")),
+                Err(Error::unsupported(
+                    "Feature 'columnMapping' is not supported for writes",
+                )),
             ),
             (
                 // The table does not require writing CDC files, so it is safe to write to it.
@@ -889,7 +865,9 @@ mod test {
                     &["delta.appendOnly"],
                     &[ChangeDataFeed, ColumnMapping, AppendOnly],
                 ),
-                Err(Error::unsupported("Feature 'columnMapping' not supported for writes")),
+                Err(Error::unsupported(
+                    "Feature 'columnMapping' is not supported for writes",
+                )),
             ),
             (
                 // Should succeed since change data feed is not enabled
@@ -899,7 +877,10 @@ mod test {
         ];
 
         for (table_configuration, result) in cases {
-            match (table_configuration.ensure_write_supported(), result) {
+            match (
+                table_configuration.ensure_operation_supported(Operation::Write),
+                result,
+            ) {
                 (Ok(()), Ok(())) => { /* Correct result */ }
                 (actual_result, Err(expected)) => {
                     assert_result_error_with_message(actual_result, &expected.to_string());
@@ -1050,7 +1031,9 @@ mod test {
         let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
         let protocol = Protocol::try_new(3, 7, Some(["unknown"]), Some(["unknown"])).unwrap();
         let table_root = Url::try_from("file:///").unwrap();
-        TableConfiguration::try_new(metadata, protocol, table_root, 0)
+        let table_config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        table_config
+            .ensure_operation_supported(Operation::Scan)
             .expect_err("Unknown feature is not supported in kernel");
     }
     #[test]
@@ -1271,8 +1254,7 @@ mod test {
             min_writer_version: 2,
             feature_type: FeatureType::Writer,
             feature_requirements: &[],
-            read_support: KernelSupport::Supported,
-            write_support: KernelSupport::Supported,
+            kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
         };
 
@@ -1294,8 +1276,7 @@ mod test {
             min_writer_version: 2,
             feature_type: FeatureType::Writer,
             feature_requirements: &[],
-            read_support: KernelSupport::Supported,
-            write_support: KernelSupport::Supported,
+            kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
         };
 
@@ -1333,8 +1314,7 @@ mod test {
             min_writer_version: 5,
             feature_type: FeatureType::ReaderWriter,
             feature_requirements: &[],
-            read_support: KernelSupport::Supported,
-            write_support: KernelSupport::Supported,
+            kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
         };
 
@@ -1380,8 +1360,7 @@ mod test {
             min_writer_version: 2,
             feature_type: FeatureType::Writer,
             feature_requirements: &[],
-            read_support: KernelSupport::Supported,
-            write_support: KernelSupport::Supported,
+            kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
         };
 
@@ -1407,8 +1386,7 @@ mod test {
             min_writer_version: 3,
             feature_type: FeatureType::Writer,
             feature_requirements: &[],
-            read_support: KernelSupport::Supported,
-            write_support: KernelSupport::Supported,
+            kernel_support: KernelSupport::Supported,
             enablement_check: EnablementCheck::AlwaysIfSupported,
         };
 
@@ -1423,5 +1401,104 @@ mod test {
         let config = create_mock_table_config_with_version(&[], None, 1, 2);
         assert!(!config.is_feature_info_supported(&feature, &custom_feature_info));
         assert!(!config.is_feature_info_enabled(&feature, &custom_feature_info));
+    }
+
+    #[test]
+    fn test_v2_checkpoint_supported() {
+        let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
+        assert!(config.is_v2_checkpoint_write_supported());
+    }
+
+    #[test]
+    fn test_ensure_operation_supported_reads() {
+        let config = create_mock_table_config(&[], &[]);
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+
+        let config = create_mock_table_config(&[], &[TableFeature::V2Checkpoint]);
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+
+        let config = create_mock_table_config_with_version(&[], None, 1, 2);
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+
+        let config = create_mock_table_config_with_version(
+            &[],
+            Some(&[TableFeature::InCommitTimestamp]),
+            2,
+            7,
+        );
+        assert!(config.ensure_operation_supported(Operation::Scan).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_operation_supported_writes() {
+        let config = create_mock_table_config(
+            &[],
+            &[
+                TableFeature::AppendOnly,
+                TableFeature::DeletionVectors,
+                TableFeature::DomainMetadata,
+                TableFeature::Invariants,
+                TableFeature::RowTracking,
+            ],
+        );
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+
+        // Type Widening is not supported for writes
+        let config = create_mock_table_config(&[], &[TableFeature::TypeWidening]);
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            r#"Feature 'typeWidening' is not supported for writes"#,
+        );
+    }
+
+    #[test]
+    fn test_illegal_writer_feature_combination() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![TableFeature::RowTracking]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert_result_error_with_message(
+            config.ensure_operation_supported(Operation::Write),
+            "rowTracking requires domainMetadata to be supported",
+        );
+    }
+
+    #[test]
+    fn test_row_tracking_with_domain_metadata_requirement() {
+        let schema = StructType::new_unchecked([StructField::nullable("value", DataType::INTEGER)]);
+        let metadata = Metadata::try_new(None, None, schema, vec![], 0, HashMap::new()).unwrap();
+        let protocol = Protocol::try_new(
+            3,
+            7,
+            Some::<Vec<String>>(vec![]),
+            Some(vec![
+                TableFeature::RowTracking,
+                TableFeature::DomainMetadata,
+            ]),
+        )
+        .unwrap();
+        let table_root = Url::try_from("file:///").unwrap();
+        let config = TableConfiguration::try_new(metadata, protocol, table_root, 0).unwrap();
+        assert!(
+            config.ensure_operation_supported(Operation::Write).is_ok(),
+            "RowTracking with DomainMetadata should be supported for writes"
+        );
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[test]
+    fn test_catalog_managed_writes() {
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogManaged]);
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
+
+        let config = create_mock_table_config(&[], &[TableFeature::CatalogOwnedPreview]);
+        assert!(config.ensure_operation_supported(Operation::Write).is_ok());
     }
 }
