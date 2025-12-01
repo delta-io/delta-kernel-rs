@@ -67,18 +67,6 @@ object_store = { version = "0.12.3", optional = true, features = ["aws", "azure"
 # TODO: Remove this once https://github.com/apache/arrow-rs/pull/8244 ships
 comfy-table = { version = "~7.1", optional = true }
 
-# arrow 55
-[dependencies.arrow_55]
-package = "arrow"
-version = "55"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
-optional = true
-[dependencies.parquet_55]
-package = "parquet"
-version = "55"
-features = ["async", "object_store"]
-optional = true
-
 # arrow 56
 [dependencies.arrow_56]
 package = "arrow"
