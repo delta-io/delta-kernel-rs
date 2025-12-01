@@ -234,6 +234,10 @@ impl ActionsBatch {
     }
 }
 
+pub(crate) trait ParallelizableLogReplayProcessor: LogReplayProcessor {
+    fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
+}
+
 /// A trait for processing batches of actions from Delta transaction logs during log replay.
 ///
 /// Log replay processors scan transaction logs in **reverse chronological order** (newest to oldest),

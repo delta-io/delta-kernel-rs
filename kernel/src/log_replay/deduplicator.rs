@@ -10,7 +10,7 @@
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
-use crate::{engine_data::GetData, DeltaResult};
+use crate::{engine_data::GetData, log_replay::FileActionKey, DeltaResult};
 
 pub(crate) trait Deduplicator {
     /// Key type for identifying file actions. JSON deduplicators use `FileActionKey`
@@ -34,24 +34,24 @@ pub(crate) trait Deduplicator {
 }
 
 #[allow(unused)]
-pub(crate) struct CheckpointDeduplicator {
-    seen_file_keys: HashSet<String>,
+pub(crate) struct CheckpointDeduplicator<'a> {
+    seen_file_keys: &'a HashSet<FileActionKey>,
     add_path_index: usize,
 }
-impl CheckpointDeduplicator {
+impl CheckpointDeduplicator<'_> {
     #[allow(unused)]
-    pub(crate) fn try_new(
-        seen_file_keys: HashSet<String>,
+    pub(crate) fn try_new<'a>(
+        seen_file_keys: &'a HashSet<FileActionKey>,
         add_path_index: usize,
-    ) -> DeltaResult<Self> {
-        Ok(Self {
+    ) -> DeltaResult<CheckpointDeduplicator<'a>> {
+        Ok(CheckpointDeduplicator {
             seen_file_keys,
             add_path_index,
         })
     }
 }
 
-impl Deduplicator for CheckpointDeduplicator {
+impl Deduplicator for CheckpointDeduplicator<'_> {
     type Key = String;
 
     fn extract_file_action<'a>(
