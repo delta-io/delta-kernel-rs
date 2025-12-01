@@ -67,18 +67,6 @@ object_store = { version = "0.12.3", optional = true, features = ["aws", "azure"
 # TODO: Remove this once https://github.com/apache/arrow-rs/pull/8244 ships
 comfy-table = { version = "~7.1", optional = true }
 
-# arrow 55
-[dependencies.arrow_55]
-package = "arrow"
-version = "55"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
-optional = true
-[dependencies.parquet_55]
-package = "parquet"
-version = "55"
-features = ["async", "object_store"]
-optional = true
-
 # arrow 56
 [dependencies.arrow_56]
 package = "arrow"
@@ -115,7 +103,6 @@ integration-test = ["hdfs-native-object-store/integration-test"]
 arrow = ["arrow-57"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store", "comfy-table"]
 arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store", "comfy-table"]
 arrow-57 = ["dep:arrow_57", "dep:parquet_57", "object_store", "comfy-table"]
 arrow-conversion = ["need-arrow"]

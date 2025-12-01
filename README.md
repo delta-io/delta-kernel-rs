@@ -85,7 +85,6 @@ arrow versions as we can.
 We allow selecting the version of arrow to use via feature flags. Currently we support the following
 flags:
 
-- `arrow-55`: Use arrow version 55
 - `arrow-56`: Use arrow version 56
 - `arrow-57`: Use arrow version 57
 - `arrow`: Use the latest arrow version. Note that this is an _unstable_ flag: we will bump this to
