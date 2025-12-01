@@ -10,7 +10,7 @@ use crate::scan::state::DvInfo;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
-use crate::table_features::TableFeature;
+use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -138,8 +138,8 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
-                Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
+                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
             )
             .unwrap(),
         )])
@@ -157,7 +157,7 @@ async fn unsupported_reader_feature() {
     assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
 }
 #[tokio::test]
-async fn column_mapping_should_fail() {
+async fn column_mapping_should_succeed() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
@@ -190,7 +190,8 @@ async fn column_mapping_should_fail() {
             .unwrap()
             .try_collect();
 
-    assert!(matches!(res, Err(Error::ChangeDataFeedUnsupported(_))));
+    // Column mapping with CDF should now succeed
+    assert!(res.is_ok(), "CDF should now support column mapping");
 }
 
 // Note: This should be removed once type widening support is added for CDF
@@ -539,10 +540,11 @@ async fn data_skipping_filter() {
         Scalar::from(4),
     );
     let logical_schema = get_schema();
-    let predicate = match PhysicalPredicate::try_new(&predicate, &logical_schema) {
-        Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
-        other => panic!("Unexpected result: {other:?}"),
-    };
+    let predicate =
+        match PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::None) {
+            Ok(PhysicalPredicate::Some(p, s)) => Some((p, s)),
+            other => panic!("Unexpected result: {other:?}"),
+        };
     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
         .unwrap()
         .into_iter();

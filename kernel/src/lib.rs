@@ -50,7 +50,7 @@
 //! connectors are asked to provide the context information they require to execute the actual
 //! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
-#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
+#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_cfg))]
 #![warn(
     unreachable_pub,
     trivial_numeric_casts,
@@ -93,6 +93,7 @@ pub mod error;
 pub mod expressions;
 mod log_compaction;
 mod log_path;
+pub mod metrics;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -148,12 +149,13 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-pub use crate::engine_data::FilteredEngineData;
+pub use action_reconciliation::ActionReconciliationIterator;
 pub use delta_kernel_derive;
-pub use engine_data::{EngineData, RowVisitor};
+pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use log_compaction::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
+pub use log_compaction::{should_compact, LogCompactionWriter};
+pub use metrics::MetricsReporter;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 
@@ -539,6 +541,11 @@ pub trait StorageHandler: AsAny {
     /// Copy a file atomically from source to destination. If the destination file already exists,
     /// it must return Err(Error::FileAlreadyExists).
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
+
+    /// Perform a HEAD request for the given file at a Url, returning the file metadata.
+    ///
+    /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
+    fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
@@ -710,6 +717,14 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`MetricsReporter`] for metrics collection.
+    ///
+    /// Returns an optional reporter that will receive metric events from Delta operations.
+    /// The default implementation returns None (no metrics reporting).
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        None
+    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

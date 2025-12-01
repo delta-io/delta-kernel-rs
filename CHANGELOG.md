@@ -1,5 +1,109 @@
 # Changelog
 
+## [v0.18.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.1/) (2025-11-24)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.0...v0.18.1)
+
+
+### 🚀 Features / new APIs
+
+1. Scan::execute no longer requires lifetime bound  ([#1515])
+2. Migrate protocol validation to table_configuration ([#1411])
+3. Add Display for StructType, StructField, and MetadataColumnSpec ([#1494])
+5. Add EngineDataArrowExt and use it everywhere ([#1516])
+6. Implement builder for StructType ([#1492])
+7. Enable CDF for column-mapped tables ([#1510])
+
+### 🧪 Testing
+
+1. Extract File Action tests ([#1365])
+
+
+[#1515]: https://github.com/delta-io/delta-kernel-rs/pull/1515
+[#1365]: https://github.com/delta-io/delta-kernel-rs/pull/1365
+[#1411]: https://github.com/delta-io/delta-kernel-rs/pull/1411
+[#1494]: https://github.com/delta-io/delta-kernel-rs/pull/1494
+[#1516]: https://github.com/delta-io/delta-kernel-rs/pull/1516
+[#1492]: https://github.com/delta-io/delta-kernel-rs/pull/1492
+[#1510]: https://github.com/delta-io/delta-kernel-rs/pull/1510
+
+
+## [v0.18.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.0/) (2025-11-19)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.17.1...v0.18.0)
+
+### 🏗️ Breaking changes
+1. New Engine StorageHandler head API ([#1465])
+   - Engine API implementers must add the `head` API to StorageHandler which fetches metadata about a file in storage
+2. Add remove_files API ([#1353])
+   - The schema for scan rows (from `Scan::scan_metadata`) has been updated to include two
+     new fields: `fileConstantValues.tags` and `fileConstantValues.defaultRowCommitVersion`.
+
+### 🚀 Features / new APIs
+
+1. Add parser for iceberg compat properties ([#1466])
+2. Pass ColumnMappingMode to physical_name ([#1403])
+3. Allow visiting entire domain metadata ([#1384])
+4. Add Table Feature Info ([#1462])
+5. *(FFI)* Snapshot log tail FFI ([#1379])
+6. Add generic is_feature_supported and is_feature_enabled methods to TableConfiguration ([#1405])
+7. Un-deprecate ArrayData.array_elements() ([#1493])
+8. Allow writes to CDF tables for add-only, remove-only, and non-data-change transactions ([#1490])
+9. *(catalog-managed)* UCCommitter ([#1418])
+
+### 🐛 Bug Fixes
+
+1. Eliminate endless busy looping in read_json_files on failed read ([#1489])
+2. Handle array/map types in ffi schema example and test ([#1497])
+
+### 📚 Documentation
+
+1. Fix docs for rustc 1.92+ ([#1470])
+
+### 🚜 Refactor
+
+1. Harmonize checkpoint and log compaction iterators ([#1436])
+2. Avoid overly complex itertools methods in log listing code ([#1434])
+3. Simplify creation of default engine in tests ([#1437])
+
+### 🧪 Testing
+
+1. Add tests for StructField.physical_name ([#1469])
+
+[#1466]: https://github.com/delta-io/delta-kernel-rs/pull/1466
+[#1403]: https://github.com/delta-io/delta-kernel-rs/pull/1403
+[#1465]: https://github.com/delta-io/delta-kernel-rs/pull/1465
+[#1436]: https://github.com/delta-io/delta-kernel-rs/pull/1436
+[#1470]: https://github.com/delta-io/delta-kernel-rs/pull/1470
+[#1384]: https://github.com/delta-io/delta-kernel-rs/pull/1384
+[#1462]: https://github.com/delta-io/delta-kernel-rs/pull/1462
+[#1474]: https://github.com/delta-io/delta-kernel-rs/pull/1474
+[#1379]: https://github.com/delta-io/delta-kernel-rs/pull/1379
+[#1434]: https://github.com/delta-io/delta-kernel-rs/pull/1434
+[#1437]: https://github.com/delta-io/delta-kernel-rs/pull/1437
+[#1353]: https://github.com/delta-io/delta-kernel-rs/pull/1353
+[#1489]: https://github.com/delta-io/delta-kernel-rs/pull/1489
+[#1405]: https://github.com/delta-io/delta-kernel-rs/pull/1405
+[#1469]: https://github.com/delta-io/delta-kernel-rs/pull/1469
+[#1493]: https://github.com/delta-io/delta-kernel-rs/pull/1493
+[#1497]: https://github.com/delta-io/delta-kernel-rs/pull/1497
+[#1490]: https://github.com/delta-io/delta-kernel-rs/pull/1490
+[#1418]: https://github.com/delta-io/delta-kernel-rs/pull/1418
+
+
+## [v0.17.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.17.1/) (2025-11-13)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.17.0...v0.17.1)
+
+
+### 📚 Documentation
+
+1. Fix docs for rustc 1.92+ ([#1470])
+
+
+[#1470]: https://github.com/delta-io/delta-kernel-rs/pull/1470
+
+
 ## [v0.17.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.17.0/) (2025-11-10)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.16.0...v0.17.0)

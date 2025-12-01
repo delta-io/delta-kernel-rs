@@ -21,12 +21,14 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
+use crate::scan::log_replay::BASE_ROW_ID_NAME;
 use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
     ToSchema as _,
 };
+use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
 
 use self::log_replay::scan_action_iter;
@@ -119,6 +121,10 @@ impl ScanBuilder {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
 
+        self.snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Scan)?;
+
         let state_info = StateInfo::try_new(
             logical_schema,
             self.snapshot.table_configuration(),
@@ -151,6 +157,7 @@ impl PhysicalPredicate {
     pub(crate) fn try_new(
         predicate: &Predicate,
         logical_schema: &Schema,
+        column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<PhysicalPredicate> {
         if can_statically_skip_all_files(predicate) {
             return Ok(PhysicalPredicate::StaticSkipAll);
@@ -160,6 +167,7 @@ impl PhysicalPredicate {
             column_mappings: HashMap::new(),
             logical_path: vec![],
             physical_path: vec![],
+            column_mapping_mode,
         };
         let schema_opt = get_referenced_fields.transform_struct(logical_schema);
         let mut unresolved = get_referenced_fields.unresolved_references.into_iter();
@@ -210,6 +218,7 @@ struct GetReferencedFields<'a> {
     column_mappings: HashMap<ColumnName, ColumnName>,
     logical_path: Vec<String>,
     physical_path: Vec<String>,
+    column_mapping_mode: ColumnMappingMode,
 }
 impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     // Capture the path mapping for this leaf field
@@ -235,7 +244,7 @@ impl<'a> SchemaTransform<'a> for GetReferencedFields<'a> {
     }
 
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        let physical_name = field.physical_name();
+        let physical_name = field.physical_name(self.column_mapping_mode);
         self.logical_path.push(field.name.clone());
         self.physical_path.push(physical_name.to_string());
         let field = self.recurse_into_struct_field(field);
@@ -446,6 +455,8 @@ impl Scan {
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
         static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
+            use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
+
             let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
             DataType::struct_type_unchecked(vec![StructField::nullable(
                 "add",
@@ -455,8 +466,13 @@ impl Scan {
                     StructField::not_null("size", DataType::LONG),
                     StructField::nullable("modificationTime", DataType::LONG),
                     StructField::nullable("stats", DataType::STRING),
+                    StructField::nullable(
+                        "tags",
+                        MapType::new(DataType::STRING, DataType::STRING, true),
+                    ),
                     StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-                    StructField::nullable("baseRowId", DataType::LONG),
+                    StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+                    StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
                 ]),
             )])
         });
@@ -567,7 +583,7 @@ impl Scan {
     pub fn execute(
         &self,
         engine: Arc<dyn Engine>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + use<'_>> {
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
         struct ScanFile {
             path: String,
             size: i64,
@@ -608,6 +624,8 @@ impl Scan {
             // Iterator<DeltaResult<Vec<ScanFile>>> to Iterator<DeltaResult<ScanFile>>
             .flatten_ok();
 
+        let physical_schema = self.physical_schema().clone();
+        let logical_schema = self.logical_schema().clone();
         let result = scan_files_iter
             .map(move |scan_file| -> DeltaResult<_> {
                 let scan_file = scan_file?;
@@ -631,19 +649,21 @@ impl Scan {
                 // TODO(#860): we disable predicate pushdown until we support row indexes.
                 let read_result_iter = engine.parquet_handler().read_parquet_files(
                     &[meta],
-                    self.physical_schema().clone(),
+                    physical_schema.clone(),
                     None,
                 )?;
 
                 let engine = engine.clone(); // Arc clone
+                let physical_schema_inner = physical_schema.clone();
+                let logical_schema_inner = logical_schema.clone();
                 Ok(read_result_iter.map(move |read_result| -> DeltaResult<_> {
                     let read_result = read_result?;
                     // transform the physical data into the correct logical form
                     let logical = state::transform_to_logical(
                         engine.as_ref(),
                         read_result,
-                        self.physical_schema(),
-                        self.logical_schema(),
+                        &physical_schema_inner,
+                        &logical_schema_inner,
                         scan_file.transform.clone(), // Arc clone
                     );
                     let len = logical.as_ref().map_or(0, |res| res.len());
@@ -687,7 +707,9 @@ impl Scan {
 ///    },
 ///    fileConstantValues: {
 ///      partitionValues: map<string, string>,
-///      baseRowId: long
+///      tags: map<string, string>,
+///      baseRowId: long,
+///      defaultRowCommitVersion: long,
 ///    }
 /// }
 /// ```
@@ -729,6 +751,7 @@ pub(crate) mod test_utils {
 
     use super::state::ScanCallback;
     use super::PhysicalPredicate;
+    use crate::table_features::ColumnMappingMode;
     use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.
@@ -843,6 +866,7 @@ pub(crate) mod test_utils {
             physical_schema: logical_schema,
             physical_predicate: PhysicalPredicate::None,
             transform_spec,
+            column_mapping_mode: ColumnMappingMode::None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -1053,7 +1077,9 @@ mod tests {
         ];
 
         for (predicate, expected) in test_cases {
-            let result = PhysicalPredicate::try_new(&predicate, &logical_schema).ok();
+            let result =
+                PhysicalPredicate::try_new(&predicate, &logical_schema, ColumnMappingMode::Name)
+                    .ok();
             assert_eq!(
                 result, expected,
                 "Failed for predicate: {predicate:#?}, expected {expected:#?}, got {result:#?}"
