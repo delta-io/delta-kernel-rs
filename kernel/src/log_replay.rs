@@ -119,6 +119,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
         }
     }
 }
+
 impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
     type Key = FileActionKey;
     /// Checks if log replay already processed this logical file (in which case the current action

@@ -46,15 +46,6 @@ pub struct SerializableScanState {
     pub seen_file_keys: HashSet<FileActionKey>,
 }
 
-// These index positions correspond to the order of columns defined in
-// `selected_column_names_and_types()`
-pub(crate) const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
-const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
-pub(crate) const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
-pub(crate) const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
-pub(crate) const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
-
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
 /// During a table scan, the processor reads batches of log actions (in reverse chronological order)
@@ -89,6 +80,15 @@ pub(crate) struct ScanLogReplayProcessor {
 }
 
 impl ScanLogReplayProcessor {
+    // These index positions correspond to the order of columns defined in
+    // `selected_column_names_and_types()`
+    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
+    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
+    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
+
     /// Create a new [`ScanLogReplayProcessor`] instance
     pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
         Self::new_with_seen_files(engine, state_info, Default::default())
@@ -299,8 +299,8 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values =
-                    getters[ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
+                let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                    .get(i, "add.partitionValues")?;
                 let partition_values = parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -319,7 +319,8 @@ impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
-        let base_row_id: Option<i64> = getters[BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
+        let base_row_id: Option<i64> =
+            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
         let transform = self
             .state_info
             .transform_spec
@@ -491,10 +492,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let deduplicator = FileActionDeduplicator::new(
             &mut self.seen_file_keys,
             is_log_batch,
-            ADD_PATH_INDEX,
-            REMOVE_PATH_INDEX,
-            ADD_DV_START_INDEX,
-            REMOVE_DV_START_INDEX,
+            Self::ADD_PATH_INDEX,
+            Self::REMOVE_PATH_INDEX,
+            Self::ADD_DV_START_INDEX,
+            Self::REMOVE_DV_START_INDEX,
         );
         let mut visitor = AddRemoveDedupVisitor::new(
             deduplicator,
