@@ -45,17 +45,25 @@ pub struct KernelSchemaVisitorState {
 pub fn unwrap_kernel_schema(
     state: &mut KernelSchemaVisitorState,
     schema_id: usize,
-) -> Option<StructType> {
-    let schema_element = state.elements.take(schema_id)?;
+) -> DeltaResult<StructType> {
+    let schema_element = state
+        .elements
+        .take(schema_id)
+        .ok_or_else(|| Error::schema("Nonexistent id passed to unwrap_kernel_schema"))?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
-        return None;
+        return Err(Error::schema(
+            "Final returned id was not a struct, schema is invalid",
+        ));
     };
     if !state.elements.is_empty() {
         warn!("Didn't consume all visited fields, schema is invalid.");
-        return None;
+        Err(Error::schema(
+            "Didn't consume all visited fields, schema is invalid.",
+        ))
+    } else {
+        Ok(*struct_type)
     }
-    Some(*struct_type)
 }
 
 fn wrap_field(state: &mut KernelSchemaVisitorState, field: StructField) -> usize {

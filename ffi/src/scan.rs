@@ -9,7 +9,7 @@ use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
 use delta_kernel_ffi_macros::handle_descriptor;
-use tracing::{debug, warn};
+use tracing::debug;
 use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
@@ -140,13 +140,9 @@ fn scan_impl(
     if let Some(schema) = schema {
         let mut visitor_state = KernelSchemaVisitorState::default();
         let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-        let schema = unwrap_kernel_schema(&mut visitor_state, schema_id);
-        if schema.is_none() {
-            warn!("Passed a schema to scan, but visiting it did not produce a valid schema");
-        } else {
-            debug!("FFI scan projection schema: {:#?}", schema);
-        }
-        scan_builder = scan_builder.with_schema_opt(schema.map(Arc::new));
+        let schema = unwrap_kernel_schema(&mut visitor_state, schema_id)?;
+        debug!("FFI scan projection schema: {:#?}", schema);
+        scan_builder = scan_builder.with_schema(Arc::new(schema));
     }
 
     Ok(Arc::new(scan_builder.build()?).into())
