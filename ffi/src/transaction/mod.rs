@@ -299,9 +299,8 @@ mod tests {
                 write_schema_ref
                     .field_at_index(0)
                     .unwrap()
-                    .data_type()
-                    .clone(),
-                DataType::INTEGER
+                    .data_type(),
+&DataType::INTEGER
             );
             assert_eq!(write_schema_ref.field_at_index(1).unwrap().name(), "string");
             assert_eq!(
