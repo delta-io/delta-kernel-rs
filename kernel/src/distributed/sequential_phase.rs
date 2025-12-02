@@ -36,7 +36,7 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut sequential = SequentialPhase::try_new(processor, log_segment, engine)?;
+/// let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine)?;
 ///
 /// // Iterate over sequential batches
 /// for batch in sequential.by_ref() {
@@ -73,7 +73,7 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // Whether the iterator has been fully exhausted
     is_finished: bool,
     // The log segment that is being processed
-    log_segment: Arc<LogSegment>,
+    checkpoint_parts: Vec<FileMeta>,
 }
 
 unsafe impl<P: LogReplayProcessor> Send for SequentialPhase<P> {}
@@ -97,7 +97,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     #[allow(unused)]
     pub(crate) fn try_new(
         processor: P,
-        log_segment: Arc<LogSegment>,
+        log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
         let commit_phase =
@@ -116,12 +116,18 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
                 None
             };
 
+        let checkpoint_parts = log_segment
+            .checkpoint_parts
+            .iter()
+            .map(|path| path.location.clone())
+            .collect_vec();
+
         Ok(Self {
             processor,
             commit_phase,
             checkpoint_manifest_phase,
             is_finished: false,
-            log_segment,
+            checkpoint_parts,
         })
     }
 
@@ -147,7 +153,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         let distributed_files = match self.checkpoint_manifest_phase {
             Some(manifest_reader) => manifest_reader.extract_sidecars()?,
             None => {
-                let parts = &self.log_segment.checkpoint_parts;
+                let parts = self.checkpoint_parts;
                 require!(
                     parts.len() != 1,
                     Error::generic(
@@ -156,7 +162,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
                     )
                 );
                 // If this is a multi-part checkpoint, use the checkpoint parts for distributed phase
-                parts.iter().map(|path| path.location.clone()).collect_vec()
+                parts
             }
         };
 
@@ -205,7 +211,7 @@ mod tests {
         expected_sidecars: &[&str],
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
-        let log_segment = Arc::new(snapshot.log_segment().clone());
+        let log_segment = snapshot.log_segment();
 
         let state_info = Arc::new(StateInfo::try_new(
             snapshot.schema(),
@@ -215,7 +221,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
+        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
 
         // Process all batches and collect Add file paths
         let mut file_paths = Vec::new();
@@ -298,7 +304,7 @@ mod tests {
     #[test]
     fn test_sequential_finish_before_exhaustion_error() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
-        let log_segment = Arc::new(snapshot.log_segment().clone());
+        let log_segment = snapshot.log_segment();
 
         let state_info = Arc::new(StateInfo::try_new(
             snapshot.schema(),
@@ -308,7 +314,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
+        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
 
         // Call next() once but don't exhaust the iterator
         if let Some(result) = sequential.next() {
