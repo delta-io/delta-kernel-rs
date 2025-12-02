@@ -14,7 +14,6 @@ use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
 use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
-use crate::distributed::sequential_phase::SequentialPhase;
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -22,7 +21,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResol
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
-use crate::scan::log_replay::{ScanLogReplayProcessor, BASE_ROW_ID_NAME};
+use crate::scan::log_replay::BASE_ROW_ID_NAME;
 use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
@@ -145,29 +144,6 @@ pub(crate) enum PhysicalPredicate {
     Some(PredicateRef, SchemaRef),
     StaticSkipAll,
     None,
-}
-
-/// Serializable representation of PhysicalPredicate (skipping the predicate expression itself)
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-enum SerializablePhysicalPredicate {
-    /// Has a predicate and schema (but we skip serializing the predicate itself)
-    Some {
-        schema: crate::schema::StructType,
-    },
-    StaticSkipAll,
-    None,
-}
-
-impl From<&PhysicalPredicate> for SerializablePhysicalPredicate {
-    fn from(pred: &PhysicalPredicate) -> Self {
-        match pred {
-            PhysicalPredicate::Some(_pred, schema) => SerializablePhysicalPredicate::Some {
-                schema: (**schema).clone(),
-            },
-            PhysicalPredicate::StaticSkipAll => SerializablePhysicalPredicate::StaticSkipAll,
-            PhysicalPredicate::None => SerializablePhysicalPredicate::None,
-        }
-    }
 }
 
 impl PhysicalPredicate {

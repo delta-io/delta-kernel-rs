@@ -352,11 +352,9 @@ mod tests {
 
     #[test]
     fn test_get_transform_expr_static_drop() {
-        let transform_spec = vec![
-            FieldTransformSpec::StaticDrop {
-                field_name: "col2".to_string(),
-            },
-        ];
+        let transform_spec = vec![FieldTransformSpec::StaticDrop {
+            field_name: "col2".to_string(),
+        }];
         let metadata_values = HashMap::new();
 
         // Create a physical schema with the relevant columns
