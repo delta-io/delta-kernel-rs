@@ -152,7 +152,7 @@ impl TableChangesScan {
         let schema = self.table_changes.end_snapshot.schema();
         let it = table_changes_action_iter(
             engine,
-            self.table_changes.start_table_config.clone(),
+            &self.table_changes.start_table_config,
             commits,
             schema,
             physical_predicate,

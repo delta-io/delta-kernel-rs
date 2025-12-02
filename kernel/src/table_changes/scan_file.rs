@@ -365,7 +365,7 @@ mod tests {
 
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
-            table_config,
+            &table_config,
             log_segment.ascending_commit_files.clone(),
             table_schema.into(),
             None,

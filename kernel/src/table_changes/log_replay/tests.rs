@@ -86,7 +86,7 @@ fn execute_table_changes(
     .into_iter();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)?
+    table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)?
         .try_collect()
 }
 
@@ -181,7 +181,7 @@ async fn metadata_protocol() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     let scan_batches =
-        table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap();
     let sv = result_to_sv(scan_batches);
     assert_eq!(sv, &[false, false]);
@@ -214,7 +214,7 @@ async fn cdf_not_enabled() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
@@ -244,7 +244,7 @@ async fn unsupported_reader_feature() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
@@ -283,7 +283,7 @@ async fn column_mapping_should_succeed() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
@@ -369,7 +369,7 @@ async fn incompatible_schemas_fail() {
         let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
         let table_config = get_default_table_config(&table_root_url);
         let res: DeltaResult<Vec<_>> =
-            table_changes_action_iter(engine, table_config, commits, cdf_schema.into(), None)
+            table_changes_action_iter(engine, &table_config, commits, cdf_schema.into(), None)
                 .unwrap()
                 .try_collect();
 
@@ -481,7 +481,7 @@ async fn test_schema_evolution(
     let table_config = get_default_table_config(&table_root_url);
 
     // Try to read CDF using the evolved schema - this currently fails
-    table_changes_action_iter(engine, table_config, commits, evolved_schema.into(), None)?
+    table_changes_action_iter(engine, &table_config, commits, evolved_schema.into(), None)?
         .try_collect()
 }
 
@@ -567,7 +567,7 @@ async fn add_remove() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let sv = table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -619,7 +619,7 @@ async fn filter_data_change() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let sv = table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -667,7 +667,7 @@ async fn cdc_selection() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let sv = table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -735,7 +735,7 @@ async fn dv() {
     .into();
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
-    let sv = table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+    let sv = table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
         .unwrap()
         .flat_map(|scan_metadata| {
             let scan_metadata = scan_metadata.unwrap();
@@ -817,7 +817,7 @@ async fn data_skipping_filter() {
     let table_config = get_default_table_config(&table_root_url);
     let sv = table_changes_action_iter(
         engine,
-        table_config,
+        &table_config,
         commits,
         logical_schema.into(),
         predicate,
@@ -869,7 +869,7 @@ async fn failing_protocol() {
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     let res: DeltaResult<Vec<_>> =
-        table_changes_action_iter(engine, table_config, commits, get_schema().into(), None)
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 

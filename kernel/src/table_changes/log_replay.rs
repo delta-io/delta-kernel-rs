@@ -51,18 +51,20 @@ pub(crate) struct TableChangesScanMetadata {
 /// (JSON) commit files.
 pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
-    mut table_configuration: TableConfiguration,
+    start_table_configuration: &TableConfiguration,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+
+    let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
             let scanner = LogReplayScanner::try_new(
                 engine.as_ref(),
-                &mut table_configuration,
+                &mut current_configuration,
                 commit_file,
                 &table_schema,
             )?;
