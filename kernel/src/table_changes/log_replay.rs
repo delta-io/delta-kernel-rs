@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::sync::{Arc, LazyLock};
 
-use crate::actions::visitors::{visit_deletion_vector_at, visit_protocol_at};
+use crate::actions::visitors::visit_deletion_vector_at;
 use crate::actions::{
     get_log_add_schema, Add, Cdc, Metadata, Protocol, Remove, ADD_NAME, CDC_NAME, METADATA_NAME,
     PROTOCOL_NAME, REMOVE_NAME,
@@ -16,12 +16,11 @@ use crate::path::ParsedLogPath;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{
-    ArrayType, ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType,
-    ToSchema as _,
+    ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema as _,
 };
 use crate::table_changes::check_cdf_table_properties;
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
-use crate::table_properties::TableProperties;
+use crate::table_configuration::TableConfiguration;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
@@ -52,15 +51,23 @@ pub(crate) struct TableChangesScanMetadata {
 /// (JSON) commit files.
 pub(crate) fn table_changes_action_iter(
     engine: Arc<dyn Engine>,
+    start_table_configuration: &TableConfiguration,
     commit_files: impl IntoIterator<Item = ParsedLogPath>,
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
     let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+
+    let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
         .into_iter()
         .map(move |commit_file| -> DeltaResult<_> {
-            let scanner = LogReplayScanner::try_new(engine.as_ref(), commit_file, &table_schema)?;
+            let scanner = LogReplayScanner::try_new(
+                engine.as_ref(),
+                &mut current_configuration,
+                commit_file,
+                &table_schema,
+            )?;
             scanner.into_scan_batches(engine.clone(), filter.clone())
         }) //Iterator-Result-Iterator-Result
         .flatten_ok() // Iterator-Result-Result
@@ -144,6 +151,7 @@ impl LogReplayScanner {
     /// For more details, see the documentation for [`LogReplayScanner`].
     fn try_new(
         engine: &dyn Engine,
+        table_configuration: &mut TableConfiguration,
         commit_file: ParsedLogPath,
         table_schema: &SchemaRef,
     ) -> DeltaResult<Self> {
@@ -174,19 +182,21 @@ impl LogReplayScanner {
                 add_paths: &mut add_paths,
                 remove_dvs: &mut remove_dvs,
                 has_cdc_action: &mut has_cdc_action,
-                protocol: None,
-                metadata_info: None,
             };
             visitor.visit_rows_of(actions.as_ref())?;
 
-            if let Some(protocol) = visitor.protocol {
-                protocol
-                    .is_cdf_supported()
-                    .then_some(())
-                    .ok_or_else(|| Error::change_data_feed_unsupported(commit_file.version))?;
+            let metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+
+            // Validate protocol and metadata if present
+            if let Some(ref protocol) = protocol_opt {
+                require!(
+                    protocol.is_cdf_supported(),
+                    Error::change_data_feed_unsupported(commit_file.version)
+                );
             }
-            if let Some((schema, configuration)) = visitor.metadata_info {
-                let schema: StructType = serde_json::from_str(&schema)?;
+            if let Some(ref metadata) = metadata_opt {
+                let schema = metadata.parse_schema()?;
                 // Currently, schema compatibility is defined as having equal schema types. In the
                 // future, more permisive schema evolution will be supported.
                 // See: https://github.com/delta-io/delta-kernel-rs/issues/523
@@ -194,9 +204,19 @@ impl LogReplayScanner {
                     table_schema.as_ref() == &schema,
                     Error::change_data_feed_incompatible_schema(table_schema, &schema)
                 );
-                let table_properties = TableProperties::from(configuration);
+                let table_properties = metadata.parse_table_properties();
                 check_cdf_table_properties(&table_properties)
                     .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
+            }
+
+            // Update table configuration with any new Protocol or Metadata from this commit
+            if metadata_opt.is_some() || protocol_opt.is_some() {
+                *table_configuration = TableConfiguration::try_new_from(
+                    table_configuration,
+                    metadata_opt,
+                    protocol_opt,
+                    commit_file.version,
+                )?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.
@@ -275,8 +295,6 @@ impl LogReplayScanner {
 // This is a visitor used in the prepare phase of [`LogReplayScanner`]. See
 // [`LogReplayScanner::try_new`] for details usage.
 struct PreparePhaseVisitor<'a> {
-    protocol: Option<Protocol>,
-    metadata_info: Option<(String, HashMap<String, String>)>,
     has_cdc_action: &'a mut bool,
     add_paths: &'a mut HashSet<String>,
     remove_dvs: &'a mut HashMap<String, DvInfo>,
@@ -301,8 +319,6 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
             const INTEGER: DataType = DataType::INTEGER;
             const LONG: DataType = DataType::LONG;
             const BOOLEAN: DataType = DataType::BOOLEAN;
-            let string_list: DataType = ArrayType::new(STRING, false).into();
-            let string_string_map = MapType::new(STRING, STRING, false).into();
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
                 (BOOLEAN, column_name!("add.dataChange")),
@@ -314,12 +330,6 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 (INTEGER, column_name!("remove.deletionVector.sizeInBytes")),
                 (LONG, column_name!("remove.deletionVector.cardinality")),
                 (STRING, column_name!("cdc.path")),
-                (STRING, column_name!("metaData.schemaString")),
-                (string_string_map, column_name!("metaData.configuration")),
-                (INTEGER, column_name!("protocol.minReaderVersion")),
-                (INTEGER, column_name!("protocol.minWriterVersion")),
-                (string_list.clone(), column_name!("protocol.readerFeatures")),
-                (string_list, column_name!("protocol.writerFeatures")),
             ];
             let (types, names) = types_and_names.into_iter().unzip();
             (names, types).into()
@@ -329,7 +339,7 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
 
     fn visit<'b>(&mut self, row_count: usize, getters: &[&'b dyn GetData<'b>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 16,
+            getters.len() == 10,
             Error::InternalError(format!(
                 "Wrong number of PreparePhaseVisitor getters: {}",
                 getters.len()
@@ -350,12 +360,6 @@ impl RowVisitor for PreparePhaseVisitor<'_> {
                 }
             } else if getters[9].get_str(i, "cdc.path")?.is_some() {
                 *self.has_cdc_action = true;
-            } else if let Some(schema) = getters[10].get_str(i, "metaData.schemaString")? {
-                let configuration_map_opt = getters[11].get_opt(i, "metadata.configuration")?;
-                let configuration = configuration_map_opt.unwrap_or_else(HashMap::new);
-                self.metadata_info = Some((schema.to_string(), configuration));
-            } else if let Some(protocol) = visit_protocol_at(i, &getters[12..])? {
-                self.protocol = Some(protocol);
             }
         }
         Ok(())

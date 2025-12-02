@@ -40,6 +40,7 @@ use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
+use crate::table_configuration::TableConfiguration;
 use crate::table_features::Operation;
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -113,6 +114,7 @@ pub struct TableChanges {
     end_snapshot: SnapshotRef,
     start_version: Version,
     schema: Schema,
+    start_table_config: TableConfiguration,
 }
 
 impl TableChanges {
@@ -204,6 +206,7 @@ impl TableChanges {
             log_segment,
             start_version,
             schema,
+            start_table_config: start_snapshot.table_configuration().clone(),
         })
     }
 
