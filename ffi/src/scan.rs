@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
+use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
@@ -47,6 +48,23 @@ pub struct EnginePredicate {
     pub predicate: *mut c_void,
     pub visitor:
         extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
+}
+
+/// A schema for columns to select from the snapshot.
+///
+/// This allows engines to specify which columns they want to read for projection pushdown or to
+/// specify metadata columns. The engine provides a pointer to its native schema representation
+/// along with a visitor function. The kernel uses this to build a kernel
+/// [`delta_kernel::schema::Schema`] that specifies the projection. Inside [`scan`] the kernel
+/// allocates visitor state, which becomes the second argument to the schema visitor invocation
+/// along with the engine-provided schema pointer. The visitor state is valid for the lifetime of
+/// the schema visitor invocation. Thanks to this double indirection, engine and kernel each retain
+/// ownership of their respective objects, with no need to coordinate memory lifetimes with the
+/// other.
+#[repr(C)]
+pub struct EngineSchema {
+    pub schema: *mut c_void,
+    pub visitor: extern "C" fn(schema: *mut c_void, state: &mut KernelSchemaVisitorState) -> usize,
 }
 
 /// Drop a `SharedScanMetadata`.
@@ -98,16 +116,19 @@ pub unsafe extern "C" fn scan(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     predicate: Option<&mut EnginePredicate>,
+    schema: Option<&mut EngineSchema>,
 ) -> ExternResult<Handle<SharedScan>> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
-    scan_impl(snapshot, predicate).into_extern_result(&engine.as_ref())
+    scan_impl(snapshot, predicate, schema).into_extern_result(&engine.as_ref())
 }
 
 fn scan_impl(
     snapshot: SnapshotRef,
     predicate: Option<&mut EnginePredicate>,
+    schema: Option<&mut EngineSchema>,
 ) -> DeltaResult<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();
+
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::default();
         let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
@@ -115,6 +136,15 @@ fn scan_impl(
         debug!("Got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
+
+    if let Some(schema) = schema {
+        let mut visitor_state = KernelSchemaVisitorState::default();
+        let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+        let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
+        debug!("FFI scan projection schema: {:#?}", schema);
+        scan_builder = scan_builder.with_schema(Arc::new(schema));
+    }
+
     Ok(Arc::new(scan_builder.build()?).into())
 }
 
