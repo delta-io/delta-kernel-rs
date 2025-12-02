@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -167,6 +168,35 @@ void free_partition_list(PartitionList* list) {
   free(list);
 }
 
+uintptr_t visit_requested_cols(void* requested_cols_void, KernelSchemaVisitorState *state) {
+  (void)state;
+  char* requested_cols = (char*)requested_cols_void;
+  printf("Asked to visit: %s\n", requested_cols);
+
+  /* char* col = strtok(requested_cols, " , "); */
+
+  /* uintptr_t cols[128]; */
+  /* int i = 0; */
+
+  /* while (col != NULL) { */
+  /*   printf("requested_col: %s\n", col); */
+  /*   ExternResultusize visit_res = visit_field_string( */
+  /*     state, */
+      
+
+  /*     if (engine_res.tag != OkHandleSharedExternEngine) { */
+  /*   print_error("File to get engine", (Error*)engine_builder_res.err); */
+  /*   free_error((Error*)engine_builder_res.err); */
+  /*   return -1; */
+  /* } */
+
+  /* SharedExternEngine* engine = engine_res.ok; */
+  /*   col = strtok(NULL, " , "); */
+  /* } */
+
+  return 0;
+}
+
 static const char *LEVEL_STRING[] = {
   "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -216,10 +246,38 @@ void log_line_callback(KernelStringSlice line) {
 
 int main(int argc, char* argv[])
 {
-  if (argc < 2) {
-    printf("Usage: %s table/path\n", argv[0]);
+  char* requested_cols = NULL;
+  int c;
+  while ((c = getopt (argc, argv, "c:")) != -1) {
+    switch (c) {
+    case 'c':
+      requested_cols = optarg;
+      break;
+    case '?':
+      if (optopt == 'c') {
+        fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+      }
+      else if (isprint(optopt)) {
+        fprintf (stderr, "Unknown option `-%c'.\n", optopt);
+      }
+      else {
+        fprintf (stderr,
+                 "Unknown option character `\\x%x'.\n",
+                 optopt);
+      }
+      return 1;
+    default:
+      abort ();
+    }
+  }
+
+  if (optind != (argc - 1)) {
+    printf("Usage: %s [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
     return -1;
   }
+
+  char* table_path = argv[optind];
+  printf("Reading table at %s\n", table_path);
 
 #ifdef VERBOSE
   enable_event_tracing(tracing_callback, TRACE);
@@ -228,9 +286,6 @@ int main(int argc, char* argv[])
 #else
   enable_event_tracing(tracing_callback, INFO);
 #endif
-
-  char* table_path = argv[1];
-  printf("Reading table at %s\n", table_path);
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
@@ -273,7 +328,9 @@ int main(int argc, char* argv[])
 
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
-  print_schema(snapshot);
+
+  CSchema *schema = get_schema(snapshot);
+  print_schema(schema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -282,7 +339,21 @@ int main(int argc, char* argv[])
 
   print_diag("Starting table scan\n\n");
 
+  EngineSchema* engine_schema = NULL;
+  if (requested_cols != NULL) {
+    print_diag("Selecting columns: [%s]\n", requested_cols);
+    engine_schema = malloc(sizeof(EngineSchema));
+    engine_schema->schema = requested_cols;
+    engine_schema->visitor = visit_requested_cols;
+  }
+
   ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
+  if (engine_schema != NULL) {
+    free(engine_schema);
+  }
+
+  free_cschema(schema);
+
   if (scan_res.tag != OkHandleSharedScan) {
     printf("Failed to create scan\n");
     return -1;

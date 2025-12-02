@@ -50,6 +50,12 @@ typedef struct
   SchemaItemList* lists;
 } SchemaBuilder;
 
+typedef struct
+{
+  uintptr_t list_id;
+  SchemaBuilder* builder;
+} CSchema;
+
 // lists are preallocated to have exactly enough space, so we just fill in the next open slot and
 // increment our length
 SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type, bool is_nullable)
@@ -230,11 +236,11 @@ DEFINE_VISIT_SIMPLE_TYPE(date)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp_ntz)
 
-// free all the data in the builder (but not the builder itself, it's stack allocated)
-void free_builder(SchemaBuilder builder)
+// free all the data in the builder and the builder itself
+void free_builder(SchemaBuilder* builder)
 {
-  for (int i = 0; i < builder.list_count; i++) {
-    SchemaItemList* list = (builder.lists) + i;
+  for (int i = 0; i < builder->list_count; i++) {
+    SchemaItemList* list = (builder->lists) + i;
     for (uint32_t j = 0; j < list->len; j++) {
       SchemaItem* item = list->list + j;
       free(item->name);
@@ -246,19 +252,25 @@ void free_builder(SchemaBuilder builder)
     }
     free(list->list); // free all the items in this list (we alloc'd them together)
   }
-  free(builder.lists);
+  free(builder->lists);
+  free(builder);
 }
 
-// Print the schema of the snapshot
-void print_schema(SharedSnapshot* snapshot)
+// Free the schema and any associated builder data
+void free_cschema(CSchema *schema) {
+  free_builder(schema->builder);
+  free(schema);
+}
+
+// Get the schema of the snapshot
+CSchema* get_schema(SharedSnapshot* snapshot)
 {
   print_diag("Building schema\n");
-  SchemaBuilder builder = {
-    .list_count = 0,
-    .lists = NULL,
-  };
+  SchemaBuilder* builder = malloc(sizeof(SchemaBuilder));
+  builder->list_count = 0;
+  builder->lists = NULL;
   EngineSchemaVisitor visitor = {
-    .data = &builder,
+    .data = builder,
     .make_field_list = make_field_list,
     .visit_struct = visit_struct,
     .visit_array = visit_array,
@@ -283,9 +295,15 @@ void print_schema(SharedSnapshot* snapshot)
   printf("Schema returned in list %" PRIxPTR "\n", schema_list_id);
 #endif
   print_diag("Done building schema\n");
+  CSchema* cschema = malloc(sizeof(CSchema));
+  cschema->list_id = schema_list_id;
+  cschema->builder = builder;
+  return cschema;
+}
+
+// Print out a schema
+void print_schema(CSchema *schema) {
   printf("Schema:\n");
-  print_list(&builder, schema_list_id, 0, 0);
+  print_list(schema->builder, schema->list_id, 0, 0);
   printf("\n");
-  free_schema(schema);
-  free_builder(builder);
 }
