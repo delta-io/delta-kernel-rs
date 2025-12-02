@@ -59,7 +59,8 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     seen_file_keys: &'seen mut HashSet<FileActionKey>,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
-    /// Whether we're processing a log batch (as opposed to a checkpoint)
+    /// Whether we're processing a commit log JSON file (`true`) or a checkpoint file (`false`).
+    /// When `true`, file actions are added to `seen_file_keys` as they're processed.
     is_log_batch: bool,
     /// Index of the getter containing the add.path column
     add_path_index: usize,
