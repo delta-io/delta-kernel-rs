@@ -76,6 +76,8 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     checkpoint_parts: Vec<FileMeta>,
 }
 
+unsafe impl<P: LogReplayProcessor> Send for SequentialPhase<P> {}
+
 /// Result of sequential log replay processing.
 #[allow(unused)]
 pub(crate) enum AfterSequential<P: LogReplayProcessor> {
