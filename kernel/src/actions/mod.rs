@@ -536,12 +536,21 @@ impl Protocol {
             }
             (None, None) => Ok(()),
             (None, Some(writer_features)) => {
+                // Special case: reader version 2 implies ColumnMapping support.
+                // All other ReaderWriter features require explicit reader_features list (reader version 3).
                 // Unknown features are treated as potentially Writer-only for forward compatibility.
+                let is_valid = writer_features.iter().all(|feature| {
+                    match feature.feature_type() {
+                        FeatureType::Writer | FeatureType::Unknown => true,
+                        FeatureType::ReaderWriter => {
+                            // ColumnMapping is allowed when reader version is 2 (implied support)
+                            self.min_reader_version == 2 && feature == &TableFeature::ColumnMapping
+                        }
+                    }
+                });
+
                 require!(
-                    writer_features.iter().all(|feature| matches!(
-                        feature.feature_type(),
-                        FeatureType::Writer | FeatureType::Unknown
-                    )),
+                    is_valid,
                     Error::invalid_protocol(
                         "Writer features must be Writer-only or also listed in reader features"
                     )
@@ -1475,6 +1484,73 @@ mod tests {
 
             assert!(matches!(protocol.validate_table_features(), Ok(()),));
         }
+    }
+
+    #[test]
+    fn test_validate_legacy_column_mapping_valid() {
+        // Valid: ColumnMapping with reader v2
+        // Reader version 2 implies columnMapping support (no explicit reader_features)
+        // Writer version 7 requires explicit writer_features list
+        let protocol = Protocol {
+            min_reader_version: 2,
+            min_writer_version: 7,
+            reader_features: None,
+            writer_features: Some(vec![TableFeature::ColumnMapping]),
+        };
+        assert!(protocol.validate_table_features().is_ok());
+    }
+
+    #[test]
+    fn test_validate_legacy_writer_only_features_valid() {
+        // Valid: Writer-only features with reader v1
+        let protocol = Protocol {
+            min_reader_version: 1,
+            min_writer_version: 7,
+            reader_features: None,
+            writer_features: Some(vec![TableFeature::AppendOnly]),
+        };
+        assert!(protocol.validate_table_features().is_ok());
+    }
+
+    #[test]
+    fn test_validate_legacy_column_mapping_with_writer_features_valid() {
+        // Valid: Mix of Writer-only and ColumnMapping with reader v2
+        let protocol = Protocol {
+            min_reader_version: 2,
+            min_writer_version: 7,
+            reader_features: None,
+            writer_features: Some(vec![TableFeature::AppendOnly, TableFeature::ColumnMapping]),
+        };
+        assert!(protocol.validate_table_features().is_ok());
+    }
+
+    #[test]
+    fn test_validate_column_mapping_reader_v1_invalid() {
+        // Invalid: ColumnMapping with reader v1
+        // Reader v1 doesn't imply any ReaderWriter features
+        let protocol = Protocol {
+            min_reader_version: 1,
+            min_writer_version: 7,
+            reader_features: None,
+            writer_features: Some(vec![TableFeature::ColumnMapping]),
+        };
+        assert!(protocol.validate_table_features().is_err());
+    }
+
+    #[test]
+    fn test_validate_multiple_readerwriter_features_reader_v2_invalid() {
+        // Invalid: Multiple ReaderWriter features with reader v2
+        // Only ColumnMapping alone is allowed with reader v2
+        let protocol = Protocol {
+            min_reader_version: 2,
+            min_writer_version: 7,
+            reader_features: None,
+            writer_features: Some(vec![
+                TableFeature::ColumnMapping,
+                TableFeature::DeletionVectors,
+            ]),
+        };
+        assert!(protocol.validate_table_features().is_err());
     }
 
     #[test]
