@@ -193,7 +193,7 @@ impl ScanLogReplayProcessor {
     /// seen_file_keys set may never be updated again if it was built from a `SerializableScanState`.
     /// This is because serialization removes deletion vector information from the seen_file_keys.
     /// Thus, it is only safe to apply this processor to checkpoint actions (actions that will not
-    /// modify the deduplication set). Checkpoint actions should be removed if their path is in the 
+    /// modify the deduplication set). Checkpoint actions should be removed if their path is in the
     /// seen_file_keys set.
     ///
     #[internal_api]
