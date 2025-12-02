@@ -436,7 +436,7 @@ fn get_indices(
         {
             // If the field is a variant, make sure the parquet schema matches the unshredded variant
             // representation. This is to ensure that shredded reads are not performed.
-            if requested_field.data_type().clone() == DataType::unshredded_variant() {
+            if requested_field.data_type() == &DataType::unshredded_variant() {
                 validate_parquet_variant(field)?;
             }
             match field.data_type() {
