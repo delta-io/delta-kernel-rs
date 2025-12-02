@@ -282,7 +282,7 @@ int main(int argc, char* argv[])
 
   print_diag("Starting table scan\n\n");
 
-  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL);
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
   if (scan_res.tag != OkHandleSharedScan) {
     printf("Failed to create scan\n");
     return -1;
