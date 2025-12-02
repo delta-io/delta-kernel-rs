@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
-use crate::schema_visitor::{unwrap_kernel_schema, KernelSchemaVisitorState};
+use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
@@ -140,7 +140,7 @@ fn scan_impl(
     if let Some(schema) = schema {
         let mut visitor_state = KernelSchemaVisitorState::default();
         let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
-        let schema = unwrap_kernel_schema(&mut visitor_state, schema_id)?;
+        let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
         debug!("FFI scan projection schema: {:#?}", schema);
         scan_builder = scan_builder.with_schema(Arc::new(schema));
     }

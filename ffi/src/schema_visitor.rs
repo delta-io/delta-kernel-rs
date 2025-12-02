@@ -42,7 +42,7 @@ pub struct KernelSchemaVisitorState {
 /// This validates that the schema was properly constructed by ensuring:
 /// 1. The schema_id points to a DataType::Struct (the root schema)
 /// 2. No other elements remain in the state (all field IDs are consumed)
-pub fn unwrap_kernel_schema(
+pub fn extract_kernel_schema(
     state: &mut KernelSchemaVisitorState,
     schema_id: usize,
 ) -> DeltaResult<StructType> {
@@ -145,7 +145,6 @@ pub unsafe extern "C" fn visit_field_decimal(
     allocate_error: AllocateErrorFn,
 ) -> ExternResult<usize> {
     let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-
     visit_field_decimal_impl(state, name_str, precision, scale, nullable)
         .into_extern_result(&allocate_error)
 }
@@ -659,7 +658,7 @@ mod tests {
         });
 
         // Verify the schema
-        let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
         assert_eq!(fields.len(), 17);
 
@@ -840,7 +839,7 @@ mod tests {
             )
         );
 
-        let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
 
         let root_fields: Vec<_> = schema.fields().collect();
         assert_eq!(root_fields.len(), 1);
@@ -1084,7 +1083,7 @@ mod tests {
         );
 
         // Verify nullability settings
-        let schema = unwrap_kernel_schema(&mut state, schema_id).unwrap();
+        let schema = extract_kernel_schema(&mut state, schema_id).unwrap();
         let fields: Vec<_> = schema.fields().collect();
         assert_eq!(fields.len(), 8);
 
