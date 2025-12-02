@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 
 use super::UrlExt;
 use crate::engine::default::executor::TaskExecutor;
-use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
+use crate::metrics::MetricEvent;
+use crate::{DeltaResult, Error, FileMeta, FileSlice, MetricsReporter, StorageHandler};
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
 use futures::stream::StreamExt;
