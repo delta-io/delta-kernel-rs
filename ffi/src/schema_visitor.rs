@@ -49,7 +49,7 @@ pub fn extract_kernel_schema(
     let schema_element = state
         .elements
         .take(schema_id)
-        .ok_or_else(|| Error::schema("Nonexistent id passed to unwrap_kernel_schema"))?;
+        .ok_or_else(|| Error::schema("Nonexistent id passed to extract_kernel_schema"))?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
         return Err(Error::schema(

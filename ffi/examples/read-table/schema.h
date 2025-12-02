@@ -96,7 +96,7 @@ void print_physical_name(const char *name, const CStringMap* metadata)
 #ifdef VERBOSE
   char* key_str = "delta.columnMapping.physicalName";
   KernelStringSlice key = { key_str, strlen(key_str) };
-  char* value = get_from_map(metadata, key, allocate_string);
+  char* value = get_from_string_map(metadata, key, allocate_string);
   if (value) {
     printf("Physical name of %s is %s\n", name, value);
     free(value);
@@ -263,7 +263,7 @@ void free_cschema(CSchema *schema) {
 }
 
 // Get the schema of the snapshot
-CSchema* get_schema(SharedSnapshot* snapshot)
+CSchema* get_cschema(SharedSnapshot* snapshot)
 {
   print_diag("Building schema\n");
   SchemaBuilder* builder = malloc(sizeof(SchemaBuilder));
@@ -298,11 +298,12 @@ CSchema* get_schema(SharedSnapshot* snapshot)
   CSchema* cschema = malloc(sizeof(CSchema));
   cschema->list_id = schema_list_id;
   cschema->builder = builder;
+  free_schema(schema);
   return cschema;
 }
 
 // Print out a schema
-void print_schema(CSchema *schema) {
+void print_cschema(CSchema *schema) {
   printf("Schema:\n");
   print_list(schema->builder, schema->list_id, 0, 0);
   printf("\n");

@@ -168,33 +168,145 @@ void free_partition_list(PartitionList* list) {
   free(list);
 }
 
-uintptr_t visit_requested_cols(void* requested_cols_void, KernelSchemaVisitorState *state) {
+uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, CSchema *cschema) {
+  print_diag("Visiting schema item %s (%s)\n", item->name, item->type);
+  KernelStringSlice name = { item->name, strlen(item->name) };
+  ExternResultusize visit_res;
+  if (strcmp(item->type, "string") == 0) {
+    visit_res = visit_field_string(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "integer") == 0) {
+    visit_res = visit_field_integer(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "short") == 0) {
+    visit_res = visit_field_short(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "byte") == 0) {
+    visit_res = visit_field_byte(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "long") == 0) {
+    visit_res = visit_field_long(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "float") == 0) {
+    visit_res = visit_field_float(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "double") == 0) {
+    visit_res = visit_field_double(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "binary") == 0) {
+    visit_res = visit_field_binary(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "date") == 0) {
+    visit_res = visit_field_date(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "timestamp") == 0) {
+    visit_res = visit_field_timestamp(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "timestamp_ntz") == 0) {
+    visit_res = visit_field_double(state, name, false, allocate_error);
+  } else if (strncmp(item->type, "decimal", 7) == 0) {
+    unsigned int precision;
+    int scale;
+    sscanf(item->type, "decimal(%u)(%d)", &precision, &scale);
+    visit_res = visit_field_decimal(state, name, precision, scale, false, allocate_error);
+  } else if (strcmp(item->type, "array") == 0) {
+    SchemaItemList *child_list = &cschema->builder->lists[item->children];
+    // an array should always have 1 child
+    if (child_list->len != 1) {
+      printf("Invalid array child list");
+      return 0;
+    }
+    uintptr_t child_visit_id = visit_schema_item(&child_list->list[0], state, cschema);
+    if (child_visit_id == 0) {
+      // previous visit will have printed the issue
+      return 0;
+    }
+    visit_res = visit_field_array(state, name, child_visit_id, false, allocate_error);
+  } else if (strcmp(item->type, "map") == 0) {
+    SchemaItemList *child_list = &cschema->builder->lists[item->children];
+    // an map should always have 2 children
+    if (child_list->len != 2) {
+      printf("Invalid map child list");
+      return 0;
+    }
+    uintptr_t key_visit_id = visit_schema_item(&child_list->list[0], state, cschema);
+    if (key_visit_id == 0) {
+      // previous visit will have printed the issue
+      return 0;
+    }
+    uintptr_t val_visit_id = visit_schema_item(&child_list->list[1], state, cschema);
+    if (val_visit_id == 0) {
+      // previous visit will have printed the issue
+      return 0;
+    }
+    visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, false, allocate_error);
+  } else if (strcmp(item->type, "struct") == 0) {
+    printf("Can't visit structs yet\n");
+    return 0;
+  } else {
+    printf("Can't visit unknown type: %s\n", item->type);
+    return 0;
+  }
+
+  if (visit_res.tag != Okusize) {
+    print_error("Could not visit field", (Error*)visit_res.err);
+    return 0;
+  }
+  return visit_res.ok;
+}
+
+typedef struct {
+  CSchema* cschema;
+  char* requested_cols;
+} RequestedSchemaSpec;
+
+uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *state) {
   (void)state;
-  char* requested_cols = (char*)requested_cols_void;
-  printf("Asked to visit: %s\n", requested_cols);
+  RequestedSchemaSpec *spec = (RequestedSchemaSpec*)requested_spec;
+  print_diag("Asked to visit: %s\n", spec->requested_cols);
 
-  /* char* col = strtok(requested_cols, " , "); */
+  uintptr_t cols[128];
+  int col_index = 0;
 
-  /* uintptr_t cols[128]; */
-  /* int i = 0; */
+  CSchema* cschema = spec->cschema;
+  SchemaItemList* top_level_list = &cschema->builder->lists[cschema->list_id];
 
-  /* while (col != NULL) { */
-  /*   printf("requested_col: %s\n", col); */
-  /*   ExternResultusize visit_res = visit_field_string( */
-  /*     state, */
-      
+  char* col = strtok(spec->requested_cols, ",");
 
-  /*     if (engine_res.tag != OkHandleSharedExternEngine) { */
-  /*   print_error("File to get engine", (Error*)engine_builder_res.err); */
-  /*   free_error((Error*)engine_builder_res.err); */
-  /*   return -1; */
-  /* } */
+  while (col != NULL) {
+    print_diag("Visiting requested col: %s\n", col);
+    for (uint32_t i = 0; i < top_level_list->len; i++) {
+      SchemaItem* item = &top_level_list->list[i];
+      // need to prevent looking at the (is nullable: x) part
+      char *s = item->name;
+      char found = 0;
+      while (*s) {
+        if (*s == '(') {
+          *(s-1) = '\0';
+          found = 1;
+          break;
+        }
+        s++;
+      }
+      if (strcmp(item->name, col) == 0) {
+        uintptr_t col_id = visit_schema_item(item, state, cschema);
+        if (col_id == 0) {
+          // error will have been printed above
+          return 0;
+        }
+        cols[col_index++] = col_id;
+      }
+      if (found) {
+        *(s-1) = ' ';
+      }
+    }
+    col = strtok(NULL, ",");
+  }
 
-  /* SharedExternEngine* engine = engine_res.ok; */
-  /*   col = strtok(NULL, " , "); */
-  /* } */
+  KernelStringSlice name = { "s", 1 }; // name doesn't matter
+  ExternResultusize visit_res = visit_field_struct(
+    state,
+    name,
+    cols,
+    col_index,
+    false,
+    allocate_error);
 
-  return 0;
+  if (visit_res.tag != Okusize) {
+    print_error("Could not visit top_level schema", (Error*)visit_res.err);
+    return 0;
+  }
+  return visit_res.ok;
 }
 
 static const char *LEVEL_STRING[] = {
@@ -329,8 +441,8 @@ int main(int argc, char* argv[])
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
 
-  CSchema *schema = get_schema(snapshot);
-  print_schema(schema);
+  CSchema *cschema = get_cschema(snapshot);
+  print_cschema(cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -340,22 +452,36 @@ int main(int argc, char* argv[])
   print_diag("Starting table scan\n\n");
 
   EngineSchema* engine_schema = NULL;
+  RequestedSchemaSpec *spec = NULL;
   if (requested_cols != NULL) {
     print_diag("Selecting columns: [%s]\n", requested_cols);
     engine_schema = malloc(sizeof(EngineSchema));
-    engine_schema->schema = requested_cols;
-    engine_schema->visitor = visit_requested_cols;
+    spec = malloc(sizeof(RequestedSchemaSpec));
+    spec->cschema = cschema;
+    spec->requested_cols = requested_cols;
+    engine_schema->schema = spec;
+    engine_schema->visitor = visit_requested_spec;
   }
 
-  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, engine_schema);
+
   if (engine_schema != NULL) {
     free(engine_schema);
   }
 
-  free_cschema(schema);
+  if (spec != NULL) {
+    free(spec);
+  }
+
+  free_cschema(cschema);
 
   if (scan_res.tag != OkHandleSharedScan) {
-    printf("Failed to create scan\n");
+    print_error("Failed to create scan", (Error*)scan_res.err);
+    free_error((Error*)scan_res.err);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    free(table_root);
+    free_partition_list(partition_cols);
     return -1;
   }
 
