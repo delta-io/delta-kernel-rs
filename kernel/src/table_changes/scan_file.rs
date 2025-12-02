@@ -343,8 +343,29 @@ mod tests {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
+
+        // Create a TableConfiguration for testing
+        use crate::actions::{Metadata, Protocol};
+        use crate::table_configuration::TableConfiguration;
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            table_schema.clone(),
+            vec![],
+            0,
+            HashMap::from([
+                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+            ]),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
+
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
+            &table_config,
             log_segment.ascending_commit_files.clone(),
             table_schema.into(),
             None,
