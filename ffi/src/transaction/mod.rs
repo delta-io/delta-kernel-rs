@@ -8,7 +8,7 @@ use crate::KernelStringSlice;
 use crate::{unwrap_and_parse_path_as_url, TryFromStringSlice};
 use crate::{DeltaResult, ExternEngine, Snapshot, Url};
 use crate::{ExclusiveEngineData, SharedExternEngine};
-use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::committer::{Committer, FileSystemCommitter};
 use delta_kernel::transaction::{CommitResult, Transaction};
 use delta_kernel_ffi_macros::handle_descriptor;
 
@@ -41,6 +41,34 @@ fn transaction_impl(
 ) -> DeltaResult<Handle<ExclusiveTransaction>> {
     let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
     let committer = Box::new(FileSystemCommitter::new());
+    let transaction = snapshot.transaction(committer);
+    Ok(Box::new(transaction?).into())
+}
+
+/// Start a transaction with a custom committer
+/// NOTE: This consumes the committer handle
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles
+#[no_mangle]
+pub unsafe extern "C" fn transaction_with_committer(
+    path: KernelStringSlice,
+    engine: Handle<SharedExternEngine>,
+    committer: Handle<crate::committer::MutableCommitter>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let url = unsafe { unwrap_and_parse_path_as_url(path) };
+    let engine = unsafe { engine.as_ref() };
+    let committer = unsafe { committer.into_inner() };
+    transaction_with_committer_impl(url, engine, committer).into_extern_result(&engine)
+}
+
+fn transaction_with_committer_impl(
+    url: DeltaResult<Url>,
+    extern_engine: &dyn ExternEngine,
+    committer: Box<dyn Committer>,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    let snapshot = Snapshot::builder_for(url?).build(extern_engine.engine().as_ref())?;
     let transaction = snapshot.transaction(committer);
     Ok(Box::new(transaction?).into())
 }

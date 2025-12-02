@@ -52,6 +52,7 @@ mod ffi_test_utils;
 #[cfg(feature = "test-ffi")]
 pub mod test_ffi;
 pub mod transaction;
+pub mod committer;
 
 pub(crate) type NullableCvoid = Option<NonNull<c_void>>;
 
