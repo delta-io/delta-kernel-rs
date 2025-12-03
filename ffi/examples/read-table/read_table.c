@@ -226,31 +226,31 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     sscanf(item->type, "decimal(%u)(%d)", &precision, &scale);
     visit_res = visit_field_decimal(state, name, precision, scale, false, allocate_error);
   } else if (strcmp(item->type, "array") == 0) {
-    SchemaItemList *child_list = &cschema->builder->lists[item->children];
+    SchemaItemList child_list = cschema->builder->lists[item->children];
     // an array should always have 1 child
-    if (child_list->len != 1) {
+    if (child_list.len != 1) {
       printf("[ERROR] Invalid array child list");
       return 0;
     }
-    uintptr_t child_visit_id = visit_schema_item(&child_list->list[0], state, cschema);
+    uintptr_t child_visit_id = visit_schema_item(&child_list.list[0], state, cschema);
     if (child_visit_id == 0) {
       // previous visit will have printed the issue
       return 0;
     }
     visit_res = visit_field_array(state, name, child_visit_id, false, allocate_error);
   } else if (strcmp(item->type, "map") == 0) {
-    SchemaItemList *child_list = &cschema->builder->lists[item->children];
+    SchemaItemList child_list = cschema->builder->lists[item->children];
     // an map should always have 2 children
-    if (child_list->len != 2) {
+    if (child_list.len != 2) {
       printf("[ERROR] Invalid map child list");
       return 0;
     }
-    uintptr_t key_visit_id = visit_schema_item(&child_list->list[0], state, cschema);
+    uintptr_t key_visit_id = visit_schema_item(&child_list.list[0], state, cschema);
     if (key_visit_id == 0) {
       // previous visit will have printed the issue
       return 0;
     }
-    uintptr_t val_visit_id = visit_schema_item(&child_list->list[1], state, cschema);
+    uintptr_t val_visit_id = visit_schema_item(&child_list.list[1], state, cschema);
     if (val_visit_id == 0) {
       // previous visit will have printed the issue
       return 0;
@@ -295,7 +295,6 @@ typedef struct {
 
 // This is the function kernel will call asking it to visit the schema in requested_spec
 uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *state) {
-  (void)state;
   RequestedSchemaSpec *spec = (RequestedSchemaSpec*)requested_spec;
   print_diag("Asked to visit: %s\n", spec->requested_cols);
 
