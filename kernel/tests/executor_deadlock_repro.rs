@@ -109,7 +109,9 @@ fn test_deadlock_minimal_repro() {
 
         match tokio::time::timeout(Duration::from_secs(2), task).await {
             Err(_) => {
-                panic!("Deadlock: task scheduled to local queue but worker blocked on sync_channel");
+                panic!(
+                    "Deadlock: task scheduled to local queue but worker blocked on sync_channel"
+                );
             }
             Ok(Ok(Ok(_))) => {}
             Ok(Err(e)) => panic!("Task panicked: {:?}", e),
