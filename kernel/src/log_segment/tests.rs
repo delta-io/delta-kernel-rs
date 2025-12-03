@@ -111,7 +111,8 @@ async fn build_log_with_paths_and_checkpoint(
             .expect("Write _last_checkpoint");
     }
 
-    let storage = ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+    let storage =
+        ObjectStoreStorageHandler::new(store, Arc::new(TokioBackgroundExecutor::new()), None);
 
     let table_root = Url::parse("memory:///").expect("valid url");
     let log_root = table_root.join("_delta_log/").unwrap();
@@ -981,7 +982,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
@@ -1023,7 +1024,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1050,7 +1051,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let checkpoint_batch =
@@ -1091,7 +1092,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
@@ -1139,7 +1140,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1209,7 +1210,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     add_checkpoint_to_store(
         &store,
@@ -1254,7 +1255,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1313,7 +1314,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
 
     add_checkpoint_to_store(
         &store,
@@ -2172,7 +2173,8 @@ async fn test_latest_commit_file_field_is_captured() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // The latest commit should be version 5
     assert_eq!(log_segment.latest_commit_file.unwrap().version, 5);
@@ -2199,7 +2201,8 @@ async fn test_latest_commit_file_with_checkpoint_filtering() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // The latest commit should be version 4
     assert_eq!(log_segment.latest_commit_file.unwrap().version, 4);
@@ -2220,7 +2223,8 @@ async fn test_latest_commit_file_with_no_commits() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // latest_commit_file should be None when there are no commits
     assert!(log_segment.latest_commit_file.is_none());
@@ -2244,7 +2248,8 @@ async fn test_latest_commit_file_with_checkpoint_at_same_version() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // The latest commit should be version 1 (saved before filtering)
     assert_eq!(log_segment.latest_commit_file.unwrap().version, 1);
@@ -2270,7 +2275,8 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
     .await;
 
     let log_segment =
-        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None).unwrap();
+        LogSegment::for_snapshot(storage.as_ref(), log_root.clone(), vec![], None, None, None)
+            .unwrap();
 
     // latest_commit_file should be None since there's no commit at the checkpoint version
     assert!(log_segment.latest_commit_file.is_none());
