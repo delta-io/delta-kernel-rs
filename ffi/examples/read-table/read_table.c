@@ -168,6 +168,9 @@ void free_partition_list(PartitionList* list) {
   free(list);
 }
 
+// This function looks at the type field in the schema to figure out which visitor to call. It's a
+// bit gross as the schema code is string based, a real implementation would have a more robust way
+// to represent a schema.
 uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, CSchema *cschema) {
   print_diag("Visiting schema item %s (%s)\n", item->name, item->type);
   KernelStringSlice name = { item->name, strlen(item->name) };
@@ -203,7 +206,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     SchemaItemList *child_list = &cschema->builder->lists[item->children];
     // an array should always have 1 child
     if (child_list->len != 1) {
-      printf("Invalid array child list");
+      printf("[ERROR] Invalid array child list");
       return 0;
     }
     uintptr_t child_visit_id = visit_schema_item(&child_list->list[0], state, cschema);
@@ -216,7 +219,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     SchemaItemList *child_list = &cschema->builder->lists[item->children];
     // an map should always have 2 children
     if (child_list->len != 2) {
-      printf("Invalid map child list");
+      printf("[ERROR] Invalid map child list");
       return 0;
     }
     uintptr_t key_visit_id = visit_schema_item(&child_list->list[0], state, cschema);
@@ -231,10 +234,10 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     }
     visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, false, allocate_error);
   } else if (strcmp(item->type, "struct") == 0) {
-    printf("Can't visit structs yet\n");
+    printf("[ERROR] Can't visit structs yet\n");
     return 0;
   } else {
-    printf("Can't visit unknown type: %s\n", item->type);
+    printf("[ERROR] Can't visit unknown type: %s\n", item->type);
     return 0;
   }
 
@@ -250,6 +253,7 @@ typedef struct {
   char* requested_cols;
 } RequestedSchemaSpec;
 
+// This is the function kernel will call asking it to visit the schema in requested_spec
 uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *state) {
   (void)state;
   RequestedSchemaSpec *spec = (RequestedSchemaSpec*)requested_spec;
@@ -265,20 +269,22 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
 
   while (col != NULL) {
     print_diag("Visiting requested col: %s\n", col);
+    char found_col = 0;
     for (uint32_t i = 0; i < top_level_list->len; i++) {
       SchemaItem* item = &top_level_list->list[i];
       // need to prevent looking at the (is nullable: x) part
       char *s = item->name;
-      char found = 0;
+      char found_paren = 0;
       while (*s) {
         if (*s == '(') {
           *(s-1) = '\0';
-          found = 1;
+          found_paren = 1;
           break;
         }
         s++;
       }
       if (strcmp(item->name, col) == 0) {
+        found_col = 1;
         uintptr_t col_id = visit_schema_item(item, state, cschema);
         if (col_id == 0) {
           // error will have been printed above
@@ -286,9 +292,16 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
         }
         cols[col_index++] = col_id;
       }
-      if (found) {
+      if (found_paren) {
         *(s-1) = ' ';
       }
+      if (found_col) {
+        break;
+      }
+    }
+    if (!found_col) {
+      printf("[ERROR] No such column in table: %s\n", col);
+      return 0;
     }
     col = strtok(NULL, ",");
   }
