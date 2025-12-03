@@ -12,7 +12,7 @@ use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
-use crate::log_replay::deduplicator::{self, CheckpointDeduplicator, Deduplicator};
+use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
     ParallelizableLogReplayProcessor,
@@ -493,8 +493,8 @@ impl ParallelizableLogReplayProcessor for ScanLogReplayProcessor {
 
         let deduplicator = CheckpointDeduplicator::try_new(
             &self.seen_file_keys,
-            ADD_PATH_INDEX,
-            ADD_DV_START_INDEX,
+            Self::ADD_PATH_INDEX,
+            Self::ADD_DV_START_INDEX,
         )?;
         let mut visitor = AddRemoveDedupVisitor::new(
             deduplicator,

@@ -13,8 +13,7 @@
 //! This module provides structures for efficient batch processing, focusing on file action
 //! deduplication with `FileActionDeduplicator` which tracks unique files across log batches
 //! to minimize memory usage for tables with extensive history.
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::engine_data::{GetData, TypedGetData};
+use crate::engine_data::GetData;
 use crate::log_replay::deduplicator::{extract_dv_unique_id, Deduplicator};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
@@ -22,7 +21,6 @@ use crate::{DeltaResult, EngineData};
 use delta_kernel_derive::internal_api;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use tracing::debug;
 
@@ -206,6 +204,8 @@ impl ActionsBatch {
     }
 }
 
+#[internal_api]
+#[allow(unused)]
 pub(crate) trait ParallelizableLogReplayProcessor {
     type Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
