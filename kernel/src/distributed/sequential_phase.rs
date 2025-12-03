@@ -101,7 +101,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
         let commit_phase =
-            CommitReader::try_new(engine.as_ref(), &log_segment, get_commit_schema().clone())?;
+            CommitReader::try_new(engine.as_ref(), log_segment, get_commit_schema().clone())?;
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
