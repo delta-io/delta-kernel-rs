@@ -60,14 +60,12 @@ mod tests {
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
     use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
-    use crate::utils::test_utils::load_test_table_with_data;
+    use crate::utils::test_utils::load_test_table;
     use itertools::Itertools;
-    use std::sync::Arc;
 
     #[test]
     fn test_sidecar_phase_processes_files() -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) =
-            load_test_table_with_data("tests/data", "v2-checkpoints-json-with-sidecars")?;
+        let (engine, snapshot, _tempdir) = load_test_table("v2-checkpoints-json-with-sidecars")?;
         let log_segment = snapshot.log_segment();
 
         // First we need to run through manifest phase to get the sidecar files
@@ -80,9 +78,9 @@ mod tests {
         let checkpoint_file = &log_segment.checkpoint_parts[0];
 
         let mut manifest_phase = CheckpointManifestReader::try_new(
+            engine.clone(),
             checkpoint_file,
             log_segment.log_root.clone(),
-            engine.clone(),
         )?;
 
         // Drain manifest phase
@@ -96,7 +94,7 @@ mod tests {
 
         let schema = get_commit_schema().project(&[ADD_NAME])?;
 
-        let mut sidecar_phase = CheckpointLeafReader::try_new(engine.clone(), sidecars, schema)?;
+        let sidecar_phase = CheckpointLeafReader::try_new(engine.clone(), sidecars, schema)?;
 
         let mut sidecar_file_paths = Vec::new();
 
@@ -131,7 +129,7 @@ mod tests {
         );
 
         // Verify first few files match expected (sampling to keep test readable)
-        let expected_first_files = vec![
+        let expected_first_files = [
             "test%25file%25prefix-part-00000-01086c52-1b86-48d0-8889-517fe626849d-c000.snappy.parquet",
             "test%25file%25prefix-part-00000-0fd71c0e-fd08-4685-87d6-aae77532d3ea-c000.snappy.parquet",
             "test%25file%25prefix-part-00000-2710dd7f-9fa5-429d-b3fb-c005ba16e062-c000.snappy.parquet",
