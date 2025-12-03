@@ -1,23 +1,29 @@
 use std::sync::Arc;
 
-use crate::{
-    log_reader::leaf::LeafCheckpointReader, log_replay::ParallelizableLogReplayProcessor,
-    scan::CHECKPOINT_READ_SCHEMA, DeltaResult, Engine, FileMeta,
-};
+use delta_kernel_derive::internal_api;
 
-struct DistributedPhase<P: ParallelizableLogReplayProcessor> {
+use crate::log_reader::checkpoint_leaf::CheckpointLeafReader;
+use crate::log_replay::ParallelizableLogReplayProcessor;
+use crate::scan::CHECKPOINT_READ_SCHEMA;
+use crate::{DeltaResult, Engine, FileMeta};
+
+#[internal_api]
+#[allow(unused)]
+pub(crate) struct DistributedPhase<P: ParallelizableLogReplayProcessor> {
     processor: Arc<P>,
-    leaf_checkpoint_reader: LeafCheckpointReader,
+    leaf_checkpoint_reader: CheckpointLeafReader,
 }
 
 impl<P: ParallelizableLogReplayProcessor> DistributedPhase<P> {
+    #[internal_api]
+    #[allow(unused)]
     pub(crate) fn try_new(
         engine: Arc<dyn Engine>,
         processor: Arc<P>,
         sidecars: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
         let leaf_checkpoint_reader =
-            LeafCheckpointReader::new(sidecars, engine, CHECKPOINT_READ_SCHEMA.clone())?;
+            CheckpointLeafReader::try_new(engine, sidecars, CHECKPOINT_READ_SCHEMA.clone())?;
         Ok(Self {
             processor,
             leaf_checkpoint_reader,
@@ -41,7 +47,6 @@ mod tests {
     use crate::distributed::sequential_phase::{AfterSequential, SequentialPhase};
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state_info::StateInfo;
-    use crate::utils::test_utils::load_test_table_with_data;
     use crate::{ExpressionRef, SnapshotRef};
     use std::sync::Arc;
 
@@ -86,7 +91,7 @@ mod tests {
         one_file_per_worker: bool,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table_with_data(test_dir, table_name)?;
-        
+
         // Get expected results from single-threaded scan_metadata
         let expected_files = get_files_from_scan_metadata(&snapshot, engine.as_ref())?;
 
@@ -126,11 +131,10 @@ mod tests {
             AfterSequential::Distributed { processor, files } => {
                 // Optionally serialize and deserialize the processor
                 let processor = if with_serde {
-                    let (serialized_state, seen_file_keys) = processor.serialize()?;
-                    ScanLogReplayProcessor::from_serialized(
+                    let serialized_state = processor.into_serializable_state();
+                    ScanLogReplayProcessor::from_serializable_state(
                         engine.as_ref(),
                         serialized_state,
-                        seen_file_keys,
                     )?
                 } else {
                     processor
@@ -166,7 +170,13 @@ mod tests {
                         let metadata = result?;
                         all_distributed_files = metadata.visit_scan_files(
                             all_distributed_files,
-                            |ps: &mut Vec<(String, Option<ExpressionRef>)>, path, _, _, _, transform, _| {
+                            |ps: &mut Vec<(String, Option<ExpressionRef>)>,
+                             path,
+                             _,
+                             _,
+                             _,
+                             transform,
+                             _| {
                                 ps.push((path.to_string(), transform.clone()));
                             },
                         )?;
@@ -177,7 +187,7 @@ mod tests {
 
         // Sort and compare results
         all_distributed_files.sort_by(|a, b| a.0.cmp(&b.0));
-        
+
         assert_eq!(
             all_distributed_files,
             expected_files,
@@ -230,8 +240,8 @@ mod tests {
         verify_distributed_workflow(
             "v2-checkpoints-json-with-sidecars",
             "tests/data",
-            true,  // with serde
-            true,  // fine-grained: one file per worker
+            true, // with serde
+            true, // fine-grained: one file per worker
         )
     }
 
