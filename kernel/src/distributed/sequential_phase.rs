@@ -36,7 +36,7 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 /// # Example
 ///
 /// ```ignore
-/// let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine)?;
+/// let mut sequential = SequentialPhase::try_new(processor, log_segment, engine)?;
 ///
 /// // Iterate over sequential batches
 /// for batch in sequential.by_ref() {
@@ -221,7 +221,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
+        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Process all batches and collect Add file paths
         let mut file_paths = Vec::new();
@@ -314,7 +314,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
+        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
 
         // Call next() once but don't exhaust the iterator
         if let Some(result) = sequential.next() {
