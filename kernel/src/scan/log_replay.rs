@@ -41,9 +41,8 @@ pub struct SerializableScanState {
     pub predicate: Option<PredicateRef>,
     /// Opaque internal state blob containing schemas, transform spec, and column mapping mode
     pub internal_state_blob: Vec<u8>,
-    /// Iterator over file paths that have been removed from the table or already processed.
-    /// Note: Deletion vector info is intentionally dropped; only file paths are retained.
-    pub seen_file_keys: Box<dyn Iterator<Item = String>>,
+    /// Set of file action keys that have been removed from the table or already processed.
+    pub seen_file_keys: HashSet<FileActionKey>,
 }
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
@@ -135,16 +134,10 @@ impl ScanLogReplayProcessor {
     /// Consumes the processor and returns a `SerializableScanState` containing:
     /// - The predicate (if any) for data skipping
     /// - An opaque internal state blob (schemas, transform spec, column mapping mode)
-    /// - An iterator over seen file paths (DV info is intentionally dropped)
+    /// - The set of seen file keys including their deletion vector information
     ///
     /// The returned state can be used with `from_serializable_state` to reconstruct the
     /// processor on remote compute nodes.
-    ///
-    /// # Note
-    /// Deletion vector information is intentionally dropped from `seen_file_keys` during
-    /// serialization because the checkpoint phase does not need to examine deletion vectors.
-    /// If a `(path, dv_info)` has been seen, we can safely skip any `(path, null)` or
-    /// `(path, dv_info)` entries in checkpoint files.
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
@@ -165,14 +158,10 @@ impl ScanLogReplayProcessor {
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
 
-        // NOTE: We only provide the path since the checkpoint phase does not need to look at
-        // deletion vectors. If a (path, dv_info) has been seen, we can safely skip any (path, null)
-        // or (path, dv_info) that is present in a checkpoint file.
-        let seen_file_keys = Box::new(self.seen_file_keys.into_iter().map(|key| key.path));
         let state = SerializableScanState {
             predicate,
             internal_state_blob,
-            seen_file_keys,
+            seen_file_keys: self.seen_file_keys,
         };
 
         Ok(state)
@@ -186,15 +175,10 @@ impl ScanLogReplayProcessor {
     ///
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
-    /// - `state`: The serialized state containing predicate, internal state blob, and seen file paths
+    /// - `state`: The serialized state containing predicate, internal state blob, and seen file keys
     ///
     /// # Returns
-    /// An `Arc<ScanLogReplayProcessor>`. This is wrapped in an Arc to indicate that the
-    /// seen_file_keys set may never be updated again if it was built from a `SerializableScanState`.
-    /// This is because serialization removes deletion vector information from the seen_file_keys.
-    /// Thus, it is only safe to apply this processor to checkpoint actions (actions that will not
-    /// modify the deduplication set). Checkpoint actions should be removed if their path is in the
-    /// seen_file_keys set.
+    /// A new `ScanLogReplayProcessor` wrapped in an Arc.
     ///
     #[internal_api]
     #[allow(unused)]
@@ -227,11 +211,7 @@ impl ScanLogReplayProcessor {
             column_mapping_mode: internal_state.column_mapping_mode,
         });
 
-        let seen_file_keys = state
-            .seen_file_keys
-            .map(|path| FileActionKey::new(path, None))
-            .collect();
-        let processor = Self::new_with_seen_files(engine, state_info, seen_file_keys)?;
+        let processor = Self::new_with_seen_files(engine, state_info, state.seen_file_keys)?;
 
         Ok(Arc::new(processor))
     }
@@ -557,6 +537,7 @@ pub(crate) fn scan_action_iter(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::{collections::HashMap, sync::Arc};
 
     use crate::actions::get_commit_schema;
@@ -786,7 +767,7 @@ mod tests {
 
     #[test]
     fn test_serialization_basic_state_and_dv_dropping() {
-        // Test basic StateInfo preservation and DV info dropping
+        // Test basic StateInfo preservation and FileActionKey preservation
         let engine = SyncEngine::new();
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([
             StructField::new("id", DataType::INTEGER, true),
@@ -799,21 +780,12 @@ mod tests {
         .unwrap();
 
         // Add file keys with and without DV info
-        processor
-            .seen_file_keys
-            .insert(crate::log_replay::FileActionKey::new("file1.parquet", None));
-        processor
-            .seen_file_keys
-            .insert(crate::log_replay::FileActionKey::new(
-                "file2.parquet",
-                Some("dv-1".to_string()),
-            ));
-        processor
-            .seen_file_keys
-            .insert(crate::log_replay::FileActionKey::new(
-                "file3.parquet",
-                Some("dv-2".to_string()),
-            ));
+        let key1 = crate::log_replay::FileActionKey::new("file1.parquet", None);
+        let key2 = crate::log_replay::FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
+        let key3 = crate::log_replay::FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
+        processor.seen_file_keys.insert(key1.clone());
+        processor.seen_file_keys.insert(key2.clone());
+        processor.seen_file_keys.insert(key3.clone());
 
         let state_info = processor.state_info.clone();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -836,19 +808,11 @@ mod tests {
             state_info.column_mapping_mode
         );
 
-        // Verify DV info dropped but paths preserved
+        // Verify all file keys are preserved with their DV info
         assert_eq!(deserialized.seen_file_keys.len(), 3);
-        for key in &deserialized.seen_file_keys {
-            assert!(key.dv_unique_id.is_none(), "DV info should be dropped");
-        }
-        let paths: std::collections::HashSet<_> = deserialized
-            .seen_file_keys
-            .iter()
-            .map(|k| k.path.as_str())
-            .collect();
-        assert!(paths.contains("file1.parquet"));
-        assert!(paths.contains("file2.parquet"));
-        assert!(paths.contains("file3.parquet"));
+        assert!(deserialized.seen_file_keys.contains(&key1));
+        assert!(deserialized.seen_file_keys.contains(&key2));
+        assert!(deserialized.seen_file_keys.contains(&key3));
     }
 
     #[test]
@@ -994,7 +958,7 @@ mod tests {
         let invalid_state = SerializableScanState {
             predicate: None,
             internal_state_blob: vec![0, 1, 2, 3, 255], // Invalid JSON
-            seen_file_keys: Box::new(std::iter::empty()),
+            seen_file_keys: HashSet::new(),
         };
         assert!(ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state).is_err());
     }
@@ -1020,7 +984,7 @@ mod tests {
         let invalid_state = SerializableScanState {
             predicate: Some(predicate), // Predicate exists but schema is None
             internal_state_blob: invalid_blob,
-            seen_file_keys: Box::new(std::iter::empty()),
+            seen_file_keys: HashSet::new(),
         };
         let result = ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state);
         assert!(result.is_err());
