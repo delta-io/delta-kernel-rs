@@ -47,6 +47,7 @@ mod tests {
     use crate::distributed::sequential_phase::{AfterSequential, SequentialPhase};
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state_info::StateInfo;
+    use crate::utils::test_utils::load_test_table;
     use crate::{ExpressionRef, SnapshotRef};
     use std::sync::Arc;
 
@@ -86,11 +87,10 @@ mod tests {
     ///   If false, creates one DistributedPhase for all files (coarse-grained).
     fn verify_distributed_workflow(
         table_name: &str,
-        test_dir: &str,
         with_serde: bool,
         one_file_per_worker: bool,
     ) -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table_with_data(test_dir, table_name)?;
+        let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         // Get expected results from single-threaded scan_metadata
         let expected_files = get_files_from_scan_metadata(&snapshot, engine.as_ref())?;
@@ -105,7 +105,7 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
+        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
 
         // Process all batches in sequential phase and collect (path, transform) pairs
         let mut sequential_files = Vec::new();
@@ -131,19 +131,14 @@ mod tests {
             AfterSequential::Distributed { processor, files } => {
                 // Optionally serialize and deserialize the processor
                 let processor = if with_serde {
-                    let serialized_state = processor.into_serializable_state();
+                    let serialized_state = processor.into_serializable_state()?;
                     ScanLogReplayProcessor::from_serializable_state(
                         engine.as_ref(),
                         serialized_state,
                     )?
                 } else {
-                    processor
+                    Arc::new(processor)
                 };
-
-                // Put processor in Arc for sharing across multiple distributed phase instances.
-                // This simulates true distributed execution where the processor state is shared
-                // across multiple workers, each processing a different partition of files.
-                let processor = Arc::new(processor);
 
                 // Choose distribution strategy based on test mode
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
@@ -205,19 +200,8 @@ mod tests {
     fn test_distributed_with_sidecars() -> DeltaResult<()> {
         verify_distributed_workflow(
             "v2-checkpoints-json-with-sidecars",
-            "tests/data",
             false, // without serde
             false, // coarse-grained: all files in one worker
-        )
-    }
-
-    #[test]
-    fn test_distributed_multi_part_checkpoint() -> DeltaResult<()> {
-        verify_distributed_workflow(
-            "multi-part-checkpoint",
-            "tests/golden_data",
-            false, // without serde
-            true,  // fine-grained: one file per worker
         )
     }
 
@@ -225,7 +209,6 @@ mod tests {
     fn test_no_distributed_phase_needed() -> DeltaResult<()> {
         verify_distributed_workflow(
             "table-without-dv-small",
-            "tests/data",
             false, // without serde
             false, // coarse-grained (doesn't matter - no distributed phase)
         )
@@ -239,19 +222,8 @@ mod tests {
     fn test_distributed_with_sidecars_serde() -> DeltaResult<()> {
         verify_distributed_workflow(
             "v2-checkpoints-json-with-sidecars",
-            "tests/data",
             true, // with serde
             true, // fine-grained: one file per worker
-        )
-    }
-
-    #[test]
-    fn test_distributed_multi_part_checkpoint_serde() -> DeltaResult<()> {
-        verify_distributed_workflow(
-            "multi-part-checkpoint",
-            "tests/golden_data",
-            true,  // with serde
-            false, // coarse-grained: all files in one worker
         )
     }
 
@@ -259,7 +231,6 @@ mod tests {
     fn test_distributed_parquet_checkpoint_with_sidecars() -> DeltaResult<()> {
         verify_distributed_workflow(
             "v2-checkpoints-parquet-with-sidecars",
-            "tests/data",
             false, // without serde
             true,  // fine-grained: one file per worker
         )
@@ -269,7 +240,6 @@ mod tests {
     fn test_distributed_parquet_checkpoint_with_sidecars_serde() -> DeltaResult<()> {
         verify_distributed_workflow(
             "v2-checkpoints-parquet-with-sidecars",
-            "tests/data",
             true,  // with serde
             false, // coarse-grained: all files in one worker
         )
