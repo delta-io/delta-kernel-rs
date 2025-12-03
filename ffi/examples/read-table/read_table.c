@@ -168,6 +168,27 @@ void free_partition_list(PartitionList* list) {
   free(list);
 }
 
+
+// Our schema code might add (is nullable: x) to names, which we need to strip off.
+// Returns the location where the edit was made if one was made, or NULL if no edit
+char* fixup_name(char* name) {
+  char *s = name;
+  char found_paren = 0;
+  while (*s) {
+    if (*s == '(') {
+      *(s-1) = '\0';
+      found_paren = 1;
+      break;
+    }
+    s++;
+  }
+  if (found_paren) {
+    return s-1;
+  } else {
+    return NULL;
+  }
+}
+
 // This function looks at the type field in the schema to figure out which visitor to call. It's a
 // bit gross as the schema code is string based, a real implementation would have a more robust way
 // to represent a schema.
@@ -189,6 +210,8 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     visit_res = visit_field_float(state, name, false, allocate_error);
   } else if (strcmp(item->type, "double") == 0) {
     visit_res = visit_field_double(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "boolean") == 0) {
+    visit_res = visit_field_boolean(state, name, false, allocate_error);
   } else if (strcmp(item->type, "binary") == 0) {
     visit_res = visit_field_binary(state, name, false, allocate_error);
   } else if (strcmp(item->type, "date") == 0) {
@@ -234,8 +257,25 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     }
     visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, false, allocate_error);
   } else if (strcmp(item->type, "struct") == 0) {
-    printf("[ERROR] Can't visit structs yet\n");
-    return 0;
+    SchemaItemList child_list = cschema->builder->lists[item->children];
+    uintptr_t child_visit_ids[child_list.len];
+    for (uint32_t i = 0; i < child_list.len; i++) {
+      // visit all the children
+      SchemaItem *item = &child_list.list[i];
+      char* fixup_loc = fixup_name(item->name);
+      uintptr_t child_id = visit_schema_item(item, state, cschema);
+      if (fixup_loc != NULL) {
+        *fixup_loc = ' ';
+      }
+      child_visit_ids[i] = child_id;
+    }
+    visit_res = visit_field_struct(
+      state,
+      name,
+      child_visit_ids,
+      child_list.len,
+      false,
+      allocate_error);
   } else {
     printf("[ERROR] Can't visit unknown type: %s\n", item->type);
     return 0;
@@ -259,7 +299,17 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
   RequestedSchemaSpec *spec = (RequestedSchemaSpec*)requested_spec;
   print_diag("Asked to visit: %s\n", spec->requested_cols);
 
-  uintptr_t cols[128];
+  // figure out how many columns we are requesting. will be number of commas + 1
+  int col_count = 1;
+  char* s = spec->requested_cols;
+  while (*s) {
+    if (*s == ',') {
+      col_count++;
+    }
+    s++;
+  }
+
+  uintptr_t cols[col_count];
   int col_index = 0;
 
   CSchema* cschema = spec->cschema;
@@ -272,17 +322,7 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
     char found_col = 0;
     for (uint32_t i = 0; i < top_level_list->len; i++) {
       SchemaItem* item = &top_level_list->list[i];
-      // need to prevent looking at the (is nullable: x) part
-      char *s = item->name;
-      char found_paren = 0;
-      while (*s) {
-        if (*s == '(') {
-          *(s-1) = '\0';
-          found_paren = 1;
-          break;
-        }
-        s++;
-      }
+      char* fixup_loc = fixup_name(item->name);
       if (strcmp(item->name, col) == 0) {
         found_col = 1;
         uintptr_t col_id = visit_schema_item(item, state, cschema);
@@ -292,8 +332,8 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
         }
         cols[col_index++] = col_id;
       }
-      if (found_paren) {
-        *(s-1) = ' ';
+      if (fixup_loc != NULL) {
+        *fixup_loc = ' ';
       }
       if (found_col) {
         break;
