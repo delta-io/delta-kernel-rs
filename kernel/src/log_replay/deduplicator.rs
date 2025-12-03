@@ -10,6 +10,8 @@
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
+use std::collections::HashSet;
+
 use crate::{
     actions::deletion_vector::DeletionVectorDescriptor,
     engine_data::{GetData, TypedGetData as _},
