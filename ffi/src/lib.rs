@@ -46,6 +46,7 @@ pub mod ffi_tracing;
 pub mod log_path;
 pub mod scan;
 pub mod schema;
+pub mod schema_visitor;
 
 #[cfg(test)]
 mod ffi_test_utils;
