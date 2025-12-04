@@ -131,11 +131,11 @@ mod tests {
             AfterSequential::Distributed { processor, files } => {
                 // Optionally serialize and deserialize the processor
                 let processor = if with_serde {
-                    let serialized_state = processor.into_serializable_state()?;
-                    ScanLogReplayProcessor::from_serializable_state(
-                        engine.as_ref(),
-                        serialized_state,
-                    )?
+                    let serializable_state = processor.into_serializable_state()?;
+                    let state_str = serde_json::to_string(&serializable_state)?;
+                    let state = serde_json::from_str(&state_str)?;
+
+                    ScanLogReplayProcessor::from_serializable_state(engine.as_ref(), state)?
                 } else {
                     Arc::new(processor)
                 };

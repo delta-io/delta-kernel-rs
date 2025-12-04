@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
+use serde::{Deserialize, Serialize};
 
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
@@ -40,6 +41,7 @@ struct InternalScanState {
 ///
 /// This struct contains all the information needed to reconstruct a `ScanLogReplayProcessor`
 /// on remote compute nodes, enabling distributed log replay processing.
+#[derive(Deserialize, Serialize)]
 pub struct SerializableScanState {
     /// Optional predicate for data skipping (if provided)
     pub predicate: Option<PredicateRef>,
