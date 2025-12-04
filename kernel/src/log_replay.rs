@@ -369,7 +369,6 @@ pub(crate) trait HasSelectionVector {
 mod tests {
     use super::*;
     use crate::engine_data::GetData;
-    use crate::log_replay::deduplicator::Deduplicator;
     use crate::DeltaResult;
     use std::collections::{HashMap, HashSet};
 

@@ -5,8 +5,8 @@
 //! - **JSON commit files** (`is_log_batch = true`): Tracks (path, dv_unique_id) and updates
 //!   the hashmap as files are seen. Implementation: [`FileActionDeduplicator`]
 //!
-//! - **Checkpoint files** (`is_log_batch = false`): Uses path-only keys with a read-only hashmap
-//!   pre-populated from the commit log phase. Future implementation.
+//! - **Checkpoint files** (`is_log_batch = false`): Uses a read-only Tracks (path, dv_unique_id)
+//!   hashmap pre-populated from the commit log phase. Future implementation.
 //!
 //! [`FileActionDeduplicator`]: crate::log_replay::FileActionDeduplicator
 
