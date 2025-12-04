@@ -543,8 +543,7 @@ impl Transaction {
         let materialize_partition_columns = self
             .read_snapshot
             .table_configuration()
-            .protocol()
-            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
 
         // If the materialize partition columns feature is enabled, pass through all columns in the
         // schema. Otherwise, exclude partition columns.
