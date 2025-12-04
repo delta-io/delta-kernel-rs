@@ -3,14 +3,14 @@
 //! # Example
 //! ```rust
 //! # use std::sync::Arc;
-//! # use test_utils::DefaultEngineExtension;
 //! # use delta_kernel::engine::default::DefaultEngine;
 //! # use delta_kernel::expressions::{column_expr, Scalar};
 //! # use delta_kernel::{Predicate, Snapshot, SnapshotRef, Error, Engine};
 //! # use delta_kernel::table_changes::TableChanges;
 //! # let path = "./tests/data/table-with-cdf";
-//! # let engine = DefaultEngine::new_local();
 //! let url = delta_kernel::try_parse_uri(path)?;
+//! # use delta_kernel::engine::default::storage::store_from_url;
+//! # let engine = std::sync::Arc::new(DefaultEngine::new(store_from_url(&url)?));
 //! // Get the table changes (change data feed) between version 0 and 1
 //! let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
 //!
@@ -27,7 +27,7 @@
 //!     .with_predicate(predicate.clone())
 //!     .build()?;
 //!
-//! // Execute the table changes scan to get a fallible iterator of `ScanResult`s
+//! // Execute the table changes scan to get a fallible iterator of `Box<dyn EngineData>`s
 //! let table_change_batches = table_changes_scan.execute(engine.clone())?;
 //! # Ok::<(), Error>(())
 //! ```
@@ -36,12 +36,12 @@ use std::sync::{Arc, LazyLock};
 use scan::TableChangesScanBuilder;
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Protocol};
 use crate::log_segment::LogSegment;
 use crate::path::AsUrl;
 use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
-use crate::table_features::{ColumnMappingMode, TableFeature};
+use crate::table_configuration::TableConfiguration;
+use crate::table_features::Operation;
 use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, Version};
@@ -95,14 +95,13 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  # Examples
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
 ///  ```rust
-///  # use delta_kernel::engine::default::DefaultEngine;
-///  # use test_utils::DefaultEngineExtension;
+///  # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngine};
 ///  # use delta_kernel::{SnapshotRef, Error};
 ///  # use delta_kernel::table_changes::TableChanges;
-///  # let engine = DefaultEngine::new_local();
 ///  # let path = "./tests/data/table-with-cdf";
-///  let url = delta_kernel::try_parse_uri(path).unwrap();
-///  let table_changes = TableChanges::try_new(url, engine.as_ref(), 0, Some(1))?;
+///  let url = delta_kernel::try_parse_uri(path)?;
+///  # let engine = DefaultEngine::new(store_from_url(&url)?);
+///  let table_changes = TableChanges::try_new(url, &engine, 0, Some(1))?;
 ///  # Ok::<(), Error>(())
 ///  ````
 /// For more details, see the following sections of the protocol:
@@ -115,6 +114,7 @@ pub struct TableChanges {
     end_snapshot: SnapshotRef,
     start_version: Version,
     schema: Schema,
+    start_table_config: TableConfiguration,
 }
 
 impl TableChanges {
@@ -147,35 +147,22 @@ impl TableChanges {
             end_version,
         )?;
 
-        // Both snapshots ensure that reading is supported at the start and end version using
-        // `ensure_read_supported`. Note that we must still verify that reading is
-        // supported for every protocol action in the CDF range.
         let start_snapshot = Snapshot::builder_for(table_root.as_url().clone())
             .at_version(start_version)
             .build(engine)?;
+        start_snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Cdf)?;
+
         let end_snapshot = match end_version {
             Some(version) => Snapshot::builder_from(start_snapshot.clone())
                 .at_version(version)
                 .build(engine)?,
             None => Snapshot::builder_from(start_snapshot.clone()).build(engine)?,
         };
-
-        // we block reading catalog-managed tables with CDF for now. note this is best-effort just
-        // checking that start/end snapshots are not catalog-managed.
-        //
-        // TODO: link issue
-        #[cfg(feature = "catalog-managed")]
-        require!(
-            !start_snapshot
-                .table_configuration()
-                .protocol()
-                .is_catalog_managed()
-                && !end_snapshot
-                    .table_configuration()
-                    .protocol()
-                    .is_catalog_managed(),
-            Error::unsupported("Change data feed is not supported for catalog-managed tables")
-        );
+        end_snapshot
+            .table_configuration()
+            .ensure_operation_supported(Operation::Cdf)?;
 
         // Verify CDF is enabled at the beginning and end of the interval using
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
@@ -219,6 +206,7 @@ impl TableChanges {
             log_segment,
             start_version,
             schema,
+            start_table_config: start_snapshot.table_configuration().clone(),
         })
     }
 
@@ -254,38 +242,13 @@ impl TableChanges {
 
 /// Ensures that change data feed is enabled in `table_properties`. See the documentation
 /// of [`TableChanges`] for more details.
+// TODO: move to TableProperties and normalize with the check in TableConfiguration
 fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult<()> {
     require!(
         table_properties.enable_change_data_feed.unwrap_or(false),
         Error::unsupported("Change data feed is not enabled")
     );
-    require!(
-        matches!(
-            table_properties.column_mapping_mode,
-            None | Some(ColumnMappingMode::None)
-        ),
-        Error::unsupported("Change data feed not supported when column mapping is enabled")
-    );
     Ok(())
-}
-
-/// Ensures that Change Data Feed is supported for a table with this [`Protocol`] .
-/// See the documentation of [`TableChanges`] for more details.
-fn ensure_cdf_read_supported(protocol: &Protocol) -> DeltaResult<()> {
-    static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> =
-        LazyLock::new(|| vec![TableFeature::DeletionVectors]);
-    match &protocol.reader_features() {
-        // if min_reader_version = 3 and all reader features are subset of supported => OK
-        Some(reader_features) if protocol.min_reader_version() == 3 => {
-            ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES)
-        }
-        // if min_reader_version = 1 and there are no reader features => OK
-        None if protocol.min_reader_version() == 1 => Ok(()),
-        // any other protocol is not supported
-        _ => Err(Error::unsupported(
-            "Change data feed not supported on this protocol",
-        )),
-    }
 }
 
 #[cfg(test)]

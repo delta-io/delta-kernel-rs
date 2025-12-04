@@ -6,12 +6,11 @@ use delta_kernel::arrow::array::{
     ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
 };
 
-use delta_kernel::arrow::compute::filter_record_batch;
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::executor::TaskExecutor;
+use delta_kernel::engine::default::storage::store_from_url;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
@@ -38,6 +37,44 @@ pub fn load_test_data(
     let temp_dir = tempfile::tempdir()?;
     archive.unpack(temp_dir.path())?;
     Ok(temp_dir)
+}
+
+/// Recursively copies a directory and all its contents from source to destination.
+///
+/// This function is used to create isolated copies of test tables, enabling parallel
+/// test execution without interference. Each test gets its own copy of the table data,
+/// preventing race conditions and cross-test pollution.
+///
+/// # Arguments
+///
+/// * `source` - Path to the source directory to copy from
+/// * `dest` - Path to the destination directory (will be created if it doesn't exist)
+///
+/// # Note
+///
+/// This function copies ALL files and subdirectories, including any test artifacts
+/// that may have been created in the source directory. Ensure the source directory
+/// contains only the intended baseline data.
+pub fn copy_directory(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dest)?;
+
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let dest_path = dest.join(&file_name);
+
+        if path.is_dir() {
+            copy_directory(&path, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
@@ -194,27 +231,14 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// Simple extension trait with helpful methods (just constuctor for now) for creating/using
-/// DefaultEngine in our tests.
+/// Helper to create a DefaultEngine with the default executor for tests.
 ///
-/// Note: we implment this extension trait here so that we can import this trait (from test-utils
-/// crate) and get to use all these test-only helper methods from places where we don't have access
-pub trait DefaultEngineExtension {
-    type Executor: TaskExecutor;
-
-    fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
-}
-
-impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
-    type Executor = TokioBackgroundExecutor;
-
-    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
-        let object_store = Arc::new(LocalFileSystem::new());
-        Arc::new(DefaultEngine::new(
-            object_store,
-            TokioBackgroundExecutor::new().into(),
-        ))
-    }
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine(
+    table_root: &url::Url,
+) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+    let store = store_from_url(table_root)?;
+    Ok(Arc::new(DefaultEngine::new(store)))
 }
 
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
@@ -236,8 +260,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
+    let engine = DefaultEngine::new(Arc::clone(&storage));
 
     (storage, engine, url)
 }
@@ -301,6 +324,9 @@ pub async fn create_table(
                 "delta.inCommitTimestampEnablementTimestamp".to_string(),
                 json!("1612345678"),
             );
+        }
+        if writer_features.contains(&"changeDataFeed") {
+            config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
         }
 
         config
@@ -421,28 +447,10 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
-}
-
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()
 }
 

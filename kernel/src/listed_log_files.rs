@@ -87,30 +87,27 @@ fn list_log_files(
     // if the log_tail covers the entire requested range (i.e. starts at or before start_version),
     // we skip listing entirely. note that if we don't include this check, we will end up listing
     // and then just filtering out all the files we listed.
-    let listed_files = log_tail_start
-        // log_tail covers the entire requested range, so no listing is required
-        .is_none_or(|tail_start| start_version < tail_start.version)
-        .then(|| -> DeltaResult<_> {
-            // NOTE: since engine APIs don't limit listing, we list from start_version and filter
-            Ok(storage
-                .list_from(&start_from)?
-                .map(|meta| ParsedLogPath::try_from(meta?))
-                // NOTE: this filters out .crc files etc which start with "." - some engines
-                // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
-                // doesn't care about these files. Critically, note these are _different_ than
-                // normal `version.crc` files which are listed + captured normally. Additionally
-                // we likely aren't even 'seeing' these files since lexicographically the string
-                // "." comes before the string "0".
-                .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
-                .take_while(move |path_res| match path_res {
-                    // discard any path with too-large version; keep errors
-                    Ok(path) => path.version <= list_end_version,
-                    Err(_) => true,
-                }))
-        })
-        .transpose()?
-        .into_iter()
-        .flatten();
+    let listed_files = if log_tail_start.is_none_or(|tail| start_version < tail.version) {
+        // NOTE: since engine APIs don't limit listing, we list from start_version and filter
+        let files = storage
+            .list_from(&start_from)?
+            .map(|meta| ParsedLogPath::try_from(meta?))
+            // NOTE: this filters out .crc files etc which start with "." - some engines
+            // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
+            // doesn't care about these files. Critically, note these are _different_ than
+            // normal `version.crc` files which are listed + captured normally. Additionally
+            // we likely aren't even 'seeing' these files since lexicographically the string
+            // "." comes before the string "0".
+            .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
+            .take_while(move |path_res| match path_res {
+                // discard any path with too-large version; keep errors
+                Ok(path) => path.version <= list_end_version,
+                Err(_) => true,
+            });
+        Some(files)
+    } else {
+        None
+    };
 
     // return chained [listed_files..log_tail], filtering log_tail by the requested range
     let filtered_log_tail = log_tail
@@ -118,6 +115,7 @@ fn list_log_files(
         .filter(move |entry| entry.version >= start_version && entry.version <= end_version)
         .map(Ok);
 
+    let listed_files = listed_files.into_iter().flatten();
     Ok(listed_files.chain(filtered_log_tail))
 }
 
@@ -256,85 +254,123 @@ impl ListedLogFiles {
     ) -> DeltaResult<Self> {
         let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
-        log_files.process_results(|iter| {
-            let mut ascending_commit_files = Vec::new();
-            let mut ascending_compaction_files = Vec::new();
-            let mut checkpoint_parts = vec![];
-            let mut latest_crc_file: Option<ParsedLogPath> = None;
-            let mut latest_commit_file: Option<ParsedLogPath> = None;
+        // Helper that accumulates and groups log files during listing. Each "group" consists of all
+        // files that share the same version number (e.g., commit, checkpoint parts, CRC files).
+        //
+        // We need to group by version because:
+        // 1. A version may have multiple checkpoint parts that must be collected before we can
+        //    determine if the checkpoint is complete
+        // 2. If a complete checkpoint exists, we can discard all commits before it
+        //
+        // Groups are flushed (processed) when we encounter a file with a different version or
+        // reach EOF, at which point we check for complete checkpoints and update our state.
+        #[derive(Default)]
+        struct LogListingGroupBuilder {
+            ascending_commit_files: Vec<ParsedLogPath>,
+            ascending_compaction_files: Vec<ParsedLogPath>,
+            checkpoint_parts: Vec<ParsedLogPath>,
+            latest_crc_file: Option<ParsedLogPath>,
+            latest_commit_file: Option<ParsedLogPath>,
+            new_checkpoint_parts: Vec<ParsedLogPath>,
+            end_version: Option<Version>,
+        }
 
-            // Group log files by version
-            let log_files_per_version = iter.chunk_by(|x| x.version);
-
-            for (version, files) in &log_files_per_version {
-                let mut new_checkpoint_parts = vec![];
-                for file in files {
-                    use LogPathFileType::*;
-                    match file.file_type {
-                        Commit | StagedCommit => ascending_commit_files.push(file),
-                        CompactedCommit { hi } if end_version.is_none_or(|end| hi <= end) => {
-                            ascending_compaction_files.push(file);
-                        }
-                        CompactedCommit { .. } => (), // Failed the bounds check above
-                        SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
-                            new_checkpoint_parts.push(file)
-                        }
-                        Crc => {
-                            let latest_crc_ref = latest_crc_file.as_ref();
-                            if latest_crc_ref.is_none_or(|latest| latest.version < file.version) {
-                                latest_crc_file = Some(file);
-                            }
-                        }
-                        Unknown => {
-                            // It is possible that there are other files being stashed away into
-                            // _delta_log/  This is not necessarily forbidden, but something we
-                            // want to know about in a debugging scenario
-                            debug!(
-                                "Found file {} with unknown file type {:?} at version {}",
-                                file.filename, file.file_type, version
-                            );
-                        }
+        impl LogListingGroupBuilder {
+            fn process_file(&mut self, file: ParsedLogPath) {
+                use LogPathFileType::*;
+                match file.file_type {
+                    Commit | StagedCommit => self.ascending_commit_files.push(file),
+                    CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
+                        self.ascending_compaction_files.push(file);
+                    }
+                    CompactedCommit { .. } => (), // Failed the bounds check above
+                    SinglePartCheckpoint | UuidCheckpoint | MultiPartCheckpoint { .. } => {
+                        self.new_checkpoint_parts.push(file)
+                    }
+                    Crc => {
+                        self.latest_crc_file.replace(file);
+                    }
+                    Unknown => {
+                        // It is possible that there are other files being stashed away into
+                        // _delta_log/  This is not necessarily forbidden, but something we
+                        // want to know about in a debugging scenario
+                        debug!(
+                            "Found file {} with unknown file type {:?} at version {}",
+                            file.filename, file.file_type, file.version
+                        );
                     }
                 }
-                // Group and find the first complete checkpoint for this version.
-                // All checkpoints for the same version are equivalent, so we only take one.
+            }
+
+            // Group and find the first complete checkpoint for this version.
+            // All checkpoints for the same version are equivalent, so we only take one.
+            //
+            // If this version has a complete checkpoint, we can drop the existing commit and
+            // compaction files we collected so far -- except we must keep the latest commit.
+            fn flush_checkpoint_group(&mut self, version: Version) {
+                let new_checkpoint_parts = std::mem::take(&mut self.new_checkpoint_parts);
                 if let Some((_, complete_checkpoint)) = group_checkpoint_parts(new_checkpoint_parts)
                     .into_iter()
                     // `num_parts` is guaranteed to be non-negative and within `usize` range
                     .find(|(num_parts, part_files)| part_files.len() == *num_parts as usize)
                 {
-                    checkpoint_parts = complete_checkpoint;
+                    self.checkpoint_parts = complete_checkpoint;
                     // Check if there's a commit file at the same version as this checkpoint. We pop
                     // the last element from ascending_commit_files (which is sorted by version) and
                     // set latest_commit_file to it only if it matches the checkpoint version. If it
                     // doesn't match, we set latest_commit_file to None to discard any older commits
                     // from before the checkpoint
-                    latest_commit_file = ascending_commit_files
+                    self.latest_commit_file = self
+                        .ascending_commit_files
                         .pop()
                         .filter(|commit| commit.version == version);
                     // Log replay only uses commits/compactions after a complete checkpoint
-                    ascending_commit_files.clear();
-                    ascending_compaction_files.clear();
+                    self.ascending_commit_files.clear();
+                    self.ascending_compaction_files.clear();
                 }
             }
+        }
 
-            // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
-            // it contains only commits after the most recent checkpoint. The last element is the
-            // highest version commit overall, so we update latest_commit_file to it. If it's empty,
-            // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
-            // or remains None.
-            if let Some(commit_file) = ascending_commit_files.last() {
-                latest_commit_file = Some(commit_file.clone());
+        let mut builder = LogListingGroupBuilder {
+            end_version,
+            ..Default::default()
+        };
+
+        let mut log_files = log_files;
+        if let Some(file) = log_files.next().transpose()? {
+            // Process first file to establish an initial group
+            let mut group_version = file.version;
+            builder.process_file(file);
+
+            // Process remaining files, flushing the previous groups first if the version changed
+            while let Some(file) = log_files.next().transpose()? {
+                if file.version != group_version {
+                    builder.flush_checkpoint_group(group_version);
+                    group_version = file.version;
+                }
+                builder.process_file(file);
             }
 
-            ListedLogFiles::try_new(
-                ascending_commit_files,
-                ascending_compaction_files,
-                checkpoint_parts,
-                latest_crc_file,
-                latest_commit_file,
-            )
-        })?
+            // Flush the final group, which must always contain at least one file
+            builder.flush_checkpoint_group(group_version);
+        }
+
+        // Since ascending_commit_files is cleared at each checkpoint, if it's non-empty here
+        // it contains only commits after the most recent checkpoint. The last element is the
+        // highest version commit overall, so we update latest_commit_file to it. If it's empty,
+        // we keep the value set at the checkpoint (if a commit existed at the checkpoint version),
+        // or remains None.
+        if let Some(commit_file) = builder.ascending_commit_files.last() {
+            builder.latest_commit_file = Some(commit_file.clone());
+        }
+
+        ListedLogFiles::try_new(
+            builder.ascending_commit_files,
+            builder.ascending_compaction_files,
+            builder.checkpoint_parts,
+            builder.latest_crc_file,
+            builder.latest_commit_file,
+        )
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
@@ -382,7 +418,6 @@ impl ListedLogFiles {
 mod list_log_files_with_log_tail_tests {
     use std::sync::Arc;
 
-    use futures::executor::block_on;
     use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
     use url::Url;
 
@@ -403,48 +438,46 @@ mod list_log_files_with_log_tail_tests {
     }
 
     // create test storage given list of log files with custom data content
-    fn create_storage(
+    async fn create_storage(
         log_files: Vec<(Version, LogPathFileType, CommitSource)>,
     ) -> (Box<dyn StorageHandler>, Url) {
         let store = Arc::new(InMemory::new());
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
-        block_on(async {
-            for (version, file_type, source) in log_files {
-                let path = match file_type {
-                    LogPathFileType::Commit => {
-                        format!("_delta_log/{version:020}.json")
-                    }
-                    LogPathFileType::StagedCommit => {
-                        let uuid = uuid::Uuid::new_v4();
-                        format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
-                    }
-                    LogPathFileType::SinglePartCheckpoint => {
-                        format!("_delta_log/{version:020}.checkpoint.parquet")
-                    }
-                    LogPathFileType::MultiPartCheckpoint {
-                        part_num,
-                        num_parts,
-                    } => {
-                        format!(
-                            "_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet"
-                        )
-                    }
-                    _ => panic!("Unsupported file type in test"),
-                };
-                let data = match source {
-                    CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
-                    CommitSource::Catalog => bytes::Bytes::from("catalog"),
-                };
-                store
-                    .put(&ObjectPath::from(path.as_str()), data.into())
-                    .await
-                    .expect("Failed to put test file");
-            }
-        });
+        for (version, file_type, source) in log_files {
+            let path = match file_type {
+                LogPathFileType::Commit => {
+                    format!("_delta_log/{version:020}.json")
+                }
+                LogPathFileType::StagedCommit => {
+                    let uuid = uuid::Uuid::new_v4();
+                    format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
+                }
+                LogPathFileType::SinglePartCheckpoint => {
+                    format!("_delta_log/{version:020}.checkpoint.parquet")
+                }
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num,
+                    num_parts,
+                } => {
+                    format!(
+                        "_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet"
+                    )
+                }
+                _ => panic!("Unsupported file type in test"),
+            };
+            let data = match source {
+                CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
+                CommitSource::Catalog => bytes::Bytes::from("catalog"),
+            };
+            store
+                .put(&ObjectPath::from(path.as_str()), data.into())
+                .await
+                .expect("Failed to put test file");
+        }
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
+        let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
         (storage, log_root)
     }
 
@@ -491,14 +524,14 @@ mod list_log_files_with_log_tail_tests {
         );
     }
 
-    #[test]
-    fn test_empty_log_tail() {
+    #[tokio::test]
+    async fn test_empty_log_tail() {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::Commit, CommitSource::Filesystem),
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], Some(1), Some(2))
             .unwrap()
@@ -513,15 +546,15 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[1], CommitSource::Filesystem);
     }
 
-    #[test]
-    fn test_log_tail_has_latest_commit_files() {
+    #[tokio::test]
+    async fn test_log_tail_has_latest_commit_files() {
         // Filesystem has commits 0-2, log_tail has commits 3-5 (the latest)
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::Commit, CommitSource::Filesystem),
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         // log_tail is contiguous, only commits, and represents the latest versions
         let log_tail = vec![
@@ -553,14 +586,14 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[5], CommitSource::Catalog);
     }
 
-    #[test]
-    fn test_request_subset_with_log_tail() {
+    #[tokio::test]
+    async fn test_request_subset_with_log_tail() {
         // Test requesting a subset when log_tail is the latest commits
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         // log_tail represents versions 2-4 (latest commits)
         let log_tail = vec![
@@ -586,8 +619,8 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[2], CommitSource::Catalog);
     }
 
-    #[test]
-    fn test_log_tail_defines_latest_version() {
+    #[tokio::test]
+    async fn test_log_tail_defines_latest_version() {
         // log_tail defines the latest version of the table: if there is file system files after log
         // tail, they are ignored
         let log_files = vec![
@@ -595,7 +628,7 @@ mod list_log_files_with_log_tail_tests {
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::Commit, CommitSource::Filesystem), // ignored!
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         // log_tail is just [1], indicating version 1 is the latest
         let log_tail = vec![make_parsed_log_path_with_source(
@@ -637,6 +670,9 @@ mod list_log_files_with_log_tail_tests {
             fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
                 panic!("copy used from {src} to {dest}");
             }
+            fn head(&self, _path: &Url) -> DeltaResult<crate::FileMeta> {
+                panic!("head used");
+            }
         }
 
         // when log_tail covers the entire requested range, no filesystem listing should occur
@@ -667,8 +703,8 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[2], CommitSource::Catalog);
     }
 
-    #[test]
-    fn test_listing_omits_staged_commits() {
+    #[tokio::test]
+    async fn test_listing_omits_staged_commits() {
         // note that in the presence of staged commits, we CANNOT trust listing to determine which
         // to include in our listing/log segment. This is up to the catalog. (e.g. version
         // 5.uuid1.json and 5.uuid2.json can both exist and only catalog can say which is the 'real'
@@ -681,7 +717,7 @@ mod list_log_files_with_log_tail_tests {
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
         let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], None, None)
             .unwrap()
             .try_collect()
@@ -695,15 +731,15 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[1], CommitSource::Filesystem);
     }
 
-    #[test]
-    fn test_listing_with_large_end_version() {
+    #[tokio::test]
+    async fn test_listing_with_large_end_version() {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
         // note we let you request end version past the end of log. up to consumer to interpret
         let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], None, Some(3))
             .unwrap()

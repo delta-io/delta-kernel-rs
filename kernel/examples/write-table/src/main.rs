@@ -16,7 +16,7 @@ use uuid::Uuid;
 use delta_kernel::arrow::array::TimestampMicrosecondArray;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
@@ -76,11 +76,8 @@ async fn try_main() -> DeltaResult<()> {
     println!("Using Delta table at: {url}");
 
     // Get the engine for local filesystem
-    let engine = DefaultEngine::try_new(
-        &url,
-        HashMap::<String, String>::new(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )?;
+    use delta_kernel::engine::default::storage::store_from_url;
+    let engine = DefaultEngine::new(store_from_url(&url)?);
 
     // Create or get the table
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
@@ -320,25 +317,7 @@ async fn read_and_display_data(
 
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| Error::EngineDataType("ArrowEngineData".to_string()))?
-                .into();
-
-            if let Some(mask) = mask {
-                Ok(arrow::compute::filter_record_batch(
-                    &record_batch,
-                    &mask.into(),
-                )?)
-            } else {
-                Ok(record_batch)
-            }
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
     print_batches(&batches)?;

@@ -19,7 +19,7 @@ use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
-
+use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::transaction::CommitResult;
 use tempfile::TempDir;
 
@@ -35,8 +35,8 @@ use tempfile::tempdir;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
 use test_utils::{
-    assert_result_error_with_message, create_table, engine_store_setup, setup_test_tables,
-    test_read,
+    assert_result_error_with_message, copy_directory, create_default_engine, create_table,
+    engine_store_setup, setup_test_tables, test_read,
 };
 
 mod common;
@@ -859,7 +859,6 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[ignore]
 #[tokio::test]
 async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
@@ -880,37 +879,19 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // create a table with VARIANT column
     let table_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("v", DataType::unshredded_variant())
-            .with_metadata([("delta.columnMapping.physicalName", "col1")])
-            .add_metadata([("delta.columnMapping.id", 1)]),
-        StructField::nullable("i", DataType::INTEGER)
-            .with_metadata([("delta.columnMapping.physicalName", "col2")])
-            .add_metadata([("delta.columnMapping.id", 2)]),
+        StructField::nullable("v", DataType::unshredded_variant()),
+        StructField::nullable("i", DataType::INTEGER),
         StructField::nullable(
             "nested",
             // We flip the value and metadata fields in the actual parquet file for the test
             StructType::try_new(vec![StructField::nullable(
                 "nested_v",
                 unshredded_variant_schema_flipped(),
-            )
-            .with_metadata([("delta.columnMapping.physicalName", "col21")])
-            .add_metadata([("delta.columnMapping.id", 3)])])?,
-        )
-        .with_metadata([("delta.columnMapping.physicalName", "col3")])
-        .add_metadata([("delta.columnMapping.id", 4)]),
-    ])?);
-
-    let write_schema = Arc::new(StructType::try_new(vec![
-        StructField::nullable("col1", DataType::unshredded_variant()),
-        StructField::nullable("col2", DataType::INTEGER),
-        StructField::nullable(
-            "col3",
-            StructType::try_new(vec![StructField::nullable(
-                "col21",
-                unshredded_variant_schema_flipped(),
             )])?,
         ),
     ])?);
+
+    let write_schema = table_schema.clone();
 
     let tmp_test_dir = tempdir()?;
     let tmp_test_dir_url = Url::from_directory_path(tmp_test_dir.path()).unwrap();
@@ -921,16 +902,13 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     // We can add shredding features as well as we are allowed to write unshredded variants
     // into shredded tables and shredded reads are explicitly blocked in the default
     // engine's parquet reader.
-    // TODO: (#1124) we don't actually support column mapping writes yet, but have some
-    // tests that do column mapping on writes. For now omit the writer feature to let tests
-    // run, but after actual support this should be enabled.
     let table_url = create_table(
         store.clone(),
         table_location,
         table_schema.clone(),
         &[],
         true,
-        vec!["variantType", "variantShredding-preview", "columnMapping"],
+        vec!["variantType", "variantShredding-preview"],
         vec!["variantType", "variantShredding-preview"],
     )
     .await?;
@@ -1016,7 +994,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(Int32Array::from(i_values.clone())),
             // nested struct<nested_v variant>
             Arc::new(StructArray::try_new(
-                vec![Field::new("col21", variant_arrow_type_flipped(), true)].into(),
+                vec![Field::new("nested_v", variant_arrow_type_flipped(), true)].into(),
                 vec![variant_nested_v_array.clone()],
                 None,
             )?),
@@ -1831,6 +1809,623 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
         "Second ICT ({}) should be greater than first ICT ({})",
         second_ict,
         first_ict
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that Remove actions generated from scan metadata contain all expected fields
+    // from the Remove struct (defined in kernel/src/actions/mod.rs).
+    //
+    // This test uses the table-with-dv-small dataset which contains files with tags and deletion vectors.
+    //
+    // Not populated in the dataset are (covered by row_tracking tests):
+    // baseRowId (optional i64)
+    // defaultRowCommitVersion (optional i64)
+    use std::path::PathBuf;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let tmp_dir = tempdir()?;
+    let tmp_table_path = tmp_dir.path().join("table-with-dv-small");
+    let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
+    copy_directory(&source_path, &tmp_table_path)?;
+
+    let table_url = url::Url::from_directory_path(&tmp_table_path).unwrap();
+    let engine = create_default_engine(&table_url)?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone())
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("test engine")
+        .with_data_change(true);
+
+    let scan = snapshot.scan_builder().build()?;
+    let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
+
+    let (data, selection_vector) = scan_metadata.scan_files.into_parts();
+    let remove_metadata = FilteredEngineData::try_new(data, selection_vector)?;
+
+    txn.remove_files(remove_metadata);
+
+    let result = txn.commit(engine.as_ref())?;
+
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            let commit_version = committed.commit_version();
+
+            // Read the commit log directly to verify remove actions
+            let commit_path =
+                tmp_table_path.join(format!("_delta_log/{:020}.json", commit_version));
+            let commit_content = std::fs::read_to_string(commit_path)?;
+
+            let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            // Verify we have at least commitInfo and remove actions
+            assert!(
+                parsed_commits.len() >= 2,
+                "Expected at least 2 actions (commitInfo + remove)"
+            );
+
+            // Extract the commitInfo timestamp to validate against deletionTimestamp
+            let commit_info_action = parsed_commits
+                .iter()
+                .find(|action| action.get("commitInfo").is_some())
+                .expect("Missing commitInfo action");
+            let commit_info = &commit_info_action["commitInfo"];
+            let commit_timestamp = commit_info["timestamp"]
+                .as_i64()
+                .expect("Missing timestamp in commitInfo");
+
+            // Verify remove actions
+            let remove_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("remove").is_some())
+                .collect();
+
+            assert!(
+                !remove_actions.is_empty(),
+                "Expected at least one remove action"
+            );
+
+            assert_eq!(remove_actions.len(), 1);
+            let remove_action = remove_actions[0];
+            let remove = &remove_action["remove"];
+
+            // path (required)
+            assert!(remove.get("path").is_some(), "Missing path field");
+            let path = remove["path"].as_str().expect("path should be a string");
+            assert_eq!(
+                path,
+                "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
+            );
+
+            // dataChange (required)
+            assert_eq!(remove["dataChange"].as_bool(), Some(true));
+
+            // deletionTimestamp (optional) - should match commit timestamp
+            let deletion_timestamp = remove["deletionTimestamp"]
+                .as_i64()
+                .expect("Missing deletionTimestamp");
+            assert_eq!(
+                deletion_timestamp, commit_timestamp,
+                "deletionTimestamp should match commit timestamp"
+            );
+
+            // extendedFileMetadata (optional)
+            assert_eq!(remove["extendedFileMetadata"].as_bool(), Some(true));
+
+            // partitionValues (optional)
+            let partition_vals = remove["partitionValues"]
+                .as_object()
+                .expect("Missing partitionValues");
+            assert_eq!(partition_vals.len(), 0);
+
+            // size (optional)
+            let size = remove["size"].as_i64().expect("Missing size");
+            assert_eq!(size, 635);
+
+            // stats (optional)
+            let stats = remove["stats"].as_str().expect("Missing stats");
+            let stats_json: serde_json::Value = serde_json::from_str(stats)?;
+            assert_eq!(stats_json["numRecords"], 10);
+
+            // tags (optional)
+            let tags = remove["tags"].as_object().expect("Missing tags");
+            assert_eq!(
+                tags.get("INSERTION_TIME").and_then(|v| v.as_str()),
+                Some("1677811178336000")
+            );
+            assert_eq!(
+                tags.get("MIN_INSERTION_TIME").and_then(|v| v.as_str()),
+                Some("1677811178336000")
+            );
+            assert_eq!(
+                tags.get("MAX_INSERTION_TIME").and_then(|v| v.as_str()),
+                Some("1677811178336000")
+            );
+            assert_eq!(
+                tags.get("OPTIMIZE_TARGET_SIZE").and_then(|v| v.as_str()),
+                Some("268435456")
+            );
+
+            // deletionVector (optional)
+            let dv = remove["deletionVector"]
+                .as_object()
+                .expect("Missing deletionVector");
+            assert_eq!(dv.get("storageType").and_then(|v| v.as_str()), Some("u"));
+            assert_eq!(
+                dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
+                Some("vBn[lx{q8@P<9BNH/isA")
+            );
+            assert_eq!(dv.get("offset").and_then(|v| v.as_i64()), Some(1));
+            assert_eq!(dv.get("sizeInBytes").and_then(|v| v.as_i64()), Some(36));
+            assert_eq!(dv.get("cardinality").and_then(|v| v.as_i64()), Some(2));
+
+            // Row tracking fields should be absent as the feature is was not enabled on writing
+            // row_tracking tests cover having these populated.
+            assert!(remove.get("baseRowId").is_none());
+            assert!(remove.get("defaultRowCommitVersion").is_none());
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_files_verify_files_excluded_from_scan(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Adds and then removes files and then verifies they don't appear in the scan.
+
+    // setup tracing
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // create a simple table: one int column named 'number'
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        // First, add some files to the table
+        let engine = Arc::new(engine);
+        write_data_and_check_result_and_stats(table_url.clone(), schema.clone(), engine.clone(), 1)
+            .await?;
+
+        // Get initial file count
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = snapshot.clone().scan_builder().build()?;
+        let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
+        let (_, selection_vector) = scan_metadata.scan_files.into_parts();
+        let initial_file_count = selection_vector.iter().filter(|&x| *x).count();
+
+        assert!(initial_file_count > 0);
+
+        // Now create a transaction to remove files
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine")
+            .with_operation("DELETE".to_string())
+            .with_data_change(true);
+
+        // Create a new scan to get file metadata for removal
+        let scan2 = snapshot.scan_builder().build()?;
+        let scan_metadata2 = scan2.scan_metadata(engine.as_ref())?.next().unwrap()?;
+
+        // Create FilteredEngineData for removal (select all rows for removal)
+        let file_remove_count = (scan_metadata2.scan_files.data().len()
+            - scan_metadata2.scan_files.selection_vector().len())
+            + scan_metadata2
+                .scan_files
+                .selection_vector()
+                .iter()
+                .filter(|&x| *x)
+                .count();
+        assert!(file_remove_count > 0);
+
+        // Add remove files to transaction
+        txn.remove_files(scan_metadata2.scan_files);
+
+        // Commit the transaction
+        let result = txn.commit(engine.as_ref());
+
+        match result? {
+            CommitResult::CommittedTransaction(committed) => {
+                assert_eq!(committed.commit_version(), 2);
+
+                let new_snapshot = Snapshot::builder_for(table_url.clone())
+                    .at_version(2)
+                    .build(engine.as_ref())?;
+
+                let new_scan = new_snapshot.scan_builder().build()?;
+                let mut new_file_count = 0;
+                for new_metadata in new_scan.scan_metadata(engine.as_ref())? {
+                    new_file_count += new_metadata?.scan_files.data().len();
+                }
+
+                // All files were removed, so new_file_count should be zero
+                assert_eq!(new_file_count, 0);
+            }
+            _ => panic!("Transaction did not succeeed."),
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dyn std::error::Error>>
+{
+    // This test verifies that we can selectively remove files by:
+    // 1. Calling remove_files multiple times with different subsets
+    // 2. Modifying the selection vector to choose which files to remove
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table").await?
+    {
+        let engine = Arc::new(engine);
+
+        // Write data multiple times to create multiple files
+        for i in 1..=5 {
+            write_data_and_check_result_and_stats(
+                table_url.clone(),
+                schema.clone(),
+                engine.clone(),
+                i,
+            )
+            .await?;
+        }
+
+        // Get initial file count
+        let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+        let scan = snapshot.clone().scan_builder().build()?;
+
+        let mut initial_file_count = 0;
+        for metadata in scan.scan_metadata(engine.as_ref())? {
+            let metadata = metadata?;
+            initial_file_count += metadata
+                .scan_files
+                .selection_vector()
+                .iter()
+                .filter(|&x| *x)
+                .count();
+        }
+
+        assert!(
+            initial_file_count >= 3,
+            "Need at least 3 files for this test, got {}",
+            initial_file_count
+        );
+
+        // Create a transaction to remove files in two batches
+        let mut txn = snapshot
+            .clone()
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("selective remove test")
+            .with_operation("DELETE".to_string())
+            .with_data_change(true);
+
+        // First batch: Remove only the first file
+        let scan2 = snapshot.clone().scan_builder().build()?;
+        let scan_metadata2 = scan2.scan_metadata(engine.as_ref())?.next().unwrap()?;
+        let (data, mut selection_vector) = scan_metadata2.scan_files.into_parts();
+
+        // Select only the first file for removal
+        let mut first_batch_removed = 0;
+        for selected in selection_vector.iter_mut() {
+            if *selected && first_batch_removed < 1 {
+                // Keep selected for removal
+                first_batch_removed += 1;
+            } else {
+                // Don't remove
+                *selected = false;
+            }
+        }
+
+        assert_eq!(
+            first_batch_removed, 1,
+            "Should remove exactly 1 file in first batch"
+        );
+        txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+
+        // Second batch: Remove only the last file
+        let scan3 = snapshot.clone().scan_builder().build()?;
+        let scan_metadata3 = scan3.scan_metadata(engine.as_ref())?.next().unwrap()?;
+        let (data2, mut selection_vector2) = scan_metadata3.scan_files.into_parts();
+
+        // Find the last selected file and keep only that one selected
+        let mut last_selected_idx = None;
+        for (i, &selected) in selection_vector2.iter().enumerate() {
+            if selected {
+                last_selected_idx = Some(i);
+            }
+        }
+
+        // Deselect all except the last one
+        for (i, selected) in selection_vector2.iter_mut().enumerate() {
+            if Some(i) != last_selected_idx {
+                *selected = false;
+            }
+        }
+
+        let second_batch_removed = selection_vector2.iter().filter(|&x| *x).count();
+        assert_eq!(
+            second_batch_removed, 1,
+            "Should remove exactly 1 file in second batch"
+        );
+        txn.remove_files(FilteredEngineData::try_new(data2, selection_vector2)?);
+
+        // Commit the transaction
+        let result = txn.commit(engine.as_ref())?;
+
+        match result {
+            CommitResult::CommittedTransaction(committed) => {
+                assert_eq!(committed.commit_version(), 6);
+
+                // Verify that exactly 2 files were removed (1 from each batch)
+                let new_snapshot = Snapshot::builder_for(table_url.clone())
+                    .at_version(6)
+                    .build(engine.as_ref())?;
+
+                let new_scan = new_snapshot.scan_builder().build()?;
+                let mut new_file_count = 0;
+                for new_metadata in new_scan.scan_metadata(engine.as_ref())? {
+                    let metadata = new_metadata?;
+                    new_file_count += metadata
+                        .scan_files
+                        .selection_vector()
+                        .iter()
+                        .filter(|&x| *x)
+                        .count();
+                }
+
+                // Verify we removed exactly 2 files (1 + 1)
+                let total_removed = first_batch_removed + second_batch_removed;
+                assert_eq!(total_removed, 2);
+                assert_eq!(new_file_count, initial_file_count - total_removed);
+                assert!(new_file_count > 0, "At least one file should remain");
+            }
+            _ => panic!("Transaction did not succeed"),
+        }
+    }
+    Ok(())
+}
+
+// Helper function to create a table with CDF enabled
+async fn create_cdf_table(
+    table_name: &str,
+    schema: SchemaRef,
+) -> Result<(Url, Arc<DefaultEngine<TokioBackgroundExecutor>>, TempDir), Box<dyn std::error::Error>>
+{
+    let tmp_dir = tempdir()?;
+    let tmp_test_dir_url = Url::from_directory_path(tmp_dir.path()).unwrap();
+
+    let (store, engine, table_location) = engine_store_setup(table_name, Some(&tmp_test_dir_url));
+
+    let table_url = create_table(
+        store.clone(),
+        table_location,
+        schema.clone(),
+        &[],
+        true, // use protocol 3.7
+        vec![],
+        vec!["changeDataFeed"],
+    )
+    .await?;
+
+    Ok((table_url, Arc::new(engine), tmp_dir))
+}
+
+// Helper function to write data to a table
+async fn write_data_to_table(
+    table_url: &Url,
+    engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    schema: SchemaRef,
+    values: Vec<i32>,
+) -> Result<Version, Box<dyn std::error::Error>> {
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("test");
+
+    add_files_to_transaction(&mut txn, engine, schema, values).await?;
+
+    let result = txn.commit(engine.as_ref())?;
+    match result {
+        CommitResult::CommittedTransaction(committed) => Ok(committed.commit_version()),
+        _ => panic!("Transaction should be committed"),
+    }
+}
+
+// Helper function to add files to an existing transaction
+async fn add_files_to_transaction(
+    txn: &mut delta_kernel::transaction::Transaction,
+    engine: &Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    schema: SchemaRef,
+    values: Vec<i32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(Int32Array::from(values))],
+    )?;
+
+    let write_context = Arc::new(txn.get_write_context());
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+    txn.add_files(add_files_metadata);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cdf_write_all_adds_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that add-only transactions work with CDF enabled
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let (table_url, engine, _tmp_dir) =
+        create_cdf_table("test_cdf_all_adds", schema.clone()).await?;
+
+    // Add files - this should succeed
+    let version = write_data_to_table(&table_url, &engine, schema, vec![1, 2, 3]).await?;
+    assert_eq!(version, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that remove-only transactions work with CDF enabled
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let (table_url, engine, _tmp_dir) =
+        create_cdf_table("test_cdf_all_removes", schema.clone()).await?;
+
+    // First, add some data
+    write_data_to_table(&table_url, &engine, schema, vec![1, 2, 3]).await?;
+
+    // Now remove the files
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("cdf remove test")
+        .with_data_change(true);
+
+    let scan = snapshot.scan_builder().build()?;
+    let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
+    let (data, selection_vector) = scan_metadata.scan_files.into_parts();
+    txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+
+    // This should succeed - remove-only transactions are allowed with CDF
+    let result = txn.commit(engine.as_ref())?;
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 2);
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that mixed add+remove transactions work when dataChange=false.
+    // It's allowed because the transaction does not contain any logical data changes.
+    // This can happen when a table is being optimized/compacted.
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let (table_url, engine, _tmp_dir) =
+        create_cdf_table("test_cdf_mixed_no_data_change", schema.clone()).await?;
+
+    // First, add some data
+    write_data_to_table(&table_url, &engine, schema.clone(), vec![1, 2, 3]).await?;
+
+    // Now create a transaction with both add AND remove files, but dataChange=false
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("cdf mixed test")
+        .with_data_change(false); // dataChange=false is key here
+
+    // Add new files
+    add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
+
+    // Also remove existing files
+    let scan = snapshot.scan_builder().build()?;
+    let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
+    let (data, selection_vector) = scan_metadata.scan_files.into_parts();
+    txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+
+    // This should succeed - mixed operations are allowed when dataChange=false
+    let result = txn.commit(engine.as_ref())?;
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            assert_eq!(committed.commit_version(), 2);
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that mixed add+remove transactions fail with helpful error when dataChange=true
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
+        "number",
+        DataType::INTEGER,
+    )])?);
+
+    let (table_url, engine, _tmp_dir) =
+        create_cdf_table("test_cdf_mixed_with_data_change", schema.clone()).await?;
+
+    // First, add some data
+    write_data_to_table(&table_url, &engine, schema.clone(), vec![1, 2, 3]).await?;
+
+    // Now create a transaction with both add AND remove files with dataChange=true
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("cdf mixed fail test")
+        .with_data_change(true); // dataChange=true - this should fail
+
+    // Add new files
+    add_files_to_transaction(&mut txn, &engine, schema, vec![4, 5, 6]).await?;
+
+    // Also remove existing files
+    let scan = snapshot.scan_builder().build()?;
+    let scan_metadata = scan.scan_metadata(engine.as_ref())?.next().unwrap()?;
+    let (data, selection_vector) = scan_metadata.scan_files.into_parts();
+    txn.remove_files(FilteredEngineData::try_new(data, selection_vector)?);
+
+    // This should fail with our new error message
+    assert_result_error_with_message(
+        txn.commit(engine.as_ref()),
+        "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+         This would require writing CDC files for DML operations, which is not yet supported. \
+         Consider using separate transactions: one to add files, another to remove files."
     );
 
     Ok(())

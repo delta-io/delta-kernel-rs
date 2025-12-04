@@ -107,7 +107,7 @@ pub fn transform_to_logical(
                 physical_schema.clone(),
                 transform,
                 logical_schema.clone().into(), // TODO: expensive deep clone!
-            )
+            )?
             .evaluate(physical_data.as_ref()),
         None => Ok(physical_data),
     }
@@ -179,7 +179,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 11,
+            getters.len() == 13,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()

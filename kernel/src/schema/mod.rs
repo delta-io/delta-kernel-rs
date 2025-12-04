@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::iter::{DoubleEndedIterator, FusedIterator};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -314,17 +314,26 @@ impl StructField {
 
     /// Get the physical name for this field as it should be read from parquet.
     ///
+    /// When `column_mapping_mode` is `None`, always returns the logical name (even if physical
+    /// name metadata is present). When mode is `Id` or `Name`, returns the physical name from
+    /// metadata if present, otherwise returns the logical name.
+    ///
     /// NOTE: Caller affirms that the schema was already validated by
     /// [`crate::table_features::validate_schema_column_mapping`], to ensure that annotations are
     /// always and only present when column mapping mode is enabled.
     #[internal_api]
-    pub(crate) fn physical_name(&self) -> &str {
-        match self
-            .metadata
-            .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
-        {
-            Some(MetadataValue::String(physical_name)) => physical_name,
-            _ => &self.name,
+    pub(crate) fn physical_name(&self, column_mapping_mode: ColumnMappingMode) -> &str {
+        match column_mapping_mode {
+            ColumnMappingMode::None => &self.name,
+            ColumnMappingMode::Id | ColumnMappingMode::Name => {
+                match self
+                    .metadata
+                    .get(ColumnMetadataKey::ColumnMappingPhysicalName.as_ref())
+                {
+                    Some(MetadataValue::String(physical_name)) => physical_name,
+                    _ => &self.name,
+                }
+            }
         }
     }
 
@@ -422,7 +431,7 @@ impl StructField {
                                     .is_some_and(|x| matches!(x, MetadataValue::String(_))));
                             }
                         }
-                        field.physical_name().to_owned()
+                        field.physical_name(self.column_mapping_mode).to_owned()
                     }
                 };
 
@@ -502,6 +511,26 @@ impl StructField {
     }
 }
 
+impl Display for StructField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut metadata_str = String::from("{");
+        let mut first = true;
+        for (k, v) in self.metadata.iter() {
+            if !first {
+                metadata_str.push_str(", ");
+            }
+            first = false;
+            metadata_str.push_str(&format!("{}: {:?}", k, v));
+        }
+        metadata_str.push('}');
+        write!(
+            f,
+            "{}: {} (is nullable: {}, metadata: {})",
+            self.name, self.data_type, self.nullable, metadata_str,
+        )
+    }
+}
+
 /// A struct is used to represent both the top-level schema of the table
 /// as well as struct columns that contain nested columns.
 #[derive(Debug, PartialEq, Clone, Eq)]
@@ -516,6 +545,43 @@ pub struct StructType {
     // We use a dedicated map for metadata columns to allow for fast lookup without having to iterate
     // over all fields.
     metadata_columns: HashMap<MetadataColumnSpec, usize>,
+}
+
+pub struct StructTypeBuilder {
+    fields: IndexMap<String, StructField>,
+}
+
+impl Default for StructTypeBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StructTypeBuilder {
+    pub fn new() -> Self {
+        Self {
+            fields: IndexMap::new(),
+        }
+    }
+
+    pub fn from_schema(schema: &StructType) -> Self {
+        Self {
+            fields: schema.fields.clone(),
+        }
+    }
+
+    pub fn add_field(mut self, field: StructField) -> Self {
+        self.fields.insert(field.name.clone(), field);
+        self
+    }
+
+    pub fn build(self) -> DeltaResult<StructType> {
+        StructType::try_new(self.fields.into_values())
+    }
+
+    pub fn build_arc_unchecked(self) -> Arc<StructType> {
+        Arc::new(StructType::new_unchecked(self.fields.into_values()))
+    }
 }
 
 impl StructType {
@@ -569,6 +635,10 @@ impl StructType {
             .into_iter()
             .map(|result| result.map_err(Into::into))
             .process_results(|iter| Self::try_new(iter))?
+    }
+
+    pub fn builder() -> StructTypeBuilder {
+        StructTypeBuilder::new()
     }
 
     /// Creates a new [`StructType`] from the given fields without validating them.
@@ -778,6 +848,52 @@ impl StructType {
         };
 
         Ok(())
+    }
+}
+
+fn write_indent(f: &mut Formatter<'_>, levels: &[bool]) -> std::fmt::Result {
+    let mut it = levels.iter().peekable();
+
+    while let Some(is_last) = it.next() {
+        // Final level → draw branch
+        if it.peek().is_none() {
+            write!(f, "{}", if *is_last { "└─" } else { "├─" })?;
+        }
+        // Parent levels → vertical line or empty space
+        else {
+            write!(f, "{}", if *is_last { "   " } else { "│  " })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_struct_type(
+    st: &StructType,
+    f: &mut Formatter<'_>,
+    levels: &mut Vec<bool>,
+) -> std::fmt::Result {
+    let len = st.fields.len();
+
+    for (i, (_, field)) in st.fields.iter().enumerate() {
+        let is_last = i + 1 == len;
+        levels.push(is_last);
+
+        write_indent(f, levels)?;
+        writeln!(f, "{}", field)?;
+
+        field.data_type.fmt_recursive(f, levels)?;
+
+        levels.pop();
+    }
+    Ok(())
+}
+
+impl Display for StructType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}:", self.type_name)?;
+        let mut levels = Vec::new();
+        write_struct_type(self, f, &mut levels)
     }
 }
 
@@ -1396,6 +1512,40 @@ impl DataType {
             _ => None,
         }
     }
+
+    fn fmt_recursive(&self, f: &mut Formatter<'_>, levels: &mut Vec<bool>) -> std::fmt::Result {
+        match self {
+            DataType::Struct(inner) => write_struct_type(inner, f, levels),
+
+            DataType::Array(inner) => {
+                levels.push(true); // only one child → last
+                write_indent(f, levels)?;
+                writeln!(f, "array_element: {}", inner.element_type)?;
+                inner.element_type.fmt_recursive(f, levels)?;
+                levels.pop();
+                Ok(())
+            }
+
+            DataType::Map(inner) => {
+                // key
+                levels.push(false); // map_key is NOT last
+                write_indent(f, levels)?;
+                writeln!(f, "map_key: {}", inner.key_type)?;
+                inner.key_type.fmt_recursive(f, levels)?;
+                levels.pop();
+
+                // value
+                levels.push(true); // map_value IS last at this level
+                write_indent(f, levels)?;
+                writeln!(f, "map_value: {}", inner.value_type)?;
+                inner.value_type.fmt_recursive(f, levels)?;
+                levels.pop();
+                Ok(())
+            }
+
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Display for DataType {
@@ -1681,6 +1831,7 @@ impl<'a> SchemaTransform<'a> for SchemaDepthChecker {
 
 #[cfg(test)]
 mod tests {
+    use crate::table_features::ColumnMappingMode;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     use super::*;
@@ -1901,7 +2052,7 @@ mod tests {
                 assert!(matches!(col_id, MetadataValue::Number(num) if *num == 4));
                 assert!(matches!(id_start, MetadataValue::Number(num) if *num == 2147483648i64));
                 assert_eq!(
-                    field.physical_name(),
+                    field.physical_name(mode),
                     "col-5f422f40-de70-45b2-88ab-1d5c90e94db1"
                 );
                 let physical_field = field.make_physical(mode);
@@ -2886,5 +3037,200 @@ mod tests {
             Some(&3)
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_none() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.physicalName": "physical_name_col123"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::None, should return logical name even though physical name exists
+        assert_eq!(field.physical_name(ColumnMappingMode::None), "logical_name");
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_id() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.id": 5,
+                "delta.columnMapping.physicalName": "physical_name_col123"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Id, should return physical name
+        assert_eq!(
+            field.physical_name(ColumnMappingMode::Id),
+            "physical_name_col123"
+        );
+    }
+
+    #[test]
+    fn test_physical_name_with_mode_name() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {
+                "delta.columnMapping.physicalName": "physical_name_col456"
+            }
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Name, should return physical name
+        assert_eq!(
+            field.physical_name(ColumnMappingMode::Name),
+            "physical_name_col456"
+        );
+    }
+
+    #[test]
+    fn test_physical_name_fallback_id() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {}
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Id but no physical name, should fallback to logical name
+        assert_eq!(field.physical_name(ColumnMappingMode::Id), "logical_name");
+    }
+
+    #[test]
+    fn test_physical_name_fallback_name() {
+        let field_json = r#"{
+            "name": "logical_name",
+            "type": "string",
+            "nullable": true,
+            "metadata": {}
+        }"#;
+        let field: StructField = serde_json::from_str(field_json).unwrap();
+
+        // With ColumnMappingMode::Name but no physical name, should fallback to logical name
+        assert_eq!(field.physical_name(ColumnMappingMode::Name), "logical_name");
+    }
+
+    #[test]
+    fn test_display_struct_type_stable_output() -> DeltaResult<()> {
+        let nested_field_with_metadata =
+            StructField::create_metadata_column("nested_row_index", MetadataColumnSpec::RowIndex);
+        let inner_struct =
+            StructType::new_unchecked([StructField::new("q", DataType::LONG, false)]);
+        let nested_struct = StructType::new_unchecked([
+            nested_field_with_metadata,
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new(
+                "inner_struct",
+                DataType::Struct(Box::new(inner_struct)),
+                false,
+            ),
+        ]);
+        let array_type = ArrayType::new(DataType::Struct(Box::new(nested_struct.clone())), true);
+        let map_type = MapType::new(
+            DataType::Struct(Box::new(nested_struct.clone())),
+            DataType::Struct(Box::new(nested_struct.clone())), // kek
+            true,
+        );
+        let fields = vec![
+            StructField::new("x", DataType::DOUBLE, true),
+            StructField::new("y", DataType::FLOAT, false),
+            StructField::new("z", DataType::LONG, true),
+            StructField::new("s", nested_struct.clone(), false),
+            StructField::nullable("array_col", DataType::Array(Box::new(array_type))),
+            StructField::nullable("map_col", DataType::Map(Box::new(map_type))),
+            StructField::new("a", DataType::LONG, true),
+        ];
+
+        let struct_type = StructType::new_unchecked(fields);
+        assert_eq!(
+            struct_type.to_string(),
+            "struct:
+├─x: double (is nullable: true, metadata: {})
+├─y: float (is nullable: false, metadata: {})
+├─z: long (is nullable: true, metadata: {})
+├─s: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>> (is nullable: false, metadata: {})
+│  ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│  ├─x: double (is nullable: true, metadata: {})
+│  └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│     └─q: long (is nullable: false, metadata: {})
+├─array_col: array<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
+│  └─array_element: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
+│     ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│     ├─x: double (is nullable: true, metadata: {})
+│     └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│        └─q: long (is nullable: false, metadata: {})
+├─map_col: map<struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>, struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>> (is nullable: true, metadata: {})
+│  ├─map_key: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
+│  │  ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│  │  ├─x: double (is nullable: true, metadata: {})
+│  │  └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│  │     └─q: long (is nullable: false, metadata: {})
+│  └─map_value: struct<nested_row_index: long, x: double, inner_struct: struct<q: long>>
+│     ├─nested_row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+│     ├─x: double (is nullable: true, metadata: {})
+│     └─inner_struct: struct<q: long> (is nullable: false, metadata: {})
+│        └─q: long (is nullable: false, metadata: {})
+└─a: long (is nullable: true, metadata: {})
+"
+        );
+
+        let schema = StructType::try_new([StructField::nullable("regular_col", DataType::STRING)])?;
+        let schema = schema
+            .add_metadata_column("row_index", MetadataColumnSpec::RowIndex)?
+            .add_metadata_column("row_id", MetadataColumnSpec::RowId)?
+            .add_metadata_column("row_commit_version", MetadataColumnSpec::RowCommitVersion)?;
+        assert_eq!(schema.to_string(), "struct:
+├─regular_col: string (is nullable: true, metadata: {})
+├─row_index: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_index\")})
+├─row_id: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_id\")})
+└─row_commit_version: long (is nullable: false, metadata: {delta.metadataSpec: String(\"row_commit_version\")})
+");
+        Ok(())
+    }
+
+    #[test]
+    fn test_builder_empty() {
+        let schema = StructType::builder().build().unwrap();
+        assert_eq!(schema.num_fields(), 0)
+    }
+
+    #[test]
+    fn test_builder_add_fields() {
+        let schema = StructType::builder()
+            .add_field(StructField::new("id", DataType::INTEGER, false))
+            .add_field(StructField::new("name", DataType::STRING, true))
+            .build()
+            .unwrap();
+
+        assert_eq!(schema.num_fields(), 2);
+        assert_eq!(schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(schema.field_at_index(1).unwrap().name(), "name");
+    }
+
+    #[test]
+    fn test_builder_from_schema() {
+        let base_schema =
+            StructType::try_new([StructField::new("id", DataType::INTEGER, false)]).unwrap();
+
+        let extended_schema = StructTypeBuilder::from_schema(&base_schema)
+            .add_field(StructField::new("name", DataType::STRING, true))
+            .build()
+            .unwrap();
+
+        assert_eq!(extended_schema.num_fields(), 2);
+        assert_eq!(extended_schema.field_at_index(0).unwrap().name(), "id");
+        assert_eq!(extended_schema.field_at_index(1).unwrap().name(), "name");
     }
 }
