@@ -5,6 +5,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use itertools::Itertools;
+use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::column_names::{
     column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
@@ -31,14 +32,14 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 ////////////////////////////////////////////////////////////////////////
 
 /// A unary predicate operator.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum UnaryPredicateOp {
     /// Unary Is Null
     IsNull,
 }
 
 /// A binary predicate operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
     /// Comparison Less Than
     LessThan,
@@ -53,14 +54,14 @@ pub enum BinaryPredicateOp {
 }
 
 /// A unary expression operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
     /// Convert struct data to JSON-encoded strings
     ToJson,
 }
 
 /// A binary expression operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryExpressionOp {
     /// Arithmetic Plus
     Plus,
@@ -73,14 +74,14 @@ pub enum BinaryExpressionOp {
 }
 
 /// A variadic expression operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
     /// Collapse multiple values into one by taking the first non-null value
     Coalesce,
 }
 
 /// A junction (AND/OR) predicate operator.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JunctionPredicateOp {
     /// Conjunction
     And,
@@ -190,7 +191,7 @@ pub type OpaquePredicateOpRef = Arc<dyn OpaquePredicateOp>;
 // Expressions and predicates
 ////////////////////////////////////////////////////////////////////////
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnaryPredicate {
     /// The operator.
     pub op: UnaryPredicateOp,
@@ -198,7 +199,7 @@ pub struct UnaryPredicate {
     pub expr: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BinaryPredicate {
     /// The operator.
     pub op: BinaryPredicateOp,
@@ -208,7 +209,7 @@ pub struct BinaryPredicate {
     pub right: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnaryExpression {
     /// The operator.
     pub op: UnaryExpressionOp,
@@ -216,7 +217,7 @@ pub struct UnaryExpression {
     pub expr: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BinaryExpression {
     /// The operator.
     pub op: BinaryExpressionOp,
@@ -226,7 +227,7 @@ pub struct BinaryExpression {
     pub right: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VariadicExpression {
     /// The operator.
     pub op: VariadicExpressionOp,
@@ -234,7 +235,7 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JunctionPredicate {
     /// The operator.
     pub op: JunctionPredicateOp,
@@ -249,6 +250,22 @@ pub struct JunctionPredicate {
 pub struct OpaquePredicate {
     pub op: OpaquePredicateOpRef,
     pub exprs: Vec<Expression>,
+}
+fn fail_serialize_opaque_predicate<S>(
+    _value: &OpaquePredicate,
+    _serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    Err(ser::Error::custom("Cannot serialize Opaque Expression"))
+}
+
+fn fail_deserialize_opaque_predicate<'de, D>(_deserializer: D) -> Result<OpaquePredicate, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Err(de::Error::custom("Cannot deserialize Opaque Expression"))
 }
 
 impl OpaquePredicate {
@@ -274,9 +291,28 @@ impl OpaqueExpression {
     }
 }
 
+fn fail_serialize_opaque_expression<S>(
+    _value: &OpaqueExpression,
+    _serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    Err(ser::Error::custom("Cannot serialize Opaque Expression"))
+}
+
+fn fail_deserialize_opaque_expression<'de, D>(
+    _deserializer: D,
+) -> Result<OpaqueExpression, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Err(de::Error::custom("Cannot deserialize Opaque Expression"))
+}
+
 /// A transformation affecting a single field (one pieces of a [`Transform`]). The transformation
 /// could insert 0+ new fields after the target, or could replace the target with 0+ a new fields).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FieldTransform {
     /// The list of expressions this field transform emits at the target location.
     pub exprs: Vec<ExpressionRef>,
@@ -291,7 +327,7 @@ pub struct FieldTransform {
 /// not specifically mentioned by the transform is passed through, unmodified and with the same
 /// relative field ordering. This is particularly useful for wide schemas where only a few columns
 /// need to be modified and/or dropped, or where a small number of columns need to be injected.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Transform {
     /// The path to the nested input struct this transform operates on (if any). If no path is
     /// given, the transform operates directly on top-level columns.
@@ -373,7 +409,7 @@ impl Transform {
 /// These expressions do not track or validate data types, other than the type
 /// of literals. It is up to the expression evaluator to validate the
 /// expression against a schema and add appropriate casts as required.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expression {
     /// A literal value.
     Literal(Scalar),
@@ -394,6 +430,8 @@ pub enum Expression {
     Variadic(VariadicExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
+    #[serde(serialize_with = "fail_serialize_opaque_expression")]
+    #[serde(deserialize_with = "fail_deserialize_opaque_expression")]
     Opaque(OpaqueExpression),
     /// An unknown expression (i.e. one that neither kernel nor engine attempts to evaluate). For
     /// data skipping purposes, kernel treats unknown expressions as if they were literal NULL
@@ -411,7 +449,7 @@ pub enum Expression {
 /// These predicates do not track or validate data types, other than the type
 /// of literals. It is up to the predicate evaluator to validate the
 /// predicate against a schema and add appropriate casts as required.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
     /// A boolean-valued expression, useful for e.g. `AND(<boolean_col1>, <boolean_col2>)`.
     BooleanExpression(Expression),
@@ -430,6 +468,8 @@ pub enum Predicate {
     Junction(JunctionPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.
+    #[serde(serialize_with = "fail_serialize_opaque_predicate")]
+    #[serde(deserialize_with = "fail_deserialize_opaque_predicate")]
     Opaque(OpaquePredicate),
     /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
     /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
