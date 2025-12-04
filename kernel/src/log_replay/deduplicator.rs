@@ -18,8 +18,7 @@ use crate::log_replay::FileActionKey;
 use crate::DeltaResult;
 
 pub(crate) trait Deduplicator {
-    /// Key type for identifying file actions. JSON deduplicators use `FileActionKey`
-    /// (path + dv_unique_id), checkpoint deduplicators may use path-only keys.
+    /// Key type for identifying file actions.
     type Key;
 
     /// Extracts a file action key from the data. Returns `(key, is_add)` if found.
@@ -44,6 +43,7 @@ pub(crate) struct CheckpointDeduplicator<'a> {
     add_path_index: usize,
     add_dv_start_index: usize,
 }
+
 impl CheckpointDeduplicator<'_> {
     #[allow(unused)]
     pub(crate) fn try_new<'a>(
@@ -78,10 +78,13 @@ impl Deduplicator for CheckpointDeduplicator<'_> {
     }
 
     fn check_and_record_seen(&mut self, key: Self::Key) -> bool {
+        // NOTE: we do not record the key because this is an immutable map.
+        // Checkpoints should never require an update on the seen_file_keys.
         self.seen_file_keys.contains(&key)
     }
 
     fn is_log_batch(&self) -> bool {
+        // Checkpoint deduplicator may only be constructed for checkpoint batches
         false
     }
 }
