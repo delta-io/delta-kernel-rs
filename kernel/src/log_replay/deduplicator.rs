@@ -12,12 +12,10 @@
 
 use std::collections::HashSet;
 
-use crate::{
-    actions::deletion_vector::DeletionVectorDescriptor,
-    engine_data::{GetData, TypedGetData as _},
-    log_replay::FileActionKey,
-    DeltaResult,
-};
+use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::engine_data::{GetData, TypedGetData as _};
+use crate::log_replay::FileActionKey;
+use crate::DeltaResult;
 
 pub(crate) trait Deduplicator {
     /// Key type for identifying file actions. JSON deduplicators use `FileActionKey`
