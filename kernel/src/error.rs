@@ -2,6 +2,7 @@
 
 use std::{
     backtrace::{Backtrace, BacktraceStatus},
+    convert::Infallible,
     num::ParseIntError,
     str::Utf8Error,
 };
@@ -340,5 +341,11 @@ impl From<object_store::Error> for Error {
             object_store::Error::NotFound { path, .. } => Self::file_not_found(path),
             err => Self::ObjectStore(err),
         }
+    }
+}
+
+impl From<Infallible> for Error {
+    fn from(value: Infallible) -> Self {
+        match value {}
     }
 }
