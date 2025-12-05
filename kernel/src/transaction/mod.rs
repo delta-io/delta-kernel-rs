@@ -8,9 +8,10 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
-    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
-    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
-    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
+    as_log_add_schema, domain_metadata::scan_domain_metadatas, get_commit_schema,
+    get_log_commit_info_schema, get_log_domain_metadata_schema, get_log_remove_schema,
+    get_log_txn_schema, CommitInfo, DomainMetadata, Metadata, Protocol, SetTransaction,
+    INTERNAL_DOMAIN_PREFIX, METADATA_NAME, PROTOCOL_NAME,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -33,6 +34,8 @@ use crate::{
     RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
+
+pub mod create_table;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -126,7 +129,8 @@ fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
 /// txn.commit(&engine)?;
 /// ```
 pub struct Transaction {
-    read_snapshot: SnapshotRef,
+    // None for create table transactions (table doesn't exist yet)
+    read_snapshot: Option<SnapshotRef>,
     committer: Box<dyn Committer>,
     operation: Option<String>,
     engine_info: Option<String>,
@@ -148,26 +152,36 @@ pub struct Transaction {
     domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
+    // For create table only: table URL (needed when no snapshot exists)
+    table_url: Option<Url>,
+    // For create table only: Protocol action to include in commit
+    protocol_action: Option<Protocol>,
+    // For create table only: Metadata action to include in commit
+    metadata_action: Option<Metadata>,
 }
 
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let version_info = match &self.read_snapshot {
+            Some(snapshot) => format!("{}", snapshot.version()),
+            None => "create_table".to_string(),
+        };
         f.write_str(&format!(
             "Transaction {{ read_snapshot version: {}, engine_info: {} }}",
-            self.read_snapshot.version(),
+            version_info,
             self.engine_info.is_some()
         ))
     }
 }
 
 impl Transaction {
-    /// Create a new transaction from a snapshot. The snapshot will be used to read the current
-    /// state of the table (e.g. to read the current version).
+    /// Create a new transaction from a snapshot for an existing table. The snapshot will be used
+    /// to read the current state of the table (e.g. to read the current version).
     ///
     /// Instead of using this API, the more typical (user-facing) API is
     /// [Snapshot::transaction](crate::snapshot::Snapshot::transaction) to create a transaction from
     /// a snapshot.
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_existing_table(
         snapshot: impl Into<SnapshotRef>,
         committer: Box<dyn Committer>,
     ) -> DeltaResult<Self> {
@@ -181,7 +195,7 @@ impl Transaction {
         let commit_timestamp = current_time_ms()?;
 
         Ok(Transaction {
-            read_snapshot: read_snapshot.clone(),
+            read_snapshot: Some(read_snapshot),
             committer,
             operation: None,
             engine_info: None,
@@ -192,6 +206,40 @@ impl Transaction {
             domain_metadata_additions: vec![],
             domain_removals: vec![],
             data_change: true,
+            table_url: None,
+            protocol_action: None,
+            metadata_action: None,
+        })
+    }
+
+    /// Create a new transaction for creating a new table. This is used when the table doesn't
+    /// exist yet and we need to create it with Protocol and Metadata actions.
+    ///
+    /// This is typically called via `CreateTableBuilder::build()` rather than directly.
+    pub(crate) fn try_new_create_table(
+        table_url: Url,
+        protocol: Protocol,
+        metadata: Metadata,
+        engine_info: String,
+        committer: Box<dyn Committer>,
+    ) -> DeltaResult<Self> {
+        let commit_timestamp = current_time_ms()?;
+
+        Ok(Transaction {
+            read_snapshot: None,
+            committer,
+            operation: Some("CREATE TABLE".to_string()),
+            engine_info: Some(engine_info),
+            add_files_metadata: vec![],
+            remove_files_metadata: vec![],
+            set_transactions: vec![],
+            commit_timestamp,
+            domain_metadata_additions: vec![],
+            domain_removals: vec![],
+            data_change: true,
+            table_url: Some(table_url),
+            protocol_action: Some(protocol),
+            metadata_action: Some(metadata),
         })
     }
 
@@ -232,28 +280,30 @@ impl Transaction {
             )));
         }
 
+        // CDF check only applies to existing tables (not create table)
         // If there are add and remove files with data change in the same transaction, we block it.
         // This is because kernel does not yet have a way to discern DML operations. For DML
         // operations that perform updates on rows, ChangeDataFeed requires that a `cdc` file be
         // written to the delta log.
-        if !self.add_files_metadata.is_empty()
-            && !self.remove_files_metadata.is_empty()
-            && self.data_change
-        {
-            let cdf_enabled = self
-                .read_snapshot
-                .table_configuration()
-                .table_properties()
-                .enable_change_data_feed
-                .unwrap_or(false);
-            require!(
-                !cdf_enabled,
-                Error::generic(
-                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
-                     This would require writing CDC files for DML operations, which is not yet supported. \
-                     Consider using separate transactions: one to add files, another to remove files."
-                )
-            );
+        if let Some(ref snapshot) = self.read_snapshot {
+            if !self.add_files_metadata.is_empty()
+                && !self.remove_files_metadata.is_empty()
+                && self.data_change
+            {
+                let cdf_enabled = snapshot
+                    .table_configuration()
+                    .table_properties()
+                    .enable_change_data_feed
+                    .unwrap_or(false);
+                require!(
+                    !cdf_enabled,
+                    Error::generic(
+                        "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+                         This would require writing CDC files for DML operations, which is not yet supported. \
+                         Consider using separate transactions: one to add files, another to remove files."
+                    )
+                );
+            }
         }
 
         // Step 1: Generate SetTransaction actions
@@ -264,15 +314,16 @@ impl Transaction {
             .map(|txn| txn.into_engine_data(get_log_txn_schema().clone(), engine));
 
         // Step 2: Construct commit info with ICT if enabled
-        let in_commit_timestamp =
-            self.read_snapshot
-                .get_in_commit_timestamp(engine)?
-                .map(|prev_ict| {
-                    // The Delta protocol requires the timestamp to be "the larger of two values":
-                    // - The time at which the writer attempted the commit (current_time)
-                    // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
-                    self.commit_timestamp.max(prev_ict + 1)
-                });
+        // For create-table transactions, there's no previous ICT, so in_commit_timestamp is None
+        let in_commit_timestamp = match &self.read_snapshot {
+            Some(snapshot) => snapshot.get_in_commit_timestamp(engine)?.map(|prev_ict| {
+                // The Delta protocol requires the timestamp to be "the larger of two values":
+                // - The time at which the writer attempted the commit (current_time)
+                // - One millisecond later than the previous commit's inCommitTimestamp (last_commit_timestamp + 1)
+                self.commit_timestamp.max(prev_ict + 1)
+            }),
+            None => None,
+        };
         let commit_info = CommitInfo::new(
             self.commit_timestamp,
             in_commit_timestamp,
@@ -282,19 +333,44 @@ impl Transaction {
         let commit_info_action =
             commit_info.into_engine_data(get_log_commit_info_schema().clone(), engine);
 
-        // Step 3: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
-        let commit_version = self.read_snapshot.version() + 1;
+        // Step 3: Generate Protocol and Metadata actions for create-table
+        let (protocol_action, metadata_action) = if self.is_create_table() {
+            let protocol = self.protocol_action.clone().ok_or_else(|| {
+                Error::generic("protocol_action must be set for create-table transactions")
+            })?;
+            let metadata = self.metadata_action.clone().ok_or_else(|| {
+                Error::generic("metadata_action must be set for create-table transactions")
+            })?;
+
+            let protocol_schema = get_commit_schema().project(&[PROTOCOL_NAME])?;
+            let metadata_schema = get_commit_schema().project(&[METADATA_NAME])?;
+
+            let protocol_data = protocol.into_engine_data(protocol_schema, engine)?;
+            let metadata_data = metadata.into_engine_data(metadata_schema, engine)?;
+
+            (Some(protocol_data), Some(metadata_data))
+        } else {
+            (None, None)
+        };
+
+        // Step 4: Generate add actions and get data for domain metadata actions (e.g. row tracking high watermark)
+        let commit_version = self.get_commit_version();
         let (add_actions, row_tracking_domain_metadata) =
             self.generate_adds(engine, commit_version)?;
 
-        // Step 4: Generate all domain metadata actions (user and system domains)
+        // Step 5: Generate all domain metadata actions (user and system domains)
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Generate remove actions
+        // Step 6: Generate remove actions
         let remove_actions = self.generate_remove_actions(engine)?;
 
+        // Build the action chain
+        // For create-table: CommitInfo -> Protocol -> Metadata -> adds -> txns -> domain_metadata -> removes
+        // For existing table: CommitInfo -> adds -> txns -> domain_metadata -> removes
         let actions = iter::once(commit_info_action)
+            .chain(protocol_action.map(Ok))
+            .chain(metadata_action.map(Ok))
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
@@ -303,18 +379,20 @@ impl Transaction {
             .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
             .chain(remove_actions);
 
-        // Step 6: Commit via the committer
+        // Step 7: Commit via the committer
+        // Catalog-managed check only applies to existing tables
         #[cfg(feature = "catalog-managed")]
-        if self.committer.any_ref().is::<FileSystemCommitter>()
-            && self
-                .read_snapshot
-                .table_configuration()
-                .protocol()
-                .is_catalog_managed()
-        {
-            return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
+        if let Some(ref snapshot) = self.read_snapshot {
+            if self.committer.any_ref().is::<FileSystemCommitter>()
+                && snapshot
+                    .table_configuration()
+                    .protocol()
+                    .is_catalog_managed()
+            {
+                return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
+            }
         }
-        let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
+        let log_root = LogRoot::new(self.get_table_root()?.clone())?;
         let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
         match self
             .committer
@@ -407,6 +485,31 @@ impl Transaction {
         self
     }
 
+    /// Returns true if this is a create-table transaction (no existing snapshot).
+    fn is_create_table(&self) -> bool {
+        self.read_snapshot.is_none()
+    }
+
+    /// Returns the commit version for this transaction.
+    /// For create-table transactions, this is 0.
+    /// For existing table transactions, this is snapshot.version() + 1.
+    fn get_commit_version(&self) -> Version {
+        match &self.read_snapshot {
+            Some(snapshot) => snapshot.version() + 1,
+            None => 0,
+        }
+    }
+
+    /// Returns the table root URL for this transaction.
+    fn get_table_root(&self) -> DeltaResult<&Url> {
+        match &self.read_snapshot {
+            Some(snapshot) => Ok(snapshot.table_root()),
+            None => self.table_url.as_ref().ok_or_else(|| {
+                Error::generic("table_url must be set for create-table transactions")
+            }),
+        }
+    }
+
     /// Validate that user domains don't conflict with system domains or each other.
     fn validate_user_domain_operations(&self) -> DeltaResult<()> {
         let mut seen_domains = HashSet::new();
@@ -456,11 +559,26 @@ impl Transaction {
         &'a self,
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
+    ) -> DeltaResult<EngineDataResultIterator<'a>> {
+        // For create-table transactions, domain metadata operations are not yet supported
+        // (the table doesn't exist yet, so there's no protocol to check)
+        if self.is_create_table() {
+            if !self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty() {
+                return Err(Error::unsupported(
+                    "Domain metadata operations are not supported in create-table transactions",
+                ));
+            }
+            // For create table, just return empty domain metadata actions
+            return Ok(Box::new(iter::empty()));
+        }
+
+        let snapshot = self.read_snapshot.as_ref().ok_or_else(|| {
+            Error::generic("snapshot must exist for non-create-table transactions")
+        })?;
+
         // Validate feature support for user domain operations
         if (!self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty())
-            && !self
-                .read_snapshot
+            && !snapshot
                 .table_configuration()
                 .is_domain_metadata_supported()
         {
@@ -473,8 +591,7 @@ impl Transaction {
         // Generate user domain removals via log replay (expensive if non-empty)
         let removal_actions = if !self.domain_removals.is_empty() {
             // Scan log to fetch existing configurations for tombstones
-            let existing_domains =
-                scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?;
+            let existing_domains = scan_domain_metadatas(snapshot.log_segment(), None, engine)?;
 
             // Create removal tombstones with pre-image configurations
             let removals: Vec<_> = self
@@ -500,13 +617,14 @@ impl Transaction {
             .into_iter();
 
         // Chain all domain actions and convert to EngineData
-        Ok(self
-            .domain_metadata_additions
-            .clone()
-            .into_iter()
-            .chain(removal_actions)
-            .chain(system_domain_actions)
-            .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
+        Ok(Box::new(
+            self.domain_metadata_additions
+                .clone()
+                .into_iter()
+                .chain(removal_actions)
+                .chain(system_domain_actions)
+                .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)),
+        ))
     }
 
     /// The schema that the [`Engine`]'s [`ParquetHandler`] is expected to use when reporting information about
@@ -531,20 +649,43 @@ impl Transaction {
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
-    fn generate_logical_to_physical(&self) -> Expression {
+    fn generate_logical_to_physical(&self) -> DeltaResult<Expression> {
         // for now, we just pass through all the columns except partition columns.
         // note this is _incorrect_ if table config deems we need partition columns.
-        let partition_columns = self
-            .read_snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
-        let schema = self.read_snapshot.schema();
+        let partition_columns: Vec<String> = match &self.read_snapshot {
+            Some(snapshot) => snapshot
+                .table_configuration()
+                .metadata()
+                .partition_columns()
+                .to_vec(),
+            None => {
+                // For create-table, get partition columns from metadata_action
+                let metadata = self.metadata_action.as_ref().ok_or_else(|| {
+                    Error::generic("metadata_action must be set for create-table transactions")
+                })?;
+                metadata.partition_columns().to_vec()
+            }
+        };
+        let schema = self.get_schema()?;
         let fields = schema
             .fields()
-            .filter(|f| !partition_columns.contains(f.name()))
+            .filter(|f| !partition_columns.contains(&f.name().to_string()))
             .map(|f| Expression::column([f.name()]));
-        Expression::struct_from(fields)
+        Ok(Expression::struct_from(fields))
+    }
+
+    /// Get the schema for this transaction.
+    fn get_schema(&self) -> DeltaResult<SchemaRef> {
+        match &self.read_snapshot {
+            Some(snapshot) => Ok(snapshot.schema()),
+            None => {
+                // For create-table, parse schema from metadata_action
+                let metadata = self.metadata_action.as_ref().ok_or_else(|| {
+                    Error::generic("metadata_action must be set for create-table transactions")
+                })?;
+                Ok(Arc::new(metadata.parse_schema()?))
+            }
+        }
     }
 
     /// Get the write context for this transaction. At the moment, this is constant for the whole
@@ -552,29 +693,38 @@ impl Transaction {
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
     // that engines cannot call this method after a metadata change, since the write context could
     // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
-        let target_dir = self.read_snapshot.table_root();
-        let snapshot_schema = self.read_snapshot.schema();
-        let logical_to_physical = self.generate_logical_to_physical();
+    pub fn get_write_context(&self) -> DeltaResult<WriteContext> {
+        let target_dir = self.get_table_root()?;
+        let snapshot_schema = self.get_schema()?;
+        let logical_to_physical = self.generate_logical_to_physical()?;
 
         // Compute physical schema: exclude partition columns since they're stored in the path
-        let partition_columns = self
-            .read_snapshot
-            .table_configuration()
-            .metadata()
-            .partition_columns();
+        let partition_columns: Vec<String> = match &self.read_snapshot {
+            Some(snapshot) => snapshot
+                .table_configuration()
+                .metadata()
+                .partition_columns()
+                .to_vec(),
+            None => {
+                // For create-table, get partition columns from metadata_action
+                self.metadata_action
+                    .as_ref()
+                    .map(|m| m.partition_columns().to_vec())
+                    .unwrap_or_default()
+            }
+        };
         let physical_fields = snapshot_schema
             .fields()
-            .filter(|f| !partition_columns.contains(f.name()))
+            .filter(|f| !partition_columns.contains(&f.name().to_string()))
             .cloned();
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
-        WriteContext::new(
+        Ok(WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
-        )
+        ))
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -638,15 +788,20 @@ impl Transaction {
         let commit_version = i64::try_from(commit_version)
             .map_err(|_| Error::generic("Commit version too large to fit in i64"))?;
 
-        let needs_row_tracking = self
-            .read_snapshot
-            .table_configuration()
-            .should_write_row_tracking();
+        // For create-table, row tracking is not enabled (no existing table config)
+        let needs_row_tracking = match &self.read_snapshot {
+            Some(snapshot) => snapshot.table_configuration().should_write_row_tracking(),
+            None => false,
+        };
 
         if needs_row_tracking {
+            let snapshot = self
+                .read_snapshot
+                .as_ref()
+                .ok_or_else(|| Error::generic("snapshot must exist when row tracking is needed"))?;
             // Read the current rowIdHighWaterMark from the snapshot's row tracking domain metadata
             let row_id_high_water_mark =
-                RowTrackingDomainMetadata::get_high_water_mark(&self.read_snapshot, engine)?;
+                RowTrackingDomainMetadata::get_high_water_mark(snapshot, engine)?;
 
             // Create a row tracking visitor and visit all files to collect row tracking information
             let mut row_tracking_visitor = RowTrackingVisitor::new(
@@ -711,20 +866,26 @@ impl Transaction {
     }
 
     fn into_committed(self, version: Version) -> CommittedTransaction {
-        let stats = PostCommitStats {
-            commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
-                + 1,
-            commits_since_log_compaction: self
-                .read_snapshot
-                .log_segment()
-                .commits_since_log_compaction_or_checkpoint()
-                + 1,
+        // For create-table, start with 1 since this is the first commit
+        let stats = match &self.read_snapshot {
+            Some(snapshot) => PostCommitStats {
+                commits_since_checkpoint: snapshot.log_segment().commits_since_checkpoint() + 1,
+                commits_since_log_compaction: snapshot
+                    .log_segment()
+                    .commits_since_log_compaction_or_checkpoint()
+                    + 1,
+            },
+            None => PostCommitStats {
+                commits_since_checkpoint: 1,
+                commits_since_log_compaction: 1,
+            },
         };
 
         CommittedTransaction {
             transaction: self,
             commit_version: version,
             post_commit_stats: stats,
+            post_commit_snapshot: None,
         }
     }
 
@@ -939,7 +1100,7 @@ impl WriteContext {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let write_context = transaction.get_write_context();
+    /// let write_context = transaction.get_write_context()?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
     /// ```
@@ -996,19 +1157,22 @@ impl CommitResult {
 }
 
 /// This is the result of a successfully committed [Transaction]. One can retrieve the
-/// [PostCommitStats] and [commit version] from this struct. In the future a post-commit snapshot
-/// can be obtained as well.
+/// [PostCommitStats], [commit version], and optionally the [post-commit snapshot] from this struct.
 ///
 /// [commit version]: Self::commit_version
+/// [post-commit snapshot]: Self::post_commit_snapshot
 #[derive(Debug)]
 pub struct CommittedTransaction {
-    // TODO: remove after post-commit snapshot
+    // TODO: remove after post-commit snapshot is fully implemented
     #[allow(dead_code)]
     transaction: Transaction,
     /// the version of the table that was just committed
     commit_version: Version,
     /// The [`PostCommitStats`] for this transaction
     post_commit_stats: PostCommitStats,
+    /// Optional post-commit snapshot. For create-table operations, this can be used
+    /// to get a snapshot without re-reading from disk.
+    post_commit_snapshot: Option<SnapshotRef>,
 }
 
 impl CommittedTransaction {
@@ -1020,6 +1184,13 @@ impl CommittedTransaction {
     /// The [`PostCommitStats`] for this transaction
     pub fn post_commit_stats(&self) -> &PostCommitStats {
         &self.post_commit_stats
+    }
+
+    /// Get the optional post-commit snapshot. This is available for create-table operations
+    /// when the snapshot can be built from the in-memory transaction data.
+    /// Currently, this always returns `None` and will be implemented in a future release.
+    pub fn post_commit_snapshot(&self) -> Option<&SnapshotRef> {
+        self.post_commit_snapshot.as_ref()
     }
 
     // TODO(#916): post-commit snapshot
@@ -1112,7 +1283,7 @@ mod tests {
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context()?;
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -1144,7 +1315,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
 
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context()?;
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
