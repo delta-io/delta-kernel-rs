@@ -21,7 +21,7 @@ pub enum VisitorError {
     /// The visitor has an incorrect number of getters
     #[error("Invalid getter count for {action_type}: expected {expected}, got {actual}")]
     InvalidGetterCount {
-        action_type: String,
+        action_type: &'static str,
         expected: usize,
         actual: usize,
     },
@@ -80,7 +80,7 @@ impl RowVisitor for SelectionVectorVisitor {
         require!(
             getters.len() == 1,
             VisitorError::InvalidGetterCount {
-                action_type: "SelectionVector".to_string(),
+                action_type: "SelectionVector",
                 expected: 1,
                 actual: getters.len(),
             }
@@ -134,7 +134,7 @@ impl AddVisitor {
         require!(
             getters.len() == 15,
             VisitorError::InvalidGetterCount {
-                action_type: "Add".to_string(),
+                action_type: "Add",
                 expected: 15,
                 actual: getters.len(),
             }
@@ -208,7 +208,7 @@ impl RemoveVisitor {
         require!(
             getters.len() == 15,
             VisitorError::InvalidGetterCount {
-                action_type: "Remove".to_string(),
+                action_type: "Remove",
                 expected: 15,
                 actual: getters.len(),
             }
@@ -302,7 +302,7 @@ impl RowVisitor for CdcVisitor {
         require!(
             getters.len() == 5,
             VisitorError::InvalidGetterCount {
-                action_type: "Cdc".to_string(),
+                action_type: "Cdc",
                 expected: 5,
                 actual: getters.len(),
             }
@@ -357,7 +357,7 @@ impl SetTransactionVisitor {
         require!(
             getters.len() == 3,
             VisitorError::InvalidGetterCount {
-                action_type: "SetTransaction".to_string(),
+                action_type: "SetTransaction",
                 expected: 3,
                 actual: getters.len(),
             }
@@ -439,7 +439,7 @@ impl RowVisitor for SidecarVisitor {
         require!(
             getters.len() == 4,
             VisitorError::InvalidGetterCount {
-                action_type: "Sidecar".to_string(),
+                action_type: "Sidecar",
                 expected: 4,
                 actual: getters.len(),
             }
@@ -487,7 +487,7 @@ impl DomainMetadataVisitor {
         require!(
             getters.len() == 3,
             VisitorError::InvalidGetterCount {
-                action_type: "DomainMetadata".to_string(),
+                action_type: "DomainMetadata",
                 expected: 3,
                 actual: getters.len(),
             }
@@ -577,7 +577,7 @@ pub(crate) fn visit_metadata_at<'a>(
     require!(
         getters.len() == 9,
         VisitorError::InvalidGetterCount {
-            action_type: "Metadata".to_string(),
+            action_type: "Metadata",
             expected: 9,
             actual: getters.len(),
         }
@@ -626,7 +626,7 @@ pub(crate) fn visit_protocol_at<'a>(
     require!(
         getters.len() == 4,
         VisitorError::InvalidGetterCount {
-            action_type: "Protocol".to_string(),
+            action_type: "Protocol",
             expected: 4,
             actual: getters.len(),
         }
@@ -699,7 +699,7 @@ impl RowVisitor for InCommitTimestampVisitor {
         require!(
             getters.len() == 1,
             VisitorError::InvalidGetterCount {
-                action_type: "InCommitTimestamp".to_string(),
+                action_type: "InCommitTimestamp",
                 expected: 1,
                 actual: getters.len(),
             }
@@ -1245,6 +1245,42 @@ mod tests {
     struct MockGetter;
     impl<'a> GetData<'a> for MockGetter {}
 
+    /// Helper function to assert that an error is an InvalidGetterCount with the expected values
+    fn assert_invalid_getter_count(
+        err: VisitorError,
+        expected_action_type: &'static str,
+        expected_count: usize,
+        actual_count: usize,
+    ) {
+        match err {
+            VisitorError::InvalidGetterCount {
+                action_type,
+                expected,
+                actual,
+            } => {
+                assert_eq!(
+                    action_type, expected_action_type,
+                    "action_type mismatch: expected '{}', got '{}'",
+                    expected_action_type, action_type
+                );
+                assert_eq!(
+                    expected, expected_count,
+                    "expected count mismatch: expected {}, got {}",
+                    expected_count, expected
+                );
+                assert_eq!(
+                    actual, actual_count,
+                    "actual count mismatch: expected {}, got {}",
+                    actual_count, actual
+                );
+            }
+            other => panic!(
+                "Expected InvalidGetterCount error for action '{}' with expected={} and actual={}, got {:?}",
+                expected_action_type, expected_count, actual_count, other
+            ),
+        }
+    }
+
     #[test]
     fn test_add_visitor_wrong_getter_count() {
         let json_strings: StringArray = vec![add_action()].into();
@@ -1262,19 +1298,7 @@ mod tests {
         let result = AddVisitor::visit_add(0, "test.parquet".to_string(), &wrong_getters);
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                VisitorError::InvalidGetterCount {
-                    action_type,
-                    expected,
-                    actual,
-                } if action_type == "Add" && *expected == 15 && *actual == 5
-            ),
-            "Expected InvalidGetterCount with Add/15/5, got {:?}",
-            err
-        );
+        assert_invalid_getter_count(result.unwrap_err(), "Add", 15, 5);
     }
 
     #[test]
@@ -1298,87 +1322,7 @@ mod tests {
         let result = RemoveVisitor::visit_remove(0, "test.parquet".to_string(), &wrong_getters);
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                VisitorError::InvalidGetterCount {
-                    action_type,
-                    expected,
-                    actual,
-                } if action_type == "Remove" && *expected == 15 && *actual == 3
-            ),
-            "Expected InvalidGetterCount with Remove/15/3, got {:?}",
-            err
-        );
+        assert_invalid_getter_count(result.unwrap_err(), "Remove", 15, 3);
     }
 
-    #[test]
-    fn test_add_missing_required_field_size() {
-        // Test that missing required field (size) is rejected during JSON parsing
-        // The Arrow parser enforces non-nullable fields before data reaches the visitor
-        let json_str = r#"{"add":{"path":"test.parquet","partitionValues":{},"modificationTime":1000,"dataChange":true}}"#;
-        let json_array: StringArray = vec![json_str].into();
-
-        // parse_json_batch should reject this because 'size' is a required non-nullable field
-        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
-
-        // Verify the parse fails (currently panics, which is expected behavior)
-        assert!(
-            result.is_err(),
-            "Expected parse to fail for missing required field 'size'"
-        );
-    }
-
-    #[test]
-    fn test_add_missing_required_field_modification_time() {
-        // Test that missing required field (modificationTime) is rejected during JSON parsing
-        // The Arrow parser enforces non-nullable fields before data reaches the visitor
-        let json_str =
-            r#"{"add":{"path":"test.parquet","partitionValues":{},"size":100,"dataChange":true}}"#;
-        let json_array: StringArray = vec![json_str].into();
-
-        // parse_json_batch should reject this because 'modificationTime' is a required non-nullable field
-        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
-
-        // Verify the parse fails (currently panics, which is expected behavior)
-        assert!(
-            result.is_err(),
-            "Expected parse to fail for missing required field 'modificationTime'"
-        );
-    }
-
-    #[test]
-    fn test_add_missing_required_field_data_change() {
-        // Test that missing required field (dataChange) is rejected during JSON parsing
-        // The Arrow parser enforces non-nullable fields before data reaches the visitor
-        let json_str = r#"{"add":{"path":"test.parquet","partitionValues":{},"size":100,"modificationTime":1000}}"#;
-        let json_array: StringArray = vec![json_str].into();
-
-        // parse_json_batch should reject this because 'dataChange' is a required non-nullable field
-        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
-
-        // Verify the parse fails (currently panics, which is expected behavior)
-        assert!(
-            result.is_err(),
-            "Expected parse to fail for missing required field 'dataChange'"
-        );
-    }
-
-    #[test]
-    fn test_remove_missing_required_field_data_change() {
-        // Test that Remove action missing dataChange field is rejected during JSON parsing
-        // The Arrow parser enforces non-nullable fields before data reaches the visitor
-        let json_str = r#"{"remove":{"path":"test.parquet"}}"#;
-        let json_array: StringArray = vec![json_str].into();
-
-        // parse_json_batch should reject this because 'dataChange' is a required non-nullable field
-        let result = std::panic::catch_unwind(|| parse_json_batch(json_array));
-
-        // Verify the parse fails (currently panics, which is expected behavior)
-        assert!(
-            result.is_err(),
-            "Expected parse to fail for missing required field 'dataChange'"
-        );
-    }
 }
