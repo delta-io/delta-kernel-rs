@@ -83,10 +83,10 @@ impl EnsureDataTypes {
             | (DataType::Array(inner_type), ArrowDataType::LargeListView(arrow_list_field)) => {
                 self.ensure_nullability(
                     "List",
-                    inner_type.contains_null,
+                    inner_type.contains_null(),
                     arrow_list_field.is_nullable(),
                 )?;
-                self.ensure_data_types(&inner_type.element_type, arrow_list_field.data_type())
+                self.ensure_data_types(inner_type.element_type(), arrow_list_field.data_type())
             }
             (DataType::Map(kernel_map_type), ArrowDataType::Map(arrow_map_type, _)) => {
                 let ArrowDataType::Struct(fields) = arrow_map_type.data_type() else {
@@ -97,13 +97,13 @@ impl EnsureDataTypes {
                         "Arrow map type didn't have expected key/value fields",
                     ));
                 };
-                self.ensure_data_types(&kernel_map_type.key_type, key_type.data_type())?;
+                self.ensure_data_types(kernel_map_type.key_type(), key_type.data_type())?;
                 self.ensure_nullability(
                     "Map",
-                    kernel_map_type.value_contains_null,
+                    kernel_map_type.value_contains_null(),
                     value_type.is_nullable(),
                 )?;
-                self.ensure_data_types(&kernel_map_type.value_type, value_type.data_type())?;
+                self.ensure_data_types(kernel_map_type.value_type(), value_type.data_type())?;
                 Ok(DataTypeCompat::Nested)
             }
             (DataType::Struct(kernel_fields), ArrowDataType::Struct(arrow_fields)) => {
@@ -117,7 +117,7 @@ impl EnsureDataTypes {
                 // ensure that for the fields that we found, the types match
                 for (kernel_field, arrow_field) in mapped_fields.zip(arrow_fields) {
                     self.ensure_nullability_and_metadata(kernel_field, arrow_field)?;
-                    self.ensure_data_types(&kernel_field.data_type, arrow_field.data_type())?;
+                    self.ensure_data_types(kernel_field.data_type(), arrow_field.data_type())?;
                     found_fields += 1;
                 }
 
@@ -165,17 +165,17 @@ impl EnsureDataTypes {
         arrow_field: &ArrowField,
     ) -> DeltaResult<()> {
         self.ensure_nullability(
-            &kernel_field.name,
-            kernel_field.nullable,
+            kernel_field.name(),
+            kernel_field.is_nullable(),
             arrow_field.is_nullable(),
         )?;
         if self.check_nullability_and_metadata
-            && !metadata_eq(&kernel_field.metadata, arrow_field.metadata())
+            && !metadata_eq(kernel_field.metadata(), arrow_field.metadata())
         {
             Err(Error::Generic(format!(
                 "Field {} has metadata {:?} in kernel and {:?} in arrow",
-                kernel_field.name,
-                kernel_field.metadata,
+                kernel_field.name(),
+                kernel_field.metadata(),
                 arrow_field.metadata(),
             )))
         } else {
