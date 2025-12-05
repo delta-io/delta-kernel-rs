@@ -47,7 +47,7 @@ mod tests;
 
 // safety: we define get_commit_schema() and _know_ it contains ADD_NAME and REMOVE_NAME
 #[allow(clippy::unwrap_used)]
-static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+pub(crate) static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     get_commit_schema()
         .project(&[ADD_NAME, REMOVE_NAME])
         .unwrap()
