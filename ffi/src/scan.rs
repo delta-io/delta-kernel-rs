@@ -67,6 +67,21 @@ pub struct EngineSchema {
     pub visitor: extern "C" fn(schema: *mut c_void, state: &mut KernelSchemaVisitorState) -> usize,
 }
 
+/// An engine-provided expression along with a visitor function to convert
+/// it to a kernel expression.
+///
+/// The engine provides a pointer to its own expression representation, along
+/// with a visitor function that can convert it to a kernel expression by
+/// calling the appropriate visitor methods on the kernel's
+/// `KernelExpressionVisitorState`. The visitor function returns an expression
+/// ID that can be converted to a kernel expression handle.
+#[repr(C)]
+pub struct EngineExpression {
+    pub expression: *mut c_void,
+    pub visitor:
+        extern "C" fn(expression: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
+}
+
 /// Drop a `SharedScanMetadata`.
 ///
 /// # Safety
