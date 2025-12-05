@@ -41,7 +41,8 @@ fn get_default_table_config(table_root: &url::Url) -> TableConfiguration {
         ]),
     )
     .unwrap();
-    let protocol = Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+    // CDF requires min_writer_version = 4
+    let protocol = Protocol::try_new(1, 4, None::<Vec<String>>, None::<Vec<String>>).unwrap();
     TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap()
 }
 
@@ -167,7 +168,7 @@ async fn metadata_protocol() {
                     3,
                     7,
                     Some([TableFeature::DeletionVectors]),
-                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
                 )
                 .unwrap(),
             ),
@@ -230,8 +231,14 @@ async fn unsupported_reader_feature() {
             Protocol::try_new(
                 3,
                 7,
-                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
-                Some([TableFeature::DeletionVectors, TableFeature::TypeWidening]),
+                Some([
+                    TableFeature::DeletionVectors,
+                    TableFeature::unknown("unsupportedReaderFeature"),
+                ]),
+                Some([
+                    TableFeature::DeletionVectors,
+                    TableFeature::unknown("unsupportedReaderFeature"),
+                ]),
             )
             .unwrap(),
         )])
@@ -323,25 +330,24 @@ async fn unsupported_protocol_feature_midstream() {
     // First commit: Basic protocol with CDF enabled
     mock_table
         .commit([
-            protocol_action(1, 1, None, None),
+            protocol_action(2, 6, None, None),
             metadata_with_cdf(get_schema()),
         ])
         .await;
 
-    // Second commit: Protocol update with unsupported feature (TypeWidening)
+    // Second commit: Protocol update with unsupported feature
     mock_table
         .commit([protocol_action(
             3,
             7,
-            Some(vec![TableFeature::TypeWidening]),
-            Some(vec![TableFeature::TypeWidening]),
+            Some(vec![TableFeature::unknown("unsupportedFeature")]),
+            Some(vec![TableFeature::unknown("unsupportedFeature")]),
         )])
         .await;
 
     assert_midstream_failure(engine, &mock_table);
 }
 
-// Note: This should be removed once type widening support is added for CDF
 #[tokio::test]
 async fn incompatible_schemas_fail() {
     async fn assert_incompatible_schema(commit_schema: StructType, cdf_schema: StructType) {
