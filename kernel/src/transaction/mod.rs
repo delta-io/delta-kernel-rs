@@ -1182,7 +1182,8 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_partition_columns_in_write_context() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_materialize_partition_columns_in_write_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
 
         // Test 1: Use basic_partitioned table (without materializePartitionColumns feature)
