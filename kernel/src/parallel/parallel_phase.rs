@@ -63,7 +63,7 @@ mod tests {
     use super::*;
     use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
     use crate::scan::log_replay::ScanLogReplayProcessor;
-    use crate::scan::state_info::StateInfo;
+    use crate::scan::AfterPhase1;
     use crate::utils::test_utils::load_test_table;
     use crate::{ExpressionRef, SnapshotRef};
     use std::sync::Arc;
@@ -112,17 +112,8 @@ mod tests {
         // Get expected results from single-threaded scan_metadata
         let expected_files = get_files_from_scan_metadata(&snapshot, engine.as_ref())?;
 
-        let log_segment = Arc::new(snapshot.log_segment().clone());
-
-        let state_info = Arc::new(StateInfo::try_new(
-            snapshot.schema(),
-            snapshot.table_configuration(),
-            None,
-            (),
-        )?);
-
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
+        let scan = snapshot.scan_builder().build()?;
+        let mut sequential = scan.distributed_scan_metadata(engine.clone())?;
 
         // Process all batches in sequential phase and collect (path, transform) pairs
         let mut sequential_files = Vec::new();
