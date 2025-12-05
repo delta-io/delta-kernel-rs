@@ -15,6 +15,7 @@
 //! to minimize memory usage for tables with extensive history.
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::engine_data::{GetData, TypedGetData};
+use crate::log_replay::deduplicator::Deduplicator;
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::{DeltaResult, EngineData};
 
@@ -24,10 +25,12 @@ use std::collections::HashSet;
 
 use tracing::debug;
 
+pub(crate) mod deduplicator;
+
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub(crate) struct FileActionKey {
+#[derive(Debug, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Clone)]
+pub struct FileActionKey {
     pub(crate) path: String,
     pub(crate) dv_unique_id: Option<String>,
 }
@@ -56,7 +59,8 @@ pub(crate) struct FileActionDeduplicator<'seen> {
     seen_file_keys: &'seen mut HashSet<FileActionKey>,
     // TODO: Consider renaming to `is_commit_batch`, `deduplicate_batch`, or `save_batch`
     // to better reflect its role in deduplication logic.
-    /// Whether we're processing a log batch (as opposed to a checkpoint)
+    /// Whether we're processing a commit log JSON file (`true`) or a checkpoint file (`false`).
+    /// When `true`, file actions are added to `seen_file_keys` as they're processed.
     is_log_batch: bool,
     /// Index of the getter containing the add.path column
     add_path_index: usize,
@@ -84,36 +88,6 @@ impl<'seen> FileActionDeduplicator<'seen> {
             remove_path_index,
             add_dv_start_index,
             remove_dv_start_index,
-        }
-    }
-
-    /// Checks if log replay already processed this logical file (in which case the current action
-    /// should be ignored). If not already seen, register it so we can recognize future duplicates.
-    /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
-    /// and should process it.
-    pub(crate) fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
-        // Note: each (add.path + add.dv_unique_id()) pair has a
-        // unique Add + Remove pair in the log. For example:
-        // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
-
-        if self.seen_file_keys.contains(&key) {
-            debug!(
-                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
-            true
-        } else {
-            debug!(
-                "Including ({}, {:?}) in scan, is log {}",
-                key.path, key.dv_unique_id, self.is_log_batch
-            );
-            if self.is_log_batch {
-                // Remember file actions from this batch so we can ignore duplicates as we process
-                // batches from older commit and/or checkpoint files. We don't track checkpoint
-                // batches because they are already the oldest actions and never replace anything.
-                self.seen_file_keys.insert(key);
-            }
-            false
         }
     }
 
@@ -145,6 +119,39 @@ impl<'seen> FileActionDeduplicator<'seen> {
             None => Ok(None),
         }
     }
+}
+
+impl<'seen> Deduplicator for FileActionDeduplicator<'seen> {
+    type Key = FileActionKey;
+    /// Checks if log replay already processed this logical file (in which case the current action
+    /// should be ignored). If not already seen, register it so we can recognize future duplicates.
+    /// Returns `true` if we have seen the file and should ignore it, `false` if we have not seen it
+    /// and should process it.
+    fn check_and_record_seen(&mut self, key: FileActionKey) -> bool {
+        // Note: each (add.path + add.dv_unique_id()) pair has a
+        // unique Add + Remove pair in the log. For example:
+        // https://github.com/delta-io/delta/blob/master/spark/src/test/resources/delta/table-with-dv-large/_delta_log/00000000000000000001.json
+
+        if self.seen_file_keys.contains(&key) {
+            debug!(
+                "Ignoring duplicate ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            true
+        } else {
+            debug!(
+                "Including ({}, {:?}) in scan, is log {}",
+                key.path, key.dv_unique_id, self.is_log_batch
+            );
+            if self.is_log_batch {
+                // Remember file actions from this batch so we can ignore duplicates as we process
+                // batches from older commit and/or checkpoint files. We don't track checkpoint
+                // batches because they are already the oldest actions and never replace anything.
+                self.seen_file_keys.insert(key);
+            }
+            false
+        }
+    }
 
     /// Extracts a file action key and determines if it's an add operation.
     /// This method examines the data at the given index using the provided getters
@@ -159,7 +166,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     /// - `Ok(Some((key, is_add)))`: When a file action is found, returns the key and whether it's an add operation
     /// - `Ok(None)`: When no file action is found
     /// - `Err(...)`: On any error during extraction
-    pub(crate) fn extract_file_action<'a>(
+    fn extract_file_action<'a>(
         &self,
         i: usize,
         getters: &[&'a dyn GetData<'a>],
@@ -190,7 +197,7 @@ impl<'seen> FileActionDeduplicator<'seen> {
     ///
     /// `true` indicates we are processing a batch from a commit file.
     /// `false` indicates we are processing a batch from a checkpoint.
-    pub(crate) fn is_log_batch(&self) -> bool {
+    fn is_log_batch(&self) -> bool {
         self.is_log_batch
     }
 }
@@ -362,6 +369,7 @@ pub(crate) trait HasSelectionVector {
 mod tests {
     use super::*;
     use crate::engine_data::GetData;
+    use crate::log_replay::deduplicator::Deduplicator;
     use crate::DeltaResult;
     use std::collections::{HashMap, HashSet};
 
