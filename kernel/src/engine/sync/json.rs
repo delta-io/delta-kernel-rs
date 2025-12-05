@@ -17,11 +17,15 @@ use crate::{
 
 pub(crate) struct SyncJsonHandler;
 
+/// Note: This function must match the signature expected by `read_files` helper function,
+/// which is also used by `try_create_from_parquet`. The `_file_location` parameter is unused
+/// here but required to satisfy the shared function signature.
 fn try_create_from_json(
     file: File,
     _schema: SchemaRef,
     arrow_schema: ArrowSchemaRef,
     _predicate: Option<PredicateRef>,
+    _file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let json = ReaderBuilder::new(arrow_schema)
         .build(BufReader::new(file))?
