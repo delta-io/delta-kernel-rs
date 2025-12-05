@@ -23,16 +23,8 @@ pub(crate) type TransformSpec = Vec<FieldTransformSpec>;
 ///
 /// These transformations are "sparse" - they only specify what changes, while unchanged fields
 /// pass through implicitly in their original order.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum FieldTransformSpec {
-    /// Insert the given expression after the named input column (None = prepend instead)
-    // NOTE: It's quite likely we will sometimes need to reorder columns for one reason or another,
-    // which would usually be expressed as a drop+insert pair of transforms.
-    #[allow(unused)]
-    StaticInsert {
-        insert_after: Option<String>,
-        expr: ExpressionRef,
-    },
     /// Drops the named input column
     // NOTE: Row tracking needs to drop metadata columns that were used to compute rowids, since
     // they should not appear in the query's output.
@@ -102,7 +94,6 @@ pub(crate) fn parse_partition_values(
                 ))
             }
             FieldTransformSpec::DynamicColumn { .. }
-            | FieldTransformSpec::StaticInsert { .. }
             | FieldTransformSpec::GenerateRowId { .. }
             | FieldTransformSpec::StaticDrop { .. } => None,
         })
@@ -125,9 +116,6 @@ pub(crate) fn get_transform_expr(
     for field_transform in transform_spec {
         use FieldTransformSpec::*;
         transform = match field_transform {
-            StaticInsert { insert_after, expr } => {
-                transform.with_inserted_field(insert_after.clone(), expr.clone())
-            }
             StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
             GenerateRowId {
                 field_name,
@@ -363,17 +351,10 @@ mod tests {
     }
 
     #[test]
-    fn test_get_transform_expr_static_transforms() {
-        let expr = Arc::new(Expression::literal(42));
-        let transform_spec = vec![
-            FieldTransformSpec::StaticInsert {
-                insert_after: Some("col1".to_string()),
-                expr: expr.clone(),
-            },
-            FieldTransformSpec::StaticDrop {
-                field_name: "col2".to_string(),
-            },
-        ];
+    fn test_get_transform_expr_static_drop() {
+        let transform_spec = vec![FieldTransformSpec::StaticDrop {
+            field_name: "col2".to_string(),
+        }];
         let metadata_values = HashMap::new();
 
         // Create a physical schema with the relevant columns
@@ -392,16 +373,6 @@ mod tests {
         let Expression::Transform(transform) = result.as_ref() else {
             panic!("Expected Transform expression");
         };
-
-        // Verify StaticInsert: should insert after col1
-        assert!(transform.field_transforms.contains_key("col1"));
-        assert!(!transform.field_transforms["col1"].is_replace);
-        assert_eq!(transform.field_transforms["col1"].exprs.len(), 1);
-        let Expression::Literal(scalar) = transform.field_transforms["col1"].exprs[0].as_ref()
-        else {
-            panic!("Expected literal expression for insert");
-        };
-        assert_eq!(scalar, &Scalar::Integer(42));
 
         // Verify StaticDrop: should drop col2 (empty expressions and is_replace = true)
         assert!(transform.field_transforms.contains_key("col2"));
