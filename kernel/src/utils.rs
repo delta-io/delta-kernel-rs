@@ -152,17 +152,21 @@ pub(crate) mod test_utils {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
-    use crate::Engine;
-    use crate::EngineData;
+    use crate::{DeltaResult, EngineData, Error, SnapshotRef};
+    use crate::{Engine, Snapshot};
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use serde::Serialize;
+    use std::path::PathBuf;
     use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
+    use test_utils::load_test_data;
+    use url::Url;
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -282,6 +286,41 @@ pub(crate) mod test_utils {
                 );
             }
         }
+    }
+
+    /// Load a test table from tests/data directory.
+    /// Tries compressed (tar.zst) first, falls back to extracted.
+    /// Returns (engine, snapshot, optional tempdir). The TempDir must be kept alive
+    /// for the duration of the test to prevent premature cleanup of extracted files.
+    pub(crate) fn load_test_table(
+        table_name: &str,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
+        // Try loading compressed table first, fall back to extracted
+        let (path, tempdir) = match load_test_data("tests/data", table_name) {
+            Ok(test_dir) => {
+                let test_path = test_dir.path().join(table_name);
+                (test_path, Some(test_dir))
+            }
+            Err(_) => {
+                // Fall back to already-extracted table
+                let manifest_dir = env!("CARGO_MANIFEST_DIR");
+                let mut path = PathBuf::from(manifest_dir);
+                path.push("tests/data");
+                path.push(table_name);
+                let path = std::fs::canonicalize(path)
+                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+                (path, None)
+            }
+        };
+
+        // Create engine and snapshot from the resolved path
+        let url = Url::from_directory_path(&path)
+            .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
+
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = Arc::new(DefaultEngine::new(store));
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+        Ok((engine, snapshot, tempdir))
     }
 }
 
