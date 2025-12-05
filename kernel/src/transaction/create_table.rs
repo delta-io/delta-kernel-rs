@@ -36,6 +36,7 @@ use crate::actions::{
 };
 use crate::committer::Committer;
 use crate::schema::SchemaRef;
+use crate::table_features::extract_feature_overrides;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error};
@@ -172,25 +173,44 @@ impl CreateTableBuilder {
             }
         }
 
+        // Extract feature overrides (delta.feature.X = supported) from table properties
+        let feature_overrides = extract_feature_overrides(self.table_properties)?;
+
+        // Build reader/writer feature lists from explicit feature overrides
+        let mut reader_features: Vec<String> = Vec::new();
+        let mut writer_features: Vec<String> = Vec::new();
+
+        for feature in &feature_overrides.features {
+            let feature_name = feature.to_string();
+
+            // All features go into writer_features
+            writer_features.push(feature_name.clone());
+
+            // ReaderWriter features also go into reader_features
+            if feature.is_reader_writer() {
+                reader_features.push(feature_name);
+            }
+        }
+
         // Create Protocol action with table features support
         let protocol = Protocol::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(Vec::<String>::new()), // readerFeatures (empty for now)
-            Some(Vec::<String>::new()), // writerFeatures (empty for now)
+            Some(reader_features),
+            Some(writer_features),
         )?;
 
         // Get current timestamp
         let created_time = current_time_ms()?;
 
-        // Create Metadata action
+        // Create Metadata action with cleaned properties (feature overrides removed)
         let metadata = Metadata::try_new(
             None, // name
             None, // description
             (*self.schema).clone(),
             self.partition_columns,
             created_time,
-            self.table_properties,
+            feature_overrides.cleaned_properties,
         )?;
 
         // Create Transaction with cached Protocol and Metadata
