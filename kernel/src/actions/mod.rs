@@ -2,8 +2,7 @@
 //! specification](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)
 
 use std::collections::HashMap;
-use std::fmt::{Debug, Display};
-use std::hash::Hash;
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
@@ -24,7 +23,6 @@ use url::Url;
 use visitors::{MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -568,33 +566,6 @@ impl Protocol {
         self.has_table_feature(&TableFeature::CatalogManaged)
             || self.has_table_feature(&TableFeature::CatalogOwnedPreview)
     }
-
-    pub(crate) fn is_cdf_supported(&self) -> bool {
-        // TODO: we should probably expand this to ~all supported reader features instead of gating
-        // on a subset here. missing ones are:
-        // - variantType
-        // - typeWidening
-        // - catalogManaged
-        static CDF_SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-            vec![
-                TableFeature::DeletionVectors,
-                TableFeature::ColumnMapping,
-                TableFeature::TimestampWithoutTimezone,
-                TableFeature::V2Checkpoint,
-                TableFeature::VacuumProtocolCheck,
-            ]
-        });
-        match self.reader_features() {
-            // if min_reader_version = 3 and all reader features are subset of supported => OK
-            Some(reader_features) if self.min_reader_version() == 3 => {
-                ensure_supported_features(reader_features, &CDF_SUPPORTED_READER_FEATURES).is_ok()
-            }
-            // if min_reader_version = 1 or 2 and there are no reader features => OK
-            None => (1..=2).contains(&self.min_reader_version()),
-            // any other protocol is not supported
-            _ => false,
-        }
-    }
 }
 
 // TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
@@ -634,43 +605,6 @@ impl IntoEngineData for Protocol {
 
         engine.evaluation_handler().create_one(schema, &values)
     }
-}
-
-// given `table_features`, check if they are subset of `supported_features`
-pub(crate) fn ensure_supported_features<T>(
-    table_features: &[T],
-    supported_features: &[T],
-) -> DeltaResult<()>
-where
-    T: Display + FromStr + Hash + Eq,
-    <T as FromStr>::Err: Display,
-{
-    // first check if all features are supported, else we proceed to craft an error message
-    if table_features
-        .iter()
-        .all(|feature| supported_features.contains(feature))
-    {
-        return Ok(());
-    }
-
-    // we get the type name (TableFeature) for better error messages
-    let features_type = std::any::type_name::<T>()
-        .rsplit("::")
-        .next()
-        .unwrap_or("table feature");
-
-    // NB: we didn't do this above to avoid allocation in the common case
-    let mut unsupported = table_features
-        .iter()
-        .filter(|feature| !supported_features.contains(*feature));
-
-    Err(Error::Unsupported(format!(
-        "Found unsupported {}s: \"{}\". Supported {}s: \"{}\"",
-        features_type,
-        unsupported.join("\", \""),
-        features_type,
-        supported_features.iter().join("\", \""),
-    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
@@ -1553,21 +1487,6 @@ mod tests {
         assert!(protocol.validate_table_features().is_err());
     }
 
-    #[test]
-    fn test_ensure_supported_features() {
-        let supported_features = [TableFeature::ColumnMapping, TableFeature::DeletionVectors];
-        let table_features = vec![TableFeature::ColumnMapping];
-        ensure_supported_features(&table_features, &supported_features).unwrap();
-        // test unknown features
-        let table_features = vec![TableFeature::ColumnMapping, TableFeature::unknown("idk")];
-        let error = ensure_supported_features(&table_features, &supported_features).unwrap_err();
-        match error {
-            Error::Unsupported(e) if e ==
-                "Found unsupported TableFeatures: \"idk\". Supported TableFeatures: \"columnMapping\", \"deletionVectors\""
-            => {},
-            _ => panic!("Expected unsupported error, got: {error}"),
-        }
-    }
     #[test]
     fn test_parse_table_feature_never_fails() {
         // parse a non-str
