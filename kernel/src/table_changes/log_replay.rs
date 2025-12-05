@@ -212,7 +212,7 @@ impl LogReplayScanner {
                 )?;
             }
 
-            // If metadata is updated, check if Change Data Feed is supported
+            // If metadata is updated, check if Change Data Feed is enabled
             if has_metadata_update {
                 require!(
                     table_configuration.is_feature_enabled(&TableFeature::ChangeDataFeed),
