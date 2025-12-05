@@ -42,8 +42,7 @@ use crate::schema::{DataType, Schema, StructField, StructType};
 use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::Operation;
-use crate::table_properties::TableProperties;
-use crate::utils::require;
+use crate::table_features::TableFeature;
 use crate::{DeltaResult, Engine, Error, Version};
 
 mod log_replay;
@@ -168,12 +167,12 @@ impl TableChanges {
         // [`check_cdf_table_properties`] to fail early. This also ensures that column mapping is
         // disabled.
         //
-        // We also check the [`Protocol`] using [`ensure_cdf_read_supported`] to verify that
-        // we support CDF with those features enabled.
-        //
         // Note: We must still check each metadata and protocol action in the CDF range.
         let check_table_config = |snapshot: &Snapshot| {
-            if snapshot.table_configuration().is_cdf_read_supported() {
+            if snapshot
+                .table_configuration()
+                .is_feature_enabled(&TableFeature::ChangeDataFeed)
+            {
                 Ok(())
             } else {
                 Err(Error::change_data_feed_unsupported(snapshot.version()))
@@ -238,17 +237,6 @@ impl TableChanges {
     pub fn into_scan_builder(self) -> TableChangesScanBuilder {
         TableChangesScanBuilder::new(self)
     }
-}
-
-/// Ensures that change data feed is enabled in `table_properties`. See the documentation
-/// of [`TableChanges`] for more details.
-// TODO: move to TableProperties and normalize with the check in TableConfiguration
-fn check_cdf_table_properties(table_properties: &TableProperties) -> DeltaResult<()> {
-    require!(
-        table_properties.enable_change_data_feed.unwrap_or(false),
-        Error::unsupported("Change data feed is not enabled")
-    );
-    Ok(())
 }
 
 #[cfg(test)]
