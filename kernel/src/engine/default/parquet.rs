@@ -14,9 +14,11 @@ use crate::parquet::arrow::arrow_reader::{
 };
 use crate::parquet::arrow::arrow_writer::ArrowWriter;
 use crate::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+use crate::parquet::arrow::async_writer::AsyncArrowWriter;
+use crate::parquet::arrow::async_writer::ParquetObjectWriter;
 use futures::StreamExt;
 use object_store::path::Path;
-use object_store::DynObjectStore;
+use object_store::{DynObjectStore, ObjectStore};
 use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
@@ -245,6 +247,58 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
             self.readahead,
         )
     }
+
+    /// Writes engine data to a Parquet file at the specified location.
+    ///
+    /// This implementation uses asynchronous file I/O with object_store to write the Parquet file.
+    /// If a file already exists at the given location, it will be overwritten.
+    ///
+    /// # Parameters
+    ///
+    /// - `location` - The full URL path where the Parquet file should be written
+    ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
+    /// - `data` - An iterator of engine data to be written to the Parquet file..
+    ///
+    /// # Returns
+    ///
+    /// A [`DeltaResult`] indicating success or failure.
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+    ) -> DeltaResult<()> {
+        let store = self.store.clone();
+
+        self.task_executor.block_on(async move {
+            let path = Path::from_url_path(location.path())?;
+
+            // Get first batch to initialize writer with schema
+            let first_batch = data.next().ok_or_else(|| {
+                Error::generic("Cannot write parquet file with empty data iterator")
+            })??;
+            let first_arrow = ArrowEngineData::try_from_engine_data(first_batch)?;
+            let first_record_batch: RecordBatch = (*first_arrow).into();
+
+            let object_writer = ParquetObjectWriter::new(store, path);
+            let schema = first_record_batch.schema();
+            let mut writer = AsyncArrowWriter::try_new(object_writer, schema, None)?;
+
+            // Write the first batch
+            writer.write(&first_record_batch).await?;
+
+            // Write remaining batches
+            for result in data {
+                let engine_data = result?;
+                let arrow_data = ArrowEngineData::try_from_engine_data(engine_data)?;
+                let batch: RecordBatch = (*arrow_data).into();
+                writer.write(&batch).await?;
+            }
+
+            writer.finish().await?;
+
+            Ok(())
+        })
+    }
 }
 
 /// Implements [`FileOpener`] for a parquet file
@@ -276,16 +330,15 @@ impl ParquetOpener {
 
 impl FileOpener for ParquetOpener {
     fn open(&self, file_meta: FileMeta, _range: Option<Range<i64>>) -> DeltaResult<FileOpenFuture> {
-        let path = Path::from_url_path(file_meta.location.path())?;
         let store = self.store.clone();
-
         let batch_size = self.batch_size;
-        // let projection = self.projection.clone();
         let table_schema = self.table_schema.clone();
         let predicate = self.predicate.clone();
         let limit = self.limit;
 
         Ok(Box::pin(async move {
+            let path = Path::from_url_path(file_meta.location.path())?;
+
             let mut reader = {
                 use object_store::ObjectStoreScheme;
                 // HACK: unfortunately, `ParquetObjectReader` under the hood does a suffix range
@@ -430,7 +483,7 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
-    use crate::arrow::array::{Array, RecordBatch};
+    use crate::arrow::array::{Array, BooleanArray, RecordBatch};
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -640,5 +693,320 @@ mod tests {
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
         );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "x",
+                    Arc::new(Int64Array::from(vec![10, 20, 30])) as Arc<dyn Array>,
+                ),
+                (
+                    "y",
+                    Arc::new(Int64Array::from(vec![100, 200, 300])) as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Create iterator with single batch
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data)));
+
+        // Test writing through the trait method
+        let file_url = Url::parse("memory:///test/data.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter)
+            .unwrap();
+
+        // Verify we can read the file back
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 3);
+        assert_eq!(data[0].num_columns(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write_and_read_roundtrip() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        // Create test data with multiple types
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "int_col",
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as Arc<dyn Array>,
+                ),
+                (
+                    "string_col",
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as Arc<dyn Array>,
+                ),
+                (
+                    "bool_col",
+                    Arc::new(BooleanArray::from(vec![true, false, true, false, true]))
+                        as Arc<dyn Array>,
+                ),
+            ])
+            .unwrap(),
+        ));
+
+        // Create iterator with single batch
+        let data_iter: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data)));
+
+        // Write the data
+        let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter)
+            .unwrap();
+
+        // Read it back
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url.clone(),
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify the data
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 5);
+        assert_eq!(data[0].num_columns(), 3);
+
+        // Verify column values
+        let int_col = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(int_col.values(), &[1, 2, 3, 4, 5]);
+
+        let string_col = data[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(string_col.value(0), "a");
+        assert_eq!(string_col.value(4), "e");
+
+        let bool_col = data[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert!(bool_col.value(0));
+        assert!(!bool_col.value(1));
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write_overwrite_true() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let file_url = Url::parse("memory:///overwrite_test/data.parquet").unwrap();
+
+        // Create first data set
+        let engine_data1: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter1: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data1)));
+
+        // Write the first file
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter1)
+            .unwrap();
+
+        // Create second data set with different data
+        let engine_data2: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter2: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data2)));
+
+        // Overwrite with second file (overwrite=true)
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter2)
+            .unwrap();
+
+        // Read back and verify it contains the second data set
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify we have the second data set (2 rows, not 3)
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 2);
+        let value_col = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_col.values(), &[10, 20]);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_handler_trait_write_always_overwrites() {
+        let store = Arc::new(InMemory::new());
+        let parquet_handler: Arc<dyn ParquetHandler> = Arc::new(DefaultParquetHandler::new(
+            store.clone(),
+            Arc::new(TokioBackgroundExecutor::new()),
+        ));
+
+        let file_url = Url::parse("memory:///no_overwrite_test/data.parquet").unwrap();
+
+        // Create first data set
+        let engine_data1: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter1: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data1)));
+
+        // Write the first file
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter1)
+            .unwrap();
+
+        // Create second data set
+        let engine_data2: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
+            RecordBatch::try_from_iter(vec![(
+                "value",
+                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn Array>,
+            )])
+            .unwrap(),
+        ));
+        let data_iter2: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send> =
+            Box::new(std::iter::once(Ok(engine_data2)));
+
+        // Write again - should overwrite successfully (new behavior always overwrites)
+        parquet_handler
+            .write_parquet_file(file_url.clone(), data_iter2)
+            .unwrap();
+
+        // Verify the file was overwritten with the new data
+        let path = Path::from_url_path(file_url.path()).unwrap();
+        let reader = ParquetObjectReader::new(store.clone(), path);
+        let physical_schema = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .unwrap()
+            .schema()
+            .clone();
+
+        let file_meta = FileMeta {
+            location: file_url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let data: Vec<RecordBatch> = parquet_handler
+            .read_parquet_files(
+                slice::from_ref(&file_meta),
+                Arc::new(physical_schema.try_into_kernel().unwrap()),
+                None,
+            )
+            .unwrap()
+            .map(into_record_batch)
+            .try_collect()
+            .unwrap();
+
+        // Verify we now have the second data set (2 rows)
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].num_rows(), 2);
+        let value_col = data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_col.values(), &[10, 20]);
     }
 }
