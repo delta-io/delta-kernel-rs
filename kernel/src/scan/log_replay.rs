@@ -24,6 +24,7 @@ use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 /// Internal serializable state (schemas, transform spec, column mapping, etc.)
 /// NOTE: This is opaque to the user - it is passed through as a blob.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct InternalScanState {
     logical_schema: Arc<StructType>,
     physical_schema: Arc<StructType>,
@@ -138,6 +139,10 @@ impl ScanLogReplayProcessor {
     ///
     /// The returned state can be used with `from_serializable_state` to reconstruct the
     /// processor on remote compute nodes.
+    ///
+    /// WARNING: The SerializableScanState may only be deserialized using an equal binary version
+    /// of delta-kernel-rs. Using different versions for serialization and deserialization leads to
+    /// undefined behaviour!
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
@@ -991,5 +996,28 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("predicate schema"));
         }
+    }
+
+    #[test]
+    fn deserialize_internal_state_with_extry_fields_fails() {
+        // Test that missing predicate_schema when predicate exists is detected
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )]));
+        let invalid_internal_state = InternalScanState {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            predicate_schema: None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+        };
+        let blob = serde_json::to_string(&invalid_internal_state).unwrap();
+        let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
+        obj["new_field"] = serde_json::json!("my_new_value");
+        let invalid_blob = obj.to_string();
+
+        let internal_res: Result<InternalScanState, _> = serde_json::from_str(&invalid_blob);
     }
 }
