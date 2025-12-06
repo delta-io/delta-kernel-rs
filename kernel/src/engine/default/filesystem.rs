@@ -1,9 +1,11 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use delta_kernel_derive::internal_api;
-use futures::stream::StreamExt;
+use futures::stream::{self, BoxStream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::path::Path;
 use object_store::{DynObjectStore, ObjectStore, PutMode};
@@ -19,23 +21,17 @@ use crate::{DeltaResult, Error, FileMeta, FileSlice, StorageHandler};
 /// Generic over the inner iterator type and item type.
 /// The `event_fn` receives (duration, num_files, bytes_read) to construct the appropriate MetricEvent.
 /// Metrics are emitted either when the iterator is exhausted or when dropped.
-struct MetricsIterator<I, T>
-where
-    I: Iterator<Item = DeltaResult<T>>,
-{
+struct MetricsIterator<I, T> {
     inner: I,
     reporter: Option<Arc<dyn MetricsReporter>>,
     start: Instant,
     num_files: u64,
     bytes_read: u64,
-    metrics_emitted: bool,
     event_fn: fn(Duration, u64, u64) -> MetricEvent,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl<I, T> MetricsIterator<I, T>
-where
-    I: Iterator<Item = DeltaResult<T>>,
-{
+impl<I, T> MetricsIterator<I, T> {
     fn new(
         inner: I,
         reporter: Option<Arc<dyn MetricsReporter>>,
@@ -48,76 +44,70 @@ where
             start,
             num_files: 0,
             bytes_read: 0,
-            metrics_emitted: false,
             event_fn,
+            _phantom: std::marker::PhantomData,
         }
     }
 
     fn emit_metrics_once(&mut self) {
-        if !self.metrics_emitted {
-            self.reporter.as_ref().inspect(|r| {
-                r.report((self.event_fn)(
-                    self.start.elapsed(),
-                    self.num_files,
-                    self.bytes_read,
-                ));
-            });
-            self.metrics_emitted = true;
+        if let Some(r) = self.reporter.take() {
+            r.report((self.event_fn)(
+                self.start.elapsed(),
+                self.num_files,
+                self.bytes_read,
+            ));
         }
     }
 }
 
-impl<I> Iterator for MetricsIterator<I, FileMeta>
-where
-    I: Iterator<Item = DeltaResult<FileMeta>>,
-{
-    type Item = DeltaResult<FileMeta>;
+impl<I, T> Drop for MetricsIterator<I, T> {
+    fn drop(&mut self) {
+        self.emit_metrics_once();
+    }
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next() {
+impl<I> Stream for MetricsIterator<I, FileMeta>
+where
+    I: Stream<Item = DeltaResult<FileMeta>> + Unpin,
+{
+    type Item = I::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
             Some(item) => {
                 if item.is_ok() {
                     self.num_files += 1;
                 }
-                Some(item)
+                Poll::Ready(Some(item))
             }
             None => {
                 self.emit_metrics_once();
-                None
+                Poll::Ready(None)
             }
         }
     }
 }
 
-impl<I> Iterator for MetricsIterator<I, Bytes>
+impl<I> Stream for MetricsIterator<I, Bytes>
 where
-    I: Iterator<Item = DeltaResult<Bytes>>,
+    I: Stream<Item = DeltaResult<Bytes>> + Unpin,
 {
-    type Item = DeltaResult<Bytes>;
+    type Item = I::Item;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next() {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match futures::ready!(Pin::new(&mut self.inner).poll_next(cx)) {
             Some(item) => {
                 if let Ok(ref bytes) = item {
                     self.num_files += 1;
                     self.bytes_read += bytes.len() as u64;
                 }
-                Some(item)
+                Poll::Ready(Some(item))
             }
             None => {
                 self.emit_metrics_once();
-                None
+                Poll::Ready(None)
             }
         }
-    }
-}
-
-impl<I, T> Drop for MetricsIterator<I, T>
-where
-    I: Iterator<Item = DeltaResult<T>>,
-{
-    fn drop(&mut self) {
-        self.emit_metrics_once();
     }
 }
 
@@ -151,105 +141,187 @@ impl<E: TaskExecutor> ObjectStoreStorageHandler<E> {
     }
 }
 
+/// Native async implementation for list_from
+async fn list_from_impl(
+    store: Arc<DynObjectStore>,
+    path: Url,
+    reporter: Option<Arc<dyn MetricsReporter>>,
+) -> DeltaResult<BoxStream<'static, DeltaResult<FileMeta>>> {
+    let start = Instant::now();
+
+    // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
+    // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
+    // because it strips trailing /, so we're reduced to manually checking the original URL.
+    let offset = Path::from_url_path(path.path())?;
+    let prefix = if path.path().ends_with('/') {
+        offset.clone()
+    } else {
+        let mut parts = offset.parts().collect_vec();
+        if parts.pop().is_none() {
+            return Err(Error::Generic(format!(
+                "Offset path must not be a root directory. Got: '{path}'",
+            )));
+        }
+        Path::from_iter(parts)
+    };
+
+    // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
+    // local filesystem doesn't return a sorted list by default. Although the `object_store`
+    // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
+    // implementations actually do:
+    // - AWS:
+    //   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
+    //   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
+    //   order based on their key names." (Directory buckets are out of scope for now)
+    // - Azure: Docs state
+    //   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
+    //   "A listing operation returns an XML response that contains all or part of the requested
+    //   list. The operation returns entities in alphabetical order."
+    // - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
+    //   doesn't indicate order, but [this
+    //   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
+    //   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
+    //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
+    // So we just need to know if we're local and then if so, we sort the returned file list
+    let has_ordered_listing = path.scheme() != "file";
+
+    let stream = store
+        .list_with_offset(Some(&prefix), &offset)
+        .map(move |meta| {
+            let meta = meta?;
+            let mut location = path.clone();
+            location.set_path(&format!("/{}", meta.location.as_ref()));
+            Ok(FileMeta {
+                location,
+                last_modified: meta.last_modified.timestamp_millis(),
+                size: meta.size,
+            })
+        });
+
+    if !has_ordered_listing {
+        // Local filesystem doesn't return sorted list - need to collect and sort
+        let mut items: Vec<_> = stream.try_collect().await?;
+        items.sort_unstable();
+
+        if let Some(r) = reporter {
+            r.report(MetricEvent::StorageListCompleted {
+                duration: start.elapsed(),
+                num_files: items.len() as u64,
+            });
+        }
+        Ok(Box::pin(stream::iter(items.into_iter().map(Ok))))
+    } else {
+        let stream = MetricsIterator::new(
+            stream,
+            reporter,
+            start,
+            |duration, num_files, _bytes_read| MetricEvent::StorageListCompleted {
+                duration,
+                num_files,
+            },
+        );
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Native async implementation for read_files
+async fn read_files_impl(
+    store: Arc<DynObjectStore>,
+    files: Vec<FileSlice>,
+    readahead: usize,
+    reporter: Option<Arc<dyn MetricsReporter>>,
+) -> DeltaResult<BoxStream<'static, DeltaResult<Bytes>>> {
+    let start = Instant::now();
+    let files = stream::iter(files).map(move |(url, range)| {
+        let store = store.clone();
+        async move {
+            // Wasn't checking the scheme before calling to_file_path causing the url path to
+            // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
+            // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
+            // details about why this check is necessary
+            let path = if url.scheme() == "file" {
+                let file_path = url
+                    .to_file_path()
+                    .map_err(|_| Error::InvalidTableLocation(format!("Invalid file URL: {url}")))?;
+                Path::from_absolute_path(file_path)
+                    .map_err(|e| Error::InvalidTableLocation(format!("Invalid file path: {e}")))?
+            } else {
+                Path::from(url.path())
+            };
+            if url.is_presigned() {
+                // have to annotate type here or rustc can't figure it out
+                Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
+            } else if let Some(rng) = range {
+                Ok(store.get_range(&path, rng).await?)
+            } else {
+                let result = store.get(&path).await?;
+                Ok(result.bytes().await?)
+            }
+        }
+    });
+
+    // We allow executing up to `readahead` futures concurrently and
+    // buffer the results. This allows us to achieve async concurrency.
+    Ok(Box::pin(MetricsIterator::new(
+        files.buffered(readahead),
+        reporter,
+        start,
+        |duration, num_files, bytes_read| MetricEvent::StorageReadCompleted {
+            duration,
+            num_files,
+            bytes_read,
+        },
+    )))
+}
+
+/// Native async implementation for copy_atomic
+async fn copy_atomic_impl(
+    store: Arc<DynObjectStore>,
+    src_path: Path,
+    dest_path: Path,
+    reporter: Option<Arc<dyn MetricsReporter>>,
+) -> DeltaResult<()> {
+    let start = Instant::now();
+
+    // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
+    // necessarily atomic, but since the source file is immutable, we aren't exposed to the
+    // possibility of source file changing while we do the PUT.
+    let data = store.get(&src_path).await?.bytes().await?;
+    let result = store
+        .put_opts(&dest_path, data.into(), PutMode::Create.into())
+        .await;
+
+    if let Some(r) = reporter {
+        r.report(MetricEvent::StorageCopyCompleted {
+            duration: start.elapsed(),
+        });
+    }
+
+    result.map_err(|e| match e {
+        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(dest_path.into()),
+        e => e.into(),
+    })?;
+    Ok(())
+}
+
+/// Native async implementation for head
+async fn head_impl(store: Arc<DynObjectStore>, url: Url) -> DeltaResult<FileMeta> {
+    let meta = store.head(&Path::from_url_path(url.path())?).await?;
+    Ok(FileMeta {
+        location: url,
+        last_modified: meta.last_modified.timestamp_millis(),
+        size: meta.size,
+    })
+}
+
 impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
     fn list_from(
         &self,
         path: &Url,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<FileMeta>>>> {
-        let start = Instant::now();
-        // The offset is used for list-after; the prefix is used to restrict the listing to a specific directory.
-        // Unfortunately, `Path` provides no easy way to check whether a name is directory-like,
-        // because it strips trailing /, so we're reduced to manually checking the original URL.
-        let offset = Path::from_url_path(path.path())?;
-        let prefix = if path.path().ends_with('/') {
-            offset.clone()
-        } else {
-            let mut parts = offset.parts().collect_vec();
-            if parts.pop().is_none() {
-                return Err(Error::Generic(format!(
-                    "Offset path must not be a root directory. Got: '{}'",
-                    path.as_str()
-                )));
-            }
-            Path::from_iter(parts)
-        };
-
-        let store = self.inner.clone();
-
-        // HACK to check if we're using a LocalFileSystem from ObjectStore. We need this because
-        // local filesystem doesn't return a sorted list by default. Although the `object_store`
-        // crate explicitly says it _does not_ return a sorted listing, in practice all the cloud
-        // implementations actually do:
-        // - AWS:
-        //   [`ListObjectsV2`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
-        //   states: "For general purpose buckets, ListObjectsV2 returns objects in lexicographical
-        //   order based on their key names." (Directory buckets are out of scope for now)
-        // - Azure: Docs state
-        //   [here](https://learn.microsoft.com/en-us/rest/api/storageservices/enumerating-blob-resources):
-        //   "A listing operation returns an XML response that contains all or part of the requested
-        //   list. The operation returns entities in alphabetical order."
-        // - GCP: The [main](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) doc
-        //   doesn't indicate order, but [this
-        //   page](https://cloud.google.com/storage/docs/xml-api/get-bucket-list) does say: "This page
-        //   shows you how to list the [objects](https://cloud.google.com/storage/docs/objects) stored
-        //   in your Cloud Storage buckets, which are ordered in the list lexicographically by name."
-        // So we just need to know if we're local and then if so, we sort the returned file list
-        let has_ordered_listing = path.scheme() != "file";
-
-        // This channel will become the iterator
-        let (sender, receiver) = std::sync::mpsc::sync_channel(4_000);
-        let url = path.clone();
-        self.task_executor.spawn(async move {
-            let mut stream = store.list_with_offset(Some(&prefix), &offset);
-
-            while let Some(meta) = stream.next().await {
-                match meta {
-                    Ok(meta) => {
-                        let mut location = url.clone();
-                        location.set_path(&format!("/{}", meta.location.as_ref()));
-                        sender
-                            .send(Ok(FileMeta {
-                                location,
-                                last_modified: meta.last_modified.timestamp_millis(),
-                                size: meta.size,
-                            }))
-                            .ok();
-                    }
-                    Err(e) => {
-                        sender.send(Err(e.into())).ok();
-                    }
-                }
-            }
-        });
-
-        let reporter = self.reporter.clone();
-
-        if !has_ordered_listing {
-            // This FS doesn't return things in the order we require
-            let mut fms: Vec<FileMeta> = receiver.into_iter().try_collect()?;
-            fms.sort_unstable();
-
-            let num_files = fms.len() as u64;
-            let storage_list_duration = start.elapsed();
-            reporter.as_ref().inspect(|r| {
-                r.report(MetricEvent::StorageListCompleted {
-                    duration: storage_list_duration,
-                    num_files,
-                });
-            });
-
-            Ok(Box::new(fms.into_iter().map(Ok)))
-        } else {
-            Ok(Box::new(MetricsIterator::new(
-                receiver.into_iter(),
-                reporter,
-                start,
-                |duration, num_files, _bytes_read| MetricEvent::StorageListCompleted {
-                    duration,
-                    num_files,
-                },
-            )))
-        }
+        let future = list_from_impl(self.inner.clone(), path.clone(), self.reporter.clone());
+        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        Ok(iter) // type coercion drops the unneeded Send bound
     }
 
     /// Read data specified by the start and end offset from the file.
@@ -262,116 +334,31 @@ impl<E: TaskExecutor> StorageHandler for ObjectStoreStorageHandler<E> {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>> {
-        let start = Instant::now();
-        let store = self.inner.clone();
-
-        // This channel will become the output iterator.
-        // Because there will already be buffering in the stream, we set the
-        // buffer size to 0.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
-
-        self.task_executor.spawn(
-            futures::stream::iter(files)
-                .map(move |(url, range)| {
-                    let store = store.clone();
-                    async move {
-                        // Wasn't checking the scheme before calling to_file_path causing the url path to
-                        // be eaten in a strange way. Now, if not a file scheme, just blindly convert to a path.
-                        // https://docs.rs/url/latest/url/struct.Url.html#method.to_file_path has more
-                        // details about why this check is necessary
-                        let path = if url.scheme() == "file" {
-                            let file_path = url.to_file_path().map_err(|_| {
-                                Error::InvalidTableLocation(format!("Invalid file URL: {url}"))
-                            })?;
-                            Path::from_absolute_path(file_path).map_err(|e| {
-                                Error::InvalidTableLocation(format!("Invalid file path: {e}"))
-                            })?
-                        } else {
-                            Path::from(url.path())
-                        };
-                        if url.is_presigned() {
-                            // have to annotate type here or rustc can't figure it out
-                            Ok::<bytes::Bytes, Error>(reqwest::get(url).await?.bytes().await?)
-                        } else if let Some(rng) = range {
-                            Ok(store.get_range(&path, rng).await?)
-                        } else {
-                            let result = store.get(&path).await?;
-                            Ok(result.bytes().await?)
-                        }
-                    }
-                })
-                // We allow executing up to `readahead` futures concurrently and
-                // buffer the results. This allows us to achieve async concurrency
-                // within a synchronous method.
-                .buffered(self.readahead)
-                .for_each(move |res| {
-                    sender.send(res).ok();
-                    futures::future::ready(())
-                }),
-        );
-
-        Ok(Box::new(MetricsIterator::new(
-            receiver.into_iter(),
+        let future = read_files_impl(
+            self.inner.clone(),
+            files,
+            self.readahead,
             self.reporter.clone(),
-            start,
-            |duration, num_files, bytes_read| MetricEvent::StorageReadCompleted {
-                duration,
-                num_files,
-                bytes_read,
-            },
-        )))
+        );
+        let iter = super::stream_future_to_iter(self.task_executor.clone(), future)?;
+        Ok(iter) // type coercion drops the unneeded Send bound
     }
 
     fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()> {
-        let start = Instant::now();
         let src_path = Path::from_url_path(src.path())?;
         let dest_path = Path::from_url_path(dest.path())?;
-        let dest_path_str = dest_path.to_string();
-        let store = self.inner.clone();
-
-        // Read source file then write atomically with PutMode::Create. Note that a GET/PUT is not
-        // necessarily atomic, but since the source file is immutable, we aren't exposed to the
-        // possiblilty of source file changing while we do the PUT.
-        let result = self.task_executor.block_on(async move {
-            let data = store.get(&src_path).await?.bytes().await?;
-
-            store
-                .put_opts(&dest_path, data.into(), PutMode::Create.into())
-                .await
-                .map_err(|e| match e {
-                    object_store::Error::AlreadyExists { .. } => {
-                        Error::FileAlreadyExists(dest_path_str)
-                    }
-                    e => e.into(),
-                })?;
-            Ok(())
-        });
-        let copy_atomic_duration = start.elapsed();
-
-        self.reporter.as_ref().inspect(|r| {
-            r.report(MetricEvent::StorageCopyCompleted {
-                duration: copy_atomic_duration,
-            });
-        });
-
-        result
+        let future = copy_atomic_impl(
+            self.inner.clone(),
+            src_path,
+            dest_path,
+            self.reporter.clone(),
+        );
+        self.task_executor.block_on(future)
     }
 
     fn head(&self, path: &Url) -> DeltaResult<FileMeta> {
-        let store = self.inner.clone();
-        let url = path.clone();
-        let path = Path::from_url_path(path.path())?;
-        self.task_executor.block_on(async move {
-            store
-                .head(&path)
-                .await
-                .map_err(Into::into)
-                .map(|meta| FileMeta {
-                    location: url,
-                    last_modified: meta.last_modified.timestamp_millis(),
-                    size: meta.size,
-                })
-        })
+        let future = head_impl(self.inner.clone(), path.clone());
+        self.task_executor.block_on(future)
     }
 }
 
