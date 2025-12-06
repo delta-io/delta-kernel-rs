@@ -26,8 +26,8 @@ use tracing::debug;
 
 /// The subset of file action fields that uniquely identifies it in the log, used for deduplication
 /// of adds and removes during log replay.
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub(crate) struct FileActionKey {
+#[derive(Debug, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize, Clone)]
+pub struct FileActionKey {
     pub(crate) path: String,
     pub(crate) dv_unique_id: Option<String>,
 }
