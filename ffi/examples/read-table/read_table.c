@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -170,6 +171,199 @@ void free_partition_list(PartitionList* list) {
   free(list);
 }
 
+
+// Our schema code might add (is nullable: x) to names, which we need to strip off.
+// Returns the location where the edit was made if one was made, or NULL if no edit
+char* fixup_name(char* name) {
+  char *s = name;
+  char found_paren = 0;
+  while (*s) {
+    if (*s == '(') {
+      *(s-1) = '\0';
+      found_paren = 1;
+      break;
+    }
+    s++;
+  }
+  if (found_paren) {
+    return s-1;
+  } else {
+    return NULL;
+  }
+}
+
+// This function looks at the type field in the schema to figure out which visitor to call. It's a
+// bit gross as the schema code is string based, a real implementation would have a more robust way
+// to represent a schema.
+uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, CSchema *cschema) {
+  print_diag("Visiting schema item %s (%s)\n", item->name, item->type);
+  KernelStringSlice name = { item->name, strlen(item->name) };
+  ExternResultusize visit_res;
+  if (strcmp(item->type, "string") == 0) {
+    visit_res = visit_field_string(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "integer") == 0) {
+    visit_res = visit_field_integer(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "short") == 0) {
+    visit_res = visit_field_short(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "byte") == 0) {
+    visit_res = visit_field_byte(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "long") == 0) {
+    visit_res = visit_field_long(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "float") == 0) {
+    visit_res = visit_field_float(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "double") == 0) {
+    visit_res = visit_field_double(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "boolean") == 0) {
+    visit_res = visit_field_boolean(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "binary") == 0) {
+    visit_res = visit_field_binary(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "date") == 0) {
+    visit_res = visit_field_date(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "timestamp") == 0) {
+    visit_res = visit_field_timestamp(state, name, false, allocate_error);
+  } else if (strcmp(item->type, "timestamp_ntz") == 0) {
+    visit_res = visit_field_double(state, name, false, allocate_error);
+  } else if (strncmp(item->type, "decimal", 7) == 0) {
+    unsigned int precision;
+    int scale;
+    sscanf(item->type, "decimal(%u)(%d)", &precision, &scale);
+    visit_res = visit_field_decimal(state, name, precision, scale, false, allocate_error);
+  } else if (strcmp(item->type, "array") == 0) {
+    SchemaItemList child_list = cschema->builder->lists[item->children];
+    // an array should always have 1 child
+    if (child_list.len != 1) {
+      printf("[ERROR] Invalid array child list");
+      return 0;
+    }
+    uintptr_t child_visit_id = visit_schema_item(&child_list.list[0], state, cschema);
+    if (child_visit_id == 0) {
+      // previous visit will have printed the issue
+      return 0;
+    }
+    visit_res = visit_field_array(state, name, child_visit_id, false, allocate_error);
+  } else if (strcmp(item->type, "map") == 0) {
+    SchemaItemList child_list = cschema->builder->lists[item->children];
+    // an map should always have 2 children
+    if (child_list.len != 2) {
+      printf("[ERROR] Invalid map child list");
+      return 0;
+    }
+    uintptr_t key_visit_id = visit_schema_item(&child_list.list[0], state, cschema);
+    if (key_visit_id == 0) {
+      // previous visit will have printed the issue
+      return 0;
+    }
+    uintptr_t val_visit_id = visit_schema_item(&child_list.list[1], state, cschema);
+    if (val_visit_id == 0) {
+      // previous visit will have printed the issue
+      return 0;
+    }
+    visit_res = visit_field_map(state, name, key_visit_id, val_visit_id, false, allocate_error);
+  } else if (strcmp(item->type, "struct") == 0) {
+    SchemaItemList child_list = cschema->builder->lists[item->children];
+    uintptr_t child_visit_ids[child_list.len];
+    for (uint32_t i = 0; i < child_list.len; i++) {
+      // visit all the children
+      SchemaItem *item = &child_list.list[i];
+      char* fixup_loc = fixup_name(item->name);
+      uintptr_t child_id = visit_schema_item(item, state, cschema);
+      if (fixup_loc != NULL) {
+        *fixup_loc = ' ';
+      }
+      child_visit_ids[i] = child_id;
+    }
+    visit_res = visit_field_struct(
+      state,
+      name,
+      child_visit_ids,
+      child_list.len,
+      false,
+      allocate_error);
+  } else {
+    printf("[ERROR] Can't visit unknown type: %s\n", item->type);
+    return 0;
+  }
+
+  if (visit_res.tag != Okusize) {
+    print_error("Could not visit field", (Error*)visit_res.err);
+    return 0;
+  }
+  return visit_res.ok;
+}
+
+typedef struct {
+  CSchema* cschema;
+  char* requested_cols;
+} RequestedSchemaSpec;
+
+// This is the function kernel will call asking it to visit the schema in requested_spec
+uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *state) {
+  RequestedSchemaSpec *spec = (RequestedSchemaSpec*)requested_spec;
+  print_diag("Asked to visit: %s\n", spec->requested_cols);
+
+  // figure out how many columns we are requesting. will be number of commas + 1
+  int col_count = 1;
+  char* s = spec->requested_cols;
+  while (*s) {
+    if (*s == ',') {
+      col_count++;
+    }
+    s++;
+  }
+
+  uintptr_t cols[col_count];
+  int col_index = 0;
+
+  CSchema* cschema = spec->cschema;
+  SchemaItemList* top_level_list = &cschema->builder->lists[cschema->list_id];
+
+  char* col = strtok(spec->requested_cols, ",");
+
+  while (col != NULL) {
+    print_diag("Visiting requested col: %s\n", col);
+    char found_col = 0;
+    for (uint32_t i = 0; i < top_level_list->len; i++) {
+      SchemaItem* item = &top_level_list->list[i];
+      char* fixup_loc = fixup_name(item->name);
+      if (strcmp(item->name, col) == 0) {
+        found_col = 1;
+        uintptr_t col_id = visit_schema_item(item, state, cschema);
+        if (col_id == 0) {
+          // error will have been printed above
+          return 0;
+        }
+        cols[col_index++] = col_id;
+      }
+      if (fixup_loc != NULL) {
+        *fixup_loc = ' ';
+      }
+      if (found_col) {
+        break;
+      }
+    }
+    if (!found_col) {
+      printf("[ERROR] No such column in table: %s\n", col);
+      return 0;
+    }
+    col = strtok(NULL, ",");
+  }
+
+  KernelStringSlice name = { "s", 1 }; // name doesn't matter
+  ExternResultusize visit_res = visit_field_struct(
+    state,
+    name,
+    cols,
+    col_index,
+    false,
+    allocate_error);
+
+  if (visit_res.tag != Okusize) {
+    print_error("Could not visit top_level schema", (Error*)visit_res.err);
+    return 0;
+  }
+  return visit_res.ok;
+}
+
 static const char *LEVEL_STRING[] = {
   "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -219,10 +413,38 @@ void log_line_callback(KernelStringSlice line) {
 
 int main(int argc, char* argv[])
 {
-  if (argc < 2) {
-    printf("Usage: %s table/path\n", argv[0]);
+  char* requested_cols = NULL;
+  int c;
+  while ((c = getopt (argc, argv, "c:")) != -1) {
+    switch (c) {
+    case 'c':
+      requested_cols = optarg;
+      break;
+    case '?':
+      if (optopt == 'c') {
+        fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+      }
+      else if (isprint(optopt)) {
+        fprintf (stderr, "Unknown option `-%c'.\n", optopt);
+      }
+      else {
+        fprintf (stderr,
+                 "Unknown option character `\\x%x'.\n",
+                 optopt);
+      }
+      return 1;
+    default:
+      abort ();
+    }
+  }
+
+  if (optind != (argc - 1)) {
+    printf("Usage: %s [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
     return -1;
   }
+
+  char* table_path = argv[optind];
+  printf("Reading table at %s\n", table_path);
 
 #ifdef VERBOSE
   enable_event_tracing(tracing_callback, TRACE);
@@ -231,9 +453,6 @@ int main(int argc, char* argv[])
 #else
   enable_event_tracing(tracing_callback, INFO);
 #endif
-
-  char* table_path = argv[1];
-  printf("Reading table at %s\n", table_path);
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
@@ -276,7 +495,9 @@ int main(int argc, char* argv[])
 
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
-  print_schema(snapshot);
+
+  CSchema *cschema = get_cschema(snapshot);
+  print_cschema(cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -285,9 +506,37 @@ int main(int argc, char* argv[])
 
   print_diag("Starting table scan\n\n");
 
-  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
+  EngineSchema* engine_schema = NULL;
+  RequestedSchemaSpec *spec = NULL;
+  if (requested_cols != NULL) {
+    print_diag("Selecting columns: [%s]\n", requested_cols);
+    engine_schema = malloc(sizeof(EngineSchema));
+    spec = malloc(sizeof(RequestedSchemaSpec));
+    spec->cschema = cschema;
+    spec->requested_cols = requested_cols;
+    engine_schema->schema = spec;
+    engine_schema->visitor = visit_requested_spec;
+  }
+
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, engine_schema);
+
+  if (engine_schema != NULL) {
+    free(engine_schema);
+  }
+
+  if (spec != NULL) {
+    free(spec);
+  }
+
+  free_cschema(cschema);
+
   if (scan_res.tag != OkHandleSharedScan) {
-    printf("Failed to create scan\n");
+    print_error("Failed to create scan", (Error*)scan_res.err);
+    free_error((Error*)scan_res.err);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    free(table_root);
+    free_partition_list(partition_cols);
     return -1;
   }
 
