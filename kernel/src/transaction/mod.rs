@@ -26,7 +26,7 @@ use crate::scan::log_replay::{
 use crate::scan::scan_row_schema;
 use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::table_features::Operation;
+use crate::table_features::{Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
@@ -462,7 +462,7 @@ impl Transaction {
             && !self
                 .read_snapshot
                 .table_configuration()
-                .is_domain_metadata_supported()
+                .is_feature_supported(&TableFeature::DomainMetadata)
         {
             return Err(Error::unsupported("Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"));
         }
