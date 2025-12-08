@@ -705,12 +705,21 @@ pub trait ParquetHandler: AsAny {
     ///
     /// # Parameters
     ///
-    /// - `file` - File metadata for the Parquet file whose schema should be read.
+    /// - `file` - File metadata for the Parquet file whose schema should be read. The `size` field
+    ///   should contain the actual file size to enable efficient footer reads without additional
+    ///   I/O operations.
     ///
     /// # Returns
     ///
     /// A [`DeltaResult`] containing a [`SchemaRef`] representing the Parquet file's schema,
     /// converted to Delta Kernel's schema format.
+    ///
+    /// # Field IDs
+    ///
+    /// If the Parquet file contains field IDs (written when column mapping is enabled), they are
+    /// preserved in each [`StructField`]'s metadata under the key `"PARQUET:field_id"`. Callers
+    /// can access field IDs via [`StructField::get_config_value`] with
+    /// [`ColumnMetadataKey::ParquetFieldId`].
     ///
     /// # Errors
     ///
@@ -719,6 +728,10 @@ pub trait ParquetHandler: AsAny {
     /// - The file is not a valid Parquet file
     /// - The footer cannot be read or parsed
     /// - The schema cannot be converted to Delta Kernel's format
+    ///
+    /// [`StructField`]: crate::schema::StructField
+    /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
     fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef>;
 }
 

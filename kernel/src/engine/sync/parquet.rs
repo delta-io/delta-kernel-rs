@@ -86,57 +86,101 @@ mod tests {
 
     #[test]
     fn test_sync_get_parquet_schema() -> DeltaResult<()> {
+        use crate::schema::{DataType, PrimitiveType};
+
         let handler = SyncParquetHandler;
 
-        // Use a checkpoint parquet file
+        // Use a checkpoint parquet file.
+        // Note: This test file does not have Parquet field IDs (column mapping is not enabled).
+        // When field IDs are present, they are preserved in StructField metadata under
+        // "PARQUET:field_id" and can be accessed via ColumnMetadataKey::ParquetFieldId.
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
         ))?;
+        let file_size = std::fs::metadata(&path)?.len();
         let url = Url::from_file_path(path).unwrap();
 
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         // Get the schema
         let schema = handler.get_parquet_schema(&file_meta)?;
 
-        // Verify the schema has fields
-        assert!(
-            schema.fields().count() > 0,
-            "Schema should have at least one field"
-        );
+        // Helper to get a field by name from a struct type
+        let get_field = |struct_type: &crate::schema::StructType, name: &str| {
+            struct_type
+                .fields()
+                .find(|f| f.name() == name)
+                .unwrap_or_else(|| panic!("Field '{}' not found", name))
+                .clone()
+        };
 
-        // Verify this is a checkpoint schema with expected fields
-        let field_names: Vec<&String> = schema.fields().map(|f| f.name()).collect();
-        assert!(
-            field_names.iter().any(|&name| name == "txn"),
-            "Checkpoint should have 'txn' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "add"),
-            "Checkpoint should have 'add' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "remove"),
-            "Checkpoint should have 'remove' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "metaData"),
-            "Checkpoint should have 'metaData' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "protocol"),
-            "Checkpoint should have 'protocol' field"
-        );
-
-        // Verify we can access field properties
-        for field in schema.fields() {
-            assert!(!field.name().is_empty(), "Field name should not be empty");
-            let _data_type = field.data_type(); // Should not panic
+        // Verify top-level checkpoint action fields exist and are structs
+        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
+        for field_name in top_level_fields {
+            let field = get_field(&schema, field_name);
+            assert!(
+                matches!(field.data_type(), DataType::Struct(_)),
+                "Field '{}' should be a struct type",
+                field_name
+            );
         }
+
+        // Verify 'add' struct has expected nested fields with correct types
+        let add_field = get_field(&schema, "add");
+        let add_struct = match add_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'add' should be a struct"),
+        };
+        assert_eq!(
+            get_field(add_struct, "path").data_type(),
+            &DataType::Primitive(PrimitiveType::String)
+        );
+        assert_eq!(
+            get_field(add_struct, "size").data_type(),
+            &DataType::Primitive(PrimitiveType::Long)
+        );
+        assert!(
+            matches!(
+                get_field(add_struct, "partitionValues").data_type(),
+                DataType::Map(_)
+            ),
+            "'partitionValues' should be a map type"
+        );
+
+        // Verify 'metaData' struct has nested 'format' struct
+        let metadata_field = get_field(&schema, "metaData");
+        let metadata_struct = match metadata_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'metaData' should be a struct"),
+        };
+        let format_field = get_field(metadata_struct, "format");
+        let format_struct = match format_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'format' should be a struct"),
+        };
+        assert_eq!(
+            get_field(format_struct, "provider").data_type(),
+            &DataType::Primitive(PrimitiveType::String)
+        );
+
+        // Verify 'protocol' struct has correct primitive types
+        let protocol_field = get_field(&schema, "protocol");
+        let protocol_struct = match protocol_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'protocol' should be a struct"),
+        };
+        assert_eq!(
+            get_field(protocol_struct, "minReaderVersion").data_type(),
+            &DataType::Primitive(PrimitiveType::Integer)
+        );
+        assert_eq!(
+            get_field(protocol_struct, "minWriterVersion").data_type(),
+            &DataType::Primitive(PrimitiveType::Integer)
+        );
 
         Ok(())
     }

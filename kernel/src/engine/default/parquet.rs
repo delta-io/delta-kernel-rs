@@ -249,30 +249,32 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
         let store = self.store.clone();
         let location = file.location.clone();
+        let file_size = file.size;
 
         self.task_executor.block_on(async move {
-            let arrow_schema =
-                if location.is_presigned() {
-                    // Handle presigned URLs by fetching the file via HTTP
-                    let client = reqwest::Client::new();
-                    let response = client.get(location.as_str()).send().await.map_err(|e| {
+            let arrow_schema = if location.is_presigned() {
+                // Handle presigned URLs by fetching the file via HTTP
+                let client = reqwest::Client::new();
+                let response =
+                    client.get(location.as_str()).send().await.map_err(|e| {
                         Error::generic(format!("Failed to fetch presigned URL: {}", e))
                     })?;
-                    let bytes = response.bytes().await.map_err(|e| {
-                        Error::generic(format!("Failed to read response bytes: {}", e))
-                    })?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
 
-                    // Load metadata from bytes
-                    let metadata = ArrowReaderMetadata::load(&bytes, Default::default())?;
-                    metadata.schema().clone()
-                } else {
-                    // Handle object store paths
-                    let path = Path::from_url_path(location.path())?;
-                    let mut reader = ParquetObjectReader::new(store, path);
-                    let metadata =
-                        ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
-                    metadata.schema().clone()
-                };
+                // Load metadata from bytes
+                let metadata = ArrowReaderMetadata::load(&bytes, Default::default())?;
+                metadata.schema().clone()
+            } else {
+                // Handle object store paths
+                let path = Path::from_url_path(location.path())?;
+                let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
+                let metadata =
+                    ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
+                metadata.schema().clone()
+            };
 
             // Convert Arrow schema to Kernel schema
             StructType::try_from_arrow(arrow_schema.as_ref())
@@ -679,59 +681,103 @@ mod tests {
 
     #[test]
     fn test_get_parquet_schema() {
+        use crate::schema::{DataType, PrimitiveType};
+
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-        // Use a checkpoint parquet file
+        // Use a checkpoint parquet file.
+        // Note: This test file does not have Parquet field IDs (column mapping is not enabled).
+        // When field IDs are present, they are preserved in StructField metadata under
+        // "PARQUET:field_id" and can be accessed via ColumnMetadataKey::ParquetFieldId.
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
         ))
         .unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
         let url = Url::from_file_path(path).unwrap();
 
         let file_meta = FileMeta {
             location: url,
             last_modified: 0,
-            size: 0,
+            size: file_size,
         };
 
         // Get the schema
         let schema = handler.get_parquet_schema(&file_meta).unwrap();
 
-        // Verify the schema has fields
-        assert!(
-            schema.fields().count() > 0,
-            "Schema should have at least one field"
-        );
+        // Helper to get a field by name from a struct type
+        let get_field = |struct_type: &crate::schema::StructType, name: &str| {
+            struct_type
+                .fields()
+                .find(|f| f.name() == name)
+                .unwrap_or_else(|| panic!("Field '{}' not found", name))
+                .clone()
+        };
 
-        // Verify this is a checkpoint schema with expected fields
-        let field_names: Vec<&String> = schema.fields().map(|f| f.name()).collect();
-        assert!(
-            field_names.iter().any(|&name| name == "txn"),
-            "Checkpoint should have 'txn' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "add"),
-            "Checkpoint should have 'add' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "remove"),
-            "Checkpoint should have 'remove' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "metaData"),
-            "Checkpoint should have 'metaData' field"
-        );
-        assert!(
-            field_names.iter().any(|&name| name == "protocol"),
-            "Checkpoint should have 'protocol' field"
-        );
-
-        // Verify we can access field properties
-        for field in schema.fields() {
-            assert!(!field.name().is_empty(), "Field name should not be empty");
-            let _data_type = field.data_type(); // Should not panic
+        // Verify top-level checkpoint action fields exist and are structs
+        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
+        for field_name in top_level_fields {
+            let field = get_field(&schema, field_name);
+            assert!(
+                matches!(field.data_type(), DataType::Struct(_)),
+                "Field '{}' should be a struct type",
+                field_name
+            );
         }
+
+        // Verify 'add' struct has expected nested fields with correct types
+        let add_field = get_field(&schema, "add");
+        let add_struct = match add_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'add' should be a struct"),
+        };
+        assert_eq!(
+            get_field(add_struct, "path").data_type(),
+            &DataType::Primitive(PrimitiveType::String)
+        );
+        assert_eq!(
+            get_field(add_struct, "size").data_type(),
+            &DataType::Primitive(PrimitiveType::Long)
+        );
+        assert!(
+            matches!(
+                get_field(add_struct, "partitionValues").data_type(),
+                DataType::Map(_)
+            ),
+            "'partitionValues' should be a map type"
+        );
+
+        // Verify 'metaData' struct has nested 'format' struct
+        let metadata_field = get_field(&schema, "metaData");
+        let metadata_struct = match metadata_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'metaData' should be a struct"),
+        };
+        let format_field = get_field(metadata_struct, "format");
+        let format_struct = match format_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'format' should be a struct"),
+        };
+        assert_eq!(
+            get_field(format_struct, "provider").data_type(),
+            &DataType::Primitive(PrimitiveType::String)
+        );
+
+        // Verify 'protocol' struct has correct primitive types
+        let protocol_field = get_field(&schema, "protocol");
+        let protocol_struct = match protocol_field.data_type() {
+            DataType::Struct(s) => s,
+            _ => panic!("'protocol' should be a struct"),
+        };
+        assert_eq!(
+            get_field(protocol_struct, "minReaderVersion").data_type(),
+            &DataType::Primitive(PrimitiveType::Integer)
+        );
+        assert_eq!(
+            get_field(protocol_struct, "minWriterVersion").data_type(),
+            &DataType::Primitive(PrimitiveType::Integer)
+        );
     }
 
     #[test]
@@ -751,5 +797,50 @@ mod tests {
 
         let result = handler.get_parquet_schema(&file_meta);
         assert!(result.is_err(), "Should error on non-existent file");
+    }
+
+    #[test]
+    fn test_get_parquet_schema_preserves_field_ids() {
+        use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        // Use a parquet file from acceptance tests with column mapping enabled.
+        // This table has simpler types (string, long, date) that convert cleanly.
+        let path = std::fs::canonicalize(PathBuf::from(
+            "../acceptance/tests/dat/out/reader_tests/generated/column_mapping/delta/part-00000-f94de347-a288-43fe-9ea3-257ef31d0382-c000.snappy.parquet",
+        ))
+        .unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let url = Url::from_file_path(path).unwrap();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+
+        let schema = handler.get_parquet_schema(&file_meta).unwrap();
+
+        // Verify that fields have field IDs preserved in metadata.
+        // In column mapping mode, parquet files are written with field IDs.
+        let mut found_field_ids = false;
+        for field in schema.fields() {
+            if let Some(field_id) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
+                found_field_ids = true;
+                // Verify field ID is a valid number
+                let id: i64 = field_id
+                    .to_string()
+                    .parse()
+                    .expect("Field ID should be a valid number");
+                assert!(id > 0, "Field ID should be positive");
+            }
+        }
+
+        assert!(
+            found_field_ids,
+            "Table with column mapping should have field IDs in parquet schema"
+        );
     }
 }
