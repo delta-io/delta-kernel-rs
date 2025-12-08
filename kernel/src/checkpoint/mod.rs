@@ -101,6 +101,7 @@ use crate::log_replay::LogReplayProcessor;
 use crate::path::ParsedLogPath;
 use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::snapshot::SnapshotRef;
+use crate::table_features::TableFeature;
 use crate::table_properties::TableProperties;
 use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, FileMeta};
 
@@ -232,7 +233,7 @@ impl CheckpointWriter {
         let is_v2_checkpoints_supported = self
             .snapshot
             .table_configuration()
-            .is_v2_checkpoint_write_supported();
+            .is_feature_supported(&TableFeature::V2Checkpoint);
 
         let actions = self.snapshot.log_segment().read_actions(
             engine,

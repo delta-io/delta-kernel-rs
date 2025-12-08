@@ -462,7 +462,7 @@ impl Transaction {
             && !self
                 .read_snapshot
                 .table_configuration()
-                .is_domain_metadata_supported()
+                .is_feature_supported(&TableFeature::DomainMetadata)
         {
             return Err(Error::unsupported("Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"));
         }
