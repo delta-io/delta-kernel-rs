@@ -57,22 +57,14 @@ impl ParquetHandler for SyncParquetHandler {
         read_files(files, schema, predicate, try_create_from_parquet)
     }
 
-    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
-        // Convert URL to file path
+    fn read_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
         let path = file
             .location
             .to_file_path()
             .map_err(|_| Error::generic("SyncEngine can only read local files"))?;
-
-        // Open the file
         let file = File::open(path)?;
-
-        // Load metadata from the file
         let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
-        let arrow_schema = metadata.schema();
-
-        // Convert Arrow schema to Kernel schema
-        StructType::try_from_arrow(arrow_schema.as_ref())
+        StructType::try_from_arrow(metadata.schema().as_ref())
             .map(Arc::new)
             .map_err(Error::Arrow)
     }
@@ -85,15 +77,10 @@ mod tests {
     use url::Url;
 
     #[test]
-    fn test_sync_get_parquet_schema() -> DeltaResult<()> {
+    fn test_sync_read_parquet_schema() -> DeltaResult<()> {
         use crate::schema::{DataType, PrimitiveType};
 
         let handler = SyncParquetHandler;
-
-        // Use a checkpoint parquet file.
-        // Note: This test file does not have Parquet field IDs (column mapping is not enabled).
-        // When field IDs are present, they are preserved in StructField metadata under
-        // "PARQUET:field_id" and can be accessed via ColumnMetadataKey::ParquetFieldId.
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
         ))?;
@@ -106,10 +93,8 @@ mod tests {
             size: file_size,
         };
 
-        // Get the schema
-        let schema = handler.get_parquet_schema(&file_meta)?;
+        let schema = handler.read_parquet_schema(&file_meta)?;
 
-        // Helper to get a field by name from a struct type
         let get_field = |struct_type: &crate::schema::StructType, name: &str| {
             struct_type
                 .fields()
@@ -118,7 +103,6 @@ mod tests {
                 .clone()
         };
 
-        // Verify top-level checkpoint action fields exist and are structs
         let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
         for field_name in top_level_fields {
             let field = get_field(&schema, field_name);
@@ -129,7 +113,6 @@ mod tests {
             );
         }
 
-        // Verify 'add' struct has expected nested fields with correct types
         let add_field = get_field(&schema, "add");
         let add_struct = match add_field.data_type() {
             DataType::Struct(s) => s,
@@ -151,7 +134,6 @@ mod tests {
             "'partitionValues' should be a map type"
         );
 
-        // Verify 'metaData' struct has nested 'format' struct
         let metadata_field = get_field(&schema, "metaData");
         let metadata_struct = match metadata_field.data_type() {
             DataType::Struct(s) => s,
@@ -167,7 +149,6 @@ mod tests {
             &DataType::Primitive(PrimitiveType::String)
         );
 
-        // Verify 'protocol' struct has correct primitive types
         let protocol_field = get_field(&schema, "protocol");
         let protocol_struct = match protocol_field.data_type() {
             DataType::Struct(s) => s,
@@ -186,10 +167,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_get_parquet_schema_invalid_file() {
+    fn test_sync_read_parquet_schema_invalid_file() {
         let handler = SyncParquetHandler;
 
-        // Test with a non-existent file
         let mut temp_path = std::env::temp_dir();
         temp_path.push("non_existent_file_for_sync_test.parquet");
         let url = Url::from_file_path(temp_path).unwrap();
@@ -199,7 +179,7 @@ mod tests {
             size: 0,
         };
 
-        let result = handler.get_parquet_schema(&file_meta);
+        let result = handler.read_parquet_schema(&file_meta);
         assert!(result.is_err(), "Should error on non-existent file");
     }
 }

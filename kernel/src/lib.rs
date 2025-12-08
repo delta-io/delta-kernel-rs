@@ -732,7 +732,7 @@ pub trait ParquetHandler: AsAny {
     /// [`StructField`]: crate::schema::StructField
     /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
-    fn get_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef>;
+    fn read_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
