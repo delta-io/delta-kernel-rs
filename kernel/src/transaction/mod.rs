@@ -532,17 +532,24 @@ impl Transaction {
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
-        // for now, we just pass through all the columns except partition columns.
-        // note this is _incorrect_ if table config deems we need partition columns.
         let partition_columns = self
             .read_snapshot
             .table_configuration()
             .metadata()
             .partition_columns();
         let schema = self.read_snapshot.schema();
+
+        // Check if materializePartitionColumns feature is enabled
+        let materialize_partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+
+        // If the materialize partition columns feature is enabled, pass through all columns in the
+        // schema. Otherwise, exclude partition columns.
         let fields = schema
             .fields()
-            .filter(|f| !partition_columns.contains(f.name()))
+            .filter(|f| materialize_partition_columns || !partition_columns.contains(f.name()))
             .map(|f| Expression::column([f.name()]));
         Expression::struct_from(fields)
     }
@@ -1169,6 +1176,112 @@ mod tests {
         assert!(
             physical_schema.contains("number"),
             "Physical schema should contain data column 'number'"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_materialize_partition_columns_in_write_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+
+        // Test 1: Use basic_partitioned table (without materializePartitionColumns feature)
+        // Partition columns should be excluded from the logical_to_physical expression
+        let path_without =
+            std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url_without = url::Url::from_directory_path(path_without).unwrap();
+        let snapshot_without = Snapshot::builder_for(url_without)
+            .at_version(0)
+            .build(&engine)?;
+
+        // Verify the table is partitioned by "letter" column
+        let partition_cols_without = snapshot_without
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        assert_eq!(partition_cols_without.len(), 1);
+        assert_eq!(partition_cols_without[0], "letter");
+
+        // Verify the table does not have the materializePartitionColumns feature
+        let has_feature_without = snapshot_without
+            .table_configuration()
+            .protocol()
+            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+        assert!(
+            !has_feature_without,
+            "basic_partitioned should not have materializePartitionColumns feature"
+        );
+
+        // Create a transaction and get write context
+        let txn_without = snapshot_without.transaction(Box::new(FileSystemCommitter::new()))?;
+        let write_context_without = txn_without.get_write_context();
+        let expr_without = write_context_without.logical_to_physical();
+
+        // Without materializePartitionColumns, partition column should be excluded
+        let expr_str_without = format!("{:?}", expr_without);
+        assert!(!expr_str_without.contains("letter"),
+            "Partition column 'letter' should be excluded when materializePartitionColumns is not enabled. Expression: {}",
+            expr_str_without);
+        assert!(
+            expr_str_without.contains("number"),
+            "Non-partition column 'number' should be included. Expression: {}",
+            expr_str_without
+        );
+        assert!(
+            expr_str_without.contains("a_float"),
+            "Non-partition column 'a_float' should be included. Expression: {}",
+            expr_str_without
+        );
+
+        // Test 2: Use partitioned_with_materialize_feature table (with materializePartitionColumns feature)
+        // Partition columns should be included in the logical_to_physical expression
+        let path_with = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/partitioned_with_materialize_feature/",
+        ))
+        .unwrap();
+        let url_with = url::Url::from_directory_path(path_with).unwrap();
+        let snapshot_with = Snapshot::builder_for(url_with)
+            .at_version(1)
+            .build(&engine)?;
+
+        // Verify the table is partitioned by "letter" column
+        let partition_cols_with = snapshot_with
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        assert_eq!(partition_cols_with.len(), 1);
+        assert_eq!(partition_cols_with[0], "letter");
+
+        // Verify the table HAS the materializePartitionColumns feature
+        let has_feature_with = snapshot_with
+            .table_configuration()
+            .protocol()
+            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+        assert!(
+            has_feature_with,
+            "partitioned_with_materialize_feature should have materializePartitionColumns feature"
+        );
+
+        // Create a transaction and get write context
+        let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()))?;
+        let write_context_with = txn_with.get_write_context();
+        let expr_with = write_context_with.logical_to_physical();
+
+        // With materializePartitionColumns, ALL columns including partition columns should be included
+        let expr_str_with = format!("{:?}", expr_with);
+        assert!(expr_str_with.contains("letter"),
+            "Partition column 'letter' should be included when materializePartitionColumns is enabled. Expression: {}",
+            expr_str_with);
+        assert!(
+            expr_str_with.contains("number"),
+            "Non-partition column 'number' should be included. Expression: {}",
+            expr_str_with
+        );
+        assert!(
+            expr_str_with.contains("a_float"),
+            "Non-partition column 'a_float' should be included. Expression: {}",
+            expr_str_with
         );
 
         Ok(())
