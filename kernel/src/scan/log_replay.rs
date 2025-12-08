@@ -2,6 +2,8 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
+use tracing::info;
+
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
@@ -90,7 +92,11 @@ impl ScanLogReplayProcessor {
 
         // Only create parsed stats filter if checkpoint has stats_parsed
         let parsed_data_skipping_filter = if use_parsed_stats {
-            DataSkippingFilter::new(engine, physical_predicate.clone(), true)
+            let filter = DataSkippingFilter::new(engine, physical_predicate.clone(), true);
+            if filter.is_some() {
+                info!("Created parsed stats data skipping filter for checkpoint batches");
+            }
+            filter
         } else {
             None
         };

@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 use itertools::Itertools;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 
 use self::log_replay::get_scan_metadata_transform_expr;
@@ -409,6 +409,10 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         // Check if checkpoint has stats_parsed using schema discovery
         let use_parsed_stats = self.snapshot.log_segment().has_parsed_stats(engine);
+        info!(
+            "scan_metadata: use_parsed_stats={} (checkpoint schema discovery)",
+            use_parsed_stats
+        );
         let (action_iter, checkpoint_has_parsed_stats) =
             self.replay_for_scan_metadata(engine, use_parsed_stats)?;
         self.scan_metadata_inner(engine, action_iter, checkpoint_has_parsed_stats)
