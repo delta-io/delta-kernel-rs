@@ -52,6 +52,14 @@ impl DvInfo {
         self.deletion_vector.is_some()
     }
 
+    /// Get the cardinality (number of deleted rows) of this deletion vector.
+    ///
+    /// Returns `Some(cardinality)` if a deletion vector is present, `None` otherwise.
+    /// The cardinality represents the number of rows that are marked as deleted.
+    pub fn cardinality(&self) -> Option<i64> {
+        self.deletion_vector.as_ref().map(|dv| dv.cardinality)
+    }
+
     pub(crate) fn get_treemap(
         &self,
         engine: &dyn Engine,
@@ -123,6 +131,35 @@ pub type ScanCallback<T> = fn(
     partition_values: HashMap<String, String>,
 );
 
+/// Row tracking information for a file.
+///
+/// Contains the base row ID and default row commit version which are
+/// used to reconstruct row identifiers for tables with row tracking enabled.
+#[derive(Debug, Clone, Default)]
+pub struct RowTrackingMetadata {
+    /// The base row ID for this file. The row ID of row `i` in the file is
+    /// `base_row_id + i`. `None` indicates row tracking is not available.
+    pub base_row_id: Option<i64>,
+    /// The commit version when this file was first added to the table.
+    /// `None` indicates this information is not available.
+    pub default_row_commit_version: Option<i64>,
+}
+
+/// Extended callback type that includes row tracking information.
+///
+/// This callback provides all the information from [`ScanCallback`] plus
+/// row tracking metadata for V2 feature support.
+pub type ScanCallbackV2<T> = fn(
+    context: &mut T,
+    path: &str,
+    size: i64,
+    stats: Option<Stats>,
+    dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
+    partition_values: HashMap<String, String>,
+    row_tracking: RowTrackingMetadata,
+);
+
 /// Request that the kernel call a callback on each valid file that needs to be read for the
 /// scan.
 ///
@@ -155,6 +192,25 @@ pub type ScanCallback<T> = fn(
 impl ScanMetadata {
     pub fn visit_scan_files<T>(&self, context: T, callback: ScanCallback<T>) -> DeltaResult<T> {
         let mut visitor = ScanFileVisitor {
+            callback,
+            selection_vector: self.scan_files.selection_vector(),
+            transforms: &self.scan_file_transforms,
+            context,
+        };
+        visitor.visit_rows_of(self.scan_files.data())?;
+        Ok(visitor.context)
+    }
+
+    /// Like [`visit_scan_files`] but with an extended callback that includes row tracking info.
+    ///
+    /// This method provides all the information from `visit_scan_files` plus row tracking
+    /// metadata (base_row_id and default_row_commit_version) for V2 feature support.
+    pub fn visit_scan_files_v2<T>(
+        &self,
+        context: T,
+        callback: ScanCallbackV2<T>,
+    ) -> DeltaResult<T> {
+        let mut visitor = ScanFileVisitorV2 {
             callback,
             selection_vector: self.scan_files.selection_vector(),
             transforms: &self.scan_file_transforms,
@@ -218,6 +274,81 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     dv_info,
                     get_transform_for_row(row_index, self.transforms),
                     partition_values,
+                )
+            }
+        }
+        Ok(())
+    }
+}
+
+// V2 visitor that includes row tracking info
+struct ScanFileVisitorV2<'a, T> {
+    callback: ScanCallbackV2<T>,
+    selection_vector: &'a [bool],
+    transforms: &'a [Option<ExpressionRef>],
+    context: T,
+}
+
+impl<T> RowVisitor for ScanFileVisitorV2<'_, T> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| SCAN_ROW_SCHEMA.leaves(None));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 13,
+            Error::InternalError(format!(
+                "Wrong number of ScanFileVisitorV2 getters: {}",
+                getters.len()
+            ))
+        );
+        for row_index in 0..row_count {
+            if !self.selection_vector[row_index] {
+                // skip skipped rows
+                continue;
+            }
+            // Since path column is required, use it to detect presence of an Add action
+            if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
+                let size = getters[1].get(row_index, "scanFile.size")?;
+                let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
+                let stats: Option<Stats> =
+                    stats.and_then(|json| match serde_json::from_str(json.as_str()) {
+                        Ok(stats) => Some(stats),
+                        Err(e) => {
+                            warn!("Invalid stats string in Add file {json}: {}", e);
+                            None
+                        }
+                    });
+
+                let dv_index = SCAN_ROW_SCHEMA
+                    .index_of("deletionVector")
+                    .ok_or_else(|| Error::missing_column("deletionVector"))?;
+                let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
+                let dv_info = DvInfo { deletion_vector };
+                let partition_values =
+                    getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
+
+                // Extract row tracking info from getters[10] and getters[11]
+                let base_row_id: Option<i64> = getters[10]
+                    .get_opt(row_index, "scanFile.fileConstantValues.baseRowId")?;
+                let default_row_commit_version: Option<i64> = getters[11]
+                    .get_opt(row_index, "scanFile.fileConstantValues.defaultRowCommitVersion")?;
+                let row_tracking = RowTrackingMetadata {
+                    base_row_id,
+                    default_row_commit_version,
+                };
+
+                (self.callback)(
+                    &mut self.context,
+                    path,
+                    size,
+                    stats,
+                    dv_info,
+                    get_transform_for_row(row_index, self.transforms),
+                    partition_values,
+                    row_tracking,
                 )
             }
         }

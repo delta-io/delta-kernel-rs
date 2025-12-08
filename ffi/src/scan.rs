@@ -335,6 +335,43 @@ pub struct CDvInfo<'a> {
     has_vector: bool,
 }
 
+/// Get the cardinality (number of deleted rows) from a deletion vector.
+///
+/// Returns the number of rows that are marked as deleted in this deletion vector,
+/// or -1 if no deletion vector is present.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid CDvInfo pointer.
+#[no_mangle]
+pub unsafe extern "C" fn get_dv_cardinality(dv_info: &CDvInfo) -> i64 {
+    dv_info.info.cardinality().unwrap_or(-1)
+}
+
+/// Row tracking information for a file in a scan.
+///
+/// This struct contains the base row ID and default row commit version
+/// which are needed to reconstruct row identifiers for files with row tracking.
+#[repr(C)]
+pub struct RowTrackingInfo {
+    /// The base row ID for this file. This is the starting row ID for the first row
+    /// in the file. Subsequent rows have IDs: base_row_id + row_index.
+    /// A value of -1 indicates row tracking info is not available.
+    pub base_row_id: i64,
+    /// The commit version when this file was first added to the table.
+    /// A value of -1 indicates this information is not available.
+    pub default_row_commit_version: i64,
+}
+
+impl Default for RowTrackingInfo {
+    fn default() -> Self {
+        Self {
+            base_row_id: -1,
+            default_row_commit_version: -1,
+        }
+    }
+}
+
 /// This callback will be invoked for each valid file that needs to be read for a scan.
 ///
 /// The arguments to the callback are:
@@ -353,6 +390,21 @@ type CScanCallback = extern "C" fn(
     dv_info: &CDvInfo,
     transform: Option<&Expression>,
     partition_map: &CStringMap,
+);
+
+/// Extended callback that includes row tracking information.
+///
+/// This callback is similar to [`CScanCallback`] but includes additional row tracking
+/// information (base_row_id and default_row_commit_version) for V2 feature support.
+type CScanCallbackV2 = extern "C" fn(
+    engine_context: NullableCvoid,
+    path: KernelStringSlice,
+    size: i64,
+    stats: Option<&Stats>,
+    dv_info: &CDvInfo,
+    transform: Option<&Expression>,
+    partition_map: &CStringMap,
+    row_tracking_info: &RowTrackingInfo,
 );
 
 #[derive(Default)]
@@ -556,6 +608,74 @@ pub unsafe extern "C" fn visit_scan_metadata(
     // TODO: return ExternResult to caller instead of panicking?
     scan_metadata
         .visit_scan_files(context_wrapper, rust_callback)
+        .unwrap();
+}
+
+// V2 wrapper function that includes row tracking info
+fn rust_callback_v2(
+    context: &mut ContextWrapperV2,
+    path: &str,
+    size: i64,
+    kernel_stats: Option<delta_kernel::scan::state::Stats>,
+    dv_info: DvInfo,
+    transform: Option<ExpressionRef>,
+    partition_values: HashMap<String, String>,
+    row_tracking: delta_kernel::scan::state::RowTrackingMetadata,
+) {
+    let transform = transform.map(|e| e.as_ref().clone());
+    let partition_map = CStringMap {
+        values: partition_values,
+    };
+    let stats = kernel_stats.map(|ks| Stats {
+        num_records: ks.num_records,
+    });
+    let cdv_info = CDvInfo {
+        info: &dv_info,
+        has_vector: dv_info.has_vector(),
+    };
+    let row_tracking_info = RowTrackingInfo {
+        base_row_id: row_tracking.base_row_id.unwrap_or(-1),
+        default_row_commit_version: row_tracking.default_row_commit_version.unwrap_or(-1),
+    };
+    (context.callback)(
+        context.engine_context,
+        kernel_string_slice!(path),
+        size,
+        stats.as_ref(),
+        &cdv_info,
+        transform.as_ref(),
+        &partition_map,
+        &row_tracking_info,
+    );
+}
+
+// V2 context wrapper
+struct ContextWrapperV2 {
+    engine_context: NullableCvoid,
+    callback: CScanCallbackV2,
+}
+
+/// V2 shim for ffi to call visit_scan_metadata with row tracking info.
+/// This is similar to [`visit_scan_metadata`] but includes additional row tracking
+/// information (base_row_id and default_row_commit_version) in the callback.
+///
+/// # Safety
+/// engine is responsible for passing a valid [`SharedScanMetadata`].
+#[no_mangle]
+pub unsafe extern "C" fn visit_scan_metadata_v2(
+    scan_metadata: Handle<SharedScanMetadata>,
+    engine_context: NullableCvoid,
+    callback: CScanCallbackV2,
+) {
+    let scan_metadata = unsafe { scan_metadata.as_ref() };
+    let context_wrapper = ContextWrapperV2 {
+        engine_context,
+        callback,
+    };
+
+    // TODO: return ExternResult to caller instead of panicking?
+    scan_metadata
+        .visit_scan_files_v2(context_wrapper, rust_callback_v2)
         .unwrap();
 }
 
