@@ -54,6 +54,9 @@ void scan_row_callback(
   const CStringMap* partition_values)
 {
   (void)size; // not using this at the moment
+#ifndef PRINT_ARROW_DATA
+  (void)transform; // only used when PRINT_ARROW_DATA is defined
+#endif
   struct EngineContext* context = engine_context;
   print_diag("Called back to read file: %.*s. (size: %" PRIu64 ", num records: ", (int)path.len, path.ptr, size);
   if (stats) {
@@ -286,7 +289,7 @@ int main(int argc, char* argv[])
 
   print_diag("Starting table scan\n\n");
 
-  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL);
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
   if (scan_res.tag != OkHandleSharedScan) {
     printf("Failed to create scan\n");
     return -1;
