@@ -65,7 +65,7 @@ impl ParquetHandler for SyncParquetHandler {
     ///
     /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `file:///path/to/file.parquet`).
-    /// - `data` - An iterator of engine data to be written to the Parquet file..
+    /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
     ///

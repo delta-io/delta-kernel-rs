@@ -709,7 +709,7 @@ pub trait ParquetHandler: AsAny {
     ///
     /// - `url` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`).
-    /// - `data` - An iterator of engine data to be written to the Parquet file..
+    /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
     ///

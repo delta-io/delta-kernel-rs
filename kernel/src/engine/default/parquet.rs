@@ -273,7 +273,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     ///
     /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
-    /// - `data` - An iterator of engine data to be written to the Parquet file..
+    /// - `data` - An iterator of engine data to be written to the Parquet file.
     ///
     /// # Returns
     ///
@@ -499,7 +499,10 @@ mod tests {
     use std::path::PathBuf;
     use std::slice;
 
-    use crate::arrow::array::{Array, BooleanArray, RecordBatch};
+    use crate::arrow::array::{
+        Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int8Array, RecordBatch, TimestampMicrosecondArray,
+    };
 
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -782,21 +785,100 @@ mod tests {
             Arc::new(TokioBackgroundExecutor::new()),
         ));
 
-        // Create test data with multiple types
+        // Create test data with all Delta-supported primitive types
         let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(
             RecordBatch::try_from_iter(vec![
+                // Byte (i8)
+                (
+                    "byte_col",
+                    Arc::new(Int8Array::from(vec![1i8, 2, 3, 4, 5])) as Arc<dyn Array>,
+                ),
+                // Short (i16)
+                (
+                    "short_col",
+                    Arc::new(Int16Array::from(vec![100i16, 200, 300, 400, 500])) as Arc<dyn Array>,
+                ),
+                // Integer (i32)
                 (
                     "int_col",
-                    Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])) as Arc<dyn Array>,
+                    Arc::new(Int32Array::from(vec![1000i32, 2000, 3000, 4000, 5000]))
+                        as Arc<dyn Array>,
                 ),
+                // Long (i64)
                 (
-                    "string_col",
-                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as Arc<dyn Array>,
+                    "long_col",
+                    Arc::new(Int64Array::from(vec![10000i64, 20000, 30000, 40000, 50000]))
+                        as Arc<dyn Array>,
                 ),
+                // Float (f32)
+                (
+                    "float_col",
+                    Arc::new(Float32Array::from(vec![1.1f32, 2.2, 3.3, 4.4, 5.5]))
+                        as Arc<dyn Array>,
+                ),
+                // Double (f64)
+                (
+                    "double_col",
+                    Arc::new(Float64Array::from(vec![1.11f64, 2.22, 3.33, 4.44, 5.55]))
+                        as Arc<dyn Array>,
+                ),
+                // Boolean
                 (
                     "bool_col",
                     Arc::new(BooleanArray::from(vec![true, false, true, false, true]))
                         as Arc<dyn Array>,
+                ),
+                // String
+                (
+                    "string_col",
+                    Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])) as Arc<dyn Array>,
+                ),
+                // Binary
+                (
+                    "binary_col",
+                    Arc::new(BinaryArray::from_vec(vec![
+                        b"bin1", b"bin2", b"bin3", b"bin4", b"bin5",
+                    ])) as Arc<dyn Array>,
+                ),
+                // Date
+                (
+                    "date_col",
+                    Arc::new(Date32Array::from(vec![18262, 18263, 18264, 18265, 18266]))
+                        as Arc<dyn Array>, // Days since epoch (2020-01-01 onwards)
+                ),
+                // Timestamp (with UTC timezone)
+                (
+                    "timestamp_col",
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![
+                            1609459200000000i64, // 2021-01-01 00:00:00 UTC
+                            1609545600000000i64,
+                            1609632000000000i64,
+                            1609718400000000i64,
+                            1609804800000000i64,
+                        ])
+                        .with_timezone("UTC"),
+                    ) as Arc<dyn Array>,
+                ),
+                // TimestampNtz (without timezone)
+                (
+                    "timestamp_ntz_col",
+                    Arc::new(TimestampMicrosecondArray::from(vec![
+                        1609459200000000i64, // 2021-01-01 00:00:00
+                        1609545600000000i64,
+                        1609632000000000i64,
+                        1609718400000000i64,
+                        1609804800000000i64,
+                    ])) as Arc<dyn Array>,
+                ),
+                // Decimal (precision 10, scale 2)
+                (
+                    "decimal_col",
+                    Arc::new(
+                        Decimal128Array::from(vec![12345i128, 23456, 34567, 45678, 56789])
+                            .with_precision_and_scale(10, 2)
+                            .unwrap(),
+                    ) as Arc<dyn Array>,
                 ),
             ])
             .unwrap(),
@@ -841,31 +923,137 @@ mod tests {
         // Verify the data
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].num_rows(), 5);
-        assert_eq!(data[0].num_columns(), 3);
+        assert_eq!(data[0].num_columns(), 13);
 
-        // Verify column values
+        let mut col_idx = 0;
+
+        // Verify byte column
+        let byte_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .unwrap();
+        assert_eq!(byte_col.values(), &[1i8, 2, 3, 4, 5]);
+        col_idx += 1;
+
+        // Verify short column
+        let short_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        assert_eq!(short_col.values(), &[100i16, 200, 300, 400, 500]);
+        col_idx += 1;
+
+        // Verify int column
         let int_col = data[0]
-            .column(0)
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(int_col.values(), &[1000i32, 2000, 3000, 4000, 5000]);
+        col_idx += 1;
+
+        // Verify long column
+        let long_col = data[0]
+            .column(col_idx)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(int_col.values(), &[1, 2, 3, 4, 5]);
+        assert_eq!(long_col.values(), &[10000i64, 20000, 30000, 40000, 50000]);
+        col_idx += 1;
 
-        let string_col = data[0]
-            .column(1)
+        // Verify float column
+        let float_col = data[0]
+            .column(col_idx)
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Float32Array>()
             .unwrap();
-        assert_eq!(string_col.value(0), "a");
-        assert_eq!(string_col.value(4), "e");
+        assert_eq!(float_col.values(), &[1.1f32, 2.2, 3.3, 4.4, 5.5]);
+        col_idx += 1;
 
+        // Verify double column
+        let double_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(double_col.values(), &[1.11f64, 2.22, 3.33, 4.44, 5.55]);
+        col_idx += 1;
+
+        // Verify bool column
         let bool_col = data[0]
-            .column(2)
+            .column(col_idx)
             .as_any()
             .downcast_ref::<BooleanArray>()
             .unwrap();
         assert!(bool_col.value(0));
         assert!(!bool_col.value(1));
+        col_idx += 1;
+
+        // Verify string column
+        let string_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(string_col.value(0), "a");
+        assert_eq!(string_col.value(4), "e");
+        col_idx += 1;
+
+        // Verify binary column
+        let binary_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(binary_col.value(0), b"bin1");
+        assert_eq!(binary_col.value(4), b"bin5");
+        col_idx += 1;
+
+        // Verify date column
+        let date_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(date_col.values(), &[18262, 18263, 18264, 18265, 18266]);
+        col_idx += 1;
+
+        // Verify timestamp column (with UTC timezone)
+        let timestamp_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamp_col.value(0), 1609459200000000i64);
+        assert_eq!(timestamp_col.value(4), 1609804800000000i64);
+        assert!(timestamp_col
+            .timezone()
+            .is_some_and(|tz| tz.eq_ignore_ascii_case("utc")));
+        col_idx += 1;
+
+        // Verify timestamp_ntz column (without timezone)
+        let timestamp_ntz_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(timestamp_ntz_col.value(0), 1609459200000000i64);
+        assert_eq!(timestamp_ntz_col.value(4), 1609804800000000i64);
+        assert!(timestamp_ntz_col.timezone().is_none());
+        col_idx += 1;
+
+        // Verify decimal column
+        let decimal_col = data[0]
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(decimal_col.value(0), 12345i128);
+        assert_eq!(decimal_col.value(4), 56789i128);
+        assert_eq!(decimal_col.precision(), 10);
+        assert_eq!(decimal_col.scale(), 2);
     }
 
     #[tokio::test]
