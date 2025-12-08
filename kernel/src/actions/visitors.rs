@@ -421,6 +421,41 @@ impl RowVisitor for SidecarVisitor {
     }
 }
 
+/// Visitor to extract CheckpointMetadata from V2 checkpoint manifest.
+/// Used to get the sidecar file schema from CheckpointMetadata.tags["schema"].
+#[derive(Default)]
+pub(crate) struct CheckpointMetadataVisitor {
+    pub(crate) checkpoint_metadata: Option<CheckpointMetadata>,
+}
+
+impl RowVisitor for CheckpointMetadataVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
+            LazyLock::new(|| CheckpointMetadata::to_schema().leaves(CHECKPOINT_METADATA_NAME));
+        NAMES_AND_TYPES.as_ref()
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        require!(
+            getters.len() == 2,
+            Error::InternalError(format!(
+                "Wrong number of CheckpointMetadataVisitor getters: {}",
+                getters.len()
+            ))
+        );
+        for i in 0..row_count {
+            // version is required, use it to detect presence of CheckpointMetadata
+            if let Some(version) = getters[0].get_opt(i, "checkpointMetadata.version")? {
+                let tags: Option<HashMap<String, String>> =
+                    getters[1].get_opt(i, "checkpointMetadata.tags")?;
+                self.checkpoint_metadata = Some(CheckpointMetadata { version, tags });
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Visit data batches of actions to extract the latest domain metadata for each domain. Note that
 /// this will return all domains including 'removed' domains. The caller is responsible for either
 /// using or throwing away these tombstones.

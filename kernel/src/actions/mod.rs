@@ -20,7 +20,7 @@ use crate::{
 };
 
 use url::Url;
-use visitors::{MetadataVisitor, ProtocolVisitor};
+pub(crate) use visitors::{CheckpointMetadataVisitor, MetadataVisitor, ProtocolVisitor};
 
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use serde::{Deserialize, Serialize};

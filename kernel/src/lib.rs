@@ -698,6 +698,21 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Read the schema from a Parquet file's footer without reading the data.
+    ///
+    /// This is used for checkpoint schema discovery to determine what columns are available
+    /// in checkpoint files (e.g., to check if `stats_parsed` exists).
+    ///
+    /// Engines SHOULD cache the footer metadata to avoid re-reading during subsequent
+    /// `read_parquet_files` calls on the same file.
+    ///
+    /// # Parameters
+    /// - `file` - File metadata for the parquet file to read schema from.
+    ///
+    /// # Returns
+    /// The schema of the parquet file.
+    fn read_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

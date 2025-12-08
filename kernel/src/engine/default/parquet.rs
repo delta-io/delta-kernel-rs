@@ -261,6 +261,26 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         );
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
+
+    fn read_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
+        use crate::engine::arrow_conversion::TryIntoKernel as _;
+        use crate::schema::StructType;
+
+        let path = Path::from_url_path(file.location.path())?;
+        let store = self.store.clone();
+
+        // Use the task executor to run the async operation
+        let schema = self.task_executor.block_on(async move {
+            let reader = ParquetObjectReader::new(store, path);
+            let metadata =
+                ArrowReaderMetadata::load_async(&mut reader.clone(), Default::default()).await?;
+            let arrow_schema = metadata.schema().clone();
+            let kernel_schema: StructType = arrow_schema.try_into_kernel()?;
+            Ok::<_, Error>(Arc::new(kernel_schema))
+        })?;
+
+        Ok(schema)
+    }
 }
 
 /// Implements [`FileOpener`] for a parquet file

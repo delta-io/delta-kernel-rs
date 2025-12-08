@@ -163,8 +163,9 @@ impl Snapshot {
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
         let new_latest_commit_file = new_listed_files.latest_commit_file.clone();
+        // For snapshot updates, checkpoint_schema will be discovered later via parquet footer
         let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
+            LogSegment::try_new(new_listed_files, log_root.clone(), new_version, None)?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < old_version {
@@ -246,6 +247,8 @@ impl Snapshot {
             },
             log_root,
             new_version,
+            // Preserve the checkpoint_schema from the old log segment
+            old_log_segment.checkpoint_schema.clone(),
         )?;
         Ok(Arc::new(Snapshot::new(
             combined_log_segment,
@@ -1499,7 +1502,8 @@ mod tests {
             latest_commit_file: None, // No commit file
         };
 
-        let log_segment = LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0))?;
+        let log_segment =
+            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
