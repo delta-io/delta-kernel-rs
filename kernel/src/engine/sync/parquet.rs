@@ -52,4 +52,20 @@ impl ParquetHandler for SyncParquetHandler {
     ) -> DeltaResult<FileDataReadResultIterator> {
         read_files(files, schema, predicate, try_create_from_parquet)
     }
+
+    fn read_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
+        use crate::engine::arrow_conversion::TryIntoKernel as _;
+        use crate::schema::StructType;
+        use std::sync::Arc;
+
+        let path = file
+            .location
+            .to_file_path()
+            .map_err(|_| crate::Error::generic(format!("Invalid file path: {}", file.location)))?;
+        let file_handle = File::open(&path)?;
+        let metadata = ArrowReaderMetadata::load(&file_handle, Default::default())?;
+        let arrow_schema = metadata.schema().clone();
+        let kernel_schema: StructType = arrow_schema.try_into_kernel()?;
+        Ok(Arc::new(kernel_schema))
+    }
 }

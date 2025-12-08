@@ -42,7 +42,10 @@ use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 /// to be applied to the selected rows.
 pub(crate) struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
-    data_skipping_filter: Option<DataSkippingFilter>,
+    /// Data skipping filter for commit files (JSON stats)
+    json_data_skipping_filter: Option<DataSkippingFilter>,
+    /// Data skipping filter for checkpoint files (parsed stats)
+    parsed_data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
     state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
@@ -53,7 +56,15 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    ///
+    /// `use_parsed_stats` indicates whether the checkpoint contains stats_parsed and we should
+    /// use parsed stats for data skipping on checkpoint batches. If false, JSON stats will be
+    /// used for all batches.
+    fn new(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        use_parsed_stats: bool,
+    ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -72,9 +83,22 @@ impl ScanLogReplayProcessor {
                 None
             }
         };
+
+        // Create JSON stats filter for commits (always needed)
+        let json_data_skipping_filter =
+            DataSkippingFilter::new(engine, physical_predicate.clone(), false);
+
+        // Only create parsed stats filter if checkpoint has stats_parsed
+        let parsed_data_skipping_filter = if use_parsed_stats {
+            DataSkippingFilter::new(engine, physical_predicate.clone(), true)
+        } else {
+            None
+        };
+
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            json_data_skipping_filter,
+            parsed_data_skipping_filter,
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
@@ -359,10 +383,43 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
             actions,
             is_log_batch,
         } = actions_batch;
-        // Build an initial selection vector for the batch which has had the data skipping filter
-        // applied. The selection vector is further updated by the deduplication visitor to remove
-        // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+
+        // Build an initial selection vector using the appropriate data skipping filter.
+        // - Commits use JSON stats (is_log_batch = true)
+        // - Checkpoints use parsed stats if available, otherwise JSON stats
+        // - If parsed stats fail (type mismatch), skip data skipping entirely (don't fall back to JSON)
+        let selection_vector = if is_log_batch {
+            // Commit batch: use JSON stats
+            match self.json_data_skipping_filter.as_ref() {
+                Some(f) => f.apply(actions.as_ref())?,
+                None => vec![true; actions.len()],
+            }
+        } else {
+            // Checkpoint batch: use parsed stats if available
+            match &self.parsed_data_skipping_filter {
+                Some(f) => {
+                    // Try parsed stats. If it fails (type mismatch, NULL stats), skip data skipping.
+                    // Per design doc: Don't fall back to JSON stats - if parsed stats are corrupt,
+                    // JSON stats may be too. Just proceed without data skipping.
+                    match f.apply(actions.as_ref()) {
+                        Ok(sv) => sv,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Parsed stats evaluation failed, skipping data skipping: {e}"
+                            );
+                            vec![true; actions.len()]
+                        }
+                    }
+                }
+                None => {
+                    // No parsed stats filter (checkpoint doesn't have stats_parsed), use JSON stats
+                    match self.json_data_skipping_filter.as_ref() {
+                        Some(f) => f.apply(actions.as_ref())?,
+                        None => vec![true; actions.len()],
+                    }
+                }
+            }
+        };
         assert_eq!(selection_vector.len(), actions.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -384,7 +441,9 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     }
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
-        self.data_skipping_filter.as_ref()
+        // Return the JSON filter for backward compatibility with the trait.
+        // The actual filter selection is done in process_actions_batch based on is_log_batch.
+        self.json_data_skipping_filter.as_ref()
     }
 }
 
@@ -394,14 +453,22 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 /// that is selected in the returned `engine_data` _must_ be processed to complete the scan.
 /// Non-selected rows _must_ be ignored.
 ///
+/// `use_parsed_stats` indicates whether the checkpoint contains stats_parsed and we should
+/// use parsed stats for data skipping on checkpoint batches. If false, JSON stats will be
+/// used for all batches.
+///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    use_parsed_stats: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(
+        ScanLogReplayProcessor::new(engine, state_info, use_parsed_stats)?
+            .process_actions_iter(action_iter),
+    )
 }
 
 #[cfg(test)]
@@ -495,6 +562,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            false, // use_parsed_stats
         )
         .unwrap();
         for res in iter {
@@ -521,6 +589,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_parsed_stats
         )
         .unwrap();
 
@@ -599,6 +668,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_parsed_stats
         )
         .unwrap();
 

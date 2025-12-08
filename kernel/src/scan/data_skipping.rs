@@ -23,6 +23,119 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// Transform that converts all fields to nullable, since stats may not be available for all columns.
+struct NullableStatsTransform;
+
+impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+        let field = match self.transform(&field.data_type)? {
+            Borrowed(_) if field.is_nullable() => Borrowed(field),
+            data_type => Owned(StructField {
+                name: field.name.clone(),
+                data_type: data_type.into_owned(),
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+        };
+        Some(field)
+    }
+}
+
+/// Transform that converts all primitive types to LONG for null count stats.
+struct NullCountStatsTransform;
+
+impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
+    fn transform_primitive(&mut self, _ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        Some(Cow::Owned(PrimitiveType::Long))
+    }
+}
+
+/// Builds the schema for stats (both JSON stats and stats_parsed) based on the referenced columns.
+///
+/// The resulting schema has the structure:
+/// ```text
+/// {
+///   numRecords: long,
+///   nullCount: {col1: long, col2: long, ...},
+///   minValues: {col1: type1, col2: type2, ...},
+///   maxValues: {col1: type1, col2: type2, ...}
+/// }
+/// ```
+///
+/// All fields are made nullable since stats may not be available for all columns.
+/// Returns `None` if the schema transformation fails.
+pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
+    let stats_schema = NullableStatsTransform
+        .transform_struct(referenced_schema)?
+        .into_owned();
+
+    let nullcount_schema = NullCountStatsTransform
+        .transform_struct(&stats_schema)?
+        .into_owned();
+
+    Some(Arc::new(StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable("nullCount", nullcount_schema),
+        StructField::nullable("minValues", stats_schema.clone()),
+        StructField::nullable("maxValues", stats_schema),
+    ])))
+}
+
+/// Adds a `stats_parsed` field to the `add` action in the given schema.
+///
+/// This is used to build the checkpoint read schema that includes parsed statistics.
+/// The parquet reader will return NULL for this field if the checkpoint doesn't have it.
+///
+/// # Arguments
+/// * `base_schema` - The base schema containing an `add` field (e.g., LOG_ADD_SCHEMA)
+/// * `stats_schema` - The stats schema from `build_stats_schema()`
+///
+/// # Returns
+/// A new schema with `stats_parsed` added to the `add` action, or `None` if the schema
+/// doesn't contain an `add` field or the field is not a struct.
+pub(crate) fn add_stats_parsed_to_schema(
+    base_schema: &StructType,
+    stats_schema: &StructType,
+) -> Option<SchemaRef> {
+    use crate::actions::ADD_NAME;
+
+    // Find the "add" field in the base schema
+    let add_field = base_schema.field(ADD_NAME)?;
+
+    // Get the add struct type
+    let add_struct = match &add_field.data_type {
+        DataType::Struct(s) => s,
+        _ => return None,
+    };
+
+    // Create a new add struct with stats_parsed field added
+    let mut new_add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
+    new_add_fields.push(StructField::nullable(
+        "stats_parsed",
+        DataType::Struct(Box::new(stats_schema.clone())),
+    ));
+    let new_add_struct = StructType::new_unchecked(new_add_fields);
+
+    // Build the new schema with the modified add field
+    let new_fields: Vec<StructField> = base_schema
+        .fields()
+        .map(|f| {
+            if f.name == ADD_NAME {
+                StructField::new(
+                    f.name.clone(),
+                    DataType::Struct(Box::new(new_add_struct.clone())),
+                    f.nullable,
+                )
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+
+    Some(Arc::new(StructType::new_unchecked(new_fields)))
+}
+
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
 ///
@@ -55,77 +168,66 @@ pub(crate) struct DataSkippingFilter {
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
-    json_handler: Arc<dyn JsonHandler>,
+    /// JSON handler for parsing stats. None when using parsed stats (stats_parsed column).
+    json_handler: Option<Arc<dyn JsonHandler>>,
 }
 
 impl DataSkippingFilter {
     /// Creates a new data skipping filter. Returns None if there is no predicate, or the predicate
     /// is ineligible for data skipping.
     ///
+    /// # Arguments
+    /// * `engine` - The engine to use for evaluation
+    /// * `physical_predicate` - The predicate and its referenced schema
+    /// * `use_parsed_stats` - If true, extract `add.stats_parsed` (struct) directly from checkpoints.
+    ///   If false, extract `add.stats` (JSON string) and parse it.
+    ///
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
+        use_parsed_stats: bool,
     ) -> Option<Self> {
         static STATS_EXPR: LazyLock<ExpressionRef> =
             LazyLock::new(|| Arc::new(column_expr!("add.stats")));
+        static PARSED_STATS_EXPR: LazyLock<ExpressionRef> =
+            LazyLock::new(|| Arc::new(column_expr!("add.stats_parsed")));
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
         let (predicate, referenced_schema) = physical_predicate?;
-        debug!("Creating a data skipping filter for {:#?}", predicate);
+        debug!(
+            "Creating a data skipping filter for {:#?} (use_parsed_stats={})",
+            predicate, use_parsed_stats
+        );
 
-        // Convert all fields into nullable, as stats may not be available for all columns
-        // (and usually aren't for partition columns).
-        struct NullableStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-            fn transform_struct_field(
-                &mut self,
-                field: &'a StructField,
-            ) -> Option<Cow<'a, StructField>> {
-                use Cow::*;
-                let field = match self.transform(&field.data_type)? {
-                    Borrowed(_) if field.is_nullable() => Borrowed(field),
-                    data_type => Owned(StructField {
-                        name: field.name.clone(),
-                        data_type: data_type.into_owned(),
-                        nullable: true,
-                        metadata: field.metadata.clone(),
-                    }),
-                };
-                Some(field)
-            }
-        }
+        let stats_schema = build_stats_schema(&referenced_schema)?;
 
-        // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
-        struct NullCountStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
-            fn transform_primitive(
-                &mut self,
-                _ptype: &'a PrimitiveType,
-            ) -> Option<Cow<'a, PrimitiveType>> {
-                Some(Cow::Owned(PrimitiveType::Long))
-            }
-        }
-
-        let stats_schema = NullableStatsTransform
-            .transform_struct(&referenced_schema)?
-            .into_owned();
-
-        let nullcount_schema = NullCountStatsTransform
-            .transform_struct(&stats_schema)?
-            .into_owned();
-        let stats_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", nullcount_schema),
-            StructField::nullable("minValues", stats_schema.clone()),
-            StructField::nullable("maxValues", stats_schema),
-        ]));
+        // Configure based on whether we're using parsed stats or JSON stats
+        let (input_schema, stats_expr, output_type, json_handler) = if use_parsed_stats {
+            // For parsed stats: extract add.stats_parsed directly as a struct
+            let schema_with_parsed_stats =
+                add_stats_parsed_to_schema(get_log_add_schema(), &stats_schema)?;
+            (
+                schema_with_parsed_stats,
+                PARSED_STATS_EXPR.clone(),
+                DataType::Struct(Box::new(stats_schema.as_ref().clone())),
+                None,
+            )
+        } else {
+            // For JSON stats: extract add.stats as a string and parse it
+            (
+                get_log_add_schema().clone(),
+                STATS_EXPR.clone(),
+                DataType::STRING,
+                Some(engine.json_handler()),
+            )
+        };
 
         // Skipping happens in several steps:
         //
-        // 1. The stats selector fetches add.stats from the metadata
+        // 1. The stats selector fetches add.stats or add.stats_parsed from the metadata
         //
         // 2. The predicate (skipping evaluator) produces false for any file whose stats prove we
         //    can safely skip it. A value of true means the stats say we must keep the file, and
@@ -136,11 +238,7 @@ impl DataSkippingFilter {
         //    the predicate is true/null and false (= skip) when the predicate is false.
         let select_stats_evaluator = engine
             .evaluation_handler()
-            .new_expression_evaluator(
-                get_log_add_schema().clone(),
-                STATS_EXPR.clone(),
-                DataType::STRING,
-            )
+            .new_expression_evaluator(input_schema, stats_expr, output_type)
             // A stats expression failure here doesn't affect correctness
             // as its a performance optimization so we log the error and continue.
             .inspect_err(|e| error!("Failed to create select stats evaluator: {e}"))
@@ -170,19 +268,23 @@ impl DataSkippingFilter {
             select_stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
-            json_handler: engine.json_handler(),
+            json_handler,
         })
     }
 
     /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
     /// which can be applied to the actions to find those that passed data skipping.
     pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        // retrieve and parse stats from actions data
+        // Retrieve stats from actions data (either JSON string or parsed struct)
         let stats = self.select_stats_evaluator.evaluate(actions)?;
         assert_eq!(stats.len(), actions.len());
-        let parsed_stats = self
-            .json_handler
-            .parse_json(stats, self.stats_schema.clone())?;
+
+        // If we have a json_handler, we need to parse the JSON stats.
+        // Otherwise, stats is already a parsed struct from stats_parsed column.
+        let parsed_stats = match &self.json_handler {
+            Some(handler) => handler.parse_json(stats, self.stats_schema.clone())?,
+            None => stats, // Already a struct from stats_parsed
+        };
         assert_eq!(parsed_stats.len(), actions.len());
 
         // evaluate the predicate on the parsed stats, then convert to selection vector

@@ -7,14 +7,16 @@ use std::time::Instant;
 
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
-    get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
-    PROTOCOL_NAME, SIDECAR_NAME,
+    get_commit_schema, schema_contains_file_actions, CheckpointMetadata, CheckpointMetadataVisitor,
+    Metadata, Protocol, Sidecar, CHECKPOINT_METADATA_NAME, METADATA_NAME, PROTOCOL_NAME,
+    SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::{SchemaRef, StructField, ToSchema as _};
+use crate::schema::{SchemaRef, StructField};
+use crate::schema::{StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
@@ -64,6 +66,12 @@ pub(crate) struct LogSegment {
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
     pub latest_commit_file: Option<ParsedLogPath>,
+    /// Schema of the checkpoint parquet file, used to determine if stats_parsed is available.
+    /// This can be obtained from:
+    /// 1. `_last_checkpoint.checkpoint_schema`
+    /// 2. V2 checkpoint manifest (sidecarFileSchema in CheckpointMetadata.tags)
+    /// 3. Parquet footer fallback (read via Engine's ParquetHandler)
+    pub checkpoint_schema: Option<SchemaRef>,
 }
 
 impl LogSegment {
@@ -72,6 +80,7 @@ impl LogSegment {
         listed_files: ListedLogFiles,
         log_root: Url,
         end_version: Option<Version>,
+        checkpoint_schema: Option<SchemaRef>,
     ) -> DeltaResult<Self> {
         let ListedLogFiles {
             mut ascending_commit_files,
@@ -135,6 +144,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            checkpoint_schema,
         })
     }
 
@@ -198,6 +208,12 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
+        // Extract checkpoint_schema from the hint before consuming it
+        let checkpoint_schema = checkpoint_hint
+            .as_ref()
+            .and_then(|cp| cp.checkpoint_schema.clone())
+            .map(Arc::new);
+
         let listed_files = match (checkpoint_hint, time_travel_version) {
             (Some(cp), None) => {
                 ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
@@ -214,7 +230,12 @@ impl LogSegment {
             _ => ListedLogFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version)
+        LogSegment::try_new(
+            listed_files,
+            log_root,
+            time_travel_version,
+            checkpoint_schema,
+        )
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between versions
@@ -257,7 +278,8 @@ impl LogSegment {
                     .map(|c| c.version)
             ))
         );
-        LogSegment::try_new(listed_files, log_root, end_version)
+        // TableChanges doesn't use checkpoints for data skipping
+        LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
     #[allow(unused)]
@@ -300,7 +322,131 @@ impl LogSegment {
             commits.drain(..start_idx);
         }
 
-        LogSegment::try_new(listed_commits, log_root, Some(end_version))
+        // Timestamp conversion doesn't use checkpoints
+        LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
+    }
+
+    /// Returns the checkpoint schema, discovering it using the following priority:
+    ///
+    /// 1. `_last_checkpoint.checkpoint_schema` (already stored in self.checkpoint_schema)
+    /// 2. V2 checkpoint manifest: `CheckpointMetadata.tags["schema"]` for JSON checkpoints
+    /// 3. Parquet footer of the first checkpoint file
+    ///
+    /// Returns None if there are no checkpoint files or if schema discovery fails.
+    pub(crate) fn get_checkpoint_schema(&self, engine: &dyn Engine) -> Option<SchemaRef> {
+        // Method 1: Return cached schema if available (from _last_checkpoint.checkpoint_schema)
+        if self.checkpoint_schema.is_some() {
+            return self.checkpoint_schema.clone();
+        }
+
+        let first_checkpoint = self.checkpoint_parts.first()?;
+
+        if first_checkpoint.extension == "json" {
+            // Method 2: V2 checkpoint manifest - extract schema from CheckpointMetadata.tags
+            return self.get_schema_from_v2_checkpoint_manifest(engine);
+        }
+
+        if first_checkpoint.extension == "parquet" {
+            // Method 3: Parquet footer fallback
+            let file_meta = first_checkpoint.location.clone();
+            match engine.parquet_handler().read_parquet_schema(&file_meta) {
+                Ok(schema) => return Some(schema),
+                Err(e) => {
+                    warn!("Failed to read checkpoint parquet schema: {e}");
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extracts the sidecar file schema from a V2 JSON checkpoint manifest.
+    ///
+    /// V2 JSON checkpoints store the sidecar schema in `CheckpointMetadata.tags["schema"]`
+    /// as a JSON-serialized schema string.
+    fn get_schema_from_v2_checkpoint_manifest(&self, engine: &dyn Engine) -> Option<SchemaRef> {
+        let first_checkpoint = self.checkpoint_parts.first()?;
+        if first_checkpoint.extension != "json" {
+            return None;
+        }
+
+        // Build schema for reading CheckpointMetadata action
+        let checkpoint_metadata_schema: SchemaRef =
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                CHECKPOINT_METADATA_NAME,
+                CheckpointMetadata::to_schema(),
+            )]));
+
+        let checkpoint_files: Vec<_> = self
+            .checkpoint_parts
+            .iter()
+            .map(|f| f.location.clone())
+            .collect();
+
+        // Read the JSON checkpoint to find CheckpointMetadata
+        let batches = match engine.json_handler().read_json_files(
+            &checkpoint_files,
+            checkpoint_metadata_schema,
+            None,
+        ) {
+            Ok(batches) => batches,
+            Err(e) => {
+                warn!("Failed to read V2 checkpoint manifest: {e}");
+                return None;
+            }
+        };
+
+        // Visit batches to find CheckpointMetadata
+        let mut visitor = CheckpointMetadataVisitor::default();
+        for batch_result in batches {
+            match batch_result {
+                Ok(batch) => {
+                    if let Err(e) = visitor.visit_rows_of(batch.as_ref()) {
+                        warn!("Failed to visit checkpoint metadata: {e}");
+                        continue;
+                    }
+                    if visitor.checkpoint_metadata.is_some() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to read checkpoint batch: {e}");
+                    continue;
+                }
+            }
+        }
+
+        // Extract schema from CheckpointMetadata.tags["schema"]
+        let checkpoint_metadata = visitor.checkpoint_metadata?;
+        let tags = checkpoint_metadata.tags?;
+        let schema_json = tags.get("schema")?;
+
+        // Parse the JSON schema string into a StructType
+        match serde_json::from_str::<StructType>(schema_json) {
+            Ok(schema) => {
+                debug!("Discovered checkpoint schema from V2 manifest tags");
+                Some(Arc::new(schema))
+            }
+            Err(e) => {
+                warn!("Failed to parse checkpoint schema from V2 manifest: {e}");
+                None
+            }
+        }
+    }
+
+    /// Checks if the checkpoint schema contains `stats_parsed` field in the add action.
+    /// Returns true if stats_parsed exists and can be used for data skipping.
+    pub(crate) fn has_parsed_stats(&self, engine: &dyn Engine) -> bool {
+        let Some(schema) = self.get_checkpoint_schema(engine) else {
+            return false;
+        };
+        let Some(add_field) = schema.field("add") else {
+            return false;
+        };
+        let crate::schema::DataType::Struct(add_struct) = add_field.data_type() else {
+            return false;
+        };
+        add_struct.field("stats_parsed").is_some()
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
