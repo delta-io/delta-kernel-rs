@@ -228,8 +228,8 @@ fn test_version_filtering() {
     }
 }
 
-#[test]
-fn test_no_compaction_staged_commits() {
+#[tokio::test]
+async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
     use crate::engine::default::DefaultEngine;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
@@ -264,36 +264,30 @@ fn test_no_compaction_staged_commits() {
 
     // Write version 0
     let commit_0_path = Path::from("_delta_log/00000000000000000000.json");
-    futures::executor::block_on(async {
-        store
-            .put(
-                &commit_0_path,
-                format!("{}\n{}", metadata_action, protocol_action).into(),
-            )
-            .await
-            .unwrap();
-    });
+    store
+        .put(
+            &commit_0_path,
+            format!("{}\n{}", metadata_action, protocol_action).into(),
+        )
+        .await
+        .unwrap();
 
     // Write version 1
     let add_action = serde_json::to_string(&Action::Add(Add::default())).unwrap();
     let commit_1_path = Path::from("_delta_log/00000000000000000001.json");
-    futures::executor::block_on(async {
-        store
-            .put(&commit_1_path, add_action.clone().into())
-            .await
-            .unwrap();
-    });
+    store
+        .put(&commit_1_path, add_action.clone().into())
+        .await
+        .unwrap();
 
     // Write a staged commit (this would normally be filtered out during listing)
     let staged_commit_path = Path::from(
         "_delta_log/_staged_commits/00000000000000000002.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
     );
-    futures::executor::block_on(async {
-        store
-            .put(&staged_commit_path, add_action.into())
-            .await
-            .unwrap();
-    });
+    store
+        .put(&staged_commit_path, add_action.into())
+        .await
+        .unwrap();
 
     let table_root = url::Url::parse("memory:///").unwrap();
     let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();

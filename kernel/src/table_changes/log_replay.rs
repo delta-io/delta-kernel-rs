@@ -18,9 +18,10 @@ use crate::scan::state::DvInfo;
 use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema as _,
 };
-use crate::table_changes::check_cdf_table_properties;
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
+use crate::table_features::Operation;
+use crate::table_features::TableFeature;
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
@@ -186,15 +187,10 @@ impl LogReplayScanner {
             visitor.visit_rows_of(actions.as_ref())?;
 
             let metadata_opt = Metadata::try_new_from_data(actions.as_ref())?;
+            let has_metadata_update = metadata_opt.is_some();
             let protocol_opt = Protocol::try_new_from_data(actions.as_ref())?;
+            let has_protocol_update = protocol_opt.is_some();
 
-            // Validate protocol and metadata if present
-            if let Some(ref protocol) = protocol_opt {
-                require!(
-                    protocol.is_cdf_supported(),
-                    Error::change_data_feed_unsupported(commit_file.version)
-                );
-            }
             if let Some(ref metadata) = metadata_opt {
                 let schema = metadata.parse_schema()?;
                 // Currently, schema compatibility is defined as having equal schema types. In the
@@ -204,19 +200,31 @@ impl LogReplayScanner {
                     table_schema.as_ref() == &schema,
                     Error::change_data_feed_incompatible_schema(table_schema, &schema)
                 );
-                let table_properties = metadata.parse_table_properties();
-                check_cdf_table_properties(&table_properties)
-                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
             }
 
             // Update table configuration with any new Protocol or Metadata from this commit
-            if metadata_opt.is_some() || protocol_opt.is_some() {
+            if has_metadata_update || has_protocol_update {
                 *table_configuration = TableConfiguration::try_new_from(
                     table_configuration,
                     metadata_opt,
                     protocol_opt,
                     commit_file.version,
                 )?;
+            }
+
+            // If metadata is updated, check if Change Data Feed is enabled
+            if has_metadata_update {
+                require!(
+                    table_configuration.is_feature_enabled(&TableFeature::ChangeDataFeed),
+                    Error::change_data_feed_unsupported(commit_file.version)
+                );
+            }
+
+            // If protocol is updated, check if Change Data Feed is supported
+            if has_protocol_update {
+                table_configuration
+                    .ensure_operation_supported(Operation::Cdf)
+                    .map_err(|_| Error::change_data_feed_unsupported(commit_file.version))?;
             }
         }
         // We resolve the remove deletion vector map after visiting the entire commit.

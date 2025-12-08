@@ -372,7 +372,7 @@ mod tests {
     }}
     {"protocol": {
         "minReaderVersion": 1,
-        "minWriterVersion": 2
+        "minWriterVersion": 4
     }}
     {"metaData": {
         "id": "5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
