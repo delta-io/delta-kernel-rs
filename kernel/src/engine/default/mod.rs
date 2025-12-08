@@ -7,8 +7,10 @@
 //! the [executor] module.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
+use futures::stream::{BoxStream, StreamExt as _};
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -33,6 +35,52 @@ pub mod filesystem;
 pub mod json;
 pub mod parquet;
 pub mod storage;
+
+/// Converts a Stream-producing future to a synchronous iterator.
+///
+/// This method performs the initial blocking call to extract the stream from the future, and each
+/// subsequent call to `next` on the iterator translates to a blocking `stream.next()` call, using
+/// the provided `task_executor`. Buffered streams allow concurrency in the form of prefetching,
+/// because that initial call will attempt to populate the N buffer slots; every call to
+/// `stream.next()` leaves an empty slot (out of N buffer slots) that the stream immediately
+/// attempts to fill by launching another future that can make progress in the background while we
+/// block on and consume each of the N-1 entries that precede it.
+///
+/// This is an internal utility for bridging object_store's async API to
+/// Delta Kernel's synchronous handler traits.
+pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
+    task_executor: Arc<E>,
+    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
+) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
+    Ok(Box::new(BlockingStreamIterator {
+        stream: Some(task_executor.block_on(stream_future)?),
+        task_executor,
+    }))
+}
+
+struct BlockingStreamIterator<T: Send + 'static, E: executor::TaskExecutor> {
+    stream: Option<BoxStream<'static, T>>,
+    task_executor: Arc<E>,
+}
+
+impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIterator<T, E> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Move the stream into the future so we can block on it.
+        let mut stream = self.stream.take()?;
+        let (item, stream) = self
+            .task_executor
+            .block_on(async move { (stream.next().await, stream) });
+
+        // We must not poll an exhausted stream after it returned None.
+        if item.is_some() {
+            self.stream = Some(stream);
+        }
+
+        item
+    }
+}
 
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
