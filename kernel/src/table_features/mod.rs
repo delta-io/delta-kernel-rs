@@ -1,5 +1,3 @@
-use std::sync::LazyLock;
-
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
@@ -74,6 +72,8 @@ pub(crate) enum TableFeature {
     #[strum(serialize = "clustering")]
     #[serde(rename = "clustering")]
     ClusteredTable,
+    /// Materialize partition columns in parquet data files.
+    MaterializePartitionColumns,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -118,13 +118,11 @@ pub(crate) enum TableFeature {
 
 /// ReaderWriter features that can be supported by legacy readers (min_reader_version < 3).
 /// Only ColumnMapping qualifies with min_reader_version = 2.
-#[allow(dead_code)]
-static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
+pub(crate) static LEGACY_READER_FEATURES: [TableFeature; 1] = [TableFeature::ColumnMapping];
 
 /// Writer and ReaderWriter features that can be supported by legacy writers (min_writer_version < 7).
 /// These are features with min_writer_version in range [1, 6].
-#[allow(dead_code)]
-static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
+pub(crate) static LEGACY_WRITER_FEATURES: [TableFeature; 7] = [
     // Writer-only features (min_writer < 7)
     TableFeature::AppendOnly,       // min_writer = 2
     TableFeature::Invariants,       // min_writer = 2
@@ -157,14 +155,16 @@ pub(crate) enum EnablementCheck {
     EnabledIf(fn(&TableProperties) -> bool),
 }
 
-/// Represents the type of data being accessed in an operation (used with both read and write)
+/// Represents the type of operation being performed on a table
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operation {
-    /// Operations on regular table data
+    /// Read operations on regular table data
     Scan,
-    /// Operations on change data feed data
+    /// Read operations on change data feed data
     Cdf,
+    /// Write operations on regular table data
+    Write,
 }
 
 /// Defines whether the Rust kernel has implementation support for a feature's operation
@@ -211,10 +211,8 @@ pub(crate) struct FeatureInfo {
     pub feature_type: FeatureType,
     /// Requirements this feature has (features + custom validations)
     pub feature_requirements: &'static [FeatureRequirement],
-    /// Rust kernel's read support for this feature (may vary by Operation type)
-    pub read_support: KernelSupport,
-    /// Rust kernel's write support for this feature (may vary by Operation type)
-    pub write_support: KernelSupport,
+    /// Rust kernel's support for this feature (may vary by Operation type)
+    pub kernel_support: KernelSupport,
     /// How to check if this feature is enabled in a table
     pub enablement_check: EnablementCheck,
 }
@@ -227,14 +225,13 @@ static APPEND_ONLY_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 2,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| props.append_only == Some(true)),
 };
 
 #[allow(dead_code)]
 // Although kernel marks invariants as "Supported", invariants must NOT actually be present in the table schema.
-// Kernel will fail to read/write any table that actually uses invariants (see check in TableConfiguration::ensure_write_supported).
+// Kernel will fail to write to any table that actually uses invariants (see check in TableConfiguration::ensure_write_supported).
 // This is to allow legacy tables with the Invariants feature enabled but not in use.
 static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     name: "invariants",
@@ -242,8 +239,7 @@ static INVARIANTS_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 2,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -254,8 +250,7 @@ static CHECK_CONSTRAINTS_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 3,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -266,18 +261,7 @@ static CHANGE_DATA_FEED_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 4,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Custom(|_protocol, properties, _operation| {
-        // Kernel supports writing to CDF-enabled tables only if AppendOnly is also enabled
-        // because we don't yet support writing .cdc files for DML operations
-        if properties.enable_change_data_feed == Some(true) && properties.append_only != Some(true)
-        {
-            return Err(Error::unsupported(
-                "Writing to table with Change Data Feed is only supported if append only mode is enabled",
-            ));
-        }
-        Ok(())
-    }),
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_change_data_feed == Some(true)
     }),
@@ -290,8 +274,7 @@ static GENERATED_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 4,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -302,8 +285,7 @@ static IDENTITY_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 6,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -314,16 +296,10 @@ static IN_COMMIT_TIMESTAMP_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan => Ok(()),
+    kernel_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
+        Operation::Scan | Operation::Write => Ok(()),
         Operation::Cdf => Err(Error::unsupported(
-            "CDF reads are not supported for tables with In-Commit Timestamps enabled",
-        )),
-    }),
-    write_support: KernelSupport::Custom(|_protocol, _properties, operation| match operation {
-        Operation::Scan => Ok(()),
-        Operation::Cdf => Err(Error::unsupported(
-            "CDF writes are not supported for tables with In-Commit Timestamps enabled",
+            "Feature 'inCommitTimestamp' is not supported for CDF",
         )),
     }),
     enablement_check: EnablementCheck::EnabledIf(|props| {
@@ -338,8 +314,7 @@ static ROW_TRACKING_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_row_tracking == Some(true) && props.row_tracking_suspended != Some(true)
     }),
@@ -352,8 +327,7 @@ static DOMAIN_METADATA_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -384,8 +358,7 @@ static ICEBERG_COMPAT_V1_INFO: FeatureInfo = FeatureInfo {
         }),
         FeatureRequirement::NotSupported(TableFeature::DeletionVectors),
     ],
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v1 == Some(true)
     }),
@@ -420,8 +393,7 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
         FeatureRequirement::NotEnabled(TableFeature::IcebergCompatV1),
         FeatureRequirement::NotEnabled(TableFeature::DeletionVectors),
     ],
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_iceberg_compat_v2 == Some(true)
     }),
@@ -434,8 +406,18 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+#[allow(dead_code)]
+static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
+    name: "materializePartitionColumns",
+    min_reader_version: 3,
+    min_writer_version: 7,
+    feature_type: FeatureType::Writer,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -447,10 +429,14 @@ static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
-    read_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Write => Ok(()),
+        Operation::Cdf => Err(Error::unsupported(
+            "Feature 'catalogManaged' is not supported for CDF",
+        )),
+    }),
     #[cfg(not(feature = "catalog-managed"))]
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -462,10 +448,14 @@ static CATALOG_OWNED_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
     #[cfg(feature = "catalog-managed")]
-    read_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Write => Ok(()),
+        Operation::Cdf => Err(Error::unsupported(
+            "Feature 'catalogOwned-preview' is not supported for CDF",
+        )),
+    }),
     #[cfg(not(feature = "catalog-managed"))]
-    read_support: KernelSupport::NotSupported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::NotSupported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -476,8 +466,12 @@ static COLUMN_MAPPING_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 5,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'columnMapping' is not supported for writes",
+        )),
+    }),
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.column_mapping_mode.is_some()
             && props.column_mapping_mode != Some(ColumnMappingMode::None)
@@ -491,8 +485,9 @@ static DELETION_VECTORS_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    // We support writing to tables with DeletionVectors enabled, but we never write DV files
+    // ourselves (no DML). The kernel only performs append operations.
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::EnabledIf(|props| {
         props.enable_deletion_vectors == Some(true)
     }),
@@ -505,8 +500,7 @@ static TIMESTAMP_WITHOUT_TIMEZONE_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -517,8 +511,12 @@ static TYPE_WIDENING_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'typeWidening' is not supported for writes",
+        )),
+    }),
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
@@ -529,8 +527,12 @@ static TYPE_WIDENING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Custom(|_, _, op| match op {
+        Operation::Scan | Operation::Cdf => Ok(()),
+        Operation::Write => Err(Error::unsupported(
+            "Feature 'typeWidening-preview' is not supported for writes",
+        )),
+    }),
     enablement_check: EnablementCheck::EnabledIf(|props| props.enable_type_widening == Some(true)),
 };
 
@@ -541,8 +543,7 @@ static V2_CHECKPOINT_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -553,8 +554,7 @@ static VACUUM_PROTOCOL_CHECK_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -565,8 +565,7 @@ static VARIANT_TYPE_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -577,8 +576,7 @@ static VARIANT_TYPE_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -589,8 +587,7 @@ static VARIANT_SHREDDING_PREVIEW_INFO: FeatureInfo = FeatureInfo {
     min_writer_version: 7,
     feature_type: FeatureType::ReaderWriter,
     feature_requirements: &[],
-    read_support: KernelSupport::Supported,
-    write_support: KernelSupport::Supported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -620,7 +617,8 @@ impl TableFeature {
             | TableFeature::InCommitTimestamp
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
-            | TableFeature::ClusteredTable => FeatureType::Writer,
+            | TableFeature::ClusteredTable
+            | TableFeature::MaterializePartitionColumns => FeatureType::Writer,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -643,6 +641,7 @@ impl TableFeature {
             TableFeature::IcebergCompatV1 => Some(&ICEBERG_COMPAT_V1_INFO),
             TableFeature::IcebergCompatV2 => Some(&ICEBERG_COMPAT_V2_INFO),
             TableFeature::ClusteredTable => Some(&CLUSTERED_TABLE_INFO),
+            TableFeature::MaterializePartitionColumns => Some(&MATERIALIZE_PARTITION_COLUMNS_INFO),
 
             // ReaderWriter features
             TableFeature::CatalogManaged => Some(&CATALOG_MANAGED_INFO),
@@ -682,52 +681,6 @@ impl TableFeature {
         TableFeature::Unknown(s.to_string())
     }
 }
-
-pub(crate) static SUPPORTED_READER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-    vec![
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogManaged,
-        #[cfg(feature = "catalog-managed")]
-        TableFeature::CatalogOwnedPreview,
-        TableFeature::ColumnMapping,
-        TableFeature::DeletionVectors,
-        TableFeature::TimestampWithoutTimezone,
-        TableFeature::TypeWidening,
-        TableFeature::TypeWideningPreview,
-        TableFeature::VacuumProtocolCheck,
-        TableFeature::V2Checkpoint,
-        TableFeature::VariantType,
-        TableFeature::VariantTypePreview,
-        // The default engine currently DOES NOT support shredded Variant reads and the parquet
-        // reader will reject the read if it sees a shredded schema in the parquet file. That being
-        // said, kernel does permit reconstructing shredded variants into the
-        // `STRUCT<metadata: BINARY, value: BINARY>` representation if parquet readers of
-        // third-party engines support it.
-        TableFeature::VariantShreddingPreview,
-    ]
-});
-
-/// The writer features have the following limitations:
-/// - We 'support' Invariants only insofar as we check that they are not present.
-/// - We support writing to tables that have Invariants enabled but not used.
-/// - We only support DeletionVectors in that we never write them (no DML).
-/// - We support writing to existing tables with row tracking, but we don't support creating
-///   tables with row tracking yet.
-pub(crate) static SUPPORTED_WRITER_FEATURES: LazyLock<Vec<TableFeature>> = LazyLock::new(|| {
-    vec![
-        TableFeature::ChangeDataFeed,
-        TableFeature::AppendOnly,
-        TableFeature::DeletionVectors,
-        TableFeature::DomainMetadata,
-        TableFeature::InCommitTimestamp,
-        TableFeature::Invariants,
-        TableFeature::RowTracking,
-        TableFeature::TimestampWithoutTimezone,
-        TableFeature::VariantType,
-        TableFeature::VariantTypePreview,
-        TableFeature::VariantShreddingPreview,
-    ]
-});
 
 #[cfg(test)]
 mod tests {
@@ -825,6 +778,10 @@ mod tests {
             (TableFeature::IcebergCompatV2, "icebergCompatV2"),
             (TableFeature::VacuumProtocolCheck, "vacuumProtocolCheck"),
             (TableFeature::ClusteredTable, "clustering"),
+            (
+                TableFeature::MaterializePartitionColumns,
+                "materializePartitionColumns",
+            ),
             (TableFeature::VariantType, "variantType"),
             (TableFeature::VariantTypePreview, "variantType-preview"),
             (
