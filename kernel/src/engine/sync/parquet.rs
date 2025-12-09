@@ -74,11 +74,16 @@ impl ParquetHandler for SyncParquetHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use url::Url;
 
     use super::*;
+    use crate::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use crate::parquet::arrow::arrow_writer::ArrowWriter;
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     #[test]
     fn test_sync_read_parquet_footer() -> DeltaResult<()> {
@@ -120,10 +125,57 @@ mod tests {
 
     #[test]
     fn test_sync_read_parquet_footer_preserves_field_ids() {
-        let (file_meta, _temp_dir) = crate::utils::test_utils::create_parquet_file_with_field_ids();
+        // Create Arrow schema with field IDs in metadata
+        let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+        );
+        let field_with_id_2 = Field::new("name", ArrowDataType::Utf8, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
 
+        // Write a parquet file with this schema
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_field_ids.parquet");
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Read footer and verify schema
         let handler = SyncParquetHandler;
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+
         let footer = handler.read_parquet_footer(&file_meta).unwrap();
-        crate::utils::test_utils::validate_field_ids_preserved(&footer.schema);
+
+        // Verify field IDs are preserved
+        let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
+        assert_eq!(
+            id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"1".into())
+        );
+
+        let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
+        assert_eq!(
+            name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"2".into())
+        );
     }
 }

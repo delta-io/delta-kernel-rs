@@ -146,7 +146,6 @@ impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, 
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use std::collections::HashMap;
     use std::{path::Path, sync::Arc};
 
     use itertools::Itertools;
@@ -155,20 +154,16 @@ pub(crate) mod test_utils {
     use serde::Serialize;
     use tempfile::TempDir;
     use test_utils::delta_path_for_version;
-    use url::Url;
 
     use crate::actions::{
         get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
     };
-    use crate::arrow::array::{Int64Array, RecordBatch, StringArray};
+    use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
-    use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::Engine;
     use crate::EngineData;
-    use crate::FileMeta;
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -368,63 +363,6 @@ pub(crate) mod test_utils {
         assert_eq!(
             get_schema_field(protocol_struct, "minWriterVersion").data_type(),
             &KernelDataType::Primitive(PrimitiveType::Integer)
-        );
-    }
-
-    /// Creates a temporary parquet file with field IDs in the schema metadata.
-    /// Returns the FileMeta and a TempDir (which must be kept alive to preserve the file).
-    pub(crate) fn create_parquet_file_with_field_ids() -> (FileMeta, TempDir) {
-        let field_with_id = Field::new("id", DataType::Int64, false).with_metadata(HashMap::from(
-            [(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())],
-        ));
-        let field_with_id_2 = Field::new("name", DataType::Utf8, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-        );
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let file_path = temp_dir.path().join("test_field_ids.parquet");
-
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-
-        let file = std::fs::File::create(&file_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let file_size = std::fs::metadata(&file_path).unwrap().len();
-        let url = Url::from_file_path(&file_path).unwrap();
-
-        let file_meta = FileMeta {
-            location: url,
-            last_modified: 0,
-            size: file_size,
-        };
-
-        (file_meta, temp_dir)
-    }
-
-    /// Validates that field IDs are preserved in the schema from a parquet footer.
-    pub(crate) fn validate_field_ids_preserved(schema: &SchemaRef) {
-        let id_field = schema.fields().find(|f| f.name() == "id").unwrap();
-        assert_eq!(
-            id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"1".into()),
-            "Field 'id' should have field_id=1"
-        );
-
-        let name_field = schema.fields().find(|f| f.name() == "name").unwrap();
-        assert_eq!(
-            name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
-            Some(&"2".into()),
-            "Field 'name' should have field_id=2"
         );
     }
 }
