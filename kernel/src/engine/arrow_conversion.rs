@@ -197,12 +197,6 @@ impl TryFromArrow<ArrowSchemaRef> for StructType {
     }
 }
 
-impl TryFromArrow<&ArrowSchemaRef> for StructType {
-    fn try_from_arrow(arrow_schema: &ArrowSchemaRef) -> Result<Self, ArrowError> {
-        arrow_schema.as_ref().try_into_kernel()
-    }
-}
-
 impl TryFromArrow<&ArrowField> for StructField {
     fn try_from_arrow(arrow_field: &ArrowField) -> Result<Self, ArrowError> {
         Ok(StructField::new(

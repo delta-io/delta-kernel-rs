@@ -74,10 +74,11 @@ impl ParquetHandler for SyncParquetHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
 
     use url::Url;
+
+    use super::*;
 
     #[test]
     fn test_sync_read_parquet_footer() -> DeltaResult<()> {
@@ -115,5 +116,14 @@ mod tests {
 
         let result = handler.read_parquet_footer(&file_meta);
         assert!(result.is_err(), "Should error on non-existent file");
+    }
+
+    #[test]
+    fn test_sync_read_parquet_footer_preserves_field_ids() {
+        let (file_meta, _temp_dir) = crate::utils::test_utils::create_parquet_file_with_field_ids();
+
+        let handler = SyncParquetHandler;
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
+        crate::utils::test_utils::validate_field_ids_preserved(&footer.schema);
     }
 }
