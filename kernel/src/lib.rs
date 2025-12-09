@@ -617,6 +617,16 @@ pub trait JsonHandler: AsAny {
     ) -> DeltaResult<()>;
 }
 
+/// Metadata from a Parquet file footer.
+///
+/// This struct contains metadata extracted from a Parquet file's footer, including the schema.
+/// It is designed to be extensible for future additions such as row group statistics.
+#[derive(Debug, Clone)]
+pub struct ParquetFooter {
+    /// The schema of the Parquet file, converted to Delta Kernel's schema format.
+    pub schema: SchemaRef,
+}
+
 /// Provides Parquet file related functionalities to Delta Kernel.
 ///
 /// Connectors can leverage this trait to provide their own custom
@@ -697,22 +707,22 @@ pub trait ParquetHandler: AsAny {
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
 
-    /// Read the schema from a Parquet file's footer metadata without reading the data.
+    /// Read the footer metadata from a Parquet file without reading the data.
     ///
-    /// This method reads only the Parquet file footer (metadata section) to extract the schema,
-    /// which is useful for schema inspection, compatibility checking, and determining whether
-    /// parsed statistics columns are present and compatible with the current table schema.
+    /// This method reads only the Parquet file footer (metadata section), which is useful for
+    /// schema inspection, compatibility checking, and determining whether parsed statistics
+    /// columns are present and compatible with the current table schema.
     ///
     /// # Parameters
     ///
-    /// - `file` - File metadata for the Parquet file whose schema should be read. The `size` field
+    /// - `file` - File metadata for the Parquet file whose footer should be read. The `size` field
     ///   should contain the actual file size to enable efficient footer reads without additional
     ///   I/O operations.
     ///
     /// # Returns
     ///
-    /// A [`DeltaResult`] containing a [`SchemaRef`] representing the Parquet file's schema,
-    /// converted to Delta Kernel's schema format.
+    /// A [`DeltaResult`] containing a [`ParquetFooter`] with the Parquet file's metadata, including
+    /// the schema converted to Delta Kernel's format.
     ///
     /// # Field IDs
     ///
@@ -732,7 +742,7 @@ pub trait ParquetHandler: AsAny {
     /// [`StructField`]: crate::schema::StructField
     /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
     /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
-    fn read_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef>;
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide

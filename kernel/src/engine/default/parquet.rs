@@ -31,8 +31,8 @@ use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
 use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
-    PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
+    ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -246,13 +246,13 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         )
     }
 
-    fn read_parquet_schema(&self, file: &FileMeta) -> DeltaResult<SchemaRef> {
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
         let store = self.store.clone();
         let location = file.location.clone();
         let file_size = file.size;
 
         self.task_executor.block_on(async move {
-            let arrow_schema = if location.is_presigned() {
+            let metadata = if location.is_presigned() {
                 let client = reqwest::Client::new();
                 let response =
                     client.get(location.as_str()).send().await.map_err(|e| {
@@ -262,19 +262,17 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
                     .bytes()
                     .await
                     .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
-                let metadata = ArrowReaderMetadata::load(&bytes, Default::default())?;
-                metadata.schema().clone()
+                ArrowReaderMetadata::load(&bytes, Default::default())?
             } else {
                 let path = Path::from_url_path(location.path())?;
                 let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
-                let metadata =
-                    ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?;
-                metadata.schema().clone()
+                ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?
             };
 
-            StructType::try_from_arrow(arrow_schema.as_ref())
+            let schema = StructType::try_from_arrow(metadata.schema().as_ref())
                 .map(Arc::new)
-                .map_err(Error::Arrow)
+                .map_err(Error::Arrow)?;
+            Ok(ParquetFooter { schema })
         })
     }
 }
@@ -469,7 +467,6 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    use crate::schema::{DataType, PrimitiveType};
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -678,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_parquet_schema() {
+    fn test_read_parquet_footer() {
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
@@ -695,79 +692,12 @@ mod tests {
             size: file_size,
         };
 
-        let schema = handler.read_parquet_schema(&file_meta).unwrap();
-
-        let get_field = |struct_type: &crate::schema::StructType, name: &str| {
-            struct_type
-                .fields()
-                .find(|f| f.name() == name)
-                .unwrap_or_else(|| panic!("Field '{}' not found", name))
-                .clone()
-        };
-
-        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
-        for field_name in top_level_fields {
-            let field = get_field(&schema, field_name);
-            assert!(
-                matches!(field.data_type(), DataType::Struct(_)),
-                "Field '{}' should be a struct type",
-                field_name
-            );
-        }
-
-        let add_field = get_field(&schema, "add");
-        let add_struct = match add_field.data_type() {
-            DataType::Struct(s) => s,
-            _ => panic!("'add' should be a struct"),
-        };
-        assert_eq!(
-            get_field(add_struct, "path").data_type(),
-            &DataType::Primitive(PrimitiveType::String)
-        );
-        assert_eq!(
-            get_field(add_struct, "size").data_type(),
-            &DataType::Primitive(PrimitiveType::Long)
-        );
-        assert!(
-            matches!(
-                get_field(add_struct, "partitionValues").data_type(),
-                DataType::Map(_)
-            ),
-            "'partitionValues' should be a map type"
-        );
-
-        let metadata_field = get_field(&schema, "metaData");
-        let metadata_struct = match metadata_field.data_type() {
-            DataType::Struct(s) => s,
-            _ => panic!("'metaData' should be a struct"),
-        };
-        let format_field = get_field(metadata_struct, "format");
-        let format_struct = match format_field.data_type() {
-            DataType::Struct(s) => s,
-            _ => panic!("'format' should be a struct"),
-        };
-        assert_eq!(
-            get_field(format_struct, "provider").data_type(),
-            &DataType::Primitive(PrimitiveType::String)
-        );
-
-        let protocol_field = get_field(&schema, "protocol");
-        let protocol_struct = match protocol_field.data_type() {
-            DataType::Struct(s) => s,
-            _ => panic!("'protocol' should be a struct"),
-        };
-        assert_eq!(
-            get_field(protocol_struct, "minReaderVersion").data_type(),
-            &DataType::Primitive(PrimitiveType::Integer)
-        );
-        assert_eq!(
-            get_field(protocol_struct, "minWriterVersion").data_type(),
-            &DataType::Primitive(PrimitiveType::Integer)
-        );
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
+        crate::utils::test_utils::validate_checkpoint_schema(&footer.schema);
     }
 
     #[test]
-    fn test_read_parquet_schema_invalid_file() {
+    fn test_read_parquet_footer_invalid_file() {
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
@@ -780,12 +710,12 @@ mod tests {
             size: 0,
         };
 
-        let result = handler.read_parquet_schema(&file_meta);
+        let result = handler.read_parquet_footer(&file_meta);
         assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[test]
-    fn test_read_parquet_schema_preserves_field_ids() {
+    fn test_read_parquet_footer_preserves_field_ids() {
         // Create Arrow schema with field IDs in metadata
         let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
             HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
@@ -813,7 +743,7 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        // Read schema back using read_parquet_schema
+        // Read footer and verify schema
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
@@ -826,16 +756,16 @@ mod tests {
             size: file_size,
         };
 
-        let schema = handler.read_parquet_schema(&file_meta).unwrap();
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
 
         // Verify field IDs are preserved
-        let id_field = schema.fields().find(|f| f.name() == "id").unwrap();
+        let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
         assert_eq!(
             id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
             Some(&"1".into())
         );
 
-        let name_field = schema.fields().find(|f| f.name() == "name").unwrap();
+        let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
         assert_eq!(
             name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
             Some(&"2".into())
