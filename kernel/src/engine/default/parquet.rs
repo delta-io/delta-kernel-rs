@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::file_stream::{FileOpenFuture, FileOpener, FileStream};
 use super::UrlExt;
-use crate::engine::arrow_conversion::TryIntoArrow as _;
+use crate::engine::arrow_conversion::{TryFromArrow as _, TryIntoArrow as _};
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::{
     fixup_parquet_read, generate_mask, get_requested_indices, ordering_needs_row_indexes,
@@ -30,10 +30,10 @@ use crate::engine::arrow_utils::{
 };
 use crate::engine::default::executor::TaskExecutor;
 use crate::engine::parquet_row_group_skipping::ParquetRowGroupSkipping;
-use crate::schema::SchemaRef;
+use crate::schema::{SchemaRef, StructType};
 use crate::{
-    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetHandler,
-    PredicateRef,
+    DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
+    ParquetHandler, PredicateRef,
 };
 
 #[derive(Debug)]
@@ -261,6 +261,36 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         );
         super::stream_future_to_iter(self.task_executor.clone(), future)
     }
+
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter> {
+        let store = self.store.clone();
+        let location = file.location.clone();
+        let file_size = file.size;
+
+        self.task_executor.block_on(async move {
+            let metadata = if location.is_presigned() {
+                let client = reqwest::Client::new();
+                let response =
+                    client.get(location.as_str()).send().await.map_err(|e| {
+                        Error::generic(format!("Failed to fetch presigned URL: {}", e))
+                    })?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::generic(format!("Failed to read response bytes: {}", e)))?;
+                ArrowReaderMetadata::load(&bytes, Default::default())?
+            } else {
+                let path = Path::from_url_path(location.path())?;
+                let mut reader = ParquetObjectReader::new(store, path).with_file_size(file_size);
+                ArrowReaderMetadata::load_async(&mut reader, Default::default()).await?
+            };
+
+            let schema = StructType::try_from_arrow(metadata.schema().as_ref())
+                .map(Arc::new)
+                .map_err(Error::Arrow)?;
+            Ok(ParquetFooter { schema })
+        })
+    }
 }
 
 /// Implements [`FileOpener`] for a parquet file
@@ -443,14 +473,16 @@ impl FileOpener for PresignedUrlOpener {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::slice;
 
     use crate::arrow::array::{Array, RecordBatch};
-
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -544,7 +576,7 @@ mod tests {
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
         let stats_struct = StructArray::try_new_with_length(
-            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
             vec![Arc::new(Int64Array::from(vec![num_records as i64]))],
             None,
             1,
@@ -655,6 +687,104 @@ mod tests {
                 .write_parquet(&Url::parse("memory:///data").unwrap(), data)
                 .await,
             "Generic delta kernel error: Path must end with a trailing slash: memory:///data",
+        );
+    }
+
+    #[test]
+    fn test_read_parquet_footer() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        let path = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",
+        ))
+        .unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        let url = Url::from_file_path(path).unwrap();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
+        crate::utils::test_utils::validate_checkpoint_schema(&footer.schema);
+    }
+
+    #[test]
+    fn test_read_parquet_footer_invalid_file() {
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        let mut temp_path = std::env::temp_dir();
+        temp_path.push("non_existent_file_for_test.parquet");
+        let url = Url::from_file_path(temp_path).unwrap();
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: 0,
+        };
+
+        let result = handler.read_parquet_footer(&file_meta);
+        assert!(result.is_err(), "Should error on non-existent file");
+    }
+
+    #[test]
+    fn test_read_parquet_footer_preserves_field_ids() {
+        // Create Arrow schema with field IDs in metadata
+        let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+        );
+        let field_with_id_2 = Field::new("name", ArrowDataType::Utf8, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
+
+        // Write a parquet file with this schema
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_field_ids.parquet");
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Read footer and verify schema
+        let store = Arc::new(LocalFileSystem::new());
+        let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let url = Url::from_file_path(&file_path).unwrap();
+
+        let file_meta = FileMeta {
+            location: url,
+            last_modified: 0,
+            size: file_size,
+        };
+
+        let footer = handler.read_parquet_footer(&file_meta).unwrap();
+
+        // Verify field IDs are preserved
+        let id_field = footer.schema.fields().find(|f| f.name() == "id").unwrap();
+        assert_eq!(
+            id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"1".into())
+        );
+
+        let name_field = footer.schema.fields().find(|f| f.name() == "name").unwrap();
+        assert_eq!(
+            name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"2".into())
         );
     }
 }
