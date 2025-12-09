@@ -74,12 +74,12 @@ impl ParquetHandler for SyncParquetHandler {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    use crate::schema::{DataType, PrimitiveType};
     use url::Url;
 
     #[test]
     fn test_sync_read_parquet_schema() -> DeltaResult<()> {
-        use crate::schema::{DataType, PrimitiveType};
-
         let handler = SyncParquetHandler;
         let path = std::fs::canonicalize(PathBuf::from(
             "./tests/data/with_checkpoint_no_last_checkpoint/_delta_log/00000000000000000002.checkpoint.parquet",

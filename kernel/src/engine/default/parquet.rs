@@ -459,14 +459,17 @@ impl FileOpener for PresignedUrlOpener {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::slice;
 
     use crate::arrow::array::{Array, RecordBatch};
-
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use crate::schema::{DataType, PrimitiveType};
     use crate::EngineData;
 
     use itertools::Itertools;
@@ -560,7 +563,7 @@ mod tests {
         partition_values_builder.append(true).unwrap();
         let partition_values = partition_values_builder.finish();
         let stats_struct = StructArray::try_new_with_length(
-            vec![Field::new("numRecords", DataType::Int64, true)].into(),
+            vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
             vec![Arc::new(Int64Array::from(vec![num_records as i64]))],
             None,
             1,
@@ -676,8 +679,6 @@ mod tests {
 
     #[test]
     fn test_read_parquet_schema() {
-        use crate::schema::{DataType, PrimitiveType};
-
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
@@ -785,18 +786,39 @@ mod tests {
 
     #[test]
     fn test_read_parquet_schema_preserves_field_ids() {
-        use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        // Create Arrow schema with field IDs in metadata
+        let field_with_id = Field::new("id", ArrowDataType::Int64, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+        );
+        let field_with_id_2 = Field::new("name", ArrowDataType::Utf8, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![field_with_id, field_with_id_2]));
 
+        // Write a parquet file with this schema
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_field_ids.parquet");
+
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let file = std::fs::File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Read schema back using read_parquet_schema
         let store = Arc::new(LocalFileSystem::new());
         let handler = DefaultParquetHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
 
-        // Use a parquet file with column mapping enabled (has field IDs)
-        let path = std::fs::canonicalize(PathBuf::from(
-            "../acceptance/tests/dat/out/reader_tests/generated/column_mapping/delta/part-00000-f94de347-a288-43fe-9ea3-257ef31d0382-c000.snappy.parquet",
-        ))
-        .unwrap();
-        let file_size = std::fs::metadata(&path).unwrap().len();
-        let url = Url::from_file_path(path).unwrap();
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let url = Url::from_file_path(&file_path).unwrap();
 
         let file_meta = FileMeta {
             location: url,
@@ -806,21 +828,17 @@ mod tests {
 
         let schema = handler.read_parquet_schema(&file_meta).unwrap();
 
-        let mut found_field_ids = false;
-        for field in schema.fields() {
-            if let Some(field_id) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
-                found_field_ids = true;
-                let id: i64 = field_id
-                    .to_string()
-                    .parse()
-                    .expect("Field ID should be a valid number");
-                assert!(id > 0, "Field ID should be positive");
-            }
-        }
+        // Verify field IDs are preserved
+        let id_field = schema.fields().find(|f| f.name() == "id").unwrap();
+        assert_eq!(
+            id_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"1".into())
+        );
 
-        assert!(
-            found_field_ids,
-            "Table with column mapping should have field IDs in parquet schema"
+        let name_field = schema.fields().find(|f| f.name() == "name").unwrap();
+        assert_eq!(
+            name_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"2".into())
         );
     }
 }
