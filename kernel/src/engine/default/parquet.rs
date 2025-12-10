@@ -534,8 +534,6 @@ mod tests {
         Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
         Int16Array, Int32Array, Int8Array, RecordBatch, TimestampMicrosecondArray,
     };
-
-    use crate::arrow::array::{Array, RecordBatch};
     use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
     use crate::engine::arrow_data::ArrowEngineData;
@@ -847,20 +845,8 @@ mod tests {
             size: 0,
         };
 
-        let data: Vec<RecordBatch> = parquet_handler
-            .read_parquet_files(
-                slice::from_ref(&file_meta),
-                Arc::new(physical_schema.try_into_kernel().unwrap()),
-                None,
-            )
-            .unwrap()
-            .map(into_record_batch)
-            .try_collect()
-            .unwrap();
-
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0].num_rows(), 3);
-        assert_eq!(data[0].num_columns(), 2);
+        let result = handler.read_parquet_footer(&file_meta);
+        assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[tokio::test]
@@ -1298,8 +1284,6 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(value_col.values(), &[10, 20]);
-        let result = handler.read_parquet_footer(&file_meta);
-        assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[test]

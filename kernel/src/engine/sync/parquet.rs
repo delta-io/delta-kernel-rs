@@ -128,19 +128,15 @@ impl ParquetHandler for SyncParquetHandler {
 mod tests {
     use super::*;
     use crate::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_conversion::TryIntoKernel as _;
+    use crate::parquet::arrow::arrow_writer::ArrowWriter;
+    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
-
     use url::Url;
-
-    use super::*;
-    use crate::arrow::array::{Int64Array, RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use crate::parquet::arrow::arrow_writer::ArrowWriter;
-    use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     #[test]
     fn test_sync_write_parquet_file() {
@@ -259,41 +255,8 @@ mod tests {
             size: 0,
         };
 
-        let mut result = handler
-            .read_parquet_files(
-                &[file_meta],
-                Arc::new(schema.try_into_kernel().unwrap()),
-                None,
-            )
-            .unwrap();
-
-        let engine_data = result.next().unwrap().unwrap();
-        let batch = ArrowEngineData::try_from_engine_data(engine_data).unwrap();
-        let record_batch = batch.record_batch();
-
-        // Verify shape
-        assert_eq!(record_batch.num_rows(), 3);
-        assert_eq!(record_batch.num_columns(), 2);
-
-        // Verify content - id column
-        let id_col = record_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(id_col.values(), &[1, 2, 3]);
-
-        // Verify content - name column
-        let name_col = record_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(name_col.value(0), "a");
-        assert_eq!(name_col.value(1), "b");
-        assert_eq!(name_col.value(2), "c");
-
-        assert!(result.next().is_none());
+        let result = handler.read_parquet_footer(&file_meta);
+        assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[test]
@@ -606,8 +569,6 @@ mod tests {
         assert_eq!(value_col.values(), &[1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         assert!(result.next().is_none());
-        let result = handler.read_parquet_footer(&file_meta);
-        assert!(result.is_err(), "Should error on non-existent file");
     }
 
     #[test]
