@@ -423,14 +423,24 @@ impl Display for Scalar {
     }
 }
 
+// NOTE: This impl provides logical/SQL NULL semantics where NULL != NULL.
+// For physical/structural comparison (e.g., comparing query plans), this will be replaced
+// with a derived PartialEq in a future change.
 impl PartialEq for Scalar {
     fn eq(&self, other: &Scalar) -> bool {
-        self.partial_cmp(other) == Some(Ordering::Equal)
+        self.logical_partial_cmp(other) == Some(Ordering::Equal)
     }
 }
 
-impl PartialOrd for Scalar {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl Scalar {
+    /// Logical (SQL semantics) comparison of two scalars.
+    ///
+    /// Returns `None` if the scalars are incomparable (different types, NULL values, or
+    /// unsupported types like Struct/Array/Map).
+    ///
+    /// NOTE: This implements SQL NULL semantics where NULL is incomparable to everything,
+    /// including itself.
+    pub fn logical_partial_cmp(&self, other: &Self) -> Option<Ordering> {
         use Scalar::*;
         match (self, other) {
             // NOTE: We intentionally do two match arms for each variant to avoid a catch-all, so
@@ -463,7 +473,7 @@ impl PartialOrd for Scalar {
                 .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
             (Decimal(_), _) => None,
-            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
+            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
             (Map(_), _) => None,  // TODO: Support Map?
@@ -1042,16 +1052,17 @@ mod tests {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
         let c = Scalar::Null(DataType::INTEGER);
-        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
-        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
-        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
-        assert_eq!(b.partial_cmp(&b), Some(Ordering::Equal));
-        assert_eq!(a.partial_cmp(&c), None);
-        assert_eq!(c.partial_cmp(&a), None);
+
+        assert_eq!(a.logical_partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.logical_partial_cmp(&a), Some(Ordering::Greater));
+        assert_eq!(a.logical_partial_cmp(&a), Some(Ordering::Equal));
+        assert_eq!(b.logical_partial_cmp(&b), Some(Ordering::Equal));
+        assert_eq!(a.logical_partial_cmp(&c), None);
+        assert_eq!(c.logical_partial_cmp(&a), None);
 
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
-        assert_eq!(null.partial_cmp(&null), None);
+        assert_eq!(null.logical_partial_cmp(&null), None);
     }
 
     #[test]
