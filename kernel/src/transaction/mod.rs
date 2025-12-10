@@ -36,6 +36,9 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 pub mod create_table;
+pub mod data_layout;
+
+pub use data_layout::DataLayout;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -222,8 +225,12 @@ impl Transaction {
         metadata: Metadata,
         engine_info: String,
         committer: Box<dyn Committer>,
+        system_domain_metadata: Option<DomainMetadata>,
     ) -> DeltaResult<Self> {
         let commit_timestamp = current_time_ms()?;
+
+        // Collect system domain metadata (e.g., clustering metadata)
+        let domain_metadata_additions = system_domain_metadata.into_iter().collect();
 
         Ok(Transaction {
             read_snapshot: None,
@@ -234,7 +241,7 @@ impl Transaction {
             remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
-            domain_metadata_additions: vec![],
+            domain_metadata_additions,
             domain_removals: vec![],
             data_change: true,
             table_url: Some(table_url),
@@ -550,6 +557,49 @@ impl Transaction {
         Ok(())
     }
 
+    /// Generate domain metadata actions for create-table transactions.
+    ///
+    /// For create-table, only system domain metadata (domains with `delta.` prefix) is allowed.
+    /// User domain operations are not supported since the table doesn't exist yet.
+    /// This includes system domains like `delta.clustering` for clustered tables.
+    fn generate_create_table_domain_metadata_actions<'a>(
+        &'a self,
+        engine: &'a dyn Engine,
+    ) -> DeltaResult<EngineDataResultIterator<'a>> {
+        // Domain removals are not allowed for create-table (nothing to remove)
+        if !self.domain_removals.is_empty() {
+            return Err(Error::unsupported(
+                "Domain metadata removals are not supported in create-table transactions",
+            ));
+        }
+
+        // Check that all additions are internal (system) domains
+        let has_user_domains = self
+            .domain_metadata_additions
+            .iter()
+            .any(|dm| !dm.is_internal());
+
+        if has_user_domains {
+            return Err(Error::unsupported(
+                "User domain metadata operations are not supported in create-table transactions",
+            ));
+        }
+
+        // If there are system domain additions (e.g., clustering), include them
+        if !self.domain_metadata_additions.is_empty() {
+            let schema = get_log_domain_metadata_schema();
+            return Ok(Box::new(
+                self.domain_metadata_additions
+                    .clone()
+                    .into_iter()
+                    .map(move |dm| dm.into_engine_data(schema.clone(), engine)),
+            ));
+        }
+
+        // For create table with no domain metadata, return empty
+        Ok(Box::new(iter::empty()))
+    }
+
     /// Generate domain metadata actions with validation. Handle both user and system domains.
     ///
     /// This function may perform an expensive log replay operation if there are any domain removals.
@@ -560,16 +610,9 @@ impl Transaction {
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<EngineDataResultIterator<'a>> {
-        // For create-table transactions, domain metadata operations are not yet supported
-        // (the table doesn't exist yet, so there's no protocol to check)
+        // For create-table transactions, delegate to specialized handler
         if self.is_create_table() {
-            if !self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty() {
-                return Err(Error::unsupported(
-                    "Domain metadata operations are not supported in create-table transactions",
-                ));
-            }
-            // For create table, just return empty domain metadata actions
-            return Ok(Box::new(iter::empty()));
+            return self.generate_create_table_domain_metadata_actions(engine);
         }
 
         let snapshot = self.read_snapshot.as_ref().ok_or_else(|| {
