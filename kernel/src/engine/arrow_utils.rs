@@ -1,28 +1,26 @@
 //! Some utilities for working with arrow data types
 
-use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
-use std::ops::Range;
-use std::sync::{Arc, OnceLock};
-
 use crate::engine::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
 use crate::engine::ensure_data_types::DataTypeCompat;
 use crate::engine_data::FilteredEngineData;
 use crate::schema::{ColumnMetadataKey, MetadataValue};
 use crate::{
-    engine::arrow_data::{extract_record_batch, ArrowEngineData},
+    engine::arrow_data::ArrowEngineData,
     schema::{DataType, MetadataColumnSpec, Schema, SchemaRef, StructField, StructType},
     utils::require,
     DeltaResult, EngineData, Error,
 };
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, BooleanArray, GenericListArray,
-    MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::compute::concat_batches;
-use crate::arrow::compute::filter_record_batch;
 use crate::arrow::datatypes::{
     DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
     Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -1074,6 +1072,14 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
     Ok(concat_batches(&schema, output.iter())?)
 }
 
+pub(crate) fn filter_to_record_batch(
+    filtered_data: FilteredEngineData,
+) -> DeltaResult<RecordBatch> {
+    let filtered = filtered_data.apply_selection_vector()?;
+    let arrow_data = ArrowEngineData::try_from_engine_data(filtered)?;
+    Ok((*arrow_data).into())
+}
+
 /// serialize an arrow RecordBatch to a JSON string by appending to a buffer.
 // TODO (zach): this should stream data to the JSON writer and output an iterator.
 #[internal_api]
@@ -1082,26 +1088,8 @@ pub(crate) fn to_json_bytes(
 ) -> DeltaResult<Vec<u8>> {
     let mut writer = LineDelimitedWriter::new(Vec::new());
     for chunk in data {
-        let filtered_data = chunk?;
-        // Honor the new contract: if selection vector is shorter than the number of rows,
-        // then all rows not covered by the selection vector are assumed to be selected
-        let (underlying_data, mut selection_vector) = filtered_data.into_parts();
-        let batch = extract_record_batch(&*underlying_data)?;
-        let num_rows = batch.num_rows();
-
-        if selection_vector.is_empty() {
-            // If selection vector is empty, write all rows per contract.
-            writer.write(batch)?;
-        } else {
-            // Extend the selection vector with `true` for uncovered rows
-            if selection_vector.len() < num_rows {
-                selection_vector.resize(num_rows, true);
-            }
-
-            let filtered_batch = filter_record_batch(batch, &BooleanArray::from(selection_vector))
-                .map_err(|e| Error::generic(format!("Failed to filter record batch: {e}")))?;
-            writer.write(&filtered_batch)?
-        };
+        let batch = filter_to_record_batch(chunk?)?;
+        writer.write(&batch)?;
     }
     writer.finish()?;
     Ok(writer.into_inner())
