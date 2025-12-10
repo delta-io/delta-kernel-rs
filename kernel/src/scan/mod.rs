@@ -26,7 +26,7 @@ use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    ToSchema as _,
+    StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -56,6 +56,39 @@ static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+
+/// Builds a checkpoint read schema that includes `stats_parsed` if stats schema is provided.
+///
+/// If `stats_schema` is `Some`, the returned schema will have the `add` field augmented with
+/// a `stats_parsed` field containing the provided stats schema. This allows reading pre-parsed
+/// statistics directly from checkpoint parquet files, avoiding JSON parsing overhead.
+///
+/// If `stats_schema` is `None`, returns the default checkpoint read schema (just `add`).
+pub(crate) fn build_checkpoint_read_schema_with_stats_parsed(
+    stats_schema: Option<&SchemaRef>,
+) -> DeltaResult<SchemaRef> {
+    let Some(stats_schema) = stats_schema else {
+        return Ok(CHECKPOINT_READ_SCHEMA.clone());
+    };
+
+    // Get the add field from the base schema
+    let add_field = CHECKPOINT_READ_SCHEMA
+        .field(ADD_NAME)
+        .ok_or_else(|| Error::generic("add field not found in checkpoint schema"))?;
+
+    let DataType::Struct(add_struct) = add_field.data_type() else {
+        return Err(Error::generic("add field is not a struct"));
+    };
+
+    // Create stats_parsed field and add it to the add struct
+    let stats_parsed_field =
+        StructField::nullable(data_skipping::STATS_PARSED_NAME, stats_schema.clone());
+
+    let new_add_struct = add_struct.add([stats_parsed_field])?;
+    let new_add_field = StructField::nullable(ADD_NAME, new_add_struct);
+
+    Ok(Arc::new(StructType::new_unchecked([new_add_field])))
+}
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -153,6 +186,26 @@ pub(crate) enum PhysicalPredicate {
 }
 
 impl PhysicalPredicate {
+    /// Returns the referenced schema if this predicate can be used for data skipping.
+    /// The referenced schema contains only the columns referenced by the predicate,
+    /// which is used to build the stats schema for data skipping.
+    pub(crate) fn referenced_schema(&self) -> Option<&SchemaRef> {
+        match self {
+            PhysicalPredicate::Some(_, schema) => Some(schema),
+            _ => None,
+        }
+    }
+
+    /// Builds the stats schema for data skipping based on the predicate's referenced columns.
+    /// Returns `None` if this predicate cannot be used for data skipping.
+    ///
+    /// The stats schema contains: numRecords, nullCount, minValues, maxValues
+    /// where minValues/maxValues contain only the columns referenced by the predicate.
+    pub(crate) fn build_stats_schema(&self) -> Option<SchemaRef> {
+        self.referenced_schema()
+            .and_then(|schema| data_skipping::build_stats_schema(schema))
+    }
+
     /// If we have a predicate, verify the columns it references and apply column mapping. First, get
     /// the set of references; use that to filter the schema to only the columns of interest (and
     /// verify that all referenced columns exist); then use the resulting logical/physical mappings
@@ -407,7 +460,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        let (action_iter, use_stats_parsed) = self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(engine, action_iter, use_stats_parsed)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -507,9 +561,11 @@ impl Scan {
 
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
+        // Note: We pass false for use_stats_parsed since we're processing existing data
+        // that doesn't include stats_parsed.
         if existing_version == self.snapshot.version() {
             let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            return Ok(Box::new(self.scan_metadata_inner(engine, scan, false)?));
         }
 
         let log_segment = self.snapshot.log_segment();
@@ -540,6 +596,8 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
+        // Note: We pass false for use_stats_parsed since the incremental update doesn't
+        // include stats_parsed in the checkpoint read schema.
         let it = new_log_segment
             .read_actions_with_projected_checkpoint_actions(
                 engine,
@@ -549,36 +607,67 @@ impl Scan {
             )?
             .chain(existing_data.into_iter().map(apply_transform));
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(engine, it, false)?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        use_stats_parsed: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            action_batch_iter,
+            self.state_info.clone(),
+            use_stats_parsed,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
     // Factored out to facilitate testing
+    // Returns (action_batch_iter, use_stats_parsed)
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<(impl Iterator<Item = DeltaResult<ActionsBatch>> + Send, bool)> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
-        self.snapshot
+
+        // Build stats schema from the predicate if available
+        let stats_schema = self.state_info.physical_predicate.build_stats_schema();
+
+        // Check if the checkpoint has compatible stats_parsed and build the appropriate schema
+        let (checkpoint_read_schema, use_stats_parsed) = if let Some(ref stats) = stats_schema {
+            let log_segment = self.snapshot.log_segment();
+            if log_segment.has_compatible_checkpoint_stats_parsed(engine, stats) {
+                debug!("Checkpoint has compatible stats_parsed, including in read schema");
+                (
+                    build_checkpoint_read_schema_with_stats_parsed(Some(stats))?,
+                    true,
+                )
+            } else {
+                debug!("Checkpoint does not have compatible stats_parsed, using default schema");
+                (CHECKPOINT_READ_SCHEMA.clone(), false)
+            }
+        } else {
+            (CHECKPOINT_READ_SCHEMA.clone(), false)
+        };
+
+        let action_iter = self
+            .snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
+                checkpoint_read_schema,
                 None,
-            )
+            )?;
+
+        Ok((action_iter, use_stats_parsed))
     }
 
     /// Perform an "all in one" scan. This will use the provided `engine` to read and process all

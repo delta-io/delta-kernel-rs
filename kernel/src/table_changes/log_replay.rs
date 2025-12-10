@@ -57,7 +57,8 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    // Table changes doesn't use stats_parsed since it reads commits, not checkpoints
+    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate, false).map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
