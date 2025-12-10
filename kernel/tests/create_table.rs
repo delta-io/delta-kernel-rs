@@ -304,3 +304,122 @@ async fn test_create_table_log_actions() -> DeltaResult<()> {
 
     Ok(())
 }
+
+/// Test that delta.feature.X = supported adds features to the protocol
+#[test]
+fn test_feature_overrides_add_to_protocol() -> DeltaResult<()> {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let table_path = temp_dir.path().to_str().expect("Invalid path").to_string();
+
+    let engine =
+        create_default_engine(&url::Url::from_directory_path(&table_path).expect("Invalid URL"))?;
+
+    let schema = Arc::new(StructType::try_new(vec![StructField::new(
+        "id",
+        DataType::LONG,
+        false,
+    )])?);
+
+    // Use feature overrides to enable deletionVectors (ReaderWriter) and changeDataFeed (Writer)
+    let _ = create_table(&table_path, schema, "FeatureTest/1.0")
+        .with_table_properties([
+            // Feature overrides (should be consumed, not stored)
+            ("delta.feature.deletionVectors", "supported"),
+            ("delta.feature.changeDataFeed", "supported"),
+            // Regular table properties (should be stored)
+            ("delta.enableDeletionVectors", "true"),
+            ("delta.enableChangeDataFeed", "true"),
+        ])
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
+        .commit(engine.as_ref())?;
+
+    // Read log file
+    let log_file_path = format!("{}/_delta_log/00000000000000000000.json", table_path);
+    let log_contents = std::fs::read_to_string(&log_file_path)?;
+
+    // Find the protocol line
+    let protocol_line = log_contents
+        .lines()
+        .find(|line| line.contains("\"protocol\""))
+        .expect("Protocol action not found");
+
+    // Verify deletionVectors is in BOTH readerFeatures and writerFeatures (ReaderWriter feature)
+    assert!(
+        protocol_line.contains("\"readerFeatures\""),
+        "Protocol should have readerFeatures"
+    );
+    assert!(
+        protocol_line.contains("\"writerFeatures\""),
+        "Protocol should have writerFeatures"
+    );
+    assert!(
+        protocol_line.contains("deletionVectors"),
+        "deletionVectors should be in protocol features"
+    );
+
+    // Verify changeDataFeed is in writerFeatures only (Writer feature)
+    assert!(
+        protocol_line.contains("changeDataFeed"),
+        "changeDataFeed should be in protocol features"
+    );
+
+    // Find the metadata line
+    let metadata_line = log_contents
+        .lines()
+        .find(|line| line.contains("\"metaData\""))
+        .expect("Metadata action not found");
+
+    // Verify feature override properties are NOT in metadata configuration
+    assert!(
+        !metadata_line.contains("delta.feature.deletionVectors"),
+        "Feature override should not be stored in metadata"
+    );
+    assert!(
+        !metadata_line.contains("delta.feature.changeDataFeed"),
+        "Feature override should not be stored in metadata"
+    );
+
+    // Verify regular properties ARE in metadata configuration
+    assert!(
+        metadata_line.contains("delta.enableDeletionVectors"),
+        "Regular property should be stored in metadata"
+    );
+    assert!(
+        metadata_line.contains("delta.enableChangeDataFeed"),
+        "Regular property should be stored in metadata"
+    );
+
+    Ok(())
+}
+
+/// Test that invalid feature override values are rejected
+#[test]
+fn test_feature_override_invalid_value() {
+    let temp_dir = tempdir().expect("Failed to create temp dir");
+    let table_path = temp_dir.path().to_str().expect("Invalid path").to_string();
+
+    let engine =
+        create_default_engine(&url::Url::from_directory_path(&table_path).expect("Invalid URL"))
+            .expect("Failed to create engine");
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::new("id", DataType::LONG, false)])
+            .expect("Invalid schema"),
+    );
+
+    // Try to use an invalid value for feature override
+    let result = create_table(&table_path, schema, "FeatureTest/1.0")
+        .with_table_properties([("delta.feature.deletionVectors", "enabled")]) // Wrong! Should be "supported"
+        .build(engine.as_ref(), Box::new(FileSystemCommitter::new()));
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Invalid value"),
+        "Error should mention invalid value"
+    );
+    assert!(
+        err_msg.contains("supported"),
+        "Error should mention 'supported' as valid value"
+    );
+}

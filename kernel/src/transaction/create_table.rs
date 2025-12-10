@@ -33,9 +33,15 @@ use crate::actions::{
 };
 use crate::committer::Committer;
 use crate::schema::SchemaRef;
+use crate::table_features::extract_table_configuration;
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error};
+
+/// Table property key for specifying the minimum reader protocol version.
+const MIN_READER_VERSION_PROP: &str = "delta.minReaderVersion";
+/// Table property key for specifying the minimum writer protocol version.
+const MIN_WRITER_VERSION_PROP: &str = "delta.minWriterVersion";
 
 /// Creates a builder for creating a new Delta table.
 ///
@@ -144,6 +150,69 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Validates protocol version properties and removes them from the properties map.
+    ///
+    /// Only protocol versions (3, 7) are supported. If `delta.minReaderVersion` or
+    /// `delta.minWriterVersion` are provided with different values, an error is returned.
+    /// These properties are stripped from the returned map as they are signal flags to
+    /// update the protocol and not stored in the table's metadata configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - The table properties to validate
+    ///
+    /// # Returns
+    ///
+    /// The properties map with protocol version properties removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `delta.minReaderVersion` is not `3`
+    /// - `delta.minWriterVersion` is not `7`
+    /// - Either property value is not a valid integer
+    fn validate_and_strip_protocol_properties(
+        mut properties: HashMap<String, String>,
+    ) -> DeltaResult<HashMap<String, String>> {
+        // Validate delta.minReaderVersion if provided
+        if let Some(reader_version) = properties.get(MIN_READER_VERSION_PROP) {
+            let parsed: i32 = reader_version.parse().map_err(|_| {
+                Error::generic(format!(
+                    "Invalid value '{}' for '{}'. Must be an integer.",
+                    reader_version, MIN_READER_VERSION_PROP
+                ))
+            })?;
+            if parsed != TABLE_FEATURES_MIN_READER_VERSION {
+                return Err(Error::generic(format!(
+                    "Invalid value '{}' for '{}'. Only '{}' is supported.",
+                    parsed, MIN_READER_VERSION_PROP, TABLE_FEATURES_MIN_READER_VERSION
+                )));
+            }
+        }
+
+        // Validate delta.minWriterVersion if provided
+        if let Some(writer_version) = properties.get(MIN_WRITER_VERSION_PROP) {
+            let parsed: i32 = writer_version.parse().map_err(|_| {
+                Error::generic(format!(
+                    "Invalid value '{}' for '{}'. Must be an integer.",
+                    writer_version, MIN_WRITER_VERSION_PROP
+                ))
+            })?;
+            if parsed != TABLE_FEATURES_MIN_WRITER_VERSION {
+                return Err(Error::generic(format!(
+                    "Invalid value '{}' for '{}'. Only '{}' is supported.",
+                    parsed, MIN_WRITER_VERSION_PROP, TABLE_FEATURES_MIN_WRITER_VERSION
+                )));
+            }
+        }
+
+        // Remove protocol version properties - they are not stored in metadata.configuration
+        properties.remove(MIN_READER_VERSION_PROP);
+        properties.remove(MIN_WRITER_VERSION_PROP);
+
+        Ok(properties)
+    }
+
     /// Builds a [`Transaction`] that can be committed to create the table.
     ///
     /// This method performs validation:
@@ -194,6 +263,9 @@ impl CreateTableTransactionBuilder {
             return Err(Error::generic("Schema cannot be empty"));
         }
 
+        // Validate and strip protocol version properties (before engine access for fail-fast)
+        let table_properties = Self::validate_and_strip_protocol_properties(self.table_properties)?;
+
         // Check if table already exists by looking for _delta_log directory
         let delta_log_url = table_url.join("_delta_log/")?;
         let storage = engine.storage_handler();
@@ -213,25 +285,28 @@ impl CreateTableTransactionBuilder {
             }
         }
 
+        // Extract table configuration (features + cleaned properties)
+        let extracted = extract_table_configuration(table_properties)?;
+
         // Create Protocol action with table features support
         let protocol = Protocol::try_new(
             TABLE_FEATURES_MIN_READER_VERSION,
             TABLE_FEATURES_MIN_WRITER_VERSION,
-            Some(Vec::<String>::new()), // readerFeatures (empty for now)
-            Some(Vec::<String>::new()), // writerFeatures (empty for now)
+            Some(extracted.reader_features),
+            Some(extracted.writer_features),
         )?;
 
         // Get current timestamp
         let created_time = current_time_ms()?;
 
-        // Create Metadata action
+        // Create Metadata action with cleaned properties (feature overrides removed)
         let metadata = Metadata::try_new(
             None, // name
             None, // description
             (*self.schema).clone(),
             self.partition_columns,
             created_time,
-            self.table_properties,
+            extracted.cleaned_properties,
         )?;
 
         // Create Transaction with cached Protocol and Metadata
@@ -248,8 +323,18 @@ impl CreateTableTransactionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::committer::FileSystemCommitter;
+    use crate::engine::sync::SyncEngine;
     use crate::schema::{DataType, StructField, StructType};
     use std::sync::Arc;
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "id",
+            DataType::INTEGER,
+            false,
+        )]))
+    }
 
     #[test]
     fn test_builder_creation() {
@@ -314,5 +399,126 @@ mod tests {
             builder.table_properties.get("key2"),
             Some(&"value2".to_string())
         );
+    }
+
+    #[test]
+    fn test_allows_valid_protocol_versions() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let props = HashMap::from([
+            (MIN_READER_VERSION_PROP.to_string(), "3".to_string()),
+            (MIN_WRITER_VERSION_PROP.to_string(), "7".to_string()),
+        ]);
+
+        let result = CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        // Should succeed - (3, 7) is allowed
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_invalid_reader_version() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "2".to_string())]);
+
+        let result = CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("delta.minReaderVersion"));
+        assert!(err.contains("Only '3' is supported"));
+    }
+
+    #[test]
+    fn test_rejects_invalid_writer_version() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "5".to_string())]);
+
+        let result = CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("delta.minWriterVersion"));
+        assert!(err.contains("Only '7' is supported"));
+    }
+
+    #[test]
+    fn test_rejects_non_integer_reader_version() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "abc".to_string())]);
+
+        let result = CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Must be an integer"));
+    }
+
+    #[test]
+    fn test_rejects_non_integer_writer_version() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "xyz".to_string())]);
+
+        let result = CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Must be an integer"));
+    }
+
+    #[test]
+    fn test_allows_only_reader_version() {
+        // Providing only reader version (3) should succeed
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let props = HashMap::from([(MIN_READER_VERSION_PROP.to_string(), "3".to_string())]);
+
+        let result = CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_allows_only_writer_version() {
+        // Providing only writer version (7) should succeed
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "7".to_string())]);
+
+        let result = CreateTableTransactionBuilder::new(table_path, test_schema(), "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_ok());
     }
 }
