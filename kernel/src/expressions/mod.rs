@@ -1030,7 +1030,33 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
+
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
     use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+
+    /// Helper function to verify roundtrip serialization/deserialization
+    fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
+        let json = serde_json::to_string(value).expect("serialization should succeed");
+        let deserialized: T = serde_json::from_str(&json).expect("deserialization should succeed");
+        assert_eq!(value, &deserialized, "roundtrip should preserve value");
+    }
+
+    /// Helper function for types where PartialEq may not work correctly (e.g., types
+    /// containing Null, Array, Map, or Struct scalars which return None from partial_cmp).
+    /// This compares the JSON representation instead.
+    fn assert_roundtrip_via_json<T: Serialize + DeserializeOwned + Debug>(value: &T) {
+        let json = serde_json::to_string(value).expect("serialization should succeed");
+        let deserialized: T = serde_json::from_str(&json).expect("deserialization should succeed");
+        let reserialized =
+            serde_json::to_string(&deserialized).expect("reserialization should succeed");
+        assert_eq!(
+            json, reserialized,
+            "roundtrip should produce identical JSON"
+        );
+    }
 
     #[test]
     fn test_expression_format() {
@@ -1092,6 +1118,482 @@ mod tests {
         for (pred, expected) in cases {
             let result = format!("{pred}");
             assert_eq!(result, expected);
+        }
+    }
+
+    // ==================== Serde Roundtrip Tests ====================
+
+    mod serde_tests {
+        use std::sync::Arc;
+
+        use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
+        use crate::expressions::{
+            column_expr, column_name, BinaryExpressionOp, BinaryPredicateOp, ColumnName,
+            Expression, Predicate, Scalar, Transform, UnaryExpressionOp, VariadicExpressionOp,
+        };
+        use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+
+        use super::{assert_roundtrip, assert_roundtrip_via_json};
+
+        // ==================== Expression::Literal Tests ====================
+
+        #[test]
+        fn test_literal_scalars_roundtrip() {
+            // Test all primitive scalar types that have proper PartialEq
+            let cases: Vec<Expression> = vec![
+                // Numeric types
+                Expression::literal(42i32),         // Integer
+                Expression::literal(9999999999i64), // Long
+                Expression::literal(123i16),        // Short
+                Expression::literal(42i8),          // Byte
+                Expression::literal(1.12345677_32), // Float
+                Expression::literal(1.12345667_64), // Double
+                // String and Boolean
+                Expression::literal("hello world"),
+                Expression::literal(true),
+                Expression::literal(false),
+                // Temporal types
+                Expression::Literal(Scalar::Timestamp(1234567890000000)),
+                Expression::Literal(Scalar::TimestampNtz(1234567890000000)),
+                Expression::Literal(Scalar::Date(19000)),
+                // Binary
+                Expression::Literal(Scalar::Binary(vec![1, 2, 3, 4, 5])),
+                // Decimal
+                Expression::Literal(Scalar::Decimal(
+                    DecimalData::try_new(12345i128, DecimalType::try_new(10, 2).unwrap()).unwrap(),
+                )),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip(expr);
+            }
+        }
+
+        #[test]
+        fn test_literal_complex_scalars_roundtrip() {
+            // Test complex scalar types that need JSON comparison (partial_cmp returns None)
+            let cases: Vec<Expression> = vec![
+                // Null with different types
+                Expression::null_literal(DataType::INTEGER),
+                Expression::null_literal(DataType::STRING),
+                Expression::null_literal(DataType::BOOLEAN),
+                // Array
+                Expression::Literal(Scalar::Array(
+                    ArrayData::try_new(
+                        ArrayType::new(DataType::INTEGER, false),
+                        vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
+                    )
+                    .unwrap(),
+                )),
+                // Map
+                Expression::Literal(Scalar::Map(
+                    MapData::try_new(
+                        MapType::new(DataType::STRING, DataType::INTEGER, false),
+                        vec![
+                            (Scalar::String("a".to_string()), Scalar::Integer(1)),
+                            (Scalar::String("b".to_string()), Scalar::Integer(2)),
+                        ],
+                    )
+                    .unwrap(),
+                )),
+                // Struct
+                Expression::Literal(Scalar::Struct(
+                    StructData::try_new(
+                        vec![
+                            StructField::nullable("x", DataType::INTEGER),
+                            StructField::nullable("y", DataType::STRING),
+                        ],
+                        vec![Scalar::Integer(42), Scalar::String("hello".to_string())],
+                    )
+                    .unwrap(),
+                )),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip_via_json(expr);
+            }
+        }
+
+        // ==================== Expression::Column Tests ====================
+
+        #[test]
+        fn test_column_expressions_roundtrip() {
+            let cases: Vec<Expression> = vec![
+                column_expr!("my_column"),
+                Expression::column(["parent", "child"]),
+                Expression::column(["a", "b", "c", "d"]),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip(expr);
+            }
+        }
+
+        #[test]
+        fn test_column_names_roundtrip() {
+            let cases: Vec<ColumnName> = vec![
+                column_name!("simple"),
+                ColumnName::new(["a", "b", "c"]),
+                ColumnName::new::<&str>([]),
+            ];
+
+            for col in &cases {
+                assert_roundtrip(col);
+            }
+        }
+
+        // ==================== Expression Operations Tests ====================
+
+        #[test]
+        fn test_unary_expression_roundtrip() {
+            let expr = Expression::unary(UnaryExpressionOp::ToJson, column_expr!("data"));
+            assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_binary_expressions_roundtrip() {
+            let ops = [
+                BinaryExpressionOp::Plus,
+                BinaryExpressionOp::Minus,
+                BinaryExpressionOp::Multiply,
+                BinaryExpressionOp::Divide,
+            ];
+
+            for op in ops {
+                let expr = Expression::binary(op, column_expr!("a"), Expression::literal(10));
+                assert_roundtrip(&expr);
+            }
+        }
+
+        #[test]
+        fn test_variadic_expression_roundtrip() {
+            let expr = Expression::variadic(
+                VariadicExpressionOp::Coalesce,
+                [
+                    column_expr!("a"),
+                    column_expr!("b"),
+                    Expression::literal("default"),
+                ],
+            );
+            assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_nested_arithmetic_expression_roundtrip() {
+            // (a + b) * (c - d) / 2
+            let left = Expression::binary(
+                BinaryExpressionOp::Plus,
+                column_expr!("a"),
+                column_expr!("b"),
+            );
+            let right = Expression::binary(
+                BinaryExpressionOp::Minus,
+                column_expr!("c"),
+                column_expr!("d"),
+            );
+            let mul = Expression::binary(BinaryExpressionOp::Multiply, left, right);
+            let expr = Expression::binary(BinaryExpressionOp::Divide, mul, Expression::literal(2));
+            assert_roundtrip(&expr);
+        }
+
+        // ==================== Expression::Struct/Transform/Other Tests ====================
+
+        #[test]
+        fn test_struct_expression_roundtrip() {
+            let expr = Expression::struct_from([
+                Arc::new(column_expr!("x")),
+                Arc::new(Expression::literal(42)),
+                Arc::new(Expression::literal("hello")),
+            ]);
+            assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_transform_expressions_roundtrip() {
+            let cases: Vec<Expression> = vec![
+                // Identity transform
+                Expression::transform(Transform::new_top_level()),
+                // Drop field
+                Expression::transform(Transform::new_top_level().with_dropped_field("old_column")),
+                // Replace field
+                Expression::transform(
+                    Transform::new_top_level()
+                        .with_replaced_field("original", Arc::new(Expression::literal(0))),
+                ),
+                // Insert fields
+                Expression::transform(
+                    Transform::new_top_level()
+                        .with_inserted_field(Some("after_col"), Arc::new(column_expr!("new_col")))
+                        .with_inserted_field(
+                            None::<String>,
+                            Arc::new(Expression::literal("prepended")),
+                        ),
+                ),
+                // Nested transform
+                Expression::transform(
+                    Transform::new_nested(["parent", "child"]).with_dropped_field("to_drop"),
+                ),
+            ];
+
+            for expr in &cases {
+                assert_roundtrip(expr);
+            }
+        }
+
+        #[test]
+        fn test_expression_wrapping_predicate_roundtrip() {
+            let pred = Predicate::eq(column_expr!("x"), Expression::literal(10));
+            let expr = Expression::from_pred(pred);
+            assert_roundtrip(&expr);
+        }
+
+        #[test]
+        fn test_expression_unknown_roundtrip() {
+            let expr = Expression::unknown("some_unknown_function()");
+            assert_roundtrip(&expr);
+        }
+
+        // ==================== Predicate Tests ====================
+
+        #[test]
+        fn test_predicate_basics_roundtrip() {
+            let cases: Vec<Predicate> = vec![
+                // Boolean expression
+                Predicate::from_expr(column_expr!("is_active")),
+                // Literals
+                Predicate::literal(true),
+                Predicate::literal(false),
+                // NOT
+                Predicate::not(Predicate::from_expr(column_expr!("x"))),
+                // Nested NOT
+                Predicate::not(Predicate::not(Predicate::gt(
+                    column_expr!("x"),
+                    Expression::literal(5),
+                ))),
+                // Unknown
+                Predicate::unknown("some_unknown_predicate()"),
+                // Unary predicates
+                Predicate::is_null(column_expr!("nullable_col")),
+                Predicate::is_not_null(column_expr!("nullable_col")),
+            ];
+
+            for pred in &cases {
+                assert_roundtrip(pred);
+            }
+        }
+
+        #[test]
+        fn test_predicate_null_literal_roundtrip() {
+            // Null literal needs JSON comparison
+            let pred = Predicate::null_literal();
+            assert_roundtrip_via_json(&pred);
+        }
+
+        #[test]
+        fn test_predicate_comparisons_roundtrip() {
+            let cases: Vec<Predicate> = vec![
+                Predicate::eq(column_expr!("x"), Expression::literal(42)),
+                Predicate::ne(column_expr!("status"), Expression::literal("active")),
+                Predicate::lt(column_expr!("age"), Expression::literal(18)),
+                Predicate::le(column_expr!("price"), Expression::literal(100)),
+                Predicate::gt(column_expr!("score"), Expression::literal(90)),
+                Predicate::ge(column_expr!("quantity"), Expression::literal(1)),
+                Predicate::distinct(column_expr!("a"), column_expr!("b")),
+            ];
+
+            for pred in &cases {
+                assert_roundtrip(pred);
+            }
+        }
+
+        #[test]
+        fn test_predicate_in_roundtrip() {
+            // IN with array needs JSON comparison
+            let array_data = ArrayData::try_new(
+                ArrayType::new(DataType::INTEGER, false),
+                vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
+            )
+            .unwrap();
+            let pred = Predicate::binary(
+                BinaryPredicateOp::In,
+                column_expr!("x"),
+                Expression::Literal(Scalar::Array(array_data)),
+            );
+            assert_roundtrip_via_json(&pred);
+        }
+
+        #[test]
+        fn test_predicate_junctions_roundtrip() {
+            let cases: Vec<Predicate> = vec![
+                // Simple AND
+                Predicate::and(
+                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
+                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
+                ),
+                // Simple OR
+                Predicate::or(
+                    Predicate::eq(column_expr!("status"), Expression::literal("active")),
+                    Predicate::eq(column_expr!("status"), Expression::literal("pending")),
+                ),
+                // Multiple AND
+                Predicate::and_from([
+                    Predicate::gt(column_expr!("x"), Expression::literal(0)),
+                    Predicate::lt(column_expr!("x"), Expression::literal(100)),
+                    Predicate::is_not_null(column_expr!("x")),
+                ]),
+                // Multiple OR
+                Predicate::or_from([
+                    Predicate::eq(column_expr!("type"), Expression::literal("A")),
+                    Predicate::eq(column_expr!("type"), Expression::literal("B")),
+                    Predicate::eq(column_expr!("type"), Expression::literal("C")),
+                ]),
+                // Nested: (a > 0 AND b < 100) OR (c = 'special')
+                Predicate::or(
+                    Predicate::and(
+                        Predicate::gt(column_expr!("a"), Expression::literal(0)),
+                        Predicate::lt(column_expr!("b"), Expression::literal(100)),
+                    ),
+                    Predicate::eq(column_expr!("c"), Expression::literal("special")),
+                ),
+            ];
+
+            for pred in &cases {
+                assert_roundtrip(pred);
+            }
+        }
+
+        // ==================== Complex Nested Structures ====================
+
+        #[test]
+        fn test_deeply_nested_structures_roundtrip() {
+            // COALESCE(a + b, c * d, 0) > 100
+            let add = Expression::binary(
+                BinaryExpressionOp::Plus,
+                column_expr!("a"),
+                column_expr!("b"),
+            );
+            let mul = Expression::binary(
+                BinaryExpressionOp::Multiply,
+                column_expr!("c"),
+                column_expr!("d"),
+            );
+            let coalesce = Expression::variadic(
+                VariadicExpressionOp::Coalesce,
+                [add, mul, Expression::literal(0)],
+            );
+            let pred = Predicate::gt(coalesce, Expression::literal(100));
+            assert_roundtrip(&pred);
+
+            // Expression wrapping a predicate that references expressions
+            let inner_pred = Predicate::and(
+                Predicate::eq(column_expr!("x"), Expression::literal(1)),
+                Predicate::gt(
+                    Expression::binary(
+                        BinaryExpressionOp::Plus,
+                        column_expr!("y"),
+                        column_expr!("z"),
+                    ),
+                    Expression::literal(10),
+                ),
+            );
+            let expr = Expression::from_pred(inner_pred);
+            assert_roundtrip(&expr);
+        }
+
+        // ==================== Opaque Variant Failure Tests ====================
+
+        #[test]
+        fn test_opaque_expression_serialize_fails() {
+            use crate::expressions::{OpaqueExpressionOp, ScalarExpressionEvaluator};
+            use crate::DeltaResult;
+
+            #[derive(Debug, PartialEq)]
+            struct TestOpaqueExprOp;
+
+            impl OpaqueExpressionOp for TestOpaqueExprOp {
+                fn name(&self) -> &str {
+                    "test_opaque"
+                }
+                fn eval_expr_scalar(
+                    &self,
+                    _eval_expr: &ScalarExpressionEvaluator<'_>,
+                    _exprs: &[Expression],
+                ) -> DeltaResult<Scalar> {
+                    Ok(Scalar::Integer(0))
+                }
+            }
+
+            let expr = Expression::opaque(TestOpaqueExprOp, [Expression::literal(1)]);
+            let result = serde_json::to_string(&expr);
+            assert!(
+                result.is_err(),
+                "Opaque expression serialization should fail"
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Cannot serialize Opaque Expression"),
+                "Error should mention opaque expression"
+            );
+        }
+
+        #[test]
+        fn test_opaque_predicate_serialize_fails() {
+            use crate::expressions::{OpaquePredicateOp, ScalarExpressionEvaluator};
+            use crate::kernel_predicates::{
+                DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
+                IndirectDataSkippingPredicateEvaluator,
+            };
+            use crate::DeltaResult;
+
+            #[derive(Debug, PartialEq)]
+            struct TestOpaquePredOp;
+
+            impl OpaquePredicateOp for TestOpaquePredOp {
+                fn name(&self) -> &str {
+                    "test_opaque_pred"
+                }
+                fn eval_pred_scalar(
+                    &self,
+                    _eval_expr: &ScalarExpressionEvaluator<'_>,
+                    _eval_pred: &DirectPredicateEvaluator<'_>,
+                    _exprs: &[Expression],
+                    _inverted: bool,
+                ) -> DeltaResult<Option<bool>> {
+                    Ok(Some(true))
+                }
+                fn eval_as_data_skipping_predicate(
+                    &self,
+                    _evaluator: &DirectDataSkippingPredicateEvaluator<'_>,
+                    _exprs: &[Expression],
+                    _inverted: bool,
+                ) -> Option<bool> {
+                    Some(true)
+                }
+                fn as_data_skipping_predicate(
+                    &self,
+                    _evaluator: &IndirectDataSkippingPredicateEvaluator<'_>,
+                    _exprs: &[Expression],
+                    _inverted: bool,
+                ) -> Option<Predicate> {
+                    None
+                }
+            }
+
+            let pred = Predicate::opaque(TestOpaquePredOp, [Expression::literal(1)]);
+            let result = serde_json::to_string(&pred);
+            assert!(
+                result.is_err(),
+                "Opaque predicate serialization should fail"
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Cannot serialize Opaque Expression"),
+                "Error should mention opaque expression"
+            );
         }
     }
 }
