@@ -494,14 +494,6 @@ impl Display for Scalar {
     }
 }
 
-// NOTE: This impl provides logical/SQL NULL semantics where NULL != NULL.
-// This will eventually be replaced with a derived PartialEq for physical comparison.
-impl PartialEq for Scalar {
-    fn eq(&self, other: &Scalar) -> bool {
-        self.physical_eq(other)
-    }
-}
-
 impl Scalar {
     /// Logical (SQL semantics) equality comparison of two scalars.
     ///
