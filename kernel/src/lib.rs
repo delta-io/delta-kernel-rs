@@ -108,6 +108,7 @@ pub(crate) mod transforms;
 
 pub use log_path::LogPath;
 
+pub(crate) mod clustering;
 mod row_tracking;
 
 mod arrow_compat;
@@ -163,6 +164,8 @@ pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 #[cfg(feature = "internal-api")]
 pub use transaction::create_table::{create_table, CreateTableTransactionBuilder};
+#[cfg(feature = "internal-api")]
+pub use transaction::DataLayout;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;

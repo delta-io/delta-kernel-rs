@@ -43,8 +43,10 @@ use crate::{
 use delta_kernel_derive::internal_api;
 
 pub mod create_table;
+pub mod data_layout;
 
 pub use create_table::create_table;
+pub use data_layout::DataLayout;
 
 // This is a workaround due to the fact that expression evaluation happens
 // on the whole EngineData instead of accounting for filtered rows, which can lead to null values in

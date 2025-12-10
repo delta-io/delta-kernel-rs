@@ -3,8 +3,11 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
+
+use indexmap::IndexSet;
 
 use self::deletion_vector::DeletionVectorDescriptor;
 use crate::expressions::{MapData, Scalar, StructData};
@@ -405,19 +408,26 @@ pub(crate) struct Protocol {
     writer_features: Option<Vec<TableFeature>>,
 }
 
+/// Parse features from strings and deduplicate them while preserving insertion order.
+///
+/// This function converts feature strings to the target type and removes duplicates
+/// to ensure the protocol doesn't contain redundant feature entries. Uses IndexSet
+/// to maintain the order of first occurrence for each unique feature.
 fn parse_features<T>(features: Option<impl IntoIterator<Item = impl ToString>>) -> Option<Vec<T>>
 where
-    T: FromStr,
+    T: FromStr + Hash + Eq,
     T::Err: Debug,
 {
-    features
-        .map(|fs| {
-            fs.into_iter()
-                .map(|f| T::from_str(&f.to_string()))
-                .collect()
-        })
-        .transpose()
-        .ok()?
+    features.map(|fs| {
+        // Parse all features and collect into an IndexSet to deduplicate
+        // while preserving insertion order
+        let unique_features: IndexSet<T> = fs
+            .into_iter()
+            .filter_map(|f| T::from_str(&f.to_string()).ok())
+            .collect();
+        // Convert to Vec for storage
+        unique_features.into_iter().collect()
+    })
 }
 
 impl Protocol {

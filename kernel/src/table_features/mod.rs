@@ -411,14 +411,13 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     name: "clustering",
     min_reader_version: 1,
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
