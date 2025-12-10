@@ -77,6 +77,26 @@ pub(crate) struct LogSegment {
 }
 
 impl LogSegment {
+    /// Creates a synthetic LogSegment for pre-commit transactions (e.g., create-table).
+    /// The sentinel version PRE_COMMIT_VERSION indicates no version exists yet on disk.
+    /// This is used to construct a pre-commit snapshot that provides table configuration
+    /// (protocol, metadata, schema) for operations like CTAS.
+    pub(crate) fn for_pre_commit(log_root: Url) -> Self {
+        use crate::PRE_COMMIT_VERSION;
+        Self {
+            end_version: PRE_COMMIT_VERSION,
+            checkpoint_version: None,
+            log_root,
+            ascending_commit_files: vec![],
+            ascending_compaction_files: vec![],
+            checkpoint_parts: vec![],
+            latest_crc_file: None,
+            latest_commit_file: None,
+            checkpoint_schema: None,
+            max_published_version: None,
+        }
+    }
+
     #[internal_api]
     pub(crate) fn try_new(
         listed_files: ListedLogFiles,
