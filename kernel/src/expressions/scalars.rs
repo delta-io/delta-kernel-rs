@@ -433,6 +433,25 @@ impl PartialEq for Scalar {
 }
 
 impl Scalar {
+    /// Logical (SQL semantics) equality comparison of two scalars.
+    ///
+    /// Returns `None` if the scalars cannot be compared (different types, NULL values, or
+    /// unsupported types like Struct/Array/Map).
+    ///
+    /// NOTE: This implements SQL NULL semantics where NULL is incomparable to everything,
+    /// including itself, so `NULL != NULL` (returns `false`).
+    pub fn logical_eq(&self, other: &Self) -> bool {
+        self.logical_partial_cmp(other) == Some(Ordering::Equal)
+    }
+
+    /// Physical (structural) equality comparison of two scalars.
+    ///
+    /// Currently delegates to logical comparison. This will eventually be replaced with
+    /// actual physical comparison where `Null(dt1) == Null(dt2)` when `dt1 == dt2`.
+    pub fn physical_eq(&self, other: &Self) -> bool {
+        self.logical_eq(other)
+    }
+
     /// Logical (SQL semantics) comparison of two scalars.
     ///
     /// Returns `None` if the scalars are incomparable (different types, NULL values, or
@@ -1070,14 +1089,14 @@ mod tests {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
         let c = Scalar::Null(DataType::INTEGER);
-        assert!(!a.eq(&b));
-        assert!(a.eq(&a));
-        assert!(!a.eq(&c));
-        assert!(!c.eq(&a));
+        assert!(!a.logical_eq(&b));
+        assert!(a.logical_eq(&a));
+        assert!(!a.logical_eq(&c));
+        assert!(!c.logical_eq(&a));
 
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
-        assert!(!null.eq(&null));
+        assert!(!null.logical_eq(&null));
     }
 
     #[test]
