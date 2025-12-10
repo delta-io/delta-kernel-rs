@@ -95,7 +95,7 @@ mod log_compaction;
 mod log_path;
 mod log_reader;
 pub mod metrics;
-mod parallel;
+pub(crate) mod parallel;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
