@@ -62,6 +62,16 @@ pub(crate) const DOMAIN_METADATA_NAME: &str = "domainMetadata";
 
 pub(crate) const INTERNAL_DOMAIN_PREFIX: &str = "delta.";
 
+/// Minimum reader version for tables that use table features.
+/// When set to 3, the protocol requires an explicit `readerFeatures` array.
+#[internal_api]
+pub(crate) const TABLE_FEATURES_MIN_READER_VERSION: i32 = 3;
+
+/// Minimum writer version for tables that use table features.
+/// When set to 7, the protocol requires an explicit `writerFeatures` array.
+#[internal_api]
+pub(crate) const TABLE_FEATURES_MIN_WRITER_VERSION: i32 = 7;
+
 static COMMIT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([
         StructField::nullable(ADD_NAME, Add::to_schema()),

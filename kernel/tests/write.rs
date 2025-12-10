@@ -242,7 +242,7 @@ async fn write_data_and_check_result_and_stats(
     });
 
     // write data out by spawning async tasks to simulate executors
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context()?);
     let tasks = append_data.into_iter().map(|data| {
         // arc clones
         let engine = engine.clone();
@@ -537,7 +537,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.get_write_context()?);
         let tasks = append_data
             .into_iter()
             .zip(partition_vals)
@@ -680,7 +680,7 @@ async fn test_append_invalid_schema() -> Result<(), Box<dyn std::error::Error>> 
 
         // write data out by spawning async tasks to simulate executors
         let engine = Arc::new(engine);
-        let write_context = Arc::new(txn.get_write_context());
+        let write_context = Arc::new(txn.get_write_context()?);
         let tasks = append_data.into_iter().map(|data| {
             // arc clones
             let engine = engine.clone();
@@ -890,7 +890,7 @@ async fn test_append_timestamp_ntz() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context()?);
 
     let add_files_metadata = engine
         .write_parquet(
@@ -1081,7 +1081,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
 
     // Write data
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context()?);
 
     let add_files_metadata = (*engine)
         .parquet_handler()
@@ -1254,7 +1254,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     .unwrap();
 
     let engine = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context()?);
 
     let add_files_metadata = (*engine)
         .parquet_handler()
@@ -1326,7 +1326,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
 
     // write context does not conflict with domain metadata
-    let _write_context = txn.get_write_context();
+    let _write_context = txn.get_write_context()?;
 
     // set multiple domain metadata
     let domain1 = "app.config";
@@ -1756,7 +1756,7 @@ async fn generate_and_add_data_file(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context()?);
     let file_meta = engine
         .write_parquet(
             &ArrowEngineData::new(data),
@@ -2804,7 +2804,7 @@ async fn add_files_to_transaction(
         vec![Arc::new(Int32Array::from(values))],
     )?;
 
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context()?);
     let add_files_metadata = engine
         .write_parquet(
             &ArrowEngineData::new(data),

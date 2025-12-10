@@ -161,6 +161,8 @@ pub use log_compaction::{should_compact, LogCompactionWriter};
 pub use metrics::MetricsReporter;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
+#[cfg(feature = "internal-api")]
+pub use transaction::create_table::{create_table, CreateTableTransactionBuilder};
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
