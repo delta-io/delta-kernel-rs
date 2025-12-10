@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::expressions::column_name;
+use crate::expressions::{column_name, PhysicalScalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, UnimplementedColumnResolver};
 use std::collections::HashMap;
 
@@ -252,7 +252,7 @@ fn test_eval_distinct() {
 #[test]
 fn test_sql_where() {
     let col = &column_expr!("x");
-    const VAL: Expr = Expr::Literal(Scalar::Integer(10));
+    const VAL: Expr = Expr::Literal(PhysicalScalar(Scalar::Integer(10)));
     const NULL: Pred = Pred::null_literal();
     const FALSE: Pred = Pred::literal(false);
     const TRUE: Pred = Pred::literal(true);

@@ -1654,12 +1654,12 @@ mod tests {
         assert_eq!(struct_data.fields()[0].name(), "provider");
         assert_eq!(struct_data.fields()[1].name(), "options");
 
-        let Scalar::String(provider) = &struct_data.values()[0] else {
+        let Scalar::String(provider) = &*struct_data.values()[0] else {
             panic!("Expected string provider");
         };
         assert_eq!(provider, "parquet");
 
-        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+        let Scalar::Map(map_data) = &*struct_data.values()[1] else {
             panic!("Expected map options");
         };
         assert_eq!(map_data.pairs().len(), 2);
@@ -1686,7 +1686,7 @@ mod tests {
         let Scalar::Struct(struct_data) = scalar else {
             panic!("Expected struct");
         };
-        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+        let Scalar::Map(map_data) = &*struct_data.values()[1] else {
             panic!("Expected map");
         };
         assert!(map_data.pairs().is_empty());
@@ -1708,7 +1708,7 @@ mod tests {
         let Scalar::Struct(struct_data) = scalar else {
             panic!("Expected struct");
         };
-        let Scalar::Map(map_data) = &struct_data.values()[1] else {
+        let Scalar::Map(map_data) = &*struct_data.values()[1] else {
             panic!("Expected map");
         };
         assert_eq!(map_data.pairs().len(), 3);

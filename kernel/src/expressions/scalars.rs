@@ -58,7 +58,7 @@ fn get_decimal_precision(value: i128) -> u8 {
 pub struct ArrayData {
     tpe: ArrayType,
     /// This exists currently for literal list comparisons, but should not be depended on see below
-    elements: Vec<Scalar>,
+    elements: Vec<PhysicalScalar>,
 }
 
 impl ArrayData {
@@ -83,7 +83,7 @@ impl ArrayData {
                         v.data_type()
                     )))
                 } else {
-                    Ok(v)
+                    Ok(PhysicalScalar(v))
                 }
             })
             .try_collect()?;
@@ -94,7 +94,7 @@ impl ArrayData {
         &self.tpe
     }
 
-    pub fn array_elements(&self) -> &[Scalar] {
+    pub fn array_elements(&self) -> &[PhysicalScalar] {
         &self.elements
     }
 }
@@ -102,7 +102,7 @@ impl ArrayData {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapData {
     data_type: MapType,
-    pairs: Vec<(Scalar, Scalar)>,
+    pairs: Vec<(PhysicalScalar, PhysicalScalar)>,
 }
 
 impl MapData {
@@ -139,7 +139,7 @@ impl MapData {
                         "Null map value disallowed if map value_contains_null is false",
                     ))
                 } else {
-                    Ok((k, v))
+                    Ok((PhysicalScalar(k), PhysicalScalar(v)))
                 }
             })
             .try_collect()?;
@@ -148,7 +148,7 @@ impl MapData {
 
     // TODO: array.elements is deprecated? do we want to expose this? How will FFI get pairs for
     // visiting?
-    pub fn pairs(&self) -> &[(Scalar, Scalar)] {
+    pub fn pairs(&self) -> &[(PhysicalScalar, PhysicalScalar)] {
         &self.pairs
     }
 
@@ -160,7 +160,7 @@ impl MapData {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructData {
     fields: Vec<StructField>,
-    values: Vec<Scalar>,
+    values: Vec<PhysicalScalar>,
 }
 
 impl StructData {
@@ -170,7 +170,10 @@ impl StructData {
     /// - if the number of fields and values do not match
     /// - if the data types of the values do not match the data types of the fields
     /// - if a null value is assigned to a non-nullable field
-    pub fn try_new(fields: Vec<StructField>, values: Vec<Scalar>) -> DeltaResult<Self> {
+    pub fn try_new(
+        fields: Vec<StructField>,
+        values: Vec<impl Into<PhysicalScalar>>,
+    ) -> DeltaResult<Self> {
         require!(
             fields.len() == values.len(),
             Error::invalid_struct_data(format!(
@@ -179,6 +182,8 @@ impl StructData {
                 values.len()
             ))
         );
+
+        let values: Vec<PhysicalScalar> = values.into_iter().map(Into::into).collect();
 
         for (f, a) in fields.iter().zip(&values) {
             require!(
@@ -208,7 +213,7 @@ impl StructData {
         &self.fields
     }
 
-    pub fn values(&self) -> &[Scalar] {
+    pub fn values(&self) -> &[PhysicalScalar] {
         &self.values
     }
 }
@@ -251,6 +256,72 @@ pub enum Scalar {
     Array(ArrayData),
     /// Map Value
     Map(MapData),
+}
+
+/// A transparent newtype wrapper around [`Scalar`] for use in types that derive `PartialEq`.
+///
+/// This wrapper allows types like `Expression` and `Predicate` to derive `PartialEq` while
+/// `Scalar`'s `PartialEq` implementation is being refactored. It transparently delegates to
+/// `Scalar`'s comparison semantics via `Deref`.
+///
+/// This wrapper is temporary scaffolding and will be removed once the `Scalar` refactoring
+/// is complete.
+#[derive(Clone)]
+pub struct PhysicalScalar(pub Scalar);
+
+impl PhysicalScalar {
+    /// Unwrap the physical scalar to get the inner `Scalar`.
+    pub fn into_inner(self) -> Scalar {
+        self.0
+    }
+
+    /// Get a reference to the inner `Scalar`.
+    pub fn as_scalar(&self) -> &Scalar {
+        &self.0
+    }
+}
+
+impl PartialEq for PhysicalScalar {
+    fn eq(&self, other: &Self) -> bool {
+        self.physical_eq(other)
+    }
+}
+
+impl PartialEq<Scalar> for PhysicalScalar {
+    fn eq(&self, other: &Scalar) -> bool {
+        self.physical_eq(other)
+    }
+}
+
+impl PartialEq<PhysicalScalar> for Scalar {
+    fn eq(&self, other: &PhysicalScalar) -> bool {
+        self.physical_eq(other)
+    }
+}
+
+impl std::ops::Deref for PhysicalScalar {
+    type Target = Scalar;
+    fn deref(&self) -> &Scalar {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PhysicalScalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl std::fmt::Display for PhysicalScalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl From<Scalar> for PhysicalScalar {
+    fn from(s: Scalar) -> Self {
+        Self(s)
+    }
 }
 
 impl Scalar {
@@ -424,11 +495,10 @@ impl Display for Scalar {
 }
 
 // NOTE: This impl provides logical/SQL NULL semantics where NULL != NULL.
-// For physical/structural comparison (e.g., comparing query plans), this will be replaced
-// with a derived PartialEq in a future change.
+// This will eventually be replaced with a derived PartialEq for physical comparison.
 impl PartialEq for Scalar {
     fn eq(&self, other: &Scalar) -> bool {
-        self.logical_partial_cmp(other) == Some(Ordering::Equal)
+        self.physical_eq(other)
     }
 }
 
@@ -949,10 +1019,11 @@ mod tests {
 
     #[test]
     fn test_arrays() {
-        let array = Scalar::Array(ArrayData {
-            tpe: ArrayType::new(DataType::INTEGER, false),
-            elements: vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
-        });
+        let array_data = ArrayData::try_new(
+            ArrayType::new(DataType::INTEGER, false),
+            vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
+        );
+        let array = Scalar::Array(array_data.unwrap());
 
         let column = column_expr!("item");
         let array_op = Pred::binary(BinaryPredicateOp::In, Expr::literal(10), array.clone());
@@ -1028,7 +1099,7 @@ mod tests {
             let scalar = PrimitiveType::Timestamp
                 .parse_scalar(scalar_string)
                 .unwrap();
-            assert_eq!(scalar, Scalar::Timestamp(micros));
+            assert_eq!(scalar, PhysicalScalar(Scalar::Timestamp(micros)));
         };
         assert_timestamp_eq("1971-07-22T03:06:40.678910Z", 49000000678910);
         assert_timestamp_eq("1971-07-22T03:06:40Z", 49000000000000);
@@ -1043,7 +1114,7 @@ mod tests {
             let scalar = PrimitiveType::TimestampNtz
                 .parse_scalar(scalar_string)
                 .unwrap();
-            assert_eq!(scalar, Scalar::TimestampNtz(micros));
+            assert_eq!(scalar, PhysicalScalar(Scalar::TimestampNtz(micros)));
         };
         assert_timestamp_eq("2011-01-11 13:06:07", 1294751167000000);
         assert_timestamp_eq("2011-01-11 13:06:07.123456", 1294751167123456);
@@ -1126,10 +1197,10 @@ mod tests {
 
         // Check that both expected pairs are present
         let has_key1 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
+            matches!(&**k, Scalar::String(s) if s == "key1") && matches!(&**v, Scalar::Integer(42))
         });
         let has_key2 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Integer(100))
+            matches!(&**k, Scalar::String(s) if s == "key2") && matches!(&**v, Scalar::Integer(100))
         });
         assert!(has_key1, "Missing key1 -> 42 pair");
         assert!(has_key2, "Missing key2 -> 100 pair");
@@ -1165,13 +1236,13 @@ mod tests {
 
         // Check that all expected pairs are present
         let has_key1 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
+            matches!(&**k, Scalar::String(s) if s == "key1") && matches!(&**v, Scalar::Integer(42))
         });
         let has_key2 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Null(_))
+            matches!(&**k, Scalar::String(s) if s == "key2") && matches!(&**v, Scalar::Null(_))
         });
         let has_key3 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key3") && matches!(v, Scalar::Integer(100))
+            matches!(&**k, Scalar::String(s) if s == "key3") && matches!(&**v, Scalar::Integer(100))
         });
         assert!(has_key1, "Missing key1 -> 42 pair");
         assert!(has_key2, "Missing key2 -> null pair");
@@ -1204,9 +1275,9 @@ mod tests {
         assert!(!array_data.array_type().contains_null());
 
         // Check that all expected values are present
-        assert!(matches!(elements[0], Scalar::Integer(42)));
-        assert!(matches!(elements[1], Scalar::Integer(100)));
-        assert!(matches!(elements[2], Scalar::Integer(200)));
+        assert!(matches!(&*elements[0], Scalar::Integer(42)));
+        assert!(matches!(&*elements[1], Scalar::Integer(100)));
+        assert!(matches!(&*elements[2], Scalar::Integer(200)));
 
         Ok(())
     }
@@ -1236,9 +1307,9 @@ mod tests {
         assert!(array_data.array_type().contains_null());
 
         // Check that all expected values are present
-        assert!(matches!(elements[0], Scalar::Integer(42)));
-        assert!(matches!(elements[1], Scalar::Null(_)));
-        assert!(matches!(elements[2], Scalar::Integer(100)));
+        assert!(matches!(&*elements[0], Scalar::Integer(42)));
+        assert!(matches!(&*elements[1], Scalar::Null(_)));
+        assert!(matches!(&*elements[2], Scalar::Integer(100)));
 
         Ok(())
     }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::expressions::{
     column_expr, column_name, column_pred, ArrayData, Expression as Expr, OpaqueExpressionOp,
-    OpaquePredicateOp, Predicate as Pred, ScalarExpressionEvaluator, StructData,
+    OpaquePredicateOp, PhysicalScalar, Predicate as Pred, ScalarExpressionEvaluator, StructData,
 };
 use crate::kernel_predicates::parquet_stats_skipping::ParquetStatsProvider;
 use crate::scan::data_skipping::as_data_skipping_predicate;
@@ -96,7 +96,7 @@ fn test_default_partial_cmp_scalars() {
         Binary(vec![1]),
         Scalar::decimal(1, 10, 10).unwrap(),
         Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
+        Struct(StructData::try_new(vec![], vec![] as Vec<PhysicalScalar>).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
     let larger_values = &[
@@ -114,7 +114,7 @@ fn test_default_partial_cmp_scalars() {
         Binary(vec![10]),
         Scalar::decimal(10, 10, 10).unwrap(),
         Null(DataType::LONG),
-        Struct(StructData::try_new(vec![], vec![]).unwrap()),
+        Struct(StructData::try_new(vec![], vec![] as Vec<PhysicalScalar>).unwrap()),
         Array(ArrayData::try_new(ArrayType::new(DataType::LONG, false), &[] as &[i64]).unwrap()),
     ];
 
@@ -939,7 +939,7 @@ impl ResolveColumnAsScalar for NullColumnResolver {
 fn test_sql_where() {
     let col = &column_expr!("x");
     let col_pred = &column_pred!("x");
-    const VAL: Expr = Expr::Literal(Scalar::Integer(1));
+    const VAL: Expr = Expr::Literal(PhysicalScalar(Scalar::Integer(1)));
     const NULL: Pred = Pred::null_literal();
     const FALSE: Pred = Pred::literal(false);
     const TRUE: Pred = Pred::literal(true);

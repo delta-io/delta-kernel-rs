@@ -10,7 +10,7 @@ pub use self::column_names::{
     column_expr, column_expr_ref, column_name, column_pred, joined_column_expr, joined_column_name,
     ColumnName,
 };
-pub use self::scalars::{ArrayData, DecimalData, MapData, Scalar, StructData};
+pub use self::scalars::{ArrayData, DecimalData, MapData, PhysicalScalar, Scalar, StructData};
 use self::transforms::{ExpressionTransform as _, GetColumnReferences};
 use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
@@ -376,7 +376,7 @@ impl Transform {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     /// A literal value.
-    Literal(Scalar),
+    Literal(PhysicalScalar),
     /// A column reference by name.
     Column(ColumnName),
     /// A predicate treated as a boolean expression
@@ -539,12 +539,12 @@ impl Expression {
 
     /// Create a new expression for a literal value
     pub fn literal(value: impl Into<Scalar>) -> Self {
-        Self::Literal(value.into())
+        Self::Literal(PhysicalScalar(value.into()))
     }
 
     /// Creates a NULL literal expression
     pub const fn null_literal(data_type: DataType) -> Self {
-        Self::Literal(Scalar::Null(data_type))
+        Self::Literal(PhysicalScalar(Scalar::Null(data_type)))
     }
 
     /// Wraps a predicate as a boolean-valued expression
@@ -664,12 +664,14 @@ impl Predicate {
 
     /// Create a new literal boolean value
     pub const fn literal(value: bool) -> Self {
-        Self::BooleanExpression(Expression::Literal(Scalar::Boolean(value)))
+        Self::BooleanExpression(Expression::Literal(PhysicalScalar(Scalar::Boolean(value))))
     }
 
     /// Creates a NULL literal boolean value
     pub const fn null_literal() -> Self {
-        Self::BooleanExpression(Expression::Literal(Scalar::Null(DataType::BOOLEAN)))
+        Self::BooleanExpression(Expression::Literal(PhysicalScalar(Scalar::Null(
+            DataType::BOOLEAN,
+        ))))
     }
 
     /// Converts a boolean-valued expression into a predicate

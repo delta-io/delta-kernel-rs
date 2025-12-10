@@ -6,7 +6,7 @@ use std::ops::Deref as _;
 
 use tracing::debug;
 
-use crate::expressions::{Expression, Scalar};
+use crate::expressions::{Expression, PhysicalScalar, Scalar};
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, SchemaTransform, StructField, StructType,
 };
@@ -110,7 +110,7 @@ macro_rules! transform_leaf {
             return None;
         }
 
-        $self.stack.push(Expression::Literal(scalar.clone()));
+        $self.stack.push(Expression::literal(scalar.clone()));
         None
     }};
 }
@@ -142,7 +142,7 @@ impl<'a, T: Iterator<Item = &'a Scalar>> SchemaTransform<'a> for LiteralExpressi
         let mut found_non_nullable_null = false;
         let mut all_null = true;
         for (field, expr) in fields.zip(&field_exprs) {
-            if !matches!(expr, Expression::Literal(Scalar::Null(_))) {
+            if !matches!(expr, Expression::Literal(PhysicalScalar(Scalar::Null(_)))) {
                 all_null = false;
             } else if !field.is_nullable() {
                 found_non_nullable_null = true;

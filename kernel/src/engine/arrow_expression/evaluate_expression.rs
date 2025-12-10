@@ -29,8 +29,8 @@ use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
-    Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    PhysicalScalar, Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp,
+    UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, StructType};
 
@@ -387,7 +387,10 @@ pub fn evaluate_predicate(
                         (Decimal256(_, _), Decimal256Type)
                     }
                 }
-                (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
+                (
+                    Expression::Literal(lit),
+                    Expression::Literal(PhysicalScalar(Scalar::Array(ad))),
+                ) => {
                     let exists = ad.array_elements().contains(lit);
                     Ok(BooleanArray::from(vec![exists]))
                 }
