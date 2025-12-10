@@ -169,7 +169,7 @@ impl MetadataColumnSpec {
     /// The reserved field ID for the specified metadata column, if any.
     pub fn reserved_field_id(&self) -> Option<i64> {
         match self {
-            Self::FilePath => Some(crate::reserved_field_ids::FILE_NAME),
+            Self::FilePath => Some(FILE_NAME),
             _ => None,
         }
     }
