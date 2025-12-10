@@ -100,6 +100,7 @@ pub mod snapshot;
 pub mod table_changes;
 pub mod table_configuration;
 pub mod table_features;
+pub mod table_manager;
 pub mod table_properties;
 pub mod transaction;
 pub(crate) mod transforms;
@@ -158,6 +159,8 @@ pub use log_compaction::{should_compact, LogCompactionWriter};
 pub use metrics::MetricsReporter;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
+pub use table_manager::TableManager;
+pub use transaction::create_table::CreateTableTransactionBuilder;
 
 use expressions::literal_expression_transform::LiteralExpressionTransform;
 use expressions::Scalar;
