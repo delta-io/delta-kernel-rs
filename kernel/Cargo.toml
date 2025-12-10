@@ -64,8 +64,7 @@ reqwest = { version = "0.12.23", default-features = false, optional = true }
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
-# TODO: Remove this once https://github.com/apache/arrow-rs/pull/8244 ships
-comfy-table = { version = "~7.1", optional = true }
+comfy-table = { version = "7.1", optional = true }
 
 # arrow 56
 [dependencies.arrow_56]
