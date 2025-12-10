@@ -1117,6 +1117,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         )?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1182,6 +1183,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         )?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1235,6 +1237,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         )?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1283,6 +1286,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
             Some(create_log_path("file:///00000000000000000001.json")),
         )?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1354,6 +1358,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
             Some(create_log_path("file:///00000000000000000001.json")),
         )?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -2320,7 +2325,8 @@ fn test_log_segment_contiguous_commit_files() {
     );
 
     // disallow gaps in LogSegment
-    let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
+    let log_segment =
+        LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None, None);
     assert_result_error_with_message(
         log_segment,
         "Generic delta kernel error: Expected ordered \
@@ -2356,6 +2362,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2376,6 +2383,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
     };
 
     // Should fail with staged commits
