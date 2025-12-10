@@ -161,9 +161,50 @@ impl TablePropertyProtocolConfig {
     /// Table features allowed during CREATE TABLE.
     /// Expand this list as more features are supported.
     const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
-        // Currently empty - no explicit feature overrides allowed yet
-        // Future: TableFeature::DeletionVectors, TableFeature::ColumnMapping, etc.
+        TableFeature::DomainMetadata,
+        TableFeature::ClusteredTable,
     ];
+
+    /// Add a writer feature to the protocol. If the feature is ReaderWriter,
+    /// it will also be added to reader features. Creates a new Protocol with
+    /// the added feature.
+    pub(crate) fn add_writer_feature(&mut self, feature: TableFeature) -> DeltaResult<()> {
+        use crate::table_features::{
+            TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+        };
+
+        // Get current features
+        let mut reader_features: Vec<_> = self
+            .protocol
+            .reader_features()
+            .map(|f| f.to_vec())
+            .unwrap_or_default();
+        let mut writer_features: Vec<_> = self
+            .protocol
+            .writer_features()
+            .map(|f| f.to_vec())
+            .unwrap_or_default();
+
+        // Add feature to writer features if not already present
+        if !writer_features.contains(&feature) {
+            writer_features.push(feature.clone());
+        }
+
+        // If it's a ReaderWriter feature, also add to reader features
+        if feature.is_reader_writer() && !reader_features.contains(&feature) {
+            reader_features.push(feature);
+        }
+
+        // Create new protocol with updated features
+        self.protocol = Protocol::try_new(
+            TABLE_FEATURES_MIN_READER_VERSION,
+            TABLE_FEATURES_MIN_WRITER_VERSION,
+            Some(reader_features.iter()),
+            Some(writer_features.iter()),
+        )?;
+
+        Ok(())
+    }
 
     /// Validates the configuration for CREATE TABLE.
     ///

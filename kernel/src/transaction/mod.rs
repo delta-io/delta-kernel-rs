@@ -46,6 +46,10 @@ use delta_kernel_derive::internal_api;
 pub mod create_table;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod create_table;
+pub mod data_layout;
+
+pub use create_table::create_table;
+pub use data_layout::DataLayout;
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =

@@ -1,18 +1,20 @@
 //! Create table transaction implementation (internal API).
 //!
-//! This module provides a type-safe API for creating Delta tables.
-//! Use the [`create_table`] function to get a [`CreateTableTransactionBuilder`] that can be
-//! configured with table properties and other options before building the [`Transaction`].
+//! This module provides the [`CreateTableTransactionBuilder`] for creating new Delta tables
+//! with optional features like partitioning, clustering, table properties, and table features.
+//! Use the [`create_table`] function to get a builder that can be configured before building
+//! the [`Transaction`].
 //!
 //! # Example
 //!
 //! ```rust,no_run
+//! # use delta_kernel::DeltaResult;
+//! # use delta_kernel::Engine;
+//! # fn example(engine: &dyn Engine) -> DeltaResult<()> {
 //! use delta_kernel::transaction::create_table::create_table;
 //! use delta_kernel::schema::{StructType, StructField, DataType};
 //! use delta_kernel::committer::FileSystemCommitter;
 //! use std::sync::Arc;
-//! # use delta_kernel::Engine;
-//! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
 //!
 //! let schema = Arc::new(StructType::try_new(vec![
 //!     StructField::new("id", DataType::INTEGER, false),
@@ -24,7 +26,6 @@
 //!     .commit(engine)?;
 //! # Ok(())
 //! # }
-//! ```
 
 // Allow `pub` items in this module even though the module itself may be `pub(crate)`.
 // The module visibility controls external access; items are `pub` for use within the crate
@@ -36,13 +37,16 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::Metadata;
+use crate::actions::{DomainMetadata, Metadata};
+use crate::clustering::ClusteringMetadataDomain;
 use crate::committer::Committer;
 use crate::log_segment::LogSegment;
-use crate::schema::SchemaRef;
+use crate::schema::{ColumnName, SchemaRef};
 use crate::snapshot::Snapshot;
 use crate::table_configuration::TableConfiguration;
+use crate::table_features::TableFeature;
 use crate::table_property_protocol_config::TablePropertyProtocolConfig;
+use crate::transaction::data_layout::{DataLayout, MAX_CLUSTERING_COLUMNS};
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error, StorageHandler, PRE_COMMIT_VERSION};
@@ -98,6 +102,16 @@ fn ensure_table_does_not_exist(
             Err(e)
         }
     }
+}
+
+/// Result of processing the data layout specification.
+struct ProcessedDataLayout {
+    /// Partition columns for the table (empty if not partitioned).
+    partition_columns: Vec<String>,
+    /// Domain metadata for clustering (None if not clustered).
+    clustering_domain_metadata: Option<DomainMetadata>,
+    /// Additional writer features required by the layout.
+    additional_writer_features: Vec<TableFeature>,
 }
 
 /// Creates a builder for creating a new Delta table.
@@ -157,6 +171,7 @@ pub struct CreateTableTransactionBuilder {
     schema: SchemaRef,
     engine_info: String,
     table_properties: HashMap<String, String>,
+    data_layout: DataLayout,
 }
 
 impl CreateTableTransactionBuilder {
@@ -169,7 +184,57 @@ impl CreateTableTransactionBuilder {
             schema,
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
+            data_layout: DataLayout::None,
         }
+    }
+
+    /// Sets the data layout for the new Delta table.
+    ///
+    /// The data layout determines how data files are organized within the table:
+    ///
+    /// - [`DataLayout::None`]: No special organization (default)
+    /// - [`DataLayout::Partitioned`]: Data files are organized by partition column values
+    /// - [`DataLayout::Clustered`]: Data files are optimized for queries on clustering columns
+    ///
+    /// Note: Partitioning and clustering are mutually exclusive. A table can have one or the
+    /// other, but not both.
+    ///
+    /// # Arguments
+    ///
+    /// * `layout` - The data layout specification
+    ///
+    /// # Example
+    ///
+    /// ## Partitioned Table
+    /// ```rust,ignore
+    /// # use delta_kernel::transaction::create_table::create_table;
+    /// # use delta_kernel::transaction::DataLayout;
+    /// # use delta_kernel::schema::{StructType, DataType, StructField};
+    /// # use std::sync::Arc;
+    /// # let schema = Arc::new(StructType::try_new(vec![
+    /// #     StructField::new("id", DataType::INTEGER, false),
+    /// #     StructField::new("date", DataType::STRING, false),
+    /// # ]).unwrap());
+    /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
+    ///     .with_data_layout(DataLayout::partitioned(["date"]).unwrap());
+    /// ```
+    ///
+    /// ## Clustered Table
+    /// ```rust,ignore
+    /// # use delta_kernel::transaction::create_table::create_table;
+    /// # use delta_kernel::transaction::DataLayout;
+    /// # use delta_kernel::schema::{StructType, DataType, StructField};
+    /// # use std::sync::Arc;
+    /// # let schema = Arc::new(StructType::try_new(vec![
+    /// #     StructField::new("id", DataType::INTEGER, false),
+    /// #     StructField::new("category", DataType::STRING, false),
+    /// # ]).unwrap());
+    /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
+    ///     .with_data_layout(DataLayout::clustered(["category"])?);
+    /// ```
+    pub fn with_data_layout(mut self, layout: DataLayout) -> Self {
+        self.data_layout = layout;
+        self
     }
 
     /// Sets table properties for the new Delta table.
@@ -214,6 +279,116 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Validates clustering columns against the schema and constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - More than 4 clustering columns are specified
+    /// - A clustering column doesn't exist in the schema
+    fn validate_clustering_columns(columns: &[ColumnName], schema: &SchemaRef) -> DeltaResult<()> {
+        use crate::schema::DataType;
+
+        // Check maximum clustering columns
+        if columns.len() > MAX_CLUSTERING_COLUMNS {
+            return Err(Error::generic(format!(
+                "Cannot specify more than {} clustering columns. Found {}.",
+                MAX_CLUSTERING_COLUMNS,
+                columns.len()
+            )));
+        }
+
+        // Validate each column exists in the schema by traversing the path
+        for col in columns {
+            let path = col.path();
+            if path.is_empty() {
+                return Err(Error::generic("Clustering column path cannot be empty"));
+            }
+
+            // Traverse the schema tree to validate the path
+            let mut current_schema = schema.as_ref();
+            for (i, field_name) in path.iter().enumerate() {
+                match current_schema.field(field_name) {
+                    Some(field) => {
+                        // If not the last element, we need to descend into a struct
+                        if i < path.len() - 1 {
+                            match field.data_type() {
+                                DataType::Struct(inner) => {
+                                    current_schema = inner;
+                                }
+                                _ => {
+                                    return Err(Error::generic(format!(
+                                        "Clustering column '{}': field '{}' is not a struct and cannot contain nested fields",
+                                        col, field_name
+                                    )));
+                                }
+                            }
+                        }
+                        // If it's the last element, we found the column - validation passes
+                    }
+                    None => {
+                        return Err(Error::generic(format!(
+                            "Clustering column '{}' not found in schema: field '{}' does not exist",
+                            col, field_name
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Processes the data layout specification and returns partition columns,
+    /// clustering metadata, and any additional features required.
+    ///
+    /// # Arguments
+    ///
+    /// * `data_layout` - The data layout specification
+    /// * `schema` - The table schema (for validation)
+    ///
+    /// # Returns
+    ///
+    /// A [`ProcessedDataLayout`] containing:
+    /// - Partition columns (empty if not partitioned)
+    /// - Clustering domain metadata (None if not clustered)
+    /// - Additional writer features required by the layout
+    fn process_data_layout(
+        data_layout: &DataLayout,
+        schema: &SchemaRef,
+    ) -> DeltaResult<ProcessedDataLayout> {
+        match data_layout {
+            DataLayout::None => Ok(ProcessedDataLayout {
+                partition_columns: vec![],
+                clustering_domain_metadata: None,
+                additional_writer_features: vec![],
+            }),
+            DataLayout::Partitioned(cols) => Ok(ProcessedDataLayout {
+                // Convert ColumnName to String for Metadata compatibility
+                partition_columns: cols.iter().map(|c| c.to_string()).collect(),
+                clustering_domain_metadata: None,
+                additional_writer_features: vec![],
+            }),
+            DataLayout::Clustered(cols) => {
+                // Validate clustering columns
+                Self::validate_clustering_columns(cols, schema)?;
+
+                // Create clustering domain metadata
+                let clustering_metadata = ClusteringMetadataDomain::new(cols);
+                let domain_metadata = clustering_metadata.to_domain_metadata()?;
+
+                // Clustering requires this feature (DomainMetadata is added in build())
+                let additional_features = vec![TableFeature::ClusteredTable];
+
+                Ok(ProcessedDataLayout {
+                    partition_columns: vec![],
+                    clustering_domain_metadata: Some(domain_metadata),
+                    additional_writer_features: additional_features,
+                })
+            }
+        }
+    }
+
     /// Builds a [`Transaction`] that can be committed to create the table.
     ///
     /// This method performs validation:
@@ -221,6 +396,7 @@ impl CreateTableTransactionBuilder {
     /// - Verifies the table doesn't already exist
     /// - Validates the schema is non-empty
     /// - Validates table properties against the allow list
+    /// - For clustered tables: validates clustering columns exist and adds required features
     ///
     /// # Arguments
     ///
@@ -234,6 +410,7 @@ impl CreateTableTransactionBuilder {
     /// - A table already exists at the given path
     /// - The schema is empty
     /// - Unsupported delta properties or feature flags are specified
+    /// - Clustering columns don't exist in schema or exceed the limit (4)
     pub fn build(
         self,
         engine: &dyn Engine,
@@ -252,10 +429,25 @@ impl CreateTableTransactionBuilder {
         }
 
         // Parse and validate table properties
-        let config = TablePropertyProtocolConfig::try_from(self.table_properties)?;
+        let mut config = TablePropertyProtocolConfig::try_from(self.table_properties)?;
         config.validate_for_create()?;
 
-        // Use protocol from config (already created with table features support)
+        // Process data layout (partitioning or clustering)
+        let layout = Self::process_data_layout(&self.data_layout, &self.schema)?;
+
+        // Add any features required by the data layout to the protocol
+        for feature in &layout.additional_writer_features {
+            config.add_writer_feature(feature.clone())?;
+        }
+
+        // Add domainMetadata feature if clustering domain metadata is present
+        // This centralizes the domain metadata feature logic in build() rather than
+        // scattering it across different layout processors.
+        if layout.clustering_domain_metadata.is_some() {
+            config.add_writer_feature(TableFeature::DomainMetadata)?;
+        }
+
+        // Use protocol from config (with any additional layout features added)
         let protocol = config.protocol;
 
         // Create Metadata action
@@ -263,7 +455,7 @@ impl CreateTableTransactionBuilder {
             None, // name
             None, // description
             (*self.schema).clone(),
-            Vec::new(), // partition_columns - added with data layout support
+            layout.partition_columns,
             current_time_ms()?,
             config.table_properties,
         )?;
@@ -275,11 +467,17 @@ impl CreateTableTransactionBuilder {
             TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
 
         // Create Transaction with pre-commit snapshot
+        // Convert clustering domain metadata to Vec<DomainMetadata> for the transaction
+        let system_domain_metadata: Vec<DomainMetadata> = layout
+            .clustering_domain_metadata
+            .into_iter()
+            .collect();
+
         Transaction::try_new_create_table(
             Arc::new(Snapshot::new(log_segment, table_configuration)),
             self.engine_info,
             committer,
-            vec![], // system_domain_metadata - not supported in base API
+            system_domain_metadata,
         )
     }
 }
@@ -302,6 +500,14 @@ mod tests {
         )]))
     }
 
+    fn test_schema_with_columns() -> SchemaRef {
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("name", DataType::STRING, true),
+            StructField::new("value", DataType::LONG, true),
+        ]))
+    }
+
     #[test]
     fn test_basic_builder_creation() {
         let schema = test_schema();
@@ -311,18 +517,7 @@ mod tests {
         assert_eq!(builder.path, "/path/to/table");
         assert_eq!(builder.engine_info, "TestApp/1.0");
         assert!(builder.table_properties.is_empty());
-    }
-
-    #[test]
-    fn test_nested_path_builder_creation() {
-        let schema = test_schema();
-        let builder = CreateTableTransactionBuilder::new(
-            "/path/to/table/nested",
-            schema.clone(),
-            "TestApp/1.0",
-        );
-
-        assert_eq!(builder.path, "/path/to/table/nested");
+        assert!(builder.data_layout.is_none());
     }
 
     #[test]
@@ -465,5 +660,110 @@ mod tests {
         // Invalid: non-integer writer version
         let props = HashMap::from([(MIN_WRITER_VERSION_PROP.to_string(), "xyz".to_string())]);
         assert_result_error_with_messages(try_create(props), &["Must be an integer"]);
+    }
+
+    #[test]
+    fn test_with_data_layout_partitioned() {
+        let schema = test_schema_with_columns();
+
+        let builder = CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::partitioned(["name"]).unwrap());
+
+        assert!(matches!(builder.data_layout, DataLayout::Partitioned(_)));
+    }
+
+    #[test]
+    fn test_with_data_layout_clustered() {
+        let schema = test_schema_with_columns();
+
+        let builder = CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::clustered(["name"]).unwrap());
+
+        assert!(matches!(builder.data_layout, DataLayout::Clustered(_)));
+    }
+
+    #[test]
+    fn test_clustering_too_many_columns() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Create a schema with 5 columns
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("a", DataType::STRING, false),
+            StructField::new("b", DataType::STRING, false),
+            StructField::new("c", DataType::STRING, false),
+            StructField::new("d", DataType::STRING, false),
+            StructField::new("e", DataType::STRING, false),
+        ]));
+
+        // Try to cluster on 5 columns (max is 4)
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::clustered(["a", "b", "c", "d", "e"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Cannot specify more than 4 clustering columns"));
+    }
+
+    #[test]
+    fn test_clustering_column_not_in_schema() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let schema = test_schema_with_columns();
+
+        // Try to cluster on a non-existent column
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::clustered(["nonexistent"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found in schema"));
+    }
+
+    #[test]
+    fn test_clustering_nested_column() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Create a schema with nested struct
+        let inner_struct = StructType::new_unchecked(vec![
+            StructField::new("city", DataType::STRING, false),
+            StructField::new("zip", DataType::STRING, false),
+        ]);
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("address", DataType::Struct(Box::new(inner_struct)), false),
+        ]));
+
+        // Cluster on nested column using dot notation
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::clustered(["address.city"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_clustering_invalid_nested_path() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let schema = test_schema_with_columns();
+
+        // Try to access nested field on a non-struct column
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::clustered(["name.nested"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("is not a struct"));
     }
 }
