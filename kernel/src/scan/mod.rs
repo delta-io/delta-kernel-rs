@@ -26,7 +26,7 @@ use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    ToSchema as _,
+    StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -56,6 +56,31 @@ static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+
+use crate::actions::add_schema_with_stats_parsed;
+
+/// Builds a checkpoint read schema that includes the `stats_parsed` field.
+///
+/// This schema is used when reading checkpoints to enable data skipping
+/// without JSON parsing overhead. The `stats_parsed` field contains pre-parsed
+/// statistics in a structured format.
+///
+/// The returned schema includes:
+/// - All existing Add fields (path, size, stats, etc.)
+/// - `stats_parsed` struct with projected columns from predicate
+///
+/// # Arguments
+/// * `stats_schema` - The stats schema built from predicate-referenced columns,
+///   with structure: `{numRecords, nullCount, minValues, maxValues}`
+#[allow(dead_code)] // Used in tests, will be used in stats_parsed integration PR
+pub(crate) fn build_checkpoint_read_schema_with_stats_parsed(
+    stats_schema: &SchemaRef,
+) -> SchemaRef {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME,
+        add_schema_with_stats_parsed(stats_schema.as_ref()),
+    )]))
+}
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
