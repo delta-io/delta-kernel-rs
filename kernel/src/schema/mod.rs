@@ -2785,6 +2785,7 @@ mod tests {
             MetadataColumnSpec::RowCommitVersion.text_value(),
             "row_commit_version"
         );
+        assert_eq!(MetadataColumnSpec::FilePath.text_value(), "_file");
 
         // Test data_type
         assert_eq!(MetadataColumnSpec::RowIndex.data_type(), DataType::LONG);
@@ -2793,11 +2794,25 @@ mod tests {
             MetadataColumnSpec::RowCommitVersion.data_type(),
             DataType::LONG
         );
+        assert_eq!(MetadataColumnSpec::FilePath.data_type(), DataType::STRING);
 
         // Test nullable
         assert!(!MetadataColumnSpec::RowIndex.nullable());
         assert!(!MetadataColumnSpec::RowId.nullable());
         assert!(!MetadataColumnSpec::RowCommitVersion.nullable());
+        assert!(!MetadataColumnSpec::FilePath.nullable());
+
+        // Test reserved_field_id
+        assert_eq!(MetadataColumnSpec::RowIndex.reserved_field_id(), None);
+        assert_eq!(MetadataColumnSpec::RowId.reserved_field_id(), None);
+        assert_eq!(
+            MetadataColumnSpec::RowCommitVersion.reserved_field_id(),
+            None
+        );
+        assert_eq!(
+            MetadataColumnSpec::FilePath.reserved_field_id(),
+            Some(crate::reserved_field_ids::FILE_NAME)
+        );
 
         // Test from_str
         assert_eq!(
@@ -2811,6 +2826,10 @@ mod tests {
         assert_eq!(
             MetadataColumnSpec::from_str("row_commit_version")?,
             MetadataColumnSpec::RowCommitVersion
+        );
+        assert_eq!(
+            MetadataColumnSpec::from_str("_file")?,
+            MetadataColumnSpec::FilePath
         );
 
         // Test invalid from_str
