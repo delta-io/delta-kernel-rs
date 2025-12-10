@@ -2,6 +2,7 @@ use std::error;
 
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use itertools::Itertools;
 
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
@@ -10,7 +11,7 @@ use delta_kernel::{DeltaResult, Error, PredicateRef, Version};
 
 mod common;
 
-use test_utils::{load_test_data, to_arrow};
+use test_utils::load_test_data;
 
 fn read_cdf_for_table(
     test_name: impl AsRef<str>,
@@ -48,7 +49,7 @@ fn read_cdf_for_table(
     let batches: Vec<RecordBatch> = scan
         .execute(engine)?
         .map(|data| -> DeltaResult<_> {
-            let record_batch = to_arrow(data?)?;
+            let record_batch = data?.try_into_record_batch()?;
             // Verify that the arrow record batches match the expected schema
             assert!(record_batch.schema().as_ref() == &scan_schema_as_arrow);
             Ok(record_batch)
@@ -539,6 +540,66 @@ fn conditional_delete_two_rows() -> DeltaResult<()> {
         "| 2  | delete       | 1               |",
         "| 8  | delete       | 1               |",
         "+----+--------------+-----------------+",
+    ];
+    sort_lines!(expected);
+    assert_batches_sorted_eq!(expected, &batches);
+    Ok(())
+}
+
+#[test]
+fn cdf_with_column_mapping_name_mode() -> Result<(), Box<dyn error::Error>> {
+    // NOTE: these tables only have CDF enabled in version 1+, so we start reading from 1. This is
+    // due to pyspark limitation while writing: we were unable to create a table with column
+    // mapping + CDF enabled in commit 0, so we created with column mapping and enabled CDF in
+    // commit 1.
+    let batches = read_cdf_for_table("cdf-column-mapping-name-mode", 1, None, None)?;
+    let mut expected = vec![
+        "+----+-------+-------+------------------+-----------------+",
+        "| id | name  | value | _change_type     | _commit_version |",
+        "+----+-------+-------+------------------+-----------------+",
+        "| 1  | Alice | 100.0 | delete           | 4               |",
+        "| 2  | Bob   | 200.0 | update_preimage  | 2               |",
+        "| 2  | Bob   | 250.0 | update_postimage | 2               |",
+        "| 4  | David | 400.0 | insert           | 3               |",
+        "+----+-------+-------+------------------+-----------------+",
+    ];
+    sort_lines!(expected);
+    assert_batches_sorted_eq!(expected, &batches);
+
+    // same as above but instead of protocol 2,5 this is 3,7 with columnMapping+DV features
+    let batches = read_cdf_for_table("cdf-column-mapping-name-mode-3-7", 1, None, None)?;
+    let mut expected = vec![
+        "+----+-------+-------+------------------+-----------------+",
+        "| id | name  | value | _change_type     | _commit_version |",
+        "+----+-------+-------+------------------+-----------------+",
+        "| 1  | Alice | 100.0 | delete           | 4               |",
+        "| 2  | Bob   | 200.0 | update_preimage  | 2               |",
+        "| 2  | Bob   | 250.0 | update_postimage | 2               |",
+        "| 4  | David | 400.0 | insert           | 3               |",
+        "+----+-------+-------+------------------+-----------------+",
+    ];
+    sort_lines!(expected);
+    assert_batches_sorted_eq!(expected, &batches);
+
+    Ok(())
+}
+
+#[test]
+fn cdf_with_column_mapping_id_mode() -> Result<(), Box<dyn error::Error>> {
+    // NOTE: these tables only have CDF enabled in version 1+, so we start reading from 1. This is
+    // due to pyspark limitation while writing: we were unable to create a table with column
+    // mapping + CDF enabled in commit 0, so we created with column mapping and enabled CDF in
+    // commit 1.
+    let batches = read_cdf_for_table("cdf-column-mapping-id-mode", 1, None, None)?;
+    let mut expected = vec![
+        "+----+-------+-------+------------------+-----------------+",
+        "| id | name  | value | _change_type     | _commit_version |",
+        "+----+-------+-------+------------------+-----------------+",
+        "| 2  | Frank | 250.0 | update_preimage  | 2               |",
+        "| 2  | Frank | 275.0 | update_postimage | 2               |",
+        "| 3  | Grace | 350.0 | delete           | 4               |",
+        "| 4  | Henry | 450.0 | insert           | 3               |",
+        "+----+-------+-------+------------------+-----------------+",
     ];
     sort_lines!(expected);
     assert_batches_sorted_eq!(expected, &batches);

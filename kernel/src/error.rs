@@ -291,7 +291,7 @@ impl Error {
         Self::InvalidCheckpoint(msg.to_string())
     }
 
-    pub(crate) fn schema(msg: impl ToString) -> Self {
+    pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
     }
 
