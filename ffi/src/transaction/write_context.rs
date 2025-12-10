@@ -1,6 +1,8 @@
 use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
-use crate::{kernel_string_slice, AllocateStringFn, NullableCvoid, SharedExternEngine, SharedSchema};
+use crate::{
+    kernel_string_slice, AllocateStringFn, NullableCvoid, SharedExternEngine, SharedSchema,
+};
 use delta_kernel::transaction::WriteContext;
 use delta_kernel_ffi_macros::handle_descriptor;
 
