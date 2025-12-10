@@ -156,12 +156,13 @@ pub unsafe extern "C" fn new_expression_evaluator(
     expression: &Expression,
     // TODO: Make this a data_type, and give a way for c code to go between schema <-> datatype
     output_type: Handle<SharedSchema>,
-) -> Handle<SharedExpressionEvaluator> {
+) -> ExternResult<Handle<SharedExpressionEvaluator>> {
     let engine = unsafe { engine.clone_as_arc() };
     let input_schema = unsafe { input_schema.clone_as_arc() };
     let output_type: DataType = output_type.as_ref().clone().into();
     let expression = Arc::new(expression.clone());
-    new_expression_evaluator_impl(engine, input_schema, expression, output_type)
+    let res = new_expression_evaluator_impl(engine.clone(), input_schema, expression, output_type);
+    res.into_extern_result(&engine.as_ref())
 }
 
 fn new_expression_evaluator_impl(
@@ -169,13 +170,14 @@ fn new_expression_evaluator_impl(
     input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
-) -> Handle<SharedExpressionEvaluator> {
+) -> DeltaResult<Handle<SharedExpressionEvaluator>> {
     let engine = extern_engine.engine();
-    let evaluator =
-        engine
-            .evaluation_handler()
-            .new_expression_evaluator(input_schema, expression, output_type);
-    evaluator.into()
+    let evaluator = engine.evaluation_handler().new_expression_evaluator(
+        input_schema,
+        expression,
+        output_type,
+    )?;
+    Ok(evaluator.into())
 }
 
 /// Free an expression evaluator
@@ -215,6 +217,7 @@ fn evaluate_expression_impl(
 #[cfg(test)]
 mod tests {
     use super::{free_expression_evaluator, new_expression_evaluator};
+    use crate::ffi_test_utils::ok_or_panic;
     use crate::{free_engine, handle::Handle, tests::get_default_engine, SharedSchema};
     use delta_kernel::{
         schema::{DataType, StructField, StructType},
@@ -232,12 +235,13 @@ mod tests {
         let output_type: Handle<SharedSchema> = in_schema.clone().into();
         let in_schema_handle: Handle<SharedSchema> = in_schema.into();
         unsafe {
-            let evaluator = new_expression_evaluator(
+            let result = new_expression_evaluator(
                 engine.shallow_copy(),
                 in_schema_handle.shallow_copy(),
                 &expr,
                 output_type.shallow_copy(),
             );
+            let evaluator = ok_or_panic(result);
             in_schema_handle.drop_handle();
             output_type.drop_handle();
             free_engine(engine);

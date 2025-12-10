@@ -1,13 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::iter;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock};
 
 use url::Url;
 
+use crate::actions::deletion_vector::DeletionVectorPath;
 use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_commit_info_schema,
-    get_log_domain_metadata_schema, get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction,
+    get_log_domain_metadata_schema, get_log_remove_schema, get_log_txn_schema, CommitInfo,
+    DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
 #[cfg(feature = "catalog-managed")]
 use crate::committer::FileSystemCommitter;
@@ -17,12 +20,17 @@ use crate::error::Error;
 use crate::expressions::{ArrayData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::LogRoot;
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType};
+use crate::scan::log_replay::{
+    BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME, FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
+};
+use crate::scan::scan_row_schema;
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
 use crate::snapshot::SnapshotRef;
-use crate::utils::current_time_ms;
+use crate::table_features::{Operation, TableFeature};
+use crate::utils::{current_time_ms, require};
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
-    RowVisitor, Version,
+    RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
 
@@ -59,9 +67,9 @@ pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| 
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
     );
 
-    Arc::new(StructType::new_unchecked(
-        mandatory_add_file_schema().fields().cloned().chain([stats]),
-    ))
+    StructTypeBuilder::from_schema(mandatory_add_file_schema())
+        .add_field(stats)
+        .build_arc_unchecked()
 });
 
 static DATA_CHANGE_COLUMN: LazyLock<StructField> =
@@ -79,30 +87,28 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
     Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
 });
 
-// NOTE: The following two methods are a workaround for the fact that we do not have a proper SchemaBuilder yet.
-// See https://github.com/delta-io/delta-kernel-rs/issues/1284
 /// Extend a schema with a statistics column and return a new SchemaRef.
 ///
 /// The stats column is of type string as required by the spec.
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_stats_col(schema: &SchemaRef) -> SchemaRef {
-    let fields = schema
-        .fields()
-        .cloned()
-        .chain([StructField::nullable("stats", DataType::STRING)]);
-    Arc::new(StructType::new_unchecked(fields))
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("stats", DataType::STRING))
+        .build_arc_unchecked()
 }
 
 /// Extend a schema with row tracking columns and return a new SchemaRef.
 ///
 /// Note that this method is only useful to extend an Add action schema.
 fn with_row_tracking_cols(schema: &SchemaRef) -> SchemaRef {
-    let fields = schema.fields().cloned().chain([
-        StructField::nullable("baseRowId", DataType::LONG),
-        StructField::nullable("defaultRowCommitVersion", DataType::LONG),
-    ]);
-    Arc::new(StructType::new_unchecked(fields))
+    StructTypeBuilder::from_schema(schema)
+        .add_field(StructField::nullable("baseRowId", DataType::LONG))
+        .add_field(StructField::nullable(
+            "defaultRowCommitVersion",
+            DataType::LONG,
+        ))
+        .build_arc_unchecked()
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -125,6 +131,7 @@ pub struct Transaction {
     operation: Option<String>,
     engine_info: Option<String>,
     add_files_metadata: Vec<Box<dyn EngineData>>,
+    remove_files_metadata: Vec<FilteredEngineData>,
     // NB: hashmap would require either duplicating the appid or splitting SetTransaction
     // key/payload. HashSet requires Borrow<&str> with matching Eq, Ord, and Hash. Plus,
     // HashSet::insert drops the to-be-inserted value without returning the existing one, which
@@ -134,7 +141,11 @@ pub struct Transaction {
     // commit-wide timestamp (in milliseconds since epoch) - used in ICT, `txn` action, etc. to
     // keep all timestamps within the same commit consistent.
     commit_timestamp: i64,
-    domain_metadatas: Vec<DomainMetadata>,
+    // Domain metadata additions for this transaction.
+    domain_metadata_additions: Vec<DomainMetadata>,
+    // Domain names to remove in this transaction. The configuration values are fetched during
+    // commit from the log to preserve the pre-image in tombstones.
+    domain_removals: Vec<String>,
     // Whether this transaction contains any logical data changes.
     data_change: bool,
 }
@@ -162,10 +173,10 @@ impl Transaction {
     ) -> DeltaResult<Self> {
         let read_snapshot = snapshot.into();
 
-        // important! before a read/write to the table we must check it is supported
+        // important! before writing to the table we must check it is supported
         read_snapshot
             .table_configuration()
-            .ensure_write_supported()?;
+            .ensure_operation_supported(Operation::Write)?;
 
         let commit_timestamp = current_time_ms()?;
 
@@ -175,9 +186,11 @@ impl Transaction {
             operation: None,
             engine_info: None,
             add_files_metadata: vec![],
+            remove_files_metadata: vec![],
             set_transactions: vec![],
             commit_timestamp,
-            domain_metadatas: vec![],
+            domain_metadata_additions: vec![],
+            domain_removals: vec![],
             data_change: true,
         })
     }
@@ -218,6 +231,31 @@ impl Transaction {
                 dup.app_id
             )));
         }
+
+        // If there are add and remove files with data change in the same transaction, we block it.
+        // This is because kernel does not yet have a way to discern DML operations. For DML
+        // operations that perform updates on rows, ChangeDataFeed requires that a `cdc` file be
+        // written to the delta log.
+        if !self.add_files_metadata.is_empty()
+            && !self.remove_files_metadata.is_empty()
+            && self.data_change
+        {
+            let cdf_enabled = self
+                .read_snapshot
+                .table_configuration()
+                .table_properties()
+                .enable_change_data_feed
+                .unwrap_or(false);
+            require!(
+                !cdf_enabled,
+                Error::generic(
+                    "Cannot add and remove data in the same transaction when Change Data Feed is enabled (delta.enableChangeDataFeed = true). \
+                     This would require writing CDC files for DML operations, which is not yet supported. \
+                     Consider using separate transactions: one to add files, another to remove files."
+                )
+            );
+        }
+
         // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
@@ -253,14 +291,17 @@ impl Transaction {
         let domain_metadata_actions =
             self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
 
-        // Step 5: Chain all our actions to be handed off to the Committer
+        // Step 5: Generate remove actions
+        let remove_actions = self.generate_remove_actions(engine)?;
+
         let actions = iter::once(commit_info_action)
             .chain(add_actions)
             .chain(set_transaction_actions)
             .chain(domain_metadata_actions);
-        // Convert EngineData to FilteredEngineData with all rows selected
+
         let filtered_actions = actions
-            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected));
+            .map(|action_result| action_result.map(FilteredEngineData::with_all_rows_selected))
+            .chain(remove_actions);
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
@@ -274,7 +315,7 @@ impl Transaction {
             return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
         }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
-        let commit_metadata = CommitMetadata::new(log_root, commit_version);
+        let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
@@ -347,7 +388,7 @@ impl Transaction {
     /// fail (that is, we don't eagerly check domain validity here).
     /// Setting metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
-        self.domain_metadatas
+        self.domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
         self
     }
@@ -362,10 +403,48 @@ impl Transaction {
     /// fail (that is, we don't eagerly check domain validity here).
     /// Removing metadata for multiple distinct domains is allowed.
     pub fn with_domain_metadata_removed(mut self, domain: String) -> Self {
-        // actual configuration value determined during commit
-        self.domain_metadatas
-            .push(DomainMetadata::remove(domain, String::new()));
+        self.domain_removals.push(domain);
         self
+    }
+
+    /// Validate that user domains don't conflict with system domains or each other.
+    fn validate_user_domain_operations(&self) -> DeltaResult<()> {
+        let mut seen_domains = HashSet::new();
+
+        // Validate domain additions
+        for dm in &self.domain_metadata_additions {
+            let domain = dm.domain();
+            if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
+                return Err(Error::generic(
+                    "Cannot modify domains that start with 'delta.' as those are system controlled",
+                ));
+            }
+
+            if !seen_domains.insert(domain) {
+                return Err(Error::generic(format!(
+                    "Metadata for domain {} already specified in this transaction",
+                    domain
+                )));
+            }
+        }
+
+        // Validate domain removals
+        for domain in &self.domain_removals {
+            if domain.starts_with(INTERNAL_DOMAIN_PREFIX) {
+                return Err(Error::generic(
+                    "Cannot modify domains that start with 'delta.' as those are system controlled",
+                ));
+            }
+
+            if !seen_domains.insert(domain.as_str()) {
+                return Err(Error::generic(format!(
+                    "Metadata for domain {} already specified in this transaction",
+                    domain
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Generate domain metadata actions with validation. Handle both user and system domains.
@@ -378,71 +457,55 @@ impl Transaction {
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'a> {
-        // if there are domain metadata actions, the table must support it
-        if !self.domain_metadatas.is_empty()
+        // Validate feature support for user domain operations
+        if (!self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty())
             && !self
                 .read_snapshot
                 .table_configuration()
-                .is_domain_metadata_supported()
+                .is_feature_supported(&TableFeature::DomainMetadata)
         {
-            return Err(Error::unsupported(
-                "Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"
-            ));
+            return Err(Error::unsupported("Domain metadata operations require writer version 7 and the 'domainMetadata' writer feature"));
         }
 
-        // validate user domain metadata and check if we have removals
-        let mut seen_domains = HashSet::new();
-        let mut has_removals = false;
-        for dm in &self.domain_metadatas {
-            if dm.is_internal() {
-                return Err(Error::Generic(
-                    "Cannot modify domains that start with 'delta.' as those are system controlled"
-                        .to_string(),
-                ));
-            }
+        // Validate user domain operations
+        self.validate_user_domain_operations()?;
 
-            if !seen_domains.insert(dm.domain()) {
-                return Err(Error::Generic(format!(
-                    "Metadata for domain {} already specified in this transaction",
-                    dm.domain()
-                )));
-            }
+        // Generate user domain removals via log replay (expensive if non-empty)
+        let removal_actions = if !self.domain_removals.is_empty() {
+            // Scan log to fetch existing configurations for tombstones
+            let existing_domains =
+                scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?;
 
-            if dm.is_removed() {
-                has_removals = true;
-            }
-        }
+            // Create removal tombstones with pre-image configurations
+            let removals: Vec<_> = self
+                .domain_removals
+                .iter()
+                .filter_map(|domain| {
+                    // If domain doesn't exist in the log, this is a no-op (filter it out)
+                    existing_domains.get(domain).map(|existing| {
+                        DomainMetadata::remove(domain.clone(), existing.configuration().to_owned())
+                    })
+                })
+                .collect();
 
-        // fetch previous configuration values (requires log replay)
-        let existing_domains = if has_removals {
-            scan_domain_metadatas(self.read_snapshot.log_segment(), None, engine)?
+            removals
         } else {
-            HashMap::new()
+            vec![]
         };
 
-        let user_domains = self
-            .domain_metadatas
-            .iter()
-            .filter_map(move |dm: &DomainMetadata| {
-                if dm.is_removed() {
-                    existing_domains.get(dm.domain()).map(|existing| {
-                        DomainMetadata::remove(
-                            dm.domain().to_string(),
-                            existing.configuration().to_string(),
-                        )
-                    })
-                } else {
-                    Some(dm.clone())
-                }
-            });
-
-        let system_domains = row_tracking_high_watermark
+        // Generate system domain actions (row tracking)
+        let system_domain_actions = row_tracking_high_watermark
             .map(DomainMetadata::try_from)
             .transpose()?
             .into_iter();
 
-        Ok(user_domains
-            .chain(system_domains)
+        // Chain all domain actions and convert to EngineData
+        Ok(self
+            .domain_metadata_additions
+            .clone()
+            .into_iter()
+            .chain(removal_actions)
+            .chain(system_domain_actions)
             .map(|dm| dm.into_engine_data(get_log_domain_metadata_schema().clone(), engine)))
     }
 
@@ -469,17 +532,24 @@ impl Transaction {
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
-        // for now, we just pass through all the columns except partition columns.
-        // note this is _incorrect_ if table config deems we need partition columns.
         let partition_columns = self
             .read_snapshot
             .table_configuration()
             .metadata()
             .partition_columns();
         let schema = self.read_snapshot.schema();
+
+        // Check if materializePartitionColumns feature is enabled
+        let materialize_partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .is_feature_enabled(&TableFeature::MaterializePartitionColumns);
+
+        // If the materialize partition columns feature is enabled, pass through all columns in the
+        // schema. Otherwise, exclude partition columns.
         let fields = schema
             .fields()
-            .filter(|f| !partition_columns.contains(f.name()))
+            .filter(|f| materialize_partition_columns || !partition_columns.contains(f.name()))
             .map(|f| Expression::column([f.name()]));
         Expression::struct_from(fields)
     }
@@ -493,9 +563,23 @@ impl Transaction {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
+
+        // Compute physical schema: exclude partition columns since they're stored in the path
+        let partition_columns = self
+            .read_snapshot
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        let physical_fields = snapshot_schema
+            .fields()
+            .filter(|f| !partition_columns.contains(f.name()))
+            .cloned();
+        let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
+
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
+            physical_schema,
             Arc::new(logical_to_physical),
         )
     }
@@ -549,7 +633,7 @@ impl Transaction {
                     input_schema.clone(),
                     Arc::new(adds_expr),
                     as_log_add_schema(output_schema.clone()).into(),
-                );
+                )?;
                 adds_evaluator.evaluate(add_files_batch?.deref())
             })
         }
@@ -664,6 +748,144 @@ impl Transaction {
             error,
         }
     }
+    /// Remove files from the table in this transaction. This API generally enables the engine to
+    /// delete data (at file-level granularity) from the table. Note that this API can be called
+    /// multiple times to remove multiple batches.
+    ///
+    /// The expected schema for `remove_metadata` is given by [`scan_row_schema`]. It is expected
+    /// this will be the result of passing [`FilteredEngineData`] returned from a scan
+    /// with the selection vector modified to select rows for removal (selected rows in the selection vector are the ones to be removed).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::Engine;
+    /// # use delta_kernel::snapshot::Snapshot;
+    /// # #[cfg(feature = "catalog-managed")]
+    /// # use delta_kernel::committer::FileSystemCommitter;
+    /// # fn example(engine: Arc<dyn Engine>, table_url: url::Url) -> delta_kernel::DeltaResult<()> {
+    /// # #[cfg(feature = "catalog-managed")]
+    /// # {
+    /// // Create a snapshot and transaction
+    /// let snapshot = Snapshot::builder_for(table_url).build(engine.as_ref())?;
+    /// let mut txn = snapshot.clone().transaction(Box::new(FileSystemCommitter::new()))?;
+    ///
+    /// // Get file metadata from a scan
+    /// let scan = snapshot.scan_builder().build()?;
+    /// let scan_metadata = scan.scan_metadata(engine.as_ref())?;
+    ///
+    /// // Remove specific files based on scan metadata
+    /// for metadata in scan_metadata {
+    ///     let metadata = metadata?;
+    ///     // In practice, you would modify the selection vector to choose which files to remove
+    ///     let files_to_remove = metadata.scan_files;
+    ///     txn.remove_files(files_to_remove);
+    /// }
+    ///
+    /// // Commit the transaction
+    /// txn.commit(engine.as_ref())?;
+    /// # }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn remove_files(&mut self, remove_metadata: FilteredEngineData) {
+        self.remove_files_metadata.push(remove_metadata);
+    }
+
+    fn generate_remove_actions<'a>(
+        &'a self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<FilteredEngineData>> + Send + 'a> {
+        // This is a workaround due to the fact that expression evaluation happens
+        // on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
+        // required fields.
+        // TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
+        // on FilteredEngineData directly.
+        struct NullableStatsTransform;
+        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+            fn transform_struct_field(
+                &mut self,
+                field: &'a StructField,
+            ) -> Option<Cow<'a, StructField>> {
+                use Cow::*;
+                let field = match self.transform(&field.data_type)? {
+                    Borrowed(_) if field.is_nullable() => Borrowed(field),
+                    data_type => Owned(StructField {
+                        name: field.name.clone(),
+                        data_type: data_type.into_owned(),
+                        nullable: true,
+                        metadata: field.metadata.clone(),
+                    }),
+                };
+                Some(field)
+            }
+        }
+
+        let input_schema = scan_row_schema();
+        let target_schema = NullableStatsTransform
+            .transform_struct(get_log_remove_schema())
+            .ok_or_else(|| Error::generic("Failed to transform remove schema"))?
+            .into_owned();
+        let evaluation_handler = engine.evaluation_handler();
+
+        // Create the transform expression once, since it only contains literals and column references
+        let transform = Expression::transform(
+            Transform::new_top_level()
+                // deletionTimestamp
+                .with_inserted_field(
+                    Some("path"),
+                    Expression::literal(self.commit_timestamp).into(),
+                )
+                // dataChange
+                .with_inserted_field(Some("path"), Expression::literal(self.data_change).into())
+                .with_inserted_field(
+                    // extended_file_metadata
+                    Some("path"),
+                    Expression::literal(true).into(),
+                )
+                .with_inserted_field(
+                    Some("path"),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, "partitionValues"]).into(),
+                )
+                // tags
+                .with_inserted_field(
+                    Some("stats"),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, TAGS_NAME]).into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::column([FILE_CONSTANT_VALUES_NAME, BASE_ROW_ID_NAME]).into(),
+                )
+                .with_inserted_field(
+                    Some("deletionVector"),
+                    Expression::column([
+                        FILE_CONSTANT_VALUES_NAME,
+                        DEFAULT_ROW_COMMIT_VERSION_NAME,
+                    ])
+                    .into(),
+                )
+                .with_dropped_field(FILE_CONSTANT_VALUES_NAME)
+                .with_dropped_field("modificationTime"),
+        );
+        let expr = Arc::new(Expression::struct_from([transform]));
+        let file_action_eval = Arc::new(evaluation_handler.new_expression_evaluator(
+            input_schema.clone(),
+            expr.clone(),
+            target_schema.clone().into(),
+        )?);
+
+        Ok(self
+            .remove_files_metadata
+            .iter()
+            .map(move |file_metadata_batch| {
+                let updated_engine_data = file_action_eval.evaluate(file_metadata_batch.data())?;
+                FilteredEngineData::try_new(
+                    updated_engine_data,
+                    file_metadata_batch.selection_vector().to_vec(),
+                )
+            }))
+    }
 }
 
 /// WriteContext is data derived from a [`Transaction`] that can be provided to writers in order to
@@ -672,15 +894,22 @@ impl Transaction {
 /// [`Transaction`]: struct.Transaction.html
 pub struct WriteContext {
     target_dir: Url,
-    schema: SchemaRef,
+    logical_schema: SchemaRef,
+    physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
 }
 
 impl WriteContext {
-    fn new(target_dir: Url, schema: SchemaRef, logical_to_physical: ExpressionRef) -> Self {
+    fn new(
+        target_dir: Url,
+        logical_schema: SchemaRef,
+        physical_schema: SchemaRef,
+        logical_to_physical: ExpressionRef,
+    ) -> Self {
         WriteContext {
             target_dir,
-            schema,
+            logical_schema,
+            physical_schema,
             logical_to_physical,
         }
     }
@@ -689,12 +918,40 @@ impl WriteContext {
         &self.target_dir
     }
 
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
+    pub fn logical_schema(&self) -> &SchemaRef {
+        &self.logical_schema
+    }
+
+    pub fn physical_schema(&self) -> &SchemaRef {
+        &self.physical_schema
     }
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// Generate a new unique absolute URL for a deletion vector file.
+    ///
+    /// This method generates a unique file name in the table directory.
+    /// Each call to this method returns a new unique path.
+    ///
+    /// # Arguments
+    ///
+    /// * `random_prefix` - A random prefix to use for the deletion vector file name.
+    ///   Making this non-empty can help distributed load on object storage when writing/reading
+    ///   to avoid throttling.  Typically a random string fo 2-4 characters is sufficient
+    ///   for this purpose.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let write_context = transaction.get_write_context();
+    /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
+    /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
+    /// ```
+    pub fn new_deletion_vector_path(&self, random_prefix: String) -> DeletionVectorPath {
+        DeletionVectorPath::new(self.target_dir.clone(), random_prefix)
     }
 }
 
@@ -846,6 +1103,187 @@ mod tests {
             ),
         ]);
         assert_eq!(*schema, expected.into());
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url.clone())
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
+        let write_context = txn.get_write_context();
+
+        // Test with empty prefix
+        let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
+        let abs_path1 = dv_path1.absolute_path()?;
+        assert!(abs_path1.as_str().contains(url.as_str()));
+
+        // Test with non-empty prefix
+        let prefix = String::from("dv_test");
+        let dv_path2 = write_context.new_deletion_vector_path(prefix.clone());
+        let abs_path2 = dv_path2.absolute_path()?;
+        assert!(abs_path2.as_str().contains(url.as_str()));
+        assert!(abs_path2.as_str().contains(&prefix));
+
+        // Test that two paths with same prefix are different (unique UUIDs)
+        let dv_path3 = write_context.new_deletion_vector_path(prefix.clone());
+        let abs_path3 = dv_path3.absolute_path()?;
+        assert_ne!(abs_path2, abs_path3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_physical_schema_excludes_partition_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
+
+        let write_context = txn.get_write_context();
+        let logical_schema = write_context.logical_schema();
+        let physical_schema = write_context.physical_schema();
+
+        // Logical schema should include the partition column
+        assert!(
+            logical_schema.contains("letter"),
+            "Logical schema should contain partition column 'letter'"
+        );
+
+        // Physical schema should exclude the partition column
+        assert!(
+            !physical_schema.contains("letter"),
+            "Physical schema should not contain partition column 'letter' (stored in path)"
+        );
+
+        // Both should contain the non-partition columns
+        assert!(
+            logical_schema.contains("number"),
+            "Logical schema should contain data column 'number'"
+        );
+
+        assert!(
+            physical_schema.contains("number"),
+            "Physical schema should contain data column 'number'"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_materialize_partition_columns_in_write_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+
+        // Test 1: Use basic_partitioned table (without materializePartitionColumns feature)
+        // Partition columns should be excluded from the logical_to_physical expression
+        let path_without =
+            std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url_without = url::Url::from_directory_path(path_without).unwrap();
+        let snapshot_without = Snapshot::builder_for(url_without)
+            .at_version(0)
+            .build(&engine)?;
+
+        // Verify the table is partitioned by "letter" column
+        let partition_cols_without = snapshot_without
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        assert_eq!(partition_cols_without.len(), 1);
+        assert_eq!(partition_cols_without[0], "letter");
+
+        // Verify the table does not have the materializePartitionColumns feature
+        let has_feature_without = snapshot_without
+            .table_configuration()
+            .protocol()
+            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+        assert!(
+            !has_feature_without,
+            "basic_partitioned should not have materializePartitionColumns feature"
+        );
+
+        // Create a transaction and get write context
+        let txn_without = snapshot_without.transaction(Box::new(FileSystemCommitter::new()))?;
+        let write_context_without = txn_without.get_write_context();
+        let expr_without = write_context_without.logical_to_physical();
+
+        // Without materializePartitionColumns, partition column should be excluded
+        let expr_str_without = format!("{:?}", expr_without);
+        assert!(!expr_str_without.contains("letter"),
+            "Partition column 'letter' should be excluded when materializePartitionColumns is not enabled. Expression: {}",
+            expr_str_without);
+        assert!(
+            expr_str_without.contains("number"),
+            "Non-partition column 'number' should be included. Expression: {}",
+            expr_str_without
+        );
+        assert!(
+            expr_str_without.contains("a_float"),
+            "Non-partition column 'a_float' should be included. Expression: {}",
+            expr_str_without
+        );
+
+        // Test 2: Use partitioned_with_materialize_feature table (with materializePartitionColumns feature)
+        // Partition columns should be included in the logical_to_physical expression
+        let path_with = std::fs::canonicalize(PathBuf::from(
+            "./tests/data/partitioned_with_materialize_feature/",
+        ))
+        .unwrap();
+        let url_with = url::Url::from_directory_path(path_with).unwrap();
+        let snapshot_with = Snapshot::builder_for(url_with)
+            .at_version(1)
+            .build(&engine)?;
+
+        // Verify the table is partitioned by "letter" column
+        let partition_cols_with = snapshot_with
+            .table_configuration()
+            .metadata()
+            .partition_columns();
+        assert_eq!(partition_cols_with.len(), 1);
+        assert_eq!(partition_cols_with[0], "letter");
+
+        // Verify the table HAS the materializePartitionColumns feature
+        let has_feature_with = snapshot_with
+            .table_configuration()
+            .protocol()
+            .has_table_feature(&TableFeature::MaterializePartitionColumns);
+        assert!(
+            has_feature_with,
+            "partitioned_with_materialize_feature should have materializePartitionColumns feature"
+        );
+
+        // Create a transaction and get write context
+        let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()))?;
+        let write_context_with = txn_with.get_write_context();
+        let expr_with = write_context_with.logical_to_physical();
+
+        // With materializePartitionColumns, ALL columns including partition columns should be included
+        let expr_str_with = format!("{:?}", expr_with);
+        assert!(expr_str_with.contains("letter"),
+            "Partition column 'letter' should be included when materializePartitionColumns is enabled. Expression: {}",
+            expr_str_with);
+        assert!(
+            expr_str_with.contains("number"),
+            "Non-partition column 'number' should be included. Expression: {}",
+            expr_str_with
+        );
+        assert!(
+            expr_str_with.contains("a_float"),
+            "Non-partition column 'a_float' should be included. Expression: {}",
+            expr_str_with
+        );
+
         Ok(())
     }
 }

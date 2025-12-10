@@ -1,8 +1,7 @@
 //! Default Json handler implementation
 
 use std::io::BufReader;
-use std::ops::Range;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::task::Poll;
 
 use crate::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -13,7 +12,6 @@ use futures::stream::{self, BoxStream};
 use futures::{ready, StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{self, DynObjectStore, GetResultPayload, PutMode};
-use tracing::warn;
 use url::Url;
 
 use super::executor::TaskExecutor;
@@ -84,6 +82,62 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
     }
 }
 
+/// Internal async implementation of read_json_files
+async fn read_json_files_impl(
+    store: Arc<DynObjectStore>,
+    files: Vec<FileMeta>,
+    physical_schema: SchemaRef,
+    _predicate: Option<PredicateRef>,
+    batch_size: usize,
+    buffer_size: usize,
+) -> DeltaResult<BoxStream<'static, DeltaResult<Box<dyn EngineData>>>> {
+    if files.is_empty() {
+        return Ok(Box::pin(stream::empty()));
+    }
+
+    let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
+
+    // an iterator of futures that open each file
+    let file_futures = files.into_iter().map(move |file| {
+        let store = store.clone();
+        let schema = schema.clone();
+        async move { open_json_file(store, schema, batch_size, file).await }
+    });
+
+    // create a stream from that iterator which buffers up to `buffer_size` futures at a time
+    let result_stream = stream::iter(file_futures)
+        .buffered(buffer_size)
+        .try_flatten()
+        .map_ok(|record_batch| -> Box<dyn EngineData> {
+            Box::new(ArrowEngineData::new(record_batch))
+        });
+
+    Ok(Box::pin(result_stream))
+}
+
+/// Internal async implementation of write_json_file
+/// Note: for now we just buffer all the data and write it out all at once
+async fn write_json_file_impl(
+    store: Arc<DynObjectStore>,
+    path: Url,
+    buffer: Vec<u8>,
+    overwrite: bool,
+) -> DeltaResult<()> {
+    let put_mode = if overwrite {
+        PutMode::Overwrite
+    } else {
+        PutMode::Create
+    };
+
+    let path = Path::from_url_path(path.path())?;
+    let result = store.put_opts(&path, buffer.into(), put_mode.into()).await;
+    result.map_err(|e| match e {
+        object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path.to_string()),
+        e => e.into(),
+    })?;
+    Ok(())
+}
+
 impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
     fn parse_json(
         &self,
@@ -97,40 +151,17 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         &self,
         files: &[FileMeta],
         physical_schema: SchemaRef,
-        _predicate: Option<PredicateRef>,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator> {
-        if files.is_empty() {
-            return Ok(Box::new(std::iter::empty()));
-        }
-
-        let schema = Arc::new(ArrowSchema::try_from_kernel(physical_schema.as_ref())?);
-        let file_opener = JsonOpener::new(self.batch_size, schema.clone(), self.store.clone());
-
-        let (tx, rx) = mpsc::sync_channel(self.buffer_size);
-        let files = files.to_vec();
-        let buffer_size = self.buffer_size;
-
-        self.task_executor.spawn(async move {
-            // an iterator of futures that open each file
-            let file_futures = files.into_iter().map(|file| file_opener.open(file, None));
-
-            // create a stream from that iterator which buffers up to `buffer_size` futures at a time
-            let mut stream = stream::iter(file_futures)
-                .buffered(buffer_size)
-                .try_flatten()
-                .map_ok(|record_batch| -> Box<dyn EngineData> {
-                    Box::new(ArrowEngineData::new(record_batch))
-                });
-
-            // send each record batch over the channel
-            while let Some(item) = stream.next().await {
-                if tx.send(item).is_err() {
-                    warn!("read_json receiver end of channel dropped before sending completed");
-                }
-            }
-        });
-
-        Ok(Box::new(rx.into_iter()))
+        let future = read_json_files_impl(
+            self.store.clone(),
+            files.to_vec(),
+            physical_schema,
+            predicate,
+            self.batch_size,
+            self.buffer_size,
+        );
+        super::stream_future_to_iter(self.task_executor.clone(), future)
     }
 
     // note: for now we just buffer all the data and write it out all at once
@@ -140,107 +171,78 @@ impl<E: TaskExecutor> JsonHandler for DefaultJsonHandler<E> {
         data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()> {
-        let buffer = to_json_bytes(data)?;
-        let put_mode = if overwrite {
-            PutMode::Overwrite
-        } else {
-            PutMode::Create
-        };
-
-        let store = self.store.clone(); // cheap Arc
-        let path = Path::from_url_path(path.path())?;
-        let path_str = path.to_string();
-        self.task_executor
-            .block_on(async move { store.put_opts(&path, buffer.into(), put_mode.into()).await })
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { .. } => Error::FileAlreadyExists(path_str),
-                e => e.into(),
-            })?;
-        Ok(())
+        self.task_executor.block_on(write_json_file_impl(
+            self.store.clone(),
+            path.clone(),
+            to_json_bytes(data)?,
+            overwrite,
+        ))
     }
 }
 
-/// Opens JSON files and returns a stream of record batches
-#[allow(missing_debug_implementations)]
-pub struct JsonOpener {
+/// Opens a JSON file and returns a stream of record batches
+async fn open_json_file(
+    store: Arc<DynObjectStore>,
+    schema: ArrowSchemaRef,
     batch_size: usize,
-    projected_schema: ArrowSchemaRef,
-    object_store: Arc<DynObjectStore>,
-}
+    file_meta: FileMeta,
+) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
+    let path = Path::from_url_path(file_meta.location.path())?;
+    let result = store.get(&path).await?;
+    let builder = ReaderBuilder::new(schema).with_batch_size(batch_size);
+    match result.payload {
+        GetResultPayload::File(file, _) => {
+            let reader = builder.build(BufReader::new(file))?;
+            let reader = futures::stream::iter(reader).map_err(Error::from);
 
-impl JsonOpener {
-    /// Returns a [`JsonOpener`]
-    pub fn new(
-        batch_size: usize,
-        projected_schema: ArrowSchemaRef,
-        object_store: Arc<DynObjectStore>,
-    ) -> Self {
-        Self {
-            batch_size,
-            projected_schema,
-            object_store,
+            // Emit exactly one error, then stop the stream. We check seen_error BEFORE
+            // updating it so the first error passes through, but subsequent items don't.
+            // This is necessary because Arrow's Reader loops the same error indefinitely.
+            let mut seen_error = false;
+            let reader = reader.take_while(move |result| {
+                let return_this = !seen_error;
+                if result.is_err() {
+                    seen_error = true;
+                }
+                futures::future::ready(return_this)
+            });
+            Ok(reader.boxed())
         }
-    }
-}
-
-impl JsonOpener {
-    pub async fn open(
-        &self,
-        file_meta: FileMeta,
-        _: Option<Range<i64>>,
-    ) -> DeltaResult<BoxStream<'static, DeltaResult<RecordBatch>>> {
-        let store = self.object_store.clone();
-        let schema = self.projected_schema.clone();
-        let batch_size = self.batch_size;
-
-        let path = Path::from_url_path(file_meta.location.path())?;
-        match store.get(&path).await?.payload {
-            GetResultPayload::File(file, _) => {
-                let reader = ReaderBuilder::new(schema)
-                    .with_batch_size(batch_size)
-                    .build(BufReader::new(file))?;
-                Ok(futures::stream::iter(reader).map_err(Error::from).boxed())
-            }
-            GetResultPayload::Stream(s) => {
-                let mut decoder = ReaderBuilder::new(schema)
-                    .with_batch_size(batch_size)
-                    .build_decoder()?;
-
-                let mut input = s.map_err(Error::from);
-                let mut buffered = Bytes::new();
-
-                let s = futures::stream::poll_fn(move |cx| {
-                    loop {
-                        if buffered.is_empty() {
-                            buffered = match ready!(input.poll_next_unpin(cx)) {
-                                Some(Ok(b)) => b,
-                                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                                None => break,
-                            };
-                        }
-                        let read = buffered.len();
-
-                        // NB (from Decoder::decode docs):
-                        // Read JSON objects from `buf` (param), returning the number of bytes read
-                        //
-                        // This method returns once `batch_size` objects have been parsed since the
-                        // last call to [`Self::flush`], or `buf` is exhausted. Any remaining bytes
-                        // should be included in the next call to [`Self::decode`]
-                        let decoded = match decoder.decode(buffered.as_ref()) {
-                            Ok(decoded) => decoded,
-                            Err(e) => return Poll::Ready(Some(Err(e.into()))),
+        GetResultPayload::Stream(s) => {
+            let mut decoder = builder.build_decoder()?;
+            let mut input = s.map_err(Error::from);
+            let mut buffered = Bytes::new();
+            let s = futures::stream::poll_fn(move |cx| {
+                loop {
+                    if buffered.is_empty() {
+                        buffered = match ready!(input.poll_next_unpin(cx)) {
+                            Some(Ok(b)) => b,
+                            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                            None => break,
                         };
-
-                        buffered.advance(decoded);
-                        if decoded != read {
-                            break;
-                        }
                     }
 
-                    Poll::Ready(decoder.flush().map_err(Error::from).transpose())
-                });
-                Ok(s.map_err(Error::from).boxed())
-            }
+                    // NB (from Decoder::decode docs):
+                    // Read JSON objects from `buf` (param), returning the number of bytes read
+                    //
+                    // This method returns once `batch_size` objects have been parsed since the
+                    // last call to [`Self::flush`], or `buf` is exhausted. Any remaining bytes
+                    // should be included in the next call to [`Self::decode`]
+                    let decoded = match decoder.decode(buffered.as_ref()) {
+                        Ok(decoded) => decoded,
+                        Err(e) => return Poll::Ready(Some(Err(e.into()))),
+                    };
+
+                    let read = buffered.len();
+                    buffered.advance(decoded);
+                    if decoded != read {
+                        break;
+                    }
+                }
+
+                Poll::Ready(decoder.flush().map_err(Error::from).transpose())
+            });
+            Ok(s.boxed())
         }
     }
 }
@@ -248,6 +250,7 @@ impl JsonOpener {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::ops::Range;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
     use std::task::Waker;
@@ -255,7 +258,7 @@ mod tests {
     use crate::actions::get_commit_schema;
     use crate::arrow::array::{AsArray, Int32Array, RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
     use crate::engine::default::executor::tokio::{
         TokioBackgroundExecutor, TokioMultiThreadExecutor,
     };
@@ -271,6 +274,7 @@ mod tests {
         PutPayload, PutResult, Result,
     };
     use serde_json::json;
+    use tracing::info;
 
     // TODO: should just use the one from test_utils, but running into dependency issues
     fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
@@ -508,9 +512,7 @@ mod tests {
         let batch: RecordBatch = handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap()
-            .into_any()
-            .downcast::<ArrowEngineData>()
-            .map(|sd| sd.into())
+            .try_into_record_batch()
             .unwrap();
         assert_eq!(batch.column(0).len(), 1);
         let add_array = batch.column_by_name("add").unwrap().as_struct();
@@ -621,6 +623,67 @@ mod tests {
             ordered_paths.into_iter().collect_vec(),
             "Expected paths to complete in order"
         );
+    }
+
+    use crate::engine::default::DefaultEngine;
+    use crate::schema::StructType;
+    use crate::Engine;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn make_invalid_named_temp() -> (NamedTempFile, Url) {
+        let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
+        write!(temp_file, r#"this is not valid json"#).expect("Failed to write to temp file");
+        let path = temp_file.path();
+        let file_url = Url::from_file_path(path).expect("Failed to create file URL");
+
+        info!("Created temporary malformed file at: {file_url}");
+        (temp_file, file_url)
+    }
+
+    #[test]
+    fn test_read_invalid_json() -> Result<(), Box<dyn std::error::Error>> {
+        let _ = tracing_subscriber::fmt().try_init();
+        let (_temp_file1, file_url1) = make_invalid_named_temp();
+        let (_temp_file2, file_url2) = make_invalid_named_temp();
+        let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
+        let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
+        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
+
+        // Helper to check that we get expected number of errors then stream ends
+        let check_errors = |file_urls: Vec<_>, expected_errors: usize| {
+            let file_vec: Vec<_> = file_urls
+                .into_iter()
+                .map(|url| FileMeta::new(url, 1, 1))
+                .collect();
+
+            let mut iter = default_engine
+                .json_handler()
+                .read_json_files(&file_vec, schema.clone(), None)
+                .unwrap();
+
+            for _ in 0..expected_errors {
+                assert!(
+                    iter.next().unwrap().is_err(),
+                    "Read succeeded unexpectedly. The JSON should have been invalid."
+                );
+            }
+
+            assert!(
+                iter.next().is_none(),
+                "The stream should end once the read result fails"
+            );
+        };
+
+        // CASE 1: Single failing file
+        info!("\nAttempting to read single malformed JSON file...");
+        check_errors(vec![file_url1.clone()], 1);
+
+        // CASE 2: Two failing files
+        info!("\nAttempting to read two malformed JSON files...");
+        check_errors(vec![file_url1, file_url2], 2);
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

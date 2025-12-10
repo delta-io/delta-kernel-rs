@@ -1,6 +1,6 @@
 //! Validation for TIMESTAMP_NTZ feature support
 
-use super::{ReaderFeature, WriterFeature};
+use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{PrimitiveType, Schema, SchemaTransform};
 use crate::utils::require;
@@ -14,9 +14,7 @@ pub(crate) fn validate_timestamp_ntz_feature_support(
     schema: &Schema,
     protocol: &Protocol,
 ) -> DeltaResult<()> {
-    if !protocol.has_reader_feature(&ReaderFeature::TimestampWithoutTimezone)
-        || !protocol.has_writer_feature(&WriterFeature::TimestampWithoutTimezone)
-    {
+    if !protocol.has_table_feature(&TableFeature::TimestampWithoutTimezone) {
         let mut uses_timestamp_ntz = UsesTimestampNtz(false);
         let _ = uses_timestamp_ntz.transform_struct(schema);
         require!(
@@ -46,7 +44,7 @@ mod tests {
     use super::*;
     use crate::actions::Protocol;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
-    use crate::table_features::{ReaderFeature, WriterFeature};
+    use crate::table_features::TableFeature;
     use crate::utils::test_utils::assert_result_error_with_message;
 
     #[test]
@@ -65,8 +63,8 @@ mod tests {
         let protocol_with_features = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::TimestampWithoutTimezone]),
-            Some([WriterFeature::TimestampWithoutTimezone]),
+            Some([TableFeature::TimestampWithoutTimezone]),
+            Some([TableFeature::TimestampWithoutTimezone]),
         )
         .unwrap();
 

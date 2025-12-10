@@ -117,11 +117,18 @@ static ExclusiveEngineData* apply_transform(
     return data;
   }
   print_diag("  Applying transform\n");
-  SharedExpressionEvaluator* evaluator = new_expression_evaluator(
+  ExternResultHandleSharedExpressionEvaluator evaluator_res = new_expression_evaluator(
     context->engine,
     context->physical_schema, // input schema
     context->arrow_context->cur_transform,
     context->logical_schema); // output schema
+  if (evaluator_res.tag != OkHandleSharedExpressionEvaluator) {
+    print_error("Failed to create expression evaluator.", (Error*)evaluator_res.err);
+    free_error((Error*)evaluator_res.err);
+    free_engine_data(data);
+    return NULL;
+  }
+  SharedExpressionEvaluator* evaluator = evaluator_res.ok;
   ExternResultHandleExclusiveEngineData transformed_res = evaluate_expression(
     context->engine,
     &data,

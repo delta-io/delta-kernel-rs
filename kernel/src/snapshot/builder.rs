@@ -1,6 +1,7 @@
 //! Builder for creating [`Snapshot`] instances.
 use crate::log_path::LogPath;
 use crate::log_segment::LogSegment;
+use crate::metrics::MetricId;
 use crate::snapshot::SnapshotRef;
 use crate::{DeltaResult, Engine, Error, Snapshot, Version};
 
@@ -82,21 +83,41 @@ impl SnapshotBuilder {
     /// - `engine`: Implementation of [`Engine`] apis.
     pub fn build(self, engine: &dyn Engine) -> DeltaResult<SnapshotRef> {
         let log_tail = self.log_tail.into_iter().map(Into::into).collect();
+
+        let operation_id = MetricId::new();
+        let reporter = engine.get_metrics_reporter();
+
         if let Some(table_root) = self.table_root {
             let log_segment = LogSegment::for_snapshot(
                 engine.storage_handler().as_ref(),
                 table_root.join("_delta_log/")?,
                 log_tail,
                 self.version,
+                reporter.as_ref(),
+                Some(operation_id),
             )?;
-            Ok(Snapshot::try_new_from_log_segment(table_root, log_segment, engine)?.into())
+
+            Ok(Snapshot::try_new_from_log_segment(
+                table_root,
+                log_segment,
+                engine,
+                Some(operation_id),
+            )?
+            .into())
         } else {
             let existing_snapshot = self.existing_snapshot.ok_or_else(|| {
                 Error::internal_error(
                     "SnapshotBuilder should have either table_root or existing_snapshot",
                 )
             })?;
-            Snapshot::try_new_from(existing_snapshot, log_tail, engine, self.version)
+
+            Snapshot::try_new_from(
+                existing_snapshot,
+                log_tail,
+                engine,
+                self.version,
+                Some(operation_id),
+            )
         }
     }
 }
@@ -121,14 +142,11 @@ mod tests {
     ) {
         let table_root = Url::parse("memory:///test_table").unwrap();
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngine::new(
-            store.clone(),
-            Arc::new(TokioBackgroundExecutor::new()),
-        ));
+        let engine = Arc::new(DefaultEngine::new(store.clone()));
         (engine, store, table_root)
     }
 
-    fn create_table(store: &Arc<dyn ObjectStore>, _table_root: &Url) -> DeltaResult<()> {
+    async fn create_table(store: &Arc<dyn ObjectStore>, _table_root: &Url) -> DeltaResult<()> {
         let protocol = json!({
             "minReaderVersion": 3,
             "minWriterVersion": 7,
@@ -166,7 +184,7 @@ mod tests {
             .join("\n");
 
         let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 0).as_str());
-        futures::executor::block_on(async { store.put(&path, commit0_data.into()).await })?;
+        store.put(&path, commit0_data.into()).await?;
 
         // Create commit 1 with a single addFile action
         let commit1 = [json!({
@@ -189,16 +207,16 @@ mod tests {
             .join("\n");
 
         let path = object_store::path::Path::from(format!("_delta_log/{:020}.json", 1).as_str());
-        futures::executor::block_on(async { store.put(&path, commit1_data.into()).await })?;
+        store.put(&path, commit1_data.into()).await?;
 
         Ok(())
     }
 
-    #[test]
-    fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test]
+    async fn test_snapshot_builder() -> Result<(), Box<dyn std::error::Error>> {
         let (engine, store, table_root) = setup_test();
         let engine = engine.as_ref();
-        create_table(&store, &table_root)?;
+        create_table(&store, &table_root).await?;
 
         let snapshot = SnapshotBuilder::new_for(table_root.clone()).build(engine)?;
         assert_eq!(snapshot.version(), 1);

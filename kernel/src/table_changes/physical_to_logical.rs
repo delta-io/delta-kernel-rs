@@ -107,6 +107,7 @@ pub(crate) fn get_cdf_transform_expr(
         &state_info.logical_schema,
         transform_spec,
         &scan_file.partition_values,
+        state_info.column_mapping_mode,
     )?;
     partition_values.extend(parsed_values);
 
@@ -131,6 +132,7 @@ mod tests {
     use crate::scan::state_info::StateInfo;
     use crate::scan::PhysicalPredicate;
     use crate::schema::{DataType, StructField, StructType};
+    use crate::table_features::ColumnMappingMode;
     use crate::transforms::FieldTransformSpec;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -180,6 +182,7 @@ mod tests {
             physical_schema: physical_schema.into(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
+            column_mapping_mode: ColumnMappingMode::None,
         }
     }
 
@@ -397,6 +400,7 @@ mod tests {
             physical_schema: physical_schema.clone().into(),
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
+            column_mapping_mode: ColumnMappingMode::None,
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);

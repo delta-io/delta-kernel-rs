@@ -7,9 +7,10 @@
 //! the [executor] module.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
-use self::storage::parse_url_opts;
+use futures::stream::{BoxStream, StreamExt as _};
 use object_store::DynObjectStore;
 use url::Url;
 
@@ -20,11 +21,13 @@ use self::parquet::DefaultParquetHandler;
 use super::arrow_conversion::TryFromArrow as _;
 use super::arrow_data::ArrowEngineData;
 use super::arrow_expression::ArrowEvaluationHandler;
+use crate::metrics::MetricsReporter;
 use crate::schema::Schema;
 use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
+use delta_kernel_derive::internal_api;
 
 pub mod executor;
 pub mod file_stream;
@@ -33,6 +36,52 @@ pub mod json;
 pub mod parquet;
 pub mod storage;
 
+/// Converts a Stream-producing future to a synchronous iterator.
+///
+/// This method performs the initial blocking call to extract the stream from the future, and each
+/// subsequent call to `next` on the iterator translates to a blocking `stream.next()` call, using
+/// the provided `task_executor`. Buffered streams allow concurrency in the form of prefetching,
+/// because that initial call will attempt to populate the N buffer slots; every call to
+/// `stream.next()` leaves an empty slot (out of N buffer slots) that the stream immediately
+/// attempts to fill by launching another future that can make progress in the background while we
+/// block on and consume each of the N-1 entries that precede it.
+///
+/// This is an internal utility for bridging object_store's async API to
+/// Delta Kernel's synchronous handler traits.
+pub(crate) fn stream_future_to_iter<T: Send + 'static, E: executor::TaskExecutor>(
+    task_executor: Arc<E>,
+    stream_future: impl Future<Output = DeltaResult<BoxStream<'static, T>>> + Send + 'static,
+) -> DeltaResult<Box<dyn Iterator<Item = T> + Send>> {
+    Ok(Box::new(BlockingStreamIterator {
+        stream: Some(task_executor.block_on(stream_future)?),
+        task_executor,
+    }))
+}
+
+struct BlockingStreamIterator<T: Send + 'static, E: executor::TaskExecutor> {
+    stream: Option<BoxStream<'static, T>>,
+    task_executor: Arc<E>,
+}
+
+impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIterator<T, E> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Move the stream into the future so we can block on it.
+        let mut stream = self.stream.take()?;
+        let (item, stream) = self
+            .task_executor
+            .block_on(async move { (stream.next().await, stream) });
+
+        // We must not poll an exhausted stream after it returned None.
+        if item.is_some() {
+            self.stream = Some(stream);
+        }
+
+        item
+    }
+}
+
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
@@ -40,41 +89,54 @@ pub struct DefaultEngine<E: TaskExecutor> {
     json: Arc<DefaultJsonHandler<E>>,
     parquet: Arc<DefaultParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
-impl<E: TaskExecutor> DefaultEngine<E> {
-    /// Create a new [`DefaultEngine`] instance
+impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
+    /// Create a new [`DefaultEngine`] instance with the default executor.
+    ///
+    /// Uses `TokioBackgroundExecutor` as the default executor.
+    /// For custom executors, use [`DefaultEngine::new_with_executor`].
     ///
     /// # Parameters
     ///
-    /// - `table_root`: The URL of the table within storage.
-    /// - `options`: key/value pairs of options to pass to the object store.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn try_new<K, V>(
-        table_root: &Url,
-        options: impl IntoIterator<Item = (K, V)>,
-        task_executor: Arc<E>,
-    ) -> DeltaResult<Self>
-    where
-        K: AsRef<str>,
-        V: Into<String>,
-    {
-        // table root is the path of the table in the ObjectStore
-        let (object_store, _table_root) = parse_url_opts(table_root, options)?;
-        Ok(Self::new(Arc::new(object_store), task_executor))
+    /// - `object_store`: The object store to use.
+    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+        Self::new_with_executor(
+            object_store,
+            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+        )
     }
 
-    /// Create a new [`DefaultEngine`] instance
+    /// Set a metrics reporter for the engine to collect events and metrics during operations.
+    ///
+    /// # Parameters
+    ///
+    /// - `reporter`: An implementation of the [`MetricsReporter`] trait which will be used to
+    /// report metrics.
+    #[allow(dead_code)]
+    #[internal_api]
+    pub(crate) fn set_metrics_reporter(&mut self, reporter: Arc<dyn MetricsReporter>) {
+        self.metrics_reporter = Some(reporter);
+    }
+}
+
+impl<E: TaskExecutor> DefaultEngine<E> {
+    /// Create a new [`DefaultEngine`] instance with a custom executor.
+    ///
+    /// Most users should use [`DefaultEngine::new`] instead. This method is only
+    /// needed for specialized testing scenarios (e.g., multi-threaded executors).
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn new_with_executor(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
+                None,
             )),
             json: Arc::new(DefaultJsonHandler::new(
                 object_store.clone(),
@@ -86,6 +148,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
+            metrics_reporter: None,
         }
     }
 
@@ -101,12 +164,12 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     ) -> DeltaResult<Box<dyn EngineData>> {
         let transform = write_context.logical_to_physical();
         let input_schema = Schema::try_from_arrow(data.record_batch().schema())?;
-        let output_schema = write_context.schema();
+        let output_schema = write_context.physical_schema();
         let logical_to_physical_expr = self.evaluation_handler().new_expression_evaluator(
             input_schema.into(),
             transform.clone(),
             output_schema.clone().into(),
-        );
+        )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
         self.parquet
             .write_parquet_file(write_context.target_dir(), physical_data, partition_values)
@@ -129,6 +192,10 @@ impl<E: TaskExecutor> Engine for DefaultEngine<E> {
 
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler> {
         self.parquet.clone()
+    }
+
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        self.metrics_reporter.clone()
     }
 }
 
@@ -163,7 +230,6 @@ impl UrlExt for Url {
 
 #[cfg(test)]
 mod tests {
-    use super::executor::tokio::TokioBackgroundExecutor;
     use super::*;
     use crate::engine::tests::test_arrow_engine;
     use object_store::local::LocalFileSystem;
@@ -173,7 +239,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store, Arc::new(TokioBackgroundExecutor::new()));
+        let engine = DefaultEngine::new(object_store);
         test_arrow_engine(&engine, &url);
     }
 

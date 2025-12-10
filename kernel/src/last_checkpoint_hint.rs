@@ -1,6 +1,8 @@
 //! Utities for reading the `_last_checkpoint` file. Maybe this file should instead go under
 //! log_segment module since it should only really be used there? as hint for listing?
 
+use std::collections::HashMap;
+
 use crate::schema::Schema;
 use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
@@ -34,6 +36,8 @@ pub(crate) struct LastCheckpointHint {
     pub(crate) checkpoint_schema: Option<Schema>,
     /// The checksum of the last checkpoint JSON.
     pub(crate) checksum: Option<String>,
+    /// Additional metadata about the last checkpoint.
+    pub(crate) tags: Option<HashMap<String, String>>,
 }
 
 impl LastCheckpointHint {
@@ -66,5 +70,11 @@ impl LastCheckpointHint {
                 Ok(None)
             }
         }
+    }
+
+    /// Convert the LastCheckpointHint to JSON bytes
+    #[cfg(test)]
+    pub(crate) fn to_json_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("Failed to convert LastCheckpointHint to JSON bytes")
     }
 }
