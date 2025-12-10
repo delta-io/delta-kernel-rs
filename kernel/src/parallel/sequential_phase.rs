@@ -66,7 +66,7 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
     processor: P,
     // The commit reader that will be used to read the commit files
-    commit_phase: CommitReader,
+    commit_phase: Option<CommitReader>,
     // The checkpoint manifest reader that will be used to read the checkpoint manifest files.
     // If the checkpoint is single-part, this will be Some(CheckpointManifestReader).
     checkpoint_manifest_phase: Option<CheckpointManifestReader>,
@@ -75,8 +75,6 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     // Checkpoint parts for potential parallel phase processing
     checkpoint_parts: Vec<FileMeta>,
 }
-
-unsafe impl<P: LogReplayProcessor> Send for SequentialPhase<P> {}
 
 /// Result of sequential log replay processing.
 #[allow(unused)]
@@ -100,8 +98,11 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<Self> {
-        let commit_phase =
-            CommitReader::try_new(engine.as_ref(), log_segment, get_commit_schema().clone())?;
+        let commit_phase = Some(CommitReader::try_new(
+            engine.as_ref(),
+            log_segment,
+            get_commit_schema().clone(),
+        )?);
 
         // Concurrently start reading the checkpoint manifest. Only create a checkpoint manifest
         // reader if the checkpoint is single-part.
@@ -181,16 +182,19 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
     fn next(&mut self) -> Option<Self::Item> {
         let next = self
             .commit_phase
-            .next()
-            .or_else(|| self.checkpoint_manifest_phase.as_mut()?.next());
+            .as_mut()
+            .and_then(|commit_phase| commit_phase.next())
+            .or_else(|| {
+                self.commit_phase = None;
+                self.checkpoint_manifest_phase.as_mut()?.next()
+            });
 
-        if next.is_none() {
+        let Some(result) = next else {
             self.is_finished = true;
-        }
+            return None;
+        };
 
-        next.map(|batch_res| {
-            batch_res.and_then(|batch| self.processor.process_actions_batch(batch))
-        })
+        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
     }
 }
 
