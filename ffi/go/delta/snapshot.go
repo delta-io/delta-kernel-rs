@@ -125,6 +125,11 @@ func (s *Snapshot) Version() uint64 {
 	return uint64(C.version(s.handle))
 }
 
+// Engine returns the engine handle for this snapshot
+func (s *Snapshot) Engine() C.HandleSharedExternEngine {
+	return s.engine
+}
+
 // TableRoot returns the root path of the Delta table
 func (s *Snapshot) TableRoot() (string, error) {
 	// Call our C wrapper that uses the allocator

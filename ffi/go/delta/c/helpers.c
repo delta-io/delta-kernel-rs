@@ -225,3 +225,23 @@ void c_visit_decimal(void* data, uintptr_t sibling_list_id, struct KernelStringS
     uintptr_t handle = *(uintptr_t*)data;
     goVisitDecimal(handle, sibling_list_id, name, is_nullable, precision, scale);
 }
+
+// Scan metadata iterator helpers
+
+struct EngineError* get_err_scan_metadata_iter(struct ExternResultHandleSharedScanMetadataIterator result) {
+    return result.err;
+}
+
+HandleSharedScanMetadataIterator get_ok_scan_metadata_iter(struct ExternResultHandleSharedScanMetadataIterator result) {
+    return result.ok;
+}
+
+struct EngineError* get_err_bool(struct ExternResultbool result) {
+    return result.err;
+}
+
+bool get_ok_bool(struct ExternResultbool result) {
+    return result.ok;
+}
+
+// Scan metadata visitor C wrappers are in scan_helpers.c

@@ -74,3 +74,9 @@ void c_visit_binary(void* data, uintptr_t sibling_list_id, struct KernelStringSl
 void c_visit_date(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);
 void c_visit_timestamp(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);
 void c_visit_timestamp_ntz(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);
+
+// Scan metadata iterator helpers
+struct EngineError* get_err_scan_metadata_iter(struct ExternResultHandleSharedScanMetadataIterator result);
+HandleSharedScanMetadataIterator get_ok_scan_metadata_iter(struct ExternResultHandleSharedScanMetadataIterator result);
+struct EngineError* get_err_bool(struct ExternResultbool result);
+bool get_ok_bool(struct ExternResultbool result);
