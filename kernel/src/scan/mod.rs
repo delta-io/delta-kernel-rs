@@ -616,12 +616,16 @@ impl Scan {
 
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
+        //
+        // We use read_actions_with_checkpoint_fallback to try the stats_parsed schema first,
+        // falling back to the standard checkpoint schema if reading fails.
         self.snapshot
             .log_segment()
-            .read_actions_with_projected_checkpoint_actions(
+            .read_actions_with_checkpoint_fallback(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
+                CHECKPOINT_READ_SCHEMA.clone(),
                 None,
             )
     }

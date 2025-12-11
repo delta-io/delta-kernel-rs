@@ -329,6 +329,31 @@ impl LogSegment {
         checkpoint_read_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        self.read_actions_with_checkpoint_fallback(
+            engine,
+            commit_read_schema,
+            checkpoint_read_schema.clone(),
+            checkpoint_read_schema,
+            meta_predicate,
+        )
+    }
+
+    /// Reads actions from commits and checkpoints, with fallback schema support for checkpoints.
+    ///
+    /// This method attempts to read checkpoint files using `checkpoint_read_schema`. If reading
+    /// fails (e.g., due to schema incompatibility), it retries with `fallback_checkpoint_schema`.
+    /// This is useful for optimistically reading checkpoints with extended schemas (like stats_parsed)
+    /// while gracefully falling back to the standard schema if the extended columns don't exist
+    /// or have incompatible types.
+    #[internal_api]
+    pub(crate) fn read_actions_with_checkpoint_fallback(
+        &self,
+        engine: &dyn Engine,
+        commit_read_schema: SchemaRef,
+        checkpoint_read_schema: SchemaRef,
+        fallback_checkpoint_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
         let commits_and_compactions = self.find_commit_cover();
         let commit_stream = engine
@@ -340,8 +365,12 @@ impl LogSegment {
             )?
             .map_ok(|batch| ActionsBatch::new(batch, true));
 
-        let checkpoint_stream =
-            self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
+        let checkpoint_stream = self.create_checkpoint_stream_with_fallback(
+            engine,
+            checkpoint_read_schema,
+            fallback_checkpoint_schema,
+            meta_predicate,
+        )?;
 
         Ok(commit_stream.chain(checkpoint_stream))
     }
@@ -403,6 +432,45 @@ impl LogSegment {
         }
         selected_files.reverse();
         selected_files
+    }
+
+    /// Creates a checkpoint stream with fallback schema support.
+    ///
+    /// Attempts to read checkpoint files using `primary_schema`. If reading the first batch
+    /// fails (e.g., schema incompatibility), retries with `fallback_schema`.
+    fn create_checkpoint_stream_with_fallback(
+        &self,
+        engine: &dyn Engine,
+        primary_schema: SchemaRef,
+        fallback_schema: SchemaRef,
+        meta_predicate: Option<PredicateRef>,
+    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
+        // Try to create stream with primary schema
+        let mut primary_iter =
+            self.create_checkpoint_stream(engine, primary_schema, meta_predicate.clone())?;
+
+        // Try to get first batch to detect schema errors early
+        match primary_iter.next() {
+            Some(Ok(first_batch)) => {
+                // Primary schema works - chain first batch with rest
+                let iter = std::iter::once(Ok(first_batch)).chain(primary_iter);
+                Ok(Box::new(iter))
+            }
+            Some(Err(e)) => {
+                // Error reading with primary schema - retry with fallback
+                debug!(
+                    "Checkpoint read failed with primary schema, retrying with fallback: {}",
+                    e
+                );
+                let fallback_iter =
+                    self.create_checkpoint_stream(engine, fallback_schema, meta_predicate)?;
+                Ok(Box::new(fallback_iter))
+            }
+            None => {
+                // No checkpoint data
+                Ok(Box::new(std::iter::empty()))
+            }
+        }
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.

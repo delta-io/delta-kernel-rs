@@ -199,18 +199,6 @@ pub(crate) fn add_schema_with_stats_parsed(stats_schema: &StructType) -> StructT
     StructType::new_unchecked(fields)
 }
 
-/// Returns the log schema (wrapped in "add" field) with `stats_parsed`.
-///
-/// This is the schema to use when reading checkpoints that may contain
-/// structured statistics in the `add.stats_parsed` field.
-#[allow(dead_code)] // Will be used in data skipping integration
-pub(crate) fn get_log_add_schema_with_stats_parsed(stats_schema: &StructType) -> SchemaRef {
-    Arc::new(StructType::new_unchecked([StructField::nullable(
-        ADD_NAME,
-        add_schema_with_stats_parsed(stats_schema),
-    )]))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[cfg_attr(
     any(test, feature = "internal-api"),
