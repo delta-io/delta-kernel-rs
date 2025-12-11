@@ -9,10 +9,10 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
 use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
+use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -57,15 +57,6 @@ struct ScanFile {
     size: i64,
     transform: Option<ExpressionRef>,
     dv_info: DvInfo,
-}
-
-// we know we're using arrow under the hood, so cast an EngineData into something we can work with
-fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
 }
 
 // This is the callback that will be called for each valid scan row
@@ -231,7 +222,7 @@ fn do_work(
             )
             .unwrap();
 
-            let record_batch = to_arrow(logical).unwrap();
+            let record_batch = logical.try_into_record_batch().unwrap();
 
             // need to split the dv_mask. what's left in dv_mask covers this result, and rest
             // will cover the following results
