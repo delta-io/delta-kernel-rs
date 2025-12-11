@@ -57,15 +57,42 @@ func main() {
 	}
 	fmt.Println()
 
-	// Get and print the schema (placeholder for now)
-	schema, err := snapshot.Schema()
+	// Create a scan
+	fmt.Println("Creating scan...")
+	scan, err := snapshot.Scan()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting schema: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error creating scan: %v\n", err)
+		os.Exit(1)
+	}
+	defer scan.Close()
+
+	// Get scan table root
+	scanTableRoot, err := scan.TableRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting scan table root: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Scan table root: %s\n\n", scanTableRoot)
+
+	// Get logical schema
+	logicalSchema, err := scan.LogicalSchema()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting logical schema: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Schema:")
-	fmt.Print(schema.String())
+	fmt.Println("Logical Schema:")
+	fmt.Print(logicalSchema.String())
 
-	fmt.Println("\nNote: Full schema extraction will be implemented next.")
+	// Get physical schema
+	physicalSchema, err := scan.PhysicalSchema()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting physical schema: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("\nPhysical Schema:")
+	fmt.Print(physicalSchema.String())
+
+	fmt.Println("\nNote: Full schema extraction via visitor pattern will be implemented next.")
 }

@@ -36,10 +36,16 @@ Table root: file:///Users/andrei.tserakhau/RustroverProjects/delta-kernel-rs/tes
 
 Table has no partition columns
 
-Schema:
-- schema_extraction: not_yet_implemented
+Creating scan...
+Scan table root: file:///Users/andrei.tserakhau/RustroverProjects/delta-kernel-rs/test_table/
 
-Note: Full schema extraction will be implemented next.
+Logical Schema:
+- logical_schema: visitor_pattern_not_implemented
+
+Physical Schema:
+- physical_schema: visitor_pattern_not_implemented
+
+Note: Full schema extraction via visitor pattern will be implemented next.
 ```
 
 **With partitioned table**:
@@ -56,10 +62,16 @@ Partition columns:
   - date
   - data
 
-Schema:
-- schema_extraction: not_yet_implemented
+Creating scan...
+Scan table root: file:///Users/andrei.tserakhau/RustroverProjects/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/multi_partitioned/delta/
 
-Note: Full schema extraction will be implemented next.
+Logical Schema:
+- logical_schema: visitor_pattern_not_implemented
+
+Physical Schema:
+- physical_schema: visitor_pattern_not_implemented
+
+Note: Full schema extraction via visitor pattern will be implemented next.
 ```
 
 ## Structure
@@ -68,7 +80,8 @@ Note: Full schema extraction will be implemented next.
 ffi/go/
 ├── delta/
 │   ├── schema.go          # Schema types (basic implementation)
-│   └── snapshot.go        # Snapshot operations (✅ WORKING!)
+│   ├── snapshot.go        # Snapshot operations (✅ WORKING!)
+│   └── scan.go           # Scan operations (✅ WORKING!)
 ├── examples/
 │   └── describe_schema.go # Working example
 ├── go.mod
@@ -87,9 +100,12 @@ ffi/go/
 2. **Version Retrieval**: `snapshot.Version()`
 3. **Table Root Path**: `snapshot.TableRoot()` - returns the absolute path to the table
 4. **Partition Columns**: `snapshot.PartitionColumns()` - returns list of partition column names
-5. **Engine Management**: Automatic default engine creation
-6. **Resource Cleanup**: `snapshot.Close()`
-7. **Error Handling**: Basic error propagation from FFI
+5. **Scan Creation**: `snapshot.Scan()` - creates a scan operation for reading table data
+6. **Schema Access**: `scan.LogicalSchema()` and `scan.PhysicalSchema()` - get logical/physical schemas (handles retrieved, visitor pattern pending)
+7. **Scan Table Root**: `scan.TableRoot()` - get table root from scan
+8. **Engine Management**: Automatic default engine creation
+9. **Resource Cleanup**: `snapshot.Close()` and `scan.Close()`
+10. **Error Handling**: Basic error propagation from FFI
 
 ## Implementation Details
 
@@ -199,8 +215,29 @@ func main() {
     }
     fmt.Printf("Partition columns: %v\n", partitions)
 
-    // TODO: Get schema (visitor pattern not yet implemented)
-    // schema, err := snapshot.Schema()
+    // Create a scan
+    scan, err := snapshot.Scan()
+    if err != nil {
+        panic(err)
+    }
+    defer scan.Close()
+
+    // Get logical schema
+    logicalSchema, err := scan.LogicalSchema()
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("Logical schema: %v\n", logicalSchema)
+
+    // Get physical schema
+    physicalSchema, err := scan.PhysicalSchema()
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("Physical schema: %v\n", physicalSchema)
+
+    // TODO: Implement schema visitor pattern to extract actual field information
+    // TODO: Implement scan metadata iterator to read data files
 }
 ```
 
@@ -214,7 +251,9 @@ We now have a **working Go CGO wrapper** that:
 - ✅ Retrieves version information
 - ✅ Gets table root paths
 - ✅ Lists partition columns
+- ✅ Creates scan operations
+- ✅ Retrieves logical and physical schema handles
 - ✅ Manages resources properly with proper cleanup
 - ✅ Uses C helper functions for complex FFI patterns (allocators, iterators)
 
-This provides a solid foundation for implementing the remaining Delta Kernel functionality like schema extraction, scans, and data reading!
+This provides a solid foundation for implementing the remaining Delta Kernel functionality like schema visitor pattern for field extraction, scan metadata iteration, and actual data reading!
