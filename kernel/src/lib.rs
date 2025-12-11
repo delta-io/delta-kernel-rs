@@ -619,6 +619,16 @@ pub trait JsonHandler: AsAny {
     ) -> DeltaResult<()>;
 }
 
+/// Reserved field IDs for metadata columns in Delta tables.
+///
+/// These field IDs are reserved and should not be used for regular table columns.
+/// They are used to provide file-level metadata as virtual columns during reads.
+pub mod reserved_field_ids {
+    /// Reserved field ID for the file name metadata column (`_file`).
+    /// This column provides the name of the Parquet file that contains each row.
+    pub const FILE_NAME: i64 = 2147483646;
+}
+
 /// Metadata from a Parquet file footer.
 ///
 /// This struct contains metadata extracted from a Parquet file's footer, including the schema.
@@ -652,11 +662,65 @@ pub trait ParquetHandler: AsAny {
     /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or no matching parquet field ID is found,
     ///    fall back to matching by column name
     ///
+    /// # Metadata Columns
+    ///
+    /// The ParquetHandler must support virtual metadata columns that provide additional information
+    /// about each row. These columns are not stored in the Parquet file but are generated at read time.
+    ///
+    /// ## Row Index Column
+    ///
+    /// When a column in `physical_schema` is marked as a row index metadata column (via
+    /// [`StructField::create_metadata_column`] with [`schema::MetadataColumnSpec::RowIndex`]), the
+    /// ParquetHandler must populate it with the 0-based row position within the Parquet file:
+    ///
+    /// - **Column name**: User-specified (commonly `"row_index"` or `"_metadata.row_index"`)
+    /// - **Type**: `LONG` (non-nullable)
+    /// - **Values**: Sequential integers starting at 0 for each file
+    /// - **Use case**: Track row positions for downstream processing, or internally used to compute Row IDs
+    ///
+    /// Example: A file with 5 rows would have row_index values `[0, 1, 2, 3, 4]`.
+    ///
+    /// ## File Name Column (Reserved Field ID)
+    ///
+    /// When a column in `physical_schema` has the reserved field ID
+    /// [`reserved_field_ids::FILE_NAME`] (2147483646), the ParquetHandler must populate it
+    /// with the file path/name:
+    ///
+    /// - **Column name**: `"_file"`
+    /// - **Type**: `STRING` (non-nullable)
+    /// - **Field ID**: 2147483646 (reserved)
+    /// - **Values**: The file path/URL (e.g., `"s3://bucket/path/file.parquet"`)
+    /// - **Use case**: Track which file each row came from in multi-file reads
+    ///
+    /// Example: All rows from the same file would have the same `_file` value.
+    ///
+    /// ## Metadata Column Examples
+    ///
+    /// ```rust,ignore
+    /// use delta_kernel::schema::{StructType, StructField, DataType, MetadataColumnSpec};
+    ///
+    /// // Example 1: Schema with row_index metadata column
+    /// let schema_with_row_index = StructType::try_new([
+    ///     StructField::nullable("id", DataType::INTEGER),
+    ///     StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+    ///     StructField::nullable("value", DataType::STRING),
+    /// ])?;
+    ///
+    /// // Example 2: Schema with _file metadata column (using reserved field ID)
+    /// let schema_with_file_path = StructType::try_new([
+    ///     StructField::nullable("id", DataType::INTEGER),
+    ///     StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+    ///     StructField::nullable("value", DataType::STRING),
+    /// ])?;
+    /// ```
+    ///
+    /// ---
+    ///
     ///  If no matching Parquet column is found, `NULL` values are returned
     ///  for nullable columns in `physical_schema`. For non-nullable columns, an error is returned.
     ///
     ///
-    /// ## Examples
+    /// ## Column Matching Examples
     ///
     /// Consider a `physical_schema` with the following fields:
     /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"parquet.field.id": 1`
