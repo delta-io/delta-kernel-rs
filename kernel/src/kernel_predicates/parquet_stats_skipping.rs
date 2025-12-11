@@ -1,6 +1,7 @@
 //! An implementation of data skipping that leverages parquet stats from the file footer.
 use crate::expressions::{
-    BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef, Scalar,
+    BinaryPredicateOp, ColumnName, Expression, JunctionPredicateOp, OpaquePredicateOpRef,
+    PhysicalScalar, Scalar,
 };
 use crate::kernel_predicates::{DataSkippingPredicateEvaluator, KernelPredicateEvaluatorDefaults};
 use crate::schema::DataType;
@@ -73,8 +74,8 @@ impl<T: ParquetStatsProvider> DataSkippingPredicateEvaluator for T {
     // data_skipping.rs, except it uses `Scalar` instead of `Expression` and `Predicate`.
     fn eval_pred_is_null(&self, col: &ColumnName, inverted: bool) -> Option<bool> {
         let safe_to_skip = match inverted {
-            true => self.get_rowcount_stat()?, // all-null
-            false => Scalar::from(0i64),       // no-null
+            true => PhysicalScalar(self.get_rowcount_stat()?), // all-null
+            false => PhysicalScalar(Scalar::from(0i64)),       // no-null
         };
         Some(self.get_nullcount_stat(col)? != safe_to_skip)
     }

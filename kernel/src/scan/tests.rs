@@ -7,7 +7,9 @@ use crate::arrow::compute::filter_record_batch;
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
-use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+use crate::expressions::{
+    column_expr, column_pred, Expression as Expr, PhysicalScalar, Predicate as Pred,
+};
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, ExpressionRef, Snapshot};
 
@@ -371,7 +373,7 @@ fn test_get_partition_value() {
             &DataType::Primitive(data_type.clone()),
         )
         .unwrap();
-        assert_eq!(value, *expected);
+        assert_eq!(value, PhysicalScalar(expected.clone()));
     }
 }
 

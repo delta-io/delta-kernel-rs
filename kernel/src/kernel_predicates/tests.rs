@@ -46,6 +46,38 @@ macro_rules! expect_eq {
     };
 }
 
+/// Helper trait for physical equality comparison of Option<Scalar> in test assertions
+trait PhysicalEq {
+    fn physical_eq_option(&self, other: &Self) -> bool;
+}
+
+impl PhysicalEq for Option<Scalar> {
+    fn physical_eq_option(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Some(a), Some(b)) => a.physical_eq(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Assert physical equality for Option<Scalar> values
+macro_rules! assert_physical_eq {
+    ( $left:expr, $right:expr, $arg:expr ) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                assert!(
+                    left_val.physical_eq_option(right_val),
+                    "assertion failed: `(left == right)` (physical comparison): {}\n  left: `{:?}`,\n right: `{:?}`",
+                    $arg,
+                    left_val,
+                    right_val
+                );
+            }
+        }
+    };
+}
+
 impl ResolveColumnAsScalar for Scalar {
     fn resolve_column(&self, _col: &ColumnName) -> Option<Scalar> {
         Some(self.clone())
@@ -754,12 +786,12 @@ fn test_eval_opaque_simple() {
 
     // Test direct expression and predicate eval, and indirect data skipping
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(1));
-    assert_eq!(filter.eval_expr(&expr), Some(Scalar::from(true)), "x < 10");
+    assert_physical_eq!(filter.eval_expr(&expr), Some(Scalar::from(true)), "x < 10");
     assert_eq!(filter.eval(&pred), Some(true), "x < 10");
     assert_eq!(filter.eval(&skipping_pred), Some(true), "x < 10");
 
     let filter = DefaultKernelPredicateEvaluator::from(Scalar::from(100));
-    assert_eq!(filter.eval_expr(&expr), Some(Scalar::from(false)), "x < 10");
+    assert_physical_eq!(filter.eval_expr(&expr), Some(Scalar::from(false)), "x < 10");
     assert_eq!(filter.eval(&pred), Some(false), "x < 10");
     assert_eq!(filter.eval(&skipping_pred), Some(false), "x < 10");
 
