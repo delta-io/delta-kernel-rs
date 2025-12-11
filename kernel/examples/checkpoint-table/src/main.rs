@@ -45,7 +45,7 @@ async fn main() -> ExitCode {
 async fn write_data<W: AsyncFileWriter>(
     first_batch: &RecordBatch,
     batch_iter: &mut ActionReconciliationIterator,
-    parquet_writer: &mut AsyncArrowWriter<W>
+    parquet_writer: &mut AsyncArrowWriter<W>,
 ) -> DeltaResult<()> {
     parquet_writer.write(first_batch).await?;
     for data_res in batch_iter {
@@ -84,7 +84,8 @@ async fn try_main() -> DeltaResult<()> {
     if cli.unsafe_i_know_what_im_doing {
         let path = object_store::path::Path::from_url_path(checkpoint_path.path())?;
         let object_writer = ParquetObjectWriter::new(store.clone(), path.clone());
-        let mut parquet_writer = AsyncArrowWriter::try_new(object_writer, first_batch.schema(), None)?;
+        let mut parquet_writer =
+            AsyncArrowWriter::try_new(object_writer, first_batch.schema(), None)?;
         write_data(&first_batch, batch_iter, &mut parquet_writer).await?;
         parquet_writer.close().await?;
         let metadata = store.head(&path).await?;
@@ -97,25 +98,24 @@ async fn try_main() -> DeltaResult<()> {
         println!("Table checkpointed");
     } else {
         println!("--unsafe-i-know-what-im-doing not specified, just doing a dry run");
-        let mut parquet_writer = AsyncArrowWriter::try_new(BlackholeWriter::new(), first_batch.schema(), None)?;
+        let mut parquet_writer =
+            AsyncArrowWriter::try_new(BlackholeWriter::default(), first_batch.schema(), None)?;
         write_data(&first_batch, batch_iter, &mut parquet_writer).await?;
         parquet_writer.finish().await?;
         let blackhole_writer = parquet_writer.into_inner();
-        println!("Would have written a checkpoint as:\n\tpath: {checkpoint_path}\n\tsize: {}", blackhole_writer.len);
+        println!(
+            "Would have written a checkpoint as:\n\tpath: {checkpoint_path}\n\tsize: {}",
+            blackhole_writer.len
+        );
     }
     Ok(())
 }
 
 /// Simple struct to allow us to go through the motions of writing the data without actually writing
 /// it anywhere. Verifies that the actual flow of data does work.
+#[derive(Default)]
 pub struct BlackholeWriter {
     len: u64,
-}
-
-impl BlackholeWriter {
-    pub fn new() -> Self {
-        Self { len: 0 }
-    }
 }
 
 impl AsyncFileWriter for BlackholeWriter {
