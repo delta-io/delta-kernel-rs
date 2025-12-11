@@ -24,7 +24,7 @@ struct Cli {
     location_args: LocationArgs,
 
     /// This program doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.  As such
-    /// you need to pass --unsafe_i_know_what_im_doing as an argument to get this to actually write
+    /// you need to pass --unsafe-i-know-what-im-doing as an argument to get this to actually write
     /// the checkpoint
     #[arg(long)]
     unsafe_i_know_what_im_doing: bool,
