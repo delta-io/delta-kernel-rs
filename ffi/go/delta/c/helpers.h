@@ -37,3 +37,20 @@ typedef struct {
 void collect_string_visitor(void* context, struct KernelStringSlice slice);
 StringArray* get_partition_columns_helper(HandleSharedSnapshot snapshot);
 void free_string_array(StringArray* arr);
+
+// Schema visitor C wrappers (call back to Go)
+extern uintptr_t goMakeFieldList(uintptr_t handle, uintptr_t reserve);
+extern void goVisitStruct(uintptr_t handle, uintptr_t siblingListID, struct KernelStringSlice name, bool nullable, uintptr_t childListID);
+extern void goVisitString(uintptr_t handle, uintptr_t siblingListID, struct KernelStringSlice name, bool nullable);
+extern void goVisitLong(uintptr_t handle, uintptr_t siblingListID, struct KernelStringSlice name, bool nullable);
+extern void goVisitInteger(uintptr_t handle, uintptr_t siblingListID, struct KernelStringSlice name, bool nullable);
+extern void goVisitBoolean(uintptr_t handle, uintptr_t siblingListID, struct KernelStringSlice name, bool nullable);
+extern void goVisitDouble(uintptr_t handle, uintptr_t siblingListID, struct KernelStringSlice name, bool nullable);
+
+uintptr_t c_make_field_list(void* data, uintptr_t reserve);
+void c_visit_struct(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata, uintptr_t child_list_id);
+void c_visit_string(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);
+void c_visit_long(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);
+void c_visit_integer(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);
+void c_visit_boolean(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);
+void c_visit_double(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name, bool is_nullable, const struct CStringMap* metadata);

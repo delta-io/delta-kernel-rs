@@ -47,28 +47,42 @@ func (s *Snapshot) Scan() (*Scan, error) {
 
 // LogicalSchema returns the logical schema of the scan
 // The logical schema represents the user-facing schema with all transformations applied
-// TODO: Implement proper schema extraction via visitor pattern
 func (sc *Scan) LogicalSchema() (*Schema, error) {
-	// For now, return placeholder
-	// Eventually this will use the visitor pattern to extract fields from sc.logicalSchema
-	return &Schema{
-		Fields: []*Field{
-			{Name: "logical_schema", DataType: "visitor_pattern_not_implemented", Nullable: true},
-		},
-	}, nil
+	if sc.logicalSchema == nil {
+		return nil, fmt.Errorf("logical schema not available")
+	}
+
+	// Create a schema builder visitor
+	builder := NewSchemaBuilder()
+
+	// Visit the schema to extract fields
+	rootListID, err := visitSchemaWithVisitor(sc.logicalSchema, builder)
+	if err != nil {
+		return nil, fmt.Errorf("failed to visit logical schema: %w", err)
+	}
+
+	// Build and return the schema
+	return builder.Build(rootListID), nil
 }
 
 // PhysicalSchema returns the physical schema of the scan
 // The physical schema represents the actual schema in the data files
-// TODO: Implement proper schema extraction via visitor pattern
 func (sc *Scan) PhysicalSchema() (*Schema, error) {
-	// For now, return placeholder
-	// Eventually this will use the visitor pattern to extract fields from sc.physicalSchema
-	return &Schema{
-		Fields: []*Field{
-			{Name: "physical_schema", DataType: "visitor_pattern_not_implemented", Nullable: true},
-		},
-	}, nil
+	if sc.physicalSchema == nil {
+		return nil, fmt.Errorf("physical schema not available")
+	}
+
+	// Create a schema builder visitor
+	builder := NewSchemaBuilder()
+
+	// Visit the schema to extract fields
+	rootListID, err := visitSchemaWithVisitor(sc.physicalSchema, builder)
+	if err != nil {
+		return nil, fmt.Errorf("failed to visit physical schema: %w", err)
+	}
+
+	// Build and return the schema
+	return builder.Build(rootListID), nil
 }
 
 // TableRoot returns the root path of the table for this scan

@@ -106,3 +106,52 @@ void free_string_array(StringArray* arr) {
         free(arr);
     }
 }
+
+// Schema visitor C wrappers - extract handle and call Go callbacks
+
+uintptr_t c_make_field_list(void* data, uintptr_t reserve) {
+    uintptr_t handle = *(uintptr_t*)data;
+    return goMakeFieldList(handle, reserve);
+}
+
+void c_visit_struct(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                    bool is_nullable, const struct CStringMap* metadata, uintptr_t child_list_id) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitStruct(handle, sibling_list_id, name, is_nullable, child_list_id);
+}
+
+void c_visit_string(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                    bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitString(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_long(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                  bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitLong(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_integer(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                     bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitInteger(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_boolean(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                     bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitBoolean(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_double(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                    bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitDouble(handle, sibling_list_id, name, is_nullable);
+}
