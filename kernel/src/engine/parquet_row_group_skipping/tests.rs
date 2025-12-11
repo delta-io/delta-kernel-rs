@@ -1,40 +1,9 @@
 use super::*;
-use crate::expressions::{column_name, column_pred, Scalar};
+use crate::expressions::{column_name, column_pred};
 use crate::kernel_predicates::DataSkippingPredicateEvaluator as _;
 use crate::parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use crate::Predicate;
 use std::fs::File;
-
-/// Helper trait for physical equality comparison of Option<Scalar> in test assertions
-trait PhysicalEq {
-    fn physical_eq_option(&self, other: &Self) -> bool;
-}
-
-impl PhysicalEq for Option<Scalar> {
-    fn physical_eq_option(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Some(a), Some(b)) => a.physical_eq(b),
-            (None, None) => true,
-            _ => false,
-        }
-    }
-}
-
-/// Assert physical equality for Option<Scalar> values
-macro_rules! assert_physical_eq {
-    ( $left:expr, $right:expr ) => {
-        match (&$left, &$right) {
-            (left_val, right_val) => {
-                assert!(
-                    left_val.physical_eq_option(right_val),
-                    "assertion failed: `(left == right)` (physical comparison)\n  left: `{:?}`,\n right: `{:?}`",
-                    left_val,
-                    right_val
-                );
-            }
-        }
-    };
-}
 
 /// Performs an exhaustive set of reads against a specially crafted parquet file.
 ///
@@ -90,25 +59,25 @@ fn test_get_stat_values() {
     ]);
     let filter = RowGroupFilter::new(metadata.metadata().row_group(0), &columns);
 
-    assert_physical_eq!(filter.get_rowcount_stat(), Some(5i64.into()));
+    assert_eq!(filter.get_rowcount_stat(), Some(5i64.into()));
 
     // Only the BOOL column has any nulls
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_nullcount_stat(&column_name!("bool")),
         Some(3i64.into())
     );
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_nullcount_stat(&column_name!("varlen.utf8")),
         Some(0i64.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("varlen.utf8"), &DataType::STRING),
         Some("a".into())
     );
 
     // CHEAT: Interpret the decimal128 column's fixed-length binary as a string
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal128"),
             &DataType::STRING
@@ -116,60 +85,60 @@ fn test_get_stat_values() {
         Some("\0\0\0\0\0\0\0\0\0\0\0\0+x".into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.ints.int64"), &DataType::LONG),
         Some(1000000000i64.into())
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.ints.int32"), &DataType::LONG),
         Some(1000000i64.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.ints.int32"), &DataType::INTEGER),
         Some(1000000i32.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.ints.int16"), &DataType::SHORT),
         Some(1000i16.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.ints.int8"), &DataType::BYTE),
         Some(0i8.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.floats.float64"), &DataType::DOUBLE),
         Some(1147f64.into())
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.floats.float32"), &DataType::DOUBLE),
         Some(139f64.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("numeric.floats.float32"), &DataType::FLOAT),
         Some(139f32.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("bool"), &DataType::BOOLEAN),
         Some(false.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("varlen.binary"), &DataType::BINARY),
         Some([].as_slice().into())
     );
 
     // CHEAT: Interpret the decimal128 column's fixed-len array as binary
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal128"),
             &DataType::BINARY
@@ -181,7 +150,7 @@ fn test_get_stat_values() {
         )
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
@@ -189,7 +158,7 @@ fn test_get_stat_values() {
         Some(Scalar::decimal(11032, 8, 3).unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
@@ -198,7 +167,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
@@ -206,7 +175,7 @@ fn test_get_stat_values() {
         Some(Scalar::decimal(11032, 16, 3).unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
@@ -215,7 +184,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
@@ -224,7 +193,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
@@ -232,19 +201,19 @@ fn test_get_stat_values() {
         Some(Scalar::decimal(11032, 32, 3).unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("chrono.date32"), &DataType::DATE),
         Some(PrimitiveType::Date.parse_scalar("1971-01-01").unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("chrono.timestamp"), &DataType::TIMESTAMP),
         None // Timestamp defaults to 96-bit, which doesn't get stats
     );
 
     // Read a random column as Variant. The actual read does not need to be performed, as stats on
     // Variant should always return None.
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("chrono.date32"),
             &DataType::unshredded_variant()
@@ -253,7 +222,7 @@ fn test_get_stat_values() {
     );
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
         Some(
             PrimitiveType::Timestamp
@@ -262,7 +231,7 @@ fn test_get_stat_values() {
         )
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(
             &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP_NTZ
@@ -275,7 +244,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_min_stat(&column_name!("chrono.date32"), &DataType::TIMESTAMP_NTZ),
         Some(
             PrimitiveType::TimestampNtz
@@ -284,13 +253,13 @@ fn test_get_stat_values() {
         )
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("varlen.utf8"), &DataType::STRING),
         Some("e".into())
     );
 
     // CHEAT: Interpret the decimal128 column's fixed-length binary as a string
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal128"),
             &DataType::STRING
@@ -298,60 +267,60 @@ fn test_get_stat_values() {
         Some("\0\0\0\0\0\0\0\0\0\0\0\0;\u{18}".into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.ints.int64"), &DataType::LONG),
         Some(1000000004i64.into())
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.ints.int32"), &DataType::LONG),
         Some(1000004i64.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.ints.int32"), &DataType::INTEGER),
         Some(1000004.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.ints.int16"), &DataType::SHORT),
         Some(1004i16.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.ints.int8"), &DataType::BYTE),
         Some(4i8.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.floats.float64"), &DataType::DOUBLE),
         Some(1125899906842747f64.into())
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.floats.float32"), &DataType::DOUBLE),
         Some(1048699f64.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("numeric.floats.float32"), &DataType::FLOAT),
         Some(1048699f32.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("bool"), &DataType::BOOLEAN),
         Some(true.into())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("varlen.binary"), &DataType::BINARY),
         Some([0, 0, 0, 0].as_slice().into())
     );
 
     // CHEAT: Interpret the decimal128 columns' fixed-len array as binary
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal128"),
             &DataType::BINARY
@@ -363,7 +332,7 @@ fn test_get_stat_values() {
         )
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(8, 3).unwrap()
@@ -371,7 +340,7 @@ fn test_get_stat_values() {
         Some(Scalar::decimal(15032, 8, 3).unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(16, 3).unwrap()
@@ -380,7 +349,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(16, 3).unwrap()
@@ -388,7 +357,7 @@ fn test_get_stat_values() {
         Some(Scalar::decimal(15032, 16, 3).unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal128"),
             &DataType::decimal(32, 3).unwrap()
@@ -397,7 +366,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal64"),
             &DataType::decimal(32, 3).unwrap()
@@ -406,7 +375,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("numeric.decimals.decimal32"),
             &DataType::decimal(32, 3).unwrap()
@@ -414,19 +383,19 @@ fn test_get_stat_values() {
         Some(Scalar::decimal(15032, 32, 3).unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("chrono.date32"), &DataType::DATE),
         Some(PrimitiveType::Date.parse_scalar("1971-01-05").unwrap())
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("chrono.timestamp"), &DataType::TIMESTAMP),
         None // Timestamp defaults to 96-bit, which doesn't get stats
     );
 
     // Read a random column as Variant. The actual read does not need to be performed, as stats on
     // Variant should always return None.
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("chrono.date32"),
             &DataType::unshredded_variant()
@@ -435,7 +404,7 @@ fn test_get_stat_values() {
     );
 
     // CHEAT: Interpret the timestamp_ntz column as a normal timestamp
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("chrono.timestamp_ntz"), &DataType::TIMESTAMP),
         Some(
             PrimitiveType::Timestamp
@@ -444,7 +413,7 @@ fn test_get_stat_values() {
         )
     );
 
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(
             &column_name!("chrono.timestamp_ntz"),
             &DataType::TIMESTAMP_NTZ
@@ -457,7 +426,7 @@ fn test_get_stat_values() {
     );
 
     // type widening!
-    assert_physical_eq!(
+    assert_eq!(
         filter.get_max_stat(&column_name!("chrono.date32"), &DataType::TIMESTAMP_NTZ),
         Some(
             PrimitiveType::TimestampNtz

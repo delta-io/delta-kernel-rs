@@ -216,7 +216,6 @@ pub(crate) fn parse_partition_value_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::PhysicalScalar;
     use crate::schema::{DataType, PrimitiveType, StructField, StructType};
     use crate::utils::test_utils::assert_result_error_with_message;
     use std::collections::HashMap;
@@ -280,9 +279,9 @@ mod tests {
         // Verify the parsed values
         assert_eq!(
             result.get(&0).unwrap().1,
-            PhysicalScalar(Scalar::String("test".to_string()))
+            Scalar::String("test".to_string())
         );
-        assert_eq!(result.get(&1).unwrap().1, PhysicalScalar(Scalar::Long(30)));
+        assert_eq!(result.get(&1).unwrap().1, Scalar::Long(30));
     }
 
     #[test]
@@ -306,10 +305,7 @@ mod tests {
     fn test_parse_partition_value_raw_string() {
         let result =
             parse_partition_value_raw(Some(&"test_string".to_string()), &DataType::STRING).unwrap();
-        assert_eq!(
-            result,
-            PhysicalScalar(Scalar::String("test_string".to_string()))
-        );
+        assert_eq!(result, Scalar::String("test_string".to_string()));
     }
 
     #[test]
@@ -319,7 +315,7 @@ mod tests {
             &DataType::Primitive(PrimitiveType::Integer),
         )
         .unwrap();
-        assert_eq!(result, PhysicalScalar(Scalar::Integer(42)));
+        assert_eq!(result, Scalar::Integer(42));
     }
 
     #[test]
