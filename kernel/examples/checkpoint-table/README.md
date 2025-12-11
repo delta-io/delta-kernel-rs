@@ -3,7 +3,7 @@ Checkpoint Table
 
 # About
 
-This example shows how to checkpoint a delta table
+This example shows how to checkpoint a Delta table.
 
 You can run this example from anywhere in this repository by running `cargo run -p checkpoint-table -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
