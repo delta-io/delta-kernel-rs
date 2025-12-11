@@ -1,37 +1,11 @@
 package delta
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../target/ffi-headers -DDEFINE_DEFAULT_ENGINE_BASE
+#cgo CFLAGS: -I${SRCDIR}/../../../target/ffi-headers -I${SRCDIR}/c -DDEFINE_DEFAULT_ENGINE_BASE
 #cgo LDFLAGS: -L${SRCDIR}/../../../target/release -ldelta_kernel_ffi
 #include "delta_kernel_ffi.h"
-#include <stdlib.h>
-#include <string.h>
-
-// Helper function to allocate a string from KernelStringSlice
-// Returns void* to match AllocateStringFn signature
-static void* allocate_string_helper(struct KernelStringSlice slice) {
-    char* str = (char*)malloc(slice.len + 1);
-    if (str) {
-        memcpy(str, slice.ptr, slice.len);
-        str[slice.len] = '\0';
-    }
-    return str;
-}
-
-// Helper to extract ok value from scan result
-static inline HandleSharedScan get_ok_scan(struct ExternResultHandleSharedScan result) {
-    return result.ok;
-}
-
-// Helper to extract error from scan result
-static inline struct EngineError* get_err_scan(struct ExternResultHandleSharedScan result) {
-    return result.err;
-}
-
-// Wrapper function to get scan table root using our allocator
-static char* get_scan_table_root(HandleSharedScan scan) {
-    return (char*)scan_table_root(scan, allocate_string_helper);
-}
+#include "helpers.h"
+// Note: helpers.c is included in snapshot.go to avoid duplicate symbols
 */
 import "C"
 import (

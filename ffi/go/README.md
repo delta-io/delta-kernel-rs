@@ -79,6 +79,9 @@ Note: Full schema extraction via visitor pattern will be implemented next.
 ```
 ffi/go/
 ├── delta/
+│   ├── c/                 # C bridge code
+│   │   ├── helpers.h     # FFI helper function declarations
+│   │   └── helpers.c     # FFI helper implementations
 │   ├── schema.go          # Schema types (basic implementation)
 │   ├── snapshot.go        # Snapshot operations (✅ WORKING!)
 │   └── scan.go           # Scan operations (✅ WORKING!)
@@ -90,9 +93,10 @@ ffi/go/
 └── README.md
 ```
 
-**Key Point**: No `c/` directory - references `target/` directly:
-- Headers: `../../target/ffi-headers/`
-- Library: `../../target/release/libdelta_kernel_ffi.{so,dylib}`
+**Key Points**:
+- `delta/c/` contains C bridge code (helpers, not copied FFI headers)
+- References FFI headers directly from: `../../target/ffi-headers/`
+- Links against library: `../../target/release/libdelta_kernel_ffi.{so,dylib}`
 
 ## What Works ✅
 
