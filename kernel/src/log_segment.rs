@@ -315,9 +315,11 @@ impl LogSegment {
     /// schemas can be useful as a cheap way of doing additional filtering on the checkpoint files
     /// (e.g. filtering out remove actions).
     ///
-    ///  The engine data returned might have extra non-log actions (e.g. sidecar
-    ///  actions) that are not part of the schema but this is an implementation
-    ///  detail that should not be relied on and will likely change.
+    /// If `fallback_checkpoint_schema` is provided, attempts to read checkpoint files using
+    /// `checkpoint_read_schema` first, falling back to the fallback schema if reading fails
+    /// (e.g., due to schema incompatibility). This is useful for optimistically reading
+    /// checkpoints with extended schemas (like stats_parsed) while gracefully falling back
+    /// to the standard schema if the extended columns don't exist or have incompatible types.
     ///
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
@@ -327,31 +329,7 @@ impl LogSegment {
         engine: &dyn Engine,
         commit_read_schema: SchemaRef,
         checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        self.read_actions_with_checkpoint_fallback(
-            engine,
-            commit_read_schema,
-            checkpoint_read_schema.clone(),
-            checkpoint_read_schema,
-            meta_predicate,
-        )
-    }
-
-    /// Reads actions from commits and checkpoints, with fallback schema support for checkpoints.
-    ///
-    /// This method attempts to read checkpoint files using `checkpoint_read_schema`. If reading
-    /// fails (e.g., due to schema incompatibility), it retries with `fallback_checkpoint_schema`.
-    /// This is useful for optimistically reading checkpoints with extended schemas (like stats_parsed)
-    /// while gracefully falling back to the standard schema if the extended columns don't exist
-    /// or have incompatible types.
-    #[internal_api]
-    pub(crate) fn read_actions_with_checkpoint_fallback(
-        &self,
-        engine: &dyn Engine,
-        commit_read_schema: SchemaRef,
-        checkpoint_read_schema: SchemaRef,
-        fallback_checkpoint_schema: SchemaRef,
+        fallback_checkpoint_schema: Option<SchemaRef>,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
@@ -387,6 +365,7 @@ impl LogSegment {
             engine,
             action_schema.clone(),
             action_schema,
+            None,
             meta_predicate,
         )
     }
@@ -434,43 +413,42 @@ impl LogSegment {
         selected_files
     }
 
-    /// Creates a checkpoint stream with fallback schema support.
+    /// Creates a checkpoint stream, optionally with fallback schema support.
     ///
-    /// Attempts to read checkpoint files using `primary_schema`. If reading the first batch
-    /// fails (e.g., schema incompatibility), retries with `fallback_schema`.
+    /// If `fallback_schema` is `Some`, attempts to read checkpoint files using `primary_schema`
+    /// first. If reading the first batch fails (e.g., schema incompatibility), retries with
+    /// the fallback schema. If `fallback_schema` is `None`, reads directly without probing.
     fn create_checkpoint_stream_with_fallback(
         &self,
         engine: &dyn Engine,
         primary_schema: SchemaRef,
-        fallback_schema: SchemaRef,
+        fallback_schema: Option<SchemaRef>,
         meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ActionsBatch>> + Send>> {
-        // Try to create stream with primary schema
+    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         let mut primary_iter =
             self.create_checkpoint_stream(engine, primary_schema, meta_predicate.clone())?;
 
-        // Try to get first batch to detect schema errors early
-        match primary_iter.next() {
-            Some(Ok(first_batch)) => {
-                // Primary schema works - chain first batch with rest
-                let iter = std::iter::once(Ok(first_batch)).chain(primary_iter);
-                Ok(Box::new(iter))
+        // If fallback schema provided, probe first batch to detect errors early.
+        // Otherwise, return primary iterator directly without probing.
+        let (first_batch, rest_iter) = if let Some(fallback_schema) = fallback_schema {
+            match primary_iter.next() {
+                Some(Ok(batch)) => (Some(Ok(batch)), primary_iter),
+                Some(Err(e)) => {
+                    debug!(
+                        "Checkpoint read failed with primary schema, retrying with fallback: {}",
+                        e
+                    );
+                    let fallback_iter =
+                        self.create_checkpoint_stream(engine, fallback_schema, meta_predicate)?;
+                    (None, fallback_iter)
+                }
+                None => (None, primary_iter),
             }
-            Some(Err(e)) => {
-                // Error reading with primary schema - retry with fallback
-                debug!(
-                    "Checkpoint read failed with primary schema, retrying with fallback: {}",
-                    e
-                );
-                let fallback_iter =
-                    self.create_checkpoint_stream(engine, fallback_schema, meta_predicate)?;
-                Ok(Box::new(fallback_iter))
-            }
-            None => {
-                // No checkpoint data
-                Ok(Box::new(std::iter::empty()))
-            }
-        }
+        } else {
+            (None, primary_iter)
+        };
+
+        Ok(first_batch.into_iter().chain(rest_iter))
     }
 
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
