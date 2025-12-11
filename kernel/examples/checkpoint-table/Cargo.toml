@@ -1,0 +1,28 @@
+[package]
+name = "checkpoint-table"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+arrow = { version = "57", features = ["prettyprint", "chrono-tz"] }
+clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+# NB: common depends on 'arrow' (latest) so have to match here
+common = { path = "../common" }
+delta_kernel = { path = "../../../kernel", features = [
+  "arrow",
+  "default-engine-rustls",
+  "internal-api",
+] }
+env_logger = "0.11.8"
+object_store = { version = "0.12.3", features = ["aws", "azure", "gcp", "http"] }
+parquet = { version = "57" }
+tokio = { version = "1.0", features = ["full"] }
+url = "2"
+bytes = "1.11.0"
+futures = "0.3.31"
+
+# for cargo-release
+[package.metadata.release]
+release = false

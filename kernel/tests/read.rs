@@ -1433,6 +1433,130 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[tokio::test]
+async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::arrow::array::{Array, AsArray, RunArray};
+
+    // Set up an in-memory table with multiple data files
+    let batch1 = generate_batch(vec![
+        ("id", vec![1i32, 2, 3].into_array()),
+        ("value", vec!["a", "b", "c"].into_array()),
+    ])?;
+    let batch2 = generate_batch(vec![
+        ("id", vec![10i32, 20].into_array()),
+        ("value", vec!["x", "y"].into_array()),
+    ])?;
+
+    let storage = Arc::new(InMemory::new());
+    add_commit(
+        storage.as_ref(),
+        0,
+        actions_to_string(vec![
+            TestAction::Metadata,
+            TestAction::Add(PARQUET_FILE1.to_string()),
+            TestAction::Add(PARQUET_FILE2.to_string()),
+        ]),
+    )
+    .await?;
+
+    for (parquet_file, batch) in [(PARQUET_FILE1, &batch1), (PARQUET_FILE2, &batch2)] {
+        storage
+            .put(
+                &Path::from(parquet_file),
+                record_batch_to_bytes(batch).into(),
+            )
+            .await?;
+    }
+
+    let location = Url::parse("memory:///")?;
+    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+
+    // Create a schema that includes the file path metadata column
+    let schema = Arc::new(StructType::try_new([
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    let snapshot = Snapshot::builder_for(location.clone()).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().with_schema(schema).build()?;
+
+    let mut file_count = 0;
+    let expected_files = [PARQUET_FILE1, PARQUET_FILE2];
+    let expected_row_counts = [3, 2];
+    let stream = scan.execute(engine.clone())?;
+
+    for data in stream {
+        let batch = into_record_batch(data?);
+
+        // Verify the schema structure
+        assert_eq!(batch.num_columns(), 3, "Expected 3 columns in the batch");
+        assert_eq!(
+            batch.schema().field(0).name(),
+            "id",
+            "First column should be 'id'"
+        );
+        assert_eq!(
+            batch.schema().field(1).name(),
+            "_file",
+            "Second column should be '_file'"
+        );
+        assert_eq!(
+            batch.schema().field(2).name(),
+            "value",
+            "Third column should be 'value'"
+        );
+
+        // Verify the file path column contains the expected file name
+        let file_path_array = batch.column(1);
+        let expected_file_name = expected_files[file_count];
+        let expected_path = format!("{}{}", location, expected_file_name);
+
+        // The file path array should be run-end encoded
+        let run_array = file_path_array
+            .as_any()
+            .downcast_ref::<RunArray<Int64Type>>()
+            .expect("File path column should be run-end encoded");
+
+        // Verify each logical row has the correct file path
+        assert_eq!(
+            run_array.len(),
+            expected_row_counts[file_count],
+            "File {} should have {} rows",
+            expected_file_name,
+            expected_row_counts[file_count]
+        );
+
+        // Verify the physical representation is efficient (single run)
+        let run_ends = run_array.run_ends().values();
+        assert_eq!(
+            run_ends.len(),
+            1,
+            "File path should be encoded as a single run"
+        );
+        assert_eq!(
+            run_ends[0], expected_row_counts[file_count] as i64,
+            "Run should end at position {}",
+            expected_row_counts[file_count]
+        );
+
+        // Verify the value is the expected file path
+        let values = run_array.values().as_string::<i32>();
+        assert_eq!(values.len(), 1, "Should have only 1 unique file path value");
+        assert_eq!(
+            values.value(0),
+            expected_path,
+            "File path should be '{}'",
+            expected_path
+        );
+
+        file_count += 1;
+    }
+
+    assert_eq!(file_count, 2, "Expected to scan 2 files");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::Error>> {
     // Prepare an in-memory table with some data
     let batch = generate_simple_batch()?;

@@ -106,7 +106,6 @@ and then checking what version of `object_store` it depends on.
 ## Documentation
 
 - [API Docs](https://docs.rs/delta_kernel/latest/delta_kernel/)
-- [architecture.md](doc/architecture.md) document describing the kernel architecture (currently wip)
 
 ## Examples
 
