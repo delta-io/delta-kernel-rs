@@ -8,7 +8,7 @@ This example shows how to checkpoint a delta table
 You can run this example from anywhere in this repository by running `cargo run -p checkpoint-table -- [args]` or by navigating to this directory and running `cargo run -- [args]`.
 
 !!!WARNING!!!: This doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.  As such
- you need to pass --unsafe_i_know_what_im_doing as an argument to get this to actually write the
+ you need to pass --unsafe-i-know-what-im-doing as an argument to get this to actually write the
  checkpoint, otherwise it will just do all the work it _would_ have done, but not actually write the
  final checkpoint.
 
