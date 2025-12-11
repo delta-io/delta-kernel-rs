@@ -58,7 +58,7 @@ void scan_row_callback(
   (void)transform; // only used when PRINT_ARROW_DATA is defined
 #endif
   struct EngineContext* context = engine_context;
-  print_diag("Called back to read file: %.*s. (size: %" PRIu64 ", num records: )\n", (int)path.len, path.ptr, size);
+  print_diag("Called back to read file: %.*s. (size: %" PRIu64 ", num records: ", (int)path.len, path.ptr, size);
   if (stats) {
     print_diag("%" PRId64 ")\n", stats->num_records);
   } else {
@@ -71,7 +71,7 @@ void scan_row_callback(
     ExternResultKernelBoolSlice selection_vector_res =
       selection_vector_from_dv(cdv_info->info, context->engine, table_root_slice);
     if (selection_vector_res.tag != OkKernelBoolSlice) {
-      print_diag("Could not get selection vector from kernel\n");
+      printf("Could not get selection vector from kernel\n");
       exit(-1);
     }
     selection_vector = selection_vector_res.ok;
