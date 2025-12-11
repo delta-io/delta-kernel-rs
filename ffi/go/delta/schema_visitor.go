@@ -19,26 +19,27 @@ type SchemaVisitor interface {
 	// Returns the list ID
 	MakeFieldList(reserve int) int
 
-	// VisitStruct is called for struct types (including top-level schema)
-	// childListID contains the fields of the struct
+	// Complex type visitors (have children)
 	VisitStruct(siblingListID int, name string, nullable bool, childListID int)
+	VisitArray(siblingListID int, name string, nullable bool, childListID int)
+	VisitMap(siblingListID int, name string, nullable bool, childListID int)
 
-	// VisitString is called for string fields
+	// Decimal type with precision and scale
+	VisitDecimal(siblingListID int, name string, nullable bool, precision uint8, scale uint8)
+
+	// Simple type visitors
 	VisitString(siblingListID int, name string, nullable bool)
-
-	// VisitLong is called for long (int64) fields
 	VisitLong(siblingListID int, name string, nullable bool)
-
-	// VisitInteger is called for integer (int32) fields
 	VisitInteger(siblingListID int, name string, nullable bool)
-
-	// VisitBoolean is called for boolean fields
-	VisitBoolean(siblingListID int, name string, nullable bool)
-
-	// VisitDouble is called for double (float64) fields
+	VisitShort(siblingListID int, name string, nullable bool)
+	VisitByte(siblingListID int, name string, nullable bool)
+	VisitFloat(siblingListID int, name string, nullable bool)
 	VisitDouble(siblingListID int, name string, nullable bool)
-
-	// TODO: Add more visit methods as needed (array, map, decimal, etc.)
+	VisitBoolean(siblingListID int, name string, nullable bool)
+	VisitBinary(siblingListID int, name string, nullable bool)
+	VisitDate(siblingListID int, name string, nullable bool)
+	VisitTimestamp(siblingListID int, name string, nullable bool)
+	VisitTimestampNtz(siblingListID int, name string, nullable bool)
 }
 
 // visitSchemaWithVisitor calls the FFI visit_schema with a Go visitor
@@ -55,15 +56,24 @@ func visitSchemaWithVisitor(schemaHandle C.HandleSharedSchema, visitor SchemaVis
 	// Create the C visitor struct
 	// Cast function pointers to the correct types
 	cVisitor := C.struct_EngineSchemaVisitor{
-		data:            handlePtr,
-		make_field_list: (*[0]byte)(C.c_make_field_list),
-		visit_struct:    (*[0]byte)(C.c_visit_struct),
-		visit_string:    (*[0]byte)(C.c_visit_string),
-		visit_long:      (*[0]byte)(C.c_visit_long),
-		visit_integer:   (*[0]byte)(C.c_visit_integer),
-		visit_boolean:   (*[0]byte)(C.c_visit_boolean),
-		visit_double:    (*[0]byte)(C.c_visit_double),
-		// TODO: Set other visitor functions as we implement them
+		data:                handlePtr,
+		make_field_list:     (*[0]byte)(C.c_make_field_list),
+		visit_struct:        (*[0]byte)(C.c_visit_struct),
+		visit_array:         (*[0]byte)(C.c_visit_array),
+		visit_map:           (*[0]byte)(C.c_visit_map),
+		visit_decimal:       (*[0]byte)(C.c_visit_decimal),
+		visit_string:        (*[0]byte)(C.c_visit_string),
+		visit_long:          (*[0]byte)(C.c_visit_long),
+		visit_integer:       (*[0]byte)(C.c_visit_integer),
+		visit_short:         (*[0]byte)(C.c_visit_short),
+		visit_byte:          (*[0]byte)(C.c_visit_byte),
+		visit_float:         (*[0]byte)(C.c_visit_float),
+		visit_double:        (*[0]byte)(C.c_visit_double),
+		visit_boolean:       (*[0]byte)(C.c_visit_boolean),
+		visit_binary:        (*[0]byte)(C.c_visit_binary),
+		visit_date:          (*[0]byte)(C.c_visit_date),
+		visit_timestamp:     (*[0]byte)(C.c_visit_timestamp),
+		visit_timestamp_ntz: (*[0]byte)(C.c_visit_timestamp_ntz),
 	}
 
 	// Call the FFI function
@@ -129,4 +139,84 @@ func goVisitDouble(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.st
 	visitor := handle.Value().(SchemaVisitor)
 	nameStr := C.GoStringN(name.ptr, C.int(name.len))
 	visitor.VisitDouble(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitShort
+func goVisitShort(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitShort(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitByte
+func goVisitByte(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitByte(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitFloat
+func goVisitFloat(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitFloat(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitBinary
+func goVisitBinary(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitBinary(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitDate
+func goVisitDate(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitDate(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitTimestamp
+func goVisitTimestamp(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitTimestamp(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitTimestampNtz
+func goVisitTimestampNtz(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitTimestampNtz(int(siblingListID), nameStr, bool(nullable))
+}
+
+//export goVisitArray
+func goVisitArray(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool, childListID C.uintptr_t) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitArray(int(siblingListID), nameStr, bool(nullable), int(childListID))
+}
+
+//export goVisitMap
+func goVisitMap(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool, childListID C.uintptr_t) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitMap(int(siblingListID), nameStr, bool(nullable), int(childListID))
+}
+
+//export goVisitDecimal
+func goVisitDecimal(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool, precision C.uint8_t, scale C.uint8_t) {
+	handle := cgo.Handle(handleValue)
+	visitor := handle.Value().(SchemaVisitor)
+	nameStr := C.GoStringN(name.ptr, C.int(name.len))
+	visitor.VisitDecimal(int(siblingListID), nameStr, bool(nullable), uint8(precision), uint8(scale))
 }

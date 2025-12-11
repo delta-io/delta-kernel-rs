@@ -155,3 +155,73 @@ void c_visit_double(void* data, uintptr_t sibling_list_id, struct KernelStringSl
     uintptr_t handle = *(uintptr_t*)data;
     goVisitDouble(handle, sibling_list_id, name, is_nullable);
 }
+
+void c_visit_short(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                   bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitShort(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_byte(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                  bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitByte(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_float(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                   bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitFloat(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_binary(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                    bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitBinary(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_date(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                  bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitDate(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_timestamp(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                       bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitTimestamp(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_timestamp_ntz(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                           bool is_nullable, const struct CStringMap* metadata) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitTimestampNtz(handle, sibling_list_id, name, is_nullable);
+}
+
+void c_visit_array(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                   bool is_nullable, const struct CStringMap* metadata, uintptr_t child_list_id) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitArray(handle, sibling_list_id, name, is_nullable, child_list_id);
+}
+
+void c_visit_map(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                 bool is_nullable, const struct CStringMap* metadata, uintptr_t child_list_id) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitMap(handle, sibling_list_id, name, is_nullable, child_list_id);
+}
+
+void c_visit_decimal(void* data, uintptr_t sibling_list_id, struct KernelStringSlice name,
+                     bool is_nullable, const struct CStringMap* metadata, uint8_t precision, uint8_t scale) {
+    (void)metadata; // unused for now
+    uintptr_t handle = *(uintptr_t*)data;
+    goVisitDecimal(handle, sibling_list_id, name, is_nullable, precision, scale);
+}
