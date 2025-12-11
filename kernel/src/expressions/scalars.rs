@@ -220,7 +220,10 @@ impl StructData {
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
-#[derive(Debug, Clone)]
+///
+/// NOTE: `PartialEq` uses physical (structural) comparison semantics.
+/// For SQL NULL semantics, use [`Scalar::logical_eq`] or [`Scalar::logical_partial_cmp`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
@@ -500,6 +503,10 @@ impl Scalar {
     /// Returns `None` if the scalars cannot be compared (different types, NULL values, or
     /// unsupported types like Struct/Array/Map).
     ///
+    /// Logical (SQL semantics) equality comparison of two scalars.
+    ///
+    /// Returns `true` if the scalars are logically equal, `false` otherwise.
+    ///
     /// NOTE: This implements SQL NULL semantics where NULL is incomparable to everything,
     /// including itself, so `NULL != NULL` (returns `false`).
     pub fn logical_eq(&self, other: &Self) -> bool {
@@ -508,10 +515,12 @@ impl Scalar {
 
     /// Physical (structural) equality comparison of two scalars.
     ///
-    /// Currently delegates to logical comparison. This will eventually be replaced with
-    /// actual physical comparison where `Null(dt1) == Null(dt2)` when `dt1 == dt2`.
+    /// Returns `true` if the scalars are structurally identical, `false` otherwise.
+    ///
+    /// Unlike logical comparison, this treats `Null(dt1) == Null(dt2)` as `true` when `dt1 == dt2`.
+    /// This is used for query plan comparison, not SQL evaluation.
     pub fn physical_eq(&self, other: &Self) -> bool {
-        self.logical_eq(other)
+        self == other
     }
 
     /// Logical (SQL semantics) comparison of two scalars.
