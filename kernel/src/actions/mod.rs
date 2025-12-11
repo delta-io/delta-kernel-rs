@@ -174,7 +174,6 @@ pub(crate) fn as_log_add_schema(schema: SchemaRef) -> SchemaRef {
 }
 
 /// The name of the parsed statistics field in checkpoint files.
-#[allow(dead_code)] // Used in tests, will be used in stats_parsed integration PR
 pub(crate) const STATS_PARSED_NAME: &str = "stats_parsed";
 
 /// Returns the Add action schema with an additional `stats_parsed` field.
@@ -191,7 +190,6 @@ pub(crate) const STATS_PARSED_NAME: &str = "stats_parsed";
 ///   maxValues: { col1: type1, col2: type2, ... }
 /// }
 /// ```
-#[allow(dead_code)] // Will be used in stats_parsed integration PR
 pub(crate) fn add_schema_with_stats_parsed(stats_schema: &StructType) -> StructType {
     let mut fields: Vec<StructField> = Add::to_schema().into_fields().collect();
     fields.push(StructField::nullable(
@@ -205,7 +203,7 @@ pub(crate) fn add_schema_with_stats_parsed(stats_schema: &StructType) -> StructT
 ///
 /// This is the schema to use when reading checkpoints that may contain
 /// structured statistics in the `add.stats_parsed` field.
-#[allow(dead_code)] // Will be used in stats_parsed integration PR
+#[allow(dead_code)] // Will be used in data skipping integration
 pub(crate) fn get_log_add_schema_with_stats_parsed(stats_schema: &StructType) -> SchemaRef {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         ADD_NAME,

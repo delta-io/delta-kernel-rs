@@ -72,7 +72,6 @@ use crate::actions::add_schema_with_stats_parsed;
 /// # Arguments
 /// * `stats_schema` - The stats schema built from predicate-referenced columns,
 ///   with structure: `{numRecords, nullCount, minValues, maxValues}`
-#[allow(dead_code)] // Used in tests, will be used in stats_parsed integration PR
 pub(crate) fn build_checkpoint_read_schema_with_stats_parsed(
     stats_schema: &SchemaRef,
 ) -> SchemaRef {
@@ -432,7 +431,8 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        let action_iter = self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(engine, action_iter)
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -588,11 +588,32 @@ impl Scan {
         Ok(Some(it).into_iter().flatten())
     }
 
+    /// Builds the checkpoint read schema, including stats_parsed if a predicate is present.
+    ///
+    /// When a predicate is available, the schema includes `add.stats_parsed` to enable
+    /// data skipping using pre-parsed statistics from checkpoint files.
+    fn build_checkpoint_schema_for_scan(&self) -> SchemaRef {
+        use data_skipping::build_stats_schema;
+
+        match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(_, referenced_schema) => {
+                if let Some(stats_schema) = build_stats_schema(referenced_schema) {
+                    build_checkpoint_read_schema_with_stats_parsed(&stats_schema)
+                } else {
+                    CHECKPOINT_READ_SCHEMA.clone()
+                }
+            }
+            _ => CHECKPOINT_READ_SCHEMA.clone(),
+        }
+    }
+
     // Factored out to facilitate testing
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+        let checkpoint_schema = self.build_checkpoint_schema_for_scan();
+
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
@@ -600,7 +621,7 @@ impl Scan {
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
+                checkpoint_schema,
                 None,
             )
     }

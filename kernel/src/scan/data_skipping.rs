@@ -212,13 +212,6 @@ impl DataSkippingFilter {
         let mut visitor = SelectionVectorVisitor::default();
         visitor.visit_rows_of(selection_vector.as_ref())?;
         Ok(visitor.selection_vector)
-
-        // TODO(zach): add some debug info about data skipping that occurred
-        // let before_count = actions.length();
-        // debug!(
-        //     "number of actions before/after data skipping: {before_count} / {}",
-        //     filtered_actions.num_rows()
-        // );
     }
 }
 
