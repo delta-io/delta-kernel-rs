@@ -27,10 +27,34 @@ export LD_LIBRARY_PATH=$PWD/../../target/release:$LD_LIBRARY_PATH      # Linux
 
 ### Example Output:
 ```
-Opening Delta table at: ../../acceptance/tests/dat/out/reader_tests/generated/basic_append/delta
+Opening Delta table at: ../../test_table
 
 ✓ Successfully opened table
   Version: 1
+
+Table root: file:///Users/andrei.tserakhau/RustroverProjects/delta-kernel-rs/test_table/
+
+Table has no partition columns
+
+Schema:
+- schema_extraction: not_yet_implemented
+
+Note: Full schema extraction will be implemented next.
+```
+
+**With partitioned table**:
+```
+Opening Delta table at: ../../acceptance/tests/dat/out/reader_tests/generated/multi_partitioned/delta
+
+✓ Successfully opened table
+  Version: 2
+
+Table root: file:///Users/andrei.tserakhau/RustroverProjects/delta-kernel-rs/acceptance/tests/dat/out/reader_tests/generated/multi_partitioned/delta/
+
+Partition columns:
+  - letter
+  - date
+  - data
 
 Schema:
 - schema_extraction: not_yet_implemented
@@ -59,11 +83,13 @@ ffi/go/
 
 ## What Works ✅
 
-1. **Snapshot Creation**: `delta.NewSnapshot(tablePath)`
+1. **Snapshot Creation**: `delta.NewSnapshot(tablePath)` and `delta.NewSnapshotAtVersion(tablePath, version)`
 2. **Version Retrieval**: `snapshot.Version()`
-3. **Engine Management**: Automatic default engine creation
-4. **Resource Cleanup**: `snapshot.Close()`
-5. **Error Handling**: Basic error propagation from FFI
+3. **Table Root Path**: `snapshot.TableRoot()` - returns the absolute path to the table
+4. **Partition Columns**: `snapshot.PartitionColumns()` - returns list of partition column names
+5. **Engine Management**: Automatic default engine creation
+6. **Resource Cleanup**: `snapshot.Close()`
+7. **Error Handling**: Basic error propagation from FFI
 
 ## Implementation Details
 
@@ -159,19 +185,36 @@ func main() {
     version := snapshot.Version()
     fmt.Printf("Table version: %d\n", version)
 
-    // TODO: Get schema (not yet implemented)
+    // Get table root path
+    tableRoot, err := snapshot.TableRoot()
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("Table root: %s\n", tableRoot)
+
+    // Get partition columns
+    partitions, err := snapshot.PartitionColumns()
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("Partition columns: %v\n", partitions)
+
+    // TODO: Get schema (visitor pattern not yet implemented)
     // schema, err := snapshot.Schema()
 }
 ```
 
 ## Success! 🎉
 
-We now have a **working minimal example** that:
+We now have a **working Go CGO wrapper** that:
 - ✅ Compiles successfully
 - ✅ Links to Rust FFI library
 - ✅ Calls FFI functions correctly
 - ✅ Reads real Delta tables
 - ✅ Retrieves version information
-- ✅ Manages resources properly
+- ✅ Gets table root paths
+- ✅ Lists partition columns
+- ✅ Manages resources properly with proper cleanup
+- ✅ Uses C helper functions for complex FFI patterns (allocators, iterators)
 
-This provides a solid foundation for implementing the remaining Delta Kernel functionality!
+This provides a solid foundation for implementing the remaining Delta Kernel functionality like schema extraction, scans, and data reading!
