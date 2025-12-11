@@ -199,7 +199,7 @@ static FullPath make_full_path(const char *root, const char *path_ptr, size_t pa
 
     res[total_len] = '\0';
     out.ptr = res;
-    out.len = path_len;
+    out.len = total_len;
     return out;
 }
 
