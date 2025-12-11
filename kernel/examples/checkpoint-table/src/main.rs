@@ -67,21 +67,32 @@ async fn try_main() -> DeltaResult<()> {
     let engine = DefaultEngine::new(store.clone());
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
+    // first we create a checkpoint writer
     let writer = snapshot.checkpoint()?;
 
+    // this tells us the path where we should write the checkpoint file
     let checkpoint_path = writer.checkpoint_path()?;
+    // this gives us a iterator of `FilteredEngineData` that needs to be written to the file
     let mut data_iter = writer.checkpoint_data(&engine)?;
 
     let batch_iter = data_iter.by_ref();
+    // we'll use the first batch to determine the schema
     let first = batch_iter.next();
 
     let Some(first) = first else {
         return Err(Error::generic("No batches in checkpoint data"));
     };
+    // Note that with `FilteredEngineData` it's important to `apply_selection_vector` to remove any
+    // filtered out rows. It's also possible to use `into_parts` to get the unfiltered batch and the
+    // selection vector individually, such that an engine could write only the selected rows out
+    // without having to allocate a new engine data.
+    // NB: Unselected rows MUST NOT be written to the checkpoint! Doing so will create an invalid
+    // checkpoint
     let first_data = first?.apply_selection_vector()?;
     let first_batch = first_data.try_into_record_batch()?;
 
     if cli.unsafe_i_know_what_im_doing {
+        // this block uses the arrow writer to write the data out
         let path = object_store::path::Path::from_url_path(checkpoint_path.path())?;
         let object_writer = ParquetObjectWriter::new(store.clone(), path.clone());
         let mut parquet_writer =
@@ -94,10 +105,13 @@ async fn try_main() -> DeltaResult<()> {
             last_modified: metadata.last_modified.timestamp() * 1000,
             size: metadata.size,
         };
+        // It's important to call `finalize` on the writer, which will create a `_last_checkpoint`
+        // file
         writer.finalize(&engine, &file_meta, data_iter)?;
         println!("Table checkpointed");
     } else {
         println!("--unsafe-i-know-what-im-doing not specified, just doing a dry run");
+        // this block just writes the checkpoint to a blackhole
         let mut parquet_writer =
             AsyncArrowWriter::try_new(BlackholeWriter::default(), first_batch.schema(), None)?;
         write_data(&first_batch, batch_iter, &mut parquet_writer).await?;
@@ -107,6 +121,8 @@ async fn try_main() -> DeltaResult<()> {
             "Would have written a checkpoint as:\n\tpath: {checkpoint_path}\n\tsize: {}",
             blackhole_writer.len
         );
+        // in this example we don't call `finalize` because we don't want to actually write
+        // anything, but if really checkpointing, it's important to call finalize as we do above
     }
     Ok(())
 }
