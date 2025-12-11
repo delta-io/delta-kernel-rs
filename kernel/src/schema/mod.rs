@@ -14,6 +14,7 @@ use tracing::warn;
 
 // re-export because many call sites that use schemas do not necessarily use expressions
 pub(crate) use crate::expressions::{column_name, ColumnName};
+use crate::reserved_field_ids::FILE_NAME;
 use crate::table_features::ColumnMappingMode;
 use crate::utils::{require, CowExt as _};
 use crate::{DeltaResult, Error};
@@ -132,6 +133,7 @@ pub enum MetadataColumnSpec {
     RowIndex,
     RowId,
     RowCommitVersion,
+    FilePath,
 }
 
 impl MetadataColumnSpec {
@@ -141,6 +143,7 @@ impl MetadataColumnSpec {
             Self::RowIndex => "row_index",
             Self::RowId => "row_id",
             Self::RowCommitVersion => "row_commit_version",
+            Self::FilePath => "_file",
         }
     }
 
@@ -150,6 +153,7 @@ impl MetadataColumnSpec {
             Self::RowIndex => DataType::LONG,
             Self::RowId => DataType::LONG,
             Self::RowCommitVersion => DataType::LONG,
+            Self::FilePath => DataType::STRING,
         }
     }
 
@@ -159,6 +163,15 @@ impl MetadataColumnSpec {
             Self::RowIndex => false,
             Self::RowId => false,
             Self::RowCommitVersion => false,
+            Self::FilePath => false,
+        }
+    }
+
+    /// The reserved field ID for the specified metadata column, if any.
+    pub fn reserved_field_id(&self) -> Option<i64> {
+        match self {
+            Self::FilePath => Some(FILE_NAME),
+            _ => None,
         }
     }
 }
@@ -171,6 +184,7 @@ impl FromStr for MetadataColumnSpec {
             "row_index" => Ok(Self::RowIndex),
             "row_id" => Ok(Self::RowId),
             "row_commit_version" => Ok(Self::RowCommitVersion),
+            "_file" => Ok(Self::FilePath),
             _ => Err(Error::Schema(format!("Unknown metadata column spec: {s}"))),
         }
     }
@@ -2771,6 +2785,7 @@ mod tests {
             MetadataColumnSpec::RowCommitVersion.text_value(),
             "row_commit_version"
         );
+        assert_eq!(MetadataColumnSpec::FilePath.text_value(), "_file");
 
         // Test data_type
         assert_eq!(MetadataColumnSpec::RowIndex.data_type(), DataType::LONG);
@@ -2779,11 +2794,25 @@ mod tests {
             MetadataColumnSpec::RowCommitVersion.data_type(),
             DataType::LONG
         );
+        assert_eq!(MetadataColumnSpec::FilePath.data_type(), DataType::STRING);
 
         // Test nullable
         assert!(!MetadataColumnSpec::RowIndex.nullable());
         assert!(!MetadataColumnSpec::RowId.nullable());
         assert!(!MetadataColumnSpec::RowCommitVersion.nullable());
+        assert!(!MetadataColumnSpec::FilePath.nullable());
+
+        // Test reserved_field_id
+        assert_eq!(MetadataColumnSpec::RowIndex.reserved_field_id(), None);
+        assert_eq!(MetadataColumnSpec::RowId.reserved_field_id(), None);
+        assert_eq!(
+            MetadataColumnSpec::RowCommitVersion.reserved_field_id(),
+            None
+        );
+        assert_eq!(
+            MetadataColumnSpec::FilePath.reserved_field_id(),
+            Some(crate::reserved_field_ids::FILE_NAME)
+        );
 
         // Test from_str
         assert_eq!(
@@ -2797,6 +2826,10 @@ mod tests {
         assert_eq!(
             MetadataColumnSpec::from_str("row_commit_version")?,
             MetadataColumnSpec::RowCommitVersion
+        );
+        assert_eq!(
+            MetadataColumnSpec::from_str("_file")?,
+            MetadataColumnSpec::FilePath
         );
 
         // Test invalid from_str
