@@ -409,7 +409,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use crate::actions::get_commit_schema;
-    use crate::expressions::{BinaryExpressionOp, PhysicalScalar, Scalar, VariadicExpressionOp};
+    use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
     use crate::scan::state_info::tests::{
@@ -539,7 +539,7 @@ mod tests {
             let [expr] = &field_transform.exprs[..] else {
                 panic!("Expected a single insertion");
             };
-            let Expr::Literal(PhysicalScalar(Scalar::Date(date_offset))) = expr.as_ref() else {
+            let Expr::Literal(Scalar::Date(date_offset)) = expr.as_ref() else {
                 panic!("Expected a literal date");
             };
             assert_eq!(*date_offset, expected_date_offset);

@@ -6,8 +6,8 @@
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, ColumnName,
     Expression as Expr, JunctionPredicate, JunctionPredicateOp, OpaqueExpression,
-    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, PhysicalScalar,
-    Predicate as Pred, Scalar, UnaryPredicate, UnaryPredicateOp,
+    OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate as Pred, Scalar,
+    UnaryPredicate, UnaryPredicateOp,
 };
 use crate::schema::DataType;
 
@@ -619,7 +619,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
 
     pub(crate) fn eval_expr(&self, expr: &Expr) -> Option<Scalar> {
         match expr {
-            Expr::Literal(PhysicalScalar(value)) => Some(value.clone()),
+            Expr::Literal(value) => Some(value.clone()),
             Expr::Column(name) => self.resolve_column(name),
             Expr::Predicate(pred) => self.eval_pred(pred, false).map(Scalar::from),
             Expr::Struct(_) | Expr::Transform(_) | Expr::Unary(_) => None, // TODO?

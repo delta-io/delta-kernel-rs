@@ -157,7 +157,7 @@ pub trait ExpressionTransform<'a> {
         let expr = match expr {
             Expression::Literal(s) => self
                 .transform_expr_literal(s)?
-                .map_owned_or_else(expr, Expression::literal),
+                .map_owned_or_else(expr, Expression::Literal),
             Expression::Column(c) => self
                 .transform_expr_column(c)?
                 .map_owned_or_else(expr, Expression::Column),
