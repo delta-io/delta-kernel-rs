@@ -58,7 +58,7 @@ void scan_row_callback(
   (void)transform; // only used when PRINT_ARROW_DATA is defined
 #endif
   struct EngineContext* context = engine_context;
-  printf("Called back to read file: %.*s. (size: %" PRIu64 ", num records: )\n", (int)path.len, path.ptr, size);
+  print_diag("Called back to read file: %.*s. (size: %" PRIu64 ", num records: )\n", (int)path.len, path.ptr, size);
   if (stats) {
     print_diag("%" PRId64 ")\n", stats->num_records);
   } else {
@@ -71,7 +71,7 @@ void scan_row_callback(
     ExternResultKernelBoolSlice selection_vector_res =
       selection_vector_from_dv(cdv_info->info, context->engine, table_root_slice);
     if (selection_vector_res.tag != OkKernelBoolSlice) {
-      printf("Could not get selection vector from kernel\n");
+      print_diag("Could not get selection vector from kernel\n");
       exit(-1);
     }
     selection_vector = selection_vector_res.ok;
@@ -88,7 +88,6 @@ void scan_row_callback(
   context->partition_values = partition_values;
   print_partition_info(context, partition_values);
 #ifdef PRINT_ARROW_DATA
-  printf("\n\n---test2\n");
   c_read_parquet_file(context, path, selection_vector, transform);
 #endif
   free_bool_slice(selection_vector);
@@ -280,11 +279,11 @@ int main(int argc, char* argv[])
   print_schema(snapshot);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
-  printf("Table root: %s\n", table_root);
+  print_diag("Table root: %s\n", table_root);
 
   PartitionList* partition_cols = get_partition_list(snapshot);
 
-  printf("Starting table scan\n\n");
+  print_diag("Starting table scan\n\n");
 
   ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
   if (scan_res.tag != OkHandleSharedScan) {
@@ -295,7 +294,7 @@ int main(int argc, char* argv[])
   SharedScan* scan = scan_res.ok;
 
   char* scan_table_path = scan_table_root(scan, allocate_string);
-  printf("Scan table root: %s\n", scan_table_path);
+  print_diag("Scan table root: %s\n", scan_table_path);
 
   SharedSchema* logical_schema = scan_logical_schema(scan);
   SharedSchema* physical_schema = scan_physical_schema(scan);
@@ -321,7 +320,7 @@ int main(int argc, char* argv[])
 
   SharedScanMetadataIterator* data_iter = data_iter_res.ok;
 
-  printf("\nIterating scan metadata\n");
+  print_diag("\nIterating scan metadata\n");
 
   // iterate scan files
   for (;;) {
@@ -332,12 +331,12 @@ int main(int argc, char* argv[])
       free_error((Error*)ok_res.err);
       return -1;
     } else if (!ok_res.ok) {
-      printf("Scan metadata iterator done\n");
+      print_diag("Scan metadata iterator done\n");
       break;
     }
   }
 
-  printf("All done reading table data\n");
+  print_diag("All done reading table data\n");
 
 #ifdef PRINT_ARROW_DATA
   print_arrow_context(context.arrow_context);
