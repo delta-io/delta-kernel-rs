@@ -10,6 +10,9 @@ import (
 // FilePrinter implements delta.FileVisitor to print file information
 type FilePrinter struct {
 	fileCount int
+	snapshot  *delta.Snapshot
+	scan      *delta.Scan
+	readData  bool
 }
 
 func (fp *FilePrinter) VisitFile(path string, size int64, stats *delta.Stats, partitionValues map[string]string) {
@@ -25,13 +28,82 @@ func (fp *FilePrinter) VisitFile(path string, size int64, stats *delta.Stats, pa
 			fmt.Printf("      %s = %s\n", k, v)
 		}
 	}
+
+	// If readData flag is set, actually read the file data
+	if fp.readData && fp.snapshot != nil && fp.scan != nil {
+		fmt.Printf("    Reading data from file...\n")
+
+		// Get table root for constructing full path
+		tableRoot, err := fp.scan.TableRoot()
+		if err != nil {
+			fmt.Printf("    Error getting table root: %v\n", err)
+			fmt.Println()
+			return
+		}
+
+		// Construct full file path
+		fullPath := tableRoot + "/" + path
+
+		// Create FileMeta
+		fileMeta := &delta.FileMeta{
+			Path:         fullPath,
+			LastModified: 0, // Not available from scan metadata
+			Size:         uint64(size),
+		}
+
+		// Create file read iterator using scan.ReadFile
+		readIter, err := fp.scan.ReadFile(fp.snapshot.Engine(), fileMeta)
+		if err != nil {
+			fmt.Printf("    Error creating file read iterator: %v\n", err)
+			fmt.Println()
+			return
+		}
+		defer readIter.Close()
+
+		// Read data batches
+		batchVisitor := &DataBatchVisitor{}
+		for {
+			hasMore, err := readIter.Next(batchVisitor)
+			if err != nil {
+				fmt.Printf("    Error reading data: %v\n", err)
+				break
+			}
+			if !hasMore {
+				break
+			}
+		}
+
+		fmt.Printf("    Total batches read: %d\n", batchVisitor.batchCount)
+		fmt.Printf("    Total rows read: %d\n", batchVisitor.totalRows)
+	}
+
 	fmt.Println()
+}
+
+// DataBatchVisitor implements delta.EngineDataVisitor to process data batches
+type DataBatchVisitor struct {
+	batchCount int
+	totalRows  uint64
+}
+
+func (dbv *DataBatchVisitor) VisitEngineData(data *delta.EngineData) bool {
+	dbv.batchCount++
+	length := data.Length()
+	dbv.totalRows += length
+
+	// Note: data.Close() is not called here because the caller owns the handle
+	// The kernel will free it after the callback returns
+
+	return true // Continue iteration
 }
 
 // MetadataCollector implements delta.ScanMetadataVisitor to collect scan metadata
 type MetadataCollector struct {
-	chunkCount  int
-	totalFiles  int
+	chunkCount int
+	totalFiles int
+	snapshot   *delta.Snapshot
+	scan       *delta.Scan
+	readData   bool
 }
 
 func (mc *MetadataCollector) VisitScanMetadata(metadata *delta.ScanMetadata) bool {
@@ -39,7 +111,11 @@ func (mc *MetadataCollector) VisitScanMetadata(metadata *delta.ScanMetadata) boo
 	fmt.Printf("\n=== Scan Metadata Chunk #%d ===\n\n", mc.chunkCount)
 
 	// Visit all files in this chunk
-	filePrinter := &FilePrinter{}
+	filePrinter := &FilePrinter{
+		snapshot: mc.snapshot,
+		scan:     mc.scan,
+		readData: mc.readData,
+	}
 	err := metadata.VisitFiles(filePrinter)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error visiting files: %v\n", err)
@@ -55,15 +131,24 @@ func (mc *MetadataCollector) VisitScanMetadata(metadata *delta.ScanMetadata) boo
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <table_path>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <table_path> [--read-data]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nExample:\n")
 		fmt.Fprintf(os.Stderr, "  %s /path/to/delta/table\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s /path/to/delta/table --read-data\n", os.Args[0])
 		os.Exit(1)
 	}
 
 	tablePath := os.Args[1]
+	readData := false
+	if len(os.Args) > 2 && os.Args[2] == "--read-data" {
+		readData = true
+	}
 
-	fmt.Printf("Reading Delta table at: %s\n\n", tablePath)
+	fmt.Printf("Reading Delta table at: %s\n", tablePath)
+	if readData {
+		fmt.Printf("Data reading: ENABLED\n")
+	}
+	fmt.Println()
 
 	// Create a snapshot of the table
 	snapshot, err := delta.NewSnapshot(tablePath)
@@ -107,7 +192,11 @@ func main() {
 	fmt.Println("=== Starting Scan ===")
 
 	// Iterate over scan metadata
-	collector := &MetadataCollector{}
+	collector := &MetadataCollector{
+		snapshot: snapshot,
+		scan:     scan,
+		readData: readData,
+	}
 	for {
 		hasMore, err := iter.Next(collector)
 		if err != nil {

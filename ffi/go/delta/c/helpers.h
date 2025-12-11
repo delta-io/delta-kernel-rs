@@ -80,3 +80,7 @@ struct EngineError* get_err_scan_metadata_iter(struct ExternResultHandleSharedSc
 HandleSharedScanMetadataIterator get_ok_scan_metadata_iter(struct ExternResultHandleSharedScanMetadataIterator result);
 struct EngineError* get_err_bool(struct ExternResultbool result);
 bool get_ok_bool(struct ExternResultbool result);
+
+// File read result iterator helpers
+struct EngineError* get_err_file_read_result_iter(struct ExternResultHandleExclusiveFileReadResultIterator result);
+HandleExclusiveFileReadResultIterator get_ok_file_read_result_iter(struct ExternResultHandleExclusiveFileReadResultIterator result);

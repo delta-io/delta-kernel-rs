@@ -85,6 +85,18 @@ func (sc *Scan) PhysicalSchema() (*Schema, error) {
 	return builder.Build(rootListID), nil
 }
 
+// PhysicalSchemaHandle returns the raw C handle for the physical schema
+// This is useful when you need to pass the schema to FFI functions
+func (sc *Scan) PhysicalSchemaHandle() C.HandleSharedSchema {
+	return sc.physicalSchema
+}
+
+// ReadFile creates an iterator to read data from a parquet file
+// The engine parameter should typically come from snapshot.Engine()
+func (sc *Scan) ReadFile(engine C.HandleSharedExternEngine, file *FileMeta) (*FileReadResultIterator, error) {
+	return readParquetFile(engine, file, sc.physicalSchema)
+}
+
 // TableRoot returns the root path of the table for this scan
 func (sc *Scan) TableRoot() (string, error) {
 	cStr := C.get_scan_table_root(sc.handle)

@@ -244,4 +244,13 @@ bool get_ok_bool(struct ExternResultbool result) {
     return result.ok;
 }
 
+struct EngineError* get_err_file_read_result_iter(struct ExternResultHandleExclusiveFileReadResultIterator result) {
+    return result.err;
+}
+
+HandleExclusiveFileReadResultIterator get_ok_file_read_result_iter(struct ExternResultHandleExclusiveFileReadResultIterator result) {
+    return result.ok;
+}
+
 // Scan metadata visitor C wrappers are in scan_helpers.c
+// Engine data visitor C wrappers are in read_data_helpers.c

@@ -5,12 +5,7 @@ package delta
 #cgo LDFLAGS: -L${SRCDIR}/../../../target/release -ldelta_kernel_ffi
 #include "delta_kernel_ffi.h"
 #include "helpers.h"
-
-// Forward declare C wrapper functions (implemented in scan_data_wrappers.go)
-void c_visit_scan_metadata(void* data, HandleSharedScanMetadata scanMetadata);
-void c_visit_scan_file(void* data, struct KernelStringSlice path, int64_t size,
-                       const struct Stats* stats, const struct CDvInfo* dv_info,
-                       const struct Expression* transform, const struct CStringMap* partition_map);
+#include "scan_helpers.h"
 */
 import "C"
 import (
