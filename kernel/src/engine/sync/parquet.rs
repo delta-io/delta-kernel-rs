@@ -28,6 +28,7 @@ fn try_create_from_parquet(
     schema: SchemaRef,
     _arrow_schema: ArrowSchemaRef,
     predicate: Option<PredicateRef>,
+    file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let metadata = ArrowReaderMetadata::load(&file, Default::default())?;
     let parquet_schema = metadata.schema();
@@ -48,7 +49,14 @@ fn try_create_from_parquet(
 
     let mut row_indexes = row_indexes.map(|rb| rb.build()).transpose()?;
     let stream = builder.build()?;
-    Ok(stream.map(move |rbr| fixup_parquet_read(rbr?, &requested_ordering, row_indexes.as_mut())))
+    Ok(stream.map(move |rbr| {
+        fixup_parquet_read(
+            rbr?,
+            &requested_ordering,
+            row_indexes.as_mut(),
+            Some(&file_location),
+        )
+    }))
 }
 
 impl ParquetHandler for SyncParquetHandler {
