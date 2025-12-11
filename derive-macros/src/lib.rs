@@ -3,7 +3,8 @@ use quote::{quote, quote_spanned, ToTokens};
 use syn::parse_macro_input;
 use syn::spanned::Spanned;
 use syn::{
-    Data, DataStruct, DeriveInput, Error, Fields, Item, Meta, PathArguments, Type, Visibility,
+    Data, DataStruct, DeriveInput, Error, Fields, GenericArgument, Item, Meta, PathArguments,
+    PathSegment, Type, TypePath, Visibility,
 };
 
 /// Parses a dot-delimited column name into an array of field names. See
@@ -82,6 +83,20 @@ fn get_schema_name(name: &Ident) -> Ident {
     Ident::new(&ret, name.span())
 }
 
+fn option_contains_hashmap(segment: &PathSegment) -> bool {
+    if segment.ident != "Option" {
+        return false;
+    }
+    if let PathArguments::AngleBracketed(args) = &segment.arguments {
+        if let Some(GenericArgument::Type(Type::Path(TypePath { path, .. }))) = args.args.first() {
+            if let Some(last_segment) = path.segments.last() {
+                return last_segment.ident == "HashMap";
+            }
+        }
+    }
+    false
+}
+
 fn gen_schema_fields(data: &Data) -> TokenStream {
     let fields = match data {
         Data::Struct(DataStruct {
@@ -119,11 +134,11 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
                     }
                 });
                 if have_schema_null {
-                    if let Some(last_ident) = type_path.path.segments.last().map(|seg| &seg.ident) {
-                        if last_ident != "HashMap" {
+                    if let Some(segment) = type_path.path.segments.last() {
+                        if segment.ident != "HashMap" && !option_contains_hashmap(segment) {
                            return Error::new(
-                                last_ident.span(),
-                                format!("Can only use allow_null_container_values on HashMap fields, not {last_ident}")
+                                segment.ident.span(),
+                                format!("Can only use allow_null_container_values on HashMap or Option<HashMap> fields, not {}", quote!(#segment))
                             ).to_compile_error()
                         }
                     }
