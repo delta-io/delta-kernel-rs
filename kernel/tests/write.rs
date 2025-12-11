@@ -2135,7 +2135,7 @@ async fn test_update_deletion_vectors_adds_expected_entries(
     dv_map.insert(file_path.to_string(), new_dv);
 
     // Call update_deletion_vectors to exercise the API
-    txn.update_deletion_vectors(dv_map, scan_files.into_iter())?;
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
 
     // Commit the transaction
     let result = txn.commit(engine.as_ref())?;
@@ -2422,7 +2422,7 @@ async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std
         dv_map.insert(file_path.to_string(), descriptor);
     }
 
-    txn.update_deletion_vectors(dv_map, scan_files.drain(..))?;
+    txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
 
     // Commit the transaction
     let result = txn.commit(engine.as_ref())?;
