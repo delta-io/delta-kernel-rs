@@ -45,7 +45,7 @@ clean:
 
 # Run tests
 test: rust-ffi
-	$(LIB_PATH_VAR)=$(LIB_PATH):$$$(LIB_PATH_VAR) go test -v ./...
+	$(LIB_PATH_VAR)=$(LIB_PATH):$$$(LIB_PATH_VAR) go test -v ./delta/...
 
 # Run acceptance tests only
 test-acceptance: rust-ffi
