@@ -406,3 +406,290 @@ fn test_timestamp_predicates_dont_data_skip() {
         );
     }
 }
+
+// Tests for DataSkippingFilter::apply() with parsed stats
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::arrow::array::{Array, Int32Array, Int64Array, StringArray, StructArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::sync::SyncEngine;
+    use crate::schema::StructType;
+    use crate::DeltaResult;
+    use crate::Engine;
+    use std::sync::Arc;
+
+    /// Helper to create a DataSkippingFilter for a predicate on column "value" (INTEGER type)
+    fn create_filter_for_value_column(engine: &dyn Engine) -> Option<DataSkippingFilter> {
+        // Create a predicate: value > 5
+        let predicate: PredicateRef = Arc::new(Pred::gt(column_expr!("value"), Expr::literal(5)));
+        let referenced_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            crate::schema::StructField::nullable("value", DataType::INTEGER),
+        ]));
+        DataSkippingFilter::new(engine, Some((predicate, referenced_schema)))
+    }
+
+    /// Creates mock checkpoint data with stats_parsed field
+    /// Returns EngineData with structure: { add: { stats_parsed: { numRecords, nullCount, minValues, maxValues } } }
+    fn create_checkpoint_data_with_parsed_stats(
+        num_records: i64,
+        min_value: i32,
+        max_value: i32,
+        null_count: i64,
+    ) -> DeltaResult<Box<dyn crate::EngineData>> {
+        // Build the nested struct arrays for stats_parsed
+        // Structure: stats_parsed: { numRecords: Long, nullCount: { value: Long }, minValues: { value: Int }, maxValues: { value: Int } }
+
+        // nullCount.value
+        let null_count_value_array = Arc::new(Int64Array::from(vec![null_count]));
+        let null_count_fields = Fields::from(vec![Field::new("value", ArrowDataType::Int64, true)]);
+        let null_count_struct = StructArray::new(
+            null_count_fields,
+            vec![null_count_value_array as Arc<dyn Array>],
+            None,
+        );
+
+        // minValues.value
+        let min_values_value_array = Arc::new(Int32Array::from(vec![min_value]));
+        let min_values_fields = Fields::from(vec![Field::new("value", ArrowDataType::Int32, true)]);
+        let min_values_struct = StructArray::new(
+            min_values_fields,
+            vec![min_values_value_array as Arc<dyn Array>],
+            None,
+        );
+
+        // maxValues.value
+        let max_values_value_array = Arc::new(Int32Array::from(vec![max_value]));
+        let max_values_fields = Fields::from(vec![Field::new("value", ArrowDataType::Int32, true)]);
+        let max_values_struct = StructArray::new(
+            max_values_fields,
+            vec![max_values_value_array as Arc<dyn Array>],
+            None,
+        );
+
+        // numRecords
+        let num_records_array = Arc::new(Int64Array::from(vec![num_records]));
+
+        // stats_parsed struct
+        let stats_parsed_fields = Fields::from(vec![
+            Field::new("numRecords", ArrowDataType::Int64, true),
+            Field::new(
+                "nullCount",
+                ArrowDataType::Struct(null_count_struct.fields().clone()),
+                true,
+            ),
+            Field::new(
+                "minValues",
+                ArrowDataType::Struct(min_values_struct.fields().clone()),
+                true,
+            ),
+            Field::new(
+                "maxValues",
+                ArrowDataType::Struct(max_values_struct.fields().clone()),
+                true,
+            ),
+        ]);
+        let stats_parsed_struct = StructArray::new(
+            stats_parsed_fields.clone(),
+            vec![
+                num_records_array as Arc<dyn Array>,
+                Arc::new(null_count_struct) as Arc<dyn Array>,
+                Arc::new(min_values_struct) as Arc<dyn Array>,
+                Arc::new(max_values_struct) as Arc<dyn Array>,
+            ],
+            None,
+        );
+
+        // add struct with stats_parsed
+        let add_fields = Fields::from(vec![Field::new(
+            "stats_parsed",
+            ArrowDataType::Struct(stats_parsed_fields),
+            true,
+        )]);
+        let add_struct = StructArray::new(
+            add_fields.clone(),
+            vec![Arc::new(stats_parsed_struct) as Arc<dyn Array>],
+            None,
+        );
+
+        // Create RecordBatch with { add: ... }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "add",
+            ArrowDataType::Struct(add_fields),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(add_struct)])?;
+
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    /// Creates mock log data with JSON stats field
+    fn create_log_data_with_json_stats(
+        stats_json: &str,
+    ) -> DeltaResult<Box<dyn crate::EngineData>> {
+        // Build add struct with stats as a string
+        let stats_array = Arc::new(StringArray::from(vec![stats_json]));
+
+        let add_fields = Fields::from(vec![Field::new("stats", ArrowDataType::Utf8, true)]);
+        let add_struct = StructArray::new(
+            add_fields.clone(),
+            vec![stats_array as Arc<dyn Array>],
+            None,
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "add",
+            ArrowDataType::Struct(add_fields),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(add_struct)])?;
+
+        Ok(Box::new(ArrowEngineData::new(batch)))
+    }
+
+    #[test]
+    fn test_apply_with_json_stats_keeps_file() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let filter = create_filter_for_value_column(&engine).expect("Failed to create filter");
+
+        // Create log data where min=0, max=10 - file should be KEPT (max > 5)
+        let stats_json = r#"{"numRecords":100,"minValues":{"value":0},"maxValues":{"value":10},"nullCount":{"value":0}}"#;
+        let data = create_log_data_with_json_stats(stats_json)?;
+
+        // Apply with is_log_batch=true, use_parsed_stats=false (JSON path)
+        let selection = filter.apply(data.as_ref(), true, false)?;
+
+        assert_eq!(selection.len(), 1);
+        assert!(
+            selection[0],
+            "File should be kept when max > predicate value"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_with_json_stats_skips_file() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let filter = create_filter_for_value_column(&engine).expect("Failed to create filter");
+
+        // Create log data where min=0, max=3 - file should be SKIPPED (max <= 5)
+        let stats_json = r#"{"numRecords":100,"minValues":{"value":0},"maxValues":{"value":3},"nullCount":{"value":0}}"#;
+        let data = create_log_data_with_json_stats(stats_json)?;
+
+        // Apply with is_log_batch=true, use_parsed_stats=false (JSON path)
+        let selection = filter.apply(data.as_ref(), true, false)?;
+
+        assert_eq!(selection.len(), 1);
+        assert!(
+            !selection[0],
+            "File should be skipped when max <= predicate value"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_with_parsed_stats_keeps_file() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let filter = create_filter_for_value_column(&engine).expect("Failed to create filter");
+
+        // Create checkpoint data where min=0, max=10 - file should be KEPT (max > 5)
+        let data = create_checkpoint_data_with_parsed_stats(
+            100, // numRecords
+            0,   // minValue
+            10,  // maxValue
+            0,   // nullCount
+        )?;
+
+        // Apply with is_log_batch=false, use_parsed_stats=true (parsed stats path)
+        let selection = filter.apply(data.as_ref(), false, true)?;
+
+        assert_eq!(selection.len(), 1);
+        assert!(
+            selection[0],
+            "File should be kept when max > predicate value (parsed stats)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_with_parsed_stats_skips_file() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let filter = create_filter_for_value_column(&engine).expect("Failed to create filter");
+
+        // Create checkpoint data where min=0, max=3 - file should be SKIPPED (max <= 5)
+        let data = create_checkpoint_data_with_parsed_stats(
+            100, // numRecords
+            0,   // minValue
+            3,   // maxValue
+            0,   // nullCount
+        )?;
+
+        // Apply with is_log_batch=false, use_parsed_stats=true (parsed stats path)
+        let selection = filter.apply(data.as_ref(), false, true)?;
+
+        assert_eq!(selection.len(), 1);
+        assert!(
+            !selection[0],
+            "File should be skipped when max <= predicate value (parsed stats)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_checkpoint_without_parsed_stats_uses_json() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let filter = create_filter_for_value_column(&engine).expect("Failed to create filter");
+
+        // Create log data (even though is_log_batch=false, use_parsed_stats=false should use JSON)
+        let stats_json = r#"{"numRecords":100,"minValues":{"value":0},"maxValues":{"value":10},"nullCount":{"value":0}}"#;
+        let data = create_log_data_with_json_stats(stats_json)?;
+
+        // Apply with is_log_batch=false, use_parsed_stats=false (should still use JSON path)
+        let selection = filter.apply(data.as_ref(), false, false)?;
+
+        assert_eq!(selection.len(), 1);
+        assert!(
+            selection[0],
+            "File should be kept (JSON path even for checkpoint)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_apply_parsed_stats_fallback_on_error() -> DeltaResult<()> {
+        let engine = SyncEngine::new();
+        let filter = create_filter_for_value_column(&engine).expect("Failed to create filter");
+
+        // Create data WITHOUT stats_parsed - should fallback to keeping all files
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "add",
+            ArrowDataType::Struct(Fields::from(vec![Field::new(
+                "path",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            true,
+        )]));
+        let path_array = Arc::new(StringArray::from(vec!["test.parquet"]));
+        let add_struct = StructArray::new(
+            Fields::from(vec![Field::new("path", ArrowDataType::Utf8, true)]),
+            vec![path_array as Arc<dyn Array>],
+            None,
+        );
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(add_struct)])?;
+        let data: Box<dyn crate::EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        // Apply with use_parsed_stats=true but data doesn't have stats_parsed
+        // Should fallback to keeping all files (selection = [true])
+        let selection = filter.apply(data.as_ref(), false, true)?;
+
+        assert_eq!(selection.len(), 1);
+        assert!(
+            selection[0],
+            "Should keep file when parsed stats extraction fails"
+        );
+        Ok(())
+    }
+}
