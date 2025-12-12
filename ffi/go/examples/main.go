@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/delta-io/delta-kernel-go/delta"
+	"github.com/olekukonko/tablewriter"
 )
 
 /*
@@ -321,42 +322,41 @@ func (dbv *DataBatchVisitor) VisitEngineData(data *delta.EngineData) bool {
 			return true
 		}
 
-		fmt.Printf("      Columns: ")
 		numCols := arrowData.NumColumns()
-		for i := 0; i < int(numCols); i++ {
-			if i > 0 {
-				fmt.Printf(", ")
-			}
-			fmt.Printf("%s (%s)", arrowData.ColumnName(i), arrowData.ColumnFormat(i))
-		}
-		fmt.Printf("\n")
-
 		numRows := arrowData.NumRows()
-		maxRowsToPrint := int64(5)
+		maxRowsToPrint := int64(50)
 		if numRows < maxRowsToPrint {
 			maxRowsToPrint = numRows
 		}
 
 		if maxRowsToPrint > 0 {
-			fmt.Printf("      First %d rows:\n", maxRowsToPrint)
+			// Create table
+			table := tablewriter.NewWriter(os.Stdout)
+
+			// Set table header with column names
+			header := make([]any, numCols)
+			for i := 0; i < int(numCols); i++ {
+				header[i] = arrowData.ColumnName(i)
+			}
+			table.Header(header...)
+
+			// Add rows to table
 			for row := int64(0); row < maxRowsToPrint; row++ {
-				fmt.Printf("        Row %d: ", row)
+				rowData := make([]any, numCols)
 				for col := 0; col < int(numCols); col++ {
-					if col > 0 {
-						fmt.Printf(", ")
-					}
-
-					colName := arrowData.ColumnName(col)
 					value, isValid := arrowData.GetValue(col, row)
-
 					if isValid {
-						fmt.Printf("%s=%v", colName, value)
+						rowData[col] = fmt.Sprintf("%v", value)
 					} else {
-						fmt.Printf("%s=null", colName)
+						rowData[col] = "NULL"
 					}
 				}
-				fmt.Printf("\n")
+				table.Append(rowData...)
 			}
+
+			// Render table
+			fmt.Printf("      First %d rows:\n", maxRowsToPrint)
+			table.Render()
 		}
 	}
 

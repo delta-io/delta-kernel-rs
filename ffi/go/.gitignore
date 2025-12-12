@@ -1,5 +1,6 @@
 # Binaries
-examples/describe_schema
+examples/delta-example
+bin
 *.exe
 *.test
 
