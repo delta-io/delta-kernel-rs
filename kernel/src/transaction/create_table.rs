@@ -38,6 +38,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use url::Url;
 
@@ -48,7 +49,11 @@ use crate::actions::{
 use crate::clustering::ClusteringMetadataDomain;
 use crate::committer::Committer;
 use crate::schema::{ColumnName, SchemaRef};
-use crate::table_features::{extract_feature_overrides, TableFeature};
+use crate::table_features::{
+    assign_column_mapping_metadata, extract_feature_overrides,
+    get_column_mapping_mode_from_properties, ColumnMappingMode, TableFeature,
+    COLUMN_MAPPING_MAX_COLUMN_ID_KEY,
+};
 use crate::transaction::data_layout::{DataLayout, MAX_CLUSTERING_COLUMNS};
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
@@ -76,6 +81,18 @@ struct ProcessedDataLayout {
     /// Domain metadata for clustering (None if not clustered).
     clustering_domain_metadata: Option<DomainMetadata>,
     /// Additional writer features required by the layout.
+    additional_writer_features: Vec<String>,
+}
+
+/// Result of processing column mapping configuration.
+struct ProcessedColumnMapping {
+    /// Updated schema with column mapping metadata (ID and physical name for each field).
+    schema: SchemaRef,
+    /// Updated properties including delta.columnMapping.maxColumnId.
+    properties: HashMap<String, String>,
+    /// Additional reader features required (columnMapping if mode is name or id).
+    additional_reader_features: Vec<String>,
+    /// Additional writer features required (columnMapping if mode is name or id).
     additional_writer_features: Vec<String>,
 }
 
@@ -283,6 +300,109 @@ impl CreateTableTransactionBuilder {
         })
     }
 
+    /// Processes column mapping configuration and updates schema/properties if needed.
+    ///
+    /// When column mapping mode is `name` or `id`, this function:
+    /// 1. Assigns unique column IDs to each field
+    /// 2. Assigns unique physical names (format: `col-{uuid}`) to each field
+    /// 3. Updates the `delta.columnMapping.maxColumnId` table property
+    /// 4. Adds `columnMapping` to the required features list
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The table schema
+    /// * `properties` - The table properties (must include `delta.columnMapping.mode` if enabled)
+    ///
+    /// # Returns
+    ///
+    /// A [`ProcessedColumnMapping`] with the updated schema, properties, and required features.
+    fn process_column_mapping(
+        schema: &SchemaRef,
+        properties: &HashMap<String, String>,
+    ) -> DeltaResult<ProcessedColumnMapping> {
+        let mode = get_column_mapping_mode_from_properties(properties)?;
+
+        match mode {
+            ColumnMappingMode::None => Ok(ProcessedColumnMapping {
+                schema: schema.clone(),
+                properties: properties.clone(),
+                additional_reader_features: vec![],
+                additional_writer_features: vec![],
+            }),
+            ColumnMappingMode::Name | ColumnMappingMode::Id => {
+                // For CREATE TABLE, start from 0. The maxColumnId property is an internal
+                // property managed by the kernel, not user-specified.
+                // assign_column_mapping_metadata will assign sequential IDs and track
+                // the max ID, which we then store in the table properties.
+                let mut max_id = 0i64;
+
+                // Assign column mapping metadata to all fields
+                let updated_schema = assign_column_mapping_metadata(schema, &mut max_id)?;
+
+                // Update properties with maxColumnId
+                let mut updated_props = properties.clone();
+                updated_props.insert(
+                    COLUMN_MAPPING_MAX_COLUMN_ID_KEY.to_string(),
+                    max_id.to_string(),
+                );
+
+                // columnMapping is a ReaderWriter feature
+                let feature_name = TableFeature::ColumnMapping.to_string();
+
+                Ok(ProcessedColumnMapping {
+                    schema: Arc::new(updated_schema),
+                    properties: updated_props,
+                    additional_reader_features: vec![feature_name.clone()],
+                    additional_writer_features: vec![feature_name],
+                })
+            }
+        }
+    }
+
+    /// Applies column mapping processing to the schema and updates extracted features.
+    ///
+    /// This method:
+    /// 1. Processes column mapping (assigns IDs and physical names if enabled)
+    /// 2. Updates extracted features with column mapping reader/writer features
+    /// 3. Updates properties with `delta.columnMapping.maxColumnId`
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The table schema
+    /// * `extracted` - The extracted features (will be updated with column mapping results)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (updated schema, column mapping mode) for use in subsequent processing.
+    fn apply_column_mapping(
+        schema: &SchemaRef,
+        extracted: &mut ExtractedFeatures,
+    ) -> DeltaResult<(SchemaRef, ColumnMappingMode)> {
+        // Process column mapping (assigns IDs and physical names if enabled)
+        let column_mapping = Self::process_column_mapping(schema, &extracted.cleaned_properties)?;
+
+        // Get the column mapping mode for use in data layout processing
+        let column_mapping_mode =
+            get_column_mapping_mode_from_properties(&column_mapping.properties)?;
+
+        // Update properties with column mapping results (includes maxColumnId if CM enabled)
+        extracted.cleaned_properties = column_mapping.properties;
+
+        // Add column mapping features if enabled
+        for feature in column_mapping.additional_reader_features {
+            if !extracted.reader_features.contains(&feature) {
+                extracted.reader_features.push(feature);
+            }
+        }
+        for feature in column_mapping.additional_writer_features {
+            if !extracted.writer_features.contains(&feature) {
+                extracted.writer_features.push(feature);
+            }
+        }
+
+        Ok((column_mapping.schema, column_mapping_mode))
+    }
+
     /// Ensures no table exists at the given path by checking for the _delta_log directory.
     ///
     /// # Errors
@@ -380,7 +500,8 @@ impl CreateTableTransactionBuilder {
     /// # Arguments
     ///
     /// * `data_layout` - The data layout specification
-    /// * `schema` - The table schema (for validation)
+    /// * `schema` - The table schema (for validation, must have column mapping metadata if CM enabled)
+    /// * `column_mapping_mode` - The column mapping mode for the table
     ///
     /// # Returns
     ///
@@ -391,6 +512,7 @@ impl CreateTableTransactionBuilder {
     fn process_data_layout(
         data_layout: &DataLayout,
         schema: &SchemaRef,
+        column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<ProcessedDataLayout> {
         match data_layout {
             DataLayout::None => Ok(ProcessedDataLayout {
@@ -408,7 +530,9 @@ impl CreateTableTransactionBuilder {
                 Self::validate_clustering_columns(cols, schema)?;
 
                 // Create clustering domain metadata
-                let clustering_metadata = ClusteringMetadataDomain::new(cols);
+                // When column mapping is enabled, we need to store physical column names
+                let clustering_metadata =
+                    ClusteringMetadataDomain::new_with_schema(cols, schema, column_mapping_mode)?;
                 let domain_metadata = clustering_metadata.to_domain_metadata()?;
 
                 // Clustering requires these features
@@ -487,8 +611,13 @@ impl CreateTableTransactionBuilder {
         // Extract feature overrides and build reader/writer feature lists
         let mut extracted = Self::extract_table_features(table_properties)?;
 
-        // Process data layout (partitioning or clustering)
-        let layout = Self::process_data_layout(&self.data_layout, &self.schema)?;
+        // Process column mapping FIRST (before data layout, as clustering needs physical names)
+        let (schema_with_cm, column_mapping_mode) =
+            Self::apply_column_mapping(&self.schema, &mut extracted)?;
+
+        // Process data layout (partitioning or clustering) using the updated schema
+        let layout =
+            Self::process_data_layout(&self.data_layout, &schema_with_cm, column_mapping_mode)?;
 
         // Add any features required by the data layout
         for feature in layout.additional_writer_features {
@@ -508,11 +637,11 @@ impl CreateTableTransactionBuilder {
         // Get current timestamp
         let created_time = current_time_ms()?;
 
-        // Create Metadata action with cleaned properties (feature overrides removed)
+        // Create Metadata action with the updated schema (with column mapping metadata if enabled)
         let metadata = Metadata::try_new(
             None, // name
             None, // description
-            (*self.schema).clone(),
+            (*schema_with_cm).clone(),
             layout.partition_columns,
             created_time,
             extracted.cleaned_properties,
