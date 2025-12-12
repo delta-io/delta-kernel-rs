@@ -61,7 +61,9 @@ func (fp *FilePrinter) VisitFile(path string, size int64, stats *delta.Stats, pa
 		defer readIter.Close()
 
 		// Read data batches
-		batchVisitor := &DataBatchVisitor{}
+		batchVisitor := &DataBatchVisitor{
+			printData: true, // Always print data when reading
+		}
 		for {
 			hasMore, err := readIter.Next(batchVisitor)
 			if err != nil {
@@ -84,12 +86,17 @@ func (fp *FilePrinter) VisitFile(path string, size int64, stats *delta.Stats, pa
 type DataBatchVisitor struct {
 	batchCount int
 	totalRows  uint64
+	printData  bool
 }
 
 func (dbv *DataBatchVisitor) VisitEngineData(data *delta.EngineData) bool {
 	dbv.batchCount++
 	length := data.Length()
 	dbv.totalRows += length
+
+	if dbv.printData {
+		fmt.Printf("      Batch #%d: %d rows\n", dbv.batchCount, length)
+	}
 
 	// Note: data.Close() is not called here because the caller owns the handle
 	// The kernel will free it after the callback returns

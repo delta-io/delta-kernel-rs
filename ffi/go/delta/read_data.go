@@ -108,6 +108,10 @@ func (ed *EngineData) GetRawData() unsafe.Pointer {
 	return C.get_raw_engine_data(ed.handle)
 }
 
+// TODO: ToArrowRecord - Convert engine data to Arrow Record
+// This requires properly handling the Arrow C Data Interface
+// For now, use GetRawData() if you need access to the underlying data pointer
+
 // Close releases the iterator resources
 func (it *FileReadResultIterator) Close() {
 	if it.handle != nil {
