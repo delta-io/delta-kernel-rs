@@ -125,6 +125,9 @@ arrow-expression = ["need-arrow"]
 # enables new experimental catalog-managed tables support
 catalog-managed = []
 
+# Schema diffing functionality (experimental)
+schema-diff = []
+
 # this is an 'internal' feature flag which has all the shared bits from default-engine and
 # default-engine-rustls
 default-engine-base = [
