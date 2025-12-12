@@ -604,6 +604,20 @@ where
     }
 }
 
+impl<T> TryFrom<Option<Vec<T>>> for Scalar
+where
+    T: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(opt: Option<Vec<T>>) -> Result<Self, Self::Error> {
+        match opt {
+            Some(vec) => vec.try_into(),
+            None => Ok(Self::Null(ArrayType::new(T::to_data_type(), false).into())),
+        }
+    }
+}
+
 impl<K, V> TryFrom<HashMap<K, V>> for Scalar
 where
     K: Into<Scalar> + ToDataType,
@@ -629,6 +643,23 @@ where
         let map_type = MapType::new(K::to_data_type(), V::to_data_type(), true);
         let map_data = MapData::try_new(map_type, map)?;
         Ok(map_data.into())
+    }
+}
+
+impl<K, V> TryFrom<Option<HashMap<K, V>>> for Scalar
+where
+    K: Into<Scalar> + ToDataType,
+    V: Into<Scalar> + ToDataType,
+{
+    type Error = Error;
+
+    fn try_from(opt: Option<HashMap<K, V>>) -> Result<Self, Self::Error> {
+        match opt {
+            Some(map) => map.try_into(),
+            None => Ok(Self::Null(
+                MapType::new(K::to_data_type(), V::to_data_type(), false).into(),
+            )),
+        }
     }
 }
 
