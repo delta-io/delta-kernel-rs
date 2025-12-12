@@ -134,3 +134,29 @@ func TestProjectionNilOptions(t *testing.T) {
 	// Should have all fields
 	require.Equal(t, 12, len(schema.Fields))
 }
+
+func TestProjectionWithBoolean(t *testing.T) {
+	path := "../../../acceptance/tests/dat/out/reader_tests/generated/all_primitive_types/delta"
+
+	snapshot, err := NewSnapshot(path)
+	require.NoError(t, err)
+	defer snapshot.Close()
+
+	// Test that boolean projection now works (was causing SIGSEGV before)
+	scan, err := snapshot.ScanWithOptions(&ScanOptions{
+		Columns: []string{"bool", "utf8"},
+	})
+	require.NoError(t, err)
+	defer scan.Close()
+
+	schema, err := scan.LogicalSchema()
+	require.NoError(t, err)
+
+	require.Equal(t, 2, len(schema.Fields))
+	require.Equal(t, "bool", schema.Fields[0].Name)
+	require.Equal(t, "boolean", schema.Fields[0].DataType)
+	require.Equal(t, "utf8", schema.Fields[1].Name)
+	require.Equal(t, "string", schema.Fields[1].DataType)
+
+	t.Log("✓ Boolean projection works correctly!")
+}

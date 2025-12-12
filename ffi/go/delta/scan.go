@@ -209,9 +209,9 @@ func (sc *Scan) Close() {
 // ProjectionBuilder implements SchemaVisitor to build a projected schema
 // It visits the original schema and adds only selected fields to the kernel state
 type ProjectionBuilder struct {
-	projection []string                           // column names to include
-	state      *C.struct_KernelSchemaVisitorState // target state to build schema
-	fieldIDs   []C.uintptr_t                      // collected field IDs for final struct
+	projection []string                              // column names to include (in requested order)
+	state      *C.struct_KernelSchemaVisitorState    // target state to build schema
+	fieldMap   map[string]C.uintptr_t                // maps field name to field ID
 }
 
 // NewProjectionBuilder creates a new projection builder
@@ -219,7 +219,7 @@ func NewProjectionBuilder(columns []string, state *C.struct_KernelSchemaVisitorS
 	return &ProjectionBuilder{
 		projection: columns,
 		state:      state,
-		fieldIDs:   make([]C.uintptr_t, 0, len(columns)),
+		fieldMap:   make(map[string]C.uintptr_t),
 	}
 }
 
@@ -257,7 +257,7 @@ func (p *ProjectionBuilder) addFieldViaFFI(name string, nullable bool, visitFn f
 	result := visitFn(nameSlice, C.bool(nullable))
 	if result.tag == C.Okusize {
 		fieldID := C.get_ok_field_id(result)
-		p.fieldIDs = append(p.fieldIDs, fieldID)
+		p.fieldMap[name] = fieldID
 	}
 }
 
@@ -352,17 +352,30 @@ func (p *ProjectionBuilder) VisitDecimal(siblingListID int, name string, nullabl
 }
 
 // BuildFinalStruct builds the final projected struct from collected field IDs
+// The fields are added in the order specified by the user's projection list
 func (p *ProjectionBuilder) BuildFinalStruct() (C.uintptr_t, error) {
-	if len(p.fieldIDs) == 0 {
+	if len(p.fieldMap) == 0 {
 		return 0, fmt.Errorf("no fields in projection")
 	}
 
+	// Build field IDs array in the user's requested order
+	fieldIDs := make([]C.uintptr_t, 0, len(p.projection))
+	for _, colName := range p.projection {
+		if fieldID, ok := p.fieldMap[colName]; ok {
+			fieldIDs = append(fieldIDs, fieldID)
+		}
+	}
+
+	if len(fieldIDs) == 0 {
+		return 0, fmt.Errorf("no fields found in field map")
+	}
+
 	// Convert field IDs to C array
-	fieldIDsPtr := (*C.uintptr_t)(C.malloc(C.size_t(len(p.fieldIDs)) * C.size_t(unsafe.Sizeof(C.uintptr_t(0)))))
+	fieldIDsPtr := (*C.uintptr_t)(C.malloc(C.size_t(len(fieldIDs)) * C.size_t(unsafe.Sizeof(C.uintptr_t(0)))))
 	defer C.free(unsafe.Pointer(fieldIDsPtr))
 
-	fieldIDsSlice := (*[1 << 30]C.uintptr_t)(unsafe.Pointer(fieldIDsPtr))[:len(p.fieldIDs):len(p.fieldIDs)]
-	for i, id := range p.fieldIDs {
+	fieldIDsSlice := (*[1 << 30]C.uintptr_t)(unsafe.Pointer(fieldIDsPtr))[:len(fieldIDs):len(fieldIDs)]
+	for i, id := range fieldIDs {
 		fieldIDsSlice[i] = id
 	}
 
@@ -377,7 +390,7 @@ func (p *ProjectionBuilder) BuildFinalStruct() (C.uintptr_t, error) {
 		p.state,
 		emptyName,
 		fieldIDsPtr,
-		C.uintptr_t(len(p.fieldIDs)),
+		C.uintptr_t(len(fieldIDs)),
 		C.bool(false), // not nullable
 		C.AllocateErrorFn(C.allocate_error_helper),
 	)
