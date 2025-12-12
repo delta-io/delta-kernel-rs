@@ -557,6 +557,18 @@ mod test {
         let name = column_name!("x.y.z");
         let name = ColumnName::new(name);
         assert_eq!(name, column_name!("x.y.z"));
+
+        // parent()
+        let simple_for_parent = column_name!("x");
+        let nested_for_parent = column_name!("x.y");
+        assert_eq!(simple_for_parent.parent(), None);
+        assert_eq!(nested_for_parent.parent(), Some(column_name!("x")));
+
+        let deep = column_name!("user.address.street");
+        assert_eq!(deep.parent(), Some(column_name!("user.address")));
+
+        let single = ColumnName::new(["field"]);
+        assert_eq!(single.parent(), None);
     }
 
     #[test]
