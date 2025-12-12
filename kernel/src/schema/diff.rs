@@ -10,60 +10,39 @@
 use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
 use std::collections::{HashMap, HashSet};
 
-/// Feature gate for schema diff functionality.
-/// Set to `false` to ensure incomplete implementations don't activate until all PRs are merged.
-/// Will be removed in the final PR when all tests and implementation are complete.
-const SCHEMA_DIFF_ENABLED: bool = false;
-
-/// Arguments for computing a schema diff
-#[derive(Debug, Clone)]
-pub(crate) struct SchemaDiffArgs<'a> {
-    /// The before/original schema
-    pub before: &'a StructType,
-    /// The after/new schema to compare against
-    pub after: &'a StructType,
-}
-
-impl<'a> SchemaDiffArgs<'a> {
-    /// Compute the difference between the two schemas
-    pub(crate) fn compute_diff(self) -> Result<SchemaDiff, SchemaDiffError> {
-        compute_schema_diff(self.before, self.after)
-    }
-}
-
 /// Represents the difference between two schemas
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SchemaDiff {
     /// Fields that were added in the new schema
-    pub added_fields: Vec<FieldChange>,
+    pub(crate) added_fields: Vec<FieldChange>,
     /// Fields that were removed from the original schema
-    pub removed_fields: Vec<FieldChange>,
+    pub(crate) removed_fields: Vec<FieldChange>,
     /// Fields that were modified between schemas
-    pub updated_fields: Vec<FieldUpdate>,
+    pub(crate) updated_fields: Vec<FieldUpdate>,
     /// Whether the diff contains breaking changes (computed once during construction)
-    has_breaking_changes: bool,
+    breaking_changes: bool,
 }
 
 /// Represents a field change (added or removed) at any nesting level
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FieldChange {
     /// The field that was added or removed
-    pub field: StructField,
+    pub(crate) field: StructField,
     /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
-    pub path: ColumnName,
+    pub(crate) path: ColumnName,
 }
 
 /// Represents an update to a field between two schema versions
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FieldUpdate {
     /// The field as it existed in the original schema
-    pub before: StructField,
+    pub(crate) before: StructField,
     /// The field as it exists in the new schema
-    pub after: StructField,
+    pub(crate) after: StructField,
     /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
-    pub path: ColumnName,
+    pub(crate) path: ColumnName,
     /// The types of changes that occurred (can be multiple, e.g. renamed + nullability changed)
-    pub change_types: Vec<FieldChangeType>,
+    pub(crate) change_types: Vec<FieldChangeType>,
 }
 
 /// The types of changes that can occur to a field
@@ -88,6 +67,8 @@ pub(crate) enum FieldChangeType {
 /// Errors that can occur during schema diffing
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SchemaDiffError {
+    #[error("Schema diffing is not yet implemented")]
+    Unsupported,
     #[error("Field at path '{path}' is missing column mapping ID")]
     MissingFieldId { path: ColumnName },
     #[error("Duplicate field ID {id} found at paths '{path1}' and '{path2}'")]
@@ -110,6 +91,11 @@ pub(crate) enum SchemaDiffError {
 }
 
 impl SchemaDiff {
+    /// Compute the difference between two schemas using field IDs
+    pub(crate) fn new(before: &StructType, after: &StructType) -> Result<Self, SchemaDiffError> {
+        compute_schema_diff(before, after)
+    }
+
     /// Returns true if there are no differences between the schemas
     pub(crate) fn is_empty(&self) -> bool {
         self.added_fields.is_empty()
@@ -124,7 +110,16 @@ impl SchemaDiff {
 
     /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
     pub(crate) fn has_breaking_changes(&self) -> bool {
-        self.has_breaking_changes
+        self.breaking_changes
+    }
+
+    /// Get all changes (both top-level and nested)
+    pub(crate) fn all_changes(&self) -> (&[FieldChange], &[FieldChange], &[FieldUpdate]) {
+        (
+            &self.added_fields,
+            &self.removed_fields,
+            &self.updated_fields,
+        )
     }
 
     /// Get all changes at the top level only (fields with path length of 1)
@@ -187,14 +182,10 @@ struct FieldWithPath {
 /// allowing detection of renames at any nesting level within structs, arrays, and maps.
 ///
 /// # Note
-/// It's recommended to use `SchemaDiffArgs` instead of calling this function directly,
-/// as the struct-based API makes it clearer which schema is which:
+/// It's recommended to use `SchemaDiff::new()` instead of calling this function directly:
 ///
 /// ```rust,ignore
-/// let diff = SchemaDiffArgs {
-///     before: &old_schema,
-///     after: &new_schema,
-/// }.compute_diff()?;
+/// let diff = SchemaDiff::new(&old_schema, &new_schema)?;
 /// ```
 ///
 /// # Arguments
@@ -207,21 +198,6 @@ fn compute_schema_diff(
     before: &StructType,
     after: &StructType,
 ) -> Result<SchemaDiff, SchemaDiffError> {
-    // Feature gate check - prevents activation of incomplete implementation in production
-    // This gate will be removed in the final PR when all functionality is complete
-    // Note: Gate is bypassed in test builds to allow tests to validate the implementation
-    #[cfg(not(test))]
-    {
-        if !SCHEMA_DIFF_ENABLED {
-            return Ok(SchemaDiff {
-                added_fields: Vec::new(),
-                removed_fields: Vec::new(),
-                updated_fields: Vec::new(),
-                has_breaking_changes: false,
-            });
-        }
-    }
-
     // Collect all fields with their paths from both schemas
     let empty_path: Vec<String> = vec![];
     let before_fields =
@@ -328,7 +304,7 @@ fn compute_schema_diff(
         added_fields,
         removed_fields,
         updated_fields,
-        has_breaking_changes,
+        breaking_changes: has_breaking_changes,
     })
 }
 
@@ -749,12 +725,7 @@ mod tests {
             create_field_with_id("name", DataType::STRING, false, 2),
         ]);
 
-        let diff = SchemaDiffArgs {
-            before: &schema,
-            after: &schema,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&schema, &schema).unwrap();
         assert!(diff.is_empty());
         assert!(!diff.has_breaking_changes());
     }
@@ -771,12 +742,7 @@ mod tests {
             create_field_with_id("email", DataType::STRING, false, 3), // Added
         ]);
 
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&before, &after).unwrap();
 
         // 1 removed (name), 1 added (email), 1 updated (id)
         assert_eq!(diff.change_count(), 3);
@@ -795,12 +761,7 @@ mod tests {
             create_field_with_id("name", DataType::STRING, false, 2),
         ]);
 
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
@@ -820,12 +781,7 @@ mod tests {
             create_field_with_id("required_field", DataType::STRING, false, 2), // Non-nullable
         ]);
 
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
@@ -843,12 +799,7 @@ mod tests {
             create_field_with_id("optional_field", DataType::STRING, true, 2), // Nullable
         ]);
 
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 1);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 0);
@@ -876,12 +827,7 @@ mod tests {
                     ),
                 ])]);
 
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&before, &after).unwrap();
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
         assert_eq!(diff.updated_fields.len(), 1);
@@ -909,11 +855,7 @@ mod tests {
                 ),
             ])]);
 
-        let result = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff();
+        let result = SchemaDiff::new(&before, &after);
         assert!(matches!(
             result,
             Err(SchemaDiffError::PhysicalNameChanged { .. })
@@ -931,11 +873,7 @@ mod tests {
         let after = StructType::new_unchecked([StructField::new("name", DataType::STRING, false)
             .add_metadata([("delta.columnMapping.id", MetadataValue::Number(1))])]);
 
-        let result = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff();
+        let result = SchemaDiff::new(&before, &after);
         assert!(matches!(
             result,
             Err(SchemaDiffError::MissingPhysicalName { .. })
@@ -958,12 +896,7 @@ mod tests {
                 .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
         ]);
 
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&before, &after).unwrap();
 
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
@@ -1000,12 +933,7 @@ mod tests {
                 .add_metadata([("custom", MetadataValue::String("new_value".to_string()))]), // Metadata changed
         ]);
 
-        let diff = SchemaDiffArgs {
-            before: &before,
-            after: &after,
-        }
-        .compute_diff()
-        .unwrap();
+        let diff = SchemaDiff::new(&before, &after).unwrap();
 
         assert_eq!(diff.added_fields.len(), 0);
         assert_eq!(diff.removed_fields.len(), 0);
@@ -1033,11 +961,7 @@ mod tests {
             create_field_with_id("field2", DataType::STRING, false, 1), // Same ID!
         ]);
 
-        let result = SchemaDiffArgs {
-            before: &schema_with_duplicates,
-            after: &schema_with_duplicates,
-        }
-        .compute_diff();
+        let result = SchemaDiff::new(&schema_with_duplicates, &schema_with_duplicates);
 
         assert!(result.is_err());
         match result {
@@ -1076,7 +1000,7 @@ mod tests {
                 path: ColumnName::new(["user", "address", "city"]), // Deeply nested (depth 3)
             }],
             updated_fields: vec![],
-            has_breaking_changes: false,
+            breaking_changes: false,
         };
 
         // Test top_level_changes - should only return depth 1 fields
