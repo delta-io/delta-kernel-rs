@@ -28,18 +28,21 @@
 //! # }
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use url::Url;
 
 use crate::actions::{
-    DomainMetadata, Metadata, Protocol, TABLE_FEATURES_MIN_READER_VERSION,
-    TABLE_FEATURES_MIN_WRITER_VERSION,
+    Metadata, Protocol, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
-use crate::clustering::ClusteringMetadataDomain;
 use crate::committer::Committer;
-use crate::schema::{ColumnName, SchemaRef};
-use crate::table_features::{extract_table_configuration, TableFeature};
-use crate::transaction::data_layout::{DataLayout, MAX_CLUSTERING_COLUMNS};
+use crate::schema::SchemaRef;
+use crate::table_features::{
+    assign_column_mapping_metadata, extract_table_configuration,
+    get_column_mapping_mode_from_properties, validate_schema_column_mapping, ColumnMappingMode,
+    ExtractedTableConfiguration, TableFeature, COLUMN_MAPPING_MAX_COLUMN_ID_KEY,
+};
+use crate::transaction::data_layout::{process_data_layout, DataLayout};
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
 use crate::{DeltaResult, Engine, Error};
@@ -48,16 +51,6 @@ use crate::{DeltaResult, Engine, Error};
 const MIN_READER_VERSION_PROP: &str = "delta.minReaderVersion";
 /// Table property key for specifying the minimum writer protocol version.
 const MIN_WRITER_VERSION_PROP: &str = "delta.minWriterVersion";
-
-/// Result of processing the data layout specification.
-struct ProcessedDataLayout {
-    /// Partition columns for the table (empty if not partitioned).
-    partition_columns: Vec<String>,
-    /// Domain metadata for clustering (None if not clustered).
-    clustering_domain_metadata: Option<DomainMetadata>,
-    /// Additional writer features required by the layout.
-    additional_writer_features: Vec<TableFeature>,
-}
 
 /// Creates a builder for creating a new Delta table.
 ///
@@ -278,6 +271,71 @@ impl CreateTableTransactionBuilder {
         Ok(properties)
     }
 
+    /// Processes column mapping configuration and updates schema/properties if needed.
+    ///
+    /// When column mapping mode is `name` or `id`, this function:
+    /// 1. Assigns unique column IDs to each field
+    /// 2. Assigns unique physical names (format: `col-{uuid}`) to each field
+    /// 3. Updates the `delta.columnMapping.maxColumnId` table property
+    /// 4. Adds `columnMapping` to the required reader/writer features
+    /// 5. Validates that all annotations were correctly assigned
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The table schema
+    /// * `extracted` - The extracted table configuration (will be updated with column mapping results)
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (updated schema, column mapping mode) for use in subsequent processing.
+    fn process_column_mapping(
+        schema: &SchemaRef,
+        extracted: &mut ExtractedTableConfiguration,
+    ) -> DeltaResult<(SchemaRef, ColumnMappingMode)> {
+        let mode = get_column_mapping_mode_from_properties(&extracted.cleaned_properties)?;
+
+        match mode {
+            ColumnMappingMode::None => Ok((schema.clone(), mode)),
+            ColumnMappingMode::Name | ColumnMappingMode::Id => {
+                // For CREATE TABLE, start from 0. The maxColumnId property is an internal
+                // property managed by the kernel, not user-specified.
+                // assign_column_mapping_metadata will assign sequential IDs and track
+                // the max ID, which we then store in the table properties.
+                let mut max_id = 0i64;
+
+                // Assign column mapping metadata to all fields
+                let updated_schema = assign_column_mapping_metadata(schema, &mut max_id)?;
+
+                // Update properties with maxColumnId
+                extracted.cleaned_properties.insert(
+                    COLUMN_MAPPING_MAX_COLUMN_ID_KEY.to_string(),
+                    max_id.to_string(),
+                );
+
+                // columnMapping is a ReaderWriter feature - add if not already present
+                if !extracted
+                    .reader_features
+                    .contains(&TableFeature::ColumnMapping)
+                {
+                    extracted.reader_features.push(TableFeature::ColumnMapping);
+                }
+                if !extracted
+                    .writer_features
+                    .contains(&TableFeature::ColumnMapping)
+                {
+                    extracted.writer_features.push(TableFeature::ColumnMapping);
+                }
+
+                let schema_with_cm = Arc::new(updated_schema);
+
+                // Validate that column mapping annotations were correctly assigned
+                validate_schema_column_mapping(&schema_with_cm, mode)?;
+
+                Ok((schema_with_cm, mode))
+            }
+        }
+    }
+
     /// Ensures no table exists at the given path by checking for the _delta_log directory.
     ///
     /// # Errors
@@ -307,116 +365,6 @@ impl CreateTableTransactionBuilder {
         }
 
         Ok(())
-    }
-
-    /// Validates clustering columns against the schema and constraints.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - More than 4 clustering columns are specified
-    /// - A clustering column doesn't exist in the schema
-    fn validate_clustering_columns(columns: &[ColumnName], schema: &SchemaRef) -> DeltaResult<()> {
-        use crate::schema::DataType;
-
-        // Check maximum clustering columns
-        if columns.len() > MAX_CLUSTERING_COLUMNS {
-            return Err(Error::generic(format!(
-                "Cannot specify more than {} clustering columns. Found {}.",
-                MAX_CLUSTERING_COLUMNS,
-                columns.len()
-            )));
-        }
-
-        // Validate each column exists in the schema by traversing the path
-        for col in columns {
-            let path = col.path();
-            if path.is_empty() {
-                return Err(Error::generic("Clustering column path cannot be empty"));
-            }
-
-            // Traverse the schema tree to validate the path
-            let mut current_schema = schema.as_ref();
-            for (i, field_name) in path.iter().enumerate() {
-                match current_schema.field(field_name) {
-                    Some(field) => {
-                        // If not the last element, we need to descend into a struct
-                        if i < path.len() - 1 {
-                            match field.data_type() {
-                                DataType::Struct(inner) => {
-                                    current_schema = inner;
-                                }
-                                _ => {
-                                    return Err(Error::generic(format!(
-                                        "Clustering column '{}': field '{}' is not a struct and cannot contain nested fields",
-                                        col, field_name
-                                    )));
-                                }
-                            }
-                        }
-                        // If it's the last element, we found the column - validation passes
-                    }
-                    None => {
-                        return Err(Error::generic(format!(
-                            "Clustering column '{}' not found in schema: field '{}' does not exist",
-                            col, field_name
-                        )));
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Processes the data layout specification and returns partition columns,
-    /// clustering metadata, and any additional features required.
-    ///
-    /// # Arguments
-    ///
-    /// * `data_layout` - The data layout specification
-    /// * `schema` - The table schema (for validation)
-    ///
-    /// # Returns
-    ///
-    /// A [`ProcessedDataLayout`] containing:
-    /// - Partition columns (empty if not partitioned)
-    /// - Clustering domain metadata (None if not clustered)
-    /// - Additional writer features required by the layout
-    fn process_data_layout(
-        data_layout: &DataLayout,
-        schema: &SchemaRef,
-    ) -> DeltaResult<ProcessedDataLayout> {
-        match data_layout {
-            DataLayout::None => Ok(ProcessedDataLayout {
-                partition_columns: vec![],
-                clustering_domain_metadata: None,
-                additional_writer_features: vec![],
-            }),
-            DataLayout::Partitioned(cols) => Ok(ProcessedDataLayout {
-                // Convert ColumnName to String for Metadata compatibility
-                partition_columns: cols.iter().map(|c| c.to_string()).collect(),
-                clustering_domain_metadata: None,
-                additional_writer_features: vec![],
-            }),
-            DataLayout::Clustered(cols) => {
-                // Validate clustering columns
-                Self::validate_clustering_columns(cols, schema)?;
-
-                // Create clustering domain metadata
-                let clustering_metadata = ClusteringMetadataDomain::new(cols);
-                let domain_metadata = clustering_metadata.to_domain_metadata()?;
-
-                // Clustering requires this feature (DomainMetadata is added in build())
-                let additional_features = vec![TableFeature::ClusteredTable];
-
-                Ok(ProcessedDataLayout {
-                    partition_columns: vec![],
-                    clustering_domain_metadata: Some(domain_metadata),
-                    additional_writer_features: additional_features,
-                })
-            }
-        }
     }
 
     /// Builds a [`Transaction`] that can be committed to create the table.
@@ -480,8 +428,12 @@ impl CreateTableTransactionBuilder {
         // Extract table configuration (features + cleaned properties)
         let mut extracted = extract_table_configuration(table_properties)?;
 
-        // Process data layout (partitioning or clustering)
-        let layout = Self::process_data_layout(&self.data_layout, &self.schema)?;
+        // Process column mapping FIRST (before data layout, as clustering needs physical names)
+        let (schema_with_cm, column_mapping_mode) =
+            Self::process_column_mapping(&self.schema, &mut extracted)?;
+
+        // Process data layout (partitioning or clustering) using the updated schema
+        let layout = process_data_layout(&self.data_layout, &schema_with_cm, column_mapping_mode)?;
 
         // Add any features required by the data layout
         for feature in layout.additional_writer_features {
@@ -514,11 +466,11 @@ impl CreateTableTransactionBuilder {
         // Get current timestamp
         let created_time = current_time_ms()?;
 
-        // Create Metadata action with cleaned properties (feature overrides removed)
+        // Create Metadata action with the updated schema (with column mapping metadata if enabled)
         let metadata = Metadata::try_new(
             None, // name
             None, // description
-            (*self.schema).clone(),
+            (*schema_with_cm).clone(),
             layout.partition_columns,
             created_time,
             extracted.cleaned_properties,

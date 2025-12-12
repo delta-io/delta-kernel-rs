@@ -6,14 +6,23 @@
 //!
 //! Clustering metadata is stored as domain metadata with the domain name `delta.clustering`.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::actions::DomainMetadata;
-use crate::schema::ColumnName;
-use crate::DeltaResult;
+use crate::schema::{ColumnName, DataType, StructType};
+use crate::table_features::{resolve_logical_to_physical_path, ColumnMappingMode};
+use crate::{DeltaResult, Error};
 
 /// The domain name for clustering metadata in Delta tables.
 pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
+
+/// Maximum number of clustering columns allowed per Delta specification.
+pub(crate) const MAX_CLUSTERING_COLUMNS: usize = 4;
+
+/// Type alias for schema reference.
+pub(crate) type SchemaRef = Arc<StructType>;
 
 /// Represents the clustering metadata stored as domain metadata in Delta tables.
 ///
@@ -34,16 +43,34 @@ pub(crate) struct ClusteringMetadataDomain {
 impl ClusteringMetadataDomain {
     /// Creates a new clustering metadata domain from column names.
     ///
+    /// When column mapping is enabled (`name` or `id` mode), this method resolves
+    /// logical column names to their physical names using the schema metadata.
+    /// When column mapping is disabled (`none` mode), logical names are stored as-is.
+    ///
     /// # Arguments
     ///
-    /// * `columns` - The columns to cluster by. Each column is represented as a
-    ///   [`ColumnName`] which supports nested paths.
-    pub(crate) fn new(columns: &[ColumnName]) -> Self {
-        let clustering_columns = columns
+    /// * `cluster_columns` - The columns to cluster by (logical names)
+    /// * `schema` - The table schema with column mapping metadata
+    /// * `column_mapping_mode` - The column mapping mode for the table
+    ///
+    /// # Returns
+    ///
+    /// A `ClusteringMetadataDomain` containing the resolved column paths (physical names
+    /// if column mapping is enabled, logical names otherwise).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a clustering column cannot be found in the schema.
+    pub(crate) fn new(
+        cluster_columns: &[ColumnName],
+        schema: &StructType,
+        column_mapping_mode: ColumnMappingMode,
+    ) -> DeltaResult<Self> {
+        let clustering_columns = cluster_columns
             .iter()
-            .map(|col| col.path().iter().map(|s| s.to_string()).collect())
-            .collect();
-        Self { clustering_columns }
+            .map(|col| resolve_logical_to_physical_path(col.path(), schema, column_mapping_mode))
+            .collect::<DeltaResult<Vec<_>>>()?;
+        Ok(Self { clustering_columns })
     }
 
     /// Returns the clustering columns as a slice of column paths.
@@ -66,9 +93,85 @@ impl ClusteringMetadataDomain {
     }
 }
 
+/// Validates clustering columns against the schema and constraints.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - More than [`MAX_CLUSTERING_COLUMNS`] (4) clustering columns are specified
+/// - A clustering column doesn't exist in the schema
+/// - A clustering column path tries to traverse a non-struct field
+pub(crate) fn validate_clustering_columns(
+    columns: &[ColumnName],
+    schema: &SchemaRef,
+) -> DeltaResult<()> {
+    // Check maximum clustering columns
+    if columns.len() > MAX_CLUSTERING_COLUMNS {
+        return Err(Error::generic(format!(
+            "Cannot specify more than {} clustering columns. Found {}.",
+            MAX_CLUSTERING_COLUMNS,
+            columns.len()
+        )));
+    }
+
+    // Validate each column exists in the schema by traversing the path
+    for col in columns {
+        let path = col.path();
+        if path.is_empty() {
+            return Err(Error::generic("Clustering column path cannot be empty"));
+        }
+
+        // Traverse the schema tree to validate the path
+        let mut current_schema = schema.as_ref();
+        for (i, field_name) in path.iter().enumerate() {
+            match current_schema.field(field_name) {
+                Some(field) => {
+                    // If not the last element, we need to descend into a struct
+                    if i < path.len() - 1 {
+                        match field.data_type() {
+                            DataType::Struct(inner) => {
+                                current_schema = inner;
+                            }
+                            _ => {
+                                return Err(Error::generic(format!(
+                                    "Clustering column '{}': field '{}' is not a struct and cannot contain nested fields",
+                                    col, field_name
+                                )));
+                            }
+                        }
+                    }
+                    // If it's the last element, we found the column - validation passes
+                }
+                None => {
+                    return Err(Error::generic(format!(
+                        "Clustering column '{}' not found in schema: field '{}' does not exist",
+                        col, field_name
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{DataType, StructField, StructType};
+
+    /// Helper to create a simple schema for testing
+    fn test_schema() -> StructType {
+        StructType::new_unchecked(vec![
+            StructField::nullable("col1", DataType::STRING),
+            StructField::nullable(
+                "nested",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![
+                    StructField::nullable("field", DataType::STRING),
+                ]))),
+            ),
+        ])
+    }
 
     impl ClusteringMetadataDomain {
         /// Creates a clustering metadata domain from a JSON configuration string.
@@ -83,7 +186,9 @@ mod tests {
             ColumnName::new(["col1"]),
             ColumnName::new(["nested", "field"]),
         ];
-        let metadata = ClusteringMetadataDomain::new(&columns);
+        let schema = test_schema();
+        let metadata =
+            ClusteringMetadataDomain::new(&columns, &schema, ColumnMappingMode::None).unwrap();
 
         assert_eq!(
             metadata.clustering_columns(),
@@ -96,7 +201,9 @@ mod tests {
 
     #[test]
     fn test_clustering_metadata_empty() {
-        let metadata = ClusteringMetadataDomain::new(&[]);
+        let schema = StructType::new_unchecked(vec![]);
+        let metadata =
+            ClusteringMetadataDomain::new(&[], &schema, ColumnMappingMode::None).unwrap();
         assert!(metadata.clustering_columns().is_empty());
     }
 
@@ -106,7 +213,9 @@ mod tests {
             ColumnName::new(["col1"]),
             ColumnName::new(["nested", "field"]),
         ];
-        let metadata = ClusteringMetadataDomain::new(&columns);
+        let schema = test_schema();
+        let metadata =
+            ClusteringMetadataDomain::new(&columns, &schema, ColumnMappingMode::None).unwrap();
 
         let json = serde_json::to_string(&metadata).unwrap();
         assert!(json.contains("clusteringColumns"));
@@ -122,7 +231,9 @@ mod tests {
     #[test]
     fn test_clustering_metadata_to_domain_metadata() {
         let columns = vec![ColumnName::new(["col1"])];
-        let metadata = ClusteringMetadataDomain::new(&columns);
+        let schema = test_schema();
+        let metadata =
+            ClusteringMetadataDomain::new(&columns, &schema, ColumnMappingMode::None).unwrap();
 
         let domain_metadata = metadata.to_domain_metadata().unwrap();
         assert_eq!(domain_metadata.domain(), CLUSTERING_DOMAIN_NAME);
