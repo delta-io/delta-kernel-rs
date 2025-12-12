@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 var skippedTests = map[string]string{
@@ -59,26 +61,18 @@ func TestAcceptance(t *testing.T) {
 			}
 			defer snapshot.Close()
 
-			if expected.Version > 0 && int64(snapshot.Version()) != expected.Version {
-				t.Errorf("Version mismatch: got %d, want %d", snapshot.Version(), expected.Version)
-			}
+			require.Equal(t, expected.Version, int64(snapshot.Version()))
 
 			// Test scan
 			scan, err := snapshot.Scan()
-			if err != nil {
-				t.Fatalf("Failed to create scan: %v", err)
-			}
+			require.NoError(t, err)
 			defer scan.Close()
 
 			schema, err := scan.LogicalSchema()
-			if err != nil {
-				t.Fatalf("Failed to get logical schema: %v", err)
-			}
+			require.NoError(t, err)
 
 			iter, err := scan.MetadataIterator(snapshot.Engine())
-			if err != nil {
-				t.Fatalf("Failed to create scan iterator: %v", err)
-			}
+			require.NoError(t, err)
 			defer iter.Close()
 
 			// Count files and rows
@@ -87,20 +81,21 @@ func TestAcceptance(t *testing.T) {
 				hasMore, err := iter.Next(&metadataCollector{
 					t: t, snapshot: snapshot, scan: scan, files: &files, rows: &rows,
 				})
-				if err != nil {
-					t.Fatalf("Error iterating: %v", err)
-				}
+				require.NoError(t, err)
 				if !hasMore {
 					break
 				}
 			}
 
-			t.Logf("✓ Version: %d, Schema: %d fields, Files: %d, Rows: %d",
-				snapshot.Version(), len(schema.Fields), files, rows)
+			t.Logf(
+				"✓ Version: %d, Schema: %d fields, Files: %d, Rows: %d",
+				snapshot.Version(),
+				len(schema.Fields),
+				files,
+				rows,
+			)
 
-			if files == 0 {
-				t.Error("Expected at least one file")
-			}
+			require.NotEmpty(t, files)
 		})
 	}
 }
@@ -159,30 +154,20 @@ func TestTimeTravel(t *testing.T) {
 
 	// snapshot at version 0
 	snapshot0, err := NewSnapshotAtVersion(path, 0)
-	if err != nil {
-		t.Fatalf("failed to create snapshot at v0: %v", err)
-	}
+	require.NoError(t, err)
 	defer snapshot0.Close()
 
-	if snapshot0.Version() != 0 {
-		t.Errorf("expected version 0, got %d", snapshot0.Version())
-	}
+	require.Equal(t, uint64(0), snapshot0.Version())
 
 	// snapshot at version 1
 	snapshot1, err := NewSnapshotAtVersion(path, 1)
-	if err != nil {
-		t.Fatalf("failed to create snapshot at v1: %v", err)
-	}
+	require.NoError(t, err)
 	defer snapshot1.Close()
 
-	if snapshot1.Version() != 1 {
-		t.Errorf("expected version 1, got %d", snapshot1.Version())
-	}
+	require.Equal(t, uint64(1), snapshot1.Version())
 
 	// verify they're different versions
-	if snapshot0.Version() == snapshot1.Version() {
-		t.Error("snapshots at different versions should not match")
-	}
+	require.NotEqual(t, snapshot0.Version(), snapshot1.Version())
 
 	t.Logf("✓ time travel works: v0=%d, v1=%d", snapshot0.Version(), snapshot1.Version())
 }
@@ -191,28 +176,23 @@ func TestSchemaProjection(t *testing.T) {
 	path := "../../../acceptance/tests/dat/out/reader_tests/generated/all_primitive_types/delta"
 
 	snapshot, err := NewSnapshot(path)
-	if err != nil {
-		t.Fatalf("failed to create snapshot: %v", err)
-	}
+	require.NoError(t, err)
 	defer snapshot.Close()
 
-	// scan with column projection
+	// Test that ScanWithOptions API works (projection filtering not yet implemented)
 	scan, err := snapshot.ScanWithOptions(&ScanOptions{
 		Columns: []string{"utf8", "int64"},
 	})
-	if err != nil {
-		t.Fatalf("failed to scan with projection: %v", err)
-	}
+	require.NoError(t, err)
 	defer scan.Close()
 
 	schema, err := scan.LogicalSchema()
-	if err != nil {
-		t.Fatalf("failed to get schema: %v", err)
-	}
+	require.NoError(t, err)
 
-	t.Logf("✓ schema projection works, schema fields: %d", len(schema.Fields))
+	t.Logf("✓ schema projection API works, fields: %d", len(schema.Fields))
 
-	// TODO: verify only requested columns in schema once visitor is fully implemented
+	// TODO: Implement actual projection filtering in visit_projection_schema
+	// Currently returns full schema because filtering logic is not yet implemented
 }
 
 func BenchmarkAcceptance(b *testing.B) {

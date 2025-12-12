@@ -6,8 +6,7 @@ package delta
 #include "delta_kernel_ffi.h"
 #include "helpers.h"
 #include "schema_projection.h"
-#include "schema_projection.c"
-// Note: helpers.c is included in snapshot.go to avoid duplicate symbols
+// Note: helpers.c and schema_projection.c are included in snapshot.go to avoid duplicate symbols
 */
 import "C"
 import (
@@ -36,15 +35,12 @@ type ScanOptions struct {
 // ScanWithOptions creates a new scan with optional column projection and predicates
 func (s *Snapshot) ScanWithOptions(opts *ScanOptions) (*Scan, error) {
 	var engineSchema *C.struct_EngineSchema
-	var cColumns **C.char
-	var projection *C.struct_ColumnProjection
 
-	// TODO: implement column projection
-	// for now, skip - visitor callback needs proper cgo setup
-	_ = cColumns
-	_ = projection
+	// TODO: Implement column projection
+	// For now, column projection is not implemented - we always read all columns
+	// The API is in place but the actual filtering logic needs to be completed
 	if opts != nil && len(opts.Columns) > 0 {
-		// placeholder - projection not yet implemented
+		// Projection requested but not yet implemented - just use nil engineSchema
 		engineSchema = nil
 	}
 
@@ -144,4 +140,60 @@ func (sc *Scan) Close() {
 		C.free_scan(sc.handle)
 		sc.handle = nil
 	}
+}
+
+// Go callback stubs for projection filtering
+// TODO: Implement actual filtering logic
+
+//export goProjectionMakeFieldList
+func goProjectionMakeFieldList(handleValue C.uintptr_t, reserve C.uintptr_t) C.uintptr_t {
+	return 0
+}
+
+//export goProjectionVisitString
+func goProjectionVisitString(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitLong
+func goProjectionVisitLong(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitInteger
+func goProjectionVisitInteger(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitShort
+func goProjectionVisitShort(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitByte
+func goProjectionVisitByte(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitFloat
+func goProjectionVisitFloat(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitDouble
+func goProjectionVisitDouble(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitBoolean
+func goProjectionVisitBoolean(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitBinary
+func goProjectionVisitBinary(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitDate
+func goProjectionVisitDate(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitTimestamp
+func goProjectionVisitTimestamp(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+}
+
+//export goProjectionVisitTimestampNtz
+func goProjectionVisitTimestampNtz(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
 }

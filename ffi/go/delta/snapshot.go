@@ -5,7 +5,9 @@ package delta
 #cgo LDFLAGS: -L${SRCDIR}/../../../target/release -ldelta_kernel_ffi
 #include "delta_kernel_ffi.h"
 #include "helpers.h"
+#include "schema_projection.h"
 #include "c/helpers.c"
+#include "c/schema_projection.c"
 */
 import "C"
 import (
