@@ -1125,14 +1125,10 @@ mod tests {
         assert!(!map_data.map_type().value_contains_null());
 
         // Check that both expected pairs are present
-        let has_key1 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
-        });
-        let has_key2 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Integer(100))
-        });
-        assert!(has_key1, "Missing key1 -> 42 pair");
-        assert!(has_key2, "Missing key2 -> 100 pair");
+        let entry1 = (Scalar::String("key1".to_string()), Scalar::Integer(42));
+        let entry2 = (Scalar::String("key2".to_string()), Scalar::Integer(100));
+        assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
+        assert!(pairs.contains(&entry2), "Missing key2 -> 100 pair");
 
         Ok(())
     }
@@ -1164,18 +1160,15 @@ mod tests {
         assert!(map_data.map_type().value_contains_null());
 
         // Check that all expected pairs are present
-        let has_key1 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
-        });
-        let has_key2 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Null(_))
-        });
-        let has_key3 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key3") && matches!(v, Scalar::Integer(100))
-        });
-        assert!(has_key1, "Missing key1 -> 42 pair");
-        assert!(has_key2, "Missing key2 -> null pair");
-        assert!(has_key3, "Missing key3 -> 100 pair");
+        let entry1 = (Scalar::String("key1".to_string()), Scalar::Integer(42));
+        let entry2 = (
+            Scalar::String("key2".to_string()),
+            Scalar::Null(DataType::INTEGER),
+        );
+        let entry3 = (Scalar::String("key3".to_string()), Scalar::Integer(100));
+        assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
+        assert!(pairs.contains(&entry2), "Missing key2 -> null pair");
+        assert!(pairs.contains(&entry3), "Missing key3 -> 100 pair");
 
         Ok(())
     }
@@ -1204,9 +1197,9 @@ mod tests {
         assert!(!array_data.array_type().contains_null());
 
         // Check that all expected values are present
-        assert!(matches!(elements[0], Scalar::Integer(42)));
-        assert!(matches!(elements[1], Scalar::Integer(100)));
-        assert!(matches!(elements[2], Scalar::Integer(200)));
+        assert_eq!(elements[0], Scalar::Integer(42));
+        assert_eq!(elements[1], Scalar::Integer(100));
+        assert_eq!(elements[2], Scalar::Integer(200));
 
         Ok(())
     }
@@ -1236,9 +1229,9 @@ mod tests {
         assert!(array_data.array_type().contains_null());
 
         // Check that all expected values are present
-        assert!(matches!(elements[0], Scalar::Integer(42)));
-        assert!(matches!(elements[1], Scalar::Null(_)));
-        assert!(matches!(elements[2], Scalar::Integer(100)));
+        assert_eq!(elements[0], Scalar::Integer(42));
+        assert!(elements[1].is_null());
+        assert_eq!(elements[2], Scalar::Integer(100));
 
         Ok(())
     }
