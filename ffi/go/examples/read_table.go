@@ -7,6 +7,13 @@ import (
 	"github.com/delta-io/delta-kernel-go/delta"
 )
 
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../../target/ffi-headers -DDEFINE_DEFAULT_ENGINE_BASE
+#cgo LDFLAGS: -L${SRCDIR}/../../../target/release -ldelta_kernel_ffi
+#include "delta_kernel_ffi.h"
+*/
+import "C"
+
 // FilePrinter implements delta.FileVisitor to print file information
 type FilePrinter struct {
 	fileCount int
@@ -62,6 +69,7 @@ func (fp *FilePrinter) VisitFile(path string, size int64, stats *delta.Stats, pa
 
 		// Read data batches
 		batchVisitor := &DataBatchVisitor{
+			snapshot:  fp.snapshot,
 			printData: true, // Always print data when reading
 		}
 		for {
@@ -86,6 +94,7 @@ func (fp *FilePrinter) VisitFile(path string, size int64, stats *delta.Stats, pa
 type DataBatchVisitor struct {
 	batchCount int
 	totalRows  uint64
+	snapshot   *delta.Snapshot // Store snapshot to access engine
 	printData  bool
 }
 
@@ -94,8 +103,55 @@ func (dbv *DataBatchVisitor) VisitEngineData(data *delta.EngineData) bool {
 	length := data.Length()
 	dbv.totalRows += length
 
-	if dbv.printData {
-		fmt.Printf("      Batch #%d: %d rows\n", dbv.batchCount, length)
+	fmt.Printf("      Batch #%d: %d rows\n", dbv.batchCount, length)
+
+	if dbv.printData && length > 0 && dbv.snapshot != nil {
+		// Get Arrow data for manual parsing
+		arrowData, err := data.GetArrowData(dbv.snapshot.Engine())
+		if err != nil {
+			fmt.Printf("      Error getting arrow data: %v\n", err)
+			return true
+		}
+
+		// Print schema information
+		fmt.Printf("      Columns: ")
+		numCols := arrowData.NumColumns()
+		for i := 0; i < int(numCols); i++ {
+			if i > 0 {
+				fmt.Printf(", ")
+			}
+			fmt.Printf("%s (%s)", arrowData.ColumnName(i), arrowData.ColumnFormat(i))
+		}
+		fmt.Printf("\n")
+
+		// Print first few rows
+		numRows := arrowData.NumRows()
+		maxRowsToPrint := int64(5)
+		if numRows < maxRowsToPrint {
+			maxRowsToPrint = numRows
+		}
+
+		if maxRowsToPrint > 0 {
+			fmt.Printf("      First %d rows:\n", maxRowsToPrint)
+			for row := int64(0); row < maxRowsToPrint; row++ {
+				fmt.Printf("        Row %d: ", row)
+				for col := 0; col < int(numCols); col++ {
+					if col > 0 {
+						fmt.Printf(", ")
+					}
+
+					colName := arrowData.ColumnName(col)
+					value, isValid := arrowData.GetValue(col, row)
+
+					if isValid {
+						fmt.Printf("%s=%v", colName, value)
+					} else {
+						fmt.Printf("%s=null", colName)
+					}
+				}
+				fmt.Printf("\n")
+			}
+		}
 	}
 
 	// Note: data.Close() is not called here because the caller owns the handle
