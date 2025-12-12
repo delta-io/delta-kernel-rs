@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::actions::STATS_PARSED_NAME;
 use crate::arrow::array::BooleanArray;
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+use crate::scan::data_skipping::build_stats_schema;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, ExpressionRef, Snapshot};
 
@@ -500,9 +502,6 @@ fn test_scan_with_checkpoint() -> DeltaResult<()> {
 
 #[test]
 fn test_build_checkpoint_read_schema_with_stats_parsed() {
-    use crate::actions::STATS_PARSED_NAME;
-    use crate::scan::data_skipping::build_stats_schema;
-
     // Build a stats schema from some referenced columns
     let referenced_schema = StructType::new_unchecked([
         StructField::nullable("id", DataType::LONG),
