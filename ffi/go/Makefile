@@ -47,6 +47,14 @@ clean:
 test: rust-ffi
 	$(LIB_PATH_VAR)=$(LIB_PATH):$$$(LIB_PATH_VAR) go test -v ./...
 
+# Run acceptance tests only
+test-acceptance: rust-ffi
+	$(LIB_PATH_VAR)=$(LIB_PATH):$$$(LIB_PATH_VAR) go test -v -run TestAcceptance ./delta
+
+# Run quick tests (short mode)
+test-quick: rust-ffi
+	$(LIB_PATH_VAR)=$(LIB_PATH):$$$(LIB_PATH_VAR) go test -short ./...
+
 # Download Go dependencies
 deps:
 	go mod download
