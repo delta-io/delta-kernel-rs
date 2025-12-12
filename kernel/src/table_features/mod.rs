@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
 
@@ -11,9 +14,23 @@ use delta_kernel_derive::internal_api;
 
 pub(crate) use column_mapping::column_mapping_mode;
 pub use column_mapping::{validate_schema_column_mapping, ColumnMappingMode};
+// Write-side column mapping support
+pub(crate) use column_mapping::{
+    assign_column_mapping_metadata, get_column_mapping_mode_from_properties, get_physical_name,
+    COLUMN_MAPPING_MAX_COLUMN_ID_KEY,
+};
 pub(crate) use timestamp_ntz::validate_timestamp_ntz_feature_support;
 mod column_mapping;
 mod timestamp_ntz;
+
+/// Prefix for table feature override properties.
+/// Properties with this prefix (e.g., `delta.feature.deletionVectors`) are used to
+/// explicitly enable table features in the protocol.
+pub const SET_TABLE_FEATURE_SUPPORTED_PREFIX: &str = "delta.feature.";
+
+/// Value to enable a table feature when used with [`SET_TABLE_FEATURE_SUPPORTED_PREFIX`].
+/// Example: `"delta.feature.deletionVectors" -> "supported"`
+pub const SET_TABLE_FEATURE_SUPPORTED_VALUE: &str = "supported";
 
 /// Table features represent protocol capabilities required to correctly read or write a given table.
 /// - Readers must implement all features required for correct table reads.
@@ -399,14 +416,13 @@ static ICEBERG_COMPAT_V2_INFO: FeatureInfo = FeatureInfo {
     }),
 };
 
-#[allow(dead_code)]
 static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     name: "clustering",
     min_reader_version: 1,
     min_writer_version: 7,
     feature_type: FeatureType::Writer,
     feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
-    kernel_support: KernelSupport::NotSupported,
+    kernel_support: KernelSupport::Supported,
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
@@ -661,6 +677,91 @@ impl TableFeature {
             TableFeature::Unknown(_) => None,
         }
     }
+
+    /// Parse a feature name string into a TableFeature.
+    ///
+    /// This uses the strum `EnumString` derive to parse known feature names.
+    /// Unknown feature names are wrapped in `TableFeature::Unknown`.
+    pub(crate) fn from_name(name: &str) -> Self {
+        TableFeature::from_str(name).unwrap_or_else(|_| TableFeature::Unknown(name.to_string()))
+    }
+
+    /// Returns true if this is a ReaderWriter feature (appears in both reader and writer feature lists).
+    /// Returns false for Writer-only features and Unknown features.
+    pub(crate) fn is_reader_writer(&self) -> bool {
+        matches!(self.feature_type(), FeatureType::ReaderWriter)
+    }
+}
+
+/// Result of extracting feature overrides from table properties.
+///
+/// Contains the features to add to the protocol and the cleaned properties
+/// (with `delta.feature.*` entries removed).
+#[derive(Debug)]
+pub(crate) struct FeatureOverrides {
+    /// Features that should be added to the protocol
+    pub(crate) features: Vec<TableFeature>,
+    /// Table properties with `delta.feature.*` entries removed
+    pub(crate) cleaned_properties: HashMap<String, String>,
+}
+
+/// Extracts feature overrides from table properties.
+///
+/// Properties with the prefix `delta.feature.` are interpreted as feature override
+/// directives. For example, `delta.feature.deletionVectors = supported` adds the
+/// `deletionVectors` feature to the protocol.
+///
+/// # Arguments
+/// * `properties` - The table properties to process
+///
+/// # Returns
+/// A [`FeatureOverrides`] containing:
+/// - `features`: The list of features to add to the protocol
+/// - `cleaned_properties`: The table properties with feature override entries removed
+///
+/// # Errors
+/// Returns an error if:
+/// - A `delta.feature.*` property has a value other than "supported"
+///
+/// # Example
+/// ```ignore
+/// let props = HashMap::from([
+///     ("delta.feature.deletionVectors".to_string(), "supported".to_string()),
+///     ("delta.enableDeletionVectors".to_string(), "true".to_string()),
+/// ]);
+/// let overrides = extract_feature_overrides(props)?;
+/// // overrides.features = [TableFeature::DeletionVectors]
+/// // overrides.cleaned_properties = {"delta.enableDeletionVectors": "true"}
+/// ```
+pub(crate) fn extract_feature_overrides(
+    properties: HashMap<String, String>,
+) -> DeltaResult<FeatureOverrides> {
+    let mut features = Vec::new();
+    let mut cleaned_properties = HashMap::new();
+
+    for (key, value) in properties {
+        if let Some(feature_name) = key.strip_prefix(SET_TABLE_FEATURE_SUPPORTED_PREFIX) {
+            // Validate value is "supported"
+            if value != SET_TABLE_FEATURE_SUPPORTED_VALUE {
+                return Err(Error::generic(format!(
+                    "Invalid value '{}' for '{}'. Only '{}' is allowed.",
+                    value, key, SET_TABLE_FEATURE_SUPPORTED_VALUE
+                )));
+            }
+
+            // Parse feature name
+            let feature = TableFeature::from_name(feature_name);
+            features.push(feature);
+        } else {
+            // Keep non-feature-override properties
+            cleaned_properties.insert(key, value);
+        }
+    }
+
+    Ok(FeatureOverrides {
+        features,
+        cleaned_properties,
+    })
 }
 
 impl ToDataType for TableFeature {
@@ -804,5 +905,164 @@ mod tests {
             let from_str: TableFeature = expected.parse().unwrap();
             assert_eq!(from_str, feature);
         }
+    }
+
+    #[test]
+    fn test_from_name() {
+        // Known features
+        assert_eq!(
+            TableFeature::from_name("deletionVectors"),
+            TableFeature::DeletionVectors
+        );
+        assert_eq!(
+            TableFeature::from_name("changeDataFeed"),
+            TableFeature::ChangeDataFeed
+        );
+        assert_eq!(
+            TableFeature::from_name("columnMapping"),
+            TableFeature::ColumnMapping
+        );
+        assert_eq!(
+            TableFeature::from_name("timestampNtz"),
+            TableFeature::TimestampWithoutTimezone
+        );
+
+        // Unknown features
+        assert_eq!(
+            TableFeature::from_name("unknownFeature"),
+            TableFeature::Unknown("unknownFeature".to_string())
+        );
+    }
+
+    #[test]
+    fn test_is_reader_writer() {
+        // ReaderWriter features
+        assert!(TableFeature::DeletionVectors.is_reader_writer());
+        assert!(TableFeature::ColumnMapping.is_reader_writer());
+        assert!(TableFeature::TimestampWithoutTimezone.is_reader_writer());
+        assert!(TableFeature::V2Checkpoint.is_reader_writer());
+
+        // Writer-only features
+        assert!(!TableFeature::ChangeDataFeed.is_reader_writer());
+        assert!(!TableFeature::AppendOnly.is_reader_writer());
+        assert!(!TableFeature::DomainMetadata.is_reader_writer());
+        assert!(!TableFeature::RowTracking.is_reader_writer());
+
+        // Unknown features
+        assert!(!TableFeature::unknown("something").is_reader_writer());
+    }
+
+    #[test]
+    fn test_extract_feature_overrides_basic() {
+        let props = HashMap::from([
+            (
+                "delta.feature.deletionVectors".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.enableDeletionVectors".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        let result = extract_feature_overrides(props).unwrap();
+
+        assert_eq!(result.features.len(), 1);
+        assert_eq!(result.features[0], TableFeature::DeletionVectors);
+
+        // Feature override should be removed from cleaned properties
+        assert!(!result
+            .cleaned_properties
+            .contains_key("delta.feature.deletionVectors"));
+        // Regular property should be retained
+        assert_eq!(
+            result.cleaned_properties.get("delta.enableDeletionVectors"),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_feature_overrides_multiple_features() {
+        let props = HashMap::from([
+            (
+                "delta.feature.deletionVectors".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.feature.changeDataFeed".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.feature.appendOnly".to_string(),
+                "supported".to_string(),
+            ),
+            (
+                "delta.enableDeletionVectors".to_string(),
+                "true".to_string(),
+            ),
+        ]);
+
+        let result = extract_feature_overrides(props).unwrap();
+
+        assert_eq!(result.features.len(), 3);
+        assert!(result.features.contains(&TableFeature::DeletionVectors));
+        assert!(result.features.contains(&TableFeature::ChangeDataFeed));
+        assert!(result.features.contains(&TableFeature::AppendOnly));
+
+        // Only the regular property should remain
+        assert_eq!(result.cleaned_properties.len(), 1);
+        assert_eq!(
+            result.cleaned_properties.get("delta.enableDeletionVectors"),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_feature_overrides_invalid_value() {
+        let props = HashMap::from([(
+            "delta.feature.deletionVectors".to_string(),
+            "enabled".to_string(), // Wrong value - should be "supported"
+        )]);
+
+        let result = extract_feature_overrides(props);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Invalid value"));
+        assert!(err.contains("enabled"));
+        assert!(err.contains("supported"));
+    }
+
+    #[test]
+    fn test_extract_feature_overrides_no_features() {
+        let props = HashMap::from([
+            (
+                "delta.enableDeletionVectors".to_string(),
+                "true".to_string(),
+            ),
+            ("delta.appendOnly".to_string(), "true".to_string()),
+            ("custom.property".to_string(), "value".to_string()),
+        ]);
+
+        let result = extract_feature_overrides(props).unwrap();
+
+        assert!(result.features.is_empty());
+        assert_eq!(result.cleaned_properties.len(), 3);
+    }
+
+    #[test]
+    fn test_extract_feature_overrides_unknown_feature() {
+        let props = HashMap::from([(
+            "delta.feature.futureFeature".to_string(),
+            "supported".to_string(),
+        )]);
+
+        let result = extract_feature_overrides(props).unwrap();
+
+        assert_eq!(result.features.len(), 1);
+        assert_eq!(
+            result.features[0],
+            TableFeature::Unknown("futureFeature".to_string())
+        );
     }
 }
