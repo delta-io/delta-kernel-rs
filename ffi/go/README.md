@@ -57,17 +57,19 @@ for {
 - ✅ snapshot creation + metadata (version, partitions, table root)
 - ✅ time travel (read table at specific version)
 - ✅ schema extraction (all types including nested struct/array/map)
+- ✅ schema projection - select specific columns for efficient reads
 - ✅ scan metadata iteration (file lists, stats, partition values)
 - ✅ parquet data reading via arrow c interface
 - ✅ arrow data access (columns, rows, values)
-- ✅ 16/19 acceptance tests passing
+- ✅ all primitive types (int8-64, float32/64, bool, string, binary, date, timestamp)
+- ✅ acceptance tests passing
 
 ## what's missing
 
 **reading limitations:**
 - ❌ no predicate pushdown - reads all files
-- ❌ no schema projection - reads all columns
 - ❌ no deletion vectors - can't handle row deletes
+- ⚠️ decimal type not yet supported
 
 **not implemented:**
 - ❌ writes (transactions, commits)
