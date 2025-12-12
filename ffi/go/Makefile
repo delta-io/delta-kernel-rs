@@ -23,7 +23,7 @@ rust-ffi:
 
 # Build Go bindings
 build: rust-ffi
-	go build ./...
+	go build ./delta
 
 # Build examples
 example: rust-ffi
@@ -62,8 +62,8 @@ deps:
 
 # Format Go code
 fmt:
-	go fmt ./...
+	go fmt ./delta
 
 # Run Go vet
 vet:
-	go vet ./...
+	go vet ./delta

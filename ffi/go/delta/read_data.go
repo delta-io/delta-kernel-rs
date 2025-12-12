@@ -69,6 +69,12 @@ func readParquetFile(engine C.HandleSharedExternEngine, file *FileMeta, physical
 	}, nil
 }
 
+// handleToPtr converts a cgo.Handle to a pointer for passing through C
+// This is a valid pattern for passing opaque values through C FFI
+func handleToPtr(h cgo.Handle) unsafe.Pointer {
+	return *(*unsafe.Pointer)(unsafe.Pointer(&h))
+}
+
 // Next advances the iterator and calls the visitor for the next batch of data
 // Returns true if more data is available, false if done
 func (it *FileReadResultIterator) Next(visitor EngineDataVisitor) (bool, error) {
@@ -76,12 +82,11 @@ func (it *FileReadResultIterator) Next(visitor EngineDataVisitor) (bool, error) 
 	handle := cgo.NewHandle(visitor)
 	defer handle.Delete()
 
-	// Pass handle value directly as NullableCvoid (no C memory allocation needed)
-	// The handle value itself is passed, not a pointer to it
-	handleAsPtr := unsafe.Pointer(uintptr(handle))
+	// Pass handle value through C as an opaque pointer
+	handleAsPtr := C.NullableCvoid(handleToPtr(handle))
 
 	// Call the FFI function with our C callback
-	result := C.read_result_next(it.handle, C.NullableCvoid(handleAsPtr), (*[0]byte)(C.c_visit_engine_data))
+	result := C.read_result_next(it.handle, handleAsPtr, (*[0]byte)(C.c_visit_engine_data))
 
 	if result.tag == C.Errbool {
 		// Error occurred

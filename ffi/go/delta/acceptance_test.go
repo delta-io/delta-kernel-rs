@@ -45,7 +45,9 @@ func TestAcceptance(t *testing.T) {
 			}
 
 			// Load expected version
-			var expected struct{ Version int64 `json:"version"` }
+			var expected struct {
+				Version int64 `json:"version"`
+			}
 			if data, _ := os.ReadFile(filepath.Join(testCasePath, "expected", "latest", "table_version_metadata.json")); data != nil {
 				_ = json.Unmarshal(data, &expected)
 			}

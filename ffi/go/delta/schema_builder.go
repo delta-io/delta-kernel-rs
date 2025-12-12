@@ -10,7 +10,7 @@ type SchemaBuilder struct {
 
 // fieldList represents a list of fields at a particular level
 type fieldList struct {
-	fields      []*fieldWithChildren
+	fields []*fieldWithChildren
 }
 
 // fieldWithChildren tracks a field and its child list ID
