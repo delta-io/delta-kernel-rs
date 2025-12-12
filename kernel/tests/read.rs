@@ -1598,3 +1598,37 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }
+
+/// Test that data skipping with parsed stats works correctly.
+/// This test reads a table with stats_parsed in its checkpoint and verifies:
+/// 1. Data skipping filters files correctly based on predicates
+/// 2. The parsed stats path is used for checkpoint batches
+#[test]
+fn data_skipping_with_parsed_stats() -> Result<(), Box<dyn std::error::Error>> {
+    // The table has two files:
+    // - file1: id=1-5, value=100-500
+    // - file2: id=6-10, value=600-1000
+    // With predicate `value < 550`, only file1 should be returned
+
+    let expected = vec![
+        "+----+-------+",
+        "| id | value |",
+        "+----+-------+",
+        "| 1  | 100   |",
+        "| 2  | 200   |",
+        "| 3  | 300   |",
+        "| 4  | 400   |",
+        "| 5  | 500   |",
+        "+----+-------+",
+    ];
+
+    // Predicate that should skip file2 (value >= 600)
+    let predicate = column_expr!("value").lt(Expr::literal(550i64));
+
+    read_table_data_str(
+        "./tests/data/table_with_stats_parsed/",
+        None,
+        Some(predicate),
+        expected,
+    )
+}

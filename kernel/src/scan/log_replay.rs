@@ -49,6 +49,9 @@ pub(crate) struct ScanLogReplayProcessor {
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
     seen_file_keys: HashSet<FileActionKey>,
+    /// Whether to use parsed stats (stats_parsed) for checkpoint batches.
+    /// When true, checkpoint stats are read directly as structs instead of parsing JSON.
+    use_parsed_stats: bool,
 }
 
 impl ScanLogReplayProcessor {
@@ -82,6 +85,8 @@ impl ScanLogReplayProcessor {
             )?,
             seen_file_keys: Default::default(),
             state_info,
+            // TODO: Determine from checkpoint schema whether stats_parsed is available
+            use_parsed_stats: true,
         })
     }
 }
@@ -362,7 +367,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
         // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        let selection_vector = self.build_selection_vector(actions.as_ref(), is_log_batch)?;
         assert_eq!(selection_vector.len(), actions.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -385,6 +390,10 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
         self.data_skipping_filter.as_ref()
+    }
+
+    fn use_parsed_stats(&self) -> bool {
+        self.use_parsed_stats
     }
 }
 
