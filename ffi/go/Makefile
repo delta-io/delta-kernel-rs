@@ -27,20 +27,11 @@ build: rust-ffi
 
 # Build examples
 example: rust-ffi
-	go build -o examples/describe_schema ./examples/describe_schema.go
-	go build -o examples/read_table ./examples/read_table.go
-
-# Run example (requires TABLE_PATH environment variable)
-run-example: example
-	@if [ -z "$(TABLE_PATH)" ]; then \
-		echo "Error: TABLE_PATH not set. Usage: make run-example TABLE_PATH=/path/to/table"; \
-		exit 1; \
-	fi
-	$(LIB_PATH_VAR)=$(LIB_PATH):$$$(LIB_PATH_VAR) ./examples/describe_schema $(TABLE_PATH)
+	go build -o bin/example ./examples/main.go
 
 # Clean build artifacts
 clean:
-	rm -f examples/describe_schema examples/read_table
+	rm -f bin/example
 	go clean
 
 # Run tests

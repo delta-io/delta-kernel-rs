@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -8,19 +9,27 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <table_path>\n", os.Args[0])
+	tablePath := flag.String("table", "", "Path to Delta table (required)")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s -table <path>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Describe Delta table schema and metadata\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExample:\n")
-		fmt.Fprintf(os.Stderr, "  %s /path/to/delta/table\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -table /path/to/delta/table\n", os.Args[0])
+	}
+	flag.Parse()
+
+	if *tablePath == "" {
+		fmt.Fprintf(os.Stderr, "Error: -table flag is required\n\n")
+		flag.Usage()
 		os.Exit(1)
 	}
 
-	tablePath := os.Args[1]
-
-	fmt.Printf("Opening Delta table at: %s\n\n", tablePath)
+	fmt.Printf("Opening Delta table at: %s\n\n", *tablePath)
 
 	// Create a snapshot of the table
-	snapshot, err := delta.NewSnapshot(tablePath)
+	snapshot, err := delta.NewSnapshot(*tablePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating snapshot: %v\n", err)
 		os.Exit(1)

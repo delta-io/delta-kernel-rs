@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -193,28 +194,34 @@ func (mc *MetadataCollector) VisitScanMetadata(metadata *delta.ScanMetadata) boo
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <table_path> [--read-data]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nExample:\n")
-		fmt.Fprintf(os.Stderr, "  %s /path/to/delta/table\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s /path/to/delta/table --read-data\n", os.Args[0])
+	tablePath := flag.String("table", "", "Path to Delta table (required)")
+	readData := flag.Bool("read-data", false, "Actually read and print data from files")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s -table <path> [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Read and scan Delta table files\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s -table /path/to/delta/table\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -table /path/to/delta/table -read-data\n", os.Args[0])
+	}
+	flag.Parse()
+
+	if *tablePath == "" {
+		fmt.Fprintf(os.Stderr, "Error: -table flag is required\n\n")
+		flag.Usage()
 		os.Exit(1)
 	}
 
-	tablePath := os.Args[1]
-	readData := false
-	if len(os.Args) > 2 && os.Args[2] == "--read-data" {
-		readData = true
-	}
-
-	fmt.Printf("Reading Delta table at: %s\n", tablePath)
-	if readData {
+	fmt.Printf("Reading Delta table at: %s\n", *tablePath)
+	if *readData {
 		fmt.Printf("Data reading: ENABLED\n")
 	}
 	fmt.Println()
 
 	// Create a snapshot of the table
-	snapshot, err := delta.NewSnapshot(tablePath)
+	snapshot, err := delta.NewSnapshot(*tablePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating snapshot: %v\n", err)
 		os.Exit(1)
@@ -258,7 +265,7 @@ func main() {
 	collector := &MetadataCollector{
 		snapshot: snapshot,
 		scan:     scan,
-		readData: readData,
+		readData: *readData,
 	}
 	for {
 		hasMore, err := iter.Next(collector)
