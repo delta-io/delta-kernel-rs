@@ -9,13 +9,6 @@ import (
 	"github.com/olekukonko/tablewriter"
 )
 
-/*
-#cgo CFLAGS: -I${SRCDIR}/../../../target/ffi-headers -DDEFINE_DEFAULT_ENGINE_BASE
-#cgo LDFLAGS: -L${SRCDIR}/../../../target/release -ldelta_kernel_ffi
-#include "delta_kernel_ffi.h"
-*/
-import "C"
-
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()

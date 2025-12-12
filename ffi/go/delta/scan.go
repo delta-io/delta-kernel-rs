@@ -209,9 +209,9 @@ func (sc *Scan) Close() {
 // ProjectionBuilder implements SchemaVisitor to build a projected schema
 // It visits the original schema and adds only selected fields to the kernel state
 type ProjectionBuilder struct {
-	projection []string                              // column names to include (in requested order)
-	state      *C.struct_KernelSchemaVisitorState    // target state to build schema
-	fieldMap   map[string]C.uintptr_t                // maps field name to field ID
+	projection []string                           // column names to include (in requested order)
+	state      *C.struct_KernelSchemaVisitorState // target state to build schema
+	fieldMap   map[string]C.uintptr_t             // maps field name to field ID
 }
 
 // NewProjectionBuilder creates a new projection builder
@@ -402,10 +402,24 @@ func (p *ProjectionBuilder) BuildFinalStruct() (C.uintptr_t, error) {
 	return 0, fmt.Errorf("failed to build final struct")
 }
 
+// uintptrToPointer converts a C uintptr_t to an unsafe.Pointer
+// This is used for FFI calls where C passes pointers as uintptr_t values.
+//
+// Note: This conversion is safe because:
+// 1. The pointers are managed by C/Rust FFI, not Go's GC
+// 2. The pointers remain valid for the function call duration
+// 3. We immediately dereference and use the pointer
+//
+//go:noinline
+func uintptrToPointer(ptr C.uintptr_t) unsafe.Pointer {
+	//lint:ignore SA4016 FFI requires converting C uintptr_t to Go pointer
+	return unsafe.Pointer(uintptr(ptr))
+}
+
 //export goBuildProjectedSchema
 func goBuildProjectedSchema(projectionPtr C.uintptr_t, statePtr C.uintptr_t, originalSchemaHandle C.HandleSharedSchema) C.uintptr_t {
 	// Extract projection columns from C struct
-	proj := (*C.struct_ColumnProjection)(unsafe.Pointer(uintptr(projectionPtr)))
+	proj := (*C.struct_ColumnProjection)(uintptrToPointer(projectionPtr))
 	columns := make([]string, int(proj.count))
 	colArray := (*[1 << 28]*C.char)(unsafe.Pointer(proj.columns))
 	for i := 0; i < int(proj.count); i++ {
@@ -413,7 +427,7 @@ func goBuildProjectedSchema(projectionPtr C.uintptr_t, statePtr C.uintptr_t, ori
 	}
 
 	// Create projection builder
-	state := (*C.struct_KernelSchemaVisitorState)(unsafe.Pointer(uintptr(statePtr)))
+	state := (*C.struct_KernelSchemaVisitorState)(uintptrToPointer(statePtr))
 	builder := NewProjectionBuilder(columns, state)
 
 	// Visit the original schema with our filtering builder
