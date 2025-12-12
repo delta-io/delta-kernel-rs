@@ -1,0 +1,287 @@
+//! Schema diffing implementation for Delta Lake schemas
+//!
+//! This module provides functionality to compute differences between two schemas
+//! using field IDs as the primary mechanism for identifying fields across schema versions.
+//! Supports nested field comparison within structs, arrays, and maps.
+
+// Allow dead code warnings since this API is not yet used by other modules
+#![allow(dead_code)]
+// TEMPORARY: Allow unused imports in PR 1 - these will be used when the full implementation is added in PR 2
+#![allow(unused_imports)]
+
+use super::{ColumnMetadataKey, ColumnName, DataType, MetadataValue, StructField, StructType};
+use std::collections::{HashMap, HashSet};
+
+/// Represents the difference between two schemas
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SchemaDiff {
+    /// Fields that were added in the new schema
+    pub(crate) added_fields: Vec<FieldChange>,
+    /// Fields that were removed from the original schema
+    pub(crate) removed_fields: Vec<FieldChange>,
+    /// Fields that were modified between schemas
+    pub(crate) updated_fields: Vec<FieldUpdate>,
+    /// Whether the diff contains breaking changes (computed once during construction)
+    breaking_changes: bool,
+}
+
+/// Represents a field change (added or removed) at any nesting level
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FieldChange {
+    /// The field that was added or removed
+    pub(crate) field: StructField,
+    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    pub(crate) path: ColumnName,
+}
+
+/// Represents an update to a field between two schema versions
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FieldUpdate {
+    /// The field as it existed in the original schema
+    pub(crate) before: StructField,
+    /// The field as it exists in the new schema
+    pub(crate) after: StructField,
+    /// The path to this field (e.g., ColumnName::new(["user", "address", "street"]))
+    pub(crate) path: ColumnName,
+    /// The types of changes that occurred (can be multiple, e.g. renamed + nullability changed)
+    pub(crate) change_types: Vec<FieldChangeType>,
+}
+
+/// The types of changes that can occur to a field
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FieldChangeType {
+    /// Field was renamed (logical name changed, but field ID stayed the same)
+    Renamed,
+    /// Field nullability was loosened (non-nullable -> nullable) - safe change
+    NullabilityLoosened,
+    /// Field nullability was tightened (nullable -> non-nullable) - breaking change
+    NullabilityTightened,
+    /// Field data type was changed
+    TypeChanged,
+    /// Field metadata was changed (excluding column mapping metadata)
+    MetadataChanged,
+    /// The container nullability was loosened (safe change)
+    ContainerNullabilityLoosened,
+    /// The container nullability was tightened (breaking change)
+    ContainerNullabilityTightened,
+}
+
+/// Errors that can occur during schema diffing
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SchemaDiffError {
+    #[error("Schema diffing is not yet implemented")]
+    Unsupported,
+    #[error("Field at path '{path}' is missing column mapping ID")]
+    MissingFieldId { path: ColumnName },
+    #[error("Duplicate field ID {id} found at paths '{path1}' and '{path2}'")]
+    DuplicateFieldId {
+        id: i64,
+        path1: ColumnName,
+        path2: ColumnName,
+    },
+    #[error(
+        "Field at path '{path}' is missing physical name (required when column mapping is enabled)"
+    )]
+    MissingPhysicalName { path: ColumnName },
+    #[error("Field with ID {field_id} at path '{path}' has inconsistent physical names: '{before}' -> '{after}'. Physical names must not change for the same field ID.")]
+    PhysicalNameChanged {
+        field_id: i64,
+        path: ColumnName,
+        before: String,
+        after: String,
+    },
+}
+
+impl SchemaDiff {
+    /// Compute the difference between two schemas using field IDs
+    pub(crate) fn new(before: &StructType, after: &StructType) -> Result<Self, SchemaDiffError> {
+        compute_schema_diff(before, after)
+    }
+
+    /// Returns true if there are no differences between the schemas
+    pub(crate) fn is_empty(&self) -> bool {
+        self.added_fields.is_empty()
+            && self.removed_fields.is_empty()
+            && self.updated_fields.is_empty()
+    }
+
+    /// Returns the total number of changes
+    pub(crate) fn change_count(&self) -> usize {
+        self.added_fields.len() + self.removed_fields.len() + self.updated_fields.len()
+    }
+
+    /// Returns true if there are any breaking changes (removed fields, type changes, or tightened nullability)
+    pub(crate) fn has_breaking_changes(&self) -> bool {
+        self.breaking_changes
+    }
+
+    /// Get all changes (both top-level and nested)
+    pub(crate) fn all_changes(&self) -> (&[FieldChange], &[FieldChange], &[FieldUpdate]) {
+        (
+            &self.added_fields,
+            &self.removed_fields,
+            &self.updated_fields,
+        )
+    }
+
+    /// Get all changes at the top level only (fields with path length of 1)
+    pub(crate) fn top_level_changes(
+        &self,
+    ) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
+        let added = self
+            .added_fields
+            .iter()
+            .filter(|f| f.path.path().len() == 1)
+            .collect();
+        let removed = self
+            .removed_fields
+            .iter()
+            .filter(|f| f.path.path().len() == 1)
+            .collect();
+        let updated = self
+            .updated_fields
+            .iter()
+            .filter(|f| f.path.path().len() == 1)
+            .collect();
+        (added, removed, updated)
+    }
+
+    /// Get all changes at nested levels only (fields with path length > 1)
+    pub(crate) fn nested_changes(
+        &self,
+    ) -> (Vec<&FieldChange>, Vec<&FieldChange>, Vec<&FieldUpdate>) {
+        let added = self
+            .added_fields
+            .iter()
+            .filter(|f| f.path.path().len() > 1)
+            .collect();
+        let removed = self
+            .removed_fields
+            .iter()
+            .filter(|f| f.path.path().len() > 1)
+            .collect();
+        let updated = self
+            .updated_fields
+            .iter()
+            .filter(|f| f.path.path().len() > 1)
+            .collect();
+        (added, removed, updated)
+    }
+}
+
+/// Internal representation of a field with its path and ID
+#[derive(Debug, Clone)]
+struct FieldWithPath {
+    field: StructField,
+    path: ColumnName,
+    field_id: i64,
+}
+
+// TEMPORARY: This is a stub implementation for PR 1 (data structures only).
+// Will be replaced with the full implementation in PR 2.
+fn compute_schema_diff(
+    _before: &StructType,
+    _after: &StructType,
+) -> Result<SchemaDiff, SchemaDiffError> {
+    Err(SchemaDiffError::Unsupported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{DataType, StructField, StructType};
+
+    fn create_field_with_id(
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        id: i64,
+    ) -> StructField {
+        StructField::new(name, data_type, nullable).add_metadata([
+            ("delta.columnMapping.id", MetadataValue::Number(id)),
+            (
+                "delta.columnMapping.physicalName",
+                MetadataValue::String(format!("col_{}", id)),
+            ),
+        ])
+    }
+
+    #[test]
+    fn test_identical_schemas() {
+        let schema = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, false, 1),
+            create_field_with_id("name", DataType::STRING, false, 2),
+        ]);
+
+        // PR 1: Expect Unsupported error (stub implementation)
+        // PR 2: Will change to expect Ok(diff) when real implementation exists
+        let result = SchemaDiff::new(&schema, &schema);
+        assert!(matches!(result, Err(SchemaDiffError::Unsupported)));
+    }
+
+    #[test]
+    fn test_change_count() {
+        // PR 1: Expect Unsupported error (stub implementation)
+        // PR 2: Will change to expect Ok(diff) when real implementation exists
+        let before = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, false, 1),
+            create_field_with_id("name", DataType::STRING, false, 2),
+        ]);
+
+        let after = StructType::new_unchecked([
+            create_field_with_id("id", DataType::LONG, true, 1), // Changed
+            create_field_with_id("email", DataType::STRING, false, 3), // Added
+        ]);
+
+        let result = SchemaDiff::new(&before, &after);
+        assert!(matches!(result, Err(SchemaDiffError::Unsupported)));
+    }
+
+    #[test]
+    fn test_top_level_and_nested_change_filters() {
+        // Test that top_level_changes and nested_changes correctly filter by path depth.
+        // This test manually constructs a SchemaDiff to exercise the filtering logic.
+
+        let top_level_field = create_field_with_id("name", DataType::STRING, false, 1);
+        let nested_field = create_field_with_id("street", DataType::STRING, false, 2);
+        let deeply_nested_field = create_field_with_id("city", DataType::STRING, false, 3);
+
+        // Create a diff with mixed top-level and nested changes
+        let diff = SchemaDiff {
+            added_fields: vec![
+                FieldChange {
+                    field: top_level_field.clone(),
+                    path: ColumnName::new(["name"]), // Top-level (depth 1)
+                },
+                FieldChange {
+                    field: nested_field.clone(),
+                    path: ColumnName::new(["address", "street"]), // Nested (depth 2)
+                },
+            ],
+            removed_fields: vec![FieldChange {
+                field: deeply_nested_field.clone(),
+                path: ColumnName::new(["user", "address", "city"]), // Deeply nested (depth 3)
+            }],
+            updated_fields: vec![],
+            breaking_changes: false,
+        };
+
+        // Test top_level_changes - should only return depth 1 fields
+        let (top_added, top_removed, top_updated) = diff.top_level_changes();
+        assert_eq!(top_added.len(), 1);
+        assert_eq!(top_added[0].path, ColumnName::new(["name"]));
+        assert_eq!(top_removed.len(), 0);
+        assert_eq!(top_updated.len(), 0);
+
+        // Test nested_changes - should only return depth > 1 fields
+        let (nested_added, nested_removed, nested_updated) = diff.nested_changes();
+        assert_eq!(nested_added.len(), 1);
+        assert_eq!(nested_added[0].path, ColumnName::new(["address", "street"]));
+        assert_eq!(nested_removed.len(), 1);
+        assert_eq!(
+            nested_removed[0].path,
+            ColumnName::new(["user", "address", "city"])
+        );
+        assert_eq!(nested_updated.len(), 0);
+    }
+}
