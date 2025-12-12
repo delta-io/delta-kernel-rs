@@ -84,3 +84,6 @@ bool get_ok_bool(struct ExternResultbool result);
 // File read result iterator helpers
 struct EngineError* get_err_file_read_result_iter(struct ExternResultHandleExclusiveFileReadResultIterator result);
 HandleExclusiveFileReadResultIterator get_ok_file_read_result_iter(struct ExternResultHandleExclusiveFileReadResultIterator result);
+
+// Engine schema helper
+struct EngineSchema* create_projection_engine_schema(void* projection_data);

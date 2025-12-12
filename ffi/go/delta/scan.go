@@ -36,12 +36,76 @@ type ScanOptions struct {
 func (s *Snapshot) ScanWithOptions(opts *ScanOptions) (*Scan, error) {
 	var engineSchema *C.struct_EngineSchema
 
-	// TODO: Implement column projection
-	// For now, column projection is not implemented - we always read all columns
-	// The API is in place but the actual filtering logic needs to be completed
+	// Build engine schema with column projection if requested
 	if opts != nil && len(opts.Columns) > 0 {
-		// Projection requested but not yet implemented - just use nil engineSchema
-		engineSchema = nil
+		// Get the scan's logical schema as the original schema
+		// We need to create a temporary scan first to get the full schema
+		fullScanResult := C.scan(s.handle, s.engine, nil, nil)
+		if fullScanResult.tag == C.ErrHandleSharedScan {
+			return nil, fmt.Errorf("failed to get full schema for projection")
+		}
+		fullScan := C.get_ok_scan(fullScanResult)
+		logicalSchema := C.scan_logical_schema(fullScan)
+
+		if logicalSchema == nil {
+			C.free_scan(fullScan)
+			return nil, fmt.Errorf("failed to get logical schema for projection")
+		}
+
+		// Allocate and populate C string array for column names
+		cColumns := C.malloc(C.size_t(len(opts.Columns)) * C.size_t(unsafe.Sizeof(uintptr(0))))
+
+		columnArray := (*[1 << 28]*C.char)(cColumns)
+		cStrings := make([]*C.char, len(opts.Columns))
+		for i, col := range opts.Columns {
+			cStrings[i] = C.CString(col)
+			columnArray[i] = cStrings[i]
+		}
+
+		// Create ColumnProjection struct on heap (needs to outlive this scope)
+		projection := (*C.struct_ColumnProjection)(C.malloc(C.size_t(unsafe.Sizeof(C.struct_ColumnProjection{}))))
+		if projection == nil {
+			C.free_scan(fullScan)
+			return nil, fmt.Errorf("failed to allocate projection struct")
+		}
+		projection.columns = (**C.char)(cColumns)
+		projection.count = C.int(len(opts.Columns))
+		projection.original_schema = logicalSchema
+
+		// Create EngineSchema using helper (handles function pointer correctly)
+		engineSchema = C.create_projection_engine_schema(unsafe.Pointer(projection))
+		if engineSchema == nil {
+			C.free_scan(fullScan)
+			return nil, fmt.Errorf("failed to create projection engine schema")
+		}
+
+		// Perform the scan with projection
+		result := C.scan(s.handle, s.engine, nil, engineSchema)
+
+		// Now cleanup everything (the scan has been created)
+		C.free(unsafe.Pointer(engineSchema))
+		C.free(unsafe.Pointer(projection))
+		for _, cStr := range cStrings {
+			C.free(unsafe.Pointer(cStr))
+		}
+		C.free(cColumns)
+		C.free_scan(fullScan)
+
+		// Check scan result
+		if result.tag == C.ErrHandleSharedScan {
+			errPtr := C.get_err_scan(result)
+			if errPtr != nil {
+				return nil, fmt.Errorf("kernel error creating scan: %d", errPtr.etype)
+			}
+			return nil, fmt.Errorf("unknown error creating scan")
+		}
+
+		handle := C.get_ok_scan(result)
+		scan := &Scan{handle: handle}
+		scan.logicalSchema = C.scan_logical_schema(scan.handle)
+		scan.physicalSchema = C.scan_physical_schema(scan.handle)
+
+		return scan, nil
 	}
 
 	result := C.scan(s.handle, s.engine, nil, engineSchema)
@@ -142,58 +206,214 @@ func (sc *Scan) Close() {
 	}
 }
 
-// Go callback stubs for projection filtering
-// TODO: Implement actual filtering logic
+// ProjectionBuilder implements SchemaVisitor to build a projected schema
+// It visits the original schema and adds only selected fields to the kernel state
+type ProjectionBuilder struct {
+	projection []string                           // column names to include
+	state      *C.struct_KernelSchemaVisitorState // target state to build schema
+	fieldIDs   []C.uintptr_t                      // collected field IDs for final struct
+}
 
-//export goProjectionMakeFieldList
-func goProjectionMakeFieldList(handleValue C.uintptr_t, reserve C.uintptr_t) C.uintptr_t {
+// NewProjectionBuilder creates a new projection builder
+func NewProjectionBuilder(columns []string, state *C.struct_KernelSchemaVisitorState) *ProjectionBuilder {
+	return &ProjectionBuilder{
+		projection: columns,
+		state:      state,
+		fieldIDs:   make([]C.uintptr_t, 0, len(columns)),
+	}
+}
+
+// shouldInclude checks if a field name is in the projection
+func (p *ProjectionBuilder) shouldInclude(name string) bool {
+	for _, col := range p.projection {
+		if col == name {
+			return true
+		}
+	}
+	return false
+}
+
+// MakeFieldList - we don't need this for projection, just return 0
+func (p *ProjectionBuilder) MakeFieldList(reserve int) int {
 	return 0
 }
 
-//export goProjectionVisitString
-func goProjectionVisitString(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+// Helper to add a field via FFI
+func (p *ProjectionBuilder) addFieldViaFFI(name string, nullable bool, visitFn func(C.struct_KernelStringSlice, C.bool) C.struct_ExternResultusize) {
+	if !p.shouldInclude(name) {
+		return
+	}
+
+	// Convert name to C string slice
+	cName := C.CString(name)
+	defer C.free(unsafe.Pointer(cName))
+
+	nameSlice := C.struct_KernelStringSlice{
+		ptr: cName,
+		len: C.uintptr_t(len(name)),
+	}
+
+	// Call the FFI function
+	result := visitFn(nameSlice, C.bool(nullable))
+	if result.tag == C.Okusize {
+		fieldID := C.get_ok_field_id(result)
+		p.fieldIDs = append(p.fieldIDs, fieldID)
+	}
 }
 
-//export goProjectionVisitLong
-func goProjectionVisitLong(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+// Implement SchemaVisitor interface for primitive types
+func (p *ProjectionBuilder) VisitString(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_string(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitInteger
-func goProjectionVisitInteger(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitLong(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_long(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitShort
-func goProjectionVisitShort(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitInteger(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_integer(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitByte
-func goProjectionVisitByte(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitShort(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_short(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitFloat
-func goProjectionVisitFloat(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitByte(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_byte(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitDouble
-func goProjectionVisitDouble(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitFloat(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_float(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitBoolean
-func goProjectionVisitBoolean(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitDouble(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_double(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitBinary
-func goProjectionVisitBinary(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitBoolean(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_boolean(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitDate
-func goProjectionVisitDate(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitBinary(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_binary(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitTimestamp
-func goProjectionVisitTimestamp(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitDate(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_date(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
 }
 
-//export goProjectionVisitTimestampNtz
-func goProjectionVisitTimestampNtz(handleValue C.uintptr_t, siblingListID C.uintptr_t, name C.struct_KernelStringSlice, nullable C.bool) {
+func (p *ProjectionBuilder) VisitTimestamp(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_timestamp(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
+}
+
+func (p *ProjectionBuilder) VisitTimestampNtz(siblingListID int, name string, nullable bool) {
+	p.addFieldViaFFI(name, nullable, func(nameSlice C.struct_KernelStringSlice, n C.bool) C.struct_ExternResultusize {
+		return C.visit_field_timestamp_ntz(p.state, nameSlice, n, C.AllocateErrorFn(C.allocate_error_helper))
+	})
+}
+
+// Complex types - for now, not supported in projection
+func (p *ProjectionBuilder) VisitStruct(siblingListID int, name string, nullable bool, childListID int) {
+	// TODO: Handle struct projection
+}
+
+func (p *ProjectionBuilder) VisitArray(siblingListID int, name string, nullable bool, childListID int) {
+	// TODO: Handle array projection
+}
+
+func (p *ProjectionBuilder) VisitMap(siblingListID int, name string, nullable bool, childListID int) {
+	// TODO: Handle map projection
+}
+
+func (p *ProjectionBuilder) VisitDecimal(siblingListID int, name string, nullable bool, precision uint8, scale uint8) {
+	// TODO: Handle decimal projection
+}
+
+// BuildFinalStruct builds the final projected struct from collected field IDs
+func (p *ProjectionBuilder) BuildFinalStruct() (C.uintptr_t, error) {
+	if len(p.fieldIDs) == 0 {
+		return 0, fmt.Errorf("no fields in projection")
+	}
+
+	// Convert field IDs to C array
+	fieldIDsPtr := (*C.uintptr_t)(C.malloc(C.size_t(len(p.fieldIDs)) * C.size_t(unsafe.Sizeof(C.uintptr_t(0)))))
+	defer C.free(unsafe.Pointer(fieldIDsPtr))
+
+	fieldIDsSlice := (*[1 << 30]C.uintptr_t)(unsafe.Pointer(fieldIDsPtr))[:len(p.fieldIDs):len(p.fieldIDs)]
+	for i, id := range p.fieldIDs {
+		fieldIDsSlice[i] = id
+	}
+
+	// Create empty name for root struct (name is ignored for root)
+	emptyName := C.struct_KernelStringSlice{
+		ptr: nil,
+		len: 0,
+	}
+
+	// Call visit_field_struct to build the final schema
+	result := C.visit_field_struct(
+		p.state,
+		emptyName,
+		fieldIDsPtr,
+		C.uintptr_t(len(p.fieldIDs)),
+		C.bool(false), // not nullable
+		C.AllocateErrorFn(C.allocate_error_helper),
+	)
+
+	if result.tag == C.Okusize {
+		return C.get_ok_field_id(result), nil
+	}
+
+	return 0, fmt.Errorf("failed to build final struct")
+}
+
+//export goBuildProjectedSchema
+func goBuildProjectedSchema(projectionPtr C.uintptr_t, statePtr C.uintptr_t, originalSchemaHandle C.HandleSharedSchema) C.uintptr_t {
+	// Extract projection columns from C struct
+	proj := (*C.struct_ColumnProjection)(unsafe.Pointer(uintptr(projectionPtr)))
+	columns := make([]string, int(proj.count))
+	colArray := (*[1 << 28]*C.char)(unsafe.Pointer(proj.columns))
+	for i := 0; i < int(proj.count); i++ {
+		columns[i] = C.GoString(colArray[i])
+	}
+
+	// Create projection builder
+	state := (*C.struct_KernelSchemaVisitorState)(unsafe.Pointer(uintptr(statePtr)))
+	builder := NewProjectionBuilder(columns, state)
+
+	// Visit the original schema with our filtering builder
+	_, err := visitSchemaWithVisitor(originalSchemaHandle, builder)
+	if err != nil {
+		return 0
+	}
+
+	// Build and return the final struct
+	structID, err := builder.BuildFinalStruct()
+	if err != nil {
+		return 0
+	}
+
+	return structID
 }

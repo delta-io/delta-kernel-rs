@@ -179,7 +179,7 @@ func TestSchemaProjection(t *testing.T) {
 	require.NoError(t, err)
 	defer snapshot.Close()
 
-	// Test that ScanWithOptions API works (projection filtering not yet implemented)
+	// Test that ScanWithOptions API works
 	scan, err := snapshot.ScanWithOptions(&ScanOptions{
 		Columns: []string{"utf8", "int64"},
 	})
@@ -189,10 +189,11 @@ func TestSchemaProjection(t *testing.T) {
 	schema, err := scan.LogicalSchema()
 	require.NoError(t, err)
 
-	t.Logf("✓ schema projection API works, fields: %d", len(schema.Fields))
+	t.Logf("✓ schema projection API created, fields: %d", len(schema.Fields))
 
-	// TODO: Implement actual projection filtering in visit_projection_schema
-	// Currently returns full schema because filtering logic is not yet implemented
+	// TODO: Complete projection implementation
+	// The infrastructure is in place but disabled due to architecture refinement needed
+	// Currently returns full schema regardless of projection
 }
 
 func BenchmarkAcceptance(b *testing.B) {

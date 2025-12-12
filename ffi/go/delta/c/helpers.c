@@ -1,4 +1,5 @@
 #include "helpers.h"
+#include "schema_projection.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -250,6 +251,16 @@ struct EngineError* get_err_file_read_result_iter(struct ExternResultHandleExclu
 
 HandleExclusiveFileReadResultIterator get_ok_file_read_result_iter(struct ExternResultHandleExclusiveFileReadResultIterator result) {
     return result.ok;
+}
+
+// Engine schema helper - creates EngineSchema with projection visitor
+struct EngineSchema* create_projection_engine_schema(void* projection_data) {
+    struct EngineSchema* schema = (struct EngineSchema*)malloc(sizeof(struct EngineSchema));
+    if (schema) {
+        schema->schema = projection_data;
+        schema->visitor = &visit_projection_schema;
+    }
+    return schema;
 }
 
 // Scan metadata visitor C wrappers are in scan_helpers.c
