@@ -19,15 +19,16 @@ all: rust-ffi build example
 
 # Build the Rust FFI library
 rust-ffi:
-	cd $(PROJECT_ROOT) && cargo build -p delta_kernel_ffi --all-features
+	cd $(PROJECT_ROOT) && cargo build -p delta_kernel_ffi --all-features --release
 
 # Build Go bindings
 build: rust-ffi
 	go build ./...
 
-# Build example
+# Build examples
 example: rust-ffi
 	go build -o examples/describe_schema ./examples/describe_schema.go
+	go build -o examples/read_table ./examples/read_table.go
 
 # Run example (requires TABLE_PATH environment variable)
 run-example: example
@@ -39,7 +40,7 @@ run-example: example
 
 # Clean build artifacts
 clean:
-	rm -f examples/describe_schema
+	rm -f examples/describe_schema examples/read_table
 	go clean
 
 # Run tests

@@ -41,8 +41,8 @@ func (fp *FilePrinter) VisitFile(path string, size int64, stats *delta.Stats, pa
 			return
 		}
 
-		// Construct full file path
-		fullPath := tableRoot + "/" + path
+		// Construct full file path (path is already relative to table root)
+		fullPath := tableRoot + path
 
 		// Create FileMeta
 		fileMeta := &delta.FileMeta{
