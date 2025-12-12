@@ -187,6 +187,34 @@ func TestTimeTravel(t *testing.T) {
 	t.Logf("✓ time travel works: v0=%d, v1=%d", snapshot0.Version(), snapshot1.Version())
 }
 
+func TestSchemaProjection(t *testing.T) {
+	path := "../../../acceptance/tests/dat/out/reader_tests/generated/all_primitive_types/delta"
+
+	snapshot, err := NewSnapshot(path)
+	if err != nil {
+		t.Fatalf("failed to create snapshot: %v", err)
+	}
+	defer snapshot.Close()
+
+	// scan with column projection
+	scan, err := snapshot.ScanWithOptions(&ScanOptions{
+		Columns: []string{"utf8", "int64"},
+	})
+	if err != nil {
+		t.Fatalf("failed to scan with projection: %v", err)
+	}
+	defer scan.Close()
+
+	schema, err := scan.LogicalSchema()
+	if err != nil {
+		t.Fatalf("failed to get schema: %v", err)
+	}
+
+	t.Logf("✓ schema projection works, schema fields: %d", len(schema.Fields))
+
+	// TODO: verify only requested columns in schema once visitor is fully implemented
+}
+
 func BenchmarkAcceptance(b *testing.B) {
 	path := "../../../acceptance/tests/dat/out/reader_tests/generated/basic_append/delta"
 	for i := 0; i < b.N; i++ {

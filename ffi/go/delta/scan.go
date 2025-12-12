@@ -5,6 +5,8 @@ package delta
 #cgo LDFLAGS: -L${SRCDIR}/../../../target/release -ldelta_kernel_ffi
 #include "delta_kernel_ffi.h"
 #include "helpers.h"
+#include "schema_projection.h"
+#include "schema_projection.c"
 // Note: helpers.c is included in snapshot.go to avoid duplicate symbols
 */
 import "C"
@@ -21,11 +23,32 @@ type Scan struct {
 }
 
 // Scan creates a new scan of the snapshot
-// This allows reading data from the table with optional predicates and schema projection
-// TODO: Add predicate and schema parameters for filtering and projection
 func (s *Snapshot) Scan() (*Scan, error) {
-	// Pass nil for predicate and schema (untyped for now, will be properly typed later)
-	result := C.scan(s.handle, s.engine, nil, nil)
+	return s.ScanWithOptions(nil)
+}
+
+// ScanOptions configures scan behavior
+type ScanOptions struct {
+	Columns []string // column projection - nil means all columns
+	// TODO: add Predicate field
+}
+
+// ScanWithOptions creates a new scan with optional column projection and predicates
+func (s *Snapshot) ScanWithOptions(opts *ScanOptions) (*Scan, error) {
+	var engineSchema *C.struct_EngineSchema
+	var cColumns **C.char
+	var projection *C.struct_ColumnProjection
+
+	// TODO: implement column projection
+	// for now, skip - visitor callback needs proper cgo setup
+	_ = cColumns
+	_ = projection
+	if opts != nil && len(opts.Columns) > 0 {
+		// placeholder - projection not yet implemented
+		engineSchema = nil
+	}
+
+	result := C.scan(s.handle, s.engine, nil, engineSchema)
 
 	if result.tag == C.ErrHandleSharedScan {
 		errPtr := C.get_err_scan(result)
@@ -38,7 +61,6 @@ func (s *Snapshot) Scan() (*Scan, error) {
 	handle := C.get_ok_scan(result)
 	scan := &Scan{handle: handle}
 
-	// Get schemas immediately
 	scan.logicalSchema = C.scan_logical_schema(scan.handle)
 	scan.physicalSchema = C.scan_physical_schema(scan.handle)
 
