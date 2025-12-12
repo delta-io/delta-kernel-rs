@@ -18,9 +18,13 @@ make test-acceptance
 ## basic usage
 
 ```go
-// open table
+// open table at latest version
 snapshot, _ := delta.NewSnapshot("/path/to/table")
 defer snapshot.Close()
+
+// or open at specific version (time travel)
+snapshotV0, _ := delta.NewSnapshotAtVersion("/path/to/table", 0)
+defer snapshotV0.Close()
 
 // get metadata
 version := snapshot.Version()
@@ -51,6 +55,7 @@ for {
 ## what works
 
 - ✅ snapshot creation + metadata (version, partitions, table root)
+- ✅ time travel (read table at specific version)
 - ✅ schema extraction (all types including nested struct/array/map)
 - ✅ scan metadata iteration (file lists, stats, partition values)
 - ✅ parquet data reading via arrow c interface
@@ -62,7 +67,6 @@ for {
 **reading limitations:**
 - ❌ no predicate pushdown - reads all files
 - ❌ no schema projection - reads all columns
-- ❌ no time travel - latest version only
 - ❌ no deletion vectors - can't handle row deletes
 
 **not implemented:**
@@ -73,15 +77,14 @@ for {
 
 ## FFI coverage
 
-**implemented (11 functions):**
-- `snapshot`, `get_default_engine`, `scan`
+**implemented (12 functions):**
+- `snapshot`, `snapshot_at_version`, `get_default_engine`, `scan`
 - `scan_logical_schema`, `scan_physical_schema`
 - `scan_metadata_iter_init`, `scan_metadata_next`
 - `read_parquet_file`, `read_result_next`
 - `get_raw_arrow_data`, `visit_field_*`
 
 **missing high priority:**
-- `snapshot_at_version` - time travel
 - `selection_vector_from_dv` - deletion vectors
 - `row_indexes_from_dv` - apply deletes
 - predicate/projection in `scan()`
@@ -115,14 +118,9 @@ Rust kernel
 
 ```
 ffi/go/
-├── delta/                 # go package
-│   ├── snapshot.go        # table snapshots
-│   ├── scan.go            # scan ops
-│   ├── schema.go          # schema types
-│   ├── read_data.go       # parquet reading
-│   ├── arrow_reader.go    # arrow data
+├── delta/                 # go package, main go files
 │   └── c/                 # cgo helpers
-└── examples/main.go       # cli tool
+└── examples/main.go       # examplar cli tool
 ```
 
 ## building
@@ -182,7 +180,6 @@ test discovery: auto-scans `acceptance/tests/dat/out/reader_tests/generated/`
 
 - add predicate pushdown (high priority)
 - add schema projection (high priority)
-- add time travel (high priority)
 - add deletion vectors (high priority)
 - fix standalone binary segfault
 - implement CDC

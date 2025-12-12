@@ -154,6 +154,39 @@ func (v *dataVisitor) VisitEngineData(data *EngineData) bool {
 	return false
 }
 
+func TestTimeTravel(t *testing.T) {
+	path := "../../../acceptance/tests/dat/out/reader_tests/generated/basic_append/delta"
+
+	// snapshot at version 0
+	snapshot0, err := NewSnapshotAtVersion(path, 0)
+	if err != nil {
+		t.Fatalf("failed to create snapshot at v0: %v", err)
+	}
+	defer snapshot0.Close()
+
+	if snapshot0.Version() != 0 {
+		t.Errorf("expected version 0, got %d", snapshot0.Version())
+	}
+
+	// snapshot at version 1
+	snapshot1, err := NewSnapshotAtVersion(path, 1)
+	if err != nil {
+		t.Fatalf("failed to create snapshot at v1: %v", err)
+	}
+	defer snapshot1.Close()
+
+	if snapshot1.Version() != 1 {
+		t.Errorf("expected version 1, got %d", snapshot1.Version())
+	}
+
+	// verify they're different versions
+	if snapshot0.Version() == snapshot1.Version() {
+		t.Error("snapshots at different versions should not match")
+	}
+
+	t.Logf("✓ time travel works: v0=%d, v1=%d", snapshot0.Version(), snapshot1.Version())
+}
+
 func BenchmarkAcceptance(b *testing.B) {
 	path := "../../../acceptance/tests/dat/out/reader_tests/generated/basic_append/delta"
 	for i := 0; i < b.N; i++ {
