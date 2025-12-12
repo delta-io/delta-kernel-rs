@@ -215,7 +215,10 @@ impl StructData {
 
 /// A single value, which can be null. Used for representing literal values
 /// in [Expressions][crate::expressions::Expression].
-#[derive(Debug, Clone)]
+///
+/// NOTE: `PartialEq` uses physical (structural) comparison semantics.
+/// For SQL NULL semantics, use [`Scalar::logical_eq`] or [`Scalar::logical_partial_cmp`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
@@ -423,14 +426,40 @@ impl Display for Scalar {
     }
 }
 
-impl PartialEq for Scalar {
-    fn eq(&self, other: &Scalar) -> bool {
-        self.partial_cmp(other) == Some(Ordering::Equal)
+impl Scalar {
+    /// Logical (SQL semantics) equality comparison of two scalars.
+    ///
+    /// Returns `None` if the scalars cannot be compared (different types, NULL values, or
+    /// unsupported types like Struct/Array/Map).
+    ///
+    /// Logical (SQL semantics) equality comparison of two scalars.
+    ///
+    /// Returns `true` if the scalars are logically equal, `false` otherwise.
+    ///
+    /// NOTE: This implements SQL NULL semantics where NULL is incomparable to everything,
+    /// including itself, so `NULL != NULL` (returns `false`).
+    pub fn logical_eq(&self, other: &Self) -> bool {
+        self.logical_partial_cmp(other) == Some(Ordering::Equal)
     }
-}
 
-impl PartialOrd for Scalar {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    /// Physical (structural) equality comparison of two scalars.
+    ///
+    /// Returns `true` if the scalars are structurally identical, `false` otherwise.
+    ///
+    /// Unlike logical comparison, this treats `Null(dt1) == Null(dt2)` as `true` when `dt1 == dt2`.
+    /// This is used for query plan comparison, not SQL evaluation.
+    pub fn physical_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    /// Logical (SQL semantics) comparison of two scalars.
+    ///
+    /// Returns `None` if the scalars are incomparable (different types, NULL values, or
+    /// unsupported types like Struct/Array/Map).
+    ///
+    /// NOTE: This implements SQL NULL semantics where NULL is incomparable to everything,
+    /// including itself.
+    pub fn logical_partial_cmp(&self, other: &Self) -> Option<Ordering> {
         use Scalar::*;
         match (self, other) {
             // NOTE: We intentionally do two match arms for each variant to avoid a catch-all, so
@@ -463,7 +492,7 @@ impl PartialOrd for Scalar {
                 .then(|| d1.bits().partial_cmp(&d2.bits()))
                 .flatten(),
             (Decimal(_), _) => None,
-            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition
+            (Null(_), _) => None, // NOTE: NULL values are incomparable by definition (SQL NULL semantics)
             (Struct(_), _) => None, // TODO: Support Struct?
             (Array(_), _) => None, // TODO: Support Array?
             (Map(_), _) => None,  // TODO: Support Map?
@@ -1042,16 +1071,17 @@ mod tests {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
         let c = Scalar::Null(DataType::INTEGER);
-        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
-        assert_eq!(b.partial_cmp(&a), Some(Ordering::Greater));
-        assert_eq!(a.partial_cmp(&a), Some(Ordering::Equal));
-        assert_eq!(b.partial_cmp(&b), Some(Ordering::Equal));
-        assert_eq!(a.partial_cmp(&c), None);
-        assert_eq!(c.partial_cmp(&a), None);
+
+        assert_eq!(a.logical_partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.logical_partial_cmp(&a), Some(Ordering::Greater));
+        assert_eq!(a.logical_partial_cmp(&a), Some(Ordering::Equal));
+        assert_eq!(b.logical_partial_cmp(&b), Some(Ordering::Equal));
+        assert_eq!(a.logical_partial_cmp(&c), None);
+        assert_eq!(c.logical_partial_cmp(&a), None);
 
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
-        assert_eq!(null.partial_cmp(&null), None);
+        assert_eq!(null.logical_partial_cmp(&null), None);
     }
 
     #[test]
@@ -1059,14 +1089,14 @@ mod tests {
         let a = Scalar::Integer(1);
         let b = Scalar::Integer(2);
         let c = Scalar::Null(DataType::INTEGER);
-        assert!(!a.eq(&b));
-        assert!(a.eq(&a));
-        assert!(!a.eq(&c));
-        assert!(!c.eq(&a));
+        assert!(!a.logical_eq(&b));
+        assert!(a.logical_eq(&a));
+        assert!(!a.logical_eq(&c));
+        assert!(!c.logical_eq(&a));
 
         // assert that NULL values are incomparable
         let null = Scalar::Null(DataType::INTEGER);
-        assert!(!null.eq(&null));
+        assert!(!null.logical_eq(&null));
     }
 
     #[test]
@@ -1095,14 +1125,10 @@ mod tests {
         assert!(!map_data.map_type().value_contains_null());
 
         // Check that both expected pairs are present
-        let has_key1 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
-        });
-        let has_key2 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Integer(100))
-        });
-        assert!(has_key1, "Missing key1 -> 42 pair");
-        assert!(has_key2, "Missing key2 -> 100 pair");
+        let entry1 = (Scalar::String("key1".to_string()), Scalar::Integer(42));
+        let entry2 = (Scalar::String("key2".to_string()), Scalar::Integer(100));
+        assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
+        assert!(pairs.contains(&entry2), "Missing key2 -> 100 pair");
 
         Ok(())
     }
@@ -1134,18 +1160,15 @@ mod tests {
         assert!(map_data.map_type().value_contains_null());
 
         // Check that all expected pairs are present
-        let has_key1 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key1") && matches!(v, Scalar::Integer(42))
-        });
-        let has_key2 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key2") && matches!(v, Scalar::Null(_))
-        });
-        let has_key3 = pairs.iter().any(|(k, v)| {
-            matches!(k, Scalar::String(s) if s == "key3") && matches!(v, Scalar::Integer(100))
-        });
-        assert!(has_key1, "Missing key1 -> 42 pair");
-        assert!(has_key2, "Missing key2 -> null pair");
-        assert!(has_key3, "Missing key3 -> 100 pair");
+        let entry1 = (Scalar::String("key1".to_string()), Scalar::Integer(42));
+        let entry2 = (
+            Scalar::String("key2".to_string()),
+            Scalar::Null(DataType::INTEGER),
+        );
+        let entry3 = (Scalar::String("key3".to_string()), Scalar::Integer(100));
+        assert!(pairs.contains(&entry1), "Missing key1 -> 42 pair");
+        assert!(pairs.contains(&entry2), "Missing key2 -> null pair");
+        assert!(pairs.contains(&entry3), "Missing key3 -> 100 pair");
 
         Ok(())
     }
@@ -1174,9 +1197,9 @@ mod tests {
         assert!(!array_data.array_type().contains_null());
 
         // Check that all expected values are present
-        assert!(matches!(elements[0], Scalar::Integer(42)));
-        assert!(matches!(elements[1], Scalar::Integer(100)));
-        assert!(matches!(elements[2], Scalar::Integer(200)));
+        assert_eq!(elements[0], Scalar::Integer(42));
+        assert_eq!(elements[1], Scalar::Integer(100));
+        assert_eq!(elements[2], Scalar::Integer(200));
 
         Ok(())
     }
@@ -1206,9 +1229,9 @@ mod tests {
         assert!(array_data.array_type().contains_null());
 
         // Check that all expected values are present
-        assert!(matches!(elements[0], Scalar::Integer(42)));
-        assert!(matches!(elements[1], Scalar::Null(_)));
-        assert!(matches!(elements[2], Scalar::Integer(100)));
+        assert_eq!(elements[0], Scalar::Integer(42));
+        assert!(elements[1].is_null());
+        assert_eq!(elements[2], Scalar::Integer(100));
 
         Ok(())
     }
