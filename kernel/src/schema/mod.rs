@@ -1241,7 +1241,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DecimalType {
     precision: u8,
     scale: u8,
