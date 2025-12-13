@@ -21,6 +21,8 @@ use crate::{DeltaResult, Error};
 use delta_kernel_derive::internal_api;
 
 pub(crate) mod compare;
+#[cfg(feature = "schema-diff")]
+pub(crate) mod diff;
 
 #[cfg(feature = "internal-api")]
 pub mod derive_macro_utils;
