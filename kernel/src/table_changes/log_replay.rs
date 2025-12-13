@@ -281,8 +281,9 @@ impl LogReplayScanner {
             // Apply data skipping to get back a selection vector for actions that passed skipping.
             // We start our selection vector based on what was filtered. We will add to this vector
             // below if a file has been removed. Note: None implies all files passed data skipping.
+            // For CDF, we always use JSON stats parsing (is_log_batch=true, use_parsed_stats=false)
             let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref())?,
+                Some(filter) => filter.apply(actions.as_ref(), true, false)?,
                 None => vec![true; actions.len()],
             };
 
