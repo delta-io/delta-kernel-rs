@@ -53,7 +53,14 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    ///
+    /// If `use_stats_parsed` is true, the processor will attempt to use pre-parsed statistics
+    /// from `add.stats_parsed` in checkpoint data for data skipping.
+    fn new(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        use_stats_parsed: bool,
+    ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -74,7 +81,11 @@ impl ScanLogReplayProcessor {
         };
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            data_skipping_filter: DataSkippingFilter::new(
+                engine,
+                physical_predicate,
+                use_stats_parsed,
+            ),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
@@ -396,12 +407,19 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
+///
+/// If `use_stats_parsed` is true, the processor will attempt to use pre-parsed statistics
+/// from `add.stats_parsed` in checkpoint data for data skipping.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    use_stats_parsed: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(
+        ScanLogReplayProcessor::new(engine, state_info, use_stats_parsed)?
+            .process_actions_iter(action_iter),
+    )
 }
 
 #[cfg(test)]
@@ -495,6 +513,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            false, // use_stats_parsed
         )
         .unwrap();
         for res in iter {
@@ -521,6 +540,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_stats_parsed
         )
         .unwrap();
 
@@ -599,6 +619,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_stats_parsed
         )
         .unwrap();
 
