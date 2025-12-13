@@ -11,6 +11,7 @@ use crate::actions::{
     PROTOCOL_NAME, SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
@@ -330,15 +331,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
-        let commits_and_compactions = self.find_commit_cover();
-        let commit_stream = engine
-            .json_handler()
-            .read_json_files(
-                &commits_and_compactions,
-                commit_read_schema,
-                meta_predicate.clone(),
-            )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
+        let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
@@ -367,7 +360,7 @@ impl LogSegment {
     /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
-    fn find_commit_cover(&self) -> Vec<FileMeta> {
+    pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]
