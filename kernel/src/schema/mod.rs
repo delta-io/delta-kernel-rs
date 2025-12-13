@@ -193,14 +193,14 @@ impl FromStr for MetadataColumnSpec {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone, Eq)]
 pub struct StructField {
     /// Name of this (possibly nested) column
-    pub name: String,
+    name: String,
     /// The data type of this field
     #[serde(rename = "type")]
-    pub data_type: DataType,
+    data_type: DataType,
     /// Denotes whether this Field can be null
-    pub nullable: bool,
+    nullable: bool,
     /// A JSON map containing information about this column
-    pub metadata: HashMap<String, MetadataValue>,
+    metadata: HashMap<String, MetadataValue>,
 }
 
 impl StructField {
@@ -368,7 +368,7 @@ impl StructField {
     }
 
     #[inline]
-    pub fn is_nullable(&self) -> bool {
+    pub const fn is_nullable(&self) -> bool {
         self.nullable
     }
 
@@ -1158,11 +1158,11 @@ impl<'de> Deserialize<'de> for StructType {
 #[serde(rename_all = "camelCase")]
 pub struct ArrayType {
     #[serde(rename = "type")]
-    pub type_name: String,
+    type_name: String,
     /// The type of element stored in this array
-    pub element_type: DataType,
+    element_type: DataType,
     /// Denoting whether this array can contain one or more null values
-    pub contains_null: bool,
+    contains_null: bool,
 }
 
 impl ArrayType {
@@ -1189,14 +1189,14 @@ impl ArrayType {
 #[serde(rename_all = "camelCase")]
 pub struct MapType {
     #[serde(rename = "type")]
-    pub type_name: String,
+    type_name: String,
     /// The type of element used for the key of this map
-    pub key_type: DataType,
+    key_type: DataType,
     /// The type of element used for the value of this map
-    pub value_type: DataType,
+    value_type: DataType,
     /// Denoting whether this map can contain one or more null values
     #[serde(default = "default_true")]
-    pub value_contains_null: bool,
+    value_contains_null: bool,
 }
 
 impl MapType {

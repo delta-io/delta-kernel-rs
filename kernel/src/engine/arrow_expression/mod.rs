@@ -187,7 +187,7 @@ impl Scalar {
                 for _ in 0..num_rows {
                     let field_builders = builder.field_builders_mut().iter_mut();
                     for (builder, field) in field_builders.zip(stype.fields()) {
-                        Self::append_null(builder, &field.data_type, 1)?;
+                        Self::append_null(builder, field.data_type(), 1)?;
                     }
                     builder.append(false);
                 }

@@ -262,7 +262,7 @@ impl Metadata {
         if let Some(metadata_field) = schema.fields().find(|field| field.is_metadata_column()) {
             return Err(Error::Schema(format!(
                 "Table schema must not contain metadata columns. Found metadata column: '{}'",
-                metadata_field.name
+                metadata_field.name()
             )));
         }
 
