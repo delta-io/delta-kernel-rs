@@ -1,5 +1,7 @@
 //! Commit phase for log replay - processes JSON commit files.
 
+use itertools::Itertools;
+
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::LogSegment;
 use crate::schema::SchemaRef;
@@ -26,7 +28,7 @@ impl CommitReader {
         let actions = engine
             .json_handler()
             .read_json_files(&commit_files, schema, None)?
-            .map(|batch| batch.map(|b| ActionsBatch::new(b, true)));
+            .map_ok(|batch| ActionsBatch::new(batch, true));
 
         Ok(Self {
             actions: Box::new(actions),
