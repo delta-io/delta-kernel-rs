@@ -247,56 +247,16 @@ impl ListedLogFiles {
         &mut self.ascending_commit_files
     }
 
-    pub(crate) fn into_ascending_commit_files(self) -> Vec<ParsedLogPath> {
-        self.ascending_commit_files
-    }
-
-    pub(crate) fn ascending_compaction_files(&self) -> &Vec<ParsedLogPath> {
-        &self.ascending_compaction_files
-    }
-
-    pub(crate) fn ascending_compaction_files_mut(&mut self) -> &mut Vec<ParsedLogPath> {
-        &mut self.ascending_compaction_files
-    }
-
-    pub(crate) fn into_ascending_compaction_files(self) -> Vec<ParsedLogPath> {
-        self.ascending_compaction_files
-    }
-
     pub(crate) fn checkpoint_parts(&self) -> &Vec<ParsedLogPath> {
         &self.checkpoint_parts
-    }
-
-    pub(crate) fn checkpoint_parts_mut(&mut self) -> &mut Vec<ParsedLogPath> {
-        &mut self.checkpoint_parts
-    }
-
-    pub(crate) fn into_checkpoint_parts(self) -> Vec<ParsedLogPath> {
-        self.checkpoint_parts
     }
 
     pub(crate) fn latest_commit_file(&self) -> &Option<ParsedLogPath> {
         &self.latest_commit_file
     }
 
-    pub(crate) fn latest_commit_file_mut(&mut self) -> &mut Option<ParsedLogPath> {
-        &mut self.latest_commit_file
-    }
-
-    pub(crate) fn latest_crc_file(&self) -> &Option<ParsedLogPath> {
-        &self.latest_crc_file
-    }
-
-    pub(crate) fn latest_crc_file_mut(&mut self) -> &mut Option<ParsedLogPath> {
-        &mut self.latest_crc_file
-    }
-
     pub(crate) fn into_latest_crc_file(self) -> Option<ParsedLogPath> {
         self.latest_crc_file
-    }
-
-    pub(crate) fn into_latest_commit_file(self) -> Option<ParsedLogPath> {
-        self.latest_commit_file
     }
 
     /// List all commits between the provided `start_version` (inclusive) and `end_version`
