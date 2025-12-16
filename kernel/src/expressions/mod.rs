@@ -1051,20 +1051,6 @@ mod tests {
         assert_eq!(value, &deserialized, "roundtrip should preserve value");
     }
 
-    /// Helper function for types where PartialEq may not work correctly (e.g., types
-    /// containing Null, Array, Map, or Struct scalars which return None from partial_cmp).
-    /// This compares the JSON representation instead.
-    fn assert_roundtrip_via_json<T: Serialize + DeserializeOwned + Debug>(value: &T) {
-        let json = serde_json::to_string(value).expect("serialization should succeed");
-        let deserialized: T = serde_json::from_str(&json).expect("deserialization should succeed");
-        let reserialized =
-            serde_json::to_string(&deserialized).expect("reserialization should succeed");
-        assert_eq!(
-            json, reserialized,
-            "roundtrip should produce identical JSON"
-        );
-    }
-
     #[test]
     fn test_expression_format() {
         let cases = [
@@ -1140,7 +1126,7 @@ mod tests {
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
 
-        use super::{assert_roundtrip, assert_roundtrip_via_json};
+        use super::assert_roundtrip;
 
         // ==================== Expression::Literal Tests ====================
 
@@ -1217,7 +1203,7 @@ mod tests {
             ];
 
             for expr in &cases {
-                assert_roundtrip_via_json(expr);
+                assert_roundtrip(expr);
             }
         }
 
@@ -1391,9 +1377,8 @@ mod tests {
 
         #[test]
         fn test_predicate_null_literal_roundtrip() {
-            // Null literal needs JSON comparison
             let pred = Predicate::null_literal();
-            assert_roundtrip_via_json(&pred);
+            assert_roundtrip(&pred);
         }
 
         #[test]
@@ -1415,7 +1400,6 @@ mod tests {
 
         #[test]
         fn test_predicate_in_roundtrip() {
-            // IN with array needs JSON comparison
             let array_data = ArrayData::try_new(
                 ArrayType::new(DataType::INTEGER, false),
                 vec![Scalar::Integer(1), Scalar::Integer(2), Scalar::Integer(3)],
@@ -1426,7 +1410,7 @@ mod tests {
                 column_expr!("x"),
                 Expression::Literal(Scalar::Array(array_data)),
             );
-            assert_roundtrip_via_json(&pred);
+            assert_roundtrip(&pred);
         }
 
         #[test]
