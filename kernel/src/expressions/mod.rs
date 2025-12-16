@@ -258,11 +258,22 @@ pub struct JunctionPredicate {
 // NOTE: We have to use `Arc<dyn OpaquePredicateOp>` instead of `Box<dyn OpaquePredicateOp>` because
 // we cannot require `OpaquePredicateOp: Clone` (not a dyn-compatible trait). Instead, we must rely
 // on cheap `Arc` clone, which does not duplicate the inner object.
+//
+// TODO: OpaquePredicate currently does not support serialization or deserialization. In the
+// future, the [`OpaquePredicateOp`] trait can be extended to support ser/de.
 #[derive(Clone, Debug)]
 pub struct OpaquePredicate {
     pub op: OpaquePredicateOpRef,
     pub exprs: Vec<Expression>,
 }
+
+impl OpaquePredicate {
+    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+        let exprs = exprs.into_iter().collect();
+        Self { op, exprs }
+    }
+}
+
 fn fail_serialize_opaque_predicate<S>(
     _value: &OpaquePredicate,
     _serializer: S,
@@ -280,16 +291,12 @@ where
     Err(de::Error::custom("Cannot deserialize Opaque Expression"))
 }
 
-impl OpaquePredicate {
-    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
-        let exprs = exprs.into_iter().collect();
-        Self { op, exprs }
-    }
-}
-
 // NOTE: We have to use `Arc<dyn OpaqueExpressionOp>` instead of `Box<dyn OpaqueExpressionOp>`
 // because we cannot require `OpaqueExpressionOp: Clone` (not a dyn-compatible trait). Instead, we
 // must rely on cheap `Arc` clone, which does not duplicate the inner object.
+//
+// TODO: OpaqueExpression currently does not support serialization or deserialization. In the
+// future, the [`OpaqueExpressionOp`] trait can be extended to support ser/de.
 #[derive(Clone, Debug)]
 pub struct OpaqueExpression {
     pub op: OpaqueExpressionOpRef,
