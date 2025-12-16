@@ -434,10 +434,12 @@ mod tests {
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs
+    #[allow(clippy::too_many_arguments)]
     fn validate_simple(
         _: &mut (),
         path: &str,
         size: i64,
+        _: i64,
         stats: Option<Stats>,
         _: DvInfo,
         _: Option<ExpressionRef>,

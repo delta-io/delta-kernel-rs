@@ -64,6 +64,7 @@ fn send_scan_file(
     scan_tx: &mut spmc::Sender<ScanFile>,
     path: &str,
     size: i64,
+    _mod_time: i64,
     _stats: Option<Stats>,
     dv_info: DvInfo,
     transform: Option<ExpressionRef>,

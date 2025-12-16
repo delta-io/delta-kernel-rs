@@ -191,10 +191,12 @@ fn test_physical_predicate() {
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
+    #[allow(clippy::too_many_arguments)]
     fn scan_metadata_callback(
         paths: &mut Vec<String>,
         path: &str,
         _size: i64,
+        _mod_time: i64,
         _: Option<Stats>,
         dv_info: DvInfo,
         _transform: Option<ExpressionRef>,

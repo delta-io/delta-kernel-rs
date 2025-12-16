@@ -117,6 +117,7 @@ pub type ScanCallback<T> = fn(
     context: &mut T,
     path: &str,
     size: i64,
+    modification_time: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
     transform: Option<ExpressionRef>,
@@ -131,6 +132,7 @@ pub type ScanCallback<T> = fn(
 ///   to each call
 /// * `path`: a `&str` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
+/// * `mod_time`: an `i64` which is the time the file was created, as milliseconds since the epoch
 /// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
 /// * `transform`: An optional expression that, if present, _must_ be applied to physical data to
 ///   convert it to the correct logical format
@@ -193,6 +195,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
+                let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
                 let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
                 let stats: Option<Stats> =
                     stats.and_then(|json| match serde_json::from_str(json.as_str()) {
@@ -214,6 +217,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                     &mut self.context,
                     path,
                     size,
+                    modification_time,
                     stats,
                     dv_info,
                     get_transform_for_row(row_index, self.transforms),
@@ -240,10 +244,12 @@ mod tests {
         id: usize,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_visit(
         context: &mut TestContext,
         path: &str,
         size: i64,
+        mod_time: i64,
         stats: Option<Stats>,
         dv_info: DvInfo,
         transform: Option<ExpressionRef>,
@@ -254,6 +260,7 @@ mod tests {
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         );
         assert_eq!(size, 635);
+        assert_eq!(mod_time, 1677811178336);
         assert!(stats.is_some());
         assert_eq!(stats.as_ref().unwrap().num_records, 10);
         assert_eq!(part_vals.get("date"), Some(&"2017-12-10".to_string()));

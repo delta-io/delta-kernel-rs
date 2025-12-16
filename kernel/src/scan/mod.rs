@@ -596,10 +596,12 @@ impl Scan {
             dv_info: DvInfo,
             transform: Option<ExpressionRef>,
         }
+        #[allow(clippy::too_many_arguments)]
         fn scan_metadata_callback(
             batches: &mut Vec<ScanFile>,
             path: &str,
             size: i64,
+            _mod_time: i64,
             _: Option<Stats>,
             dv_info: DvInfo,
             transform: Option<ExpressionRef>,

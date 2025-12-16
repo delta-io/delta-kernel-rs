@@ -157,6 +157,7 @@ fn print_scan_file(
     _: &mut (),
     path: &str,
     size: i64,
+    mod_time: i64,
     stats: Option<Stats>,
     dv_info: DvInfo,
     transform: Option<ExpressionRef>,
@@ -167,10 +168,15 @@ fn print_scan_file(
     } else {
         "[unknown]".to_string()
     };
+    let mod_str = match chrono::DateTime::from_timestamp(mod_time/1000, 0) {
+        Some(dt) => format!("{} ({mod_time})", dt),
+        None => format!("Invalid mod time: {mod_time}"),
+    };
     println!(
         "Data to process:\n  \
               Path:\t\t{path}\n  \
               Size (bytes):\t{size}\n  \
+              Mod Time:\t{mod_str}\n  \
               Num Records:\t{num_record_str}\n  \
               Has DV?:\t{}\n  \
               Transform:\t{transform:?}\n  \
