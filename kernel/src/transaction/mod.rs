@@ -28,7 +28,9 @@ use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema};
+use crate::schema::{
+    ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema,
+};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
@@ -1759,7 +1761,6 @@ mod tests {
         Ok(())
     }
 
-
     /// Tests that update_deletion_vectors validates table protocol requirements.
     /// Validates that attempting DV updates on unsupported tables returns protocol error.
     #[test]
@@ -1776,7 +1777,8 @@ mod tests {
             err_msg.contains("Deletion vector")
                 && (err_msg.contains("require") || err_msg.contains("version")),
             "Expected protocol error about DV requirements, got: {}",
-            err_msg);
+            err_msg
+        );
         Ok(())
     }
 
