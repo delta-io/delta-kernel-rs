@@ -356,11 +356,15 @@ async fn test_write_deletion_vectors_end_to_end() -> Result<(), Box<dyn std::err
     // Test multiple calls
     txn.update_deletion_vectors(
         dv_map1,
-        get_scan_files(snapshot.clone(), engine.as_ref())?.into_iter().map(Ok),
+        get_scan_files(snapshot.clone(), engine.as_ref())?
+            .into_iter()
+            .map(Ok),
     )?;
     txn.update_deletion_vectors(
         dv_map2,
-        get_scan_files(snapshot.clone(), engine.as_ref())?.into_iter().map(Ok),
+        get_scan_files(snapshot.clone(), engine.as_ref())?
+            .into_iter()
+            .map(Ok),
     )?;
     let commit_result = txn.commit(engine.as_ref())?;
     assert!(matches!(
