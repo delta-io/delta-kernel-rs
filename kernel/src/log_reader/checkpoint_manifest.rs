@@ -67,7 +67,7 @@ impl CheckpointManifestReader {
             }
         };
 
-        let actions = Box::new(actions.map(|batch_res| Ok(ActionsBatch::new(batch_res?, false))));
+        let actions = Box::new(actions.map_ok(|batch_res| ActionsBatch::new(batch_res, false)));
         Ok(Self {
             actions,
             sidecar_visitor: SidecarVisitor::default(),
@@ -104,17 +104,15 @@ impl Iterator for CheckpointManifestReader {
     type Item = DeltaResult<ActionsBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let result = self.actions.next().map(|batch_result| {
-            let batch = batch_result?;
+        let Some(result) = self.actions.next() else {
+            self.is_complete = true;
+            return None;
+        };
+
+        Some(result.and_then(|batch| {
             self.sidecar_visitor.visit_rows_of(batch.actions())?;
             Ok(batch)
-        });
-
-        if result.is_none() {
-            self.is_complete = true;
-        }
-
-        result
+        }))
     }
 }
 
