@@ -13,7 +13,7 @@ use self::log_replay::get_scan_metadata_transform_expr;
 use crate::actions::deletion_vector::{
     deletion_treemap_to_bools, split_vector, DeletionVectorDescriptor,
 };
-use crate::actions::{get_commit_schema, ADD_NAME, REMOVE_NAME};
+use crate::actions::{add_schema_with_stats_parsed, get_commit_schema, ADD_NAME, REMOVE_NAME};
 use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
@@ -26,7 +26,7 @@ use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    ToSchema as _,
+    StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -34,6 +34,7 @@ use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Versi
 use self::log_replay::scan_action_iter;
 
 pub(crate) mod data_skipping;
+use data_skipping::build_stats_schema;
 pub(crate) mod field_classifiers;
 pub mod log_replay;
 pub mod state;
@@ -56,6 +57,28 @@ static COMMIT_READ_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 #[allow(clippy::unwrap_used)]
 static CHECKPOINT_READ_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| get_commit_schema().project(&[ADD_NAME]).unwrap());
+
+/// Builds a checkpoint read schema that includes the `stats_parsed` field.
+///
+/// This schema is used when reading checkpoints to enable data skipping
+/// without JSON parsing overhead. The `stats_parsed` field contains pre-parsed
+/// statistics in a structured format.
+///
+/// The returned schema includes:
+/// - All existing Add fields (path, size, stats, etc.)
+/// - `stats_parsed` struct with projected columns from predicate
+///
+/// # Arguments
+/// * `stats_schema` - The stats schema built from predicate-referenced columns,
+///   with structure: `{numRecords, nullCount, minValues, maxValues}`
+pub(crate) fn build_checkpoint_read_schema_with_stats_parsed(
+    stats_schema: &SchemaRef,
+) -> SchemaRef {
+    Arc::new(StructType::new_unchecked([StructField::nullable(
+        ADD_NAME,
+        add_schema_with_stats_parsed(stats_schema.as_ref()),
+    )]))
+}
 
 /// Builder to scan a snapshot of a table.
 pub struct ScanBuilder {
@@ -544,7 +567,8 @@ impl Scan {
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
-                None,
+                None, // no fallback schema
+                None, // no meta predicate
             )?
             .chain(existing_data.into_iter().map(apply_transform));
 
@@ -563,6 +587,21 @@ impl Scan {
         Ok(Some(it).into_iter().flatten())
     }
 
+    /// Builds the checkpoint read schema with stats_parsed if a predicate references columns.
+    ///
+    /// Returns `Some(schema)` with stats_parsed if we should try it, `None` otherwise.
+    fn build_checkpoint_schema_with_stats_parsed(&self) -> Option<SchemaRef> {
+        match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(_, referenced_schema) => {
+                let stats_schema = build_stats_schema(referenced_schema)?;
+                Some(build_checkpoint_read_schema_with_stats_parsed(
+                    &stats_schema,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     // Factored out to facilitate testing
     fn replay_for_scan_metadata(
         &self,
@@ -570,12 +609,23 @@ impl Scan {
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
+
+        // If we have a predicate that references columns, try reading with stats_parsed schema
+        // and fall back to standard schema if it fails. Otherwise, just use the standard schema.
+        let (checkpoint_schema, fallback_schema) =
+            if let Some(stats_parsed_schema) = self.build_checkpoint_schema_with_stats_parsed() {
+                (stats_parsed_schema, Some(CHECKPOINT_READ_SCHEMA.clone()))
+            } else {
+                (CHECKPOINT_READ_SCHEMA.clone(), None)
+            };
+
         self.snapshot
             .log_segment()
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
-                CHECKPOINT_READ_SCHEMA.clone(),
+                checkpoint_schema,
+                fallback_schema,
                 None,
             )
     }
