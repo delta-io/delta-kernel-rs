@@ -28,7 +28,7 @@ use crate::scan::log_replay::{
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
 };
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder};
+use crate::schema::{ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
@@ -656,7 +656,7 @@ impl Transaction {
         if !self
             .read_snapshot
             .table_configuration()
-            .is_deletion_vector_supported()
+            .is_feature_supported(&TableFeature::DeletionVectors)
         {
             return Err(Error::unsupported(
                 "Deletion vector operations require reader version 3, writer version 7, \
