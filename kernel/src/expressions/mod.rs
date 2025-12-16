@@ -247,7 +247,7 @@ pub struct JunctionPredicate {
 // we cannot require `OpaquePredicateOp: Clone` (not a dyn-compatible trait). Instead, we must rely
 // on cheap `Arc` clone, which does not duplicate the inner object.
 //
-// TODO: OpaquePredicate currently does not support serialization or deserialization. In the
+// TODO(#1564): OpaquePredicate currently does not support serialization or deserialization. In the
 // future, the [`OpaquePredicateOp`] trait can be extended to support ser/de.
 #[derive(Clone, Debug)]
 pub struct OpaquePredicate {
@@ -283,7 +283,7 @@ where
 // because we cannot require `OpaqueExpressionOp: Clone` (not a dyn-compatible trait). Instead, we
 // must rely on cheap `Arc` clone, which does not duplicate the inner object.
 //
-// TODO: OpaqueExpression currently does not support serialization or deserialization. In the
+// TODO(#1564): OpaqueExpression currently does not support serialization or deserialization. In the
 // future, the [`OpaqueExpressionOp`] trait can be extended to support ser/de.
 #[derive(Clone, Debug)]
 pub struct OpaqueExpression {
