@@ -218,16 +218,19 @@ fn nullable_add_log_schema() -> &'static SchemaRef {
 
 /// Schema for an array of deletion vector descriptors.
 /// Used when appending DV columns to scan file data.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 static STRUCT_DELETION_VECTOR_SCHEMA: LazyLock<ArrayType> =
     LazyLock::new(|| ArrayType::new(DeletionVectorDescriptor::to_schema().into(), true));
 
 /// Returns the schema for an array of deletion vector descriptors.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 fn struct_deletion_vector_schema() -> &'static ArrayType {
     &STRUCT_DELETION_VECTOR_SCHEMA
 }
 
 /// Schema for the intermediate column holding new DV descriptors.
 /// This temporary column is dropped during transformation to final add actions.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked(vec![StructField::nullable(
         NEW_DELETION_VECTOR_NAME,
@@ -236,6 +239,7 @@ static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 /// Returns the schema for the intermediate column holding new DV descriptors.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
 }
@@ -648,6 +652,7 @@ impl Transaction {
     /// txn.commit(engine)?;
     /// ```
     #[internal_api]
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     pub(crate) fn update_deletion_vectors(
         &mut self,
         new_dv_descriptors: HashMap<String, DeletionVectorDescriptor>,
@@ -1234,6 +1239,7 @@ impl Transaction {
 
 /// Visitor that matches file paths from scan data against new deletion vector descriptors.
 /// Used by update_deletion_vectors() to attach new DV descriptors to scan file metadata.
+#[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 struct DvMatchVisitor<'a> {
     /// Map from file path to the new deletion vector descriptor for that file
     dv_updates: &'a HashMap<String, DeletionVectorDescriptor>,
@@ -1245,9 +1251,11 @@ struct DvMatchVisitor<'a> {
 }
 
 impl<'a> DvMatchVisitor<'a> {
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     const PATH_INDEX: usize = 0;
 
     /// Creates a new DvMatchVisitor that will match file paths against the provided DV updates map.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn new(dv_updates: &'a HashMap<String, DeletionVectorDescriptor>) -> Self {
         Self {
             dv_updates,
