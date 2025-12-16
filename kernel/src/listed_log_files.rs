@@ -221,6 +221,7 @@ impl ListedLogFiles {
         })
     }
 
+    #[allow(clippy::type_complexity)] // It's the most readable way to destructure
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -255,6 +256,7 @@ impl ListedLogFiles {
         &self.latest_commit_file
     }
 
+    #[allow(dead_code)] // Currently only used in tests
     pub(crate) fn into_latest_crc_file(self) -> Option<ParsedLogPath> {
         self.latest_crc_file
     }
