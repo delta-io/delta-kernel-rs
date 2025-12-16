@@ -38,10 +38,10 @@ pub(crate) trait SchemaVisitor {
 /// Arrays and maps are treated as leaves - their element/key/value types are not visited.
 #[allow(dead_code)] // Reserved for future use
 pub(crate) fn visit_type<V: SchemaVisitor>(
-    r#type: &DataType,
+    data_type: &DataType,
     visitor: &mut V,
 ) -> DeltaResult<V::T> {
-    match r#type {
+    match data_type {
         DataType::Primitive(p) => visitor.primitive(p),
         DataType::Array(array) => visitor.array(array),
         DataType::Map(map) => visitor.map(map),
