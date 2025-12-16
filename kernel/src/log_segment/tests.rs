@@ -1117,6 +1117,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         )?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1182,6 +1183,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         )?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1235,6 +1237,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         )?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1283,6 +1286,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
             Some(create_log_path("file:///00000000000000000001.json")),
         )?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1354,6 +1358,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
             Some(create_log_path("file:///00000000000000000001.json")),
         )?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -2320,7 +2325,8 @@ fn test_log_segment_contiguous_commit_files() {
     );
 
     // disallow gaps in LogSegment
-    let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
+    let log_segment =
+        LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None, None);
     assert_result_error_with_message(
         log_segment,
         "Generic delta kernel error: Expected ordered \
@@ -2356,6 +2362,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2376,6 +2383,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
     };
 
     // Should fail with staged commits
@@ -2386,4 +2394,159 @@ fn test_publish_validation() {
     } else {
         panic!("Expected Error::Generic");
     }
+}
+
+// Helper to create a checkpoint schema with stats_parsed for testing
+fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
+    use crate::schema::StructType;
+
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked(min_values_fields.clone()),
+        ),
+        StructField::nullable("maxValues", StructType::new_unchecked(min_values_fields)),
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+// Helper to create a checkpoint schema without stats_parsed
+fn create_checkpoint_schema_without_stats_parsed() -> StructType {
+    use crate::schema::StructType;
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats", DataType::STRING),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_basic() {
+    // Create a checkpoint schema with stats_parsed containing an integer column
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    // Exact type match should work
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+
+    // Type widening (int -> long) should work
+    let stats_schema_widened =
+        StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema_widened
+    ));
+
+    // Incompatible type (string -> int) should fail
+    let checkpoint_schema_string =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]);
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema_string,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
+    // Checkpoint has "id" column, stats schema needs "other" column (missing in checkpoint is OK)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema =
+        StructType::new_unchecked([StructField::nullable("other", DataType::INTEGER)]);
+
+    // Missing column in checkpoint is OK - it will just return NULL
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_extra_column_ok() {
+    // Checkpoint has extra columns not needed by stats schema (should be OK)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("extra", DataType::STRING),
+    ]);
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_no_stats_parsed() {
+    // Checkpoint schema without stats_parsed field
+    let checkpoint_schema = create_checkpoint_schema_without_stats_parsed();
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_empty_stats_schema() {
+    // Empty stats schema (no columns needed for data skipping)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema = StructType::new_unchecked([]);
+
+    // If no columns are needed for data skipping, any stats_parsed is compatible
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_multiple_columns() {
+    // Multiple columns - check that we iterate over all columns and find incompatibility
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::STRING),
+    ]);
+
+    // First column matches, second is incompatible
+    let stats_schema = StructType::new_unchecked([
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::INTEGER),
+    ]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
 }

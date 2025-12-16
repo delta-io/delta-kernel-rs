@@ -14,7 +14,8 @@ use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::{SchemaRef, StructField, ToSchema as _};
+use crate::schema::compare::SchemaComparison;
+use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
@@ -64,6 +65,9 @@ pub(crate) struct LogSegment {
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
     pub latest_commit_file: Option<ParsedLogPath>,
+    /// Schema of the checkpoint file(s), if known from `_last_checkpoint` hint.
+    /// Used to determine if `stats_parsed` is available for data skipping.
+    pub checkpoint_schema: Option<SchemaRef>,
 }
 
 impl LogSegment {
@@ -72,6 +76,7 @@ impl LogSegment {
         listed_files: ListedLogFiles,
         log_root: Url,
         end_version: Option<Version>,
+        checkpoint_schema: Option<SchemaRef>,
     ) -> DeltaResult<Self> {
         let ListedLogFiles {
             mut ascending_commit_files,
@@ -135,6 +140,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            checkpoint_schema,
         })
     }
 
@@ -198,6 +204,12 @@ impl LogSegment {
         checkpoint_hint: Option<LastCheckpointHint>,
         time_travel_version: Option<Version>,
     ) -> DeltaResult<Self> {
+        // Extract checkpoint schema from hint
+        let checkpoint_schema = checkpoint_hint
+            .as_ref()
+            .and_then(|hint| hint.checkpoint_schema.as_ref())
+            .map(|s| Arc::new(s.clone()));
+
         let listed_files = match (checkpoint_hint, time_travel_version) {
             (Some(cp), None) => {
                 ListedLogFiles::list_with_checkpoint_hint(&cp, storage, &log_root, log_tail, None)?
@@ -214,7 +226,12 @@ impl LogSegment {
             _ => ListedLogFiles::list(storage, &log_root, log_tail, None, time_travel_version)?,
         };
 
-        LogSegment::try_new(listed_files, log_root, time_travel_version)
+        LogSegment::try_new(
+            listed_files,
+            log_root,
+            time_travel_version,
+            checkpoint_schema,
+        )
     }
 
     /// Constructs a [`LogSegment`] to be used for `TableChanges`. For a TableChanges between versions
@@ -257,7 +274,7 @@ impl LogSegment {
                     .map(|c| c.version)
             ))
         );
-        LogSegment::try_new(listed_files, log_root, end_version)
+        LogSegment::try_new(listed_files, log_root, end_version, None)
     }
 
     #[allow(unused)]
@@ -300,7 +317,7 @@ impl LogSegment {
             commits.drain(..start_idx);
         }
 
-        LogSegment::try_new(listed_commits, log_root, Some(end_version))
+        LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
@@ -643,5 +660,218 @@ impl LogSegment {
             Error::generic("Found staged commit file in log segment")
         );
         Ok(())
+    }
+
+    /// Checks if a checkpoint schema contains a usable `add.stats_parsed` field.
+    ///
+    /// This validates that:
+    /// 1. The `add.stats_parsed` field exists in the checkpoint schema
+    /// 2. The types in `stats_parsed` are compatible with the stats schema for data skipping
+    ///
+    /// The `stats_schema` parameter contains only the columns referenced in the data skipping
+    /// predicate. This is built from the predicate and passed in by the caller.
+    ///
+    /// Returns `false` if stats_parsed doesn't exist or has incompatible types.
+    fn schema_has_compatible_stats_parsed(
+        checkpoint_schema: &Schema,
+        stats_schema: &StructType,
+    ) -> bool {
+        // Get add.stats_parsed from the checkpoint schema
+        let Some(stats_parsed) = checkpoint_schema
+            .field("add")
+            .and_then(|f| match f.data_type() {
+                DataType::Struct(s) => s.field("stats_parsed"),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+
+        // Get minValues struct to check column types.
+        // We only need to check minValues since minValues and maxValues are always written
+        // together with the same types for each column.
+        let DataType::Struct(stats_struct) = stats_parsed.data_type() else {
+            return false;
+        };
+
+        let Some(min_values) = stats_struct.field("minValues") else {
+            // stats_parsed exists but no minValues - unusual but valid
+            return true;
+        };
+
+        let DataType::Struct(min_values_struct) = min_values.data_type() else {
+            return false;
+        };
+
+        // Check type compatibility for each column in the checkpoint's stats_parsed
+        // that also exists in the stats schema (columns needed for data skipping)
+        for checkpoint_field in min_values_struct.fields() {
+            if let Some(stats_field) = stats_schema.field(&checkpoint_field.name) {
+                if checkpoint_field
+                    .data_type()
+                    .can_read_as(stats_field.data_type())
+                    .is_err()
+                {
+                    debug!(
+                        "Incompatible type for column '{}': checkpoint has {:?}, stats schema has {:?}",
+                        checkpoint_field.name,
+                        checkpoint_field.data_type(),
+                        stats_field.data_type()
+                    );
+                    return false;
+                }
+            }
+            // If column doesn't exist in stats schema, it's fine (not needed for data skipping)
+        }
+
+        true
+    }
+
+    /// Checks whether the checkpoint in this log segment contains usable `stats_parsed`.
+    ///
+    /// This is used to determine if pre-parsed statistics are available for data skipping,
+    /// which avoids the overhead of parsing JSON stats at query time.
+    ///
+    /// # Why check upfront?
+    ///
+    /// While it's possible to determine if parsed stats exist after reading (e.g., by extracting
+    /// the column or using lazy evaluation in coalesce), checking upfront is cleaner and enables
+    /// distributed log replay optimizations.
+    ///
+    /// The `stats_schema` parameter contains only the columns referenced in the data skipping
+    /// predicate.
+    ///
+    /// Returns `false` if the checkpoint schema cannot be determined or `stats_parsed` is missing
+    /// or has incompatible types.
+    #[allow(unused)]
+    pub(crate) fn has_usable_stats_parsed(
+        &self,
+        engine: &dyn Engine,
+        stats_schema: &StructType,
+    ) -> bool {
+        // Get the checkpoint schema
+        let Some(checkpoint_schema) = self.get_checkpoint_schema(engine) else {
+            return false;
+        };
+
+        // Check if stats_parsed exists and has compatible types
+        let has_stats_parsed =
+            Self::schema_has_compatible_stats_parsed(&checkpoint_schema, stats_schema);
+        debug!("Checkpoint has usable stats_parsed: {}", has_stats_parsed);
+        has_stats_parsed
+    }
+
+    /// Gets the checkpoint schema from the best available source.
+    ///
+    /// Sources are checked in order of preference (cheapest first):
+    /// 1. `checkpoint_schema` from `_last_checkpoint` hint (no I/O required)
+    /// 2. For V1 parquet checkpoints: read the parquet footer schema
+    /// 3. For V2 JSON checkpoints: read the manifest, extract sidecar references,
+    ///    and read the first sidecar's parquet footer schema
+    #[allow(unused)]
+    fn get_checkpoint_schema(&self, engine: &dyn Engine) -> Option<Schema> {
+        let first_checkpoint = self.checkpoint_parts.first()?;
+
+        // First check the hint from _last_checkpoint (cheap, no I/O)
+        if let Some(schema) = &self.checkpoint_schema {
+            return Some(schema.as_ref().clone());
+        }
+
+        // Fall back to reading the checkpoint to determine the schema
+        match first_checkpoint.extension.as_str() {
+            "parquet" => {
+                // V1 parquet checkpoint: read the footer directly
+                match engine
+                    .parquet_handler()
+                    .read_parquet_footer(&first_checkpoint.location)
+                {
+                    Ok(footer) => Some(footer.schema.as_ref().clone()),
+                    Err(e) => {
+                        debug!("Could not read checkpoint footer: {}", e);
+                        None
+                    }
+                }
+            }
+            "json" => {
+                // V2 JSON checkpoint: need to read sidecars
+                self.get_json_checkpoint_schema(engine, first_checkpoint)
+            }
+            _ => {
+                debug!(
+                    "Unknown checkpoint extension '{}', cannot get schema",
+                    first_checkpoint.extension
+                );
+                None
+            }
+        }
+    }
+
+    /// Gets the schema from a V2 JSON checkpoint by reading its first sidecar's footer.
+    ///
+    /// V2 JSON checkpoints store file actions in separate parquet sidecar files.
+    /// We read the checkpoint JSON to find sidecar references, then read the first
+    /// sidecar's parquet footer to get the schema.
+    ///
+    /// This is pretty inefficient, so looking for a better way to do this (combine with reading the checkpoint?)
+    #[allow(unused)]
+    fn get_json_checkpoint_schema(
+        &self,
+        engine: &dyn Engine,
+        checkpoint: &ParsedLogPath,
+    ) -> Option<Schema> {
+        // Schema to read just the sidecar column from the JSON checkpoint
+        static SIDECAR_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+            Arc::new(StructType::new_unchecked([StructField::nullable(
+                SIDECAR_NAME,
+                Sidecar::to_schema(),
+            )]))
+        });
+
+        // Read the JSON checkpoint to extract sidecar references
+        let batches = match engine.json_handler().read_json_files(
+            std::slice::from_ref(&checkpoint.location),
+            SIDECAR_SCHEMA.clone(),
+            None,
+        ) {
+            Ok(batches) => batches,
+            Err(e) => {
+                debug!("Could not read JSON checkpoint: {}", e);
+                return None;
+            }
+        };
+
+        // Extract sidecar file references
+        let mut visitor = SidecarVisitor::default();
+        for batch_result in batches {
+            let batch = match batch_result {
+                Ok(b) => b,
+                Err(e) => {
+                    debug!("Error reading JSON checkpoint batch: {}", e);
+                    return None;
+                }
+            };
+            if let Err(e) = visitor.visit_rows_of(batch.as_ref()) {
+                debug!("Error visiting sidecar rows: {}", e);
+                return None;
+            }
+        }
+
+        // Get the first sidecar file path and read its footer
+        let first_sidecar = visitor.sidecars.first()?;
+        let sidecar_path = match first_sidecar.to_filemeta(&self.log_root) {
+            Ok(path) => path,
+            Err(e) => {
+                debug!("Could not resolve sidecar path: {}", e);
+                return None;
+            }
+        };
+
+        match engine.parquet_handler().read_parquet_footer(&sidecar_path) {
+            Ok(footer) => Some(footer.schema.as_ref().clone()),
+            Err(e) => {
+                debug!("Could not read sidecar footer: {}", e);
+                None
+            }
+        }
     }
 }
