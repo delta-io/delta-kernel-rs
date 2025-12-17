@@ -386,7 +386,7 @@ fn test_replay_for_scan_metadata() {
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
     let scan = snapshot.scan_builder().build().unwrap();
     let data: Vec<_> = scan
-        .replay_for_scan_metadata(&engine)
+        .replay_for_scan_metadata(&engine, None, false)
         .unwrap()
         .try_collect()
         .unwrap();
@@ -544,4 +544,71 @@ fn test_build_checkpoint_read_schema_with_stats_parsed() {
     };
     assert!(min_values_struct.field("id").is_some());
     assert!(min_values_struct.field("name").is_some());
+}
+
+/// Test data skipping using parsed stats (stats_parsed) from checkpoint.
+///
+/// The test table (parsed-stats-test) has 6 files:
+/// - File 0: id 1-100
+/// - File 1: id 101-200
+/// - File 2: id 201-300
+/// - File 3: id 301-400 (in checkpoint)
+/// - File 4: id 401-500 (post-checkpoint, in JSON)
+/// - File 5: id 501-600 (post-checkpoint, in JSON)
+#[test]
+fn test_parsed_stats_data_skipping() {
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"));
+    let url = url::Url::from_directory_path(path.unwrap()).unwrap();
+    let engine = Arc::new(SyncEngine::new());
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref()).unwrap();
+
+    // Debug: Check if checkpoint has usable stats_parsed
+    let id_schema = StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+    let has_parsed = snapshot
+        .log_segment()
+        .has_usable_stats_parsed(engine.as_ref(), &id_schema);
+    eprintln!("has_usable_stats_parsed for 'id' column: {}", has_parsed);
+
+    // Test 1: No predicate - should return all 600 rows from 6 files
+    let scan = snapshot.clone().scan_builder().build().unwrap();
+    let batches: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.len()).sum();
+    eprintln!(
+        "Test 1 (no predicate): got {} rows, expected 600",
+        total_rows
+    );
+    assert_eq!(total_rows, 600, "Expected 600 total rows without predicate");
+
+    // Test 2: Predicate that matches NO files based on stats
+    // WHERE id > 1000 => all files have max_id <= 600, all should be skipped
+    let predicate = Arc::new(column_expr!("id").gt(Expr::literal(1000i64)));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+    let batches: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.len()).sum();
+    eprintln!("Test 2 (id > 1000): got {} rows, expected 0", total_rows);
+    assert_eq!(
+        total_rows, 0,
+        "Expected 0 rows with id > 1000 (all files should be skipped)"
+    );
+
+    // Test 3: Predicate that should skip most files
+    // WHERE id > 500 => only File 5 (id 501-600) should match
+    let predicate = Arc::new(column_expr!("id").gt(Expr::literal(500i64)));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(predicate)
+        .build()
+        .unwrap();
+    let batches: Vec<_> = scan.execute(engine.clone()).unwrap().try_collect().unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.len()).sum();
+    eprintln!("Test 3 (id > 500): got {} rows, expected 100", total_rows);
+    // File 5 has ids 501-600, 100 rows > 500
+    assert_eq!(total_rows, 100, "Expected 100 rows with id > 500");
 }

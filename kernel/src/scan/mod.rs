@@ -430,7 +430,30 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        // Compute stats schema from the predicate's referenced columns if available.
+        // This ensures we only request stats for columns actually used in data skipping.
+        let stats_schema_opt = match &self.state_info.physical_predicate {
+            PhysicalPredicate::Some(_, referenced_schema) => build_stats_schema(referenced_schema),
+            _ => None,
+        };
+
+        let has_usable_stats_parsed = match stats_schema_opt {
+            Some(ref schema)
+                if self
+                    .snapshot
+                    .log_segment()
+                    .has_usable_stats_parsed(engine, schema) =>
+            {
+                true
+            }
+            _ => false,
+        };
+
+        self.scan_metadata_inner(
+            engine,
+            self.replay_for_scan_metadata(engine, stats_schema_opt, has_usable_stats_parsed)?,
+            has_usable_stats_parsed,
+        )
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -530,9 +553,10 @@ impl Scan {
 
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
+        // Note: existing data doesn't have parsed stats, so use_parsed_stats is false.
         if existing_version == self.snapshot.version() {
             let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            return Ok(Box::new(self.scan_metadata_inner(engine, scan, false)?));
         }
 
         let log_segment = self.snapshot.log_segment();
@@ -563,62 +587,52 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
+        // Note: This incremental segment has no checkpoint, so no parsed stats available.
         let it = new_log_segment
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
-                None, // no fallback schema
                 None, // no meta predicate
             )?
             .chain(existing_data.into_iter().map(apply_transform));
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(engine, it, false)?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        use_parsed_stats: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            action_batch_iter,
+            self.state_info.clone(),
+            use_parsed_stats,
+        )?;
         Ok(Some(it).into_iter().flatten())
-    }
-
-    /// Builds the checkpoint read schema with stats_parsed if a predicate references columns.
-    ///
-    /// Returns `Some(schema)` with stats_parsed if we should try it, `None` otherwise.
-    fn build_checkpoint_schema_with_stats_parsed(&self) -> Option<SchemaRef> {
-        match &self.state_info.physical_predicate {
-            PhysicalPredicate::Some(_, referenced_schema) => {
-                let stats_schema = build_stats_schema(referenced_schema)?;
-                Some(build_checkpoint_read_schema_with_stats_parsed(
-                    &stats_schema,
-                ))
-            }
-            _ => None,
-        }
     }
 
     // Factored out to facilitate testing
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
+        stats_schema_opt: Option<SchemaRef>,
+        has_usable_stats_parsed: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
 
-        // If we have a predicate that references columns, try reading with stats_parsed schema
-        // and fall back to standard schema if it fails. Otherwise, just use the standard schema.
-        let (checkpoint_schema, fallback_schema) =
-            if let Some(stats_parsed_schema) = self.build_checkpoint_schema_with_stats_parsed() {
-                (stats_parsed_schema, Some(CHECKPOINT_READ_SCHEMA.clone()))
-            } else {
-                (CHECKPOINT_READ_SCHEMA.clone(), None)
-            };
+        let checkpoint_schema = if has_usable_stats_parsed {
+            build_checkpoint_read_schema_with_stats_parsed(stats_schema_opt.as_ref().unwrap())
+        } else {
+            CHECKPOINT_READ_SCHEMA.clone()
+        };
 
         self.snapshot
             .log_segment()
@@ -626,8 +640,7 @@ impl Scan {
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 checkpoint_schema,
-                fallback_schema,
-                None,
+                None, // no meta predicate
             )
     }
 

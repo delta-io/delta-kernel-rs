@@ -345,7 +345,7 @@ pub(crate) trait LogReplayProcessor: Sized {
         is_log_batch: bool,
     ) -> DeltaResult<Vec<bool>> {
         match self.data_skipping_filter() {
-            Some(filter) => filter.apply(batch, is_log_batch, self.use_parsed_stats()),
+            Some(filter) => filter.apply(batch, is_log_batch),
             None => Ok(vec![true; batch.len()]), // If no filter is provided, select all rows
         }
     }
@@ -354,12 +354,6 @@ pub(crate) trait LogReplayProcessor: Sized {
     /// when building the initial selection vector in `build_selection_vector`.
     /// If `None` is returned, no filter is applied, and all rows are selected.
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter>;
-
-    /// Returns whether parsed stats should be used for checkpoint batches.
-    /// Default implementation returns false; override to enable parsed stats.
-    fn use_parsed_stats(&self) -> bool {
-        false
-    }
 }
 
 /// This trait is used to determine if a processor's output contains any selected rows.

@@ -57,7 +57,8 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    // Table changes reads from commit files which have JSON stats, not parsed stats
+    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate, false).map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
@@ -281,9 +282,8 @@ impl LogReplayScanner {
             // Apply data skipping to get back a selection vector for actions that passed skipping.
             // We start our selection vector based on what was filtered. We will add to this vector
             // below if a file has been removed. Note: None implies all files passed data skipping.
-            // For CDF, we always use JSON stats parsing (is_log_batch=true, use_parsed_stats=false)
             let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref(), true, false)?,
+                Some(filter) => filter.apply(actions.as_ref(), true)?,
                 None => vec![true; actions.len()],
             };
 

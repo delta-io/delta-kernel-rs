@@ -49,14 +49,15 @@ pub(crate) struct ScanLogReplayProcessor {
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
     seen_file_keys: HashSet<FileActionKey>,
-    /// Whether to use parsed stats (stats_parsed) for checkpoint batches.
-    /// When true, checkpoint stats are read directly as structs instead of parsing JSON.
-    use_parsed_stats: bool,
 }
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance.
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    fn new(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        use_parsed_stats: bool,
+    ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -77,7 +78,11 @@ impl ScanLogReplayProcessor {
         };
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            data_skipping_filter: DataSkippingFilter::new(
+                engine,
+                physical_predicate,
+                use_parsed_stats,
+            ),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
@@ -85,8 +90,6 @@ impl ScanLogReplayProcessor {
             )?,
             seen_file_keys: Default::default(),
             state_info,
-            // TODO: Determine from checkpoint schema whether stats_parsed is available
-            use_parsed_stats: true,
         })
     }
 }
@@ -391,10 +394,6 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
         self.data_skipping_filter.as_ref()
     }
-
-    fn use_parsed_stats(&self) -> bool {
-        self.use_parsed_stats
-    }
 }
 
 /// Given an iterator of [`ActionsBatch`]s (batches of actions read from the log) and a predicate,
@@ -409,8 +408,12 @@ pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    use_parsed_stats: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(
+        ScanLogReplayProcessor::new(engine, state_info, use_parsed_stats)?
+            .process_actions_iter(action_iter),
+    )
 }
 
 #[cfg(test)]
@@ -504,6 +507,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            false, // use_parsed_stats
         )
         .unwrap();
         for res in iter {
@@ -530,6 +534,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_parsed_stats
         )
         .unwrap();
 
@@ -608,6 +613,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_parsed_stats
         )
         .unwrap();
 
