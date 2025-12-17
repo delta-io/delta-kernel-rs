@@ -59,10 +59,7 @@ struct FileToScan {
 }
 
 // This is the callback that will be called for each valid scan row
-fn send_scan_file(
-    scan_tx: &mut spmc::Sender<FileToScan>,
-    scan_file: ScanFile,
-) {
+fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) {
     let scan_file = FileToScan {
         path: scan_file.path.to_string(),
         size: scan_file.size,
