@@ -334,13 +334,18 @@ pub(crate) trait LogReplayProcessor: Sized {
     ///
     /// # Parameters
     /// - `batch`: A reference to the batch of actions to be processed.
+    /// - `is_log_batch`: True if this batch is from a commit file, false if from a checkpoint.
     ///
     /// # Returns
     /// A `DeltaResult<Vec<bool>>`, where each boolean indicates if the corresponding row should be included.
     /// If no filter is provided, all rows are selected.
-    fn build_selection_vector(&self, batch: &dyn EngineData) -> DeltaResult<Vec<bool>> {
+    fn build_selection_vector(
+        &self,
+        batch: &dyn EngineData,
+        is_log_batch: bool,
+    ) -> DeltaResult<Vec<bool>> {
         match self.data_skipping_filter() {
-            Some(filter) => filter.apply(batch),
+            Some(filter) => filter.apply(batch, is_log_batch),
             None => Ok(vec![true; batch.len()]), // If no filter is provided, select all rows
         }
     }

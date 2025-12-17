@@ -13,7 +13,7 @@ use crate::actions::{
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
 use crate::path::ParsedLogPath;
-use crate::scan::data_skipping::DataSkippingFilter;
+use crate::scan::data_skipping::{build_stats_schema, DataSkippingFilter};
 use crate::scan::state::DvInfo;
 use crate::schema::{
     ColumnNamesAndTypes, DataType, SchemaRef, StructField, StructType, ToSchema as _,
@@ -57,7 +57,8 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    // Table changes reads from commit files which have JSON stats, not parsed stats
+    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate, false).map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
@@ -282,7 +283,7 @@ impl LogReplayScanner {
             // We start our selection vector based on what was filtered. We will add to this vector
             // below if a file has been removed. Note: None implies all files passed data skipping.
             let selection_vector = match &filter {
-                Some(filter) => filter.apply(actions.as_ref())?,
+                Some(filter) => filter.apply(actions.as_ref(), true)?,
                 None => vec![true; actions.len()],
             };
 

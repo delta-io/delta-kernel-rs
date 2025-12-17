@@ -5,8 +5,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
+    make_array, Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
+use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 
@@ -26,17 +27,34 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
     let (fields, columns, nulls) = applied.into_parts();
-    if let Some(nulls) = nulls {
-        if nulls.null_count() != 0 {
-            return Err(Error::invalid_struct_data(
-                "Top-level nulls in struct are not supported",
-            ));
-        }
-    }
+
+    // RecordBatch doesn't support top-level nulls (null rows). When the struct has null rows,
+    // propagate those nulls down to each column so the columns themselves are null for those rows.
+    let columns = match nulls {
+        Some(struct_nulls) if struct_nulls.null_count() > 0 => columns
+            .into_iter()
+            .map(|col| propagate_nulls_to_column(col, &struct_nulls))
+            .collect(),
+        _ => columns,
+    };
+
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(fields)),
         columns,
     )?)
+}
+
+/// Propagates struct-level nulls to a column. When a struct row is null, the corresponding
+/// value in the column should also be null.
+fn propagate_nulls_to_column(column: ArrayRef, struct_nulls: &NullBuffer) -> ArrayRef {
+    let combined_nulls = NullBuffer::union(column.nulls(), Some(struct_nulls));
+    column
+        .to_data()
+        .into_builder()
+        .nulls(combined_nulls)
+        .build()
+        .map(make_array)
+        .unwrap_or(column)
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified

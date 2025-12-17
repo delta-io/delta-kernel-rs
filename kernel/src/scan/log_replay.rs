@@ -13,7 +13,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateE
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -53,7 +53,11 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance.
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    fn new(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        use_parsed_stats: bool,
+    ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -74,7 +78,11 @@ impl ScanLogReplayProcessor {
         };
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            data_skipping_filter: DataSkippingFilter::new(
+                engine,
+                physical_predicate,
+                use_parsed_stats,
+            ),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
@@ -362,7 +370,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
         // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        let selection_vector = self.build_selection_vector(actions.as_ref(), is_log_batch)?;
         assert_eq!(selection_vector.len(), actions.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -400,8 +408,12 @@ pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    use_parsed_stats: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(
+        ScanLogReplayProcessor::new(engine, state_info, use_parsed_stats)?
+            .process_actions_iter(action_iter),
+    )
 }
 
 #[cfg(test)]
@@ -495,6 +507,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            false, // use_parsed_stats
         )
         .unwrap();
         for res in iter {
@@ -521,6 +534,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_parsed_stats
         )
         .unwrap();
 
@@ -599,6 +613,7 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            false, // use_parsed_stats
         )
         .unwrap();
 

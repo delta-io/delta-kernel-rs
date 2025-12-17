@@ -131,31 +131,43 @@ fn as_sql_data_skipping_predicate(pred: &Pred) -> Option<Pred> {
 
 pub(crate) struct DataSkippingFilter {
     stats_schema: SchemaRef,
+    /// Evaluator for extracting JSON stats from `add.stats` (used for log batches,
+    /// or checkpoint batches when parsed stats are unavailable)
     select_stats_evaluator: Arc<dyn ExpressionEvaluator>,
+    /// Evaluator for extracting parsed stats from `add.stats_parsed` (only built
+    /// when use_parsed_stats=true, used for checkpoint batches)
+    select_parsed_stats_evaluator: Option<Arc<dyn ExpressionEvaluator>>,
     skipping_evaluator: Arc<dyn PredicateEvaluator>,
     filter_evaluator: Arc<dyn PredicateEvaluator>,
     json_handler: Arc<dyn JsonHandler>,
 }
 
 impl DataSkippingFilter {
-    /// Creates a new data skipping filter. Returns None if there is no predicate, or the predicate
-    /// is ineligible for data skipping.
+    /// Creates a new data skipping filter. Returns None if the predicate is ineligible for data
+    /// skipping.
     ///
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
+    ///
+    /// # Arguments
+    /// * `engine` - The engine to use for creating evaluators
+    /// * `predicate` - The physical predicate for data skipping
+    /// * `stats_schema` - Pre-built stats schema from the predicate's referenced columns
+    /// * `use_parsed_stats` - If true, builds the parsed stats evaluator for checkpoint batches
     pub(crate) fn new(
         engine: &dyn Engine,
-        physical_predicate: Option<(PredicateRef, SchemaRef)>,
+        predicate: &Pred,
+        stats_schema: SchemaRef,
+        use_parsed_stats: bool,
     ) -> Option<Self> {
         static STATS_EXPR: LazyLock<ExpressionRef> =
             LazyLock::new(|| Arc::new(column_expr!("add.stats")));
+        static PARSED_STATS_EXPR: LazyLock<ExpressionRef> =
+            LazyLock::new(|| Arc::new(column_expr!("add.stats_parsed")));
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
-        let (predicate, referenced_schema) = physical_predicate?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
-
-        let stats_schema = build_stats_schema(&referenced_schema)?;
 
         // Skipping happens in several steps:
         //
@@ -180,6 +192,33 @@ impl DataSkippingFilter {
             .inspect_err(|e| error!("Failed to create select stats evaluator: {e}"))
             .ok()?;
 
+        // Only build the parsed stats evaluator if we're going to use it
+        let select_parsed_stats_evaluator = if use_parsed_stats {
+            // Build dynamic input schema: { add: { stats_parsed: stats_schema } }
+            let parsed_stats_input_schema: SchemaRef =
+                Arc::new(StructType::new_unchecked([StructField::nullable(
+                    "add",
+                    StructType::new_unchecked([StructField::nullable(
+                        "stats_parsed",
+                        stats_schema.as_ref().clone(),
+                    )]),
+                )]));
+
+            Some(
+                engine
+                    .evaluation_handler()
+                    .new_expression_evaluator(
+                        parsed_stats_input_schema,
+                        PARSED_STATS_EXPR.clone(),
+                        stats_schema.clone().into(),
+                    )
+                    .inspect_err(|e| error!("Failed to create parsed stats evaluator: {e}"))
+                    .ok()?,
+            )
+        } else {
+            None
+        };
+
         let skipping_evaluator = engine
             .evaluation_handler()
             .new_predicate_evaluator(
@@ -202,6 +241,7 @@ impl DataSkippingFilter {
         Some(Self {
             stats_schema,
             select_stats_evaluator,
+            select_parsed_stats_evaluator,
             skipping_evaluator,
             filter_evaluator,
             json_handler: engine.json_handler(),
@@ -210,13 +250,39 @@ impl DataSkippingFilter {
 
     /// Apply the DataSkippingFilter to an EngineData batch of actions. Returns a selection vector
     /// which can be applied to the actions to find those that passed data skipping.
-    pub(crate) fn apply(&self, actions: &dyn EngineData) -> DeltaResult<Vec<bool>> {
-        // retrieve and parse stats from actions data
-        let stats = self.select_stats_evaluator.evaluate(actions)?;
-        assert_eq!(stats.len(), actions.len());
-        let parsed_stats = self
-            .json_handler
-            .parse_json(stats, self.stats_schema.clone())?;
+    ///
+    /// # Arguments
+    /// * `actions` - The batch of actions to filter
+    /// * `is_log_batch` - True if this is a commit batch, false if checkpoint batch
+    pub(crate) fn apply(
+        &self,
+        actions: &dyn EngineData,
+        is_log_batch: bool,
+    ) -> DeltaResult<Vec<bool>> {
+        // Determine stats extraction path based on batch type and parsed stats availability
+        let parsed_stats = match (&self.select_parsed_stats_evaluator, is_log_batch) {
+            (Some(evaluator), false) => {
+                // Checkpoint batch with parsed stats evaluator available: extract directly
+                debug!("Using parsed stats path for checkpoint batch");
+                match evaluator.evaluate(actions) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        // Schema mismatch or other error - fall back to no data skipping
+                        // This is safe: we keep all files rather than incorrectly skipping
+                        debug!("Failed to extract parsed stats, skipping data skipping: {e}");
+                        return Ok(vec![true; actions.len()]);
+                    }
+                }
+            }
+            _ => {
+                // Log batch or no parsed stats evaluator: parse JSON stats
+                debug!("Using JSON stats path (is_log_batch={is_log_batch})");
+                let stats = self.select_stats_evaluator.evaluate(actions)?;
+                assert_eq!(stats.len(), actions.len());
+                self.json_handler
+                    .parse_json(stats, self.stats_schema.clone())?
+            }
+        };
         assert_eq!(parsed_stats.len(), actions.len());
 
         // evaluate the predicate on the parsed stats, then convert to selection vector

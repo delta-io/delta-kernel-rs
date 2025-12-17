@@ -1405,7 +1405,6 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
     Ok(())
 }
-
 async fn create_segment_for(
     commit_versions: &[u64],
     compaction_versions: &[(u64, u64)],
