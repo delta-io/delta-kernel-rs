@@ -153,16 +153,13 @@ impl RowVisitor for LogVisitor {
 }
 
 // This is the callback that will be called for each valid scan row
-fn print_scan_file(
-    _: &mut (),
-    file: ScanFile,
-) {
+fn print_scan_file(_: &mut (), file: ScanFile) {
     let num_record_str = if let Some(s) = file.stats {
         format!("{}", s.num_records)
     } else {
         "[unknown]".to_string()
     };
-    let mod_str = match chrono::DateTime::from_timestamp(file.modification_time/1000, 0) {
+    let mod_str = match chrono::DateTime::from_timestamp(file.modification_time / 1000, 0) {
         Some(dt) => format!("{} ({})", dt, file.modification_time),
         None => format!("Invalid mod time: {}", file.modification_time),
     };
