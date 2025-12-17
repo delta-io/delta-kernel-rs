@@ -316,7 +316,6 @@ fn read_with_execute(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn scan_metadata_callback(batches: &mut Vec<ScanFile>, scan_file: ScanFile) {
     batches.push(scan_file);
 }

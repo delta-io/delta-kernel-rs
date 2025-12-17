@@ -245,7 +245,6 @@ mod tests {
         id: usize,
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn validate_visit(context: &mut TestContext, scan_file: ScanFile) {
         assert_eq!(
             scan_file.path,
