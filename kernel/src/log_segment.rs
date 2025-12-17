@@ -332,10 +332,6 @@ impl LogSegment {
     /// schemas can be useful as a cheap way of doing additional filtering on the checkpoint files
     /// (e.g. filtering out remove actions).
     ///
-    ///  The engine data returned might have extra non-log actions (e.g. sidecar
-    ///  actions) that are not part of the schema but this is an implementation
-    ///  detail that should not be relied on and will likely change.
-    ///
     /// `meta_predicate` is an optional expression to filter the log files with. It is _NOT_ the
     /// query's predicate, but rather a predicate for filtering log files themselves.
     #[internal_api]

@@ -406,3 +406,136 @@ fn test_timestamp_predicates_dont_data_skip() {
         );
     }
 }
+
+#[test]
+fn test_build_stats_schema_simple() {
+    // Test with a simple schema containing a few columns
+    let referenced_schema = StructType::new_unchecked([
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("name", DataType::STRING),
+    ]);
+
+    let stats_schema = build_stats_schema(&referenced_schema).unwrap();
+
+    // Verify structure has numRecords, nullCount, minValues, maxValues
+    assert!(stats_schema.field("numRecords").is_some());
+    assert!(stats_schema.field("nullCount").is_some());
+    assert!(stats_schema.field("minValues").is_some());
+    assert!(stats_schema.field("maxValues").is_some());
+
+    // Verify numRecords is LONG
+    let num_records = stats_schema.field("numRecords").unwrap();
+    assert_eq!(num_records.data_type, DataType::LONG);
+    assert!(num_records.is_nullable());
+
+    // Verify nullCount has LONG fields for each column
+    let null_count = stats_schema.field("nullCount").unwrap();
+    let DataType::Struct(null_count_struct) = &null_count.data_type else {
+        panic!("nullCount should be a struct");
+    };
+    assert!(null_count_struct.field("id").is_some());
+    assert!(null_count_struct.field("name").is_some());
+    assert_eq!(
+        null_count_struct.field("id").unwrap().data_type,
+        DataType::LONG
+    );
+    assert_eq!(
+        null_count_struct.field("name").unwrap().data_type,
+        DataType::LONG
+    );
+
+    // Verify minValues preserves original types
+    let min_values = stats_schema.field("minValues").unwrap();
+    let DataType::Struct(min_values_struct) = &min_values.data_type else {
+        panic!("minValues should be a struct");
+    };
+    assert_eq!(
+        min_values_struct.field("id").unwrap().data_type,
+        DataType::LONG
+    );
+    assert_eq!(
+        min_values_struct.field("name").unwrap().data_type,
+        DataType::STRING
+    );
+
+    // Verify maxValues preserves original types
+    let max_values = stats_schema.field("maxValues").unwrap();
+    let DataType::Struct(max_values_struct) = &max_values.data_type else {
+        panic!("maxValues should be a struct");
+    };
+    assert_eq!(
+        max_values_struct.field("id").unwrap().data_type,
+        DataType::LONG
+    );
+    assert_eq!(
+        max_values_struct.field("name").unwrap().data_type,
+        DataType::STRING
+    );
+}
+
+#[test]
+fn test_build_stats_schema_all_fields_nullable() {
+    // Non-nullable fields should become nullable in stats schema
+    let referenced_schema =
+        StructType::new_unchecked([StructField::not_null("required_col", DataType::INTEGER)]);
+
+    let stats_schema = build_stats_schema(&referenced_schema).unwrap();
+
+    let min_values = stats_schema.field("minValues").unwrap();
+    let DataType::Struct(min_values_struct) = &min_values.data_type else {
+        panic!("minValues should be a struct");
+    };
+
+    // The field should be nullable in the stats schema
+    assert!(min_values_struct
+        .field("required_col")
+        .unwrap()
+        .is_nullable());
+}
+
+#[test]
+fn test_build_stats_schema_nested() {
+    // Test with nested struct
+    let inner_struct = StructType::new_unchecked([
+        StructField::nullable("a", DataType::INTEGER),
+        StructField::nullable("b", DataType::STRING),
+    ]);
+    let referenced_schema = StructType::new_unchecked([StructField::nullable(
+        "nested",
+        DataType::Struct(Box::new(inner_struct)),
+    )]);
+
+    let stats_schema = build_stats_schema(&referenced_schema).unwrap();
+
+    // Verify nested structure is preserved
+    let min_values = stats_schema.field("minValues").unwrap();
+    let DataType::Struct(min_struct) = &min_values.data_type else {
+        panic!("minValues should be a struct");
+    };
+    let nested = min_struct.field("nested").unwrap();
+    let DataType::Struct(nested_struct) = &nested.data_type else {
+        panic!("nested should be a struct");
+    };
+
+    assert!(nested_struct.field("a").is_some());
+    assert!(nested_struct.field("b").is_some());
+
+    // Verify nullCount has LONG for nested fields
+    let null_count = stats_schema.field("nullCount").unwrap();
+    let DataType::Struct(null_count_struct) = &null_count.data_type else {
+        panic!("nullCount should be a struct");
+    };
+    let nested_null_count = null_count_struct.field("nested").unwrap();
+    let DataType::Struct(nested_nc_struct) = &nested_null_count.data_type else {
+        panic!("nested nullCount should be a struct");
+    };
+
+    assert_eq!(
+        nested_nc_struct.field("a").unwrap().data_type,
+        DataType::LONG
+    );
+    assert_eq!(
+        nested_nc_struct.field("b").unwrap().data_type,
+        DataType::LONG
+    );
+}

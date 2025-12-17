@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::actions::STATS_PARSED_NAME;
 use crate::arrow::array::BooleanArray;
 use crate::arrow::compute::filter_record_batch;
 use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+use crate::scan::data_skipping::build_stats_schema;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
 use crate::{EngineData, ExpressionRef, Snapshot};
 
@@ -496,4 +498,50 @@ fn test_scan_with_checkpoint() -> DeltaResult<()> {
         vec!["part-00000-70b1dcdf-0236-4f63-a072-124cdbafd8a0-c000.snappy.parquet"]
     );
     Ok(())
+}
+
+#[test]
+fn test_build_checkpoint_read_schema_with_stats_parsed() {
+    // Build a stats schema from some referenced columns
+    let referenced_schema = StructType::new_unchecked([
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("name", DataType::STRING),
+    ]);
+    let stats_schema = build_stats_schema(&referenced_schema).unwrap();
+
+    // Build the checkpoint read schema with stats_parsed
+    let checkpoint_schema = build_checkpoint_read_schema_with_stats_parsed(&stats_schema);
+
+    // Verify it has the "add" field
+    let add_field = checkpoint_schema.field("add").unwrap();
+    let DataType::Struct(add_struct) = &add_field.data_type else {
+        panic!("add should be a struct");
+    };
+
+    // Verify add struct contains all original Add fields
+    assert!(add_struct.field("path").is_some());
+    assert!(add_struct.field("size").is_some());
+    assert!(add_struct.field("stats").is_some());
+    assert!(add_struct.field("modificationTime").is_some());
+
+    // Verify add struct contains stats_parsed field
+    let stats_parsed = add_struct.field(STATS_PARSED_NAME).unwrap();
+    assert!(stats_parsed.is_nullable());
+
+    // Verify stats_parsed has the expected structure
+    let DataType::Struct(stats_parsed_struct) = &stats_parsed.data_type else {
+        panic!("stats_parsed should be a struct");
+    };
+    assert!(stats_parsed_struct.field("numRecords").is_some());
+    assert!(stats_parsed_struct.field("nullCount").is_some());
+    assert!(stats_parsed_struct.field("minValues").is_some());
+    assert!(stats_parsed_struct.field("maxValues").is_some());
+
+    // Verify the projected columns are in minValues/maxValues
+    let min_values = stats_parsed_struct.field("minValues").unwrap();
+    let DataType::Struct(min_values_struct) = &min_values.data_type else {
+        panic!("minValues should be a struct");
+    };
+    assert!(min_values_struct.field("id").is_some());
+    assert!(min_values_struct.field("name").is_some());
 }

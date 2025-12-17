@@ -348,6 +348,26 @@ impl StructField {
         }
     }
 
+    /// Creates a copy of this field with the specified nullability.
+    pub fn with_nullable(&self, nullable: bool) -> Self {
+        StructField {
+            name: self.name.clone(),
+            data_type: self.data_type().clone(),
+            nullable,
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    /// Creates a copy of this field with the specified data type.
+    pub fn with_data_type(&self, data_type: impl Into<DataType>) -> Self {
+        StructField {
+            name: self.name.clone(),
+            data_type: data_type.into(),
+            nullable: self.nullable,
+            metadata: self.metadata.clone(),
+        }
+    }
+
     #[inline]
     pub fn name(&self) -> &String {
         &self.name
