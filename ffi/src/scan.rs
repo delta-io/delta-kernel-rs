@@ -501,10 +501,7 @@ fn row_indexes_from_dv_impl(
 
 // Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
 // and then calls the ffi specified callback
-fn rust_callback(
-    context: &mut ContextWrapper,
-    scan_file: ScanFile,
-) {
+fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) {
     let transform = scan_file.transform.map(|e| e.as_ref().clone());
     let partition_map = CStringMap {
         values: scan_file.partition_values,
