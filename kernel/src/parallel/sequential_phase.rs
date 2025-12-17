@@ -13,7 +13,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use crate::actions::get_commit_schema;
-use crate::log_reader::checkpoint_manifest::CheckpointManifestReader;
+use crate::log_reader::checkpoint_manifest::{
+    CheckpointManifestReader, ControlFlow as CheckpointManifestControlFlow,
+};
 use crate::log_reader::commit::CommitReader;
 use crate::log_replay::LogReplayProcessor;
 use crate::log_segment::LogSegment;
@@ -76,6 +78,14 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
     checkpoint_parts: Vec<FileMeta>,
 }
 
+/// Control flow for iterating the CheckpointManifestReader. This is the result of calling
+/// [`CheckpointManifestReader::next`].
+#[allow(unused)]
+pub(crate) enum ControlFlow<P: LogReplayProcessor> {
+    Continue((SequentialPhase<P>, DeltaResult<P::Output>)),
+    Break(AfterSequential<P>),
+}
+
 /// Result of sequential log replay processing.
 #[allow(unused)]
 pub(crate) enum AfterSequential<P: LogReplayProcessor> {
@@ -130,6 +140,44 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
         })
     }
 
+    pub(crate) fn next(mut self) -> DeltaResult<ControlFlow<P>> {
+        let next = self
+            .commit_phase
+            .as_mut()
+            .and_then(|commit_phase| commit_phase.next());
+
+        let result = match next {
+            Some(result) => result,
+            None => {
+                self.commit_phase = None;
+                let Some(manifest_phase) = self.checkpoint_manifest_phase.take() else {
+                    return Ok(ControlFlow::Break(AfterSequential::Done(self.processor)));
+                };
+                match manifest_phase.next() {
+                    CheckpointManifestControlFlow::Continue((p, item)) => {
+                        self.checkpoint_manifest_phase = Some(p);
+                        item
+                    }
+                    CheckpointManifestControlFlow::Break(parallel_files_res) => {
+                        let parallel_files = parallel_files_res?;
+                        let res = if parallel_files.is_empty() {
+                            AfterSequential::Done(self.processor)
+                        } else {
+                            AfterSequential::Parallel {
+                                processor: self.processor,
+                                files: parallel_files,
+                            }
+                        };
+                        return Ok(ControlFlow::Break(res));
+                    }
+                }
+            }
+        };
+
+        let result = result.and_then(|batch| self.processor.process_actions_batch(batch));
+        Ok(ControlFlow::Continue((self, result)))
+    }
+
     /// Complete sequential phase and extract processor + files for distribution.
     ///
     /// Must be called after the iterator is exhausted.
@@ -179,23 +227,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
 impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
     type Item = DeltaResult<P::Output>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self
-            .commit_phase
-            .as_mut()
-            .and_then(|commit_phase| commit_phase.next())
-            .or_else(|| {
-                self.commit_phase = None;
-                self.checkpoint_manifest_phase.as_mut()?.next()
-            });
-
-        let Some(result) = next else {
-            self.is_finished = true;
-            return None;
-        };
-
-        Some(result.and_then(|batch| self.processor.process_actions_batch(batch)))
-    }
+    fn next(&mut self) -> Option<Self::Item> {}
 }
 
 #[cfg(test)]
