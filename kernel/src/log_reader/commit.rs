@@ -49,43 +49,14 @@ mod tests {
     use super::*;
     use crate::arrow::array::{StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngine;
     use crate::scan::COMMIT_READ_SCHEMA;
-    use crate::{Error, Snapshot, SnapshotRef};
+    use crate::utils::test_utils::load_test_table;
     use itertools::Itertools;
-    use object_store::local::LocalFileSystem;
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use url::Url;
-
-    fn load_test_table(
-        table_name: &str,
-    ) -> DeltaResult<(
-        Arc<DefaultEngine<TokioBackgroundExecutor>>,
-        SnapshotRef,
-        url::Url,
-    )> {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("tests/data");
-        path.push(table_name);
-
-        let path = std::fs::canonicalize(path)
-            .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
-
-        let url = Url::from_directory_path(path)
-            .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
-
-        let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(DefaultEngine::new(store));
-        let snapshot = Snapshot::builder_for(url.clone()).build(engine.as_ref())?;
-
-        Ok((engine, snapshot, url))
-    }
 
     #[test]
     fn test_commit_phase_processes_commits() -> Result<(), Box<dyn std::error::Error>> {
-        let (engine, snapshot, _url) = load_test_table("app-txn-no-checkpoint")?;
+        let (engine, snapshot, _tempdir) = load_test_table("app-txn-no-checkpoint")?;
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
         let schema = COMMIT_READ_SCHEMA.clone();
