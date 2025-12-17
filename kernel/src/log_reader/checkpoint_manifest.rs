@@ -11,7 +11,6 @@ use crate::actions::{REMOVE_NAME, SIDECAR_NAME};
 use crate::log_replay::ActionsBatch;
 use crate::path::ParsedLogPath;
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema};
-use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 
 /// Phase that processes single-part checkpoint. This also treats the checkpoint as a manifest file
@@ -22,7 +21,14 @@ pub(crate) struct CheckpointManifestReader {
     sidecar_visitor: SidecarVisitor,
     log_root: Url,
     is_complete: bool,
-    manifest_file: FileMeta,
+}
+
+/// Control flow for iterating the CheckpointManifestReader. This is the result of calling
+/// [`CheckpointManifestReader::next`].
+#[allow(unused)]
+pub(crate) enum ControlFlow {
+    Continue((CheckpointManifestReader, DeltaResult<ActionsBatch>)),
+    Break(DeltaResult<Vec<FileMeta>>),
 }
 
 impl CheckpointManifestReader {
@@ -73,46 +79,27 @@ impl CheckpointManifestReader {
             sidecar_visitor: SidecarVisitor::default(),
             log_root,
             is_complete: false,
-            manifest_file: manifest.location.clone(),
         })
     }
 
-    /// Extract the sidecars from the manifest file if there were any.
-    /// NOTE: The iterator must be completely exhausted before calling this
     #[allow(unused)]
-    pub(crate) fn extract_sidecars(self) -> DeltaResult<Vec<FileMeta>> {
-        require!(
-            self.is_complete,
-            Error::generic(format!(
-                "Cannot extract sidecars from in-progress ManifestReader for file: {}",
-                self.manifest_file.location
-            ))
-        );
-
-        let sidecars: Vec<_> = self
-            .sidecar_visitor
-            .sidecars
-            .into_iter()
-            .map(|s| s.to_filemeta(&self.log_root))
-            .try_collect()?;
-
-        Ok(sidecars)
-    }
-}
-
-impl Iterator for CheckpointManifestReader {
-    type Item = DeltaResult<ActionsBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    pub(crate) fn next(mut self) -> ControlFlow {
         let Some(result) = self.actions.next() else {
-            self.is_complete = true;
-            return None;
+            let sidecars: DeltaResult<Vec<_>> = self
+                .sidecar_visitor
+                .sidecars
+                .into_iter()
+                .map(|s| s.to_filemeta(&self.log_root))
+                .try_collect();
+
+            return ControlFlow::Break(sidecars);
         };
 
-        Some(result.and_then(|batch| {
+        let result = result.and_then(|batch| {
             self.sidecar_visitor.visit_rows_of(batch.actions())?;
             Ok(batch)
-        }))
+        });
+        ControlFlow::Continue((self, result))
     }
 }
 
@@ -121,7 +108,7 @@ mod tests {
     use super::*;
     use crate::arrow::array::{Array, StringArray, StructArray};
     use crate::engine::arrow_data::EngineDataArrowExt as _;
-    use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
+    use crate::utils::test_utils::load_test_table;
     use crate::SnapshotRef;
 
     use itertools::Itertools;
@@ -138,32 +125,37 @@ mod tests {
         let log_root = log_segment.log_root.clone();
         assert_eq!(log_segment.checkpoint_parts.len(), 1);
         let checkpoint_file = &log_segment.checkpoint_parts[0];
-        let mut manifest_phase =
+        let mut checkpoint_manifest_phase =
             CheckpointManifestReader::try_new(engine.clone(), checkpoint_file, log_root)?;
 
         // Extract add file paths and verify expectations
         let mut file_paths = vec![];
-        for result in manifest_phase.by_ref() {
-            let batch = result?;
-            let ActionsBatch {
-                actions,
-                is_log_batch,
-            } = batch;
-            assert!(!is_log_batch, "Manifest should not be a log batch");
+        let actual_sidecars = loop {
+            match checkpoint_manifest_phase.next() {
+                ControlFlow::Continue((p, batch)) => {
+                    checkpoint_manifest_phase = p;
+                    let ActionsBatch {
+                        actions,
+                        is_log_batch,
+                    } = batch?;
+                    assert!(!is_log_batch, "Manifest should not be a log batch");
 
-            let record_batch = actions.try_into_record_batch()?;
-            let add = record_batch.column_by_name("add").unwrap();
-            let add_struct = add.as_any().downcast_ref::<StructArray>().unwrap();
-            let path = add_struct
-                .column_by_name("path")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
+                    let record_batch = actions.try_into_record_batch()?;
+                    let add = record_batch.column_by_name("add").unwrap();
+                    let add_struct = add.as_any().downcast_ref::<StructArray>().unwrap();
+                    let path = add_struct
+                        .column_by_name("path")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
 
-            let batch_paths = path.iter().flatten().map(ToString::to_string).collect_vec();
-            file_paths.extend(batch_paths);
-        }
+                    let batch_paths = path.iter().flatten().map(ToString::to_string).collect_vec();
+                    file_paths.extend(batch_paths);
+                }
+                ControlFlow::Break(files) => break files?,
+            }
+        };
 
         // Verify collected add paths
         file_paths.sort();
@@ -171,9 +163,6 @@ mod tests {
             file_paths, expected_add_paths,
             "CheckpointManifestReader should extract expected Add file paths from checkpoint"
         );
-
-        // Check sidecars
-        let actual_sidecars = manifest_phase.extract_sidecars()?;
 
         assert_eq!(
             actual_sidecars.len(),
@@ -210,24 +199,6 @@ mod tests {
             &["part-00000-a190be9e-e3df-439e-b366-06a863f51e99-c000.snappy.parquet"],
             &[],
         )
-    }
-
-    #[test]
-    fn test_manifest_phase_early_finalize_error() -> DeltaResult<()> {
-        let (engine, snapshot, _tempdir) = load_test_table("with_checkpoint_no_last_checkpoint")?;
-
-        let manifest_phase = CheckpointManifestReader::try_new(
-            engine.clone(),
-            &snapshot.log_segment().checkpoint_parts[0],
-            snapshot.log_segment().log_root.clone(),
-        )?;
-
-        let result = manifest_phase.extract_sidecars();
-        assert_result_error_with_message(
-            result,
-            "Cannot extract sidecars from in-progress ManifestReader for file",
-        );
-        Ok(())
     }
 
     #[test]
