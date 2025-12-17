@@ -2,9 +2,11 @@ cmake_minimum_required(VERSION 3.12)
 project(read_table)
 option(PRINT_DATA "Print out the table data. Requires arrow-glib" ON)
 option(VERBOSE "Enable for more diagnostics messages." OFF)
-add_executable(read_table read_table.c arrow.c kernel_utils.c)
+add_executable(read_table read_table.c arrow.c ../common/kernel_utils.c)
 target_compile_definitions(read_table PUBLIC DEFINE_DEFAULT_ENGINE_BASE)
-target_include_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers")
+target_include_directories(read_table PUBLIC 
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/ffi-headers"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../common")
 target_link_directories(read_table PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../../../target/debug")
 target_link_libraries(read_table PUBLIC delta_kernel_ffi)
 target_compile_options(read_table PUBLIC)

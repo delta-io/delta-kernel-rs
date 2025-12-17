@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn test_parse_partition_value_raw_null() {
         let result = parse_partition_value_raw(None, &DataType::STRING).unwrap();
-        assert!(matches!(result, Scalar::Null(_)));
+        assert!(result.is_null());
     }
 
     #[test]
