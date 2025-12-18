@@ -406,12 +406,12 @@ pub(crate) fn scan_action_iter(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use crate::actions::get_commit_schema;
     use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
-    use crate::scan::state::{DvInfo, Stats};
+    use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
         assert_transform_spec, get_simple_state_info, get_state_info,
     };
@@ -434,24 +434,19 @@ mod tests {
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs
-    fn validate_simple(
-        _: &mut (),
-        path: &str,
-        size: i64,
-        stats: Option<Stats>,
-        _: DvInfo,
-        _: Option<ExpressionRef>,
-        part_vals: HashMap<String, String>,
-    ) {
+    fn validate_simple(_: &mut (), scan_file: ScanFile) {
         assert_eq!(
-            path,
+            scan_file.path,
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         );
-        assert_eq!(size, 635);
-        assert!(stats.is_some());
-        assert_eq!(stats.as_ref().unwrap().num_records, 10);
-        assert_eq!(part_vals.get("date"), Some(&"2017-12-10".to_string()));
-        assert_eq!(part_vals.get("non-existent"), None);
+        assert_eq!(scan_file.size, 635);
+        assert!(scan_file.stats.is_some());
+        assert_eq!(scan_file.stats.as_ref().unwrap().num_records, 10);
+        assert_eq!(
+            scan_file.partition_values.get("date"),
+            Some(&"2017-12-10".to_string())
+        );
+        assert_eq!(scan_file.partition_values.get("non-existent"), None);
     }
 
     #[test]

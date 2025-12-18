@@ -229,12 +229,10 @@ mod tests {
         let mut file_paths = Vec::new();
         for result in sequential.by_ref() {
             let metadata = result?;
-            file_paths = metadata.visit_scan_files(
-                file_paths,
-                |ps: &mut Vec<String>, path, _, _, _, _, _| {
-                    ps.push(path.to_string());
-                },
-            )?;
+            file_paths =
+                metadata.visit_scan_files(file_paths, |ps: &mut Vec<String>, file_stat| {
+                    ps.push(file_stat.path);
+                })?;
         }
 
         // Assert collected adds match expected
