@@ -279,10 +279,32 @@ pub fn evaluate_expression(
             }),
             result_type,
         ) => {
-            let arrays: Vec<ArrayRef> = exprs
-                .iter()
-                .map(|expr| evaluate_expression(expr, batch, None))
-                .try_collect()?;
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
+
+            for expr in exprs {
+                let array = evaluate_expression(expr, batch, None)?;
+
+                // Short-circuit: if this array has no nulls, it is the complete result
+                if array.null_count() == 0 {
+                    // Validate result type if provided
+                    if let Some(result_type) = result_type {
+                        let expected_type = result_type.try_into_arrow()?;
+                        if array.data_type() != &expected_type {
+                            return Err(ArrowError::InvalidArgumentError(format!(
+                                "Requested result type {:?} does not match array's data type {:?}",
+                                expected_type,
+                                array.data_type()
+                            ))
+                            .into());
+                        }
+                    }
+                    return Ok(array);
+                }
+
+                arrays.push(array);
+            }
+
+            // All evaluated arrays have some nulls - coalesce them
             Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
@@ -1093,6 +1115,74 @@ mod tests {
             result2,
             "Requested result type Utf8 does not match arrays' data type Int32",
         );
+    }
+
+    #[test]
+    fn test_coalesce_short_circuit_first_no_nulls() {
+        // First array has no nulls - should short-circuit and return it directly
+        let arr1 = Arc::new(Int32Array::from(vec![1, 2, 3])); // No nulls
+        let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30]));
+
+        let result = coalesce_arrays(&[arr1.clone(), arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        // Result should be arr1's values
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 2);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_short_circuit_second_no_nulls() {
+        // First array has nulls, second has none
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30])); // No nulls
+
+        let result = coalesce_arrays(&[arr1, arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        // Row 0: 1 (from arr1), Row 1: 20 (from arr2), Row 2: 3 (from arr1)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 20);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit() {
+        // Test the short-circuit optimization via expression evaluation
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        // Create coalesce expression with column that has no nulls
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![Expression::column(["a"]), Expression::literal(0i32)],
+        );
+
+        // Should return column "a" directly (short-circuit)
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result_array.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_type_mismatch() {
+        // Verify type validation works when short-circuiting
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![Expression::column(["a"])],
+        );
+
+        // Request STRING type but array is INT32 - should fail even with short-circuit
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
+        assert!(result.is_err());
     }
 
     #[test]
