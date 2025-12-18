@@ -231,8 +231,8 @@ mod tests {
             let metadata = result?;
             file_paths = metadata.visit_scan_files(
                 file_paths,
-                |ps: &mut Vec<String>, path, _, _, _, _, _| {
-                    ps.push(path.to_string());
+                |ps: &mut Vec<String>, file_stat| {
+                    ps.push(file_stat.path);
                 },
             )?;
         }
