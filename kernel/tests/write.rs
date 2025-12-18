@@ -7,6 +7,7 @@ use delta_kernel::{DeltaResult, Engine, Snapshot, Version};
 use url::Url;
 use uuid::Uuid;
 
+use delta_kernel::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use delta_kernel::arrow::array::{ArrayRef, BinaryArray, StructArray};
 use delta_kernel::arrow::array::{Int32Array, StringArray, TimestampMicrosecondArray};
 use delta_kernel::arrow::buffer::NullBuffer;
@@ -35,8 +36,8 @@ use tempfile::tempdir;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 
 use test_utils::{
-    assert_result_error_with_message, copy_directory, create_default_engine, create_table,
-    engine_store_setup, setup_test_tables, test_read,
+    assert_result_error_with_message, copy_directory, create_add_files_metadata,
+    create_default_engine, create_table, engine_store_setup, setup_test_tables, test_read,
 };
 
 mod common;
@@ -49,6 +50,82 @@ fn validate_txn_id(commit_info: &serde_json::Value) {
 }
 
 const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// Creates a table with deletion vector support and writes the specified files
+async fn create_dv_table_with_files(
+    table_name: &str,
+    schema: Arc<StructType>,
+    file_paths: &[&str],
+) -> Result<
+    (
+        Arc<dyn ObjectStore>,
+        Arc<dyn delta_kernel::Engine>,
+        Url,
+        Vec<String>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (store, engine, table_url) = engine_store_setup(table_name, None);
+    let engine = Arc::new(engine);
+
+    // Create table with DV support (protocol 3/7 with deletionVectors feature)
+    create_table(
+        store.clone(),
+        table_url.clone(),
+        schema.clone(),
+        &[],
+        true, // use_37_protocol
+        vec!["deletionVectors"],
+        vec!["deletionVectors"],
+    )
+    .await?;
+
+    // Write files
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("test engine")
+        .with_operation("WRITE".to_string())
+        .with_data_change(true);
+
+    let add_files_schema = txn.add_files_schema();
+
+    // Build metadata for all files at once
+    let files: Vec<(&str, i64, i64, i64)> = file_paths
+        .iter()
+        .enumerate()
+        .map(|(i, &path)| {
+            (
+                path,
+                1024 + i as i64 * 100, // size
+                1000000 + i as i64,    // mod_time
+                3,                     // num_records
+            )
+        })
+        .collect();
+    let metadata = create_add_files_metadata(add_files_schema, files)?;
+    txn.add_files(metadata);
+
+    let _ = txn.commit(engine.as_ref())?;
+
+    let paths: Vec<String> = file_paths.iter().map(|&s| s.to_string()).collect();
+    Ok((store, engine, table_url, paths))
+}
+
+/// Extracts scan files from a snapshot for use in deletion vector updates
+fn get_scan_files(
+    snapshot: Arc<Snapshot>,
+    engine: &dyn delta_kernel::Engine,
+) -> DeltaResult<Vec<FilteredEngineData>> {
+    let scan = snapshot.scan_builder().build()?;
+    let all_scan_metadata: Vec<_> = scan.scan_metadata(engine)?.collect::<Result<Vec<_>, _>>()?;
+
+    Ok(all_scan_metadata
+        .into_iter()
+        .map(|sm| sm.scan_files)
+        .collect())
+}
 
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
@@ -1982,6 +2059,469 @@ async fn test_remove_files_adds_expected_entries() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
+async fn test_update_deletion_vectors_adds_expected_entries(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that deletion vector updates write proper Remove and Add actions
+    // to the transaction log.
+    //
+    // NOTE: Additional unit tests for update_deletion_vectors exist in kernel/src/transaction/mod.rs
+    //
+    // The test validates:
+    // 1. Transaction setup for DV updates
+    // 2. Scanning and extracting scan files with DV data
+    // 3. Creating new DV descriptors for the files
+    // 4. Calling update_deletion_vectors to update the DVs
+    // 5. Committing and verifying the generated actions
+    //
+    // Expected commit log structure:
+    // - commitInfo: Contains metadata about the transaction
+    // - remove: Contains OLD deletion vector data and original file metadata
+    // - add: Contains NEW deletion vector data and updated file metadata
+    //
+    // The test ensures:
+    // - Remove action has the OLD DV descriptor with all 5 fields
+    // - Add action has the NEW DV descriptor with all 5 fields
+    // - All file metadata is preserved (size, stats, tags, partitionValues)
+    // - dataChange is properly set to true
+    // - deletionTimestamp matches commit timestamp
+    use std::path::PathBuf;
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let tmp_dir = tempdir()?;
+    let tmp_table_path = tmp_dir.path().join("table-with-dv-small");
+    let source_path = std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/"))?;
+    copy_directory(&source_path, &tmp_table_path)?;
+
+    let table_url = url::Url::from_directory_path(&tmp_table_path).unwrap();
+    let engine = create_default_engine(&table_url)?;
+
+    let snapshot = Snapshot::builder_for(table_url.clone())
+        .at_version(1)
+        .build(engine.as_ref())?;
+
+    // Create transaction with DV update mode enabled
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("test engine")
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    // Build scan and collect all scan metadata
+    let scan = snapshot.clone().scan_builder().build()?;
+    let all_scan_metadata: Vec<_> = scan
+        .scan_metadata(engine.as_ref())?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Extract scan files for DV update
+    let scan_files: Vec<_> = all_scan_metadata
+        .into_iter()
+        .map(|sm| sm.scan_files)
+        .collect();
+
+    // Create new DV descriptors for the files
+    let file_path = "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet";
+    let mut dv_map = HashMap::new();
+
+    // Create a NEW deletion vector descriptor (different from the original)
+    let new_dv = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "cd^-aqEH.-t@S}K{vb[*k^".to_string(),
+        offset: Some(10),
+        size_in_bytes: 40,
+        cardinality: 3,
+    };
+    dv_map.insert(file_path.to_string(), new_dv);
+
+    // Call update_deletion_vectors to exercise the API
+    txn.update_deletion_vectors(dv_map, scan_files.into_iter().map(Ok))?;
+
+    // Commit the transaction
+    let result = txn.commit(engine.as_ref())?;
+
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            let commit_version = committed.commit_version();
+
+            // Read the original version 1 log to get original file metadata
+            let original_log_path = tmp_table_path.join("_delta_log/00000000000000000001.json");
+            let original_log_content = std::fs::read_to_string(original_log_path)?;
+            let original_commits: Vec<_> = Deserializer::from_str(&original_log_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            let file_path = "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet";
+
+            // Extract original file metadata from version 1
+            let original_add = original_commits
+                .iter()
+                .find(|action| {
+                    action
+                        .get("add")
+                        .and_then(|add| add.get("path").and_then(|p| p.as_str()))
+                        == Some(file_path)
+                })
+                .expect("Missing original add action in version 1")
+                .get("add")
+                .expect("Should have add field");
+
+            let original_size = original_add["size"]
+                .as_i64()
+                .expect("Original add action should have size");
+            let original_partition_values = original_add["partitionValues"]
+                .as_object()
+                .expect("Original add action should have partitionValues");
+            let original_tags = original_add.get("tags");
+            let original_stats = original_add.get("stats");
+
+            // Read the commit log directly
+            let commit_path =
+                tmp_table_path.join(format!("_delta_log/{:020}.json", commit_version));
+            let commit_content = std::fs::read_to_string(commit_path)?;
+
+            let parsed_commits: Vec<_> = Deserializer::from_str(&commit_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            // Should have commitInfo, remove, and add actions
+            assert!(
+                parsed_commits.len() >= 3,
+                "Expected at least 3 actions (commitInfo + remove + add), got {}",
+                parsed_commits.len()
+            );
+
+            // Extract commitInfo timestamp
+            let commit_info_action = parsed_commits
+                .iter()
+                .find(|action| action.get("commitInfo").is_some())
+                .expect("Missing commitInfo action");
+            let commit_info = &commit_info_action["commitInfo"];
+            let commit_timestamp = commit_info["timestamp"]
+                .as_i64()
+                .expect("Missing timestamp in commitInfo");
+
+            // Verify remove action contains OLD DV information
+            let remove_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("remove").is_some())
+                .collect();
+
+            assert_eq!(
+                remove_actions.len(),
+                1,
+                "Expected exactly one remove action"
+            );
+
+            let remove_action = remove_actions[0];
+            let remove = &remove_action["remove"];
+
+            assert_eq!(
+                remove["path"].as_str(),
+                Some(file_path),
+                "Remove path should match"
+            );
+            assert_eq!(remove["dataChange"].as_bool(), Some(true));
+            assert_eq!(
+                remove["deletionTimestamp"].as_i64(),
+                Some(commit_timestamp),
+                "deletionTimestamp should match commit timestamp"
+            );
+
+            // Verify OLD deletion vector in remove action
+            let old_dv = remove["deletionVector"]
+                .as_object()
+                .expect("Remove action should have deletionVector");
+            assert_eq!(
+                old_dv.get("storageType").and_then(|v| v.as_str()),
+                Some("u"),
+                "Old DV storage type should be 'u'"
+            );
+            assert_eq!(
+                old_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
+                Some("vBn[lx{q8@P<9BNH/isA"),
+                "Old DV path should match original"
+            );
+            assert_eq!(
+                old_dv.get("offset").and_then(|v| v.as_i64()),
+                Some(1),
+                "Old DV offset should be 1"
+            );
+            assert_eq!(
+                old_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
+                Some(36),
+                "Old DV size should be 36"
+            );
+            assert_eq!(
+                old_dv.get("cardinality").and_then(|v| v.as_i64()),
+                Some(2),
+                "Old DV cardinality should be 2"
+            );
+
+            // Verify file metadata is preserved in remove action
+            let remove_size = remove["size"]
+                .as_i64()
+                .expect("Remove action should have size");
+            let remove_partition_values = remove["partitionValues"]
+                .as_object()
+                .expect("Remove action should have partitionValues");
+            let remove_tags = remove.get("tags");
+            let remove_stats = remove.get("stats");
+
+            // Verify add action contains NEW DV information
+            let add_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("add").is_some())
+                .collect();
+
+            assert_eq!(add_actions.len(), 1, "Expected exactly one add action");
+
+            let add_action = add_actions[0];
+            let add = &add_action["add"];
+
+            assert_eq!(
+                add["path"].as_str(),
+                Some(file_path),
+                "Add path should match"
+            );
+            assert_eq!(add["dataChange"].as_bool(), Some(true));
+
+            // Verify NEW deletion vector in add action
+            let new_dv = add["deletionVector"]
+                .as_object()
+                .expect("Add action should have deletionVector");
+            assert_eq!(
+                new_dv.get("storageType").and_then(|v| v.as_str()),
+                Some("u"),
+                "New DV storage type should be 'u'"
+            );
+            assert_eq!(
+                new_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
+                Some("cd^-aqEH.-t@S}K{vb[*k^"),
+                "New DV path should match updated value"
+            );
+            assert_eq!(
+                new_dv.get("offset").and_then(|v| v.as_i64()),
+                Some(10),
+                "New DV offset should be 10"
+            );
+            assert_eq!(
+                new_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
+                Some(40),
+                "New DV size should be 40"
+            );
+            assert_eq!(
+                new_dv.get("cardinality").and_then(|v| v.as_i64()),
+                Some(3),
+                "New DV cardinality should be 3"
+            );
+
+            // Verify file metadata is preserved in add action
+            let add_size = add["size"].as_i64().expect("Add action should have size");
+            let add_partition_values = add["partitionValues"]
+                .as_object()
+                .expect("Add action should have partitionValues");
+            let add_tags = add.get("tags");
+            let add_stats = add.get("stats");
+
+            // Ensure metadata is consistent between remove and add actions
+            assert_eq!(
+                remove_size, add_size,
+                "File size should be preserved between remove and add"
+            );
+            assert_eq!(
+                remove_partition_values, add_partition_values,
+                "Partition values should be preserved between remove and add"
+            );
+            assert_eq!(
+                remove_tags, add_tags,
+                "Tags should be preserved between remove and add"
+            );
+            assert_eq!(
+                remove_stats, add_stats,
+                "Stats should be preserved between remove and add"
+            );
+
+            // Ensure metadata matches the original file metadata from version 1
+            assert_eq!(
+                remove_size, original_size,
+                "Remove action size should match original file size"
+            );
+            assert_eq!(
+                add_size, original_size,
+                "Add action size should match original file size"
+            );
+            assert_eq!(
+                remove_partition_values, original_partition_values,
+                "Remove action partition values should match original"
+            );
+            assert_eq!(
+                add_partition_values, original_partition_values,
+                "Add action partition values should match original"
+            );
+            assert_eq!(
+                remove_tags, original_tags,
+                "Remove action tags should match original"
+            );
+            assert_eq!(
+                add_tags, original_tags,
+                "Add action tags should match original"
+            );
+            assert_eq!(
+                remove_stats, original_stats,
+                "Remove action stats should match original"
+            );
+            assert_eq!(
+                add_stats, original_stats,
+                "Add action stats should match original"
+            );
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_deletion_vectors_multiple_files() -> Result<(), Box<dyn std::error::Error>> {
+    // This test verifies that update_deletion_vectors can update multiple files
+    // in a single call, creating proper Remove and Add actions for each file.
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(StructType::try_new(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("value", DataType::STRING),
+    ])?);
+
+    // Setup: Create table with 3 files
+    let file_names = &["file0.parquet", "file1.parquet", "file2.parquet"];
+    let (store, engine, table_url, file_paths) =
+        create_dv_table_with_files("test_table", schema, file_names).await?;
+
+    // Create DV update transaction
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let mut txn = snapshot
+        .clone()
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("test engine")
+        .with_operation("UPDATE".to_string())
+        .with_data_change(true);
+
+    let mut scan_files = get_scan_files(snapshot.clone(), engine.as_ref())?;
+
+    // Update deletion vectors for all 3 files in a single call
+    let mut dv_map = HashMap::new();
+    for (idx, file_path) in file_paths.iter().enumerate() {
+        let descriptor = DeletionVectorDescriptor {
+            storage_type: DeletionVectorStorageType::PersistedRelative,
+            path_or_inline_dv: format!("dv_file_{}.bin", idx),
+            offset: Some(idx as i32 * 10),
+            size_in_bytes: 40 + idx as i32,
+            cardinality: idx as i64 + 1,
+        };
+        dv_map.insert(file_path.to_string(), descriptor);
+    }
+
+    txn.update_deletion_vectors(dv_map, scan_files.drain(..).map(Ok))?;
+
+    // Commit the transaction
+    let result = txn.commit(engine.as_ref())?;
+
+    match result {
+        CommitResult::CommittedTransaction(committed) => {
+            let commit_version = committed.commit_version();
+
+            // Read the commit log directly from object store
+            let final_commit_path =
+                table_url.join(&format!("_delta_log/{:020}.json", commit_version))?;
+            let commit_content = store
+                .get(&Path::from_url_path(final_commit_path.path())?)
+                .await?
+                .bytes()
+                .await?;
+
+            let parsed_commits: Vec<_> = Deserializer::from_slice(&commit_content)
+                .into_iter::<serde_json::Value>()
+                .try_collect()?;
+
+            // Extract all remove and add actions
+            let remove_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("remove").is_some())
+                .collect();
+
+            let add_actions: Vec<_> = parsed_commits
+                .iter()
+                .filter(|action| action.get("add").is_some())
+                .collect();
+
+            // Should have 3 remove and 3 add actions
+            assert_eq!(
+                remove_actions.len(),
+                3,
+                "Expected 3 remove actions for 3 files"
+            );
+            assert_eq!(add_actions.len(), 3, "Expected 3 add actions for 3 files");
+
+            // Verify each file has a DV in both remove and add
+            for (idx, file_path) in file_paths.iter().enumerate() {
+                // Find the remove action for this file
+                let remove_action = remove_actions
+                    .iter()
+                    .find(|action| action["remove"]["path"].as_str() == Some(file_path.as_str()))
+                    .unwrap_or_else(|| panic!("Should find remove action for {}", file_path));
+
+                // Find the add action for this file
+                let add_action = add_actions
+                    .iter()
+                    .find(|action| action["add"]["path"].as_str() == Some(file_path.as_str()))
+                    .unwrap_or_else(|| panic!("Should find add action for {}", file_path));
+
+                // Verify remove action does NOT have a DV (since these were newly written files)
+                assert!(
+                    remove_action["remove"]["deletionVector"].is_null(),
+                    "Remove action for newly written file should not have a DV"
+                );
+
+                // Verify add action has the NEW DV
+                let add_dv = add_action["add"]["deletionVector"]
+                    .as_object()
+                    .expect("Add action should have deletionVector");
+
+                let expected_path = format!("dv_file_{}.bin", idx);
+                assert_eq!(
+                    add_dv.get("pathOrInlineDv").and_then(|v| v.as_str()),
+                    Some(expected_path.as_str()),
+                    "DV path should match for file {}",
+                    file_path
+                );
+                assert_eq!(
+                    add_dv.get("offset").and_then(|v| v.as_i64()),
+                    Some(idx as i64 * 10),
+                    "DV offset should match for file {}",
+                    file_path
+                );
+                assert_eq!(
+                    add_dv.get("sizeInBytes").and_then(|v| v.as_i64()),
+                    Some(40 + idx as i64),
+                    "DV size should match for file {}",
+                    file_path
+                );
+                assert_eq!(
+                    add_dv.get("cardinality").and_then(|v| v.as_i64()),
+                    Some(idx as i64 + 1),
+                    "DV cardinality should match for file {}",
+                    file_path
+                );
+            }
+        }
+        _ => panic!("Transaction should be committed"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_remove_files_verify_files_excluded_from_scan(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Adds and then removes files and then verifies they don't appear in the scan.
@@ -2015,10 +2555,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
         // Now create a transaction to remove files
         let mut txn = snapshot
             .clone()
-            .transaction(Box::new(FileSystemCommitter::new()))?
-            .with_engine_info("default engine")
-            .with_operation("DELETE".to_string())
-            .with_data_change(true);
+            .transaction(Box::new(FileSystemCommitter::new()))?;
 
         // Create a new scan to get file metadata for removal
         let scan2 = snapshot.scan_builder().build()?;
