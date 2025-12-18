@@ -1,6 +1,7 @@
 #include "delta_kernel_ffi.h"
 #include "read_table.h"
 #include "kernel_utils.h"
+#include <limits.h>
 #include <stdint.h>
 
 /**
@@ -50,6 +51,12 @@ typedef struct
   SchemaItemList* lists;
 } SchemaBuilder;
 
+typedef struct
+{
+  uintptr_t list_id;
+  SchemaBuilder* builder;
+} CSchema;
+
 // lists are preallocated to have exactly enough space, so we just fill in the next open slot and
 // increment our length
 SchemaItem* add_to_list(SchemaItemList* list, char* name, char* type, bool is_nullable)
@@ -78,7 +85,24 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
     }
     SchemaItem* item = &list->list[i];
     char* prefix = is_last ? "└" : "├";
-    printf("%s─ %s: %s\n", prefix, item->name, item->type);
+    printf("%s─ %s: %s", prefix, item->name, item->type);
+    if (strcmp(item->type, "array") == 0) {
+      SchemaItemList child_list = builder->lists[item->children];
+      if (child_list.len != 1) {
+        printf(" (invalid array child list)\n");
+      } else {
+        printf(" (can contain null: %s)\n", child_list.list[0].is_nullable ? "true" : "false");
+      }
+    } else if (strcmp(item->type, "map") == 0) {
+      SchemaItemList child_list = builder->lists[item->children];
+      if (child_list.len != 2) {
+        printf(" (invalid map child list)\n");
+      } else {
+        printf(" (can contain null: %s)\n", child_list.list[1].is_nullable ? "true" : "false");
+      }
+    } else {
+      printf("\n");
+    }
     if (list->list[i].children != UINTPTR_MAX) {
       print_list(builder, list->list[i].children, indent + 1, parents_on_last + is_last);
     }
@@ -90,7 +114,7 @@ void print_physical_name(const char *name, const CStringMap* metadata)
 #ifdef VERBOSE
   char* key_str = "delta.columnMapping.physicalName";
   KernelStringSlice key = { key_str, strlen(key_str) };
-  char* value = get_from_map(metadata, key, allocate_string);
+  char* value = get_from_string_map(metadata, key, allocate_string);
   if (value) {
     printf("Physical name of %s is %s\n", name, value);
     free(value);
@@ -147,11 +171,7 @@ void visit_array(
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
-  char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  // NOTE: we truncate to the max int size because the format specifier "%.*s" requires an int length specifier
-  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
-  int wrote = snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
-  snprintf(name_ptr + wrote, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  char* name_ptr = allocate_string(name);
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
@@ -167,11 +187,7 @@ void visit_map(
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
-  char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  // NOTE: we truncate to the max int size because the format specifier "%.*s" requires an int length specifier
-  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
-  int wrote = snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
-  snprintf(name_ptr + wrote, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  char* name_ptr = allocate_string(name);
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);
@@ -230,11 +246,11 @@ DEFINE_VISIT_SIMPLE_TYPE(date)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp)
 DEFINE_VISIT_SIMPLE_TYPE(timestamp_ntz)
 
-// free all the data in the builder (but not the builder itself, it's stack allocated)
-void free_builder(SchemaBuilder builder)
+// free all the data in the builder and the builder itself
+void free_builder(SchemaBuilder* builder)
 {
-  for (int i = 0; i < builder.list_count; i++) {
-    SchemaItemList* list = (builder.lists) + i;
+  for (int i = 0; i < builder->list_count; i++) {
+    SchemaItemList* list = (builder->lists) + i;
     for (uint32_t j = 0; j < list->len; j++) {
       SchemaItem* item = list->list + j;
       free(item->name);
@@ -246,19 +262,25 @@ void free_builder(SchemaBuilder builder)
     }
     free(list->list); // free all the items in this list (we alloc'd them together)
   }
-  free(builder.lists);
+  free(builder->lists);
+  free(builder);
 }
 
-// Print the schema of the snapshot
-void print_schema(SharedSnapshot* snapshot)
+// Free the schema and any associated builder data
+void free_cschema(CSchema *schema) {
+  free_builder(schema->builder);
+  free(schema);
+}
+
+// Get the schema of the snapshot
+CSchema* get_cschema(SharedSnapshot* snapshot)
 {
   print_diag("Building schema\n");
-  SchemaBuilder builder = {
-    .list_count = 0,
-    .lists = NULL,
-  };
+  SchemaBuilder* builder = malloc(sizeof(SchemaBuilder));
+  builder->list_count = 0;
+  builder->lists = NULL;
   EngineSchemaVisitor visitor = {
-    .data = &builder,
+    .data = builder,
     .make_field_list = make_field_list,
     .visit_struct = visit_struct,
     .visit_array = visit_array,
@@ -283,9 +305,16 @@ void print_schema(SharedSnapshot* snapshot)
   printf("Schema returned in list %" PRIxPTR "\n", schema_list_id);
 #endif
   print_diag("Done building schema\n");
-  printf("Schema:\n");
-  print_list(&builder, schema_list_id, 0, 0);
-  printf("\n");
+  CSchema* cschema = malloc(sizeof(CSchema));
+  cschema->list_id = schema_list_id;
+  cschema->builder = builder;
   free_schema(schema);
-  free_builder(builder);
+  return cschema;
+}
+
+// Print out a schema
+void print_cschema(CSchema *schema) {
+  printf("Schema:\n");
+  print_list(schema->builder, schema->list_id, 0, 0);
+  printf("\n");
 }
