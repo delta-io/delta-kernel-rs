@@ -91,12 +91,12 @@ fn visit_field_primitive_impl(
 }
 
 // TODO: turn all the primitive visitors below into a macro once cbindgen can run on macro expanded code
-///Visit a string field. Strings can hold arbitrary UTF-8 text data.
+/// Visit a string field. Strings can hold arbitrary UTF-8 text data.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_string(
     state: &mut KernelSchemaVisitorState,
@@ -109,12 +109,12 @@ pub unsafe extern "C" fn visit_field_string(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a long field. Long fields store 64-bit signed integers.
+/// Visit a long field. Long fields store 64-bit signed integers.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_long(
     state: &mut KernelSchemaVisitorState,
@@ -127,12 +127,12 @@ pub unsafe extern "C" fn visit_field_long(
         .into_extern_result(&allocate_error)
 }
 
-///Visit an integer field. Integer fields store 32-bit signed integers.
+/// Visit an integer field. Integer fields store 32-bit signed integers.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_integer(
     state: &mut KernelSchemaVisitorState,
@@ -145,12 +145,12 @@ pub unsafe extern "C" fn visit_field_integer(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a short field. Short fields store 16-bit signed integers.
+/// Visit a short field. Short fields store 16-bit signed integers.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_short(
     state: &mut KernelSchemaVisitorState,
@@ -181,12 +181,12 @@ pub unsafe extern "C" fn visit_field_byte(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a float field. Float fields store 32-bit floating point numbers.
+/// Visit a float field. Float fields store 32-bit floating point numbers.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_float(
     state: &mut KernelSchemaVisitorState,
@@ -199,12 +199,12 @@ pub unsafe extern "C" fn visit_field_float(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a double field. Double fields store 64-bit floating point numbers.
+/// Visit a double field. Double fields store 64-bit floating point numbers.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_double(
     state: &mut KernelSchemaVisitorState,
@@ -217,12 +217,12 @@ pub unsafe extern "C" fn visit_field_double(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a boolean field. Boolean fields store true/false values.
+/// Visit a boolean field. Boolean fields store true/false values.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_boolean(
     state: &mut KernelSchemaVisitorState,
@@ -235,12 +235,12 @@ pub unsafe extern "C" fn visit_field_boolean(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a binary field. Binary fields store arbitrary byte arrays.
+/// Visit a binary field. Binary fields store arbitrary byte arrays.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_binary(
     state: &mut KernelSchemaVisitorState,
@@ -253,12 +253,12 @@ pub unsafe extern "C" fn visit_field_binary(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a date field. Date fields store calendar dates without time information.
+/// Visit a date field. Date fields store calendar dates without time information.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_date(
     state: &mut KernelSchemaVisitorState,
@@ -271,12 +271,12 @@ pub unsafe extern "C" fn visit_field_date(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC.
+/// Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_timestamp(
     state: &mut KernelSchemaVisitorState,
@@ -289,12 +289,12 @@ pub unsafe extern "C" fn visit_field_timestamp(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a timestamp_ntz field. Similar to timestamp but without timezone information.
+/// Visit a timestamp_ntz field. Similar to timestamp but without timezone information.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_timestamp_ntz(
     state: &mut KernelSchemaVisitorState,
