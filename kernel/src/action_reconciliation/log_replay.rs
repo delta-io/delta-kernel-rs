@@ -64,6 +64,12 @@ pub(crate) struct ActionReconciliationProcessor {
 ///
 /// It contains the filtered batch of actions to be included, along with statistics about the
 /// number of actions filtered for inclusion.
+///
+/// # Warning
+///
+/// This iterator must be fully consumed to ensure proper collection of statistics. Additionally,
+/// all yielded data must be written to the specified path before e.g. calling
+/// [`CheckpointWriter::finalize`]. Failing to do so may result in data loss or corruption.
 pub(crate) struct ActionReconciliationBatch {
     /// The filtered batch of actions.
     pub(crate) filtered_data: FilteredEngineData,
@@ -76,6 +82,81 @@ pub(crate) struct ActionReconciliationBatch {
 impl HasSelectionVector for ActionReconciliationBatch {
     fn has_selected_rows(&self) -> bool {
         self.filtered_data.has_selected_rows()
+    }
+}
+
+/// Iterator over action reconciliation data.
+///
+/// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
+/// counts. Used by both checkpoint and log compaction workflows.
+pub struct ActionReconciliationIterator {
+    inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    actions_count: i64,
+    add_actions_count: i64,
+    is_exhausted: bool,
+}
+
+impl ActionReconciliationIterator {
+    /// Create a new iterator with counters initialized to 0
+    pub(crate) fn new(
+        inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
+    ) -> Self {
+        Self {
+            inner,
+            actions_count: 0,
+            add_actions_count: 0,
+            is_exhausted: false,
+        }
+    }
+
+    /// True if this iterator has been exhausted (ie all batches have been processed)
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.is_exhausted
+    }
+
+    /// Get the total number of actions processed so far
+    pub(crate) fn actions_count(&self) -> i64 {
+        self.actions_count
+    }
+
+    /// Get the total number of add actions processed so far
+    pub(crate) fn add_actions_count(&self) -> i64 {
+        self.add_actions_count
+    }
+
+    /// Helper to transform a batch: update metrics and extract filtered data
+    fn transform_batch(
+        &mut self,
+        batch: Option<DeltaResult<ActionReconciliationBatch>>,
+    ) -> Option<DeltaResult<FilteredEngineData>> {
+        let Some(batch) = batch else {
+            self.is_exhausted = true;
+            return None;
+        };
+        Some(batch.map(|batch| {
+            self.actions_count += batch.actions_count;
+            self.add_actions_count += batch.add_actions_count;
+            batch.filtered_data
+        }))
+    }
+}
+
+impl std::fmt::Debug for ActionReconciliationIterator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActionReconciliationIterator")
+            .field("actions_count", &self.actions_count)
+            .field("add_actions_count", &self.add_actions_count)
+            .field("is_exhausted", &self.is_exhausted)
+            .finish()
+    }
+}
+
+impl Iterator for ActionReconciliationIterator {
+    type Item = DeltaResult<FilteredEngineData>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.inner.next();
+        self.transform_batch(batch)
     }
 }
 
@@ -114,10 +195,7 @@ impl LogReplayProcessor for ActionReconciliationProcessor {
         self.seen_protocol = visitor.seen_protocol;
         self.seen_metadata = visitor.seen_metadata;
 
-        let filtered_data = FilteredEngineData {
-            data: actions,
-            selection_vector: visitor.selection_vector,
-        };
+        let filtered_data = FilteredEngineData::try_new(actions, visitor.selection_vector)?;
 
         Ok(ActionReconciliationBatch {
             filtered_data,
@@ -770,8 +848,11 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2, "Expected two batches in results");
-        assert_eq!(results[0].selection_vector, vec![true, true, true],);
-        assert_eq!(results[1].selection_vector, vec![false, false, false, true],);
+        assert_eq!(results[0].selection_vector(), &vec![true, true, true]);
+        assert_eq!(
+            results[1].selection_vector(),
+            &vec![false, false, false, true]
+        );
         assert_eq!(actions_count, 4);
         assert_eq!(add_actions, 0);
 
@@ -809,8 +890,8 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2); // The third batch should be filtered out since there are no selected actions
-        assert_eq!(results[0].selection_vector, vec![true]);
-        assert_eq!(results[1].selection_vector, vec![false, true]);
+        assert_eq!(results[0].selection_vector(), &vec![true]);
+        assert_eq!(results[1].selection_vector(), &vec![false, true]);
         assert_eq!(actions_count, 2);
         assert_eq!(add_actions, 1);
 
@@ -845,8 +926,8 @@ mod tests {
 
         // Verify results
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].selection_vector, vec![true, true]);
-        assert_eq!(results[1].selection_vector, vec![false, false, true]);
+        assert_eq!(results[0].selection_vector(), &vec![true, true]);
+        assert_eq!(results[1].selection_vector(), &vec![false, false, true]);
         assert_eq!(actions_count, 3);
         assert_eq!(add_actions, 2);
 
@@ -927,13 +1008,16 @@ mod tests {
 
         // First batch: protocol, metadata, and one recent txn (old_app filtered out)
         assert_eq!(
-            results[0].filtered_data.selection_vector,
+            results[0].filtered_data.selection_vector(),
             vec![true, true, false, true]
         );
         assert_eq!(results[0].actions_count, 3);
 
         // Second batch: timeless_app kept, another_old filtered out
-        assert_eq!(results[1].filtered_data.selection_vector, vec![true, false]);
+        assert_eq!(
+            results[1].filtered_data.selection_vector(),
+            vec![true, false]
+        );
         assert_eq!(results[1].actions_count, 1);
 
         Ok(())

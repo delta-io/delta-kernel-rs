@@ -9,6 +9,7 @@ use super::read_files;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::arrow_utils::parse_json as arrow_parse_json;
 use crate::engine::arrow_utils::to_json_bytes;
+use crate::engine_data::FilteredEngineData;
 use crate::schema::SchemaRef;
 use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
@@ -16,11 +17,15 @@ use crate::{
 
 pub(crate) struct SyncJsonHandler;
 
+/// Note: This function must match the signature expected by `read_files` helper function,
+/// which is also used by `try_create_from_parquet`. The `_file_location` parameter is unused
+/// here but required to satisfy the shared function signature.
 fn try_create_from_json(
     file: File,
     _schema: SchemaRef,
     arrow_schema: ArrowSchemaRef,
     _predicate: Option<PredicateRef>,
+    _file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let json = ReaderBuilder::new(arrow_schema)
         .build(BufReader::new(file))?
@@ -52,7 +57,7 @@ impl JsonHandler for SyncJsonHandler {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()> {
         let path = path
@@ -144,7 +149,9 @@ mod tests {
 
         // First write with no existing file
         let data = create_test_data(vec!["remi", "wilson"])?;
-        let result = handler.write_json_file(&url, Box::new(std::iter::once(Ok(data))), overwrite);
+        let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
+        let result =
+            handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
         // Verify the first write is successful
         assert!(result.is_ok());
@@ -153,7 +160,9 @@ mod tests {
 
         // Second write with existing file
         let data = create_test_data(vec!["seb", "tia"])?;
-        let result = handler.write_json_file(&url, Box::new(std::iter::once(Ok(data))), overwrite);
+        let filtered_data = Ok(FilteredEngineData::with_all_rows_selected(data));
+        let result =
+            handler.write_json_file(&url, Box::new(std::iter::once(filtered_data)), overwrite);
 
         if overwrite {
             // Verify the second write is successful

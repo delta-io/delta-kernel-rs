@@ -112,6 +112,10 @@ pub enum Error {
     #[error("Deletion Vector error: {0}")]
     DeletionVector(String),
 
+    /// A selection vector is larger than data length
+    #[error("Selection vector is larger than data length: {0}")]
+    InvalidSelectionVector(String),
+
     /// A specified URL was invalid
     #[error("Invalid url: {0}")]
     InvalidUrl(#[from] url::ParseError),
@@ -287,7 +291,7 @@ impl Error {
         Self::InvalidCheckpoint(msg.to_string())
     }
 
-    pub(crate) fn schema(msg: impl ToString) -> Self {
+    pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
     }
 

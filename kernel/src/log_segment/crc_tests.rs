@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::actions::{get_log_schema, Format, Metadata, Protocol};
+use crate::actions::{get_commit_schema, Metadata, Protocol};
 use crate::arrow::array::StringArray;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -13,14 +13,13 @@ use crate::engine::default::DefaultEngine;
 use crate::engine::sync::json::SyncJsonHandler;
 use crate::log_segment::tests::{add_checkpoint_to_store, create_log_path};
 use crate::log_segment::{ListedLogFiles, LogPathFileType, LogSegment, ParsedLogPath};
-use crate::table_features::{ReaderFeature, WriterFeature};
+use crate::table_features::TableFeature;
 use crate::utils::test_utils::{string_array_to_engine_data, Action};
 use crate::{DeltaResult, Error, FileMeta, JsonHandler};
 
 use object_store::{memory::InMemory, path::Path, ObjectStore};
 use serde_json;
 use url::Url;
-use uuid::Uuid;
 
 // Helper function to create checkpoint data with optional Protocol and Metadata actions
 fn create_checkpoint_data(
@@ -42,7 +41,7 @@ fn create_checkpoint_data(
         let string_array: StringArray = vec![add_json].into();
         let parsed = handler.parse_json(
             string_array_to_engine_data(string_array),
-            get_log_schema().clone(),
+            get_commit_schema().clone(),
         )?;
         return ArrowEngineData::try_from_engine_data(parsed);
     }
@@ -54,7 +53,7 @@ fn create_checkpoint_data(
     let string_array: StringArray = json_strings.into();
     let parsed = handler.parse_json(
         string_array_to_engine_data(string_array),
-        get_log_schema().clone(),
+        get_commit_schema().clone(),
     )?;
     ArrowEngineData::try_from_engine_data(parsed)
 }
@@ -84,28 +83,25 @@ async fn write_crc(
 
 // Return unique protocol and metadata actions for testing
 fn unique_protocol_metadata() -> (Protocol, Metadata) {
+    let schema: crate::schema::StructType = serde_json::from_str(
+        r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#
+    ).unwrap();
+    // Use min_reader_version=3 and min_writer_version=7 to allow reader/writer features
     (
         Protocol::try_new(
-            chrono::Utc::now().timestamp_subsec_nanos() as i32 + 3,
-            chrono::Utc::now().timestamp_subsec_nanos() as i32 + 7,
-            Some(vec![ReaderFeature::ColumnMapping]),
-            Some(vec![WriterFeature::ColumnMapping]),
+            3,
+            7,
+            Some(vec![TableFeature::ColumnMapping]),
+            Some(vec![TableFeature::ColumnMapping]),
         ).unwrap(),
-        Metadata {
-            id: Uuid::new_v4().to_string(),
-            name: None,
-            description: None,
-            format: Format {
-                provider: "parquet".to_string(),
-                options: HashMap::new(),
-            },
-            schema_string:
-                r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#
-                    .to_string(),
-            partition_columns: vec![],
-            created_time: Some(chrono::Utc::now().timestamp_millis()),
-            configuration: HashMap::new(),
-        }
+        Metadata::try_new(
+            None,
+            None,
+            schema,
+            vec![],
+            chrono::Utc::now().timestamp_millis(),
+            HashMap::new(),
+        ).unwrap()
     )
 }
 
@@ -138,7 +134,7 @@ struct TestCompaction {
 /// setup the test with in-memory store and default engine
 fn setup_test() -> (Arc<InMemory>, DefaultEngine<TokioBackgroundExecutor>, Url) {
     let store = Arc::new(InMemory::new());
-    let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
+    let engine = DefaultEngine::new(store.clone());
     let log_root = Url::parse("memory:///_delta_log/").unwrap();
     (store, engine, log_root)
 }
@@ -276,7 +272,7 @@ async fn crc_pm_test(
     if let Some(checkpoint) = checkpoint {
         let checkpoint_data = create_checkpoint_data(checkpoint.metadata, checkpoint.protocol)?;
         let checkpoint_filename = format!("{:020}.checkpoint.parquet", checkpoint.version);
-        add_checkpoint_to_store(&store, checkpoint_data, &checkpoint_filename)?;
+        add_checkpoint_to_store(&store, checkpoint_data, &checkpoint_filename).await?;
 
         let url = log_root.join(&checkpoint_filename)?;
         checkpoint_paths.push(create_log_path(url.as_ref()));
@@ -308,7 +304,7 @@ async fn crc_pm_test(
     };
 
     let listed_files =
-        ListedLogFiles::try_new(commit_paths, compaction_paths, checkpoint_paths, crc_path)
+        ListedLogFiles::try_new(commit_paths, compaction_paths, checkpoint_paths, crc_path, None)
             .unwrap();
 
     let log_segment = LogSegment::try_new(listed_files, log_root, target_version)?;
@@ -488,6 +484,7 @@ async fn test_crc_missing_protocol() -> DeltaResult<()> {
             filename: "00000000000000000005.crc".to_string(),
             extension: "crc".to_string(),
         }),
+        None,
     )
     .unwrap();
 
@@ -539,6 +536,7 @@ async fn test_crc_missing_metadata() -> DeltaResult<()> {
             filename: "00000000000000000005.crc".to_string(),
             extension: "crc".to_string(),
         }),
+        None,
     )
     .unwrap();
 

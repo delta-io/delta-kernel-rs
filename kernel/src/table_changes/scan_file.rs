@@ -25,6 +25,16 @@ pub(crate) enum CdfScanFileType {
     Cdc,
 }
 
+impl CdfScanFileType {
+    pub(crate) fn get_cdf_string_value(&self) -> &str {
+        match self {
+            CdfScanFileType::Add => super::ADD_CHANGE_TYPE,
+            CdfScanFileType::Remove => super::REMOVE_CHANGE_TYPE,
+            CdfScanFileType::Cdc => "not-expected",
+        }
+    }
+}
+
 /// Represents all the metadata needed to read a Change Data Feed.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct CdfScanFile {
@@ -212,7 +222,7 @@ pub(crate) fn cdf_scan_row_schema() -> SchemaRef {
     CDF_SCAN_ROW_SCHEMA.clone()
 }
 
-/// Expression to convert an action with `log_schema` into one with
+/// Expression to convert an action with `commit_schema` into one with
 /// [`cdf_scan_row_schema`]. This is the expression used to create [`TableChangesScanMetadata`].
 pub(crate) fn cdf_scan_row_expression(commit_timestamp: i64, commit_number: i64) -> Expression {
     Expression::struct_from([
@@ -243,7 +253,7 @@ mod tests {
     use itertools::Itertools;
 
     use super::{scan_metadata_to_scan_file, CdfScanFile, CdfScanFileType};
-    use crate::actions::deletion_vector::DeletionVectorDescriptor;
+    use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
     use crate::actions::{Add, Cdc, Remove};
     use crate::engine::sync::SyncEngine;
     use crate::log_segment::LogSegment;
@@ -259,7 +269,7 @@ mod tests {
         let mut mock_table = LocalMockTable::new();
 
         let dv_info = DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
             offset: Some(1),
             size_in_bytes: 36,
@@ -282,7 +292,7 @@ mod tests {
         };
 
         let rm_dv = DeletionVectorDescriptor {
-            storage_type: "u".to_string(),
+            storage_type: DeletionVectorStorageType::PersistedRelative,
             path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
             offset: Some(1),
             size_in_bytes: 38,
@@ -333,8 +343,29 @@ mod tests {
             StructField::nullable("id", DataType::INTEGER),
             StructField::nullable("value", DataType::STRING),
         ]);
+
+        // Create a TableConfiguration for testing
+        use crate::actions::{Metadata, Protocol};
+        use crate::table_configuration::TableConfiguration;
+        let metadata = Metadata::try_new(
+            None,
+            None,
+            table_schema.clone(),
+            vec![],
+            0,
+            HashMap::from([
+                ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+            ]),
+        )
+        .unwrap();
+        let protocol = Protocol::try_new(1, 1, None::<Vec<String>>, None::<Vec<String>>).unwrap();
+        let table_config =
+            TableConfiguration::try_new(metadata, protocol, table_root.clone(), 0).unwrap();
+
         let scan_metadata = table_changes_action_iter(
             Arc::new(engine),
+            &table_config,
             log_segment.ascending_commit_files.clone(),
             table_schema.into(),
             None,

@@ -2,19 +2,19 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use itertools::Itertools;
-
 use super::data_skipping::DataSkippingFilter;
-use super::{ScanMetadata, TransformSpec};
+use super::state_info::StateInfo;
+use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
-use crate::scan::{FieldTransformSpec, Scalar};
+use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
 
@@ -44,8 +44,7 @@ pub(crate) struct ScanLogReplayProcessor {
     partition_filter: Option<PredicateRef>,
     data_skipping_filter: Option<DataSkippingFilter>,
     add_transform: Arc<dyn ExpressionEvaluator>,
-    logical_schema: SchemaRef,
-    transform_spec: Option<Arc<TransformSpec>>,
+    state_info: Arc<StateInfo>,
     /// A set of (data file path, dv_unique_id) pairs that have been seen thus
     /// far in the log. This is used to filter out files with Remove actions as
     /// well as duplicate entries in the log.
@@ -54,24 +53,36 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(
-        engine: &dyn Engine,
-        physical_predicate: Option<(PredicateRef, SchemaRef)>,
-        logical_schema: SchemaRef,
-        transform_spec: Option<Arc<TransformSpec>>,
-    ) -> Self {
-        Self {
+    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+        // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
+        // The DataSkippingFilter and partition_filter components expect the predicate
+        // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
+        // the enum representation to the tuple format.
+        let physical_predicate = match &state_info.physical_predicate {
+            PhysicalPredicate::Some(predicate, schema) => {
+                // Valid predicate that can be used for data skipping and partition filtering
+                Some((predicate.clone(), schema.clone()))
+            }
+            PhysicalPredicate::StaticSkipAll => {
+                debug_assert!(false, "StaticSkipAll case should be handled at a higher level and not reach this code");
+                None
+            }
+            PhysicalPredicate::None => {
+                // No predicate provided
+                None
+            }
+        };
+        Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
             data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
                 SCAN_ROW_DATATYPE.clone(),
-            ),
+            )?,
             seen_file_keys: Default::default(),
-            logical_schema,
-            transform_spec,
-        }
+            state_info,
+        })
     }
 }
 
@@ -82,8 +93,7 @@ impl ScanLogReplayProcessor {
 struct AddRemoveDedupVisitor<'seen> {
     deduplicator: FileActionDeduplicator<'seen>,
     selection_vector: Vec<bool>,
-    logical_schema: SchemaRef,
-    transform_spec: Option<Arc<TransformSpec>>,
+    state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
@@ -94,14 +104,14 @@ impl AddRemoveDedupVisitor<'_> {
     const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
     const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
     const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-    const REMOVE_PATH_INDEX: usize = 5; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 6; // Start position of remove deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
 
     fn new(
         seen: &mut HashSet<FileActionKey>,
         selection_vector: Vec<bool>,
-        logical_schema: SchemaRef,
-        transform_spec: Option<Arc<TransformSpec>>,
+        state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
         is_log_batch: bool,
     ) -> AddRemoveDedupVisitor<'_> {
@@ -115,87 +125,10 @@ impl AddRemoveDedupVisitor<'_> {
                 Self::REMOVE_DV_START_INDEX,
             ),
             selection_vector,
-            logical_schema,
-            transform_spec,
+            state_info,
             partition_filter,
             row_transform_exprs: Vec::new(),
         }
-    }
-
-    fn parse_partition_value(
-        &self,
-        field_idx: usize,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<(usize, (String, Scalar))> {
-        let field = self.logical_schema.field_at_index(field_idx);
-        let Some(field) = field else {
-            return Err(Error::InternalError(format!(
-                "out of bounds partition column field index {field_idx}"
-            )));
-        };
-        let name = field.physical_name();
-        let partition_value =
-            super::parse_partition_value(partition_values.get(name), field.data_type())?;
-        Ok((field_idx, (name.to_string(), partition_value)))
-    }
-
-    fn parse_partition_values(
-        &self,
-        transform_spec: &TransformSpec,
-        partition_values: &HashMap<String, String>,
-    ) -> DeltaResult<HashMap<usize, (String, Scalar)>> {
-        transform_spec
-            .iter()
-            .filter_map(|field_transform| match field_transform {
-                FieldTransformSpec::PartitionColumn { field_index, .. } => {
-                    Some(self.parse_partition_value(*field_index, partition_values))
-                }
-                FieldTransformSpec::StaticInsert { .. }
-                | FieldTransformSpec::StaticReplace { .. }
-                | FieldTransformSpec::StaticDrop { .. } => None,
-            })
-            .try_collect()
-    }
-
-    /// Compute an expression that will transform from physical to logical for a given Add file action
-    ///
-    /// An empty `transform_spec` is valid and represents the case where only column mapping is needed
-    /// (e.g., no partition columns to inject). The resulting empty `Expression::Transform` will
-    /// pass all input fields through unchanged while applying the output schema for name mapping.
-    fn get_transform_expr(
-        &self,
-        transform_spec: &TransformSpec,
-        mut partition_values: HashMap<usize, (String, Scalar)>,
-    ) -> DeltaResult<ExpressionRef> {
-        let mut transform = crate::expressions::Transform::new_top_level();
-
-        for field_transform in transform_spec {
-            use FieldTransformSpec::*;
-            transform = match field_transform {
-                StaticInsert { insert_after, expr } => {
-                    transform.with_inserted_field(insert_after.clone(), expr.clone())
-                }
-                StaticReplace { field_name, expr } => {
-                    transform.with_replaced_field(field_name.clone(), expr.clone())
-                }
-                StaticDrop { field_name } => transform.with_dropped_field(field_name.clone()),
-                PartitionColumn {
-                    field_index,
-                    insert_after,
-                } => {
-                    let Some((_, partition_value)) = partition_values.remove(field_index) else {
-                        return Err(Error::InternalError(format!(
-                            "missing partition value for field index {field_index}"
-                        )));
-                    };
-
-                    let partition_value = Arc::new(partition_value.into());
-                    transform.with_inserted_field(insert_after.clone(), partition_value)
-                }
-            }
-        }
-
-        Ok(Arc::new(Expression::Transform(transform)))
     }
 
     fn is_file_partition_pruned(
@@ -240,11 +173,16 @@ impl AddRemoveDedupVisitor<'_> {
         // WARNING: It's not safe to partition-prune removes (just like it's not safe to data skip
         // removes), because they are needed to suppress earlier incompatible adds we might
         // encounter if the table's schema was replaced after the most recent checkpoint.
-        let partition_values = match &self.transform_spec {
+        let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
                 let partition_values =
                     getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
-                let partition_values = self.parse_partition_values(transform, &partition_values)?;
+                let partition_values = parse_partition_values(
+                    &self.state_info.logical_schema,
+                    transform,
+                    &partition_values,
+                    self.state_info.column_mapping_mode,
+                )?;
                 if self.is_file_partition_pruned(&partition_values) {
                     return Ok(false);
                 }
@@ -257,10 +195,20 @@ impl AddRemoveDedupVisitor<'_> {
         if self.deduplicator.check_and_record_seen(file_key) || !is_add {
             return Ok(false);
         }
+        let base_row_id: Option<i64> =
+            getters[Self::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
         let transform = self
+            .state_info
             .transform_spec
             .as_ref()
-            .map(|transform| self.get_transform_expr(transform, partition_values))
+            .map(|transform| {
+                get_transform_expr(
+                    transform,
+                    partition_values,
+                    &self.state_info.physical_schema,
+                    base_row_id,
+                )
+            })
             .transpose()?;
         if transform.is_some() {
             // fill in any needed `None`s for previous rows
@@ -277,6 +225,7 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
             const STRING: DataType = DataType::STRING;
             const INTEGER: DataType = DataType::INTEGER;
+            const LONG: DataType = DataType::LONG;
             let ss_map: DataType = MapType::new(STRING, STRING, true).into();
             let types_and_names = vec![
                 (STRING, column_name!("add.path")),
@@ -284,6 +233,7 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
                 (STRING, column_name!("add.deletionVector.storageType")),
                 (STRING, column_name!("add.deletionVector.pathOrInlineDv")),
                 (INTEGER, column_name!("add.deletionVector.offset")),
+                (LONG, column_name!("add.baseRowId")),
                 (STRING, column_name!("remove.path")),
                 (STRING, column_name!("remove.deletionVector.storageType")),
                 (STRING, column_name!("remove.deletionVector.pathOrInlineDv")),
@@ -298,13 +248,13 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
         } else {
             // All checkpoint actions are already reconciled and Remove actions in checkpoint files
             // only serve as tombstones for vacuum jobs. So we only need to examine the adds here.
-            (&names[..5], &types[..5])
+            (&names[..6], &types[..6])
         }
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         let is_log_batch = self.deduplicator.is_log_batch();
-        let expected_getters = if is_log_batch { 9 } else { 5 };
+        let expected_getters = if is_log_batch { 10 } else { 6 };
         require!(
             getters.len() == expected_getters,
             Error::InternalError(format!(
@@ -322,21 +272,37 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
     }
 }
 
+pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
+pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
+pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
+pub(crate) static TAGS_NAME: &str = "tags";
+
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
 pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| {
     // Note that fields projected out of a nullable struct must be nullable
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-    let file_constant_values =
-        StructType::new_unchecked([StructField::nullable("partitionValues", partition_values)]);
+    let file_constant_values = StructType::new_unchecked([
+        StructField::nullable("partitionValues", partition_values),
+        StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+        StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+        StructField::nullable(
+            "tags",
+            MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                /*valueContainsNull*/ true,
+            ),
+        ),
+    ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
         StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-        StructField::nullable("fileConstantValues", file_constant_values),
+        StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
     ]))
 });
 
@@ -352,9 +318,12 @@ fn get_add_transform_expr() -> ExpressionRef {
             column_expr_ref!("add.modificationTime"),
             column_expr_ref!("add.stats"),
             column_expr_ref!("add.deletionVector"),
-            Arc::new(Expression::Struct(vec![column_expr_ref!(
-                "add.partitionValues"
-            )])),
+            Arc::new(Expression::Struct(vec![
+                column_expr_ref!("add.partitionValues"),
+                column_expr_ref!("add.baseRowId"),
+                column_expr_ref!("add.defaultRowCommitVersion"),
+                column_expr_ref!("add.tags"),
+            ])),
         ]))
     });
     EXPR.clone()
@@ -372,7 +341,10 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("size"),
                 column_expr_ref!("modificationTime"),
                 column_expr_ref!("stats"),
+                column_expr_ref!("fileConstantValues.tags"),
                 column_expr_ref!("deletionVector"),
+                column_expr_ref!("fileConstantValues.baseRowId"),
+                column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
             ],
         ))]))
     });
@@ -396,8 +368,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let mut visitor = AddRemoveDedupVisitor::new(
             &mut self.seen_file_keys,
             selection_vector,
-            self.logical_schema.clone(),
-            self.transform_spec.clone(),
+            self.state_info.clone(),
             self.partition_filter.clone(),
             is_log_batch,
         );
@@ -405,11 +376,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 
         // TODO: Teach expression eval to respect the selection vector we just computed so carefully!
         let result = self.add_transform.evaluate(actions.as_ref())?;
-        Ok(ScanMetadata::new(
+        ScanMetadata::try_new(
             result,
             visitor.selection_vector,
             visitor.row_transform_exprs,
-        ))
+        )
     }
 
     fn data_skipping_filter(&self) -> Option<&DataSkippingFilter> {
@@ -428,27 +399,29 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
-    logical_schema: SchemaRef,
-    transform_spec: Option<Arc<TransformSpec>>,
-    physical_predicate: Option<(PredicateRef, SchemaRef)>,
-) -> impl Iterator<Item = DeltaResult<ScanMetadata>> {
-    ScanLogReplayProcessor::new(engine, physical_predicate, logical_schema, transform_spec)
-        .process_actions_iter(action_iter)
+    state_info: Arc<StateInfo>,
+) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
+    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
 }
 
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::actions::get_log_schema;
-    use crate::expressions::Scalar;
+    use crate::actions::get_commit_schema;
+    use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::{DvInfo, Stats};
-    use crate::scan::test_utils::{
-        add_batch_simple, add_batch_with_partition_col, add_batch_with_remove,
-        run_with_validate_callback,
+    use crate::scan::state_info::tests::{
+        assert_transform_spec, get_simple_state_info, get_state_info,
     };
-    use crate::scan::{Scan, StateInfo};
+    use crate::scan::state_info::StateInfo;
+    use crate::scan::test_utils::{
+        add_batch_for_row_id, add_batch_simple, add_batch_with_partition_col,
+        add_batch_with_remove, run_with_validate_callback,
+    };
+    use crate::scan::PhysicalPredicate;
+    use crate::schema::MetadataColumnSpec;
     use crate::table_features::ColumnMappingMode;
     use crate::Expression as Expr;
     use crate::{
@@ -484,7 +457,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter() {
         run_with_validate_callback(
-            vec![add_batch_simple(get_log_schema().clone())],
+            vec![add_batch_simple(get_commit_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
@@ -496,7 +469,7 @@ mod tests {
     #[test]
     fn test_scan_action_iter_with_remove() {
         run_with_validate_callback(
-            vec![add_batch_with_remove(get_log_schema().clone())],
+            vec![add_batch_with_remove(get_commit_schema().clone())],
             None, // not testing schema
             None, // not testing transform
             &[false, false, true, false],
@@ -507,17 +480,23 @@ mod tests {
 
     #[test]
     fn test_no_transforms() {
-        let batch = vec![add_batch_simple(get_log_schema().clone())];
-        let logical_schema = Arc::new(crate::schema::StructType::new_unchecked(vec![]));
+        let batch = vec![add_batch_simple(get_commit_schema().clone())];
+        let logical_schema = Arc::new(StructType::new_unchecked(vec![]));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: logical_schema.clone(),
+            physical_schema: logical_schema.clone(),
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+        });
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            logical_schema,
-            None,
-            None,
-        );
+            state_info,
+        )
+        .unwrap();
         for res in iter {
             let scan_metadata = res.unwrap();
             assert!(
@@ -533,20 +512,17 @@ mod tests {
             StructField::new("value", DataType::INTEGER, true),
             StructField::new("date", DataType::DATE, true),
         ]));
-        let partition_cols = ["date".to_string()];
-        let state_info =
-            StateInfo::try_new(schema.as_ref(), &partition_cols, ColumnMappingMode::None).unwrap();
-        let static_transform = Some(Arc::new(Scan::get_transform_spec(&state_info.all_fields)));
+        let partition_cols = vec!["date".to_string()];
+        let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            schema,
-            static_transform,
-            None,
-        );
+            Arc::new(state_info),
+        )
+        .unwrap();
 
         fn validate_transform(transform: Option<&ExpressionRef>, expected_date_offset: i32) {
             assert!(transform.is_some());
@@ -580,6 +556,80 @@ mod tests {
             assert!(transforms[2].is_none(), "transform at [2] should be None");
             validate_transform(transforms[1].as_ref(), 17511);
             validate_transform(transforms[3].as_ref(), 17510);
+        }
+    }
+
+    #[test]
+    fn test_row_id_transform() {
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "value",
+            DataType::INTEGER,
+            true,
+        )]));
+        let state_info = get_state_info(
+            schema.clone(),
+            vec![],
+            None,
+            [
+                ("delta.enableRowTracking", "true"),
+                (
+                    "delta.rowTracking.materializedRowIdColumnName",
+                    "row_id_col",
+                ),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            vec![("row_id", MetadataColumnSpec::RowId)],
+        )
+        .unwrap();
+
+        let transform_spec = state_info.transform_spec.as_ref().unwrap();
+        assert_transform_spec(
+            transform_spec,
+            false,
+            "row_id_col",
+            "row_indexes_for_row_id_0",
+        );
+
+        let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
+        let iter = scan_action_iter(
+            &SyncEngine::new(),
+            batch
+                .into_iter()
+                .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
+            Arc::new(state_info),
+        )
+        .unwrap();
+
+        for res in iter {
+            let scan_metadata = res.unwrap();
+            let transforms = scan_metadata.scan_file_transforms;
+            assert_eq!(transforms.len(), 1, "Should have 1 transform");
+            if let Some(Expr::Transform(transform_expr)) = transforms[0].as_ref().map(Arc::as_ref) {
+                assert!(transform_expr.input_path.is_none());
+                let row_id_transform = transform_expr
+                    .field_transforms
+                    .get("row_id_col")
+                    .expect("Should have row_id_col transform");
+                assert!(row_id_transform.is_replace);
+                assert_eq!(row_id_transform.exprs.len(), 1);
+                let expr = &row_id_transform.exprs[0];
+                let expeceted_expr = Arc::new(Expr::variadic(
+                    VariadicExpressionOp::Coalesce,
+                    vec![
+                        Expr::column(["row_id_col"]),
+                        Expr::binary(
+                            BinaryExpressionOp::Plus,
+                            Expr::literal(42i64),
+                            Expr::column(["row_indexes_for_row_id_0"]),
+                        ),
+                    ],
+                ));
+                assert_eq!(expr, &expeceted_expr);
+            } else {
+                panic!("Should have been a transform expression");
+            }
         }
     }
 }

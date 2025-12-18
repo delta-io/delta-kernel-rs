@@ -1,18 +1,16 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
-use common::{LocationArgs, ScanArgs};
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use common::{LocationArgs, ParseWithExamples, ScanArgs};
+use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::{DeltaResult, Snapshot};
 
 use clap::Parser;
 use itertools::Itertools;
 
-/// An example program that dumps out the data of a delta table. Struct and Map types are not
-/// supported.
+/// An example program that dumps out the data of a delta table.
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -39,7 +37,7 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Read", "read", "");
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     println!("Reading {url}");
     let engine = common::get_engine(&url, &cli.location_args)?;
@@ -51,22 +49,7 @@ fn try_main() -> DeltaResult<()> {
     let mut rows_so_far = 0;
     let batches: Vec<RecordBatch> = scan
         .execute(Arc::new(engine))?
-        .map(|scan_result| -> DeltaResult<_> {
-            // extract the batches and filter them if they have deletion vectors
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch: RecordBatch = data
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-                .into();
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .scan(&mut rows_so_far, |rows_so_far, record_batch| {
             // handle truncation if we've specified a limit
             let Ok(batch) = record_batch else {

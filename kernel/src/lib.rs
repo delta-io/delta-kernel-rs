@@ -50,7 +50,7 @@
 //! connectors are asked to provide the context information they require to execute the actual
 //! operation. This is done by invoking methods on the [`StorageHandler`] trait.
 
-#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_auto_cfg))]
+#![cfg_attr(all(doc, NIGHTLY_CHANNEL), feature(doc_cfg))]
 #![warn(
     unreachable_pub,
     trivial_numeric_casts,
@@ -87,10 +87,15 @@ use self::schema::{DataType, SchemaRef};
 mod action_reconciliation;
 pub mod actions;
 pub mod checkpoint;
+pub mod committer;
 pub mod engine_data;
 pub mod error;
 pub mod expressions;
 mod log_compaction;
+mod log_path;
+mod log_reader;
+pub mod metrics;
+pub(crate) mod parallel;
 pub mod scan;
 pub mod schema;
 pub mod snapshot;
@@ -99,11 +104,14 @@ pub mod table_configuration;
 pub mod table_features;
 pub mod table_properties;
 pub mod transaction;
+pub(crate) mod transforms;
+
+pub use log_path::LogPath;
 
 mod row_tracking;
 
 mod arrow_compat;
-#[cfg(any(feature = "arrow-55", feature = "arrow-56"))]
+#[cfg(any(feature = "arrow-56", feature = "arrow-57"))]
 pub use arrow_compat::*;
 
 pub mod kernel_predicates;
@@ -143,11 +151,13 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
+pub use action_reconciliation::ActionReconciliationIterator;
 pub use delta_kernel_derive;
-pub use engine_data::{EngineData, RowVisitor};
+pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
-pub use log_compaction::{should_compact, LogCompactionDataIterator, LogCompactionWriter};
+pub use log_compaction::{should_compact, LogCompactionWriter};
+pub use metrics::MetricsReporter;
 pub use snapshot::Snapshot;
 pub use snapshot::SnapshotRef;
 
@@ -420,7 +430,7 @@ pub trait EvaluationHandler: AsAny {
         input_schema: SchemaRef,
         expression: ExpressionRef,
         output_type: DataType,
-    ) -> Arc<dyn ExpressionEvaluator>;
+    ) -> DeltaResult<Arc<dyn ExpressionEvaluator>>;
 
     /// Create a [`PredicateEvaluator`] that can evaluate the given [`Predicate`] on columnar
     /// batches with the given [`Schema`] to produce a column of boolean results.
@@ -437,7 +447,7 @@ pub trait EvaluationHandler: AsAny {
         &self,
         input_schema: SchemaRef,
         predicate: PredicateRef,
-    ) -> Arc<dyn PredicateEvaluator>;
+    ) -> DeltaResult<Arc<dyn PredicateEvaluator>>;
 
     /// Create a single-row all-null-value [`EngineData`] with the schema specified by
     /// `output_schema`.
@@ -468,7 +478,8 @@ trait EvaluationHandlerExtension: EvaluationHandler {
         schema_transform.transform_struct(schema.as_ref());
         let row_expr = schema_transform.try_into_expr()?;
 
-        let eval = self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into());
+        let eval =
+            self.new_expression_evaluator(null_row_schema, row_expr.into(), schema.into())?;
         eval.evaluate(null_row.as_ref())
     }
 }
@@ -528,6 +539,15 @@ pub trait StorageHandler: AsAny {
         &self,
         files: Vec<FileSlice>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Bytes>>>>;
+
+    /// Copy a file atomically from source to destination. If the destination file already exists,
+    /// it must return Err(Error::FileAlreadyExists).
+    fn copy_atomic(&self, src: &Url, dest: &Url) -> DeltaResult<()>;
+
+    /// Perform a HEAD request for the given file at a Url, returning the file metadata.
+    ///
+    /// If the file does not exist, this must return an `Err` with [`Error::FileNotFound`].
+    fn head(&self, path: &Url) -> DeltaResult<FileMeta>;
 }
 
 /// Provides JSON handling functionality to Delta Kernel.
@@ -596,9 +616,29 @@ pub trait JsonHandler: AsAny {
     fn write_json_file(
         &self,
         path: &Url,
-        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + '_>,
+        data: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         overwrite: bool,
     ) -> DeltaResult<()>;
+}
+
+/// Reserved field IDs for metadata columns in Delta tables.
+///
+/// These field IDs are reserved and should not be used for regular table columns.
+/// They are used to provide file-level metadata as virtual columns during reads.
+pub mod reserved_field_ids {
+    /// Reserved field ID for the file name metadata column (`_file`).
+    /// This column provides the name of the Parquet file that contains each row.
+    pub const FILE_NAME: i64 = 2147483646;
+}
+
+/// Metadata from a Parquet file footer.
+///
+/// This struct contains metadata extracted from a Parquet file's footer, including the schema.
+/// It is designed to be extensible for future additions such as row group statistics.
+#[derive(Debug, Clone)]
+pub struct ParquetFooter {
+    /// The schema of the Parquet file, converted to Delta Kernel's schema format.
+    pub schema: SchemaRef,
 }
 
 /// Provides Parquet file related functionalities to Delta Kernel.
@@ -624,11 +664,65 @@ pub trait ParquetHandler: AsAny {
     /// 2. **Field Name**: If no field ID is present in the `physical_schema`'s [`StructField`] or no matching parquet field ID is found,
     ///    fall back to matching by column name
     ///
+    /// # Metadata Columns
+    ///
+    /// The ParquetHandler must support virtual metadata columns that provide additional information
+    /// about each row. These columns are not stored in the Parquet file but are generated at read time.
+    ///
+    /// ## Row Index Column
+    ///
+    /// When a column in `physical_schema` is marked as a row index metadata column (via
+    /// [`StructField::create_metadata_column`] with [`schema::MetadataColumnSpec::RowIndex`]), the
+    /// ParquetHandler must populate it with the 0-based row position within the Parquet file:
+    ///
+    /// - **Column name**: User-specified (commonly `"row_index"` or `"_metadata.row_index"`)
+    /// - **Type**: `LONG` (non-nullable)
+    /// - **Values**: Sequential integers starting at 0 for each file
+    /// - **Use case**: Track row positions for downstream processing, or internally used to compute Row IDs
+    ///
+    /// Example: A file with 5 rows would have row_index values `[0, 1, 2, 3, 4]`.
+    ///
+    /// ## File Name Column (Reserved Field ID)
+    ///
+    /// When a column in `physical_schema` has the reserved field ID
+    /// [`reserved_field_ids::FILE_NAME`] (2147483646), the ParquetHandler must populate it
+    /// with the file path/name:
+    ///
+    /// - **Column name**: `"_file"`
+    /// - **Type**: `STRING` (non-nullable)
+    /// - **Field ID**: 2147483646 (reserved)
+    /// - **Values**: The file path/URL (e.g., `"s3://bucket/path/file.parquet"`)
+    /// - **Use case**: Track which file each row came from in multi-file reads
+    ///
+    /// Example: All rows from the same file would have the same `_file` value.
+    ///
+    /// ## Metadata Column Examples
+    ///
+    /// ```rust,ignore
+    /// use delta_kernel::schema::{StructType, StructField, DataType, MetadataColumnSpec};
+    ///
+    /// // Example 1: Schema with row_index metadata column
+    /// let schema_with_row_index = StructType::try_new([
+    ///     StructField::nullable("id", DataType::INTEGER),
+    ///     StructField::create_metadata_column("row_index", MetadataColumnSpec::RowIndex),
+    ///     StructField::nullable("value", DataType::STRING),
+    /// ])?;
+    ///
+    /// // Example 2: Schema with _file metadata column (using reserved field ID)
+    /// let schema_with_file_path = StructType::try_new([
+    ///     StructField::nullable("id", DataType::INTEGER),
+    ///     StructField::create_metadata_column("_file", MetadataColumnSpec::FilePath),
+    ///     StructField::nullable("value", DataType::STRING),
+    /// ])?;
+    /// ```
+    ///
+    /// ---
+    ///
     ///  If no matching Parquet column is found, `NULL` values are returned
     ///  for nullable columns in `physical_schema`. For non-nullable columns, an error is returned.
     ///
     ///
-    /// ## Examples
+    /// ## Column Matching Examples
     ///
     /// Consider a `physical_schema` with the following fields:
     /// - Column 0:  `"i_logical"` (integer, non-null) with metadata `"parquet.field.id": 1`
@@ -680,6 +774,64 @@ pub trait ParquetHandler: AsAny {
         physical_schema: SchemaRef,
         predicate: Option<PredicateRef>,
     ) -> DeltaResult<FileDataReadResultIterator>;
+
+    /// Write data to a Parquet file at the specified URL.
+    ///
+    /// This method writes the provided `data` to a Parquet file at the given `url`.
+    ///
+    /// This will overwrite the file if it already exists.
+    ///
+    /// # Parameters
+    ///
+    /// - `url` - The full URL path where the Parquet file should be written
+    ///   (e.g., `s3://bucket/path/file.parquet`).
+    /// - `data` - An iterator of engine data to be written to the Parquet file.
+    ///
+    /// # Returns
+    ///
+    /// A [`DeltaResult`] indicating success or failure.
+    fn write_parquet_file(
+        &self,
+        location: url::Url,
+        data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+    ) -> DeltaResult<()>;
+
+    /// Read the footer metadata from a Parquet file without reading the data.
+    ///
+    /// This method reads only the Parquet file footer (metadata section), which is useful for
+    /// schema inspection, compatibility checking, and determining whether parsed statistics
+    /// columns are present and compatible with the current table schema.
+    ///
+    /// # Parameters
+    ///
+    /// - `file` - File metadata for the Parquet file whose footer should be read. The `size` field
+    ///   should contain the actual file size to enable efficient footer reads without additional
+    ///   I/O operations.
+    ///
+    /// # Returns
+    ///
+    /// A [`DeltaResult`] containing a [`ParquetFooter`] with the Parquet file's metadata, including
+    /// the schema converted to Delta Kernel's format.
+    ///
+    /// # Field IDs
+    ///
+    /// If the Parquet file contains field IDs (written when column mapping is enabled), they are
+    /// preserved in each [`StructField`]'s metadata under the key `"PARQUET:field_id"`. Callers
+    /// can access field IDs via [`StructField::get_config_value`] with
+    /// [`ColumnMetadataKey::ParquetFieldId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The file cannot be accessed or does not exist
+    /// - The file is not a valid Parquet file
+    /// - The footer cannot be read or parsed
+    /// - The schema cannot be converted to Delta Kernel's format
+    ///
+    /// [`StructField`]: crate::schema::StructField
+    /// [`StructField::get_config_value`]: crate::schema::StructField::get_config_value
+    /// [`ColumnMetadataKey::ParquetFieldId`]: crate::schema::ColumnMetadataKey::ParquetFieldId
+    fn read_parquet_footer(&self, file: &FileMeta) -> DeltaResult<ParquetFooter>;
 }
 
 /// The `Engine` trait encapsulates all the functionality an engine or connector needs to provide
@@ -699,6 +851,14 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`MetricsReporter`] for metrics collection.
+    ///
+    /// Returns an optional reporter that will receive metric events from Delta operations.
+    /// The default implementation returns None (no metrics reporting).
+    fn get_metrics_reporter(&self) -> Option<Arc<dyn MetricsReporter>> {
+        None
+    }
 }
 
 // we have an 'internal' feature flag: default-engine-base, which is actually just the shared

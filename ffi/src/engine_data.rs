@@ -1,5 +1,4 @@
 //! EngineData related ffi code
-
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::arrow;
 #[cfg(feature = "default-engine-base")]
@@ -8,12 +7,14 @@ use delta_kernel::arrow::array::{
     ArrayData, RecordBatch, StructArray,
 };
 #[cfg(feature = "default-engine-base")]
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt as _};
 #[cfg(feature = "default-engine-base")]
 use delta_kernel::DeltaResult;
 use delta_kernel::EngineData;
 use std::ffi::c_void;
 
+#[cfg(feature = "default-engine-base")]
+use crate::error::AllocateErrorFn;
 use crate::ExclusiveEngineData;
 #[cfg(feature = "default-engine-base")]
 use crate::{ExternResult, IntoExternResult, SharedExternEngine};
@@ -62,6 +63,16 @@ pub struct ArrowFFIData {
     pub schema: FFI_ArrowSchema,
 }
 
+#[cfg(feature = "default-engine-base")]
+impl ArrowFFIData {
+    pub fn empty() -> Self {
+        Self {
+            array: FFI_ArrowArray::empty(),
+            schema: FFI_ArrowSchema::empty(),
+        }
+    }
+}
+
 // TODO: This should use a callback to avoid having to have the engine free the struct
 /// Get an [`ArrowFFIData`] to allow binding to the arrow [C Data
 /// Interface](https://arrow.apache.org/docs/format/CDataInterface.html). This includes the data and
@@ -84,11 +95,7 @@ pub unsafe extern "C" fn get_raw_arrow_data(
 // TODO: This method leaks the returned pointer memory. How will the engine free it?
 #[cfg(feature = "default-engine-base")]
 fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowFFIData> {
-    let record_batch: delta_kernel::arrow::array::RecordBatch = data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into();
+    let record_batch = data.try_into_record_batch()?;
     let sa: StructArray = record_batch.into();
     let array_data: ArrayData = sa.into();
     // these call `clone`. is there a way to not copy anything and what exactly are they cloning?
@@ -113,9 +120,9 @@ fn get_raw_arrow_data_impl(data: Box<dyn EngineData>) -> DeltaResult<*mut ArrowF
 pub unsafe extern "C" fn get_engine_data(
     array: FFI_ArrowArray,
     schema: &FFI_ArrowSchema,
-    engine: Handle<SharedExternEngine>,
+    allocate_error: AllocateErrorFn,
 ) -> ExternResult<Handle<ExclusiveEngineData>> {
-    get_engine_data_impl(array, schema).into_extern_result(&engine.as_ref())
+    get_engine_data_impl(array, schema).into_extern_result(&allocate_error)
 }
 
 #[cfg(feature = "default-engine-base")]
