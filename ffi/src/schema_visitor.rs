@@ -163,12 +163,12 @@ pub unsafe extern "C" fn visit_field_short(
         .into_extern_result(&allocate_error)
 }
 
-///Visit a byte field. Byte fields store 8-bit signed integers.
+/// Visit a byte field. Byte fields store 8-bit signed integers.
 ///
-///# Safety
+/// # Safety
 ///
-///Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
-///and `allocate_error` function pointer.
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
 #[no_mangle]
 pub unsafe extern "C" fn visit_field_byte(
     state: &mut KernelSchemaVisitorState,
