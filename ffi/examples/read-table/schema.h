@@ -85,7 +85,24 @@ void print_list(SchemaBuilder* builder, uintptr_t list_id, int indent, int paren
     }
     SchemaItem* item = &list->list[i];
     char* prefix = is_last ? "└" : "├";
-    printf("%s─ %s: %s\n", prefix, item->name, item->type);
+    printf("%s─ %s: %s", prefix, item->name, item->type);
+    if (strcmp(item->type, "array") == 0) {
+      SchemaItemList child_list = builder->lists[item->children];
+      if (child_list.len != 1) {
+        printf(" (invalid array child list)\n");
+      } else {
+        printf(" (can contain null: %s)\n", child_list.list[0].is_nullable ? "true" : "false");
+      }
+    } else if (strcmp(item->type, "map") == 0) {
+      SchemaItemList child_list = builder->lists[item->children];
+      if (child_list.len != 2) {
+        printf(" (invalid map child list)\n");
+      } else {
+        printf(" (can contain null: %s)\n", child_list.list[1].is_nullable ? "true" : "false");
+      }
+    } else {
+      printf("\n");
+    }
     if (list->list[i].children != UINTPTR_MAX) {
       print_list(builder, list->list[i].children, indent + 1, parents_on_last + is_last);
     }
@@ -154,11 +171,7 @@ void visit_array(
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
-  char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  // NOTE: we truncate to the max int size because the format specifier "%.*s" requires an int length specifier
-  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
-  int wrote = snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
-  snprintf(name_ptr + wrote, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  char* name_ptr = allocate_string(name);
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("array", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* array_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "array", is_nullable);
@@ -174,11 +187,7 @@ void visit_map(
   uintptr_t child_list_id)
 {
   SchemaBuilder* builder = data;
-  char* name_ptr = malloc(sizeof(char) * (name.len + 22));
-  // NOTE: we truncate to the max int size because the format specifier "%.*s" requires an int length specifier
-  int name_chars = name.len > INT_MAX ? INT_MAX : (int)name.len; // handle _REALLY_ long names by truncation
-  int wrote = snprintf(name_ptr, name.len + 1, "%.*s", name_chars, name.ptr);
-  snprintf(name_ptr + wrote, 22, " (is nullable: %s)", is_nullable ? "true" : "false");
+  char* name_ptr = allocate_string(name);
   print_physical_name(name_ptr, metadata);
   PRINT_CHILD_VISIT("map", name_ptr, sibling_list_id, "Types", child_list_id);
   SchemaItem* map_item = add_to_list(&builder->lists[sibling_list_id], name_ptr, "map", is_nullable);

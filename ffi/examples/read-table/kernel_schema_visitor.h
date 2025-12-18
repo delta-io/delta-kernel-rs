@@ -5,26 +5,6 @@
  * `KernelSchemaVisitor` in kernel parlance.
  */
 
-// Our schema code might add (is nullable: x) to names, which we need to strip off.
-// Returns the location where the edit was made if one was made, or NULL if no edit
-char* fixup_name(char* name) {
-  char *s = name;
-  char found_paren = 0;
-  while (*s) {
-    if (*s == '(') {
-      *(s-1) = '\0';
-      found_paren = 1;
-      break;
-    }
-    s++;
-  }
-  if (found_paren) {
-    return s-1;
-  } else {
-    return NULL;
-  }
-}
-
 // This function looks at tahe type field in the schema to figure out which visitor to call. It's a
 // bit gross as the schema code is string based, a real implementation would have a more robust way
 // to represent a schema.
@@ -98,12 +78,7 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
     for (uint32_t i = 0; i < child_list.len; i++) {
       // visit all the children
       SchemaItem *item = &child_list.list[i];
-      // Removes the nullability information from name `name (is nullable: true)` -> `name`
-      char* fixup_loc = fixup_name(item->name);
       uintptr_t child_id = visit_schema_item(item, state, cschema);
-      if (fixup_loc != NULL) {
-        *fixup_loc = ' ';
-      }
       child_visit_ids[i] = child_id;
     }
     visit_res = visit_field_struct(
@@ -158,8 +133,6 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
     char found_col = 0;
     for (uint32_t i = 0; i < top_level_list->len; i++) {
       SchemaItem* item = &top_level_list->list[i];
-      // Removes the nullability information from name `name (is nullable: true)` -> `name`
-      char* fixup_loc = fixup_name(item->name);
       if (strcmp(item->name, col) == 0) {
         found_col = 1;
         uintptr_t col_id = visit_schema_item(item, state, cschema);
@@ -168,9 +141,6 @@ uintptr_t visit_requested_spec(void* requested_spec, KernelSchemaVisitorState *s
           return 0;
         }
         cols[col_index++] = col_id;
-      }
-      if (fixup_loc != NULL) {
-        *fixup_loc = ' ';
       }
       if (found_col) {
         break;

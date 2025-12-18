@@ -6,9 +6,9 @@ Schema:
 ├─ struct: struct
 │  ├─ float64: double
 │  └─ bool: boolean
-├─ array (is nullable: true): array
+├─ array (can contain null: true): array
 │  └─ array_element: short
-└─ map (is nullable: true): map
+└─ map (can contain null: true): map
    ├─ map_key: string
    └─ map_value: integer
 
