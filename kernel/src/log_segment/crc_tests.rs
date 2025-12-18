@@ -93,7 +93,8 @@ fn unique_protocol_metadata() -> (Protocol, Metadata) {
             7,
             Some(vec![TableFeature::ColumnMapping]),
             Some(vec![TableFeature::ColumnMapping]),
-        ).unwrap(),
+        )
+        .unwrap(),
         Metadata::try_new(
             None,
             None,
@@ -101,7 +102,8 @@ fn unique_protocol_metadata() -> (Protocol, Metadata) {
             vec![],
             chrono::Utc::now().timestamp_millis(),
             HashMap::new(),
-        ).unwrap()
+        )
+        .unwrap(),
     )
 }
 
@@ -303,9 +305,14 @@ async fn crc_pm_test(
         None
     };
 
-    let listed_files =
-        ListedLogFiles::try_new(commit_paths, compaction_paths, checkpoint_paths, crc_path, None)
-            .unwrap();
+    let listed_files = ListedLogFiles::try_new(
+        commit_paths,
+        compaction_paths,
+        checkpoint_paths,
+        crc_path,
+        None,
+    )
+    .unwrap();
 
     let log_segment = LogSegment::try_new(listed_files, log_root, target_version)?;
     Ok((log_segment, engine))
