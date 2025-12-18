@@ -141,7 +141,8 @@ impl RowVisitor for LogVisitor {
                     SetTransactionVisitor::visit_txn(i, app_id, &getters[txn_start..txn_end])?;
                 Action::SetTransaction(txn)
             } else if let Some(path) = getters[sidecar_start].get_opt(i, "sidecar.path")? {
-                let sidecar = SidecarVisitor::visit_sidecar(i, path, &getters[sidecar_start..sidecar_end])?;
+                let sidecar = 
+                SidecarVisitor::visit_sidecar(i, path, &getters[sidecar_start..sidecar_end])?;
                 Action::Sidecar(sidecar)
             } else if let Some(path) = getters[cdc_start].get_opt(i, "cdc.path")? {
                 let cdc = CdcVisitor::visit_cdc(i, path, &getters[cdc_start..cdc_end])?;
