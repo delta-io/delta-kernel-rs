@@ -383,6 +383,7 @@ pub(crate) struct SidecarVisitor {
 }
 
 impl SidecarVisitor {
+    #[internal_api]
     fn visit_sidecar<'a>(
         row_index: usize,
         path: String,

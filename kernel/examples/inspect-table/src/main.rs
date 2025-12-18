@@ -1,11 +1,11 @@
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
-    SetTransactionVisitor,
+    SetTransactionVisitor, SidecarVisitor,
 };
 use delta_kernel::actions::{
-    get_commit_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME,
+    get_all_actions_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
@@ -67,10 +67,11 @@ enum Action {
     Add(delta_kernel::actions::Add),
     SetTransaction(delta_kernel::actions::SetTransaction),
     Cdc(delta_kernel::actions::Cdc),
+    Sidecar(delta_kernel::actions::Sidecar),
 }
 
 static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-    LazyLock::new(|| get_commit_schema().leaves(None));
+    LazyLock::new(|| get_all_actions_schema().leaves(None));
 
 struct LogVisitor {
     actions: Vec<(Action, usize)>,
@@ -117,6 +118,7 @@ impl RowVisitor for LogVisitor {
         let (metadata_start, metadata_end) = self.offsets[METADATA_NAME];
         let (protocol_start, protocol_end) = self.offsets[PROTOCOL_NAME];
         let (txn_start, txn_end) = self.offsets[SET_TRANSACTION_NAME];
+        let (sidecar_start, sidecar_end) = self.offsets[SIDECAR_NAME];
         let (cdc_start, cdc_end) = self.offsets[CDC_NAME];
         for i in 0..row_count {
             let action = if let Some(path) = getters[add_start].get_opt(i, "add.path")? {
@@ -138,6 +140,10 @@ impl RowVisitor for LogVisitor {
                 let txn =
                     SetTransactionVisitor::visit_txn(i, app_id, &getters[txn_start..txn_end])?;
                 Action::SetTransaction(txn)
+            } else if let Some(path) = getters[sidecar_start].get_opt(i, "sidecar.path")? {
+                let sidecar =
+                    SidecarVisitor::visit_sidecar(i, path, &getters[sidecar_start..sidecar_end])?;
+                Action::Sidecar(sidecar)
             } else if let Some(path) = getters[cdc_start].get_opt(i, "cdc.path")? {
                 let cdc = CdcVisitor::visit_cdc(i, path, &getters[cdc_start..cdc_end])?;
                 Action::Cdc(cdc)
@@ -206,11 +212,11 @@ fn try_main() -> DeltaResult<()> {
             }
         }
         Commands::Actions { oldest_first } => {
-            let commit_schema = get_commit_schema();
+            let actions_schema = get_all_actions_schema();
             let actions =
                 snapshot
                     .log_segment()
-                    .read_actions(&engine, commit_schema.clone(), None)?;
+                    .read_actions(&engine, actions_schema.clone(), None)?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {
@@ -228,6 +234,7 @@ fn try_main() -> DeltaResult<()> {
                     Action::Add(a) => println!("\nAction {row}:\n{a:#?}"),
                     Action::SetTransaction(t) => println!("\nAction {row}:\n{t:#?}"),
                     Action::Cdc(c) => println!("\nAction {row}:\n{c:#?}"),
+                    Action::Sidecar(s) => println!("\nAction {row}:\n{s:#?}"),
                 }
             }
         }
