@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,7 +14,7 @@ use delta_kernel::expressions::{
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
+use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
@@ -317,28 +316,8 @@ fn read_with_execute(
     Ok(())
 }
 
-struct ScanFile {
-    path: String,
-    size: i64,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-}
-
-fn scan_metadata_callback(
-    batches: &mut Vec<ScanFile>,
-    path: &str,
-    size: i64,
-    _stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    _: HashMap<String, String>,
-) {
-    batches.push(ScanFile {
-        path: path.to_string(),
-        size,
-        dv_info,
-        transform,
-    });
+fn scan_metadata_callback(batches: &mut Vec<ScanFile>, scan_file: ScanFile) {
+    batches.push(scan_file);
 }
 
 fn read_with_scan_metadata(

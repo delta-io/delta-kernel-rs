@@ -51,12 +51,13 @@ void scan_row_callback(
   void* engine_context,
   KernelStringSlice path,
   int64_t size,
+  int64_t mod_time,
   const Stats* stats,
   const CDvInfo* cdv_info,
   const Expression* transform,
   const CStringMap* partition_values)
 {
-  (void)size; // not using this at the moment
+  (void)mod_time; // not using this at the moment
 #ifndef PRINT_ARROW_DATA
   (void)transform; // only used when PRINT_ARROW_DATA is defined
 #endif

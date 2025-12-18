@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::scan::state::DvInfo;
+use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
@@ -341,6 +341,7 @@ pub struct CDvInfo<'a> {
 /// * `context`: a `void*` context this can be anything that engine needs to pass through to each call
 /// * `path`: a `KernelStringSlice` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
+/// * `mod_time`: an `i64` which is the time the file was created, as milliseconds since the epoch
 /// * `dv_info`: a [`CDvInfo`] struct, which allows getting the selection vector for this file
 /// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
 ///   convert it to the correct logical format. If this is `NULL`, no transform is needed.
@@ -349,6 +350,7 @@ type CScanCallback = extern "C" fn(
     engine_context: NullableCvoid,
     path: KernelStringSlice,
     size: i64,
+    mod_time: i64,
     stats: Option<&Stats>,
     dv_info: &CDvInfo,
     transform: Option<&Expression>,
@@ -499,30 +501,24 @@ fn row_indexes_from_dv_impl(
 
 // Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
 // and then calls the ffi specified callback
-fn rust_callback(
-    context: &mut ContextWrapper,
-    path: &str,
-    size: i64,
-    kernel_stats: Option<delta_kernel::scan::state::Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-) {
-    let transform = transform.map(|e| e.as_ref().clone());
+fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) {
+    let transform = scan_file.transform.map(|e| e.as_ref().clone());
     let partition_map = CStringMap {
-        values: partition_values,
+        values: scan_file.partition_values,
     };
-    let stats = kernel_stats.map(|ks| Stats {
+    let stats = scan_file.stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
     let cdv_info = CDvInfo {
-        info: &dv_info,
-        has_vector: dv_info.has_vector(),
+        info: &scan_file.dv_info,
+        has_vector: scan_file.dv_info.has_vector(),
     };
+    let path = scan_file.path.as_str();
     (context.callback)(
         context.engine_context,
         kernel_string_slice!(path),
-        size,
+        scan_file.size,
+        scan_file.modification_time,
         stats.as_ref(),
         &cdv_info,
         transform.as_ref(),

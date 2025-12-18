@@ -9,10 +9,10 @@ use delta_kernel::actions::{
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::scan::state::{DvInfo, Stats};
+use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, ExpressionRef, Snapshot};
+use delta_kernel::{DeltaResult, Error, Snapshot};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -153,29 +153,30 @@ impl RowVisitor for LogVisitor {
 }
 
 // This is the callback that will be called for each valid scan row
-fn print_scan_file(
-    _: &mut (),
-    path: &str,
-    size: i64,
-    stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-) {
-    let num_record_str = if let Some(s) = stats {
+fn print_scan_file(_: &mut (), file: ScanFile) {
+    let num_record_str = if let Some(s) = file.stats {
         format!("{}", s.num_records)
     } else {
         "[unknown]".to_string()
     };
+    let mod_str = match chrono::DateTime::from_timestamp(file.modification_time / 1000, 0) {
+        Some(dt) => format!("{} ({})", dt, file.modification_time),
+        None => format!("Invalid mod time: {}", file.modification_time),
+    };
     println!(
         "Data to process:\n  \
-              Path:\t\t{path}\n  \
-              Size (bytes):\t{size}\n  \
+              Path:\t\t{0}\n  \
+              Size (bytes):\t{1}\n  \
+              Mod Time:\t{mod_str}\n  \
               Num Records:\t{num_record_str}\n  \
-              Has DV?:\t{}\n  \
-              Transform:\t{transform:?}\n  \
-              Part Vals:\t{partition_values:?}",
-        dv_info.has_vector()
+              Has DV?:\t{2}\n  \
+              Transform:\t{3:?}\n  \
+              Part Vals:\t{4:?}",
+        file.path,
+        file.size,
+        file.dv_info.has_vector(),
+        file.transform,
+        file.partition_values,
     );
 }
 

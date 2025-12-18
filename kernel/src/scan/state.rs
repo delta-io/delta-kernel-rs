@@ -113,15 +113,27 @@ pub fn transform_to_logical(
     }
 }
 
-pub type ScanCallback<T> = fn(
-    context: &mut T,
-    path: &str,
-    size: i64,
-    stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-);
+/// A `ScanFile` represents information about one file that needs to be scanned to read a table.
+#[derive(Debug, Clone)]
+pub struct ScanFile {
+    /// Path to the file
+    pub path: String,
+    /// Size of the file
+    pub size: i64,
+    /// The time the file was created, as milliseconds since the epoch
+    pub modification_time: i64,
+    /// Statistics about the file
+    pub stats: Option<Stats>,
+    /// A [`DvInfo`] struct, which allows getting the selection vector for this file
+    pub dv_info: DvInfo,
+    /// An optional expression that, if present, _must_ be applied to physical data to convert it to
+    /// the correct logical format
+    pub transform: Option<ExpressionRef>,
+    /// a `HashMap<String, String>` which map partition names to the value they have in this file
+    pub partition_values: HashMap<String, String>,
+}
+
+pub type ScanCallback<T> = fn(context: &mut T, scan_file: ScanFile);
 
 /// Request that the kernel call a callback on each valid file that needs to be read for the
 /// scan.
@@ -129,12 +141,7 @@ pub type ScanCallback<T> = fn(
 /// The arguments to the callback are:
 /// * `context`: an `&mut context` argument. this can be anything that engine needs to pass through
 ///   to each call
-/// * `path`: a `&str` which is the path to the file
-/// * `size`: an `i64` which is the size of the file
-/// * `dv_info`: a [`DvInfo`] struct, which allows getting the selection vector for this file
-/// * `transform`: An optional expression that, if present, _must_ be applied to physical data to
-///   convert it to the correct logical format
-/// * `partition_values`: a `HashMap<String, String>` which are partition values
+/// * `scan_file`: a [`ScanFile`] struct with all the information about the file
 ///
 /// ## Context
 /// A note on the `context`. This can be any value the engine wants. This function takes ownership
@@ -193,6 +200,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
             // Since path column is required, use it to detect presence of an Add action
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
+                let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
                 let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
                 let stats: Option<Stats> =
                     stats.and_then(|json| match serde_json::from_str(json.as_str()) {
@@ -210,15 +218,16 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
                     getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
-                (self.callback)(
-                    &mut self.context,
+                let scan_file = ScanFile {
                     path,
                     size,
+                    modification_time,
                     stats,
                     dv_info,
-                    get_transform_for_row(row_index, self.transforms),
+                    transform: get_transform_for_row(row_index, self.transforms),
                     partition_values,
-                )
+                };
+                (self.callback)(&mut self.context, scan_file)
             }
         }
         Ok(())
@@ -227,41 +236,33 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use crate::actions::get_commit_schema;
+    use crate::scan::state::ScanFile;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
-    use crate::ExpressionRef;
-
-    use super::{DvInfo, Stats};
 
     #[derive(Clone)]
     struct TestContext {
         id: usize,
     }
 
-    fn validate_visit(
-        context: &mut TestContext,
-        path: &str,
-        size: i64,
-        stats: Option<Stats>,
-        dv_info: DvInfo,
-        transform: Option<ExpressionRef>,
-        part_vals: HashMap<String, String>,
-    ) {
+    fn validate_visit(context: &mut TestContext, scan_file: ScanFile) {
         assert_eq!(
-            path,
+            scan_file.path,
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         );
-        assert_eq!(size, 635);
-        assert!(stats.is_some());
-        assert_eq!(stats.as_ref().unwrap().num_records, 10);
-        assert_eq!(part_vals.get("date"), Some(&"2017-12-10".to_string()));
-        assert_eq!(part_vals.get("non-existent"), None);
-        assert!(dv_info.deletion_vector.is_some());
-        let dv = dv_info.deletion_vector.unwrap();
+        assert_eq!(scan_file.size, 635);
+        assert_eq!(scan_file.modification_time, 1677811178336);
+        assert!(scan_file.stats.is_some());
+        assert_eq!(scan_file.stats.as_ref().unwrap().num_records, 10);
+        assert_eq!(
+            scan_file.partition_values.get("date"),
+            Some(&"2017-12-10".to_string())
+        );
+        assert_eq!(scan_file.partition_values.get("non-existent"), None);
+        assert!(scan_file.dv_info.deletion_vector.is_some());
+        let dv = scan_file.dv_info.deletion_vector.unwrap();
         assert_eq!(dv.unique_id(), "uvBn[lx{q8@P<9BNH/isA@1");
-        assert!(transform.is_none());
+        assert!(scan_file.transform.is_none());
         assert_eq!(context.id, 2);
     }
 

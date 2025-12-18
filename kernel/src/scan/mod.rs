@@ -22,7 +22,6 @@ use crate::listed_log_files::ListedLogFiles;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
 use crate::scan::log_replay::BASE_ROW_ID_NAME;
-use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -590,27 +589,8 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        struct ScanFile {
-            path: String,
-            size: i64,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-        }
-        fn scan_metadata_callback(
-            batches: &mut Vec<ScanFile>,
-            path: &str,
-            size: i64,
-            _: Option<Stats>,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-            _: HashMap<String, String>,
-        ) {
-            batches.push(ScanFile {
-                path: path.to_string(),
-                size,
-                dv_info,
-                transform,
-            });
+        fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
+            batches.push(file);
         }
 
         debug!(

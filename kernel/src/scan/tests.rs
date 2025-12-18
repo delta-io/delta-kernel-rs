@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,10 +7,10 @@ use crate::arrow::record_batch::RecordBatch;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::sync::SyncEngine;
 use crate::expressions::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+use crate::scan::state::ScanFile;
 use crate::schema::{ColumnMetadataKey, DataType, StructField, StructType};
-use crate::{EngineData, ExpressionRef, Snapshot};
+use crate::{EngineData, Snapshot};
 
-use super::state::{DvInfo, Stats};
 use super::*;
 
 #[test]
@@ -191,17 +190,9 @@ fn test_physical_predicate() {
 
 fn get_files_for_scan(scan: Scan, engine: &dyn Engine) -> DeltaResult<Vec<String>> {
     let scan_metadata_iter = scan.scan_metadata(engine)?;
-    fn scan_metadata_callback(
-        paths: &mut Vec<String>,
-        path: &str,
-        _size: i64,
-        _: Option<Stats>,
-        dv_info: DvInfo,
-        _transform: Option<ExpressionRef>,
-        _partition_values: HashMap<String, String>,
-    ) {
-        paths.push(path.to_string());
-        assert!(dv_info.deletion_vector.is_none());
+    fn scan_metadata_callback(paths: &mut Vec<String>, scan_file: ScanFile) {
+        paths.push(scan_file.path.to_string());
+        assert!(scan_file.dv_info.deletion_vector.is_none());
     }
     let mut files = vec![];
     for res in scan_metadata_iter {
