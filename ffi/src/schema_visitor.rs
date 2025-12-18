@@ -49,7 +49,7 @@ pub fn extract_kernel_schema(
     let schema_element = state
         .elements
         .take(schema_id)
-        .ok_or_else(|| Error::schema("Nonexistent id passed to unwrap_kernel_schema"))?;
+        .ok_or_else(|| Error::schema("Nonexistent id passed to extract_kernel_schema"))?;
     let DataType::Struct(struct_type) = schema_element.data_type else {
         warn!("Final returned id was not a struct, schema is invalid");
         return Err(Error::schema(
@@ -90,43 +90,221 @@ fn visit_field_primitive_impl(
     Ok(wrap_field(state, field))
 }
 
-macro_rules! generate_primitive_schema_visitors {
-    ($(($fn_name:ident, $primitive_type:expr, $doc:expr)),* $(,)?) => {
-        $(
-            #[doc = $doc]
-            #[doc = ""]
-            #[doc = "# Safety"]
-            #[doc = ""]
-            #[doc = "Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,"]
-            #[doc = "and `allocate_error` function pointer."]
-            #[no_mangle]
-            pub unsafe extern "C" fn $fn_name(
-                state: &mut KernelSchemaVisitorState,
-                name: KernelStringSlice,
-                nullable: bool,
-                allocate_error: AllocateErrorFn,
-            ) -> ExternResult<usize> {
-                let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
-                visit_field_primitive_impl(state, name_str, $primitive_type, nullable)
-                    .into_extern_result(&allocate_error)
-            }
-        )*
-    };
+// TODO: turn all the primitive visitors below into a macro once cbindgen can run on macro expanded code
+/// Visit a string field. Strings can hold arbitrary UTF-8 text data.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_string(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::String, nullable)
+        .into_extern_result(&allocate_error)
 }
 
-generate_primitive_schema_visitors! {
-    (visit_field_string, PrimitiveType::String, "Visit a string field. Strings can hold arbitrary UTF-8 text data."),
-    (visit_field_long, PrimitiveType::Long, "Visit a long field. Long fields store 64-bit signed integers."),
-    (visit_field_integer, PrimitiveType::Integer, "Visit an integer field. Integer fields store 32-bit signed integers."),
-    (visit_field_short, PrimitiveType::Short, "Visit a short field. Short fields store 16-bit signed integers."),
-    (visit_field_byte, PrimitiveType::Byte, "Visit a byte field. Byte fields store 8-bit signed integers."),
-    (visit_field_float, PrimitiveType::Float, "Visit a float field. Float fields store 32-bit floating point numbers."),
-    (visit_field_double, PrimitiveType::Double, "Visit a double field. Double fields store 64-bit floating point numbers."),
-    (visit_field_boolean, PrimitiveType::Boolean, "Visit a boolean field. Boolean fields store true/false values."),
-    (visit_field_binary, PrimitiveType::Binary, "Visit a binary field. Binary fields store arbitrary byte arrays."),
-    (visit_field_date, PrimitiveType::Date, "Visit a date field. Date fields store calendar dates without time information."),
-    (visit_field_timestamp, PrimitiveType::Timestamp, "Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC."),
-    (visit_field_timestamp_ntz, PrimitiveType::TimestampNtz, "Visit a timestamp_ntz field. Similar to timestamp but without timezone information."),
+/// Visit a long field. Long fields store 64-bit signed integers.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_long(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Long, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit an integer field. Integer fields store 32-bit signed integers.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_integer(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Integer, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a short field. Short fields store 16-bit signed integers.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_short(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Short, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a byte field. Byte fields store 8-bit signed integers.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_byte(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Byte, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a float field. Float fields store 32-bit floating point numbers.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_float(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Float, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a double field. Double fields store 64-bit floating point numbers.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_double(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Double, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a boolean field. Boolean fields store true/false values.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_boolean(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Boolean, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a binary field. Binary fields store arbitrary byte arrays.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_binary(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Binary, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a date field. Date fields store calendar dates without time information.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_date(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Date, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a timestamp field. Timestamp fields store date and time with microsecond precision in UTC.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_timestamp(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::Timestamp, nullable)
+        .into_extern_result(&allocate_error)
+}
+
+/// Visit a timestamp_ntz field. Similar to timestamp but without timezone information.
+///
+/// # Safety
+///
+/// Caller is responsible for providing a valid `state`, `name` slice with valid UTF-8 data,
+/// and `allocate_error` function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn visit_field_timestamp_ntz(
+    state: &mut KernelSchemaVisitorState,
+    name: KernelStringSlice,
+    nullable: bool,
+    allocate_error: AllocateErrorFn,
+) -> ExternResult<usize> {
+    let name_str = unsafe { TryFromStringSlice::try_from_slice(&name) };
+    visit_field_primitive_impl(state, name_str, PrimitiveType::TimestampNtz, nullable)
+        .into_extern_result(&allocate_error)
 }
 
 /// Visit a decimal field. Decimal fields store fixed-precision decimal numbers with specified precision and scale.

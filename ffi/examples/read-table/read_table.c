@@ -1,11 +1,14 @@
+#include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "arrow.h"
 #include "read_table.h"
 #include "schema.h"
+#include "kernel_schema_visitor.h"
 #include "kernel_utils.h"
 
 // Print the content of a selection vector if `VERBOSE` is defined in read_table.h
@@ -219,10 +222,38 @@ void log_line_callback(KernelStringSlice line) {
 
 int main(int argc, char* argv[])
 {
-  if (argc < 2) {
-    printf("Usage: %s table/path\n", argv[0]);
+  char* requested_cols = NULL;
+  int c;
+  while ((c = getopt (argc, argv, "c:")) != -1) {
+    switch (c) {
+    case 'c':
+      requested_cols = optarg;
+      break;
+    case '?':
+      if (optopt == 'c') {
+        fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+      }
+      else if (isprint(optopt)) {
+        fprintf (stderr, "Unknown option `-%c'.\n", optopt);
+      }
+      else {
+        fprintf (stderr,
+                 "Unknown option character `\\x%x'.\n",
+                 optopt);
+      }
+      return 1;
+    default:
+      abort ();
+    }
+  }
+
+  if (optind != (argc - 1)) {
+    printf("Usage: %s [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
     return -1;
   }
+
+  char* table_path = argv[optind];
+  printf("Reading table at %s\n", table_path);
 
 #ifdef VERBOSE
   enable_event_tracing(tracing_callback, TRACE);
@@ -231,9 +262,6 @@ int main(int argc, char* argv[])
 #else
   enable_event_tracing(tracing_callback, INFO);
 #endif
-
-  char* table_path = argv[1];
-  printf("Reading table at %s\n", table_path);
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
@@ -276,7 +304,9 @@ int main(int argc, char* argv[])
 
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
-  print_schema(snapshot);
+
+  CSchema *cschema = get_cschema(snapshot);
+  print_cschema(cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -285,9 +315,37 @@ int main(int argc, char* argv[])
 
   print_diag("Starting table scan\n\n");
 
-  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
+  EngineSchema* engine_schema = NULL;
+  RequestedSchemaSpec *spec = NULL;
+  if (requested_cols != NULL) {
+    print_diag("Selecting columns: [%s]\n", requested_cols);
+    engine_schema = malloc(sizeof(EngineSchema));
+    spec = malloc(sizeof(RequestedSchemaSpec));
+    spec->cschema = cschema;
+    spec->requested_cols = requested_cols;
+    engine_schema->schema = spec;
+    engine_schema->visitor = visit_requested_spec;
+  }
+
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, engine_schema);
+
+  if (engine_schema != NULL) {
+    free(engine_schema);
+  }
+
+  if (spec != NULL) {
+    free(spec);
+  }
+
+  free_cschema(cschema);
+
   if (scan_res.tag != OkHandleSharedScan) {
-    printf("Failed to create scan\n");
+    print_error("Failed to create scan", (Error*)scan_res.err);
+    free_error((Error*)scan_res.err);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    free(table_root);
+    free_partition_list(partition_cols);
     return -1;
   }
 

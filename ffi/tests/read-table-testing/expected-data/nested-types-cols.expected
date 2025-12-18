@@ -12,57 +12,6 @@ Schema:
    ├─ map_key: string
    └─ map_value: integer
 
-pk:  [
-  0,
-  1,
-  2,
-  3,
-  4
-]
-struct:  -- is_valid: all not null
--- child 0 type: double
-  [
-    0,
-    1,
-    2,
-    3,
-    4
-  ]
--- child 1 type: bool
-  [
-    true,
-    false,
-    true,
-    false,
-    true
-  ]
-array:  [
-  [
-    0
-  ],
-  [
-    0,
-    1
-  ],
-  [
-    0,
-    1,
-    2
-  ],
-  [
-    0,
-    1,
-    2,
-    3
-  ],
-  [
-    0,
-    1,
-    2,
-    3,
-    4
-  ]
-]
 map:  [
   keys:
   []
@@ -111,5 +60,49 @@ map:  [
     1,
     2,
     3
+  ]
+]
+struct:  -- is_valid: all not null
+-- child 0 type: double
+  [
+    0,
+    1,
+    2,
+    3,
+    4
+  ]
+-- child 1 type: bool
+  [
+    true,
+    false,
+    true,
+    false,
+    true
+  ]
+array:  [
+  [
+    0
+  ],
+  [
+    0,
+    1
+  ],
+  [
+    0,
+    1,
+    2
+  ],
+  [
+    0,
+    1,
+    2,
+    3
+  ],
+  [
+    0,
+    1,
+    2,
+    3,
+    4
   ]
 ]
