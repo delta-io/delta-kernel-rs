@@ -79,6 +79,10 @@ uintptr_t visit_schema_item(SchemaItem* item, KernelSchemaVisitorState *state, C
       // visit all the children
       SchemaItem *item = &child_list.list[i];
       uintptr_t child_id = visit_schema_item(item, state, cschema);
+      if (child_id == 0) {
+          // previous visit will have printed the issue
+          return 0;
+      } 
       child_visit_ids[i] = child_id;
     }
     visit_res = visit_field_struct(
