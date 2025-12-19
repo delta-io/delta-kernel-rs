@@ -1,5 +1,22 @@
 # Changelog
 
+## [v0.18.2](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.2/) (2025-12-03)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.1...v0.18.2)
+
+
+### 🐛 Bug Fixes
+
+1. Address column mapping edge case in protocol validation ([#1513])
+
+### 🧪 Testing
+1. Remove arrow error message dependency from test ([#1529])
+
+
+[#1513]: https://github.com/delta-io/delta-kernel-rs/pull/1513
+[#1529]: https://github.com/delta-io/delta-kernel-rs/pull/1529
+
+
 ## [v0.18.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.1/) (2025-11-24)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.0...v0.18.1)
