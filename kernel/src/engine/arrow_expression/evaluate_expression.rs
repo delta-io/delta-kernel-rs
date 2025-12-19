@@ -283,32 +283,13 @@ pub fn evaluate_expression(
 
             for expr in exprs {
                 let array = evaluate_expression(expr, batch, None)?;
-
+                let null_count = array.null_count();
+                arrays.push(array);
                 // Short-circuit: if this array has no nulls, we can stop evaluating
                 // remaining expressions since no more values are needed.
-                if array.null_count() == 0 {
-                    if arrays.is_empty() {
-                        // First array has no nulls - return it directly (skip coalesce_arrays)
-                        // Validate result type since we're bypassing coalesce_arrays
-                        if let Some(result_type) = result_type {
-                            let expected_type = result_type.try_into_arrow()?;
-                            if array.data_type() != &expected_type {
-                                return Err(ArrowError::InvalidArgumentError(format!(
-                                    "Requested result type {:?} does not match array's data type {:?}",
-                                    expected_type,
-                                    array.data_type()
-                                ))
-                                .into());
-                            }
-                        }
-                        return Ok(array);
-                    }
-                    // Not the first array - add it and break to coalesce with previous arrays
-                    arrays.push(array);
+                if null_count == 0 {
                     break;
                 }
-
-                arrays.push(array);
             }
 
             // Coalesce accumulated arrays
