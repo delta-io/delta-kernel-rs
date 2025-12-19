@@ -1078,7 +1078,9 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         let consumed = decoder.decode(line.as_bytes())?;
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
-            return Err(Error::generic("Malformed JSON: There was an incomplete JSON object on the row {idx:?}"));
+            return Err(Error::generic(
+                "Malformed JSON: There was an incomplete JSON object on the row {idx:?}",
+            ));
         }
         // did we decode more than one record
         if decoder.len() - idx != 1 {
