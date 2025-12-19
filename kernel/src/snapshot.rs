@@ -142,8 +142,8 @@ impl Snapshot {
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
         // listing above will only return the checkpoint and not the commit.
-        if new_listed_files.ascending_commit_files.is_empty()
-            && new_listed_files.checkpoint_parts.is_empty()
+        if new_listed_files.ascending_commit_files().is_empty()
+            && new_listed_files.checkpoint_parts().is_empty()
         {
             match new_version {
                 Some(new_version) if new_version != old_version => {
@@ -162,7 +162,7 @@ impl Snapshot {
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
-        let new_latest_commit_file = new_listed_files.latest_commit_file.clone();
+        let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
         let mut new_log_segment =
             LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
 
@@ -237,13 +237,13 @@ impl Snapshot {
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFiles {
+            ListedLogFiles::try_new(
                 ascending_commit_files,
                 ascending_compaction_files,
-                checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
+                old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-            },
+            )?,
             log_root,
             new_version,
         )?;
@@ -1491,13 +1491,13 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFiles {
-            ascending_commit_files: vec![],
-            ascending_compaction_files: vec![],
+        let listed_files = ListedLogFiles::try_new(
+            vec![],
+            vec![],
             checkpoint_parts,
-            latest_crc_file: None,
-            latest_commit_file: None, // No commit file
-        };
+            None,
+            None, // No commit file
+        )?;
 
         let log_segment = LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0))?;
         let table_config = snapshot.table_configuration().clone();
