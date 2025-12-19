@@ -74,13 +74,13 @@ impl LogSegment {
         log_root: Url,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let ListedLogFiles {
+        let (
             mut ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
-        } = listed_files;
+        ) = listed_files.into_parts();
 
         // Ensure commit file versions are contiguous
         require!(
@@ -247,13 +247,13 @@ impl LogSegment {
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
             listed_files
-                .ascending_commit_files
+                .ascending_commit_files()
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
             Error::generic(format!(
                 "Expected the first commit to have version {start_version}, got {:?}",
                 listed_files
-                    .ascending_commit_files
+                    .ascending_commit_files()
                     .first()
                     .map(|c| c.version)
             ))
@@ -291,7 +291,7 @@ impl LogSegment {
             ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
 
         // remove gaps - return latest contiguous chunk of commits
-        let commits = &mut listed_commits.ascending_commit_files;
+        let commits = listed_commits.ascending_commit_files_mut();
         if !commits.is_empty() {
             let mut start_idx = commits.len() - 1;
             while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
