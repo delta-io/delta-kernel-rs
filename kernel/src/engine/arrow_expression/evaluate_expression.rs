@@ -289,6 +289,18 @@ pub fn evaluate_expression(
                 if array.null_count() == 0 {
                     if arrays.is_empty() {
                         // First array has no nulls - return it directly (skip coalesce_arrays)
+                        // Validate result type since we're bypassing coalesce_arrays
+                        if let Some(result_type) = result_type {
+                            let expected_type = result_type.try_into_arrow()?;
+                            if array.data_type() != &expected_type {
+                                return Err(ArrowError::InvalidArgumentError(format!(
+                                    "Requested result type {:?} does not match array's data type {:?}",
+                                    expected_type,
+                                    array.data_type()
+                                ))
+                                .into());
+                            }
+                        }
                         return Ok(array);
                     }
                     // Not the first array - add it and break to coalesce with previous arrays
@@ -1202,6 +1214,23 @@ mod tests {
         assert_eq!(result_array.value(0), 1);
         assert_eq!(result_array.value(1), 20);
         assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_type_mismatch() {
+        // Verify type validation works when short-circuiting
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![Expression::column(["a"])],
+        );
+
+        // Request STRING type but array is INT32 - should fail even with short-circuit
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
+        assert!(result.is_err());
     }
 
     #[test]
