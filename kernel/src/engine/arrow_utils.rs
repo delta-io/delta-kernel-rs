@@ -1043,8 +1043,10 @@ fn compute_nested_null_masks(sa: StructArray, parent_nulls: Option<&NullBuffer>)
     unsafe { StructArray::new_unchecked(fields, columns, nulls) }
 }
 
-/// Arrow lacks the functionality to json-parse a string column into a struct column -- even tho the
-/// JSON file reader does exactly the same thing.
+/// Arrow lacks the functionality to json-parse a string column into a struct column, so we
+/// implement it here. This method is for json-parsing each string in a column of strings (add.stats
+/// to be specific) to produce a nested column of strongly typed values. We require that N rows in
+/// means N rows out.
 #[internal_api]
 pub(crate) fn parse_json(
     json_strings: Box<dyn EngineData>,
@@ -1078,13 +1080,15 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         let consumed = decoder.decode(line.as_bytes())?;
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
-            return Err(Error::generic(
-                "Malformed JSON: There was an incomplete JSON object on the row {idx:?}",
-            ));
+            return Err(Error::Generic(format!(
+                "Malformed JSON: There was an incomplete JSON object on the row {idx}"
+            )));
         }
-        // did we decode more than one record
+        // did we decode exactly one record
         if decoder.len() - idx != 1 {
-            return Err(Error::generic("Malformed JSON: Multiple JSON objects"));
+            return Err(Error::Generic(format!(
+                "Malformed JSON: Multiple JSON objects or 0 objects on the row {idx}"
+            )));
         }
     }
     // Get the final batch out
