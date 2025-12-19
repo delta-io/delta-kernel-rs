@@ -10,18 +10,18 @@
 3. Add a new `read_parquet_schema` function to the `ParquetHandler` trait ([#1498])
 4. Add a new `write_parquet_file` function to the `ParquetHandler` trait ([#1392])
 5. Make PartialEq for Scalar a physical comparison ([#1554])
-   > [!CAUTION]
-   > Note this is a **breaking** behavior change. Code that previously relied on `PartialEq` as a
-   > logical comparison will still compile, but its runtime behavior will silently change to perform
-   > structural comparisons.
-   > This change moves the current definition of `PartialEq` for `Scalar` to a new `Scalar::logical_eq`
-   > method, and derives `PartialEq` (= physical comparison).
-   > We also remove PartialOrd for Scalar because it, too, would become physical (required to match
-   > PartialEq), and the result would be largely nonsensical. The logical comparison moves to
-   > Scalar::logical_partial_cmp instead.
-   > These changes are needed because today there's no reliable way to physically compare two scalars,
-   > and most comparisons are physical in practice. Only predicate evaluation needs logical
-   > comparisons, and that code already has a narrow waist.
+  > [!CAUTION]
+  > Note this is a **breaking** behavior change. Code that previously relied on `PartialEq` as a
+  > logical comparison will still compile, but its runtime behavior will silently change to perform
+  > structural comparisons.
+  > This change moves the current definition of `PartialEq` for `Scalar` to a new `Scalar::logical_eq`
+  > method, and derives `PartialEq` (= physical comparison).
+  > We also remove PartialOrd for Scalar because it, too, would become physical (required to match
+  > PartialEq), and the result would be largely nonsensical. The logical comparison moves to
+  > Scalar::logical_partial_cmp instead.
+  > These changes are needed because today there's no reliable way to physically compare two scalars,
+  > and most comparisons are physical in practice. Only predicate evaluation needs logical
+  > comparisons, and that code already has a narrow waist.
 6. Expose mod time in scan metadata callbacks: users must change the scan callback function to take
 a struct which has all the previous arguments as members (and the mod time). See an example of the
 needed change [here][change1]. For FFI code, your callback function needs an extra argument. See an
