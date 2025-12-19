@@ -7,8 +7,8 @@
 ### 🏗️ Breaking changes
 1. Error on surplus columns in output schema ([#1528])
 2. Remove `arrow-55` support (upgrate to arrow 56 or 57 required) ([#1507])
-3. Add `read_parquet_schema` API to `ParquetHandler` ([#1498])
-4. Add `write_parquet_file` API to `ParquetHandler` ([#1392])
+3. Add a new `read_parquet_schema` function to the `ParquetHandler` trait ([#1498])
+4. Add a new `write_parquet_file` function to the `ParquetHandler` trait ([#1392])
 5. Make PartialEq for Scalar a physical comparison ([#1554])
 > [!CAUTION]
 > Note this is a **breaking** behavior change. Code that previously relied on `PartialEq` as a
@@ -22,7 +22,13 @@
 > These changes are needed because today there's no reliable way to physically compare two scalars,
 > and most comparisons are physical in practice. Only predicate evaluation needs logical
 > comparisons, and that code already has a narrow waist.
-6. Expose mod time in scan metadata callbacks ([#1565])
+6. Expose mod time in scan metadata callbacks: users must change the scan callback function to take
+a struct which has all the previous arguments as members (and the mod time). See an example of the
+needed change [here][change1]. For FFI code, your callback function needs an extra argument. See an
+example of the change needed [here][change2]. ([#1565])
+
+[change1]: https://github.com/delta-io/delta-kernel-rs/pull/1565/files#diff-3f44d0b7f8cfbe763cbe0cdbb2e2450a84833065de32fc102aef9d38b21b3daaR62
+[change2]: https://github.com/delta-io/delta-kernel-rs/pull/1565/files#diff-60493959e34a593831a075fbf2cc7a03a45d8f423f98e2d6b6a4a6ce479dd25bR54
 
 ### 🚀 Features / new APIs
 
