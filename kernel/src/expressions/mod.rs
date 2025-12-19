@@ -5,7 +5,6 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
 use itertools::Itertools;
-#[cfg(feature = "expr-serde")]
 use serde::{de, ser, Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::column_names::{
@@ -34,16 +33,14 @@ pub type PredicateRef = std::sync::Arc<Predicate>;
 ////////////////////////////////////////////////////////////////////////
 
 /// A unary predicate operator.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum UnaryPredicateOp {
     /// Unary Is Null
     IsNull,
 }
 
 /// A binary predicate operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryPredicateOp {
     /// Comparison Less Than
     LessThan,
@@ -58,16 +55,14 @@ pub enum BinaryPredicateOp {
 }
 
 /// A unary expression operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UnaryExpressionOp {
     /// Convert struct data to JSON-encoded strings
     ToJson,
 }
 
 /// A binary expression operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BinaryExpressionOp {
     /// Arithmetic Plus
     Plus,
@@ -80,16 +75,14 @@ pub enum BinaryExpressionOp {
 }
 
 /// A variadic expression operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VariadicExpressionOp {
     /// Collapse multiple values into one by taking the first non-null value
     Coalesce,
 }
 
 /// A junction (AND/OR) predicate operator.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum JunctionPredicateOp {
     /// Conjunction
     And,
@@ -199,8 +192,7 @@ pub type OpaquePredicateOpRef = Arc<dyn OpaquePredicateOp>;
 // Expressions and predicates
 ////////////////////////////////////////////////////////////////////////
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnaryPredicate {
     /// The operator.
     pub op: UnaryPredicateOp,
@@ -208,8 +200,7 @@ pub struct UnaryPredicate {
     pub expr: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BinaryPredicate {
     /// The operator.
     pub op: BinaryPredicateOp,
@@ -219,8 +210,7 @@ pub struct BinaryPredicate {
     pub right: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UnaryExpression {
     /// The operator.
     pub op: UnaryExpressionOp,
@@ -228,8 +218,7 @@ pub struct UnaryExpression {
     pub expr: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BinaryExpression {
     /// The operator.
     pub op: BinaryExpressionOp,
@@ -239,8 +228,7 @@ pub struct BinaryExpression {
     pub right: Box<Expression>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VariadicExpression {
     /// The operator.
     pub op: VariadicExpressionOp,
@@ -286,7 +274,6 @@ impl OpaquePredicate {
     }
 }
 
-#[cfg(feature = "expr-serde")]
 fn fail_serialize_opaque_predicate<S>(
     _value: &OpaquePredicate,
     _serializer: S,
@@ -297,7 +284,6 @@ where
     Err(ser::Error::custom("Cannot serialize Opaque Expression"))
 }
 
-#[cfg(feature = "expr-serde")]
 fn fail_deserialize_opaque_predicate<'de, D>(_deserializer: D) -> Result<OpaquePredicate, D::Error>
 where
     D: Deserializer<'de>,
@@ -324,7 +310,6 @@ impl OpaqueExpression {
     }
 }
 
-#[cfg(feature = "expr-serde")]
 fn fail_serialize_opaque_expression<S>(
     _value: &OpaqueExpression,
     _serializer: S,
@@ -335,7 +320,6 @@ where
     Err(ser::Error::custom("Cannot serialize Opaque Expression"))
 }
 
-#[cfg(feature = "expr-serde")]
 fn fail_deserialize_opaque_expression<'de, D>(
     _deserializer: D,
 ) -> Result<OpaqueExpression, D::Error>
@@ -347,8 +331,7 @@ where
 
 /// A transformation affecting a single field (one pieces of a [`Transform`]). The transformation
 /// could insert 0+ new fields after the target, or could replace the target with 0+ a new fields).
-#[derive(Debug, Clone, PartialEq, Default)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct FieldTransform {
     /// The list of expressions this field transform emits at the target location.
     pub exprs: Vec<ExpressionRef>,
@@ -363,8 +346,7 @@ pub struct FieldTransform {
 /// not specifically mentioned by the transform is passed through, unmodified and with the same
 /// relative field ordering. This is particularly useful for wide schemas where only a few columns
 /// need to be modified and/or dropped, or where a small number of columns need to be injected.
-#[derive(Debug, Clone, PartialEq, Default)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Transform {
     /// The path to the nested input struct this transform operates on (if any). If no path is
     /// given, the transform operates directly on top-level columns.
@@ -446,8 +428,7 @@ impl Transform {
 /// These expressions do not track or validate data types, other than the type
 /// of literals. It is up to the expression evaluator to validate the
 /// expression against a schema and add appropriate casts as required.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expression {
     /// A literal value.
     Literal(Scalar),
@@ -468,6 +449,7 @@ pub enum Expression {
     Variadic(VariadicExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
+<<<<<<< HEAD
     #[cfg_attr(
         feature = "expr-serde",
         serde(serialize_with = "fail_serialize_opaque_expression")
@@ -476,6 +458,10 @@ pub enum Expression {
         feature = "expr-serde",
         serde(deserialize_with = "fail_deserialize_opaque_expression")
     )]
+=======
+    #[serde(serialize_with = "fail_serialize_opaque_expression")]
+    #[serde(deserialize_with = "fail_deserialize_opaque_expression")]
+>>>>>>> 862d19f8 (Revert "add feature flag")
     Opaque(OpaqueExpression),
     /// An unknown expression (i.e. one that neither kernel nor engine attempts to evaluate). For
     /// data skipping purposes, kernel treats unknown expressions as if they were literal NULL
@@ -495,8 +481,7 @@ pub enum Expression {
 /// These predicates do not track or validate data types, other than the type
 /// of literals. It is up to the predicate evaluator to validate the
 /// predicate against a schema and add appropriate casts as required.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Predicate {
     /// A boolean-valued expression, useful for e.g. `AND(<boolean_col1>, <boolean_col2>)`.
     BooleanExpression(Expression),
@@ -515,6 +500,7 @@ pub enum Predicate {
     Junction(JunctionPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.
+<<<<<<< HEAD
     #[cfg_attr(
         feature = "expr-serde",
         serde(serialize_with = "fail_serialize_opaque_predicate")
@@ -523,6 +509,10 @@ pub enum Predicate {
         feature = "expr-serde",
         serde(deserialize_with = "fail_deserialize_opaque_predicate")
     )]
+=======
+    #[serde(serialize_with = "fail_serialize_opaque_predicate")]
+    #[serde(deserialize_with = "fail_deserialize_opaque_predicate")]
+>>>>>>> 862d19f8 (Revert "add feature flag")
     Opaque(OpaquePredicate),
     /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
     /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
@@ -1106,7 +1096,19 @@ impl<R: Into<Expression>> std::ops::Div<R> for Expression {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
+
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+
     use super::{column_expr, column_pred, Expression as Expr, Predicate as Pred};
+
+    /// Helper function to verify roundtrip serialization/deserialization
+    fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
+        let json = serde_json::to_string(value).expect("serialization should succeed");
+        let deserialized: T = serde_json::from_str(&json).expect("deserialization should succeed");
+        assert_eq!(value, &deserialized, "roundtrip should preserve value");
+    }
 
     #[test]
     fn test_expression_format() {
@@ -1173,20 +1175,7 @@ mod tests {
 
     // ==================== Serde Roundtrip Tests ====================
 
-    #[cfg(feature = "expr-serde")]
     mod serde_tests {
-        use std::fmt::Debug;
-
-        use serde::de::DeserializeOwned;
-        use serde::Serialize;
-
-        /// Helper function to verify roundtrip serialization/deserialization
-        fn assert_roundtrip<T: Serialize + DeserializeOwned + PartialEq + Debug>(value: &T) {
-            let json = serde_json::to_string(value).expect("serialization should succeed");
-            let deserialized: T =
-                serde_json::from_str(&json).expect("deserialization should succeed");
-            assert_eq!(value, &deserialized, "roundtrip should preserve value");
-        }
         use std::sync::Arc;
 
         use crate::expressions::scalars::{ArrayData, DecimalData, MapData, StructData};
@@ -1195,6 +1184,8 @@ mod tests {
             Expression, Predicate, Scalar, Transform, UnaryExpressionOp, VariadicExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+
+        use super::assert_roundtrip;
 
         // ==================== Expression::Literal Tests ====================
 
