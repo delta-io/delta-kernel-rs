@@ -1081,13 +1081,13 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
             return Err(Error::Generic(format!(
-                "Malformed JSON: There was an incomplete JSON object on the row {idx}"
+                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {idx}"
             )));
         }
         // did we decode exactly one record
         if decoder.len() - idx != 1 {
             return Err(Error::Generic(format!(
-                "Malformed JSON: Multiple JSON objects or 0 objects on the row {idx}"
+                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {idx}"
             )));
         }
     }
@@ -1248,6 +1248,17 @@ mod tests {
 
     #[test]
     fn test_json_parsing() {
+        static EXPECTED_JSON_ERR_STR: &str = "Generic delta kernel error: Malformed JSON: Multiple, partial, or 0 JSON objects on row";
+        fn ensure_err(result: DeltaResult<RecordBatch>, expected_start: &str) {
+            let err = result.expect_err("Expected an error");
+            let msg = err.to_string();
+            println!("msg {msg}");
+            assert!(
+                msg.starts_with(expected_start),
+                "Error message was not what was expected"
+            )
+        }
+
         let requested_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("a", ArrowDataType::Int32, true),
             ArrowField::new("b", ArrowDataType::Utf8, true),
@@ -1259,31 +1270,32 @@ mod tests {
 
         let input: Vec<Option<&str>> = vec![Some("")];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
+        ensure_err(result, EXPECTED_JSON_ERR_STR);
 
         let input: Vec<Option<&str>> = vec![Some(" \n\t")];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
+        ensure_err(result, EXPECTED_JSON_ERR_STR);
 
         let input: Vec<Option<&str>> = vec![Some(r#""a""#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("invalid string");
+        // this one is an error from within the tape decoder, so has a different format
+        ensure_err(result, "Json error: expected { got \"a\"");
 
         let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("incomplete object");
+        ensure_err(result, EXPECTED_JSON_ERR_STR);
 
         let input: Vec<Option<&str>> = vec![Some("{}{}")];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("this should be an error, multiple objects on one line");
+        ensure_err(result, EXPECTED_JSON_ERR_STR);
 
         let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("Should have got an error for malformed json");
+        ensure_err(result, EXPECTED_JSON_ERR_STR);
 
         let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("split object");
+        ensure_err(result, EXPECTED_JSON_ERR_STR);
 
         let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
         let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
