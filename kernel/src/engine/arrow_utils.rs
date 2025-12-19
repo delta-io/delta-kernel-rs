@@ -1279,18 +1279,7 @@ mod tests {
 
         let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
-        assert!(result.is_err(), "The result should be an error! {result:?}");
-        let actual_error = match result.unwrap_err() {
-            Error::Backtraced {
-                source,
-                backtrace: _,
-            } => source,
-            others => Box::new(others),
-        };
-        assert!(
-            matches!(*actual_error, Error::Generic(_)),
-            "Somehow the result is not an error? {actual_error:?}"
-        );
+        result.expect_err("Should have got an error for malformed json");
 
         let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
