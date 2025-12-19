@@ -129,6 +129,9 @@ default-engine-rustls = [
   "reqwest/http2",
 ]
 
+# Enables serialization for kernel expressions and predicates
+expr-serde = []
+
 [build-dependencies]
 rustc_version = "0.4.1"
 
