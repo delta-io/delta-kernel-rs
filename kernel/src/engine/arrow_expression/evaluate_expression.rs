@@ -279,10 +279,20 @@ pub fn evaluate_expression(
             }),
             result_type,
         ) => {
-            let arrays: Vec<ArrayRef> = exprs
-                .iter()
-                .map(|expr| evaluate_expression(expr, batch, None))
-                .try_collect()?;
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
+
+            for expr in exprs {
+                let array = evaluate_expression(expr, batch, None)?;
+                let null_count = array.null_count();
+                arrays.push(array);
+                // Short-circuit: if this array has no nulls, we can stop evaluating
+                // remaining expressions since no more values are needed.
+                if null_count == 0 {
+                    break;
+                }
+            }
+
+            // Coalesce accumulated arrays
             Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
@@ -1093,6 +1103,115 @@ mod tests {
             result2,
             "Requested result type Utf8 does not match arrays' data type Int32",
         );
+    }
+
+    #[test]
+    fn test_coalesce_arrays_first_no_nulls() {
+        // First array has no nulls - coalesce_arrays still works correctly
+        let arr1 = Arc::new(Int32Array::from(vec![1, 2, 3])); // No nulls
+        let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30]));
+
+        let result = coalesce_arrays(&[arr1.clone(), arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        // Result should be arr1's values (first non-null for each row)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 2);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_arrays_second_no_nulls() {
+        // First array has nulls, second has none
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30])); // No nulls
+
+        let result = coalesce_arrays(&[arr1, arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        // Row 0: 1 (from arr1), Row 1: 20 (from arr2), Row 2: 3 (from arr1)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 20);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_first() {
+        // Test the short-circuit optimization when first array has no nulls
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        // Create coalesce expression with column that has no nulls, followed by
+        // a reference to a non-existent column. If short-circuit works, the
+        // non-existent column is never evaluated and no error occurs.
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![
+                Expression::column(["a"]),
+                Expression::column(["nonexistent"]), // Would fail if evaluated
+            ],
+        );
+
+        // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result_array.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_second() {
+        // Test short-circuit when second array has no nulls (still needs coalesce)
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, false),
+        ]);
+        let a_values = Int32Array::from(vec![Some(1), None, Some(3)]); // Has nulls
+        let b_values = Int32Array::from(vec![10, 20, 30]); // No nulls
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(a_values), Arc::new(b_values)],
+        )
+        .unwrap();
+
+        // Create coalesce expression: a has nulls, b has none, c doesn't exist.
+        // Short-circuit should stop after evaluating b.
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![
+                Expression::column(["a"]),
+                Expression::column(["b"]),
+                Expression::column(["nonexistent"]), // Would fail if evaluated
+            ],
+        );
+
+        // Should coalesce a and b, never evaluate "nonexistent"
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        // Row 0: 1 (from a), Row 1: 20 (from b), Row 2: 3 (from a)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 20);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_type_mismatch() {
+        // Verify type validation works when short-circuiting
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![Expression::column(["a"])],
+        );
+
+        // Request STRING type but array is INT32 - should fail even with short-circuit
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
+        assert!(result.is_err());
     }
 
     #[test]
