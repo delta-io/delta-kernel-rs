@@ -1089,6 +1089,13 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
     }
     // Get the final batch out
     if let Some(batch) = decoder.flush()? {
+        if batch.num_rows() != json_strings.len() {
+            return Err(Error::Generic(format!(
+                "Unexpected number of rows decoded. Got {}, expected{}",
+                batch.num_rows(),
+                json_strings.len()
+            )));
+        }
         return Ok(batch);
     }
     Err(Error::generic(
