@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use itertools::Itertools;
+#[cfg(feature = "expr-serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::schema::derive_macro_utils::ToDataType;
@@ -11,7 +12,8 @@ use crate::schema::{ArrayType, DataType, DecimalType, MapType, PrimitiveType, St
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
 pub struct DecimalData {
     bits: i128,
     ty: DecimalType,
@@ -55,7 +57,8 @@ fn get_decimal_precision(value: i128) -> u8 {
     value.unsigned_abs().checked_ilog10().map_or(0, |p| p + 1) as _
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
 pub struct ArrayData {
     tpe: ArrayType,
     /// This exists currently for literal list comparisons, but should not be depended on see below
@@ -100,7 +103,8 @@ impl ArrayData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
 pub struct MapData {
     data_type: MapType,
     pairs: Vec<(Scalar, Scalar)>,
@@ -158,7 +162,8 @@ impl MapData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
 pub struct StructData {
     fields: Vec<StructField>,
     values: Vec<Scalar>,
@@ -219,7 +224,8 @@ impl StructData {
 ///
 /// NOTE: `PartialEq` uses physical (structural) comparison semantics.
 /// For SQL NULL semantics, use [`Scalar::logical_eq`] or [`Scalar::logical_partial_cmp`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "expr-serde", derive(Serialize, Deserialize))]
 pub enum Scalar {
     /// 32bit integer
     Integer(i32),
