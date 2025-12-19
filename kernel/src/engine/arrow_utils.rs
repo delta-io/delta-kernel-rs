@@ -1257,6 +1257,14 @@ mod tests {
         let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
 
+        let input: Vec<Option<&str>> = vec![Some("")];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("empty string");
+
+        let input: Vec<Option<&str>> = vec![Some(" \n\t")];
+        let result = parse_json_impl(&input.into(), requested_schema.clone());
+        result.expect_err("empty string");
+
         let input: Vec<Option<&str>> = vec![Some(r#""a""#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
         result.expect_err("invalid string");
@@ -1268,14 +1276,6 @@ mod tests {
         let input: Vec<Option<&str>> = vec![Some("{}{}")];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
         result.expect_err("this should be an error, multiple objects on one line");
-
-        let input: Vec<Option<&str>> = vec![Some("")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
-
-        let input: Vec<Option<&str>> = vec![Some(" \n\t")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        result.expect_err("empty string");
 
         let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
         let result = parse_json_impl(&input.into(), requested_schema.clone());
