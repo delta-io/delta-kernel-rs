@@ -6,10 +6,22 @@
 
 ### 🏗️ Breaking changes
 1. Error on surplus columns in output schema ([#1528])
-2. Remove `arrow-55` support ([#1507])
-3. Add read_parquet_schema API to ParquetHandler ([#1498])
-4. Add `write_parquet_file` to `ParquetHandler` ([#1392])
+2. Remove `arrow-55` support (upgrate to arrow 56 or 57 required) ([#1507])
+3. Add `read_parquet_schema` API to `ParquetHandler` ([#1498])
+4. Add `write_parquet_file` API to `ParquetHandler` ([#1392])
 5. Make PartialEq for Scalar a physical comparison ([#1554])
+> [!CAUTION]
+> Note this is a **breaking** behavior change. Code that previously relied on `PartialEq` as a
+> logical comparison will still compile, but its runtime behavior will silently change to perform
+> structural comparisons.
+> This change moves the current definition of `PartialEq` for `Scalar` to a new `Scalar::logical_eq`
+> method, and derives `PartialEq` (= physical comparison).
+> We also remove PartialOrd for Scalar because it, too, would become physical (required to match
+> PartialEq), and the result would be largely nonsensical. The logical comparison moves to
+> Scalar::logical_partial_cmp instead.
+> These changes are needed because today there's no reliable way to physically compare two scalars,
+> and most comparisons are physical in practice. Only predicate evaluation needs logical
+> comparisons, and that code already has a narrow waist.
 6. Expose mod time in scan metadata callbacks ([#1565])
 
 ### 🚀 Features / new APIs
