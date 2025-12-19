@@ -1087,7 +1087,7 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         let consumed = decoder.decode(line.as_bytes())?;
         if consumed != line.len() {
             return Err(Error::generic(
-                "Malformed JSON: Somehow the line decoded did not match what we consumed",
+                "Malformed JSON: There was an incomplete JSON object on the row {line:?}",
             ));
         }
     }
