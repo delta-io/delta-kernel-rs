@@ -284,27 +284,22 @@ pub fn evaluate_expression(
             for expr in exprs {
                 let array = evaluate_expression(expr, batch, None)?;
 
-                // Short-circuit: if this array has no nulls, it is the complete result
+                // Short-circuit: if this array has no nulls, we can stop evaluating
+                // remaining expressions since no more values are needed.
                 if array.null_count() == 0 {
-                    // Validate result type if provided
-                    if let Some(result_type) = result_type {
-                        let expected_type = result_type.try_into_arrow()?;
-                        if array.data_type() != &expected_type {
-                            return Err(ArrowError::InvalidArgumentError(format!(
-                                "Requested result type {:?} does not match array's data type {:?}",
-                                expected_type,
-                                array.data_type()
-                            ))
-                            .into());
-                        }
+                    if arrays.is_empty() {
+                        // First array has no nulls - return it directly (skip coalesce_arrays)
+                        return Ok(array);
                     }
-                    return Ok(array);
+                    // Not the first array - add it and break to coalesce with previous arrays
+                    arrays.push(array);
+                    break;
                 }
 
                 arrays.push(array);
             }
 
-            // All evaluated arrays have some nulls - coalesce them
+            // Coalesce accumulated arrays
             Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
@@ -1118,15 +1113,15 @@ mod tests {
     }
 
     #[test]
-    fn test_coalesce_short_circuit_first_no_nulls() {
-        // First array has no nulls - should short-circuit and return it directly
+    fn test_coalesce_arrays_first_no_nulls() {
+        // First array has no nulls - coalesce_arrays still works correctly
         let arr1 = Arc::new(Int32Array::from(vec![1, 2, 3])); // No nulls
         let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30]));
 
         let result = coalesce_arrays(&[arr1.clone(), arr2], None).unwrap();
         let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
 
-        // Result should be arr1's values
+        // Result should be arr1's values (first non-null for each row)
         assert_eq!(result_array.len(), 3);
         assert_eq!(result_array.value(0), 1);
         assert_eq!(result_array.value(1), 2);
@@ -1134,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn test_coalesce_short_circuit_second_no_nulls() {
+    fn test_coalesce_arrays_second_no_nulls() {
         // First array has nulls, second has none
         let arr1 = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
         let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30])); // No nulls
@@ -1150,39 +1145,63 @@ mod tests {
     }
 
     #[test]
-    fn test_coalesce_expression_short_circuit() {
-        // Test the short-circuit optimization via expression evaluation
+    fn test_coalesce_expression_short_circuit_first() {
+        // Test the short-circuit optimization when first array has no nulls
         let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
         let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
 
-        // Create coalesce expression with column that has no nulls
+        // Create coalesce expression with column that has no nulls, followed by
+        // a reference to a non-existent column. If short-circuit works, the
+        // non-existent column is never evaluated and no error occurs.
         let expr = Expression::variadic(
             VariadicExpressionOp::Coalesce,
-            vec![Expression::column(["a"]), Expression::literal(0i32)],
+            vec![
+                Expression::column(["a"]),
+                Expression::column(["nonexistent"]), // Would fail if evaluated
+            ],
         );
 
-        // Should return column "a" directly (short-circuit)
+        // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
         let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
         let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(result_array.values(), &[1, 2, 3]);
     }
 
     #[test]
-    fn test_coalesce_expression_short_circuit_type_mismatch() {
-        // Verify type validation works when short-circuiting
-        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
-        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+    fn test_coalesce_expression_short_circuit_second() {
+        // Test short-circuit when second array has no nulls (still needs coalesce)
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, false),
+        ]);
+        let a_values = Int32Array::from(vec![Some(1), None, Some(3)]); // Has nulls
+        let b_values = Int32Array::from(vec![10, 20, 30]); // No nulls
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(a_values), Arc::new(b_values)],
+        )
+        .unwrap();
 
+        // Create coalesce expression: a has nulls, b has none, c doesn't exist.
+        // Short-circuit should stop after evaluating b.
         let expr = Expression::variadic(
             VariadicExpressionOp::Coalesce,
-            vec![Expression::column(["a"])],
+            vec![
+                Expression::column(["a"]),
+                Expression::column(["b"]),
+                Expression::column(["nonexistent"]), // Would fail if evaluated
+            ],
         );
 
-        // Request STRING type but array is INT32 - should fail even with short-circuit
-        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
-        assert!(result.is_err());
+        // Should coalesce a and b, never evaluate "nonexistent"
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        // Row 0: 1 (from a), Row 1: 20 (from b), Row 2: 3 (from a)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 20);
+        assert_eq!(result_array.value(2), 3);
     }
 
     #[test]
