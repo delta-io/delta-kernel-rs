@@ -1075,19 +1075,19 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         .with_batch_size(json_strings.len())
         .build_decoder()?;
 
-    for (idx, json) in json_strings.iter().enumerate() {
+    for (json, row_number) in json_strings.iter().zip(1..) {
         let line = json.unwrap_or("{}");
         let consumed = decoder.decode(line.as_bytes())?;
         // did we fail to decode the whole line, or was the line partial
         if consumed != line.len() || decoder.has_partial_record() {
             return Err(Error::Generic(format!(
-                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {idx}"
+                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
             )));
         }
         // did we decode exactly one record
-        if decoder.len() - idx != 1 {
+        if decoder.len() != row_number {
             return Err(Error::Generic(format!(
-                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {idx}"
+                "Malformed JSON: Multiple, partial, or 0 JSON objects on row {row_number}"
             )));
         }
     }
