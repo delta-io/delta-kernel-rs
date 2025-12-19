@@ -49,6 +49,7 @@ example of the change needed [here][change2]. ([#1565])
 12. Distributed Log Replay Sequential Phase ([#1502])
 13. Passing schema from C, plus example/tests in C ([#1535])
 14. Support sidecar in inspect-table ([#1566])
+15. short-circuit coalesce evaluation when array has no nulls ([#1568])
 
 ### 🐛 Bug Fixes
 
@@ -107,6 +108,7 @@ example of the change needed [here][change2]. ([#1565])
 [#1566]: https://github.com/delta-io/delta-kernel-rs/pull/1566
 [#1562]: https://github.com/delta-io/delta-kernel-rs/pull/1562
 [#1561]: https://github.com/delta-io/delta-kernel-rs/pull/1561
+[#1568]: https://github.com/delta-io/delta-kernel-rs/pull/1568
 
 
 ## [v0.18.2](https://github.com/delta-io/delta-kernel-rs/tree/v0.18.2/) (2025-12-03)
