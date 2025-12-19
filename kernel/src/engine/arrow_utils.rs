@@ -1278,7 +1278,7 @@ mod tests {
             vec![Some(r#"{ "a": 1"#)],
             vec![Some("{}{}")],
             vec![Some(r#"{} { "a": 1"#)],
-            vec![Some(r#"{} { "a": 1"#)],
+            vec![Some(r#"{} { "a": 1"#),Some("}")],
             vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)],
         ] {
             check_parse_fails(input, requested_schema.clone(), EXPECTED_JSON_ERR_STR);
