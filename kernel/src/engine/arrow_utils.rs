@@ -1249,14 +1249,18 @@ mod tests {
     #[test]
     fn test_json_parsing() {
         static EXPECTED_JSON_ERR_STR: &str = "Generic delta kernel error: Malformed JSON: Multiple, partial, or 0 JSON objects on row";
-        fn ensure_err(result: DeltaResult<RecordBatch>, expected_start: &str) {
+        fn check_parse_fails(
+            input: Vec<Option<&str>>,
+            schema: ArrowSchemaRef,
+            expected_start: &str,
+        ) {
+            let result = parse_json_impl(&input.into(), schema);
             let err = result.expect_err("Expected an error");
             let msg = err.to_string();
-            println!("msg {msg}");
             assert!(
                 msg.starts_with(expected_start),
                 "Error message was not what was expected"
-            )
+            );
         }
 
         let requested_schema = Arc::new(ArrowSchema::new(vec![
@@ -1268,34 +1272,24 @@ mod tests {
         let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
         assert_eq!(result.num_rows(), 0);
 
-        let input: Vec<Option<&str>> = vec![Some("")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        ensure_err(result, EXPECTED_JSON_ERR_STR);
+        for input in [
+            vec![Some("")],
+            vec![Some(" \n\t")],
+            vec![Some(r#"{ "a": 1"#)],
+            vec![Some("{}{}")],
+            vec![Some(r#"{} { "a": 1"#)],
+            vec![Some(r#"{} { "a": 1"#)],
+            vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)],
+        ] {
+            check_parse_fails(input, requested_schema.clone(), EXPECTED_JSON_ERR_STR);
+        }
 
-        let input: Vec<Option<&str>> = vec![Some(" \n\t")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        ensure_err(result, EXPECTED_JSON_ERR_STR);
-
-        let input: Vec<Option<&str>> = vec![Some(r#""a""#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
         // this one is an error from within the tape decoder, so has a different format
-        ensure_err(result, "Json error: expected { got \"a\"");
-
-        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        ensure_err(result, EXPECTED_JSON_ERR_STR);
-
-        let input: Vec<Option<&str>> = vec![Some("{}{}")];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        ensure_err(result, EXPECTED_JSON_ERR_STR);
-
-        let input: Vec<Option<&str>> = vec![Some(r#"{} { "a": 1"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        ensure_err(result, EXPECTED_JSON_ERR_STR);
-
-        let input: Vec<Option<&str>> = vec![Some(r#"{ "a": 1"#), Some(r#", "b": "b"}"#)];
-        let result = parse_json_impl(&input.into(), requested_schema.clone());
-        ensure_err(result, EXPECTED_JSON_ERR_STR);
+        check_parse_fails(
+            vec![Some(r#""a""#)],
+            requested_schema.clone(),
+            "Json error: expected { got \"a\"",
+        );
 
         let input: Vec<Option<&str>> = vec![None, Some(r#"{"a": 1, "b": "2", "c": 3}"#), None];
         let result = parse_json_impl(&input.into(), requested_schema.clone()).unwrap();
