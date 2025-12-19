@@ -1073,32 +1073,19 @@ fn parse_json_impl(json_strings: &StringArray, schema: ArrowSchemaRef) -> DeltaR
         .with_batch_size(json_strings.len())
         .build_decoder()?;
 
-    for json in json_strings {
-        let line = json.unwrap_or("{}").trim();
-        if decoder.has_partial_record() {
+    for (idx, json) in json_strings.iter().enumerate() {
+        let line = json.unwrap_or("{}");
+        let consumed = decoder.decode(line.as_bytes())?;
+        // did we fail to decode the whole line, or was the line partial
+        if consumed != line.len() || decoder.has_partial_record() {
+            return Err(Error::generic("Malformed JSON: There was an incomplete JSON object on the row {idx:?}"));
+        }
+        // did we decode more than one record
+        if decoder.len() - idx != 1 {
             return Err(Error::generic("Malformed JSON: Multiple JSON objects"));
         }
-        if line.is_empty() {
-            return Err(Error::missing_data(
-                "Malformed JSON: I don't know what to do with an empty string! {line:?}",
-            ));
-        }
-
-        let consumed = decoder.decode(line.as_bytes())?;
-        if consumed != line.len() {
-            return Err(Error::generic(
-                "Malformed JSON: There was an incomplete JSON object on the row {line:?}",
-            ));
-        }
     }
-
-    if decoder.has_partial_record() {
-        return Err(Error::generic(
-            "Malformed JSON: Partial record still to parse?",
-        ));
-    }
-
-    // Ensure any remaining batches in the decoder are flushed before dropping
+    // Get the final batch out
     if let Some(batch) = decoder.flush()? {
         return Ok(batch);
     }
