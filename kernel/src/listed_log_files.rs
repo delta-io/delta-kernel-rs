@@ -256,11 +256,6 @@ impl ListedLogFiles {
         &self.latest_commit_file
     }
 
-    #[allow(dead_code)] // Currently only used in tests
-    pub(crate) fn into_latest_crc_file(self) -> Option<ParsedLogPath> {
-        self.latest_crc_file
-    }
-
     /// List all commits between the provided `start_version` (inclusive) and `end_version`
     /// (inclusive). All other types are ignored.
     pub(crate) fn list_commits(
