@@ -1,0 +1,21 @@
+# Binaries
+examples/delta-example
+bin
+*.exe
+*.test
+
+# Go build cache
+*.so
+*.dylib
+*.dll
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

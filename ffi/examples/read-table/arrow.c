@@ -163,6 +163,46 @@ static void visit_read_data(void* vcontext, ExclusiveEngineData* data)
   free(arrow_data); // just frees the struct, the data and schema are freed/owned by add_batch_to_context
 }
 
+static bool starts_with_n(const char *pre, size_t lenpre, const char *str, size_t lenstr)
+{
+    if (lenstr < lenpre) return false;
+    return memcmp(pre, str, lenpre) == 0;
+}
+
+typedef struct {
+    char *ptr;
+    size_t len;
+} FullPath;
+
+static FullPath make_full_path(const char *root, const char *path_ptr, size_t path_len)
+{
+    FullPath out;
+
+    size_t root_len = strlen(root);
+
+    /* Case 1: path already starts with table_root prefix → return just path */
+    if (starts_with_n(root, root_len, path_ptr, path_len)) {
+        char *res = malloc(path_len + 1);
+        memcpy(res, path_ptr, path_len);
+        res[path_len] = '\0';
+        out.ptr = res;
+        out.len = path_len;
+        return out;
+    }
+
+    /* Case 2: join them → root + path */
+    size_t total_len = root_len + path_len;
+    char *res = malloc(total_len + 1);
+
+    memcpy(res, root, root_len);
+    memcpy(res + root_len, path_ptr, path_len);
+
+    res[total_len] = '\0';
+    out.ptr = res;
+    out.len = path_len;
+    return out;
+}
+
 // We call this for each file we get called back to read in read_table.c::visit_callback
 void c_read_parquet_file(
   struct EngineContext* context,
@@ -170,17 +210,15 @@ void c_read_parquet_file(
   const KernelBoolSlice selection_vector,
   const Expression* transform)
 {
-  int full_len = strlen(context->table_root) + path.len + 1;
-  char* full_path = malloc(sizeof(char) * full_len);
-  snprintf(full_path, full_len, "%s%.*s", context->table_root, (int)path.len, path.ptr);
-  print_diag("  Reading parquet file at %s\n", full_path);
-  KernelStringSlice path_slice = { full_path, full_len };
+  FullPath path_slice = make_full_path(context->table_root, path.ptr, path.len);
+  print_diag("  Reading parquet file at %s\n", path_slice.ptr);
+
   FileMeta meta = {
-    .path = path_slice,
+    .path = { path_slice.ptr, path_slice.len },
   };
   ExternResultHandleExclusiveFileReadResultIterator read_res =
     read_parquet_file(context->engine, &meta, context->physical_schema);
-  free(full_path);
+  free(path_slice.ptr);
   if (read_res.tag != OkHandleExclusiveFileReadResultIterator) {
     print_error("Couldn't read data.", (Error*) read_res.err);
     free_error((Error*)read_res.err);
