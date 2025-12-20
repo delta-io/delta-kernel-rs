@@ -8,7 +8,7 @@ use crate::engine_data::GetData;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType};
 use crate::utils::require;
-use crate::{DeltaResult, Error, RowVisitor};
+use crate::{DeltaResult, Engine, Error, FileMeta, RowVisitor};
 use delta_kernel_derive::ToSchema;
 
 /// Though technically not an action, we include the CRC (version checksum) file here. A [CRC file]
@@ -18,7 +18,6 @@ use delta_kernel_derive::ToSchema;
 /// 3. Contain exactly one JSON object with the schema of this [`Crc`] struct.
 ///
 /// [CRC file]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#version-checksum-file
-#[allow(unused)] // TODO: remove after we complete CRC support
 #[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub(crate) struct Crc {
     /// A unique identifier for the transaction that produced this commit.
@@ -94,14 +93,41 @@ pub(crate) struct DeletedRecordCountsHistogram {
     pub(crate) deleted_record_counts: Vec<i64>,
 }
 
+/// Attempt to read Protocol and Metadata from a CRC file. This will return an error if
+/// protocol/metadata cannot be found in the CRC file (specification requires both to be
+/// present).
+pub(crate) fn try_protocol_metadata_from_crc(
+    path: FileMeta,
+    engine: &dyn Engine,
+) -> DeltaResult<(Protocol, Metadata)> {
+    let json_handler = engine.json_handler();
+    let crc_schema = Crc::to_schema().into();
+
+    let mut crc_data = json_handler.read_json_files(&[path], crc_schema, None)?;
+    let crc_batch = crc_data.next().ok_or(Error::generic(
+        "CRC file should contain exactly one JSON object (and therefore one batch)",
+    ))?;
+
+    let mut visitor = CrcProtocolMetadataVisitor::default();
+    visitor.visit_rows_of(crc_batch?.as_ref())?;
+    // note that if protocol/metadata are missing the visitor we return an error here
+    Ok((
+        visitor
+            .protocol
+            .ok_or(Error::generic("Protocol not found in CRC file"))?,
+        visitor
+            .metadata
+            .ok_or(Error::generic("Metadata not found in CRC file"))?,
+    ))
+}
+
 /// For now we just define a visitor for Protocol and Metadata in CRC files since (for now) that's
 /// the only optimization we implement. Since CRC files can contain lots of other data, we have a
 /// specific visitor for only Protocol/Metadata here.
-#[allow(unused)] // TODO: remove after we read CRCs
 #[derive(Debug, Default)]
 pub(crate) struct CrcProtocolMetadataVisitor {
-    pub(crate) protocol: Protocol,
-    pub(crate) metadata: Metadata,
+    pub(crate) protocol: Option<Protocol>,
+    pub(crate) metadata: Option<Metadata>,
 }
 
 impl RowVisitor for CrcProtocolMetadataVisitor {
@@ -130,10 +156,8 @@ impl RowVisitor for CrcProtocolMetadataVisitor {
             )));
         }
 
-        self.metadata = visit_metadata_at(0, &getters[..9])?
-            .ok_or(Error::generic("Metadata not found in CRC file"))?;
-        self.protocol = visit_protocol_at(0, &getters[9..])?
-            .ok_or(Error::generic("Protocol not found in CRC file"))?;
+        self.metadata = visit_metadata_at(0, &getters[..9])?;
+        self.protocol = visit_protocol_at(0, &getters[9..])?;
         Ok(())
     }
 }
@@ -147,12 +171,19 @@ mod tests {
     use crate::arrow::array::StringArray;
 
     use crate::actions::{Format, Metadata, Protocol};
+    use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::schema::derive_macro_utils::ToDataType as _;
     use crate::schema::{ArrayType, DataType, StructField, StructType};
     use crate::table_features::TableFeature;
     use crate::utils::test_utils::string_array_to_engine_data;
     use crate::Engine;
+
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
+
+    use url::Url;
 
     #[test]
     fn test_file_size_histogram_schema() {
@@ -271,7 +302,112 @@ mod tests {
             ]),
         };
 
-        assert_eq!(visitor.protocol, expected_protocol);
-        assert_eq!(visitor.metadata, expected_metadata);
+        assert_eq!(visitor.protocol, Some(expected_protocol));
+        assert_eq!(visitor.metadata, Some(expected_metadata));
+    }
+
+    #[tokio::test]
+    async fn pm_try_new() {
+        let crc_json = serde_json::json!({
+            "tableSizeBytes": 100,
+            "numFiles": 10,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": {
+                "id": "testId",
+                "format": {
+                    "provider": "parquet",
+                    "options": {}
+                },
+                "schemaString": r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#,
+                "partitionColumns": [],
+                "configuration": {
+                    "delta.columnMapping.mode": "none"
+                },
+                "createdTime": 1677811175
+            },
+            "protocol": {
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["columnMapping"],
+                "writerFeatures": ["columnMapping"]
+            }
+        });
+
+        let json = crc_json.to_string().into_bytes();
+        let store = Arc::new(InMemory::new());
+        let engine = Arc::new(DefaultEngine::new(store.clone()));
+        let path = "/00000000000000000001.crc";
+        // put the file into an in-memory object store
+        store.put(&Path::from(path), json.into()).await.unwrap();
+
+        use futures::StreamExt as _;
+        let mut list_stream = store.list(None);
+
+        while let Some(meta) = list_stream.next().await.transpose().unwrap() {
+            println!("meta: {meta:?}");
+        }
+
+        let url = "memory:///00000000000000000001.crc";
+        let file = FileMeta::new(Url::parse(url).unwrap(), 0, 0);
+        let (protocol, metadata) = try_protocol_metadata_from_crc(file, engine.as_ref()).unwrap();
+
+        let expected_protocol = Protocol {
+            min_reader_version: 3,
+            min_writer_version: 7,
+            reader_features: Some(vec![TableFeature::ColumnMapping]),
+            writer_features: Some(vec![TableFeature::ColumnMapping]),
+        };
+        let expected_metadata = Metadata {
+            id: "testId".to_string(),
+            name: None,
+            description: None,
+            format: Format {
+                provider: "parquet".to_string(),
+                options: std::collections::HashMap::new(),
+            },
+            schema_string: r#"{"type":"struct","fields":[{"name":"value","type":"integer","nullable":true,"metadata":{}}]}"#.to_string(),
+            partition_columns: vec![],
+            created_time: Some(1677811175),
+            configuration: std::collections::HashMap::from([
+                ("delta.columnMapping.mode".to_string(), "none".to_string()),
+            ]),
+        };
+
+        assert_eq!(protocol, expected_protocol);
+        assert_eq!(metadata, expected_metadata);
+    }
+
+    #[tokio::test]
+    async fn pm_try_new_fails_when_missing() {
+        // create CRC without protocol/metadata
+        let crc_json = serde_json::json!({
+            "tableSizeBytes": 100,
+            "numFiles": 10,
+        });
+
+        let json = crc_json.to_string().into_bytes();
+        let store = Arc::new(InMemory::new());
+        let engine = Arc::new(DefaultEngine::new(store.clone()));
+        let path = "/00000000000000000001.crc";
+        // put the file into an in-memory object store
+        store.put(&Path::from(path), json.into()).await.unwrap();
+
+        use futures::StreamExt as _;
+        let mut list_stream = store.list(None);
+
+        while let Some(meta) = list_stream.next().await.transpose().unwrap() {
+            println!("meta: {meta:?}");
+        }
+
+        let url = "memory:///00000000000000000001.crc";
+        let file = FileMeta::new(Url::parse(url).unwrap(), 0, 0);
+        let res = try_protocol_metadata_from_crc(file, engine.as_ref());
+
+        // TODO: should check the actual error - this currently errors like
+        // "Arrow(JsonError("whilst decoding field 'metadata': expected { got null"))"
+        // In the future we should leverage better 'Engine Errors' to propogate an error coming
+        // from the json reader like "EngineError(JsonError("Metadata field not found in xx file"))"
+        assert!(res.is_err());
     }
 }
