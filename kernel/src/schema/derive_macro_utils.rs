@@ -123,3 +123,10 @@ impl<T: ToNullableContainerType> GetNullableContainerStructField for T {
         StructField::not_null(name, T::to_nullable_container_type())
     }
 }
+
+// Blanket impl for nullable fields of all container types with nullable values
+impl<T: ToNullableContainerType> GetNullableContainerStructField for Option<T> {
+    fn get_nullable_container_struct_field(name: impl Into<String>) -> StructField {
+        StructField::nullable(name, T::to_nullable_container_type())
+    }
+}
