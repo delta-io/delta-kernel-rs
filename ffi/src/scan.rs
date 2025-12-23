@@ -380,12 +380,21 @@ pub unsafe extern "C" fn get_from_string_map(
     map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
-) -> NullableCvoid {
-    // TODO: Return ExternResult to caller instead of panicking?
-    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    map.values
-        .get(string_key.unwrap())
-        .and_then(|v| allocate_fn(kernel_string_slice!(v)))
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<NullableCvoid> {
+    let engine = unsafe { engine.as_ref() };
+    get_from_string_map_impl(map, key, allocate_fn).into_extern_result(&engine)
+}
+fn get_from_string_map_impl(
+    map: &CStringMap,
+    key: KernelStringSlice,
+    allocate_fn: AllocateStringFn,
+) -> DeltaResult<NullableCvoid> {
+    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
+    Ok(map
+        .values
+        .get(string_key)
+        .and_then(|v| allocate_fn(kernel_string_slice!(v))))
 }
 
 /// Visit all values in a CStringMap. The callback will be called once for each element of the map
