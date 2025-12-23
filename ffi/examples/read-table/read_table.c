@@ -31,7 +31,13 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
   for (uintptr_t i = 0; i < context->partition_cols->len; i++) {
     char* col = context->partition_cols->cols[i];
     KernelStringSlice key = { col, strlen(col) };
-    char* partition_val = get_from_string_map(partition_values, key, allocate_string);
+    ExternResultNullableCvoid res = get_from_string_map(partition_values, key, allocate_string, context->engine);
+    if (res.tag != OkNullableCvoid) {
+      print_error("Failed to get from string map.", (Error*)res.err);
+      free_error((Error*)res.err);
+      continue;
+    }
+    char* partition_val = res.ok;
     if (partition_val) {
       print_diag("  partition '%s' here: %s\n", col, partition_val);
       free(partition_val);
@@ -306,7 +312,7 @@ int main(int argc, char* argv[])
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
 
-  CSchema *cschema = get_cschema(snapshot);
+  CSchema *cschema = get_cschema(snapshot, engine);
   print_cschema(cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
