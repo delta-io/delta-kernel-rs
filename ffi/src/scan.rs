@@ -380,12 +380,21 @@ pub unsafe extern "C" fn get_from_string_map(
     map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
-) -> NullableCvoid {
-    // TODO: Return ExternResult to caller instead of panicking?
-    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    map.values
-        .get(string_key.unwrap())
-        .and_then(|v| allocate_fn(kernel_string_slice!(v)))
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<NullableCvoid> {
+    let engine = unsafe { engine.as_ref() };
+    get_from_string_map_impl(map, key, allocate_fn).into_extern_result(&engine)
+}
+fn get_from_string_map_impl(
+    map: &CStringMap,
+    key: KernelStringSlice,
+    allocate_fn: AllocateStringFn,
+) -> DeltaResult<NullableCvoid> {
+    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
+    Ok(map
+        .values
+        .get(string_key)
+        .and_then(|v| allocate_fn(kernel_string_slice!(v))))
 }
 
 /// Visit all values in a CStringMap. The callback will be called once for each element of the map
@@ -540,19 +549,25 @@ struct ContextWrapper {
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_metadata(
     scan_metadata: Handle<SharedScanMetadata>,
+    engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
     callback: CScanCallback,
-) {
+) -> ExternResult<bool> {
     let scan_metadata = unsafe { scan_metadata.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    visit_scan_metadata_impl(scan_metadata, engine_context, callback).into_extern_result(&engine)
+}
+fn visit_scan_metadata_impl(
+    scan_metadata: &ScanMetadata,
+    engine_context: NullableCvoid,
+    callback: CScanCallback,
+) -> DeltaResult<bool> {
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
     };
-
-    // TODO: return ExternResult to caller instead of panicking?
-    scan_metadata
-        .visit_scan_files(context_wrapper, rust_callback)
-        .unwrap();
+    scan_metadata.visit_scan_files(context_wrapper, rust_callback)?;
+    Ok(true)
 }
 
 #[cfg(test)]
