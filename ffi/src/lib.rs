@@ -2,6 +2,10 @@
 //!
 //! Exposes that an engine needs to call from C/C++ to interface with kernel
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// we re-allow panics in tests
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 #[cfg(feature = "default-engine-base")]
 use std::collections::HashMap;
 use std::default::Default;
