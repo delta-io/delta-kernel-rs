@@ -549,19 +549,25 @@ struct ContextWrapper {
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_metadata(
     scan_metadata: Handle<SharedScanMetadata>,
+    engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
     callback: CScanCallback,
-) {
+) -> ExternResult<bool> {
     let scan_metadata = unsafe { scan_metadata.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    visit_scan_metadata_impl(scan_metadata, engine_context, callback).into_extern_result(&engine)
+}
+fn visit_scan_metadata_impl(
+    scan_metadata: &ScanMetadata,
+    engine_context: NullableCvoid,
+    callback: CScanCallback,
+) -> DeltaResult<bool> {
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
     };
-
-    // TODO: return ExternResult to caller instead of panicking?
-    scan_metadata
-        .visit_scan_files(context_wrapper, rust_callback)
-        .unwrap();
+    scan_metadata.visit_scan_files(context_wrapper, rust_callback)?;
+    Ok(true)
 }
 
 #[cfg(test)]
