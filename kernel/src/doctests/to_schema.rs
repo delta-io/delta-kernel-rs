@@ -62,4 +62,3 @@ pub struct MacroTestStructWithInvalidAttributeTarget;
 /// ```
 #[cfg(doctest)]
 pub struct MacroTestStructWithInvalidFieldType;
-
