@@ -1453,7 +1453,7 @@ async fn test_list_log_files_with_version() -> DeltaResult<()> {
         Some(0),
         None,
     )?;
-    let latest_crc = result.latest_crc_file.unwrap();
+    let latest_crc = result.into_parts().3.unwrap();
     assert_eq!(
         latest_crc.location.location.path(),
         "/_delta_log/00000000000000000001.crc".to_string()
