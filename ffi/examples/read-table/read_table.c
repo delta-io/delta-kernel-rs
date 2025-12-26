@@ -117,7 +117,11 @@ void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_
 
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
-  visit_scan_metadata(scan_metadata, engine_context, scan_row_callback);
+  ExternResultNullableCvoid result = visit_scan_metadata(scan_metadata, context->engine, engine_context, scan_row_callback);
+  if (result.tag != OkNullableCvoid) {
+    printf("Error visiting scan metadata\n");
+    exit(-1);
+  }
   free_bool_slice(selection_vector);
   free_scan_metadata(scan_metadata);
 }
