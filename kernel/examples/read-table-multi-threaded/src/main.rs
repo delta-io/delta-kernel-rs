@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
@@ -10,7 +9,7 @@ use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
 
@@ -52,7 +51,7 @@ fn main() -> ExitCode {
 
 // the way we as a connector represent data to scan. this is computed from the raw data returned
 // from the scan, and could be any format the engine chooses to use to facilitate distributing work.
-struct ScanFile {
+struct FileToScan {
     path: String,
     size: i64,
     transform: Option<ExpressionRef>,
@@ -60,20 +59,12 @@ struct ScanFile {
 }
 
 // This is the callback that will be called for each valid scan row
-fn send_scan_file(
-    scan_tx: &mut spmc::Sender<ScanFile>,
-    path: &str,
-    size: i64,
-    _stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    _: HashMap<String, String>,
-) {
-    let scan_file = ScanFile {
-        path: path.to_string(),
-        size,
-        transform,
-        dv_info,
+fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) {
+    let scan_file = FileToScan {
+        path: scan_file.path.to_string(),
+        size: scan_file.size,
+        transform: scan_file.transform,
+        dv_info: scan_file.dv_info,
     };
     scan_tx.send(scan_file).unwrap();
 }
@@ -174,7 +165,7 @@ fn do_work(
     engine: &dyn Engine,
     scan_state: Arc<ScanState>,
     record_batch_tx: Sender<RecordBatch>,
-    scan_file_rx: spmc::Receiver<ScanFile>,
+    scan_file_rx: spmc::Receiver<FileToScan>,
 ) {
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
