@@ -50,7 +50,7 @@ pub fn extract_kernel_schema(
         .elements
         .take(schema_id)
         .ok_or_else(|| Error::schema("Nonexistent id passed to extract_kernel_schema"))?;
-    let DataType::Struct(struct_type) = schema_element.data_type else {
+    let DataType::Struct(struct_type) = schema_element.data_type() else {
         warn!("Final returned id was not a struct, schema is invalid");
         return Err(Error::schema(
             "Final returned id was not a struct, schema is invalid",
@@ -62,7 +62,7 @@ pub fn extract_kernel_schema(
             "Didn't consume all visited fields, schema is invalid.",
         ))
     } else {
-        Ok(*struct_type)
+        Ok(*struct_type.clone())
     }
 }
 
@@ -441,7 +441,10 @@ fn visit_field_array_impl(
         ))
     })?;
 
-    let array_type = ArrayType::new(element_field.data_type, element_field.nullable);
+    let array_type = ArrayType::new(
+        element_field.data_type().clone(),
+        element_field.is_nullable(),
+    );
     let field = StructField::new(name_str, array_type, nullable);
     Ok(wrap_field(state, field))
 }
@@ -483,7 +486,7 @@ fn visit_field_map_impl(
     let key_field = unwrap_field(state, key_type_id)
         .ok_or_else(|| Error::generic(format!("Invalid key type ID {key_type_id} for map")))?;
 
-    if key_field.nullable {
+    if key_field.is_nullable() {
         return Err(Error::generic("Delta Map keys may not be nullable"));
     }
 
@@ -491,9 +494,9 @@ fn visit_field_map_impl(
         .ok_or_else(|| Error::generic(format!("Invalid value type ID {value_type_id} for map")))?;
 
     let map_type = MapType::new(
-        key_field.data_type,
-        value_field.data_type,
-        value_field.nullable,
+        key_field.data_type().clone(),
+        value_field.data_type().clone(),
+        value_field.is_nullable(),
     );
     let field = StructField::new(name_str, map_type, nullable);
     Ok(wrap_field(state, field))
@@ -539,15 +542,17 @@ fn create_variant_data_type(
     state: &mut KernelSchemaVisitorState,
     struct_type_id: usize,
 ) -> DeltaResult<DataType> {
-    let Some(DataType::Struct(variant_struct)) =
-        state.elements.take(struct_type_id).map(|f| f.data_type)
+    let Some(DataType::Struct(variant_struct)) = state
+        .elements
+        .take(struct_type_id)
+        .map(|f| f.data_type().clone())
     else {
         return Err(Error::generic(format!(
             "Invalid variant struct ID {} - must be DataType::Struct",
             struct_type_id
         )));
     };
-    Ok(DataType::Variant(variant_struct))
+    Ok(DataType::Variant(variant_struct.clone()))
 }
 
 #[cfg(test)]
