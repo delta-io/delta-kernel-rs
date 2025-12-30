@@ -186,7 +186,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         require!(
-            getters.len() == 13,
+            getters.len() == 14,
             Error::InternalError(format!(
                 "Wrong number of ScanFileVisitor getters: {}",
                 getters.len()
@@ -201,7 +201,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
             if let Some(path) = getters[0].get_opt(row_index, "scanFile.path")? {
                 let size = getters[1].get(row_index, "scanFile.size")?;
                 let modification_time: i64 = getters[2].get(row_index, "add.modificationTime")?;
-                let stats: Option<String> = getters[3].get_opt(row_index, "scanFile.stats")?;
+                let stats: Option<String> = getters[4].get_opt(row_index, "scanFile.stats")?;
                 let stats: Option<Stats> =
                     stats.and_then(|json| match serde_json::from_str(json.as_str()) {
                         Ok(stats) => Some(stats),
@@ -217,7 +217,7 @@ impl<T> RowVisitor for ScanFileVisitor<'_, T> {
                 let deletion_vector = visit_deletion_vector_at(row_index, &getters[dv_index..])?;
                 let dv_info = DvInfo { deletion_vector };
                 let partition_values =
-                    getters[9].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
+                    getters[10].get(row_index, "scanFile.fileConstantValues.partitionValues")?;
                 let scan_file = ScanFile {
                     path,
                     size,

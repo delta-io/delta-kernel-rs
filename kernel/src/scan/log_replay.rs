@@ -288,7 +288,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
         StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
         StructField::nullable(
-            "tags",
+            TAGS_NAME,
             MapType::new(
                 DataType::STRING,
                 DataType::STRING,
@@ -300,6 +300,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable("path", DataType::STRING),
         StructField::nullable("size", DataType::LONG),
         StructField::nullable("modificationTime", DataType::LONG),
+        StructField::nullable("dataChange", DataType::BOOLEAN),
         StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
         StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
@@ -316,6 +317,7 @@ fn get_add_transform_expr() -> ExpressionRef {
             column_expr_ref!("add.path"),
             column_expr_ref!("add.size"),
             column_expr_ref!("add.modificationTime"),
+            column_expr_ref!("add.dataChange"),
             column_expr_ref!("add.stats"),
             column_expr_ref!("add.deletionVector"),
             Arc::new(Expression::Struct(vec![
@@ -340,6 +342,7 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("fileConstantValues.partitionValues"),
                 column_expr_ref!("size"),
                 column_expr_ref!("modificationTime"),
+                column_expr_ref!("dataChange"),
                 column_expr_ref!("stats"),
                 column_expr_ref!("fileConstantValues.tags"),
                 column_expr_ref!("deletionVector"),

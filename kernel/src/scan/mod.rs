@@ -470,6 +470,7 @@ impl Scan {
                     StructField::not_null("partitionValues", partition_values),
                     StructField::not_null("size", DataType::LONG),
                     StructField::nullable("modificationTime", DataType::LONG),
+                    StructField::nullable("dataChange", DataType::BOOLEAN),
                     StructField::nullable("stats", DataType::STRING),
                     StructField::nullable(
                         "tags",
@@ -683,6 +684,7 @@ impl Scan {
 ///    path: string,
 ///    size: long,
 ///    modificationTime: long,
+///    dataChange: bool,
 ///    stats: string,
 ///    deletionVector: {
 ///      storageType: string,

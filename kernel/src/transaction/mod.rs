@@ -526,7 +526,7 @@ impl Transaction {
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
     pub fn add_files_schema(&self) -> &'static SchemaRef {
-        &BASE_ADD_FILES_SCHEMA
+        &ADD_FILES_SCHEMA_WITH_DATA_CHANGE
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -1094,6 +1094,7 @@ mod tests {
             ),
             StructField::not_null("size", DataType::LONG),
             StructField::not_null("modificationTime", DataType::LONG),
+            StructField::not_null("dataChange", DataType::BOOLEAN),
             StructField::nullable(
                 "stats",
                 DataType::struct_type_unchecked(vec![StructField::nullable(
