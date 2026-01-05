@@ -92,17 +92,95 @@ pub struct DefaultEngine<E: TaskExecutor> {
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
+/// Builder for creating [`DefaultEngine`] instances.
+///
+/// # Example
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use delta_kernel::engine::default::DefaultEngineBuilder;
+/// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
+/// # use object_store::local::LocalFileSystem;
+/// // Build a DefaultEngine
+/// let engine = DefaultEngineBuilder::new(
+///     Arc::new(LocalFileSystem::new()),
+///     Arc::new(TokioBackgroundExecutor::new()),
+/// )
+/// .build();
+///
+/// // Or via convenience method on DefaultEngine (uses default executor)
+/// # use delta_kernel::engine::default::DefaultEngine;
+/// let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new()))
+///     .build();
+/// ```
+#[derive(Debug)]
+pub struct DefaultEngineBuilder<E: TaskExecutor = executor::tokio::TokioBackgroundExecutor> {
+    object_store: Arc<DynObjectStore>,
+    task_executor: Option<Arc<E>>,
+    metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+}
+
+impl<E: TaskExecutor> DefaultEngineBuilder<E> {
+    /// Create a new [`DefaultEngineBuilder`] instance.
+    ///
+    /// # Parameters
+    ///
+    /// - `object_store`: The object store to use.
+    /// - `task_executor`: The executor to use for async tasks.
+    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+        Self {
+            object_store,
+            task_executor: Some(task_executor),
+            metrics_reporter: None,
+        }
+    }
+
+    /// Set a metrics reporter for the engine.
+    ///
+    /// # Parameters
+    ///
+    /// - `reporter`: An implementation of the [`MetricsReporter`] trait.
+    pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
+        self.metrics_reporter = Some(reporter);
+        self
+    }
+
+    /// Build the [`DefaultEngine`].
+    pub fn build(self) -> DefaultEngine<E> {
+        DefaultEngine::new_with_opts(
+            self.object_store,
+            self.task_executor.expect("task_executor is set in new()"),
+            self.metrics_reporter,
+        )
+    }
+}
+
 impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     /// Create a new [`DefaultEngine`] instance with the default executor.
     ///
     /// Uses `TokioBackgroundExecutor` as the default executor.
-    /// For custom executors, use [`DefaultEngine::new_with_executor`].
+    /// For custom executors, use [`DefaultEngine::new_with_executor`] or
+    /// [`DefaultEngineBuilder::with_executor`].
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self::new_with_executor(
+            object_store,
+            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
+        )
+    }
+
+    /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
+    ///
+    /// # Parameters
+    ///
+    /// - `object_store`: The object store to use.
+    pub fn builder(
+        object_store: Arc<DynObjectStore>,
+    ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+        DefaultEngineBuilder::new(
             object_store,
             Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
         )
@@ -132,6 +210,15 @@ impl<E: TaskExecutor> DefaultEngine<E> {
     /// - `object_store`: The object store to use.
     /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
     pub fn new_with_executor(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+        Self::new_with_opts(object_store, task_executor, None)
+    }
+
+    /// Create a new [`DefaultEngine`] with all options.
+    fn new_with_opts(
+        object_store: Arc<DynObjectStore>,
+        task_executor: Arc<E>,
+        metrics_reporter: Option<Arc<dyn MetricsReporter>>,
+    ) -> Self {
         Self {
             storage: Arc::new(ObjectStoreStorageHandler::new(
                 object_store.clone(),
@@ -148,7 +235,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             )),
             object_store,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
-            metrics_reporter: None,
+            metrics_reporter,
         }
     }
 
