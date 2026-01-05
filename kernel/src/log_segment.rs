@@ -65,6 +65,11 @@ pub(crate) struct LogSegment {
     /// The latest commit file found during listing, which may not be part of the
     /// contiguous segment but is needed for ICT timestamp reading
     pub latest_commit_file: Option<ParsedLogPath>,
+    /// The maximum published commit version seen during log segment construction, if available.
+    /// Note that this published commit file maybe not be included in
+    /// LogSegment::ascending_commit_files if there is a catalog commit present for the same
+    /// version that took priority over it.
+    pub max_known_published_commit_version: Option<Version>
 }
 
 impl LogSegment {
@@ -127,6 +132,12 @@ impl LogSegment {
             );
         }
 
+        let max_known_published_commit_version = ascending_commit_files
+            .iter()
+            .filter(|x| x.file_type == LogPathFileType::Commit)
+            .last()
+            .map(|x| x.version);
+
         Ok(LogSegment {
             end_version: effective_version,
             checkpoint_version,
@@ -136,6 +147,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            max_known_published_commit_version
         })
     }
 
