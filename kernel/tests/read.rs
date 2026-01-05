@@ -1443,7 +1443,6 @@ fn read_collations_complex_with_filter() -> Result<(), Box<dyn std::error::Error
     read_table_data_str(path, select_cols, Some(predicate_nested), expected.clone())
 }
 
-
 // Verify that predicates over invalid/missing columns do not cause skipping.
 #[test]
 fn predicate_references_invalid_missing_column() -> Result<(), Box<dyn std::error::Error>> {
