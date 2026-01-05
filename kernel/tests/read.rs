@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::arrow::array::AsArray as _;
+use delta_kernel::arrow::array::{AsArray as _, StructArray};
 use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use delta_kernel::engine::arrow_expression::apply_schema_internal;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
@@ -308,10 +309,20 @@ fn read_with_execute(
     )?);
     let batches = read_scan(scan, engine)?;
 
+    // Apply schema to ensure metadata (like collations) is preserved on nested fields.
+    let schema_dtype = DataType::Struct(Box::new(scan.logical_schema().as_ref().clone()));
+    let batches_with_metadata: Vec<_> = batches
+        .into_iter()
+        .map(|batch| {
+            let struct_array = StructArray::from(batch);
+            apply_schema_internal(&struct_array, &schema_dtype)
+        })
+        .collect::<Result<_, _>>()?;
+
     if expected.is_empty() {
-        assert_eq!(batches.len(), 0);
+        assert_eq!(batches_with_metadata.len(), 0);
     } else {
-        let batch = concat_batches(&result_schema, &batches)?;
+        let batch = concat_batches(&result_schema, &batches_with_metadata)?;
         assert_batches_sorted_eq!(expected, &[batch]);
     }
     Ok(())
@@ -391,12 +402,18 @@ fn read_with_scan_metadata(
             )
             .unwrap();
             let record_batch = logical.try_into_record_batch()?;
+
+            // Apply schema to ensure metadata (like collations) is preserved on nested fields.
+            let struct_array = StructArray::from(record_batch.clone());
+            let schema_dtype = DataType::Struct(Box::new(scan.logical_schema().as_ref().clone()));
+            let record_batch_with_metadata = apply_schema_internal(&struct_array, &schema_dtype)?;
+
             let rest = split_vector(selection_vector.as_mut(), len, Some(true));
             let batch = if let Some(mask) = selection_vector.clone() {
                 // apply the selection vector
-                filter_record_batch(&record_batch, &mask.into()).unwrap()
+                filter_record_batch(&record_batch_with_metadata, &mask.into()).unwrap()
             } else {
-                record_batch
+                record_batch_with_metadata
             };
             selection_vector = rest;
             batches.push(batch);
@@ -1229,6 +1246,203 @@ fn type_widening_decimal() -> Result<(), Box<dyn std::error::Error>> {
     ]);
     read_table_data_str("./tests/data/type-widening/", select_cols, None, expected)
 }
+
+// Verify we can read table with non-default collated columns.
+#[test]
+fn read_collations() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::schema::MetadataValue;
+    use serde_json::Value as JsonValue;
+
+    // Test reading a simple table with collations on a single string column.
+    // The table has: id INT, name STRING COLLATE UNICODE_CI.
+    let path = "./tests/data/collations/";
+    let url = url::Url::from_directory_path(std::fs::canonicalize(path)?).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let schema = snapshot.schema();
+
+    // Verify id field has no collation metadata.
+    let id_field = schema.field("id").unwrap();
+    assert_eq!(id_field.data_type(), &DataType::INTEGER);
+    assert!(id_field.metadata().get("__COLLATIONS").is_none());
+
+    // Verify name field has UNICODE_CI collation.
+    let name_field = schema.field("name").unwrap();
+    assert_eq!(name_field.data_type(), &DataType::STRING);
+    let name_collation = name_field.metadata().get("__COLLATIONS").unwrap();
+    if let MetadataValue::Other(JsonValue::Object(collations)) = name_collation {
+        assert_eq!(
+            collations.get("name").unwrap().as_str().unwrap(),
+            "icu.UNICODE_CI"
+        );
+    } else {
+        panic!("Expected collations to be an object");
+    }
+
+    let expected = vec![
+        "+----+--------+",
+        "| id | name   |",
+        "+----+--------+",
+        "| 1  | Müller |",
+        "| 2  | MÜLLER |",
+        "| 3  | müller |",
+        "+----+--------+",
+    ];
+    let select_cols: Option<&[&str]> = Some(&["id", "name"]);
+    read_table_data_str(path, select_cols, None, expected)
+}
+
+// Verify that filtering on case insensitive columns uses case sensitive skipping by default.
+#[test]
+fn read_collations_with_filter() -> Result<(), Box<dyn std::error::Error>> {
+    // Test filtering on a field with UNICODE_CI collation.
+    // The data is split across 3 parquet files (one per row):
+    // - File 1: id=1, name='Müller'
+    // - File 2: id=2, name='MÜLLER'
+    // - File 3: id=3, name='müller'
+    // Filtering for name = 'Müller' (case-sensitive) successfully uses data skipping
+    // to skip Files 2 and 3, returning only File 1.
+    let path = "./tests/data/collations/";
+
+    // Create predicate: name = 'Müller'
+    let predicate = column_expr!("name").eq(Expr::literal("Müller"));
+
+    // Data skipping works! Only returns the matching row.
+    let expected = vec![
+        "+----+--------+",
+        "| id | name   |",
+        "+----+--------+",
+        "| 1  | Müller |",
+        "+----+--------+",
+    ];
+    let select_cols: Option<&[&str]> = Some(&["id", "name"]);
+    read_table_data_str(path, select_cols, Some(predicate), expected)
+}
+
+// Verify we can read table with non-default collated fields in struct column.
+#[test]
+fn read_collations_complex() -> Result<(), Box<dyn std::error::Error>> {
+    use delta_kernel::schema::MetadataValue;
+    use serde_json::Value as JsonValue;
+
+    // First, verify the schema has the correct collation metadata.
+    let path = "./tests/data/collations-complex/";
+    let url = url::Url::from_directory_path(std::fs::canonicalize(path)?).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+    let schema = snapshot.schema();
+
+    // Verify id field has no collation metadata.
+    let id_field = schema.field("id").unwrap();
+    assert_eq!(id_field.data_type(), &DataType::INTEGER);
+    assert!(id_field.metadata().get("__COLLATIONS").is_none());
+
+    // Verify name field is a struct.
+    let name_field = schema.field("name").unwrap();
+    let name_struct = match name_field.data_type() {
+        DataType::Struct(s) => s,
+        _ => panic!("Expected name to be a struct type"),
+    };
+    assert!(name_field.metadata().get("__COLLATIONS").is_none());
+
+    // Verify name.first has UTF8_LCASE collation.
+    let first_field = name_struct.field("first").unwrap();
+    assert_eq!(first_field.data_type(), &DataType::STRING);
+    let first_collation = first_field.metadata().get("__COLLATIONS").unwrap();
+    if let MetadataValue::Other(JsonValue::Object(collations)) = first_collation {
+        assert_eq!(
+            collations.get("first").unwrap().as_str().unwrap(),
+            "spark.UTF8_LCASE"
+        );
+    } else {
+        panic!("Expected collations to be an object");
+    }
+
+    // Verify name.last has UTF8_LCASE collation.
+    let last_field = name_struct.field("last").unwrap();
+    assert_eq!(last_field.data_type(), &DataType::STRING);
+    let last_collation = last_field.metadata().get("__COLLATIONS").unwrap();
+    if let MetadataValue::Other(JsonValue::Object(collations)) = last_collation {
+        assert_eq!(
+            collations.get("last").unwrap().as_str().unwrap(),
+            "spark.UTF8_LCASE"
+        );
+    } else {
+        panic!("Expected collations to be an object");
+    }
+
+    // Verify email has UTF8_LCASE collation.
+    let email_field = schema.field("email").unwrap();
+    assert_eq!(email_field.data_type(), &DataType::STRING);
+    let email_collation = email_field.metadata().get("__COLLATIONS").unwrap();
+    if let MetadataValue::Other(JsonValue::Object(collations)) = email_collation {
+        assert_eq!(
+            collations.get("email").unwrap().as_str().unwrap(),
+            "spark.UTF8_LCASE"
+        );
+    } else {
+        panic!("Expected collations to be an object");
+    }
+
+    // Verify department has no collation metadata.
+    let department_field = schema.field("department").unwrap();
+    assert_eq!(department_field.data_type(), &DataType::STRING);
+    assert!(department_field.metadata().get("__COLLATIONS").is_none());
+
+    let expected = vec![
+        "+----+-------------------------------+---------------------------+-------------+",
+        "| id | name                          | email                     | department  |",
+        "+----+-------------------------------+---------------------------+-------------+",
+        "| 1  | {first: Alice, last: Johnson} | Alice.Johnson@example.com | Engineering |",
+        "| 2  | {first: Bob, last: Smith}     | bob.smith@example.com     | Marketing   |",
+        "| 3  | {first: Charlie, last: Brown} | charlie@example.com       | Engineering |",
+        "| 4  | {first: alice, last: johnson} | alice.johnson@example.com | Engineering |",
+        "| 5  | {first: bob, last: dylan}     | Bob.Dylan@Example.Com     | Sales       |",
+        "+----+-------------------------------+---------------------------+-------------+",
+    ];
+    let select_cols: Option<&[&str]> = Some(&[
+        "id",
+        "name",
+        "email",
+        "department",
+    ]);
+    read_table_data_str(path, select_cols, None, expected)
+}
+
+// Verify that filtering on case insensitive struct fields uses case sensitive skipping by default.
+#[test]
+fn read_collations_complex_with_filter() -> Result<(), Box<dyn std::error::Error>> {
+    // The data is split across 2 parquet files:
+    // - File 1: id=1,2,3 (Alice, Bob, Charlie).
+    // - File 2: id=4,5 (alice, bob).
+    //
+    // Test 1: Nested field predicate (name.first = 'charlie') - skips both files.
+    let path = "./tests/data/collations-complex/";
+    let predicate_nested = column_expr!("name.first").eq(Expr::literal("charlie"));
+
+    let expected = vec![
+        "+----+------+-------+------------+",
+        "| id | name | email | department |",
+        "+----+------+-------+------------+",
+        "+----+------+-------+------------+",
+    ];
+    let select_cols: Option<&[&str]> = Some(&["id", "name", "email", "department"]);
+    read_table_data_str(path, select_cols, Some(predicate_nested), expected.clone())?;
+
+    // Test 2: Nested field predicate (name.first = 'alice') - skips File 1.
+    let predicate_nested = column_expr!("name.first").eq(Expr::literal("alice"));
+
+    let expected = vec![
+        "+----+-------------------------------+---------------------------+-------------+",
+        "| id | name                          | email                     | department  |",
+        "+----+-------------------------------+---------------------------+-------------+",
+        "| 4  | {first: alice, last: johnson} | alice.johnson@example.com | Engineering |",
+        "| 5  | {first: bob, last: dylan}     | Bob.Dylan@Example.Com     | Sales       |",
+        "+----+-------------------------------+---------------------------+-------------+",
+    ];
+    read_table_data_str(path, select_cols, Some(predicate_nested), expected.clone())
+}
+
 
 // Verify that predicates over invalid/missing columns do not cause skipping.
 #[test]
