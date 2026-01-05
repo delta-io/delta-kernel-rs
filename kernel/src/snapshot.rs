@@ -497,6 +497,17 @@ impl Snapshot {
             .collect())
     }
 
+    /// Get all domain metadata including system-controlled domains (delta.*).
+    /// This is intended for testing purposes to validate system domain metadata.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_all_domain_metadata_unfiltered(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
+        all_domain_metadata_configuration(self.log_segment(), engine)
+    }
+
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
     ///
     /// Returns the `inCommitTimestamp` from the CommitInfo action of the commit that created this snapshot.
