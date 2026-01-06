@@ -1401,22 +1401,12 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     Ok(())
 }
 
+#[derive(Default)]
 struct LogSegmentConfig<'a> {
     commit_versions: &'a [u64],
     compaction_versions: &'a [(u64, u64)],
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
-}
-
-impl<'a> Default for LogSegmentConfig<'a> {
-    fn default() -> Self {
-        Self {
-            commit_versions: &[],
-            compaction_versions: &[],
-            checkpoint_version: None,
-            version_to_load: None,
-        }
-    }
 }
 
 async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
@@ -1491,7 +1481,6 @@ async fn test_compaction_listing(
         compaction_versions,
         checkpoint_version,
         version_to_load,
-        ..Default::default()
     })
     .await;
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
@@ -1646,7 +1635,6 @@ async fn test_commit_cover(
         compaction_versions,
         checkpoint_version,
         version_to_load,
-        ..Default::default()
     })
     .await;
     let cover = log_segment.find_commit_cover();
