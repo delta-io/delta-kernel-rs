@@ -8,7 +8,7 @@ use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::arrow::AsyncArrowWriter;
 
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, FileMeta, Snapshot};
 
 /// An example program that checkpoints a table.

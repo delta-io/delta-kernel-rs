@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFilesBuilder;

@@ -343,7 +343,7 @@ mod tests {
     use delta_kernel::arrow::util::pretty::pretty_format_batches;
     use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
     use delta_kernel::engine::arrow_data::ArrowEngineData;
-    use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::schema::{DataType, StructField, StructType};
     use delta_kernel::Engine;
     use delta_kernel_ffi::engine_data::get_engine_data;

@@ -625,7 +625,7 @@ mod tests {
         );
     }
 
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::schema::StructType;
     use crate::Engine;
     use std::io::Write;

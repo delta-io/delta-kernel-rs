@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::engine::default::{DefaultEngineBuilder};
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::Snapshot;
 use object_store::local::LocalFileSystem;
 use serde_json::json;

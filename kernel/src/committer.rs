@@ -174,7 +174,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::path::LogRoot;
 
     use object_store::memory::InMemory;

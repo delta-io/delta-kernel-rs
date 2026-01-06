@@ -374,7 +374,7 @@ mod tests {
     use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::utils::current_time_duration;
     use crate::Engine as _;
 

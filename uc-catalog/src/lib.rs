@@ -131,7 +131,7 @@ impl<'a> UCCatalog<'a> {
 mod tests {
     use std::env;
 
-    use delta_kernel::engine::default::{DefaultEngineBuilder};
+    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
