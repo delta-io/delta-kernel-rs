@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
@@ -9,10 +8,10 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::pretty::print_batches;
 use common::{LocationArgs, ParseWithExamples, ScanArgs};
 use delta_kernel::actions::deletion_vector::split_vector;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
+use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
+use delta_kernel::scan::state::{transform_to_logical, DvInfo, ScanFile};
 use delta_kernel::schema::SchemaRef;
-use delta_kernel::{DeltaResult, Engine, EngineData, ExpressionRef, FileMeta, Snapshot};
+use delta_kernel::{DeltaResult, Engine, ExpressionRef, FileMeta, Snapshot};
 
 use clap::Parser;
 use url::Url;
@@ -52,37 +51,20 @@ fn main() -> ExitCode {
 
 // the way we as a connector represent data to scan. this is computed from the raw data returned
 // from the scan, and could be any format the engine chooses to use to facilitate distributing work.
-struct ScanFile {
+struct FileToScan {
     path: String,
     size: i64,
     transform: Option<ExpressionRef>,
     dv_info: DvInfo,
 }
 
-// we know we're using arrow under the hood, so cast an EngineData into something we can work with
-fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
-}
-
 // This is the callback that will be called for each valid scan row
-fn send_scan_file(
-    scan_tx: &mut spmc::Sender<ScanFile>,
-    path: &str,
-    size: i64,
-    _stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    _: HashMap<String, String>,
-) {
-    let scan_file = ScanFile {
-        path: path.to_string(),
-        size,
-        transform,
-        dv_info,
+fn send_scan_file(scan_tx: &mut spmc::Sender<FileToScan>, scan_file: ScanFile) {
+    let scan_file = FileToScan {
+        path: scan_file.path.to_string(),
+        size: scan_file.size,
+        transform: scan_file.transform,
+        dv_info: scan_file.dv_info,
     };
     scan_tx.send(scan_file).unwrap();
 }
@@ -183,7 +165,7 @@ fn do_work(
     engine: &dyn Engine,
     scan_state: Arc<ScanState>,
     record_batch_tx: Sender<RecordBatch>,
-    scan_file_rx: spmc::Receiver<ScanFile>,
+    scan_file_rx: spmc::Receiver<FileToScan>,
 ) {
     // in a loop, try and get a ScanFile. Note that `recv` will return an `Err` when the other side
     // hangs up, which indicates there's no more data to process.
@@ -231,7 +213,7 @@ fn do_work(
             )
             .unwrap();
 
-            let record_batch = to_arrow(logical).unwrap();
+            let record_batch = logical.try_into_record_batch().unwrap();
 
             // need to split the dv_mask. what's left in dv_mask covers this result, and rest
             // will cover the following results

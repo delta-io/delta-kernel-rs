@@ -2,6 +2,7 @@
 //! has schema etc.)
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
 use crate::actions::domain_metadata::{
@@ -13,6 +14,7 @@ use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
 use crate::listed_log_files::ListedLogFiles;
 use crate::log_segment::LogSegment;
+use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
 use crate::scan::ScanBuilder;
 use crate::schema::SchemaRef;
@@ -98,14 +100,13 @@ impl Snapshot {
         }
     }
 
-    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
-    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
-    /// snapshot to a later version.
-    fn try_new_from(
+    /// Implementation of snapshot creation from existing snapshot.
+    fn try_new_from_impl(
         existing_snapshot: Arc<Snapshot>,
         log_tail: Vec<ParsedLogPath>,
         engine: &dyn Engine,
         version: impl Into<Option<Version>>,
+        operation_id: MetricId,
     ) -> DeltaResult<Arc<Self>> {
         let old_log_segment = &existing_snapshot.log_segment;
         let old_version = existing_snapshot.version();
@@ -141,8 +142,8 @@ impl Snapshot {
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
         // listing above will only return the checkpoint and not the commit.
-        if new_listed_files.ascending_commit_files.is_empty()
-            && new_listed_files.checkpoint_parts.is_empty()
+        if new_listed_files.ascending_commit_files().is_empty()
+            && new_listed_files.checkpoint_parts().is_empty()
         {
             match new_version {
                 Some(new_version) if new_version != old_version => {
@@ -161,7 +162,7 @@ impl Snapshot {
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
-        let new_latest_commit_file = new_listed_files.latest_commit_file.clone();
+        let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
         let mut new_log_segment =
             LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
 
@@ -179,10 +180,11 @@ impl Snapshot {
 
         if new_log_segment.checkpoint_version.is_some() {
             // we have a checkpoint in the new LogSegment, just construct a new snapshot from that
-            let snapshot = Self::try_new_from_log_segment(
+            let snapshot = Self::try_new_from_log_segment_impl(
                 existing_snapshot.table_root().clone(),
                 new_log_segment,
                 engine,
+                operation_id,
             );
             return Ok(Arc::new(snapshot?));
         }
@@ -235,13 +237,13 @@ impl Snapshot {
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFiles {
+            ListedLogFiles::try_new(
                 ascending_commit_files,
                 ascending_compaction_files,
-                checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
+                old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-            },
+            )?,
             log_root,
             new_version,
         )?;
@@ -251,19 +253,118 @@ impl Snapshot {
         )))
     }
 
-    /// Create a new [`Snapshot`] instance.
-    pub(crate) fn try_new_from_log_segment(
+    /// Create a new [`Snapshot`] instance from an existing [`Snapshot`]. This is useful when you
+    /// already have a [`Snapshot`] lying around and want to do the minimal work to 'update' the
+    /// snapshot to a later version.
+    ///
+    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
+    fn try_new_from(
+        existing_snapshot: Arc<Snapshot>,
+        log_tail: Vec<ParsedLogPath>,
+        engine: &dyn Engine,
+        version: impl Into<Option<Version>>,
+        operation_id: Option<MetricId>,
+    ) -> DeltaResult<Arc<Self>> {
+        let operation_id = operation_id.unwrap_or_default();
+        let reporter = engine.get_metrics_reporter();
+
+        let start = Instant::now();
+        let result =
+            Self::try_new_from_impl(existing_snapshot, log_tail, engine, version, operation_id);
+        let snapshot_duration = start.elapsed();
+
+        match result {
+            Ok(snapshot) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotCompleted {
+                        operation_id,
+                        version: snapshot.version(),
+                        total_duration: snapshot_duration,
+                    });
+                });
+                Ok(snapshot)
+            }
+            Err(e) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotFailed {
+                        operation_id,
+                        duration: snapshot_duration,
+                    });
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Implementation of snapshot creation from log segment.
+    ///
+    /// Reports metrics: `ProtocolMetadataLoaded`.
+    fn try_new_from_log_segment_impl(
         location: Url,
         log_segment: LogSegment,
         engine: &dyn Engine,
+        operation_id: MetricId,
     ) -> DeltaResult<Self> {
+        let reporter = engine.get_metrics_reporter();
+
+        let start = Instant::now();
         let (metadata, protocol) = log_segment.read_metadata(engine)?;
+        let read_metadata_duration = start.elapsed();
+
+        reporter.as_ref().inspect(|r| {
+            r.report(MetricEvent::ProtocolMetadataLoaded {
+                operation_id,
+                duration: read_metadata_duration,
+            });
+        });
+
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, location, log_segment.end_version)?;
+
         Ok(Self {
             log_segment,
             table_configuration,
         })
+    }
+
+    /// Create a new [`Snapshot`] instance.
+    ///
+    /// Reports metrics: `SnapshotCompleted` or `SnapshotFailed`.
+    pub(crate) fn try_new_from_log_segment(
+        location: Url,
+        log_segment: LogSegment,
+        engine: &dyn Engine,
+        operation_id: Option<MetricId>,
+    ) -> DeltaResult<Self> {
+        let operation_id = operation_id.unwrap_or_default();
+        let reporter = engine.get_metrics_reporter();
+
+        let start = Instant::now();
+        let result =
+            Self::try_new_from_log_segment_impl(location, log_segment, engine, operation_id);
+        let snapshot_duration = start.elapsed();
+
+        match result {
+            Ok(snapshot) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotCompleted {
+                        operation_id,
+                        version: snapshot.table_configuration.version(),
+                        total_duration: snapshot_duration,
+                    });
+                });
+                Ok(snapshot)
+            }
+            Err(e) => {
+                reporter.as_ref().inspect(|r| {
+                    r.report(MetricEvent::SnapshotFailed {
+                        operation_id,
+                        duration: snapshot_duration,
+                    });
+                });
+                Err(e)
+            }
+        }
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -942,7 +1043,7 @@ mod tests {
 
         let store = Arc::new(LocalFileSystem::new());
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
         let cp = LastCheckpointHint::try_read(&storage, &url).unwrap();
         assert!(cp.is_none());
     }
@@ -984,8 +1085,8 @@ mod tests {
         (data, checkpoint)
     }
 
-    #[test]
-    fn test_read_table_with_empty_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_empty_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -993,24 +1094,20 @@ mod tests {
         let empty = "{}".as_bytes().to_vec();
         let invalid_path = Path::from("invalid/_last_checkpoint");
 
-        tokio::runtime::Runtime::new()
-            .expect("create tokio runtime")
-            .block_on(async {
-                store
-                    .put(&invalid_path, empty.into())
-                    .await
-                    .expect("put _last_checkpoint");
-            });
+        store
+            .put(&invalid_path, empty.into())
+            .await
+            .expect("put _last_checkpoint");
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
         let url = Url::parse("memory:///invalid/").expect("valid url");
         let invalid = LastCheckpointHint::try_read(&storage, &url).expect("read last checkpoint");
         assert!(invalid.is_none())
     }
 
-    #[test]
-    fn test_read_table_with_last_checkpoint() {
+    #[tokio::test]
+    async fn test_read_table_with_last_checkpoint() {
         // in memory file system
         let store = Arc::new(InMemory::new());
 
@@ -1024,20 +1121,16 @@ mod tests {
         ];
 
         // Write all test files to the in memory file system
-        tokio::runtime::Runtime::new()
-            .expect("create tokio runtime")
-            .block_on(async {
-                for (path_prefix, data, _) in &test_cases {
-                    let path = Path::from(format!("{}/_last_checkpoint", path_prefix));
-                    store
-                        .put(&path, data.clone().into())
-                        .await
-                        .expect("put _last_checkpoint");
-                }
-            });
+        for (path_prefix, data, _) in &test_cases {
+            let path = Path::from(format!("{}/_last_checkpoint", path_prefix));
+            store
+                .put(&path, data.clone().into())
+                .await
+                .expect("put _last_checkpoint");
+        }
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = ObjectStoreStorageHandler::new(store, executor);
+        let storage = ObjectStoreStorageHandler::new(store, executor, None);
 
         // Test reading all checkpoints from the in memory file system for cases where the data is valid, invalid and
         // valid with tags.
@@ -1398,13 +1491,13 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFiles {
-            ascending_commit_files: vec![],
-            ascending_compaction_files: vec![],
+        let listed_files = ListedLogFiles::try_new(
+            vec![],
+            vec![],
             checkpoint_parts,
-            latest_crc_file: None,
-            latest_commit_file: None, // No commit file
-        };
+            None,
+            None, // No commit file
+        )?;
 
         let log_segment = LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0))?;
         let table_config = snapshot.table_configuration().clone();
@@ -1521,7 +1614,7 @@ mod tests {
             .build(&engine)?;
 
         // Test with empty log tail - should return same snapshot
-        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None)?;
+        let result = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, None, None)?;
         assert_eq!(result, base_snapshot);
 
         Ok(())
@@ -1589,7 +1682,7 @@ mod tests {
 
         // Create new snapshot from base to version 2 using try_new_from directly
         let new_snapshot =
-            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2))?;
+            Snapshot::try_new_from(base_snapshot.clone(), log_tail, &engine, Some(2), None)?;
 
         // Latest commit should now be version 2
         assert_eq!(
@@ -1638,11 +1731,13 @@ mod tests {
             .build(&engine)?;
 
         // Test requesting same version - should return same snapshot
-        let same_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1))?;
+        let same_version =
+            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(1), None)?;
         assert!(Arc::ptr_eq(&same_version, &base_snapshot));
 
         // Test requesting older version - should error
-        let older_version = Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0));
+        let older_version =
+            Snapshot::try_new_from(base_snapshot.clone(), vec![], &engine, Some(0), None);
         assert!(matches!(
             older_version,
             Err(Error::Generic(msg)) if msg.contains("older than snapshot hint version")

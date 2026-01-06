@@ -3,13 +3,17 @@
 use std::num::NonZero;
 use std::sync::{Arc, LazyLock};
 
+use std::time::Instant;
+
 use crate::actions::visitors::SidecarVisitor;
 use crate::actions::{
     get_commit_schema, schema_contains_file_actions, Metadata, Protocol, Sidecar, METADATA_NAME,
     PROTOCOL_NAME, SIDECAR_NAME,
 };
 use crate::last_checkpoint_hint::LastCheckpointHint;
+use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
+use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{SchemaRef, StructField, ToSchema as _};
 use crate::utils::require;
@@ -70,13 +74,13 @@ impl LogSegment {
         log_root: Url,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let ListedLogFiles {
+        let (
             mut ascending_commit_files,
             ascending_compaction_files,
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
-        } = listed_files;
+        ) = listed_files.into_parts();
 
         // Ensure commit file versions are contiguous
         require!(
@@ -145,22 +149,46 @@ impl LogSegment {
     /// - `time_travel_version`: The version of the log that the Snapshot will be at.
     ///
     /// [`Snapshot`]: crate::snapshot::Snapshot
+    ///
+    /// Reports metrics: `LogSegmentLoaded`.
     #[internal_api]
     pub(crate) fn for_snapshot(
         storage: &dyn StorageHandler,
         log_root: Url,
         log_tail: Vec<ParsedLogPath>,
         time_travel_version: impl Into<Option<Version>>,
+        reporter: Option<&Arc<dyn MetricsReporter>>,
+        operation_id: Option<MetricId>,
     ) -> DeltaResult<Self> {
+        let operation_id = operation_id.unwrap_or_default();
+        let start = Instant::now();
+
         let time_travel_version = time_travel_version.into();
         let checkpoint_hint = LastCheckpointHint::try_read(storage, &log_root)?;
-        Self::for_snapshot_impl(
+        let result = Self::for_snapshot_impl(
             storage,
             log_root,
             log_tail,
             checkpoint_hint,
             time_travel_version,
-        )
+        );
+        let log_segment_loading_duration = start.elapsed();
+
+        match result {
+            Ok(log_segment) => {
+                reporter.inspect(|r| {
+                    r.report(MetricEvent::LogSegmentLoaded {
+                        operation_id,
+                        duration: log_segment_loading_duration,
+                        num_commit_files: log_segment.ascending_commit_files.len() as u64,
+                        num_checkpoint_files: log_segment.checkpoint_parts.len() as u64,
+                        num_compaction_files: log_segment.ascending_compaction_files.len() as u64,
+                    });
+                });
+                Ok(log_segment)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // factored out for testing
@@ -219,13 +247,13 @@ impl LogSegment {
         // If all three are satisfied, this implies that all the desired commits are present.
         require!(
             listed_files
-                .ascending_commit_files
+                .ascending_commit_files()
                 .first()
                 .is_some_and(|first_commit| first_commit.version == start_version),
             Error::generic(format!(
                 "Expected the first commit to have version {start_version}, got {:?}",
                 listed_files
-                    .ascending_commit_files
+                    .ascending_commit_files()
                     .first()
                     .map(|c| c.version)
             ))
@@ -263,7 +291,7 @@ impl LogSegment {
             ListedLogFiles::list_commits(storage, &log_root, start_from, Some(end_version))?;
 
         // remove gaps - return latest contiguous chunk of commits
-        let commits = &mut listed_commits.ascending_commit_files;
+        let commits = listed_commits.ascending_commit_files_mut();
         if !commits.is_empty() {
             let mut start_idx = commits.len() - 1;
             while start_idx > 0 && commits[start_idx].version == 1 + commits[start_idx - 1].version
@@ -303,15 +331,7 @@ impl LogSegment {
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
-        let commits_and_compactions = self.find_commit_cover();
-        let commit_stream = engine
-            .json_handler()
-            .read_json_files(
-                &commits_and_compactions,
-                commit_read_schema,
-                meta_predicate.clone(),
-            )?
-            .map_ok(|batch| ActionsBatch::new(batch, true));
+        let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
 
         let checkpoint_stream =
             self.create_checkpoint_stream(engine, checkpoint_read_schema, meta_predicate)?;
@@ -340,7 +360,7 @@ impl LogSegment {
     /// returns files is DESCENDING ORDER, as that's what `replay` expects. This function assumes
     /// that all files in `self.ascending_commit_files` and `self.ascending_compaction_files` are in
     /// range for this log segment. This invariant is maintained by our listing code.
-    fn find_commit_cover(&self) -> Vec<FileMeta> {
+    pub(crate) fn find_commit_cover(&self) -> Vec<FileMeta> {
         // Create an iterator sorted in ascending order by (initial version, end version), e.g.
         // [00.json, 00.09.compacted.json, 00.99.compacted.json, 01.json, 02.json, ..., 10.json,
         //  10.19.compacted.json, 11.json, ...]

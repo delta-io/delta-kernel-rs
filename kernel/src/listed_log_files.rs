@@ -34,11 +34,11 @@ use url::Url;
 #[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
-    pub(crate) ascending_commit_files: Vec<ParsedLogPath>,
-    pub(crate) ascending_compaction_files: Vec<ParsedLogPath>,
-    pub(crate) checkpoint_parts: Vec<ParsedLogPath>,
-    pub(crate) latest_crc_file: Option<ParsedLogPath>,
-    pub(crate) latest_commit_file: Option<ParsedLogPath>,
+    ascending_commit_files: Vec<ParsedLogPath>,
+    ascending_compaction_files: Vec<ParsedLogPath>,
+    checkpoint_parts: Vec<ParsedLogPath>,
+    latest_crc_file: Option<ParsedLogPath>,
+    latest_commit_file: Option<ParsedLogPath>,
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
@@ -219,6 +219,41 @@ impl ListedLogFiles {
             latest_crc_file,
             latest_commit_file,
         })
+    }
+
+    #[allow(clippy::type_complexity)] // It's the most readable way to destructure
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<ParsedLogPath>,
+        Vec<ParsedLogPath>,
+        Vec<ParsedLogPath>,
+        Option<ParsedLogPath>,
+        Option<ParsedLogPath>,
+    ) {
+        (
+            self.ascending_commit_files,
+            self.ascending_compaction_files,
+            self.checkpoint_parts,
+            self.latest_crc_file,
+            self.latest_commit_file,
+        )
+    }
+
+    pub(crate) fn ascending_commit_files(&self) -> &Vec<ParsedLogPath> {
+        &self.ascending_commit_files
+    }
+
+    pub(crate) fn ascending_commit_files_mut(&mut self) -> &mut Vec<ParsedLogPath> {
+        &mut self.ascending_commit_files
+    }
+
+    pub(crate) fn checkpoint_parts(&self) -> &Vec<ParsedLogPath> {
+        &self.checkpoint_parts
+    }
+
+    pub(crate) fn latest_commit_file(&self) -> &Option<ParsedLogPath> {
+        &self.latest_commit_file
     }
 
     /// List all commits between the provided `start_version` (inclusive) and `end_version`
@@ -418,7 +453,6 @@ impl ListedLogFiles {
 mod list_log_files_with_log_tail_tests {
     use std::sync::Arc;
 
-    use futures::executor::block_on;
     use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
     use url::Url;
 
@@ -439,48 +473,46 @@ mod list_log_files_with_log_tail_tests {
     }
 
     // create test storage given list of log files with custom data content
-    fn create_storage(
+    async fn create_storage(
         log_files: Vec<(Version, LogPathFileType, CommitSource)>,
     ) -> (Box<dyn StorageHandler>, Url) {
         let store = Arc::new(InMemory::new());
         let log_root = Url::parse("memory:///_delta_log/").unwrap();
 
-        block_on(async {
-            for (version, file_type, source) in log_files {
-                let path = match file_type {
-                    LogPathFileType::Commit => {
-                        format!("_delta_log/{version:020}.json")
-                    }
-                    LogPathFileType::StagedCommit => {
-                        let uuid = uuid::Uuid::new_v4();
-                        format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
-                    }
-                    LogPathFileType::SinglePartCheckpoint => {
-                        format!("_delta_log/{version:020}.checkpoint.parquet")
-                    }
-                    LogPathFileType::MultiPartCheckpoint {
-                        part_num,
-                        num_parts,
-                    } => {
-                        format!(
-                            "_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet"
-                        )
-                    }
-                    _ => panic!("Unsupported file type in test"),
-                };
-                let data = match source {
-                    CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
-                    CommitSource::Catalog => bytes::Bytes::from("catalog"),
-                };
-                store
-                    .put(&ObjectPath::from(path.as_str()), data.into())
-                    .await
-                    .expect("Failed to put test file");
-            }
-        });
+        for (version, file_type, source) in log_files {
+            let path = match file_type {
+                LogPathFileType::Commit => {
+                    format!("_delta_log/{version:020}.json")
+                }
+                LogPathFileType::StagedCommit => {
+                    let uuid = uuid::Uuid::new_v4();
+                    format!("_delta_log/_staged_commits/{version:020}.{uuid}.json")
+                }
+                LogPathFileType::SinglePartCheckpoint => {
+                    format!("_delta_log/{version:020}.checkpoint.parquet")
+                }
+                LogPathFileType::MultiPartCheckpoint {
+                    part_num,
+                    num_parts,
+                } => {
+                    format!(
+                        "_delta_log/{version:020}.checkpoint.{part_num:010}.{num_parts:010}.parquet"
+                    )
+                }
+                _ => panic!("Unsupported file type in test"),
+            };
+            let data = match source {
+                CommitSource::Filesystem => bytes::Bytes::from("filesystem"),
+                CommitSource::Catalog => bytes::Bytes::from("catalog"),
+            };
+            store
+                .put(&ObjectPath::from(path.as_str()), data.into())
+                .await
+                .expect("Failed to put test file");
+        }
 
         let executor = Arc::new(TokioBackgroundExecutor::new());
-        let storage = Box::new(ObjectStoreStorageHandler::new(store, executor));
+        let storage = Box::new(ObjectStoreStorageHandler::new(store, executor, None));
         (storage, log_root)
     }
 
@@ -527,14 +559,14 @@ mod list_log_files_with_log_tail_tests {
         );
     }
 
-    #[test]
-    fn test_empty_log_tail() {
+    #[tokio::test]
+    async fn test_empty_log_tail() {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::Commit, CommitSource::Filesystem),
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], Some(1), Some(2))
             .unwrap()
@@ -549,15 +581,15 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[1], CommitSource::Filesystem);
     }
 
-    #[test]
-    fn test_log_tail_has_latest_commit_files() {
+    #[tokio::test]
+    async fn test_log_tail_has_latest_commit_files() {
         // Filesystem has commits 0-2, log_tail has commits 3-5 (the latest)
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::Commit, CommitSource::Filesystem),
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         // log_tail is contiguous, only commits, and represents the latest versions
         let log_tail = vec![
@@ -589,14 +621,14 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[5], CommitSource::Catalog);
     }
 
-    #[test]
-    fn test_request_subset_with_log_tail() {
+    #[tokio::test]
+    async fn test_request_subset_with_log_tail() {
         // Test requesting a subset when log_tail is the latest commits
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         // log_tail represents versions 2-4 (latest commits)
         let log_tail = vec![
@@ -622,8 +654,8 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[2], CommitSource::Catalog);
     }
 
-    #[test]
-    fn test_log_tail_defines_latest_version() {
+    #[tokio::test]
+    async fn test_log_tail_defines_latest_version() {
         // log_tail defines the latest version of the table: if there is file system files after log
         // tail, they are ignored
         let log_files = vec![
@@ -631,7 +663,7 @@ mod list_log_files_with_log_tail_tests {
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::Commit, CommitSource::Filesystem), // ignored!
         ];
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
 
         // log_tail is just [1], indicating version 1 is the latest
         let log_tail = vec![make_parsed_log_path_with_source(
@@ -706,8 +738,8 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[2], CommitSource::Catalog);
     }
 
-    #[test]
-    fn test_listing_omits_staged_commits() {
+    #[tokio::test]
+    async fn test_listing_omits_staged_commits() {
         // note that in the presence of staged commits, we CANNOT trust listing to determine which
         // to include in our listing/log segment. This is up to the catalog. (e.g. version
         // 5.uuid1.json and 5.uuid2.json can both exist and only catalog can say which is the 'real'
@@ -720,7 +752,7 @@ mod list_log_files_with_log_tail_tests {
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
         let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], None, None)
             .unwrap()
             .try_collect()
@@ -734,15 +766,15 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[1], CommitSource::Filesystem);
     }
 
-    #[test]
-    fn test_listing_with_large_end_version() {
+    #[tokio::test]
+    async fn test_listing_with_large_end_version() {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
-        let (storage, log_root) = create_storage(log_files);
+        let (storage, log_root) = create_storage(log_files).await;
         // note we let you request end version past the end of log. up to consumer to interpret
         let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], None, Some(3))
             .unwrap()

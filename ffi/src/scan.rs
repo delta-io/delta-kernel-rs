@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::scan::state::DvInfo;
+use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::expressions::kernel_visitor::{unwrap_kernel_predicate, KernelExpressionVisitorState};
 use crate::expressions::SharedExpression;
+use crate::schema_visitor::{extract_kernel_schema, KernelSchemaVisitorState};
 use crate::{
     kernel_string_slice, unwrap_and_parse_path_as_url, AllocateStringFn, ExternEngine,
     ExternResult, IntoExternResult, KernelBoolSlice, KernelRowIndexArray, KernelStringSlice,
@@ -47,6 +48,38 @@ pub struct EnginePredicate {
     pub predicate: *mut c_void,
     pub visitor:
         extern "C" fn(predicate: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
+}
+
+/// A schema for columns to select from the snapshot.
+///
+/// This allows engines to specify which columns they want to read for projection pushdown or to
+/// specify metadata columns. The engine provides a pointer to its native schema representation
+/// along with a visitor function. The kernel uses this to build a kernel
+/// [`delta_kernel::schema::Schema`] that specifies the projection. Inside [`scan`] the kernel
+/// allocates visitor state, which becomes the second argument to the schema visitor invocation
+/// along with the engine-provided schema pointer. The visitor state is valid for the lifetime of
+/// the schema visitor invocation. Thanks to this double indirection, engine and kernel each retain
+/// ownership of their respective objects, with no need to coordinate memory lifetimes with the
+/// other.
+#[repr(C)]
+pub struct EngineSchema {
+    pub schema: *mut c_void,
+    pub visitor: extern "C" fn(schema: *mut c_void, state: &mut KernelSchemaVisitorState) -> usize,
+}
+
+/// An engine-provided expression along with a visitor function to convert
+/// it to a kernel expression.
+///
+/// The engine provides a pointer to its own expression representation, along
+/// with a visitor function that can convert it to a kernel expression by
+/// calling the appropriate visitor methods on the kernel's
+/// `KernelExpressionVisitorState`. The visitor function returns an expression
+/// ID that can be converted to a kernel expression handle.
+#[repr(C)]
+pub struct EngineExpression {
+    pub expression: *mut c_void,
+    pub visitor:
+        extern "C" fn(expression: *mut c_void, state: &mut KernelExpressionVisitorState) -> usize,
 }
 
 /// Drop a `SharedScanMetadata`.
@@ -98,16 +131,19 @@ pub unsafe extern "C" fn scan(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
     predicate: Option<&mut EnginePredicate>,
+    schema: Option<&mut EngineSchema>,
 ) -> ExternResult<Handle<SharedScan>> {
     let snapshot = unsafe { snapshot.clone_as_arc() };
-    scan_impl(snapshot, predicate).into_extern_result(&engine.as_ref())
+    scan_impl(snapshot, predicate, schema).into_extern_result(&engine.as_ref())
 }
 
 fn scan_impl(
     snapshot: SnapshotRef,
     predicate: Option<&mut EnginePredicate>,
+    schema: Option<&mut EngineSchema>,
 ) -> DeltaResult<Handle<SharedScan>> {
     let mut scan_builder = snapshot.scan_builder();
+
     if let Some(predicate) = predicate {
         let mut visitor_state = KernelExpressionVisitorState::default();
         let pred_id = (predicate.visitor)(predicate.predicate, &mut visitor_state);
@@ -115,6 +151,15 @@ fn scan_impl(
         debug!("Got predicate: {:#?}", predicate);
         scan_builder = scan_builder.with_predicate(predicate.map(Arc::new));
     }
+
+    if let Some(schema) = schema {
+        let mut visitor_state = KernelSchemaVisitorState::default();
+        let schema_id = (schema.visitor)(schema.schema, &mut visitor_state);
+        let schema = extract_kernel_schema(&mut visitor_state, schema_id)?;
+        debug!("FFI scan projection schema: {:#?}", schema);
+        scan_builder = scan_builder.with_schema(Arc::new(schema));
+    }
+
     Ok(Arc::new(scan_builder.build()?).into())
 }
 
@@ -296,6 +341,7 @@ pub struct CDvInfo<'a> {
 /// * `context`: a `void*` context this can be anything that engine needs to pass through to each call
 /// * `path`: a `KernelStringSlice` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
+/// * `mod_time`: an `i64` which is the time the file was created, as milliseconds since the epoch
 /// * `dv_info`: a [`CDvInfo`] struct, which allows getting the selection vector for this file
 /// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
 ///   convert it to the correct logical format. If this is `NULL`, no transform is needed.
@@ -304,6 +350,7 @@ type CScanCallback = extern "C" fn(
     engine_context: NullableCvoid,
     path: KernelStringSlice,
     size: i64,
+    mod_time: i64,
     stats: Option<&Stats>,
     dv_info: &CDvInfo,
     transform: Option<&Expression>,
@@ -454,30 +501,24 @@ fn row_indexes_from_dv_impl(
 
 // Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
 // and then calls the ffi specified callback
-fn rust_callback(
-    context: &mut ContextWrapper,
-    path: &str,
-    size: i64,
-    kernel_stats: Option<delta_kernel::scan::state::Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-) {
-    let transform = transform.map(|e| e.as_ref().clone());
+fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) {
+    let transform = scan_file.transform.map(|e| e.as_ref().clone());
     let partition_map = CStringMap {
-        values: partition_values,
+        values: scan_file.partition_values,
     };
-    let stats = kernel_stats.map(|ks| Stats {
+    let stats = scan_file.stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
     let cdv_info = CDvInfo {
-        info: &dv_info,
-        has_vector: dv_info.has_vector(),
+        info: &scan_file.dv_info,
+        has_vector: scan_file.dv_info.has_vector(),
     };
+    let path = scan_file.path.as_str();
     (context.callback)(
         context.engine_context,
         kernel_string_slice!(path),
-        size,
+        scan_file.size,
+        scan_file.modification_time,
         stats.as_ref(),
         &cdv_info,
         transform.as_ref(),
