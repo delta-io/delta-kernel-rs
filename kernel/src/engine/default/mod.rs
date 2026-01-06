@@ -346,18 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_engine_builder_with_task_executor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let url = Url::from_directory_path(tmp.path()).unwrap();
-        let object_store = Arc::new(LocalFileSystem::new());
-        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        let engine = DefaultEngineBuilder::new(object_store)
-            .with_task_executor(executor)
-            .build();
-        test_arrow_engine(&engine, &url);
-    }
-
-    #[test]
     fn test_default_engine_builder_with_custom_executor() {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
