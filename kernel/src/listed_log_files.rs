@@ -31,15 +31,18 @@ use url::Url;
 /// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
 /// - `latest_crc_file`: The CRC file with the highest version, if any.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
-    ascending_commit_files: Vec<ParsedLogPath>,
-    ascending_compaction_files: Vec<ParsedLogPath>,
-    checkpoint_parts: Vec<ParsedLogPath>,
-    latest_crc_file: Option<ParsedLogPath>,
-    latest_commit_file: Option<ParsedLogPath>,
+    pub(crate) ascending_commit_files: Vec<ParsedLogPath>,
+    pub(crate) ascending_compaction_files: Vec<ParsedLogPath>,
+    pub(crate) checkpoint_parts: Vec<ParsedLogPath>,
+    pub(crate) latest_crc_file: Option<ParsedLogPath>,
+    pub(crate) latest_commit_file: Option<ParsedLogPath>,
 }
+
+/// Type alias that allows us to cleanly construct a [`ListedLogFiles`] with validation via [`ListedLogFiles::try_new`].
+pub(crate) type UnvalidatedListedLogFiles = ListedLogFiles;
 
 /// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
 /// taking into account the `log_tail` which was (ostentibly) returned from the catalog. If there
@@ -170,18 +173,13 @@ impl ListedLogFiles {
     // we should explore entirely encapsulating ListedLogFiles within LogSegment - currently
     // LogSegment constructor requires a ListedLogFiles.
     #[internal_api]
-    pub(crate) fn try_new(
-        ascending_commit_files: Vec<ParsedLogPath>,
-        ascending_compaction_files: Vec<ParsedLogPath>,
-        checkpoint_parts: Vec<ParsedLogPath>,
-        latest_crc_file: Option<ParsedLogPath>,
-        latest_commit_file: Option<ParsedLogPath>,
-    ) -> DeltaResult<Self> {
+    pub(crate) fn try_new(raw: UnvalidatedListedLogFiles) -> DeltaResult<Self> {
         // We are adding debug_assertions here since we want to validate invariants that are
         // (relatively) expensive to compute
         #[cfg(debug_assertions)]
         {
-            assert!(ascending_compaction_files
+            assert!(raw
+                .ascending_compaction_files
                 .windows(2)
                 .all(|pair| match pair {
                     [ParsedLogPath {
@@ -196,29 +194,24 @@ impl ListedLogFiles {
                     _ => false,
                 }));
 
-            assert!(checkpoint_parts.iter().all(|part| part.is_checkpoint()));
+            assert!(raw.checkpoint_parts.iter().all(|part| part.is_checkpoint()));
 
             // for a multi-part checkpoint, check that they are all same version and all the parts are there
-            if checkpoint_parts.len() > 1 {
-                assert!(checkpoint_parts
+            if raw.checkpoint_parts.len() > 1 {
+                assert!(raw
+                    .checkpoint_parts
                     .windows(2)
                     .all(|pair| pair[0].version == pair[1].version));
 
-                assert!(checkpoint_parts.iter().all(|part| matches!(
+                assert!(raw.checkpoint_parts.iter().all(|part| matches!(
                     part.file_type,
                     LogPathFileType::MultiPartCheckpoint { num_parts, .. }
-                    if checkpoint_parts.len() == num_parts as usize
+                    if raw.checkpoint_parts.len() == num_parts as usize
                 )));
             }
         }
 
-        Ok(ListedLogFiles {
-            ascending_commit_files,
-            ascending_compaction_files,
-            checkpoint_parts,
-            latest_crc_file,
-            latest_commit_file,
-        })
+        Ok(raw)
     }
 
     #[allow(clippy::type_complexity)] // It's the most readable way to destructure
@@ -272,7 +265,11 @@ impl ListedLogFiles {
                 .try_collect()?;
         // .last() on a slice is an O(1) operation
         let latest_commit_file = listed_commits.last().cloned();
-        ListedLogFiles::try_new(listed_commits, vec![], vec![], None, latest_commit_file)
+        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+            ascending_commit_files: listed_commits,
+            latest_commit_file,
+            ..Default::default()
+        })
     }
 
     /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -399,13 +396,13 @@ impl ListedLogFiles {
             builder.latest_commit_file = Some(commit_file.clone());
         }
 
-        ListedLogFiles::try_new(
-            builder.ascending_commit_files,
-            builder.ascending_compaction_files,
-            builder.checkpoint_parts,
-            builder.latest_crc_file,
-            builder.latest_commit_file,
-        )
+        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+            ascending_commit_files: builder.ascending_commit_files,
+            ascending_compaction_files: builder.ascending_compaction_files,
+            checkpoint_parts: builder.checkpoint_parts,
+            latest_crc_file: builder.latest_crc_file,
+            latest_commit_file: builder.latest_commit_file,
+        })
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all
