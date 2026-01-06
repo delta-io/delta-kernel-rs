@@ -171,6 +171,11 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         )
     }
 
+    /// Create a [`DefaultEngineBuilder`] for constructing a [`DefaultEngine`] with custom options.
+    ///
+    /// # Parameters
+    ///
+    /// - `object_store`: The object store to use.
     pub fn builder(
         object_store: Arc<DynObjectStore>,
     ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
