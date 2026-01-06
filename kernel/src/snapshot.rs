@@ -245,6 +245,7 @@ impl Snapshot {
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
+                ..Default::default()
             }
             .build()?,
             log_root,
