@@ -12,7 +12,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
-use crate::listed_log_files::ListedLogFiles;
+use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
@@ -237,13 +237,14 @@ impl Snapshot {
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFiles::try_new(
+            ListedLogFilesBuilder {
                 ascending_commit_files,
                 ascending_compaction_files,
-                old_log_segment.checkpoint_parts.clone(),
+                checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-            )?,
+            }
+            .build()?,
             log_root,
             new_version,
         )?;
@@ -555,7 +556,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::listed_log_files::ListedLogFiles;
+    use crate::listed_log_files::ListedLogFilesBuilder;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
@@ -1491,13 +1492,11 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFiles::try_new(
-            vec![],
-            vec![],
+        let listed_files = ListedLogFilesBuilder {
             checkpoint_parts,
-            None,
-            None, // No commit file
-        )?;
+            ..Default::default()
+        }
+        .build()?;
 
         let log_segment = LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0))?;
         let table_config = snapshot.table_configuration().clone();
