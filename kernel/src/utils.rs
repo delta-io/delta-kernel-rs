@@ -163,7 +163,7 @@ pub(crate) mod test_utils {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::{DeltaResult, EngineData, Error, SnapshotRef};
     use crate::{Engine, Snapshot};

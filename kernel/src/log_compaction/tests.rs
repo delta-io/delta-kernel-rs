@@ -231,7 +231,7 @@ fn test_version_filtering() {
 #[tokio::test]
 async fn test_no_compaction_staged_commits() {
     use crate::actions::Add;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::default::DefaultEngineBuilder;
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use std::sync::Arc;
 

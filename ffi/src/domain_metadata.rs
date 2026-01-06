@@ -93,7 +93,7 @@ mod tests {
         recover_string,
     };
     use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
-    use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::DeltaResult;
     use object_store::memory::InMemory;
     use serde_json::json;

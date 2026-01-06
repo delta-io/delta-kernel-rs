@@ -449,7 +449,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::engine::default::{DefaultEngine, DefaultEngineBuilder};
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::utils::test_utils::assert_result_error_with_message;
     use object_store::memory::InMemory;
