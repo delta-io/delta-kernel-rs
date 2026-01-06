@@ -1401,22 +1401,27 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     Ok(())
 }
 
-async fn create_segment_for(
-    commit_versions: &[u64],
-    compaction_versions: &[(u64, u64)],
+#[derive(Default)]
+struct LogSegmentConfig<'a> {
+    published_commit_versions: &'a [u64],
+    compaction_versions: &'a [(u64, u64)],
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
-) -> LogSegment {
-    let mut paths: Vec<Path> = commit_versions
+}
+
+async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
+    let mut paths: Vec<Path> = segment
+        .published_commit_versions
         .iter()
         .map(|version| delta_path_for_version(*version, "json"))
         .chain(
-            compaction_versions
+            segment
+                .compaction_versions
                 .iter()
                 .map(|(start, end)| compacted_log_path_for_versions(*start, *end, "json")),
         )
         .collect();
-    if let Some(version) = checkpoint_version {
+    if let Some(version) = segment.checkpoint_version {
         paths.push(delta_path_for_version(
             version,
             "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
@@ -1428,7 +1433,7 @@ async fn create_segment_for(
         log_root.clone(),
         vec![], // log_tail
         None,
-        version_to_load,
+        segment.version_to_load,
     )
     .unwrap()
 }
@@ -1471,12 +1476,12 @@ async fn test_compaction_listing(
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
 ) {
-    let log_segment = create_segment_for(
-        commit_versions,
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: commit_versions,
         compaction_versions,
         checkpoint_version,
         version_to_load,
-    )
+    })
     .await;
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
     let checkpoint_cuttoff = checkpoint_version.map(|v| v as i64).unwrap_or(-1);
@@ -1625,12 +1630,12 @@ async fn test_commit_cover(
     version_to_load: Option<u64>,
     expected_files: &[ExpectedFile],
 ) {
-    let log_segment = create_segment_for(
-        commit_versions,
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: commit_versions,
         compaction_versions,
         checkpoint_version,
         version_to_load,
-    )
+    })
     .await;
     let cover = log_segment.find_commit_cover();
     // our test-utils include "_delta_log" in the path, which is already in log_segment.log_root, so
@@ -1901,78 +1906,72 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
 #[tokio::test]
 async fn commits_since() {
     // simple
-    let log_segment = create_segment_for(
-        &Vec::from_iter(0..=4),
-        &[],
-        None, // No checkpoint
-        None, // Version to load
-    )
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &Vec::from_iter(0..=4),
+        ..Default::default()
+    })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 4);
 
     // with compaction, no checkpoint
-    let log_segment = create_segment_for(
-        &Vec::from_iter(0..=4),
-        &[(0, 2)],
-        None, // No checkpoint
-        None, // Version to load
-    )
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &Vec::from_iter(0..=4),
+        compaction_versions: &[(0, 2)],
+        ..Default::default()
+    })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
     // checkpoint, no compaction
-    let log_segment = create_segment_for(
-        &Vec::from_iter(0..=6),
-        &[],
-        Some(3), // Checkpoint @ 3
-        None,    // Version to load
-    )
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &Vec::from_iter(0..=6),
+        checkpoint_version: Some(3),
+        ..Default::default()
+    })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
 
     // checkpoint and compaction less than checkpoint
-    let log_segment = create_segment_for(
-        &Vec::from_iter(0..=6),
-        &[(0, 2)],
-        Some(3), // Checkpoint @ 3
-        None,    // Version to load
-    )
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &Vec::from_iter(0..=6),
+        compaction_versions: &[(0, 2)],
+        checkpoint_version: Some(3),
+        ..Default::default()
+    })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 3);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 3);
 
     // checkpoint and compaction greater than checkpoint
-    let log_segment = create_segment_for(
-        &Vec::from_iter(0..=6),
-        &[(3, 4)],
-        Some(2), // Checkpoint @ 2
-        None,    // Version to load
-    )
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &Vec::from_iter(0..=6),
+        compaction_versions: &[(3, 4)],
+        checkpoint_version: Some(2),
+        ..Default::default()
+    })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 4);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
     // multiple compactions
-    let log_segment = create_segment_for(
-        &Vec::from_iter(0..=6),
-        &[(1, 2), (3, 4)],
-        None, // No Checkpoint
-        None, // Version to load
-    )
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &Vec::from_iter(0..=6),
+        compaction_versions: &[(1, 2), (3, 4)],
+        ..Default::default()
+    })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 6);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 2);
 
     // multiple compactions, out of order
-    let log_segment = create_segment_for(
-        &Vec::from_iter(0..=10),
-        &[(1, 2), (3, 9), (4, 6)],
-        None, // No Checkpoint
-        None, // Version to load
-    )
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &Vec::from_iter(0..=10),
+        compaction_versions: &[(1, 2), (3, 9), (4, 6)],
+        ..Default::default()
+    })
     .await;
     assert_eq!(log_segment.commits_since_checkpoint(), 10);
     assert_eq!(log_segment.commits_since_log_compaction_or_checkpoint(), 1);
