@@ -156,21 +156,6 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
 }
 
 impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
-    /// Create a new [`DefaultEngine`] instance with the default executor.
-    ///
-    /// Uses `TokioBackgroundExecutor` as the default executor.
-    /// For custom executors, use [`DefaultEngine::new_with_executor`].
-    ///
-    /// # Parameters
-    ///
-    /// - `object_store`: The object store to use.
-    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
-        Self::new_with_executor(
-            object_store,
-            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
-        )
-    }
-
     /// Create a [`DefaultEngineBuilder`] for constructing a [`DefaultEngine`] with custom options.
     ///
     /// # Parameters
@@ -196,19 +181,6 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    /// Create a new [`DefaultEngine`] instance with a custom executor.
-    ///
-    /// Most users should use [`DefaultEngine::new`] instead. This method is only
-    /// needed for specialized testing scenarios (e.g., multi-threaded executors).
-    ///
-    /// # Parameters
-    ///
-    /// - `object_store`: The object store to use.
-    /// - `task_executor`: Used to spawn async IO tasks. See [executor::TaskExecutor].
-    pub fn new_with_executor(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
-        Self::new_with_opts(object_store, task_executor, None)
-    }
-
     fn new_with_opts(
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
@@ -329,7 +301,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(object_store);
+        let engine = DefaultEngineBuilder::new(object_store).build();
         test_arrow_engine(&engine, &url);
     }
 

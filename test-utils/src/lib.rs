@@ -13,7 +13,7 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
@@ -240,7 +240,7 @@ pub fn create_default_engine(
     table_root: &url::Url,
 ) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
     let store = store_from_url(table_root)?;
-    Ok(Arc::new(DefaultEngine::new(store)))
+    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
 }
 
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
@@ -262,7 +262,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let engine = DefaultEngine::new(Arc::clone(&storage));
+    let engine = DefaultEngineBuilder::new(Arc::clone(&storage)).build();
 
     (storage, engine, url)
 }
