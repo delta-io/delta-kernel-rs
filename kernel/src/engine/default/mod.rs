@@ -101,40 +101,38 @@ pub struct DefaultEngine<E: TaskExecutor> {
 /// # use delta_kernel::engine::default::DefaultEngineBuilder;
 /// # use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 /// # use object_store::local::LocalFileSystem;
-/// // Build a DefaultEngine
-/// let engine = DefaultEngineBuilder::new(
-///     Arc::new(LocalFileSystem::new()),
-///     Arc::new(TokioBackgroundExecutor::new()),
-/// )
-/// .build();
+/// // Build a DefaultEngine with default executor
+/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+///     .build();
 ///
-/// // Or via convenience method on DefaultEngine (uses default executor)
-/// # use delta_kernel::engine::default::DefaultEngine;
-/// let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new()))
+/// // Build with a custom executor
+/// let engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new()))
+///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
 ///     .build();
 /// ```
 #[derive(Debug)]
-pub struct DefaultEngineBuilder<E: TaskExecutor = executor::tokio::TokioBackgroundExecutor> {
+pub struct DefaultEngineBuilder<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
-    task_executor: Option<Arc<E>>,
+    task_executor: Arc<E>,
     metrics_reporter: Option<Arc<dyn MetricsReporter>>,
 }
 
-impl<E: TaskExecutor> DefaultEngineBuilder<E> {
-    /// Create a new [`DefaultEngineBuilder`] instance.
+impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+    /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    /// - `task_executor`: The executor to use for async tasks.
-    pub fn new(object_store: Arc<DynObjectStore>, task_executor: Arc<E>) -> Self {
+    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
-            task_executor: Some(task_executor),
+            task_executor: Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
             metrics_reporter: None,
         }
     }
+}
 
+impl<E: TaskExecutor> DefaultEngineBuilder<E> {
     /// Set a metrics reporter for the engine.
     ///
     /// # Parameters
@@ -145,13 +143,25 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
         self
     }
 
-    /// Build the [`DefaultEngine`].
+    /// Set a custom task executor for the engine.
+    ///
+    /// # Parameters
+    ///
+    /// - `task_executor`: The executor to use for async tasks.
+    pub fn with_task_executor<F: TaskExecutor>(
+        self,
+        task_executor: Arc<F>,
+    ) -> DefaultEngineBuilder<F> {
+        DefaultEngineBuilder {
+            object_store: self.object_store,
+            task_executor,
+            metrics_reporter: self.metrics_reporter,
+        }
+    }
+
+    /// Build the [`DefaultEngine`] with the configured executor.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(
-            self.object_store,
-            self.task_executor.expect("task_executor is set in new()"),
-            self.metrics_reporter,
-        )
+        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
     }
 }
 
@@ -160,7 +170,7 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     ///
     /// Uses `TokioBackgroundExecutor` as the default executor.
     /// For custom executors, use [`DefaultEngine::new_with_executor`] or
-    /// [`DefaultEngineBuilder::with_executor`].
+    /// [`DefaultEngineBuilder::with_task_executor`].
     ///
     /// # Parameters
     ///
@@ -172,18 +182,13 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         )
     }
 
-    /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
+    /// Create a new [`DefaultEngineBuilder`] instance.
     ///
     /// # Parameters
     ///
     /// - `object_store`: The object store to use.
-    pub fn builder(
-        object_store: Arc<DynObjectStore>,
-    ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
-        DefaultEngineBuilder::new(
-            object_store,
-            Arc::new(executor::tokio::TokioBackgroundExecutor::new()),
-        )
+    pub fn builder(object_store: Arc<DynObjectStore>) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+        DefaultEngineBuilder::new(object_store)
     }
 
     /// Set a metrics reporter for the engine to collect events and metrics during operations.
