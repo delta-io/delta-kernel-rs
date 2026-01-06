@@ -119,10 +119,6 @@ pub struct DefaultEngineBuilder<E: TaskExecutor> {
 
 impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
     /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
-    ///
-    /// # Parameters
-    ///
-    /// - `object_store`: The object store to use.
     pub fn new(object_store: Arc<DynObjectStore>) -> Self {
         Self {
             object_store,
@@ -133,21 +129,11 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<E> {
-    /// Set a metrics reporter for the engine.
-    ///
-    /// # Parameters
-    ///
-    /// - `reporter`: An implementation of the [`MetricsReporter`] trait.
     pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
         self.metrics_reporter = Some(reporter);
         self
     }
 
-    /// Set a custom task executor for the engine.
-    ///
-    /// # Parameters
-    ///
-    /// - `task_executor`: The executor to use for async tasks.
     pub fn with_task_executor<F: TaskExecutor>(
         self,
         task_executor: Arc<F>,
@@ -159,7 +145,6 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
         }
     }
 
-    /// Build the [`DefaultEngine`] with the configured executor.
     pub fn build(self) -> DefaultEngine<E> {
         DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
     }
@@ -169,8 +154,7 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     /// Create a new [`DefaultEngine`] instance with the default executor.
     ///
     /// Uses `TokioBackgroundExecutor` as the default executor.
-    /// For custom executors, use [`DefaultEngine::new_with_executor`] or
-    /// [`DefaultEngineBuilder::with_task_executor`].
+    /// For custom executors, use [`DefaultEngine::new_with_executor`].
     ///
     /// # Parameters
     ///
@@ -182,11 +166,6 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         )
     }
 
-    /// Create a new [`DefaultEngineBuilder`] instance.
-    ///
-    /// # Parameters
-    ///
-    /// - `object_store`: The object store to use.
     pub fn builder(object_store: Arc<DynObjectStore>) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
         DefaultEngineBuilder::new(object_store)
     }
@@ -218,7 +197,6 @@ impl<E: TaskExecutor> DefaultEngine<E> {
         Self::new_with_opts(object_store, task_executor, None)
     }
 
-    /// Create a new [`DefaultEngine`] with all options.
     fn new_with_opts(
         object_store: Arc<DynObjectStore>,
         task_executor: Arc<E>,
