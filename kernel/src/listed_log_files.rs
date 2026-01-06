@@ -31,6 +31,7 @@ use url::Url;
 /// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
 /// - `latest_crc_file`: The CRC file with the highest version, if any.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
+/// - `max_known_published_commit_version`: The highest published commit file version, or `None` if no published commits were found.
 #[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
@@ -39,6 +40,7 @@ pub(crate) struct ListedLogFiles {
     checkpoint_parts: Vec<ParsedLogPath>,
     latest_crc_file: Option<ParsedLogPath>,
     latest_commit_file: Option<ParsedLogPath>,
+    max_known_published_commit_version: Option<Version>,
 }
 
 /// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
@@ -176,6 +178,7 @@ impl ListedLogFiles {
         checkpoint_parts: Vec<ParsedLogPath>,
         latest_crc_file: Option<ParsedLogPath>,
         latest_commit_file: Option<ParsedLogPath>,
+        max_known_published_commit_version: Option<Version>,
     ) -> DeltaResult<Self> {
         // We are adding debug_assertions here since we want to validate invariants that are
         // (relatively) expensive to compute
@@ -218,6 +221,7 @@ impl ListedLogFiles {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            max_known_published_commit_version,
         })
     }
 
@@ -230,6 +234,7 @@ impl ListedLogFiles {
         Vec<ParsedLogPath>,
         Option<ParsedLogPath>,
         Option<ParsedLogPath>,
+        Option<Version>,
     ) {
         (
             self.ascending_commit_files,
@@ -237,6 +242,7 @@ impl ListedLogFiles {
             self.checkpoint_parts,
             self.latest_crc_file,
             self.latest_commit_file,
+            self.max_known_published_commit_version,
         )
     }
 
@@ -272,7 +278,15 @@ impl ListedLogFiles {
                 .try_collect()?;
         // .last() on a slice is an O(1) operation
         let latest_commit_file = listed_commits.last().cloned();
-        ListedLogFiles::try_new(listed_commits, vec![], vec![], None, latest_commit_file)
+        let max_known_published_commit_version = listed_commits.last().map(|commit| commit.version);
+        ListedLogFiles::try_new(
+            listed_commits,
+            vec![],
+            vec![],
+            None,
+            latest_commit_file,
+            max_known_published_commit_version,
+        )
     }
 
     /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -306,6 +320,7 @@ impl ListedLogFiles {
             checkpoint_parts: Vec<ParsedLogPath>,
             latest_crc_file: Option<ParsedLogPath>,
             latest_commit_file: Option<ParsedLogPath>,
+            max_known_published_commit_version: Option<Version>,
             new_checkpoint_parts: Vec<ParsedLogPath>,
             end_version: Option<Version>,
         }
@@ -314,7 +329,11 @@ impl ListedLogFiles {
             fn process_file(&mut self, file: ParsedLogPath) {
                 use LogPathFileType::*;
                 match file.file_type {
-                    Commit | StagedCommit => self.ascending_commit_files.push(file),
+                    Commit => {
+                        self.max_known_published_commit_version = Some(file.version);
+                        self.ascending_commit_files.push(file);
+                    }
+                    StagedCommit => self.ascending_commit_files.push(file),
                     CompactedCommit { hi } if self.end_version.is_none_or(|end| hi <= end) => {
                         self.ascending_compaction_files.push(file);
                     }
@@ -405,6 +424,7 @@ impl ListedLogFiles {
             builder.checkpoint_parts,
             builder.latest_crc_file,
             builder.latest_commit_file,
+            builder.max_known_published_commit_version,
         )
     }
 

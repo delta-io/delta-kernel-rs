@@ -29,7 +29,9 @@ use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
 };
-use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
+use test_utils::{
+    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+};
 
 use super::*;
 
@@ -1403,6 +1405,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 
 struct LogSegmentConfig<'a> {
     commit_versions: &'a [u64],
+    staged_commit_versions: &'a [u64],
     compaction_versions: &'a [(u64, u64)],
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
@@ -1412,6 +1415,7 @@ impl<'a> Default for LogSegmentConfig<'a> {
     fn default() -> Self {
         Self {
             commit_versions: &[],
+            staged_commit_versions: &[],
             compaction_versions: &[],
             checkpoint_version: None,
             version_to_load: None,
@@ -1431,17 +1435,37 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
                 .map(|(start, end)| compacted_log_path_for_versions(*start, *end, "json")),
         )
         .collect();
+
     if let Some(version) = segment.checkpoint_version {
         paths.push(delta_path_for_version(
             version,
             "checkpoint.3a0d65cd-4056-49b8-937b-95f9e3ee90e5.json",
         ));
     }
+
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+
+    let table_root = Url::parse("memory:///").expect("valid url");
+
+    let staged_commits_log_tail: Vec<ParsedLogPath> = segment
+        .staged_commit_versions
+        .iter()
+        .map(|version| staged_commit_path_for_version(*version))
+        .map(|path| {
+            ParsedLogPath::try_from(FileMeta {
+                location: table_root.join(path.as_ref()).unwrap(),
+                last_modified: 0,
+                size: 0,
+            })
+            .unwrap()
+            .unwrap()
+        })
+        .collect();
+
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root.clone(),
-        vec![], // log_tail
+        staged_commits_log_tail,
         None,
         segment.version_to_load,
     )
@@ -2367,6 +2391,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        max_known_published_commit_version: Some(2),
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2387,6 +2412,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        max_known_published_commit_version: Some(1),
     };
 
     // Should fail with staged commits
@@ -2397,4 +2423,50 @@ fn test_publish_validation() {
     } else {
         panic!("Expected Error::Generic");
     }
+}
+
+#[tokio::test]
+async fn test_max_known_published_commit_version_only_published_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn test_max_known_published_commit_version_only_staged_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        staged_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_known_published_commit_version, None);
+}
+
+#[tokio::test]
+async fn test_max_known_published_commit_version_published_and_staged_commits_no_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_max_known_published_commit_version_published_and_staged_commits_with_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 2);
 }

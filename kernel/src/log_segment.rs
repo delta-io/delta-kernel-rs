@@ -69,7 +69,7 @@ pub(crate) struct LogSegment {
     /// Note that this published commit file maybe not be included in
     /// LogSegment::ascending_commit_files if there is a catalog commit present for the same
     /// version that took priority over it.
-    pub max_known_published_commit_version: Option<Version>
+    pub max_known_published_commit_version: Option<Version>,
 }
 
 impl LogSegment {
@@ -85,6 +85,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            max_known_published_commit_version,
         ) = listed_files.into_parts();
 
         // Ensure commit file versions are contiguous
@@ -132,12 +133,6 @@ impl LogSegment {
             );
         }
 
-        let max_known_published_commit_version = ascending_commit_files
-            .iter()
-            .filter(|x| x.file_type == LogPathFileType::Commit)
-            .last()
-            .map(|x| x.version);
-
         Ok(LogSegment {
             end_version: effective_version,
             checkpoint_version,
@@ -147,7 +142,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
-            max_known_published_commit_version
+            max_known_published_commit_version,
         })
     }
 
