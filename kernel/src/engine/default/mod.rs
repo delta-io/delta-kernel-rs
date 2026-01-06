@@ -304,7 +304,15 @@ impl UrlExt for Url {
 mod tests {
     use super::*;
     use crate::engine::tests::test_arrow_engine;
+    use crate::metrics::MetricEvent;
     use object_store::local::LocalFileSystem;
+
+    #[derive(Debug)]
+    struct TestMetricsReporter;
+
+    impl MetricsReporter for TestMetricsReporter {
+        fn report(&self, _event: MetricEvent) {}
+    }
 
     #[test]
     fn test_default_engine() {
@@ -312,6 +320,82 @@ mod tests {
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let object_store = Arc::new(LocalFileSystem::new());
         let engine = DefaultEngine::new(object_store);
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_new_and_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngineBuilder::new(object_store).build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_with_metrics_reporter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let reporter = Arc::new(TestMetricsReporter);
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_metrics_reporter(reporter)
+            .build();
+        assert!(engine.get_metrics_reporter().is_some());
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_with_task_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_task_executor(executor)
+            .build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_with_custom_executor() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let executor = Arc::new(executor::tokio::TokioMultiThreadExecutor::new(
+            rt.handle().clone(),
+        ));
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_task_executor(executor)
+            .build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let engine = DefaultEngine::builder(object_store).build();
+        test_arrow_engine(&engine, &url);
+    }
+
+    #[test]
+    fn test_default_engine_builder_all_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(tmp.path()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new());
+        let reporter = Arc::new(TestMetricsReporter);
+        let executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
+        let engine = DefaultEngineBuilder::new(object_store)
+            .with_metrics_reporter(reporter)
+            .with_task_executor(executor)
+            .build();
+        assert!(engine.get_metrics_reporter().is_some());
         test_arrow_engine(&engine, &url);
     }
 
