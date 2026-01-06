@@ -127,7 +127,6 @@ void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_
   if (visit_res.tag != Okbool) {
     print_error("Failed to visit scan metadata.", (Error*)visit_res.err);
     free_error((Error*)visit_res.err);
-    exit(-1);
   }
   free_bool_slice(selection_vector);
   free_scan_metadata(scan_metadata);
@@ -287,7 +286,9 @@ int main(int argc, char* argv[])
 
   // an example of using a builder to set options when building an engine
   EngineBuilder* engine_builder = engine_builder_res.ok;
-  set_builder_opt(engine_builder, "aws_region", "us-west-2");
+  if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
+    return -1;
+  }
   // potentially set credentials here
   // set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
   // set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
