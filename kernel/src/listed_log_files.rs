@@ -31,18 +31,81 @@ use url::Url;
 /// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
 /// - `latest_crc_file`: The CRC file with the highest version, if any.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
-    pub(crate) ascending_commit_files: Vec<ParsedLogPath>,
-    pub(crate) ascending_compaction_files: Vec<ParsedLogPath>,
-    pub(crate) checkpoint_parts: Vec<ParsedLogPath>,
-    pub(crate) latest_crc_file: Option<ParsedLogPath>,
-    pub(crate) latest_commit_file: Option<ParsedLogPath>,
+    ascending_commit_files: Vec<ParsedLogPath>,
+    ascending_compaction_files: Vec<ParsedLogPath>,
+    checkpoint_parts: Vec<ParsedLogPath>,
+    latest_crc_file: Option<ParsedLogPath>,
+    latest_commit_file: Option<ParsedLogPath>,
 }
 
-/// Type alias that allows us to cleanly construct a [`ListedLogFiles`] with validation via [`ListedLogFiles::try_new`].
-pub(crate) type UnvalidatedListedLogFiles = ListedLogFiles;
+/// Builder for constructing a validated [`ListedLogFiles`].
+///
+/// Use struct literal syntax with `..Default::default()` to set only the fields you need,
+/// then call `.build()` to validate and produce a `ListedLogFiles`.
+#[derive(Debug, Default)]
+pub(crate) struct ListedLogFilesBuilder {
+    pub ascending_commit_files: Vec<ParsedLogPath>,
+    pub ascending_compaction_files: Vec<ParsedLogPath>,
+    pub checkpoint_parts: Vec<ParsedLogPath>,
+    pub latest_crc_file: Option<ParsedLogPath>,
+    pub latest_commit_file: Option<ParsedLogPath>,
+}
+
+impl ListedLogFilesBuilder {
+    /// Validates the builder contents and produces a [`ListedLogFiles`].
+    pub(crate) fn build(self) -> DeltaResult<ListedLogFiles> {
+        // We are adding debug_assertions here since we want to validate invariants that are
+        // (relatively) expensive to compute
+        #[cfg(debug_assertions)]
+        {
+            assert!(self
+                .ascending_compaction_files
+                .windows(2)
+                .all(|pair| match pair {
+                    [ParsedLogPath {
+                        version: version0,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi0 },
+                        ..
+                    }, ParsedLogPath {
+                        version: version1,
+                        file_type: LogPathFileType::CompactedCommit { hi: hi1 },
+                        ..
+                    }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
+                    _ => false,
+                }));
+
+            assert!(self
+                .checkpoint_parts
+                .iter()
+                .all(|part| part.is_checkpoint()));
+
+            // for a multi-part checkpoint, check that they are all same version and all the parts are there
+            if self.checkpoint_parts.len() > 1 {
+                assert!(self
+                    .checkpoint_parts
+                    .windows(2)
+                    .all(|pair| pair[0].version == pair[1].version));
+
+                assert!(self.checkpoint_parts.iter().all(|part| matches!(
+                    part.file_type,
+                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
+                    if self.checkpoint_parts.len() == num_parts as usize
+                )));
+            }
+        }
+
+        Ok(ListedLogFiles {
+            ascending_commit_files: self.ascending_commit_files,
+            ascending_compaction_files: self.ascending_compaction_files,
+            checkpoint_parts: self.checkpoint_parts,
+            latest_crc_file: self.latest_crc_file,
+            latest_commit_file: self.latest_commit_file,
+        })
+    }
+}
 
 /// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
 /// taking into account the `log_tail` which was (ostentibly) returned from the catalog. If there
@@ -169,51 +232,6 @@ fn group_checkpoint_parts(parts: Vec<ParsedLogPath>) -> HashMap<u32, Vec<ParsedL
 }
 
 impl ListedLogFiles {
-    // Note: for now we expose the constructor as pub(crate) to allow for use in testing. Ideally,
-    // we should explore entirely encapsulating ListedLogFiles within LogSegment - currently
-    // LogSegment constructor requires a ListedLogFiles.
-    #[internal_api]
-    pub(crate) fn try_new(raw: UnvalidatedListedLogFiles) -> DeltaResult<Self> {
-        // We are adding debug_assertions here since we want to validate invariants that are
-        // (relatively) expensive to compute
-        #[cfg(debug_assertions)]
-        {
-            assert!(raw
-                .ascending_compaction_files
-                .windows(2)
-                .all(|pair| match pair {
-                    [ParsedLogPath {
-                        version: version0,
-                        file_type: LogPathFileType::CompactedCommit { hi: hi0 },
-                        ..
-                    }, ParsedLogPath {
-                        version: version1,
-                        file_type: LogPathFileType::CompactedCommit { hi: hi1 },
-                        ..
-                    }] => version0 < version1 || (version0 == version1 && hi0 <= hi1),
-                    _ => false,
-                }));
-
-            assert!(raw.checkpoint_parts.iter().all(|part| part.is_checkpoint()));
-
-            // for a multi-part checkpoint, check that they are all same version and all the parts are there
-            if raw.checkpoint_parts.len() > 1 {
-                assert!(raw
-                    .checkpoint_parts
-                    .windows(2)
-                    .all(|pair| pair[0].version == pair[1].version));
-
-                assert!(raw.checkpoint_parts.iter().all(|part| matches!(
-                    part.file_type,
-                    LogPathFileType::MultiPartCheckpoint { num_parts, .. }
-                    if raw.checkpoint_parts.len() == num_parts as usize
-                )));
-            }
-        }
-
-        Ok(raw)
-    }
-
     #[allow(clippy::type_complexity)] // It's the most readable way to destructure
     pub(crate) fn into_parts(
         self,
@@ -265,11 +283,12 @@ impl ListedLogFiles {
                 .try_collect()?;
         // .last() on a slice is an O(1) operation
         let latest_commit_file = listed_commits.last().cloned();
-        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+        ListedLogFilesBuilder {
             ascending_commit_files: listed_commits,
             latest_commit_file,
             ..Default::default()
-        })
+        }
+        .build()
     }
 
     /// List all commit and checkpoint files with versions above the provided `start_version` (inclusive).
@@ -396,13 +415,14 @@ impl ListedLogFiles {
             builder.latest_commit_file = Some(commit_file.clone());
         }
 
-        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+        ListedLogFilesBuilder {
             ascending_commit_files: builder.ascending_commit_files,
             ascending_compaction_files: builder.ascending_compaction_files,
             checkpoint_parts: builder.checkpoint_parts,
             latest_crc_file: builder.latest_crc_file,
             latest_commit_file: builder.latest_commit_file,
-        })
+        }
+        .build()
     }
 
     /// List all commit and checkpoint files after the provided checkpoint. It is guaranteed that all

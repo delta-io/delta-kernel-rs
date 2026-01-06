@@ -17,7 +17,7 @@ use crate::engine::default::filesystem::ObjectStoreStorageHandler;
 use crate::engine::default::DefaultEngine;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
-use crate::listed_log_files::UnvalidatedListedLogFiles;
+use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::ActionsBatch;
 use crate::log_segment::{ListedLogFiles, LogSegment};
 use crate::parquet::arrow::ArrowWriter;
@@ -1109,11 +1109,12 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let v2_checkpoint_read_schema = get_commit_schema().project(&[METADATA_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+        ListedLogFilesBuilder {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        })?,
+        }
+        .build()?,
         log_root,
         None,
     )?;
@@ -1169,14 +1170,15 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let v2_checkpoint_read_schema = get_commit_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+        ListedLogFilesBuilder {
             checkpoint_parts: vec![
                 create_log_path(&checkpoint_one_file),
                 create_log_path(&checkpoint_two_file),
             ],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        })?,
+        }
+        .build()?,
         log_root,
         None,
     )?;
@@ -1223,11 +1225,12 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+        ListedLogFilesBuilder {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        })?,
+        }
+        .build()?,
         log_root,
         None,
     )?;
@@ -1270,11 +1273,12 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+        ListedLogFilesBuilder {
             checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        })?,
+        }
+        .build()?,
         log_root,
         None,
     )?;
@@ -1339,11 +1343,12 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
-        ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+        ListedLogFilesBuilder {
             checkpoint_parts: vec![create_log_path(&checkpoint_file_path)],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
-        })?,
+        }
+        .build()?,
         log_root,
         None,
     )?;
@@ -1810,7 +1815,7 @@ async fn test_commit_cover_minimal_overlap() {
 #[test]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_in_order_compaction_files() {
-    let _ = ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+    let _ = ListedLogFilesBuilder {
         ascending_compaction_files: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
@@ -1823,14 +1828,15 @@ fn test_debug_assert_listed_log_file_in_order_compaction_files() {
             "file:///_delta_log/00000000000000000001.json",
         )),
         ..Default::default()
-    });
+    }
+    .build();
 }
 
 #[test]
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
-    let _ = ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+    let _ = ListedLogFilesBuilder {
         ascending_compaction_files: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000000.00000000000000000004.compacted.json",
@@ -1843,14 +1849,15 @@ fn test_debug_assert_listed_log_file_out_of_order_compaction_files() {
             "file:///_delta_log/00000000000000000001.json",
         )),
         ..Default::default()
-    });
+    }
+    .build();
 }
 
 #[test]
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
-    let _ = ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+    let _ = ListedLogFilesBuilder {
         checkpoint_parts: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000002.parquet",
@@ -1863,14 +1870,15 @@ fn test_debug_assert_listed_log_file_different_multipart_checkpoint_versions() {
             "file:///_delta_log/00000000000000000001.json",
         )),
         ..Default::default()
-    });
+    }
+    .build();
 }
 
 #[test]
 #[should_panic]
 #[cfg(debug_assertions)]
 fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
-    let _ = ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+    let _ = ListedLogFilesBuilder {
         checkpoint_parts: vec![
             create_log_path(
                 "file:///_delta_log/00000000000000000010.checkpoint.0000000001.0000000003.parquet",
@@ -1883,7 +1891,8 @@ fn test_debug_assert_listed_log_file_invalid_multipart_checkpoint() {
             "file:///_delta_log/00000000000000000001.json",
         )),
         ..Default::default()
-    });
+    }
+    .build();
 }
 
 #[tokio::test]
@@ -2272,7 +2281,7 @@ async fn test_latest_commit_file_edge_case_commit_before_checkpoint() {
 
 #[test]
 fn test_log_segment_contiguous_commit_files() {
-    let res = ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+    let res = ListedLogFilesBuilder {
         ascending_commit_files: vec![
             create_log_path("file:///_delta_log/00000000000000000001.json"),
             create_log_path("file:///_delta_log/00000000000000000002.json"),
@@ -2282,11 +2291,12 @@ fn test_log_segment_contiguous_commit_files() {
             "file:///_delta_log/00000000000000000001.json",
         )),
         ..Default::default()
-    });
+    }
+    .build();
     assert!(res.is_ok());
 
     // allow gaps in ListedLogFiles
-    let listed = ListedLogFiles::try_new(UnvalidatedListedLogFiles {
+    let listed = ListedLogFilesBuilder {
         ascending_commit_files: vec![
             create_log_path("file:///_delta_log/00000000000000000001.json"),
             create_log_path("file:///_delta_log/00000000000000000003.json"),
@@ -2295,7 +2305,8 @@ fn test_log_segment_contiguous_commit_files() {
             "file:///_delta_log/00000000000000000001.json",
         )),
         ..Default::default()
-    });
+    }
+    .build();
 
     // disallow gaps in LogSegment
     let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
