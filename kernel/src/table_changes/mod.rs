@@ -94,7 +94,7 @@ static CDF_FIELDS: LazyLock<[StructField; 3]> = LazyLock::new(|| {
 ///  # Examples
 ///  Get `TableChanges` for versions 0 to 1 (inclusive)
 ///  ```rust
-///  # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngine};
+///  # use delta_kernel::engine::default::{storage::store_from_url, DefaultEngineBuilder};
 ///  # use delta_kernel::{SnapshotRef, Error};
 ///  # use delta_kernel::table_changes::TableChanges;
 ///  # let path = "./tests/data/table-with-cdf";
