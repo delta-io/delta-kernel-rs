@@ -18,7 +18,7 @@ use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::{CommitResult, RetryableTransaction};
 use delta_kernel::{DeltaResult, Engine, Error, Snapshot, SnapshotRef};
@@ -77,7 +77,7 @@ async fn try_main() -> DeltaResult<()> {
 
     // Get the engine for local filesystem
     use delta_kernel::engine::default::storage::store_from_url;
-    let engine = DefaultEngine::new(store_from_url(&url)?);
+    let engine = DefaultEngineBuilder::new(store_from_url(&url)?).build();
 
     // Create or get the table
     let snapshot = create_or_get_base_snapshot(&url, &engine, &cli.schema).await?;
