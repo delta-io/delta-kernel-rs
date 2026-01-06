@@ -166,7 +166,9 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         )
     }
 
-    pub fn builder(object_store: Arc<DynObjectStore>) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
+    pub fn builder(
+        object_store: Arc<DynObjectStore>,
+    ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
         DefaultEngineBuilder::new(object_store)
     }
 
