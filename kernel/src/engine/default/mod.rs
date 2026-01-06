@@ -129,11 +129,15 @@ impl DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngineBuilder<E> {
+    /// Set the metrics reporter for the engine.
     pub fn with_metrics_reporter(mut self, reporter: Arc<dyn MetricsReporter>) -> Self {
         self.metrics_reporter = Some(reporter);
         self
     }
 
+    /// Set a custom task executor for the engine.
+    ///
+    /// See [`executor::TaskExecutor`] for more details.
     pub fn with_task_executor<F: TaskExecutor>(
         self,
         task_executor: Arc<F>,
@@ -145,6 +149,7 @@ impl<E: TaskExecutor> DefaultEngineBuilder<E> {
         }
     }
 
+    /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
         DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.metrics_reporter)
     }
