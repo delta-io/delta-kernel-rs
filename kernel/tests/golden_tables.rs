@@ -10,7 +10,8 @@ use delta_kernel::arrow::array::{Array, AsArray, StructArray};
 use delta_kernel::arrow::compute::{concat_batches, take};
 use delta_kernel::arrow::compute::{lexsort_to_indices, SortColumn};
 use delta_kernel::arrow::datatypes::{DataType, FieldRef, Schema};
-use delta_kernel::arrow::{compute::filter_record_batch, record_batch::RecordBatch};
+use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::parquet::arrow::async_reader::{
     ParquetObjectReader, ParquetRecordBatchStreamBuilder,
 };
@@ -28,7 +29,7 @@ use url::Url;
 
 mod common;
 
-use test_utils::{load_test_data, to_arrow};
+use test_utils::load_test_data;
 
 // NB adapted from DAT: read all parquet files in the directory and concatenate them
 async fn read_expected(path: &Path) -> DeltaResult<RecordBatch> {
@@ -168,21 +169,11 @@ async fn latest_snapshot_test(
     url: Url,
     expected_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder(url).build(&engine)?;
-    let scan = snapshot.into_scan_builder().build()?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
+    let scan = snapshot.scan_builder().build()?;
     let scan_res = scan.execute(Arc::new(engine))?;
     let batches: Vec<RecordBatch> = scan_res
-        .map(|scan_result| -> DeltaResult<_> {
-            let scan_result = scan_result?;
-            let mask = scan_result.full_mask();
-            let data = scan_result.raw_data?;
-            let record_batch = to_arrow(data)?;
-            if let Some(mask) = mask {
-                Ok(filter_record_batch(&record_batch, &mask.into())?)
-            } else {
-                Ok(record_batch)
-            }
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
 
     let expected = read_expected(&expected_path.expect("expect an expected dir")).await?;
@@ -212,12 +203,8 @@ fn setup_golden_table(
     let table_path = test_path.join("delta");
     let url = delta_kernel::try_parse_uri(table_path.to_str().expect("table path to string"))
         .expect("table from uri");
-    let engine = DefaultEngine::try_new(
-        &url,
-        std::iter::empty::<(&str, &str)>(),
-        Arc::new(TokioBackgroundExecutor::new()),
-    )
-    .unwrap();
+    let engine = Arc::try_unwrap(test_utils::create_default_engine(&url).unwrap())
+        .expect("Arc should have single reference");
     let expected_path = test_path.join("expected");
     let expected_path = expected_path.exists().then_some(expected_path);
     (engine, url, expected_path, test_dir)
@@ -271,12 +258,9 @@ async fn canonicalized_paths_test(
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // assert latest version is 1 and there are no files in the snapshot (add is removed)
-    let snapshot = Snapshot::builder(table_root).build(&engine).unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     assert_eq!(snapshot.version(), 1);
-    let scan = snapshot
-        .into_scan_builder()
-        .build()
-        .expect("build the scan");
+    let scan = snapshot.scan_builder().build().expect("build the scan");
     let mut scan_metadata = scan.scan_metadata(&engine).expect("scan metadata");
     assert!(scan_metadata.next().is_none());
     Ok(())
@@ -287,12 +271,9 @@ async fn checkpoint_test(
     table_root: Url,
     _expected: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let snapshot = Snapshot::builder(table_root).build(&engine).unwrap();
+    let snapshot = Snapshot::builder_for(table_root).build(&engine).unwrap();
     let version = snapshot.version();
-    let scan = snapshot
-        .into_scan_builder()
-        .build()
-        .expect("build the scan");
+    let scan = snapshot.scan_builder().build().expect("build the scan");
     let scan_metadata: Vec<_> = scan
         .scan_metadata(&engine)
         .expect("scan metadata")

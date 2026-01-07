@@ -89,6 +89,18 @@ pub struct TableProperties {
     /// true to enable deletion vectors and predictive I/O for updates.
     pub enable_deletion_vectors: Option<bool>,
 
+    /// Whether widening the type of an existing column or field is allowed, either manually using
+    /// ALTER TABLE CHANGE COLUMN or automatically if automatic schema evolution is enabled.
+    pub enable_type_widening: Option<bool>,
+
+    /// Whether Iceberg compatibility V1 is enabled for this table. When enabled, Delta Lake
+    /// ensures compatibility with Apache Iceberg V1 table format.
+    pub enable_iceberg_compat_v1: Option<bool>,
+
+    /// Whether Iceberg compatibility V2 is enabled for this table. When enabled, Delta Lake
+    /// ensures compatibility with Apache Iceberg V2 table format.
+    pub enable_iceberg_compat_v2: Option<bool>,
+
     /// The degree to which a transaction must be isolated from modifications made by concurrent
     /// transactions.
     ///
@@ -134,8 +146,20 @@ pub struct TableProperties {
     /// 'classic' for classic Delta Lake checkpoints. 'v2' for v2 checkpoints.
     pub checkpoint_policy: Option<CheckpointPolicy>,
 
-    /// whether to enable row tracking during writes.
+    /// Whether to enable row tracking for the table.
+    ///
+    /// When row tracking is enabled, all rows are guaranteed to have a row ID and commit version.
     pub enable_row_tracking: Option<bool>,
+
+    /// Whether to explicitly suspend generating row tracking metadata during writes even if
+    /// row tracking is supported.
+    pub row_tracking_suspended: Option<bool>,
+
+    /// The name of the internal column that contains the materialized row ID.
+    pub materialized_row_id_column_name: Option<String>,
+
+    /// The name of the internal column that contains the materialized row commit version.
+    pub materialized_row_commit_version_column_name: Option<String>,
 
     /// Whether to enable [In-Commit Timestamps]. The in-commit timestamps writer feature strongly
     /// associates a monotonically increasing timestamp with each commit by storing it in the
@@ -223,6 +247,53 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn test_parse_type_widening() {
+        let properties =
+            HashMap::from([("delta.enableTypeWidening".to_string(), "true".to_string())]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_type_widening, Some(true));
+
+        let properties =
+            HashMap::from([("delta.enableTypeWidening".to_string(), "false".to_string())]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_type_widening, Some(false));
+    }
+
+    #[test]
+    fn test_parse_iceberg_compat_v1() {
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV1".to_string(),
+            "true".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v1, Some(true));
+
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV1".to_string(),
+            "false".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v1, Some(false));
+    }
+
+    #[test]
+    fn test_parse_iceberg_compat_v2() {
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV2".to_string(),
+            "true".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v2, Some(true));
+
+        let properties = HashMap::from([(
+            "delta.enableIcebergCompatV2".to_string(),
+            "false".to_string(),
+        )]);
+        let table_properties = TableProperties::from(properties.iter());
+        assert_eq!(table_properties.enable_iceberg_compat_v2, Some(false));
+    }
+
+    #[test]
     fn known_key_unknown_val() {
         let properties = HashMap::from([("delta.appendOnly".to_string(), "wack".to_string())]);
         let table_properties = TableProperties::from(properties.iter());
@@ -269,6 +340,9 @@ mod tests {
             ("delta.deletedFileRetentionDuration", "interval 1 second"),
             ("delta.enableChangeDataFeed", "true"),
             ("delta.enableDeletionVectors", "true"),
+            ("delta.enableTypeWidening", "true"),
+            ("delta.enableIcebergCompatV1", "true"),
+            ("delta.enableIcebergCompatV2", "true"),
             ("delta.isolationLevel", "snapshotIsolation"),
             ("delta.logRetentionDuration", "interval 2 seconds"),
             ("delta.enableExpiredLogCleanup", "true"),
@@ -282,6 +356,15 @@ mod tests {
             ("delta.tuneFileSizesForRewrites", "true"),
             ("delta.checkpointPolicy", "v2"),
             ("delta.enableRowTracking", "true"),
+            (
+                "delta.rowTracking.materializedRowIdColumnName",
+                "_row-id-col-some_uuid",
+            ),
+            (
+                "delta.rowTracking.materializedRowCommitVersionColumnName",
+                "_row-commit-version-col-some_uuid",
+            ),
+            ("delta.rowTrackingSuspended", "false"),
             ("delta.enableInCommitTimestamps", "true"),
             ("delta.inCommitTimestampEnablementVersion", "15"),
             ("delta.inCommitTimestampEnablementTimestamp", "1612345678"),
@@ -300,6 +383,9 @@ mod tests {
             deleted_file_retention_duration: Some(Duration::new(1, 0)),
             enable_change_data_feed: Some(true),
             enable_deletion_vectors: Some(true),
+            enable_type_widening: Some(true),
+            enable_iceberg_compat_v1: Some(true),
+            enable_iceberg_compat_v2: Some(true),
             isolation_level: Some(IsolationLevel::SnapshotIsolation),
             log_retention_duration: Some(Duration::new(2, 0)),
             enable_expired_log_cleanup: Some(true),
@@ -310,6 +396,11 @@ mod tests {
             tune_file_sizes_for_rewrites: Some(true),
             checkpoint_policy: Some(CheckpointPolicy::V2),
             enable_row_tracking: Some(true),
+            materialized_row_id_column_name: Some("_row-id-col-some_uuid".to_string()),
+            materialized_row_commit_version_column_name: Some(
+                "_row-commit-version-col-some_uuid".to_string(),
+            ),
+            row_tracking_suspended: Some(false),
             enable_in_commit_timestamps: Some(true),
             in_commit_timestamp_enablement_version: Some(15),
             in_commit_timestamp_enablement_timestamp: Some(1_612_345_678),

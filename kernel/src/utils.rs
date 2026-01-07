@@ -2,13 +2,12 @@
 use std::borrow::Cow;
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::table_properties::TableProperties;
-use crate::{DeltaResult, Error};
-use delta_kernel_derive::internal_api;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use url::Url;
+
+use crate::{DeltaResult, Error};
+use delta_kernel_derive::internal_api;
 
 /// convenient way to return an error if a condition isn't true
 macro_rules! require {
@@ -96,27 +95,18 @@ fn resolve_uri_type(table_uri: impl AsRef<str>) -> DeltaResult<UriType> {
     }
 }
 
-/// Calculates the transaction expiration timestamp based on table properties.
-/// Returns None if set_transaction_retention_duration is not set.
-pub(crate) fn calculate_transaction_expiration_timestamp(
-    table_properties: &TableProperties,
-) -> DeltaResult<Option<i64>> {
-    table_properties
-        .set_transaction_retention_duration
-        .map(|duration| -> DeltaResult<i64> {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Error::generic(format!("Failed to get current time: {e}")))?;
+/// Returns the current time as a Duration since Unix epoch.
+pub(crate) fn current_time_duration() -> DeltaResult<Duration> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::generic(format!("System time before Unix epoch: {}", e)))
+}
 
-            let now_ms = i64::try_from(now.as_millis())
-                .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))?;
-
-            let expiration_ms = i64::try_from(duration.as_millis())
-                .map_err(|_| Error::generic("Retention duration exceeds i64 millisecond range"))?;
-
-            Ok(now_ms - expiration_ms)
-        })
-        .transpose()
+/// Returns the current time in milliseconds since Unix epoch.
+pub(crate) fn current_time_ms() -> DeltaResult<i64> {
+    let duration = current_time_duration()?;
+    i64::try_from(duration.as_millis())
+        .map_err(|_| Error::generic("Current timestamp exceeds i64 millisecond range"))
 }
 
 // Extension trait for Cow<'_, T>
@@ -156,21 +146,27 @@ impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, 
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::actions::{get_log_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove};
-    use crate::arrow::array::{RecordBatch, StringArray};
-    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-    use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::sync::SyncEngine;
-    use crate::Engine;
-    use crate::EngineData;
+    use std::path::PathBuf;
+    use std::{path::Path, sync::Arc};
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use serde::Serialize;
-    use std::{path::Path, sync::Arc};
     use tempfile::TempDir;
-    use test_utils::delta_path_for_version;
+    use test_utils::{delta_path_for_version, load_test_data};
+    use url::Url;
+
+    use crate::actions::{
+        get_all_actions_schema, Add, Cdc, CommitInfo, Metadata, Protocol, Remove,
+    };
+    use crate::arrow::array::{RecordBatch, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::engine::arrow_data::ArrowEngineData;
+    use crate::engine::default::DefaultEngine;
+    use crate::engine::sync::SyncEngine;
+    use crate::{DeltaResult, EngineData, Error, SnapshotRef};
+    use crate::{Engine, Snapshot};
 
     #[derive(Serialize)]
     pub(crate) enum Action {
@@ -188,6 +184,10 @@ pub(crate) mod test_utils {
         #[serde(rename = "commitInfo")]
         CommitInfo(CommitInfo),
     }
+
+    use crate::schema::{
+        DataType as KernelDataType, PrimitiveType, SchemaRef, StructField, StructType,
+    };
 
     /// A mock table that writes commits to a local temporary delta log. This can be used to
     /// construct a delta log used for testing.
@@ -253,7 +253,7 @@ pub(crate) mod test_utils {
     pub(crate) fn parse_json_batch(json_strings: StringArray) -> Box<dyn EngineData> {
         let engine = SyncEngine::new();
         let json_handler = engine.json_handler();
-        let output_schema = get_log_schema().clone();
+        let output_schema = get_all_actions_schema().clone();
         json_handler
             .parse_json(string_array_to_engine_data(json_strings), output_schema)
             .unwrap()
@@ -281,7 +281,7 @@ pub(crate) mod test_utils {
         message: &str,
     ) {
         match res {
-            Ok(_) => panic!("Expected error, but got Ok result"),
+            Ok(_) => panic!("Expected error with message {message}, but got Ok result"),
             Err(error) => {
                 let error_str = error.to_string();
                 assert!(
@@ -290,6 +290,118 @@ pub(crate) mod test_utils {
                 );
             }
         }
+    }
+
+    /// Helper to get a field from a StructType by name, panicking if not found.
+    pub(crate) fn get_schema_field(struct_type: &StructType, name: &str) -> StructField {
+        struct_type
+            .fields()
+            .find(|f| f.name() == name)
+            .unwrap_or_else(|| panic!("Field '{}' not found", name))
+            .clone()
+    }
+
+    /// Validates that a schema has the expected checkpoint structure with top-level action fields
+    /// and proper nested types for add, metaData, and protocol actions.
+    pub(crate) fn validate_checkpoint_schema(schema: &SchemaRef) {
+        // Verify top-level action fields exist and are structs
+        let top_level_fields = ["txn", "add", "remove", "metaData", "protocol"];
+        for field_name in top_level_fields {
+            let field = get_schema_field(schema, field_name);
+            assert!(
+                matches!(field.data_type(), KernelDataType::Struct(_)),
+                "Field '{}' should be a struct type",
+                field_name
+            );
+        }
+
+        // Verify 'add' struct has expected fields with correct types
+        let add_field = get_schema_field(schema, "add");
+        let add_struct = match add_field.data_type() {
+            KernelDataType::Struct(s) => s,
+            _ => panic!("'add' should be a struct"),
+        };
+        assert_eq!(
+            get_schema_field(add_struct, "path").data_type(),
+            &KernelDataType::Primitive(PrimitiveType::String)
+        );
+        assert_eq!(
+            get_schema_field(add_struct, "size").data_type(),
+            &KernelDataType::Primitive(PrimitiveType::Long)
+        );
+        assert!(
+            matches!(
+                get_schema_field(add_struct, "partitionValues").data_type(),
+                KernelDataType::Map(_)
+            ),
+            "'partitionValues' should be a map type"
+        );
+
+        // Verify 'metaData' struct has nested 'format' struct
+        let metadata_field = get_schema_field(schema, "metaData");
+        let metadata_struct = match metadata_field.data_type() {
+            KernelDataType::Struct(s) => s,
+            _ => panic!("'metaData' should be a struct"),
+        };
+        let format_field = get_schema_field(metadata_struct, "format");
+        let format_struct = match format_field.data_type() {
+            KernelDataType::Struct(s) => s,
+            _ => panic!("'format' should be a struct"),
+        };
+        assert_eq!(
+            get_schema_field(format_struct, "provider").data_type(),
+            &KernelDataType::Primitive(PrimitiveType::String)
+        );
+
+        // Verify 'protocol' struct has version fields
+        let protocol_field = get_schema_field(schema, "protocol");
+        let protocol_struct = match protocol_field.data_type() {
+            KernelDataType::Struct(s) => s,
+            _ => panic!("'protocol' should be a struct"),
+        };
+        assert_eq!(
+            get_schema_field(protocol_struct, "minReaderVersion").data_type(),
+            &KernelDataType::Primitive(PrimitiveType::Integer)
+        );
+        assert_eq!(
+            get_schema_field(protocol_struct, "minWriterVersion").data_type(),
+            &KernelDataType::Primitive(PrimitiveType::Integer)
+        );
+    }
+
+    /// Load a test table from tests/data directory.
+    /// Tries compressed (tar.zst) first, falls back to extracted.
+    /// Returns (engine, snapshot, optional tempdir). The TempDir must be kept alive
+    /// for the duration of the test to prevent premature cleanup of extracted files.
+    pub(crate) fn load_test_table(
+        table_name: &str,
+    ) -> DeltaResult<(Arc<dyn Engine>, SnapshotRef, Option<TempDir>)> {
+        // Try loading compressed table first, fall back to extracted
+        let (path, tempdir) = match load_test_data("tests/data", table_name) {
+            Ok(test_dir) => {
+                let test_path = test_dir.path().join(table_name);
+                (test_path, Some(test_dir))
+            }
+            Err(_) => {
+                // Fall back to already-extracted table
+                let manifest_dir = env!("CARGO_MANIFEST_DIR");
+                let mut path = PathBuf::from(manifest_dir);
+                path.push("tests/data");
+                path.push(table_name);
+                let path = std::fs::canonicalize(path)
+                    .map_err(|e| Error::Generic(format!("Failed to canonicalize path: {}", e)))?;
+                (path, None)
+            }
+        };
+
+        // Create engine and snapshot from the resolved path
+        let url = Url::from_directory_path(&path)
+            .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
+
+        let store = Arc::new(LocalFileSystem::new());
+        let engine = Arc::new(DefaultEngine::new(store));
+        let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+        Ok((engine, snapshot, tempdir))
     }
 }
 

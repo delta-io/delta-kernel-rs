@@ -11,12 +11,33 @@ use crate::DeltaResult;
 
 use std::collections::HashMap;
 
+/// Helper trait to allow expect_eq! to work with both Option<Scalar> and Option<bool>
+trait LogicalEq {
+    fn logical_eq(&self, other: &Self) -> bool;
+}
+
+impl LogicalEq for Option<Scalar> {
+    fn logical_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Some(a), Some(b)) => a.logical_eq(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl LogicalEq for Option<bool> {
+    fn logical_eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
 macro_rules! expect_eq {
     ( $expr: expr, $expect: expr, $fmt: literal ) => {
         let expect = ($expect);
         let result = ($expr);
         assert!(
-            result == expect,
+            result.logical_eq(&expect),
             "Expected {} = {:?}, got {:?}",
             format!($fmt),
             expect,

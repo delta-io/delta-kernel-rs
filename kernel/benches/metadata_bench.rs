@@ -17,7 +17,6 @@
 //!
 //! Follow-ups: <https://github.com/delta-io/delta-kernel-rs/issues/1185>
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -41,9 +40,9 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     let table_path = tempdir.path().join(table);
     let url = try_parse_uri(table_path.to_str().unwrap()).expect("Failed to parse table path");
     // TODO: use multi-threaded executor
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::try_new(&url, HashMap::<String, String>::new(), executor)
-        .expect("Failed to create engine");
+    use delta_kernel::engine::default::storage::store_from_url;
+    let store = store_from_url(&url).expect("Failed to create store");
+    let engine = DefaultEngine::new(store);
 
     (tempdir, url, Arc::new(engine))
 }
@@ -53,7 +52,7 @@ fn create_snapshot_benchmark(c: &mut Criterion) {
 
     c.bench_function("create_snapshot", |b| {
         b.iter(|| {
-            Snapshot::builder(url.clone())
+            Snapshot::builder_for(url.clone())
                 .build(engine.as_ref())
                 .expect("Failed to create snapshot")
         })
@@ -63,11 +62,9 @@ fn create_snapshot_benchmark(c: &mut Criterion) {
 fn scan_metadata_benchmark(c: &mut Criterion) {
     let (_tempdir, url, engine) = setup();
 
-    let snapshot = Arc::new(
-        Snapshot::builder(url.clone())
-            .build(engine.as_ref())
-            .expect("Failed to create snapshot"),
-    );
+    let snapshot = Snapshot::builder_for(url.clone())
+        .build(engine.as_ref())
+        .expect("Failed to create snapshot");
 
     let mut group = c.benchmark_group("scan_metadata");
     group.sample_size(SCAN_METADATA_BENCH_SAMPLE_SIZE);

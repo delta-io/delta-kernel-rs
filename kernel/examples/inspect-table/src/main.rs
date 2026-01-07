@@ -1,18 +1,18 @@
-use common::LocationArgs;
+use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::actions::visitors::{
     visit_metadata_at, visit_protocol_at, AddVisitor, CdcVisitor, RemoveVisitor,
-    SetTransactionVisitor,
+    SetTransactionVisitor, SidecarVisitor,
 };
 use delta_kernel::actions::{
-    get_log_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
-    SET_TRANSACTION_NAME,
+    get_all_actions_schema, ADD_NAME, CDC_NAME, METADATA_NAME, PROTOCOL_NAME, REMOVE_NAME,
+    SET_TRANSACTION_NAME, SIDECAR_NAME,
 };
 use delta_kernel::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use delta_kernel::expressions::ColumnName;
-use delta_kernel::scan::state::{DvInfo, Stats};
+use delta_kernel::scan::state::ScanFile;
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::schema::{ColumnNamesAndTypes, DataType};
-use delta_kernel::{DeltaResult, Error, ExpressionRef, Snapshot};
+use delta_kernel::{DeltaResult, Error, Snapshot};
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -67,10 +67,11 @@ enum Action {
     Add(delta_kernel::actions::Add),
     SetTransaction(delta_kernel::actions::SetTransaction),
     Cdc(delta_kernel::actions::Cdc),
+    Sidecar(delta_kernel::actions::Sidecar),
 }
 
 static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-    LazyLock::new(|| get_log_schema().leaves(None));
+    LazyLock::new(|| get_all_actions_schema().leaves(None));
 
 struct LogVisitor {
     actions: Vec<(Action, usize)>,
@@ -86,6 +87,7 @@ impl LogVisitor {
         let mut it = NAMES_AND_TYPES.as_ref().0.iter().enumerate().peekable();
         while let Some((start, col)) = it.next() {
             let mut end = start + 1;
+            // move forward while the top level struct has the same name
             while it.next_if(|(_, other)| col[0] == other[0]).is_some() {
                 end += 1;
             }
@@ -104,9 +106,10 @@ impl RowVisitor for LogVisitor {
         NAMES_AND_TYPES.as_ref()
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
-        if getters.len() != 55 {
+        let expected = NAMES_AND_TYPES.as_ref().0.len();
+        if getters.len() != expected {
             return Err(Error::InternalError(format!(
-                "Wrong number of LogVisitor getters: {}",
+                "Wrong number of LogVisitor getters: {}, expected {expected}",
                 getters.len()
             )));
         }
@@ -115,6 +118,7 @@ impl RowVisitor for LogVisitor {
         let (metadata_start, metadata_end) = self.offsets[METADATA_NAME];
         let (protocol_start, protocol_end) = self.offsets[PROTOCOL_NAME];
         let (txn_start, txn_end) = self.offsets[SET_TRANSACTION_NAME];
+        let (sidecar_start, sidecar_end) = self.offsets[SIDECAR_NAME];
         let (cdc_start, cdc_end) = self.offsets[CDC_NAME];
         for i in 0..row_count {
             let action = if let Some(path) = getters[add_start].get_opt(i, "add.path")? {
@@ -136,6 +140,10 @@ impl RowVisitor for LogVisitor {
                 let txn =
                     SetTransactionVisitor::visit_txn(i, app_id, &getters[txn_start..txn_end])?;
                 Action::SetTransaction(txn)
+            } else if let Some(path) = getters[sidecar_start].get_opt(i, "sidecar.path")? {
+                let sidecar =
+                    SidecarVisitor::visit_sidecar(i, path, &getters[sidecar_start..sidecar_end])?;
+                Action::Sidecar(sidecar)
             } else if let Some(path) = getters[cdc_start].get_opt(i, "cdc.path")? {
                 let cdc = CdcVisitor::visit_cdc(i, path, &getters[cdc_start..cdc_end])?;
                 Action::Cdc(cdc)
@@ -151,45 +159,46 @@ impl RowVisitor for LogVisitor {
 }
 
 // This is the callback that will be called for each valid scan row
-fn print_scan_file(
-    _: &mut (),
-    path: &str,
-    size: i64,
-    stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-) {
-    let num_record_str = if let Some(s) = stats {
+fn print_scan_file(_: &mut (), file: ScanFile) {
+    let num_record_str = if let Some(s) = file.stats {
         format!("{}", s.num_records)
     } else {
         "[unknown]".to_string()
     };
+    let mod_str = match chrono::DateTime::from_timestamp(file.modification_time / 1000, 0) {
+        Some(dt) => format!("{} ({})", dt, file.modification_time),
+        None => format!("Invalid mod time: {}", file.modification_time),
+    };
     println!(
         "Data to process:\n  \
-              Path:\t\t{path}\n  \
-              Size (bytes):\t{size}\n  \
+              Path:\t\t{0}\n  \
+              Size (bytes):\t{1}\n  \
+              Mod Time:\t{mod_str}\n  \
               Num Records:\t{num_record_str}\n  \
-              Has DV?:\t{}\n  \
-              Transform:\t{transform:?}\n  \
-              Part Vals:\t{partition_values:?}",
-        dv_info.has_vector()
+              Has DV?:\t{2}\n  \
+              Transform:\t{3:?}\n  \
+              Part Vals:\t{4:?}",
+        file.path,
+        file.size,
+        file.dv_info.has_vector(),
+        file.transform,
+        file.partition_values,
     );
 }
 
 fn try_main() -> DeltaResult<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_with_examples(env!("CARGO_PKG_NAME"), "Inspect", "inspect", "<COMMAND>");
 
     let url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let engine = common::get_engine(&url, &cli.location_args)?;
-    let snapshot = Snapshot::builder(url).build(&engine)?;
+    let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     match cli.command {
         Commands::TableVersion => {
             println!("Latest table version: {}", snapshot.version());
         }
         Commands::Metadata => {
-            println!("{:#?}", snapshot.metadata());
+            println!("{:#?}", snapshot.table_configuration().metadata());
         }
         Commands::Schema => {
             println!("{:#?}", snapshot.schema());
@@ -203,13 +212,11 @@ fn try_main() -> DeltaResult<()> {
             }
         }
         Commands::Actions { oldest_first } => {
-            let log_schema = get_log_schema();
-            let actions = snapshot.log_segment().read_actions(
-                &engine,
-                log_schema.clone(),
-                log_schema.clone(),
-                None,
-            )?;
+            let actions_schema = get_all_actions_schema();
+            let actions =
+                snapshot
+                    .log_segment()
+                    .read_actions(&engine, actions_schema.clone(), None)?;
 
             let mut visitor = LogVisitor::new();
             for action in actions {
@@ -227,6 +234,7 @@ fn try_main() -> DeltaResult<()> {
                     Action::Add(a) => println!("\nAction {row}:\n{a:#?}"),
                     Action::SetTransaction(t) => println!("\nAction {row}:\n{t:#?}"),
                     Action::Cdc(c) => println!("\nAction {row}:\n{c:#?}"),
+                    Action::Sidecar(s) => println!("\nAction {row}:\n{s:#?}"),
                 }
             }
         }

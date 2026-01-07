@@ -6,8 +6,8 @@ use itertools::Itertools;
 
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Datum, NullBufferBuilder, RecordBatch, StringArray,
-    StructArray,
+    make_array, Array, ArrayData, ArrayRef, AsArray, BooleanArray, Datum, MutableArrayData,
+    NullBufferBuilder, RecordBatch, StringArray, StructArray,
 };
 use crate::arrow::buffer::OffsetBuffer;
 use crate::arrow::compute::kernels::cmp::{distinct, eq, gt, gt_eq, lt, lt_eq, neq, not_distinct};
@@ -20,16 +20,18 @@ use crate::arrow::datatypes::{
 use crate::arrow::error::ArrowError;
 use crate::arrow::json::writer::{make_encoder, EncoderOptions};
 use crate::arrow::json::StructMode;
+use crate::engine::arrow_conversion::TryIntoArrow;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
 use crate::engine::arrow_utils::prim_array_cmp;
+use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
     ExpressionRef, JunctionPredicate, JunctionPredicateOp, OpaqueExpression, OpaquePredicate,
     Predicate, Scalar, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp,
+    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 use crate::schema::{DataType, StructType};
 
@@ -101,6 +103,14 @@ fn evaluate_struct_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
+    if fields.len() != output_schema.num_fields() {
+        return Err(Error::generic(format!(
+            "Struct expression field count mismatch: {} fields in expression but {} in schema",
+            fields.len(),
+            output_schema.num_fields()
+        )));
+    }
+
     let output_cols: Vec<ArrayRef> = fields
         .iter()
         .zip(output_schema.fields())
@@ -127,18 +137,23 @@ fn evaluate_transform_expression(
     batch: &RecordBatch,
     output_schema: &StructType,
 ) -> DeltaResult<ArrayRef> {
-    let mut used_insertion_keys = 0;
-    let mut used_replacement_keys = 0;
+    let mut used_field_transforms = 0;
 
     // Collect output columns directly to avoid creating intermediate Expr::Column instances.
     let mut output_cols = Vec::new();
 
+    // Helper lambda to get the next output field type
+    let mut output_schema_iter = output_schema.fields();
+    let mut next_output_type = || {
+        output_schema_iter
+            .next()
+            .map(|field| field.data_type())
+            .ok_or_else(|| Error::generic("Too few fields in output schema"))
+    };
+
     // Handle prepends (insertions before any field)
-    if let Some(prepend_exprs) = transform.field_insertions.get(&None) {
-        for expr in prepend_exprs {
-            output_cols.push(evaluate_expression(expr, batch, None)?);
-        }
-        used_insertion_keys += 1;
+    for expr in &transform.prepended_fields {
+        output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
     }
 
     // Extract the input path, if any
@@ -155,51 +170,39 @@ fn evaluate_transform_expression(
         None => batch,
     };
 
-    // Process each input field in order (unified logic for both cases)
+    // Process each input field in order
     for input_field in source_data.schema_fields() {
-        let field_name = input_field.name().as_ref();
+        let field_name: &str = input_field.name();
 
-        // Handle the field based on replacement rules
-        if let Some(replacement) = transform.field_replacements.get(field_name) {
-            if let Some(expr) = replacement {
-                output_cols.push(evaluate_expression(expr, batch, None)?);
-            } // else no replacement => dropped
-            used_replacement_keys += 1;
-        } else {
-            // Field passes through unchanged - extract based on source type
+        // Any field that isn't replaced passes through unchanged
+        let field_transform = transform.field_transforms.get(field_name);
+        if !field_transform.is_some_and(|t| t.is_replace) {
             output_cols.push(extract_column(source_data, &[field_name])?);
+            let _ = next_output_type()?; // consume and discard the output schema field
         }
 
-        // Handle insertions after this input field
-        let field_name = Some(Cow::Borrowed(field_name));
-        if let Some(insertion_exprs) = transform.field_insertions.get(&field_name) {
-            for expr in insertion_exprs {
-                output_cols.push(evaluate_expression(expr, batch, None)?);
+        // Process any insertions that come after this field
+        if let Some(field_transform) = field_transform {
+            for expr in &field_transform.exprs {
+                output_cols.push(evaluate_expression(expr, batch, Some(next_output_type()?))?);
             }
-            used_insertion_keys += 1;
+            used_field_transforms += 1;
         }
     }
 
-    // Validate all transforms were used
-    if used_insertion_keys != transform.field_insertions.len() {
+    // Verify that all field transforms were used
+    if used_field_transforms != transform.field_transforms.len() {
         return Err(Error::generic(
-            "Some insertion keys don't reference valid input field names",
-        ));
-    }
-    if used_replacement_keys != transform.field_replacements.len() {
-        return Err(Error::generic(
-            "Some replacement keys don't reference valid input field names",
+            "Some field transforms reference invalid input field names",
         ));
     }
 
-    if output_cols.len() != output_schema.fields_len() {
-        return Err(Error::generic(format!(
-            "Expression count ({}) doesn't match output schema field count ({})",
-            output_cols.len(),
-            output_schema.fields_len()
-        )));
+    // Verify we consumed all output schema fields
+    if output_schema_iter.next().is_some() {
+        return Err(Error::generic("Too many fields in output schema"));
     }
 
+    // Build the final struct
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
         .zip(output_schema.fields())
@@ -224,15 +227,18 @@ pub fn evaluate_expression(
     use BinaryExpressionOp::*;
     use Expression::*;
     use UnaryExpressionOp::*;
+    use VariadicExpressionOp::*;
     match (expression, result_type) {
-        (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
-        (Column(name), _) => extract_column(batch, name),
+        (Literal(scalar), _) => {
+            validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
+        }
+        (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema)
         }
-        (Struct(_), _) => Err(Error::generic(
-            "Data type is required to evaluate struct expressions",
-        )),
+        (Struct(_), dt) => Err(Error::Generic(format!(
+            "Struct expression expects a DataType::Struct result, but got {dt:?}"
+        ))),
         (Transform(transform), Some(DataType::Struct(output_schema))) => {
             evaluate_transform_expression(transform, batch, output_schema)
         }
@@ -267,7 +273,30 @@ pub fn evaluate_expression(
                 Divide => div,
             };
 
-            Ok(eval(&left_arr, &right_arr)?)
+            validate_array_type(eval(&left_arr, &right_arr)?, result_type)
+        }
+        (
+            Variadic(VariadicExpression {
+                op: Coalesce,
+                exprs,
+            }),
+            result_type,
+        ) => {
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(exprs.len());
+
+            for expr in exprs {
+                let array = evaluate_expression(expr, batch, None)?;
+                let null_count = array.null_count();
+                arrays.push(array);
+                // Short-circuit: if this array has no nulls, we can stop evaluating
+                // remaining expressions since no more values are needed.
+                if null_count == 0 {
+                    break;
+                }
+            }
+
+            // Coalesce accumulated arrays
+            Ok(coalesce_arrays(&arrays, result_type)?)
         }
         (Opaque(OpaqueExpression { op, exprs }), _) => {
             match op
@@ -372,7 +401,6 @@ pub fn evaluate_predicate(
                     }
                 }
                 (Expression::Literal(lit), Expression::Literal(Scalar::Array(ad))) => {
-                    #[allow(deprecated)]
                     let exists = ad.array_elements().contains(lit);
                     Ok(BooleanArray::from(vec![exists]))
                 }
@@ -491,15 +519,104 @@ pub fn to_json(input: &dyn Datum) -> Result<ArrayRef, ArrowError> {
     }
 }
 
+/// Coalesce multiple arrays into one by selecting the first non-null value from each row.
+///
+/// This function implements SQL COALESCE semantics: for each row, it iterates through
+/// the input arrays from left to right and returns the first non-null value found. If all values
+/// are null for a given row, the result will be null for that row.
+///
+/// # Parameters
+/// - `arrays`: Slice of Arrow arrays to coalesce. Must not be empty and all arrays must have the same data type.
+/// - `result_type`: Optional expected result type. If provided, must match the arrays' data type.
+///
+/// # Returns
+/// An `ArrayRef` containing the coalesced values with the same number of rows as the input arrays.
+///
+/// # Errors
+/// This function returns an `ArrowError` in the following cases:
+/// - **Empty input**: The default engine currently does not support empty COALESCE statements.
+/// - **Mismatched row counts**: Not all arrays have the same number of rows.
+/// - **Mismatched data types**: Not all arrays have exactly the same data type.
+/// - **Invalid result type**: If `result_type` is provided but doesn't match the arrays' data type.
+pub fn coalesce_arrays(
+    arrays: &[ArrayRef],
+    result_type: Option<&DataType>,
+) -> Result<ArrayRef, ArrowError> {
+    let Some((first, rest)) = arrays.split_first() else {
+        return Err(ArrowError::InvalidArgumentError(
+            "The default engine currently does not support empty COALESCE statements".into(),
+        ));
+    };
+
+    // Validate against the expected output type, if provided
+    if let Some(result_type) = result_type {
+        let result_type = result_type.try_into_arrow()?;
+        if first.data_type() != &result_type {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Requested result type {result_type:?} does not match arrays' data type {:?}",
+                first.data_type()
+            )));
+        }
+    }
+
+    // Early exit for single array case
+    if rest.is_empty() {
+        return Ok(first.clone());
+    }
+
+    // Verify all arrays have the same length and data type
+    for (i, arr) in rest.iter().enumerate() {
+        if arr.len() != first.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Array at index {} has length {}, expected {}",
+                i + 1,
+                arr.len(),
+                first.len()
+            )));
+        }
+        if arr.data_type() != first.data_type() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Array at index {} has type {:?}, but expected {:?}",
+                i + 1,
+                arr.data_type(),
+                first.data_type()
+            )));
+        }
+    }
+
+    // Collect ArrayData for MutableArrayData
+    let array_data: Vec<ArrayData> = arrays.iter().map(|arr| arr.to_data()).collect();
+
+    // Build result
+    let mut mutable = MutableArrayData::new(array_data.iter().collect(), false, first.len());
+    for row in 0..first.len() {
+        // Find first non-null value for this row
+        match arrays.iter().enumerate().find(|(_, arr)| arr.is_valid(row)) {
+            Some((array_idx, _)) => mutable.extend(array_idx, row, row + 1),
+            None => mutable.extend_nulls(1),
+        }
+    }
+
+    Ok(make_array(mutable.freeze()))
+}
+
+fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
+    if let Some(expected) = expected {
+        ensure_data_types(expected, array.data_type(), false)?;
+    }
+    Ok(array)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::{ArrayRef, Int32Array, StructArray};
+    use crate::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::expressions::{column_expr_ref, Expression as Expr, Transform};
     use crate::schema::{DataType, StructField, StructType};
+    use crate::utils::test_utils::assert_result_error_with_message;
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
@@ -565,8 +682,8 @@ mod tests {
         let batch = create_test_batch();
 
         // Test 1: Empty transform (identity) - should be exactly equal to input
-        let transform = Transform::new();
-        let output_schema = StructType::new(vec![
+        let transform = Transform::new_top_level();
+        let output_schema = StructType::new_unchecked(vec![
             StructField::new("a", DataType::INTEGER, false),
             StructField::new("b", DataType::INTEGER, false),
             StructField::new("c", DataType::INTEGER, false),
@@ -590,9 +707,9 @@ mod tests {
 
         // Test 2: Nested path identity (struct relocation without modification)
         let nested_batch = create_nested_test_batch();
-        let transform_nested = Transform::new().with_input_path(["nested"]);
+        let transform_nested = Transform::new_nested(["nested"]);
 
-        let nested_output_schema = StructType::new(vec![
+        let nested_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::INTEGER, false),
         ]);
@@ -630,37 +747,17 @@ mod tests {
     fn test_field_operations_and_multiple_insertions() {
         let batch = create_test_batch();
 
-        let mut transform = Transform::new();
+        let transform = Transform::new_top_level()
+            .with_replaced_field("a", column_expr_ref!("b"))
+            .with_dropped_field("b")
+            .with_inserted_field(None::<&str>, Expr::literal(1).into())
+            .with_inserted_field(None::<&str>, Expr::literal(2).into())
+            .with_inserted_field(None::<&str>, column_expr_ref!("c"))
+            .with_inserted_field(Some("c"), Expr::literal(42).into())
+            .with_inserted_field(Some("c"), column_expr_ref!("a"))
+            .with_inserted_field(Some("c"), Expr::literal(99).into());
 
-        // Replace field 'a' with column reference to 'b'
-        transform
-            .field_replacements
-            .insert("a".to_string(), Some(column_expr_ref!("b")));
-
-        // Drop field 'b'
-        transform.field_replacements.insert("b".to_string(), None);
-
-        // Multiple prepends (multiple insertions at same position)
-        transform.field_insertions.insert(
-            None,
-            vec![
-                Expr::literal(1).into(),
-                Expr::literal(2).into(),
-                column_expr_ref!("c"),
-            ],
-        );
-
-        // Multiple insertions after 'c' (key feature: multiple at same position)
-        transform.field_insertions.insert(
-            Some(Cow::Borrowed("c")),
-            vec![
-                Expr::literal(42).into(),
-                column_expr_ref!("a"), // references original column a
-                Expr::literal(99).into(),
-            ],
-        );
-
-        let output_schema = StructType::new(vec![
+        let output_schema = StructType::new_unchecked(vec![
             StructField::new("pre1", DataType::INTEGER, false), // prepend 1
             StructField::new("pre2", DataType::INTEGER, false), // prepend 2
             StructField::new("pre3", DataType::INTEGER, false), // prepend 3 (column c)
@@ -705,9 +802,9 @@ mod tests {
         let nested_batch = create_nested_test_batch();
 
         // Test 1: Simple struct relocation (copy nested struct to top level unchanged)
-        let transform_copy = Transform::new().with_input_path(["nested"]);
+        let transform_copy = Transform::new_nested(["nested"]);
 
-        let copy_output_schema = StructType::new(vec![
+        let copy_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false),
             StructField::new("y", DataType::INTEGER, false),
         ]);
@@ -737,19 +834,11 @@ mod tests {
         }
 
         // Test 2: Modify nested struct and relocate it
-        let mut transform_modify = Transform::new().with_input_path(["nested"]);
+        let transform_modify = Transform::new_nested(["nested"])
+            .with_replaced_field("x".to_string(), Expr::literal(777).into())
+            .with_inserted_field(Some("y"), Expr::literal(555).into());
 
-        // Replace 'x' field with a literal value
-        transform_modify
-            .field_replacements
-            .insert("x".to_string(), Some(Expr::literal(777).into()));
-
-        // Insert a new field after 'y'
-        transform_modify
-            .field_insertions
-            .insert(Some(Cow::Borrowed("y")), vec![Expr::literal(555).into()]);
-
-        let modify_output_schema = StructType::new(vec![
+        let modify_output_schema = StructType::new_unchecked(vec![
             StructField::new("x", DataType::INTEGER, false), // replaced with literal 777
             StructField::new("y", DataType::INTEGER, false), // passed through
             StructField::new("new_field", DataType::INTEGER, false), // inserted after y
@@ -785,8 +874,13 @@ mod tests {
         let batch = create_test_batch();
 
         // Test unused replacement keys
-        let transform = Transform::new().with_replaced_field("missing", Expr::literal(1).into());
-        let output_schema = StructType::new(vec![StructField::new("a", DataType::INTEGER, false)]);
+        let transform =
+            Transform::new_top_level().with_replaced_field("missing", Expr::literal(1).into());
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
+        ]);
 
         let expr = Expr::Transform(transform);
         let result = evaluate_expression(
@@ -794,15 +888,14 @@ mod tests {
             &batch,
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("replacement keys"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
         // Test unused insertion keys
-        let mut transform2 = Transform::new();
-        transform2.field_insertions.insert(
-            Some(Cow::Borrowed("nonexistent")),
-            vec![Expr::literal(1).into()],
-        );
+        let transform2 = Transform::new_top_level()
+            .with_inserted_field(Some("nonexistent"), Expr::literal(1).into());
 
         let expr2 = Expr::Transform(transform2);
         let result2 = evaluate_expression(
@@ -811,15 +904,18 @@ mod tests {
             Some(&DataType::Struct(Box::new(output_schema.clone()))),
         );
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().to_string().contains("insertion keys"));
+        assert!(result2
+            .unwrap_err()
+            .to_string()
+            .contains("reference invalid input field names"));
 
-        // Test column count mismatch
-        let transform3 = Transform::new().with_dropped_field("a");
+        // Test column count mismatch -- too many output schema fields
+        let transform3 = Transform::new_top_level().with_dropped_field("a");
 
-        let wrong_output_schema = StructType::new(vec![
-            StructField::new("a", DataType::INTEGER, false), // expects a field that was dropped
-            StructField::new("b", DataType::INTEGER, false),
-            StructField::new("c", DataType::INTEGER, false),
+        let wrong_output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER), // expects a field that was dropped
+            StructField::not_null("b", DataType::INTEGER),
+            StructField::not_null("c", DataType::INTEGER),
         ]);
 
         let expr3 = Expr::Transform(transform3);
@@ -832,10 +928,28 @@ mod tests {
         assert!(result3
             .unwrap_err()
             .to_string()
-            .contains("Expression count"));
+            .contains("Too many fields in output schema"));
+
+        // Test column count mismatch -- too few output schema fields
+        let transform3 = Transform::new_top_level().with_dropped_field("a");
+
+        let wrong_output_schema =
+            StructType::new_unchecked(vec![StructField::not_null("c", DataType::INTEGER)]);
+
+        let expr3 = Expr::Transform(transform3);
+        let result3 = evaluate_expression(
+            &expr3,
+            &batch,
+            Some(&DataType::Struct(Box::new(wrong_output_schema))),
+        );
+        assert!(result3.is_err());
+        assert!(result3
+            .unwrap_err()
+            .to_string()
+            .contains("Too few fields in output schema"));
 
         // Test missing output schema
-        let transform4 = Transform::new();
+        let transform4 = Transform::new_top_level();
         let expr4 = Expr::Transform(transform4);
         let result4 = evaluate_expression(&expr4, &batch, None);
         assert!(result4.is_err());
@@ -843,5 +957,369 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("Data type is required"));
+    }
+
+    #[test]
+    fn test_struct_expression_schema_validation() {
+        let batch = create_test_batch();
+
+        let test_cases = vec![
+            (
+                "too many schema fields",
+                Expr::Struct(vec![column_expr_ref!("a"), column_expr_ref!("b")]),
+                StructType::new_unchecked(vec![
+                    StructField::not_null("a", DataType::INTEGER),
+                    StructField::not_null("b", DataType::INTEGER),
+                    StructField::not_null("c", DataType::INTEGER),
+                ]),
+            ),
+            (
+                "too few schema fields",
+                Expr::Struct(vec![
+                    column_expr_ref!("a"),
+                    column_expr_ref!("b"),
+                    column_expr_ref!("c"),
+                ]),
+                StructType::new_unchecked(vec![
+                    StructField::not_null("a", DataType::INTEGER),
+                    StructField::not_null("b", DataType::INTEGER),
+                ]),
+            ),
+        ];
+
+        for (name, expr, schema) in test_cases {
+            let result =
+                evaluate_expression(&expr, &batch, Some(&DataType::Struct(Box::new(schema))));
+            assert!(result.is_err(), "Test case '{}' should fail", name);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("field count mismatch"),
+                "Test case '{}' should contain 'field count mismatch' error",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_coalesce_arrays_same_type() {
+        // Test with Int32 arrays
+        let arr1 = Int32Array::from(vec![Some(1), None, Some(3), None, None, Some(8), None]);
+        let arr2 = Int32Array::from(vec![None, Some(2), Some(4), None, Some(6), None, None]);
+        let arr3 = Int32Array::from(vec![None, None, None, Some(5), Some(7), Some(9), None]);
+
+        let result =
+            coalesce_arrays(&[Arc::new(arr1), Arc::new(arr2), Arc::new(arr3)], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result_array.len(), 7);
+        assert_eq!(result_array.value(0), 1); // From arr1
+        assert_eq!(result_array.value(1), 2); // From arr2
+        assert_eq!(result_array.value(2), 3); // From arr1
+        assert_eq!(result_array.value(3), 5); // From arr3
+        assert_eq!(result_array.value(4), 6); // From arr2
+        assert_eq!(result_array.value(5), 8); // From arr1
+        assert!(result_array.is_null(6));
+
+        // Test with String arrays
+        let str_arr1 = Arc::new(StringArray::from(vec![Some("a"), None, Some("c")]));
+        let str_arr2 = Arc::new(StringArray::from(vec![None, Some("b"), None]));
+
+        let str_result = coalesce_arrays(&[str_arr1, str_arr2], None).unwrap();
+        let str_result_array = str_result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(str_result_array.len(), 3);
+        assert_eq!(str_result_array.value(0), "a"); // From str_arr1
+        assert_eq!(str_result_array.value(1), "b"); // From str_arr2
+        assert_eq!(str_result_array.value(2), "c"); // From str_arr1
+    }
+
+    #[test]
+    fn test_coalesce_arrays_all_nulls() {
+        let arr1 = Arc::new(Int32Array::from(vec![None, None, None]));
+        let arr2 = Arc::new(Int32Array::from(vec![None, None, None]));
+
+        let result = coalesce_arrays(&[arr1, arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        assert_eq!(result_array.len(), 3);
+        assert!(result_array.is_null(0));
+        assert!(result_array.is_null(1));
+        assert!(result_array.is_null(2));
+    }
+
+    #[test]
+    fn test_coalesce_arrays_single_array() {
+        let arr: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let result = coalesce_arrays(std::slice::from_ref(&arr), None).unwrap();
+
+        // Should return the same array
+        assert_eq!(result.as_ref(), arr.as_ref());
+    }
+
+    #[test]
+    fn test_coalesce_arrays_type_mismatch_error() {
+        // Test Int32 vs Int64 - should fail
+        let int32_arr = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let int64_arr = Arc::new(Int64Array::from(vec![None, Some(2)]));
+
+        let result = coalesce_arrays(&[int32_arr, int64_arr], None);
+        assert_result_error_with_message(
+            result,
+            "Array at index 1 has type Int64, but expected Int32",
+        );
+
+        // Test Int32 vs String - should fail
+        let int_arr = Arc::new(Int32Array::from(vec![Some(1)]));
+        let str_arr = Arc::new(StringArray::from(vec![Some("hello")]));
+
+        let result2 = coalesce_arrays(&[int_arr, str_arr], None);
+        assert_result_error_with_message(
+            result2,
+            "Array at index 1 has type Utf8, but expected Int32",
+        );
+    }
+
+    #[test]
+    fn test_coalesce_arrays_length_mismatch_error() {
+        // Test arrays with different lengths - should fail
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), Some(2)]));
+        let arr2 = Arc::new(Int32Array::from(vec![Some(3), Some(4), Some(5)]));
+
+        let result = coalesce_arrays(&[arr1, arr2], None);
+        assert_result_error_with_message(result, "Array at index 1 has length 3, expected 2");
+    }
+
+    #[test]
+    fn test_coalesce_arrays_empty_input_error() {
+        // Test with empty arrays slice - should fail
+        let result = coalesce_arrays(&[], None);
+        assert_result_error_with_message(result, "empty COALESCE statements");
+    }
+
+    #[test]
+    fn test_coalesce_arrays_result_type_validation() {
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None]));
+        let arr2 = Arc::new(Int32Array::from(vec![None, Some(2)]));
+
+        // Test with matching result type - should succeed
+        let result = coalesce_arrays(&[arr1.clone(), arr2.clone()], Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Test with mismatched result type - should fail
+        let result2 = coalesce_arrays(&[arr1, arr2], Some(&DataType::STRING));
+        assert_result_error_with_message(
+            result2,
+            "Requested result type Utf8 does not match arrays' data type Int32",
+        );
+    }
+
+    #[test]
+    fn test_coalesce_arrays_first_no_nulls() {
+        // First array has no nulls - coalesce_arrays still works correctly
+        let arr1 = Arc::new(Int32Array::from(vec![1, 2, 3])); // No nulls
+        let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30]));
+
+        let result = coalesce_arrays(&[arr1.clone(), arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        // Result should be arr1's values (first non-null for each row)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 2);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_arrays_second_no_nulls() {
+        // First array has nulls, second has none
+        let arr1 = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let arr2 = Arc::new(Int32Array::from(vec![10, 20, 30])); // No nulls
+
+        let result = coalesce_arrays(&[arr1, arr2], None).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        // Row 0: 1 (from arr1), Row 1: 20 (from arr2), Row 2: 3 (from arr1)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 20);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_first() {
+        // Test the short-circuit optimization when first array has no nulls
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        // Create coalesce expression with column that has no nulls, followed by
+        // a reference to a non-existent column. If short-circuit works, the
+        // non-existent column is never evaluated and no error occurs.
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![
+                Expression::column(["a"]),
+                Expression::column(["nonexistent"]), // Would fail if evaluated
+            ],
+        );
+
+        // Should return column "a" directly (short-circuit skips evaluating "nonexistent")
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result_array.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_second() {
+        // Test short-circuit when second array has no nulls (still needs coalesce)
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Int32, false),
+        ]);
+        let a_values = Int32Array::from(vec![Some(1), None, Some(3)]); // Has nulls
+        let b_values = Int32Array::from(vec![10, 20, 30]); // No nulls
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(a_values), Arc::new(b_values)],
+        )
+        .unwrap();
+
+        // Create coalesce expression: a has nulls, b has none, c doesn't exist.
+        // Short-circuit should stop after evaluating b.
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![
+                Expression::column(["a"]),
+                Expression::column(["b"]),
+                Expression::column(["nonexistent"]), // Would fail if evaluated
+            ],
+        );
+
+        // Should coalesce a and b, never evaluate "nonexistent"
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::INTEGER)).unwrap();
+        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        // Row 0: 1 (from a), Row 1: 20 (from b), Row 2: 3 (from a)
+        assert_eq!(result_array.len(), 3);
+        assert_eq!(result_array.value(0), 1);
+        assert_eq!(result_array.value(1), 20);
+        assert_eq!(result_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_coalesce_expression_short_circuit_type_mismatch() {
+        // Verify type validation works when short-circuiting
+        let schema = ArrowSchema::new(vec![ArrowField::new("a", ArrowDataType::Int32, false)]);
+        let a_values = Int32Array::from(vec![1, 2, 3]); // No nulls - would short-circuit
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a_values)]).unwrap();
+
+        let expr = Expression::variadic(
+            VariadicExpressionOp::Coalesce,
+            vec![Expression::column(["a"])],
+        );
+
+        // Request STRING type but array is INT32 - should fail even with short-circuit
+        let result = evaluate_expression(&expr, &batch, Some(&DataType::STRING));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nested_transforms() {
+        let nested_batch = create_nested_test_batch();
+
+        // Simple nested transform - replace a field in the nested struct
+        let nested_transform =
+            Transform::new_nested(["nested"]).with_replaced_field("x", Expr::literal(999).into());
+
+        let outer_transform = Transform::new_top_level()
+            .with_inserted_field(Some("a"), Expr::Transform(nested_transform).into());
+
+        let nested_output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("x", DataType::INTEGER),
+            StructField::not_null("y", DataType::INTEGER),
+        ]);
+        let output_schema = StructType::new_unchecked(vec![
+            StructField::not_null("a", DataType::INTEGER),
+            StructField::not_null("transformed", nested_output_schema.clone()),
+            StructField::not_null("nested", nested_output_schema),
+        ]);
+
+        let expr = Expr::Transform(outer_transform);
+        let result = evaluate_expression(
+            &expr,
+            &nested_batch,
+            Some(&DataType::Struct(Box::new(output_schema))),
+        )
+        .unwrap();
+
+        let struct_result = result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_result.num_columns(), 3);
+        assert_eq!(struct_result.len(), 3);
+
+        // Verify original field 'a' (should be [100, 200, 300])
+        validate_i32_column(struct_result, 0, &[100, 200, 300]);
+
+        // Verify nested transform replaced 'x' with literal 999 and passed through 'y' unchanged.
+        let nested_struct_result = struct_result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        validate_i32_column(nested_struct_result, 0, &[999, 999, 999]);
+        validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
+
+        // Verify nested transform passed both 'x' and 'y' unchanged.
+        let nested_struct_result = struct_result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        validate_i32_column(nested_struct_result, 0, &[1, 2, 3]);
+        validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_literal_type_validation() {
+        let batch = create_test_batch();
+
+        // Valid: literal matches expected type
+        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Error: literal type mismatch
+        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::STRING));
+        assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[test]
+    fn test_column_type_validation() {
+        let batch = create_test_batch();
+
+        // Valid: column matches expected type
+        let result = evaluate_expression(&column_expr_ref!("a"), &batch, Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Error: column type mismatch
+        let result = evaluate_expression(&column_expr_ref!("a"), &batch, Some(&DataType::STRING));
+        assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[test]
+    fn test_binary_type_validation() {
+        let batch = create_test_batch();
+        let add_expr = Expr::binary(
+            crate::expressions::BinaryExpressionOp::Plus,
+            Expr::column(["a"]),
+            Expr::column(["b"]),
+        );
+
+        // Valid: binary result matches expected type
+        let result = evaluate_expression(&add_expr, &batch, Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Error: binary result type mismatch
+        let result = evaluate_expression(&add_expr, &batch, Some(&DataType::STRING));
+        assert_result_error_with_message(result, "Incorrect datatype");
     }
 }

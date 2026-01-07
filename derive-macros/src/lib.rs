@@ -51,7 +51,7 @@ pub fn derive_to_schema(input: proc_macro::TokenStream) -> proc_macro::TokenStre
                 use delta_kernel::schema::derive_macro_utils::{
                     ToDataType as _, GetStructField as _, GetNullableContainerStructField as _,
                 };
-                delta_kernel::schema::StructType::new([
+                delta_kernel::schema::StructType::new_unchecked([
                     #schema_fields
                 ])
             }

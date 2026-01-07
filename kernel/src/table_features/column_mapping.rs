@@ -1,5 +1,5 @@
 //! Code to handle column mapping, including modes and schema transforms
-use super::ReaderFeature;
+use super::TableFeature;
 use crate::actions::Protocol;
 use crate::schema::{
     ColumnName, DataType, MetadataValue, Schema, SchemaTransform, StructField, StructType,
@@ -38,7 +38,7 @@ pub(crate) fn column_mapping_mode(
         // (but should be ignored) even when the feature is not supported. For details see
         // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#column-mapping
         (Some(mode), 2) => mode,
-        (Some(mode), 3) if protocol.has_reader_feature(&ReaderFeature::ColumnMapping) => mode,
+        (Some(mode), 3) if protocol.has_table_feature(&TableFeature::ColumnMapping) => mode,
         _ => ColumnMappingMode::None,
     }
 }
@@ -204,8 +204,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::ColumnMapping]),
-            empty_features.clone(),
+            Some([TableFeature::ColumnMapping]),
+            Some([TableFeature::ColumnMapping]),
         )
         .unwrap();
 
@@ -222,8 +222,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors]),
-            empty_features.clone(),
+            Some([TableFeature::DeletionVectors]),
+            Some([TableFeature::DeletionVectors]),
         )
         .unwrap();
 
@@ -240,8 +240,8 @@ mod tests {
         let protocol = Protocol::try_new(
             3,
             7,
-            Some([ReaderFeature::DeletionVectors, ReaderFeature::ColumnMapping]),
-            empty_features,
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
+            Some([TableFeature::DeletionVectors, TableFeature::ColumnMapping]),
         )
         .unwrap();
 
@@ -305,7 +305,7 @@ mod tests {
             create_annotations(outer_id, outer_name)
         );
         println!("{schema}");
-        StructType::new([serde_json::from_str(&schema).unwrap()])
+        StructType::new_unchecked([serde_json::from_str(&schema).unwrap()])
     }
 
     #[test]

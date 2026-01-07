@@ -1,13 +1,13 @@
 use std::ops::{Add, Div, Mul, Sub};
 
 use crate::arrow::array::{
-    create_array, Array, ArrayRef, AsArray, BooleanArray, GenericStringArray, Int32Array,
-    Int32Builder, ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder,
-    StructArray,
+    create_array, Array, ArrayRef, BooleanArray, GenericStringArray, Int32Array, Int32Builder,
+    ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StringBuilder, StructArray,
 };
 use crate::arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use crate::arrow::compute::kernels::cmp::{gt_eq, lt};
 use crate::arrow::datatypes::{DataType, Field, Fields, Schema};
+use crate::engine::arrow_data::EngineDataArrowExt as _;
 use crate::engine::arrow_expression::evaluate_expression::to_json;
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpression as _, ArrowOpaqueExpressionOp, ArrowOpaquePredicate as _,
@@ -159,7 +159,7 @@ fn test_literal_complex_type_array() {
         StructField::nullable("map", map_type.clone()),
         StructField::nullable("null_map", map_type.clone()),
     ];
-    let struct_type = StructType::new(struct_fields.clone());
+    let struct_type = StructType::new_unchecked(struct_fields.clone());
     let struct_value = Scalar::Struct(
         crate::expressions::StructData::try_new(
             struct_fields.clone(),
@@ -536,7 +536,7 @@ impl OpaqueLessThanOp {
             panic!("Invalid arg count: {}", args.len());
         };
 
-        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::BOOLEAN));
+        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::INTEGER));
         Ok(op_fn(&eval(left)?, &eval(right)?)?)
     }
 }
@@ -647,10 +647,10 @@ fn test_opaque() {
 #[test]
 fn test_null_row() {
     // note that we _allow_ nested nulls, since the top-level struct can be NULL
-    let schema = Arc::new(StructType::new(vec![
+    let schema = Arc::new(StructType::new_unchecked(vec![
         StructField::nullable(
             "x",
-            StructType::new([
+            StructType::new_unchecked([
                 StructField::nullable("a", KernelDataType::INTEGER),
                 StructField::not_null("b", KernelDataType::STRING),
             ]),
@@ -674,17 +674,14 @@ fn test_null_row() {
         ],
     )
     .unwrap();
-    let result: RecordBatch = result
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .unwrap()
-        .into();
+
+    let result = result.try_into_record_batch().unwrap();
     assert_eq!(result, expected);
 }
 
 #[test]
 fn test_null_row_err() {
-    let not_null_schema = Arc::new(StructType::new(vec![StructField::not_null(
+    let not_null_schema = Arc::new(StructType::new_unchecked(vec![StructField::not_null(
         "a",
         KernelDataType::STRING,
     )]));
@@ -699,11 +696,7 @@ fn test_null_row_err() {
 fn assert_create_one(values: &[Scalar], schema: SchemaRef, expected: RecordBatch) {
     let handler = ArrowEvaluationHandler;
     let actual = handler.create_one(schema, values).unwrap();
-    let actual_rb: RecordBatch = actual
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .unwrap()
-        .into();
+    let actual_rb = actual.try_into_record_batch().unwrap();
     assert_eq!(actual_rb, expected);
 }
 
@@ -715,7 +708,7 @@ fn test_create_one() {
         3.into(),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new([
+    let schema = Arc::new(StructType::new_unchecked([
         StructField::nullable("a", KernelDataType::INTEGER),
         StructField::nullable("b", KernelDataType::STRING),
         StructField::not_null("c", KernelDataType::INTEGER),
@@ -744,9 +737,9 @@ fn test_create_one() {
 #[test]
 fn test_create_one_nested() {
     let values: &[Scalar] = &[1.into(), 2.into()];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
-        KernelDataType::struct_type([
+        KernelDataType::struct_type_unchecked([
             StructField::nullable("b", KernelDataType::INTEGER),
             StructField::not_null("c", KernelDataType::INTEGER),
         ]),
@@ -782,9 +775,9 @@ fn test_create_one_nested() {
 #[test]
 fn test_create_one_nested_null() {
     let values: &[Scalar] = &[Scalar::Null(KernelDataType::INTEGER), 1.into()];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
-        KernelDataType::struct_type([
+        KernelDataType::struct_type_unchecked([
             StructField::nullable("b", KernelDataType::INTEGER),
             StructField::not_null("c", KernelDataType::INTEGER),
         ]),
@@ -821,7 +814,7 @@ fn test_create_one_nested_null() {
 fn test_create_one_mismatching_scalar_types() {
     // Scalar is a LONG but schema specifies INTEGER
     let values: &[Scalar] = &[Scalar::Long(10)];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "version",
         KernelDataType::INTEGER,
     )]));
@@ -838,9 +831,9 @@ fn test_create_one_not_null_struct() {
         Scalar::Null(KernelDataType::INTEGER),
         Scalar::Null(KernelDataType::INTEGER),
     ];
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "a",
-        KernelDataType::struct_type([
+        KernelDataType::struct_type_unchecked([
             StructField::not_null("b", KernelDataType::INTEGER),
             StructField::nullable("c", KernelDataType::INTEGER),
         ]),
@@ -857,7 +850,7 @@ fn test_create_one_top_level_null() {
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
-    let schema = Arc::new(StructType::new([StructField::not_null(
+    let schema = Arc::new(StructType::new_unchecked([StructField::not_null(
         "col_1",
         KernelDataType::INTEGER,
     )]));
@@ -940,7 +933,7 @@ fn test_apply_schema_column_count_mismatch() {
     ]);
 
     // Create a schema with only 2 fields (mismatch)
-    let schema = KernelDataType::Struct(Box::new(StructType::new([
+    let schema = KernelDataType::Struct(Box::new(StructType::new_unchecked([
         StructField::not_null("a", KernelDataType::INTEGER),
         StructField::not_null("b", KernelDataType::INTEGER),
     ])));
@@ -1108,77 +1101,4 @@ fn test_to_json_with_nested_struct() {
         json_array.value(1),
         r#"{"outer_int":200,"nested_struct":{"inner_string":"value"}}"#
     );
-}
-
-#[test]
-#[ignore]
-fn benchmark_to_json_performance() {
-    use std::time::Instant;
-
-    // Create a large test struct array for performance testing
-    fn create_large_test_struct_array(num_rows: usize) -> StructArray {
-        let mut id_builder = Int32Builder::with_capacity(num_rows);
-        let mut name_builder = StringBuilder::with_capacity(num_rows, num_rows * 20);
-        let mut score_builder = crate::arrow::array::Float64Builder::with_capacity(num_rows);
-        let mut active_builder = crate::arrow::array::BooleanBuilder::with_capacity(num_rows);
-
-        for i in 0..num_rows {
-            id_builder.append_value(i as i32);
-            name_builder.append_value(format!("user_{i}"));
-            score_builder.append_value((i as f64) * 0.1 + 100.0);
-            active_builder.append_value(i % 3 != 0);
-        }
-
-        let fields = Fields::from(vec![
-            Arc::new(Field::new("id", DataType::Int32, false)),
-            Arc::new(Field::new("name", DataType::Utf8, false)),
-            Arc::new(Field::new("score", DataType::Float64, false)),
-            Arc::new(Field::new("active", DataType::Boolean, false)),
-        ]);
-
-        let arrays: Vec<ArrayRef> = vec![
-            Arc::new(id_builder.finish()),
-            Arc::new(name_builder.finish()),
-            Arc::new(score_builder.finish()),
-            Arc::new(active_builder.finish()),
-        ];
-
-        StructArray::new(fields, arrays, None)
-    }
-
-    // Test with different sizes to measure performance characteristics
-    let test_sizes = [100, 1000, 5000, 100000];
-    for &size in &test_sizes {
-        let large_struct = create_large_test_struct_array(size);
-
-        let start = Instant::now();
-        let result = to_json(&large_struct).unwrap();
-        let duration = start.elapsed();
-
-        println!(
-            "to_json processed {} rows in {:?} ({:.2} μs/row)",
-            size,
-            duration,
-            duration.as_micros() as f64 / size as f64
-        );
-
-        // Verify correctness
-        assert_eq!(result.len(), size);
-        let string_array = result.as_string::<i32>();
-
-        // Check a few sample results
-        if size > 0 {
-            let first_json = string_array.value(0);
-            assert!(first_json.contains("\"id\":0"));
-            assert!(first_json.contains("\"name\":\"user_0\""));
-            assert!(first_json.contains("\"score\":100"));
-            assert!(first_json.contains("\"active\":false"));
-        }
-
-        if size > 1 {
-            let second_json = string_array.value(1);
-            assert!(second_json.contains("\"id\":1"));
-            assert!(second_json.contains("\"name\":\"user_1\""));
-        }
-    }
 }
