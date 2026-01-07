@@ -1,5 +1,7 @@
 //! Utility functions used for testing ffi code
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::sync::Arc;
 
 use crate::expressions::{SharedExpression, SharedPredicate};

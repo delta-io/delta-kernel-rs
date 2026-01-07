@@ -31,7 +31,13 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
   for (uintptr_t i = 0; i < context->partition_cols->len; i++) {
     char* col = context->partition_cols->cols[i];
     KernelStringSlice key = { col, strlen(col) };
-    char* partition_val = get_from_string_map(partition_values, key, allocate_string);
+    ExternResultNullableCvoid res = get_from_string_map(partition_values, key, allocate_string, context->engine);
+    if (res.tag != OkNullableCvoid) {
+      print_error("Failed to get from string map.", (Error*)res.err);
+      free_error((Error*)res.err);
+      continue;
+    }
+    char* partition_val = res.ok;
     if (partition_val) {
       print_diag("  partition '%s' here: %s\n", col, partition_val);
       free(partition_val);
@@ -117,7 +123,11 @@ void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_
 
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
-  visit_scan_metadata(scan_metadata, engine_context, scan_row_callback);
+  ExternResultbool visit_res = visit_scan_metadata(scan_metadata, context->engine, engine_context, scan_row_callback);
+  if (visit_res.tag != Okbool) {
+    print_error("Failed to visit scan metadata.", (Error*)visit_res.err);
+    free_error((Error*)visit_res.err);
+  }
   free_bool_slice(selection_vector);
   free_scan_metadata(scan_metadata);
 }
@@ -276,7 +286,9 @@ int main(int argc, char* argv[])
 
   // an example of using a builder to set options when building an engine
   EngineBuilder* engine_builder = engine_builder_res.ok;
-  set_builder_opt(engine_builder, "aws_region", "us-west-2");
+  if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
+    return -1;
+  }
   // potentially set credentials here
   // set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
   // set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
@@ -306,7 +318,7 @@ int main(int argc, char* argv[])
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
 
-  CSchema *cschema = get_cschema(snapshot);
+  CSchema *cschema = get_cschema(snapshot, engine);
   print_cschema(cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
