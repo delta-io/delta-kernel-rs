@@ -24,7 +24,9 @@ use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
+    sidecar_batch_with_given_paths_and_sizes,
 };
+use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
@@ -33,6 +35,44 @@ use crate::{
 use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
 
 use super::*;
+
+use crate::actions::visitors::SidecarVisitor;
+use crate::ParquetHandler;
+
+/// Processes sidecar files for the given checkpoint batch.
+///
+/// This function extracts any sidecar file references from the provided batch.
+/// Each sidecar file is read and an iterator of file action batches is returned.
+fn process_sidecars(
+    parquet_handler: Arc<dyn ParquetHandler>,
+    log_root: Url,
+    batch: &dyn EngineData,
+    checkpoint_read_schema: SchemaRef,
+    meta_predicate: Option<PredicateRef>,
+) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
+    // Visit the rows of the checkpoint batch to extract sidecar file references
+    let mut visitor = SidecarVisitor::default();
+    visitor.visit_rows_of(batch)?;
+
+    // If there are no sidecar files, return early
+    if visitor.sidecars.is_empty() {
+        return Ok(None);
+    }
+
+    let sidecar_files: Vec<_> = visitor
+        .sidecars
+        .iter()
+        .map(|sidecar| sidecar.to_filemeta(&log_root))
+        .try_collect()?;
+
+    // Read the sidecar files and return an iterator of sidecar file batches
+    Ok(Some(LogSegment::read_sidecars(
+        parquet_handler,
+        &sidecar_files,
+        checkpoint_read_schema,
+        meta_predicate,
+    )?))
+}
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
 // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
@@ -194,13 +234,23 @@ async fn write_json_to_store(
 }
 
 fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+    create_log_path_with_size(path, 0)
+}
+
+fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
     ParsedLogPath::try_from(FileMeta {
         location: Url::parse(path).expect("Invalid file URL"),
         last_modified: 0,
-        size: 0,
+        size,
     })
     .unwrap()
     .unwrap()
+}
+
+/// Gets the file size from the store for use in FileMeta
+async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
+    let object_meta = store.head(&Path::from(path)).await.unwrap();
+    object_meta.size
 }
 
 #[tokio::test]
@@ -964,7 +1014,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -1004,7 +1054,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
         read_schema.clone(),
     );
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -1032,7 +1082,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
         get_all_actions_schema().clone(),
     );
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -1073,7 +1123,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         ))
     });
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -1116,6 +1166,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         }
         .build()?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1181,6 +1232,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         .build()?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1222,16 +1274,24 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
+    // Get the actual file size for proper footer reading
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFilesBuilder {
-            checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
+            checkpoint_parts: vec![create_log_path_with_size(
+                &checkpoint_one_file,
+                checkpoint_size,
+            )],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
         .build()?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1281,6 +1341,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         .build()?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None)?;
@@ -1313,16 +1374,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let (store, log_root) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
-    add_checkpoint_to_store(
-        &store,
-        sidecar_batch_with_given_paths(
-            vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-            get_all_actions_schema().clone(),
-        ),
-        "00000000000000000001.checkpoint.parquet",
-    )
-    .await?;
-
+    // Write sidecars first so we can get their actual sizes
     add_sidecar_to_store(
         &store,
         add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
@@ -1336,20 +1388,46 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     )
     .await?;
 
+    // Get actual sidecar sizes for correct FileMeta creation
+    let sidecar1_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
+    let sidecar2_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile2.parquet").await;
+
+    // Now create checkpoint with correct sidecar sizes
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
+            get_all_actions_schema().clone(),
+        ),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
     let checkpoint_file_path = log_root
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
+
+    // Get the actual file size for proper footer reading
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFilesBuilder {
-            checkpoint_parts: vec![create_log_path(&checkpoint_file_path)],
+            checkpoint_parts: vec![create_log_path_with_size(
+                &checkpoint_file_path,
+                checkpoint_size,
+            )],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
         .build()?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1365,8 +1443,11 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     // verify no behavior change.
     assert_batch_matches(
         first_batch,
-        sidecar_batch_with_given_paths(
-            vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
             get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
         ),
     );
@@ -2309,7 +2390,8 @@ fn test_log_segment_contiguous_commit_files() {
     .build();
 
     // disallow gaps in LogSegment
-    let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
+    let log_segment =
+        LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None, None);
     assert_result_error_with_message(
         log_segment,
         "Generic delta kernel error: Expected ordered \
@@ -2345,6 +2427,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2365,6 +2448,7 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
     };
 
     // Should fail with staged commits
@@ -2375,4 +2459,156 @@ fn test_publish_validation() {
     } else {
         panic!("Expected Error::Generic");
     }
+}
+// Helper to create a checkpoint schema with stats_parsed for testing
+fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked(min_values_fields.clone()),
+        ),
+        StructField::nullable("maxValues", StructType::new_unchecked(min_values_fields)),
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+// Helper to create a checkpoint schema without stats_parsed
+fn create_checkpoint_schema_without_stats_parsed() -> StructType {
+    use crate::schema::StructType;
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats", DataType::STRING),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_basic() {
+    // Create a checkpoint schema with stats_parsed containing an integer column
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    // Exact type match should work
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+
+    // Type widening (int -> long) should work
+    let stats_schema_widened =
+        StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema_widened
+    ));
+
+    // Incompatible type (string -> int) should fail
+    let checkpoint_schema_string =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]);
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema_string,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
+    // Checkpoint has "id" column, stats schema needs "other" column (missing in checkpoint is OK)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema =
+        StructType::new_unchecked([StructField::nullable("other", DataType::INTEGER)]);
+
+    // Missing column in checkpoint is OK - it will just return NULL
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_extra_column_ok() {
+    // Checkpoint has extra columns not needed by stats schema (should be OK)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("extra", DataType::STRING),
+    ]);
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_no_stats_parsed() {
+    // Checkpoint schema without stats_parsed field
+    let checkpoint_schema = create_checkpoint_schema_without_stats_parsed();
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_empty_stats_schema() {
+    // Empty stats schema (no columns needed for data skipping)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema = StructType::new_unchecked([]);
+
+    // If no columns are needed for data skipping, any stats_parsed is compatible
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_multiple_columns() {
+    // Multiple columns - check that we iterate over all columns and find incompatibility
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::STRING),
+    ]);
+
+    // First column matches, second is incompatible
+    let stats_schema = StructType::new_unchecked([
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::INTEGER),
+    ]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
 }

@@ -23,6 +23,93 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// Transforms schema fields to be nullable, as stats may not be available for all columns
+/// (and usually aren't for partition columns).
+struct NullableStatsTransform;
+
+impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+        let field = match self.transform(&field.data_type)? {
+            Borrowed(_) if field.is_nullable() => Borrowed(field),
+            Borrowed(_) => Owned(StructField {
+                name: field.name.clone(),
+                data_type: field.data_type.clone(),
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+            Owned(data_type) => Owned(StructField {
+                name: field.name.clone(),
+                data_type,
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+        };
+        Some(field)
+    }
+}
+
+/// Transforms a schema into a nullcount schema where all leaf fields are nullable LONGs.
+struct NullCountStatsTransform;
+
+impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
+    fn transform_primitive(&mut self, _ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
+        Some(Cow::Owned(PrimitiveType::Long))
+    }
+
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        let transformed = self.recurse_into_struct_field(field)?;
+        // Make the field nullable since nullcount stats may not be available for all columns
+        Some(match transformed {
+            Cow::Borrowed(f) if f.is_nullable() => Cow::Borrowed(f),
+            Cow::Borrowed(f) => Cow::Owned(StructField {
+                name: f.name.clone(),
+                data_type: f.data_type.clone(),
+                nullable: true,
+                metadata: f.metadata.clone(),
+            }),
+            Cow::Owned(mut f) => {
+                f.nullable = true;
+                Cow::Owned(f)
+            }
+        })
+    }
+}
+
+/// Builds the stats schema structure from columns referenced by a predicate.
+///
+/// The returned schema has the following structure:
+/// ```text
+/// {
+///   numRecords: long,
+///   nullCount: { col1: long, col2: long, ... },
+///   minValues: { col1: type1, col2: type2, ... },
+///   maxValues: { col1: type1, col2: type2, ... }
+/// }
+/// ```
+///
+/// All fields are nullable since stats may not be available for all columns.
+/// Returns `None` if the referenced schema cannot be transformed (e.g., empty schema).
+pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
+    // Transform to nullable stats schema (preserves original types, makes all fields nullable)
+    let stats_schema = NullableStatsTransform
+        .transform_struct(referenced_schema)?
+        .into_owned();
+
+    // Transform directly from referenced_schema to avoid double traversal.
+    // NullCountStatsTransform converts primitives to LONG and makes fields nullable in one pass.
+    let nullcount_schema = NullCountStatsTransform
+        .transform_struct(referenced_schema)?
+        .into_owned();
+
+    Some(Arc::new(StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable("nullCount", nullcount_schema),
+        StructField::nullable("minValues", stats_schema.clone()),
+        StructField::nullable("maxValues", stats_schema),
+    ])))
+}
+
 /// Rewrites a predicate to a predicate that can be used to skip files based on their stats.
 /// Returns `None` if the predicate is not eligible for data skipping.
 ///
@@ -59,69 +146,24 @@ pub(crate) struct DataSkippingFilter {
 }
 
 impl DataSkippingFilter {
-    /// Creates a new data skipping filter. Returns None if there is no predicate, or the predicate
-    /// is ineligible for data skipping.
+    /// Creates a new data skipping filter. Returns None if there is no predicate, the predicate
+    /// is ineligible for data skipping, or no stats_schema is provided.
     ///
     /// NOTE: None is equivalent to a trivial filter that always returns TRUE (= keeps all files),
     /// but using an Option lets the engine easily avoid the overhead of applying trivial filters.
     pub(crate) fn new(
         engine: &dyn Engine,
         physical_predicate: Option<(PredicateRef, SchemaRef)>,
+        stats_schema: Option<SchemaRef>,
     ) -> Option<Self> {
         static STATS_EXPR: LazyLock<ExpressionRef> =
             LazyLock::new(|| Arc::new(column_expr!("add.stats")));
         static FILTER_PRED: LazyLock<PredicateRef> =
             LazyLock::new(|| Arc::new(column_expr!("output").distinct(Expr::literal(false))));
 
-        let (predicate, referenced_schema) = physical_predicate?;
+        let (predicate, _referenced_schema) = physical_predicate?;
+        let stats_schema = stats_schema?;
         debug!("Creating a data skipping filter for {:#?}", predicate);
-
-        // Convert all fields into nullable, as stats may not be available for all columns
-        // (and usually aren't for partition columns).
-        struct NullableStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-            fn transform_struct_field(
-                &mut self,
-                field: &'a StructField,
-            ) -> Option<Cow<'a, StructField>> {
-                use Cow::*;
-                let field = match self.transform(&field.data_type)? {
-                    Borrowed(_) if field.is_nullable() => Borrowed(field),
-                    data_type => Owned(StructField {
-                        name: field.name.clone(),
-                        data_type: data_type.into_owned(),
-                        nullable: true,
-                        metadata: field.metadata.clone(),
-                    }),
-                };
-                Some(field)
-            }
-        }
-
-        // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
-        struct NullCountStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
-            fn transform_primitive(
-                &mut self,
-                _ptype: &'a PrimitiveType,
-            ) -> Option<Cow<'a, PrimitiveType>> {
-                Some(Cow::Owned(PrimitiveType::Long))
-            }
-        }
-
-        let stats_schema = NullableStatsTransform
-            .transform_struct(&referenced_schema)?
-            .into_owned();
-
-        let nullcount_schema = NullCountStatsTransform
-            .transform_struct(&stats_schema)?
-            .into_owned();
-        let stats_schema = Arc::new(StructType::new_unchecked([
-            StructField::nullable("numRecords", DataType::LONG),
-            StructField::nullable("nullCount", nullcount_schema),
-            StructField::nullable("minValues", stats_schema.clone()),
-            StructField::nullable("maxValues", stats_schema),
-        ]));
 
         // Skipping happens in several steps:
         //
