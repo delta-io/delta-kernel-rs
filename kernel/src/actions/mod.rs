@@ -16,7 +16,7 @@ use crate::table_properties::TableProperties;
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension as _, FileMeta,
-    IntoEngineData, RowVisitor as _,
+    IntoEngineData, RowVisitor as _, KERNEL_VERSION,
 };
 
 use url::Url;
@@ -25,7 +25,6 @@ use visitors::{MetadataVisitor, ProtocolVisitor};
 use delta_kernel_derive::{internal_api, IntoEngineData, ToSchema};
 use serde::{Deserialize, Serialize};
 
-const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UNKNOWN_OPERATION: &str = "UNKNOWN";
 
 pub mod deletion_vector;
@@ -107,6 +106,20 @@ static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+static LOG_PROTOCOL_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        PROTOCOL_NAME,
+        Protocol::to_schema(),
+    )]))
+});
+
+static LOG_METADATA_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(StructType::new([StructField::nullable(
+        METADATA_NAME,
+        Metadata::to_schema(),
+    )]))
+});
+
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         SET_TRANSACTION_NAME,
@@ -146,6 +159,14 @@ pub(crate) fn get_log_remove_schema() -> &'static SchemaRef {
 
 pub(crate) fn get_log_commit_info_schema() -> &'static SchemaRef {
     &LOG_COMMIT_INFO_SCHEMA
+}
+
+pub(crate) fn get_log_protocol_schema() -> &'static SchemaRef {
+    &LOG_PROTOCOL_SCHEMA
+}
+
+pub(crate) fn get_log_metadata_schema() -> &'static SchemaRef {
+    &LOG_METADATA_SCHEMA
 }
 
 pub(crate) fn get_log_txn_schema() -> &'static SchemaRef {
