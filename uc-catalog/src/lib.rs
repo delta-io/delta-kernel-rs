@@ -106,15 +106,17 @@ impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
             .commits
             .unwrap_or_default()
             .into_iter()
-            .map(|c| -> Result<LogPath, Box<dyn std::error::Error + Send + Sync>> {
-                LogPath::staged_commit(
-                    table_url.clone(),
-                    &c.file_name,
-                    c.file_modification_timestamp,
-                    c.file_size.try_into()?,
-                )
-                .map_err(|e| e.into())
-            })
+            .map(
+                |c| -> Result<LogPath, Box<dyn std::error::Error + Send + Sync>> {
+                    LogPath::staged_commit(
+                        table_url.clone(),
+                        &c.file_name,
+                        c.file_modification_timestamp,
+                        c.file_size.try_into()?,
+                    )
+                    .map_err(|e| e.into())
+                },
+            )
             .try_collect()?;
 
         debug!("commits for kernel: {:?}\n", commits);
