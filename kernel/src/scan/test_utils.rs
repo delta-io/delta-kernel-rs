@@ -28,13 +28,24 @@ pub(crate) fn sidecar_batch_with_given_paths(
     paths: Vec<&str>,
     output_schema: SchemaRef,
 ) -> Box<ArrowEngineData> {
+    // Use default size of 9268 for backward compatibility
+    let paths_with_sizes: Vec<_> = paths.into_iter().map(|p| (p, 9268u64)).collect();
+    sidecar_batch_with_given_paths_and_sizes(paths_with_sizes, output_schema)
+}
+
+// Generates a batch of sidecar actions with the given paths and sizes.
+// The schema is provided as null columns affect equality checks.
+pub(crate) fn sidecar_batch_with_given_paths_and_sizes(
+    paths_and_sizes: Vec<(&str, u64)>,
+    output_schema: SchemaRef,
+) -> Box<ArrowEngineData> {
     let handler = SyncJsonHandler {};
 
-    let mut json_strings: Vec<String> = paths
+    let mut json_strings: Vec<String> = paths_and_sizes
         .iter()
-        .map(|path| {
+        .map(|(path, size)| {
             format!(
-                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":9268,"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
+                r#"{{"sidecar":{{"path":"{path}","sizeInBytes":{size},"modificationTime":1714496113961,"tags":{{"tag_foo":"tag_bar"}}}}}}"#
             )
         })
         .collect();
