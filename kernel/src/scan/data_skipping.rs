@@ -19,7 +19,7 @@ use crate::{
     Engine, EngineData, ExpressionEvaluator, JsonHandler, PredicateEvaluator, RowVisitor as _,
 };
 
-pub(crate) use stats_schema::stats_schema;
+pub(crate) use stats_schema::expected_stats_schema;
 
 mod stats_schema;
 #[cfg(test)]

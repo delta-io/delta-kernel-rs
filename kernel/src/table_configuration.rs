@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{ensure_supported_features, Metadata, Protocol};
-use crate::scan::data_skipping::stats_schema;
+use crate::actions::{Metadata, Protocol};
+use crate::scan::data_skipping::expected_stats_schema;
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, Schema, SchemaRef, StructType};
 use crate::table_features::{
@@ -427,7 +427,7 @@ impl TableConfiguration {
                 .filter(|field| !partition_columns.contains(field.name()))
                 .map(|field| field.make_physical(column_mapping_mode)),
         );
-        stats_schema(&physical_file_schema, &self.table_properties)
+        expected_stats_schema(&physical_file_schema, &self.table_properties)
     }
 
     /// Returns `true` if row tracking is suspended for this table.
