@@ -688,7 +688,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[5], CommitSource::Catalog);
         assert_eq!(
             total_listing_result.max_known_published_commit_version,
-            Some(2)
+            Some(5)
         );
     }
 
@@ -723,7 +723,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[2], CommitSource::Catalog);
         assert_eq!(
             total_listing_result.max_known_published_commit_version,
-            Some(1)
+            Some(3) // Recall: we listed (with log tail) with end_version=3
         );
     }
 
@@ -813,7 +813,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[2], CommitSource::Catalog);
         assert_eq!(
             total_listing_result.max_known_published_commit_version,
-            None
+            Some(1)
         );
     }
 
