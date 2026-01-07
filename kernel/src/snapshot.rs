@@ -57,6 +57,7 @@ impl std::fmt::Debug for Snapshot {
             .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version())
             .field("metadata", &self.table_configuration().metadata())
+            .field("log_segment", &self.log_segment)
             .finish()
     }
 }
@@ -245,7 +246,9 @@ impl Snapshot {
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-                ..Default::default()
+                max_known_published_commit_version: new_log_segment
+                    .max_known_published_commit_version
+                    .max(old_log_segment.max_known_published_commit_version),
             }
             .build()?,
             log_root,
