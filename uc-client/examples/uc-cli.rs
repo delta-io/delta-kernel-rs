@@ -3,7 +3,7 @@ use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use uc_client::{
     models::{commits::Commit, credentials::Operation, CommitsRequest},
-    UCClient,
+    UCClient, UCCommitsClient, UCRestCommitsClient,
 };
 
 #[derive(Parser)]
@@ -85,11 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_level)))
         .init();
 
-    // Create client
-    let client = UCClient::builder(&cli.workspace_url, &cli.token)
+    // Create shared config
+    let config = uc_client::ClientConfig::build(&cli.workspace_url, &cli.token)
         .with_timeout(Duration::from_secs(60))
         .with_max_retries(3)
         .build()?;
+
+    // Create clients
+    let client = UCClient::new(config.clone())?;
+    let commits_client = UCRestCommitsClient::new(config)?;
 
     // Execute command
     match cli.command {
@@ -143,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 request = request.with_end_version(end);
             }
 
-            match client.get_commits(request).await {
+            match commits_client.get_commits(request).await {
                 Ok(response) => {
                     println!("\n✓ Commits retrieved successfully\n");
                     println!("Table:           {}", table.full_name());
