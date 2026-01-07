@@ -39,7 +39,9 @@ use crate::actions::{
 };
 use crate::clustering::ClusteringMetadataDomain;
 use crate::committer::Committer;
-use crate::schema::{ColumnName, SchemaRef};
+use crate::schema::{
+    validate_partition_columns, validate_schema_for_create, ColumnName, SchemaRef,
+};
 use crate::table_features::{
     assign_column_mapping_metadata, extract_table_configuration,
     get_column_mapping_mode_from_properties, ColumnMappingMode, ExtractedTableConfiguration,
@@ -478,12 +480,19 @@ impl CreateTableTransactionBuilder {
                 clustering_domain_metadata: None,
                 additional_writer_features: vec![],
             }),
-            DataLayout::Partitioned(cols) => Ok(ProcessedDataLayout {
+            DataLayout::Partitioned(cols) => {
                 // Convert ColumnName to String for Metadata compatibility
-                partition_columns: cols.iter().map(|c| c.to_string()).collect(),
-                clustering_domain_metadata: None,
-                additional_writer_features: vec![],
-            }),
+                let partition_columns: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+
+                // Validate partition columns exist and have valid types
+                validate_partition_columns(schema, &partition_columns)?;
+
+                Ok(ProcessedDataLayout {
+                    partition_columns,
+                    clustering_domain_metadata: None,
+                    additional_writer_features: vec![],
+                })
+            }
             DataLayout::Clustered(cols) => {
                 // Validate clustering columns
                 Self::validate_clustering_columns(cols, schema)?;
@@ -564,6 +573,12 @@ impl CreateTableTransactionBuilder {
 
         // Validate and strip protocol version properties (before engine access for fail-fast)
         let table_properties = Self::validate_and_strip_protocol_properties(self.table_properties)?;
+
+        // Determine column mapping mode early for schema validation
+        let column_mapping_mode = get_column_mapping_mode_from_properties(&table_properties)?;
+
+        // Validate schema: duplicate columns, valid column names
+        validate_schema_for_create(&self.schema, column_mapping_mode)?;
 
         // Ensure no table exists at the path
         Self::ensure_table_does_not_exist(&table_url, &self.path, engine)?;
@@ -932,5 +947,191 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("is not a struct"));
+    }
+
+    // ==================== Schema Validation Tests ====================
+
+    #[test]
+    fn test_rejects_duplicate_column_names_case_insensitive() {
+        // Create schema with case-insensitive duplicates
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("Name", DataType::STRING, false),
+            StructField::new("name", DataType::STRING, true),
+        ]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn test_rejects_duplicate_nested_column_names() {
+        // Create schema with duplicate nested paths
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new(
+                "outer",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                    "Inner",
+                    DataType::STRING,
+                    true,
+                )]))),
+                true,
+            ),
+            StructField::new(
+                "Outer",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                    "inner",
+                    DataType::STRING,
+                    true,
+                )]))),
+                true,
+            ),
+        ]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn test_rejects_invalid_column_name_without_column_mapping() {
+        // Create schema with column name containing space (invalid for Parquet)
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "my column",
+            DataType::STRING,
+            false,
+        )]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid character"));
+    }
+
+    #[test]
+    fn test_accepts_special_column_name_with_column_mapping() {
+        // Create schema with column name containing space (valid with column mapping)
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "my column",
+            DataType::STRING,
+            false,
+        )]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        // Should succeed - spaces are allowed with column mapping
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_newline_in_column_name_even_with_column_mapping() {
+        // Create schema with column name containing newline (always invalid)
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "my\ncolumn",
+            DataType::STRING,
+            false,
+        )]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("newline") || err.contains("\\n"));
+    }
+
+    #[test]
+    fn test_rejects_partition_column_not_found() {
+        let schema = test_schema_with_columns();
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::partitioned(["nonexistent"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_rejects_partition_column_complex_type() {
+        use crate::schema::ArrayType;
+
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new(
+                "tags",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+                true,
+            ),
+        ]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::partitioned(["tags"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unsupported type"));
+    }
+
+    #[test]
+    fn test_accepts_valid_partition_column() {
+        let schema = test_schema_with_columns();
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::partitioned(["name"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_ok());
     }
 }
