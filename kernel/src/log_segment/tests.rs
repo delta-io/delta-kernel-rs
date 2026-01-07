@@ -2459,3 +2459,103 @@ fn test_publish_validation() {
         panic!("Expected Error::Generic");
     }
 }
+
+/// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment
+#[tokio::test]
+async fn test_checkpoint_schema_propagation_from_hint() {
+    use crate::schema::{StructField, StructType};
+
+    // Create a sample schema that would be in _last_checkpoint
+    let sample_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable("add", StructType::new_unchecked([])),
+        StructField::nullable("remove", StructType::new_unchecked([])),
+    ]));
+
+    let checkpoint_metadata = LastCheckpointHint {
+        version: 5,
+        size: 10,
+        parts: Some(1),
+        size_in_bytes: None,
+        num_of_add_files: None,
+        checkpoint_schema: Some(sample_schema.clone()),
+        checksum: None,
+        tags: None,
+    };
+
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(6, "json"),
+        ],
+        Some(&checkpoint_metadata),
+    )
+    .await;
+
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![], // log_tail
+        Some(checkpoint_metadata),
+        None,
+    )
+    .unwrap();
+
+    // Verify checkpoint_schema is propagated
+    assert!(log_segment.checkpoint_schema.is_some());
+    assert_eq!(log_segment.checkpoint_schema.unwrap(), sample_schema);
+}
+
+/// Test get_file_actions_schema_and_sidecars with V1 parquet checkpoint using hint schema
+/// This verifies the optimization path where hint schema is used directly (avoiding footer read)
+#[tokio::test]
+async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> {
+    use crate::schema::{StructField, StructType};
+
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone());
+
+    // Create a V1 checkpoint (without sidecar column)
+    let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+
+    // Create a hint schema without sidecar field (indicates V1)
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable("add", StructType::new_unchecked([])),
+        StructField::nullable("remove", StructType::new_unchecked([])),
+    ]));
+
+    let log_segment = LogSegment::try_new(
+        ListedLogFilesBuilder {
+            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
+            ..Default::default()
+        }
+        .build()?,
+        log_root,
+        None,
+        Some(hint_schema.clone()), // V1 hint schema (no sidecar field)
+    )?;
+
+    // With V1 hint, should use hint schema and avoid footer read
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    assert!(schema.is_some(), "Should return hint schema for V1");
+    assert_eq!(
+        schema.unwrap(),
+        hint_schema,
+        "Should use hint schema directly"
+    );
+    assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
+
+    Ok(())
+}

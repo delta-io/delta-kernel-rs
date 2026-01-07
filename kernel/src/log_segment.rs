@@ -506,7 +506,7 @@ impl LogSegment {
     /// Returns an iterator over checkpoint data, processing sidecar files when necessary.
     ///
     /// For single-part checkpoints that need file actions, this function:
-    /// 1. Determines the checkpoint schema (for future stats_parsed detection)
+    /// 1. Determines the files actions schema (for future stats_parsed detection)
     /// 2. Extracts sidecar file references if present (V2 checkpoints)
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     fn create_checkpoint_stream(
