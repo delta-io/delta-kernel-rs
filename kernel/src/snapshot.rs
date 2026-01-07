@@ -914,26 +914,22 @@ mod tests {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
         let engine = DefaultEngine::new(store.clone());
-        let protocol = |reader_version, writer_version| {
+        let protocol_fields = |reader_version, writer_version| {
             json!({
-                "protocol": {
-                    "minReaderVersion": reader_version,
-                    "minWriterVersion": writer_version
-                }
+                "minReaderVersion": reader_version,
+                "minWriterVersion": writer_version
             })
         };
-        let metadata = json!({
-            "metaData": {
-                "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
-                "format": {
-                    "provider": "parquet",
-                    "options": {}
-                },
-                "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
-                "partitionColumns": [],
-                "configuration": {},
-                "createdTime": 1587968585495i64
-            }
+        let metadata_fields = json!({
+            "id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9",
+            "format": {
+                "provider": "parquet",
+                "options": {}
+            },
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "configuration": {},
+            "createdTime": 1587968585495i64
         });
         let commit0 = vec![
             json!({
@@ -944,8 +940,12 @@ mod tests {
                     "isBlindAppend":true
                 }
             }),
-            protocol(1, 1),
-            metadata.clone(),
+            json!({
+                "protocol": protocol_fields(1, 1),
+            }),
+            json!({
+                "metaData": metadata_fields.clone(),
+            }),
         ];
         let commit1 = vec![
             json!({
@@ -956,7 +956,9 @@ mod tests {
                     "isBlindAppend":true
                 }
             }),
-            protocol(1, 2),
+            json!({
+                "protocol": protocol_fields(1, 2),
+            }),
         ];
 
         // commit 0 and 1 jsons
@@ -966,12 +968,12 @@ mod tests {
         // a) CRC: old one has 0.crc, no new one (expect 0.crc)
         // b) CRC: old one has 0.crc, new one has 1.crc (expect 1.crc)
         let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 1),
+            "tableSizeBytes": 100,
+            "numFiles": 1,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": metadata_fields,
+            "protocol": protocol_fields(1, 1),
         });
 
         // put the old crc
@@ -1005,12 +1007,12 @@ mod tests {
         // put the new crc
         let path = delta_path_for_version(1, "crc");
         let crc = json!({
-            "table_size_bytes": 100,
-            "num_files": 1,
-            "num_metadata": 1,
-            "num_protocol": 1,
-            "metadata": metadata,
-            "protocol": protocol(1, 2),
+            "tableSizeBytes": 100,
+            "numFiles": 1,
+            "numMetadata": 1,
+            "numProtocol": 1,
+            "metadata": metadata_fields,
+            "protocol": protocol_fields(1, 2),
         });
         store.put(&path, crc.to_string().into()).await?;
         let snapshot = Snapshot::builder_from(base_snapshot.clone())

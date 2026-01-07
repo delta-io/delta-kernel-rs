@@ -193,7 +193,7 @@ async fn write_json_to_store(
     Ok(())
 }
 
-fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+pub(crate) fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
     ParsedLogPath::try_from(FileMeta {
         location: Url::parse(path).expect("Invalid file URL"),
         last_modified: 0,
