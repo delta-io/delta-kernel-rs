@@ -1,3 +1,5 @@
+//! This module contains logic to compute the expected schema for file statistics
+
 use std::borrow::Cow;
 
 use crate::{
@@ -12,7 +14,7 @@ use crate::{
 ///
 /// The base stats schema is dependent on the current table configuration and derived via:
 /// - only fields present in data files are included (use physical names, no partition columns)
-/// - if `dataSkippingStatsColumns` is set, include only those columns.
+/// - if the table property `delta.dataSkippingStatsColumns` is set, include only those columns.
 ///   Column names may refer to struct fields in which case all child fields are included.
 /// - otherwise the first `dataSkippingNumIndexedCols` (default 32) leaf fields are included.
 /// - all fields are made nullable.
@@ -32,7 +34,7 @@ use crate::{
 ///    maxValues: <derived min/max schema>,
 /// }
 /// ```
-pub(crate) fn stats_schema(
+pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
 ) -> Schema {
@@ -41,7 +43,7 @@ pub(crate) fn stats_schema(
 
     // generate the base stats schema:
     // - make all fields nullable
-    // - include fields according to table properties (num_indexed_cols, stats_coliumns, ...)
+    // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
     let mut base_transform = BaseStatsTransform::new(table_properties);
     if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
         let base_schema = base_schema.into_owned();
@@ -222,7 +224,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 
 // removes all fields with non eligible data types
 //
-// should only be applied to schema oricessed via `BaseStatsTransform`.
+// should only be applied to schema processed via `BaseStatsTransform`.
 struct MinMaxStatsTransform;
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
@@ -259,7 +261,7 @@ fn should_include_column(column_name: &ColumnName, column_names: &[ColumnName]) 
 
 /// Checks if a data type is eligible for min/max file skipping.
 /// https://github.com/delta-io/delta/blob/143ab3337121248d2ca6a7d5bc31deae7c8fe4be/kernel/kernel-api/src/main/java/io/delta/kernel/internal/skipping/StatsSchemaHelper.java#L61
-fn is_skipping_eligeble_datatype(data_type: &PrimitiveType) -> bool {
+fn is_skipping_eligible_datatype(data_type: &PrimitiveType) -> bool {
     matches!(
         data_type,
         &PrimitiveType::Byte
