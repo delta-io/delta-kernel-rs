@@ -15,7 +15,8 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::compare::SchemaComparison;
+use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
@@ -27,10 +28,6 @@ use delta_kernel_derive::internal_api;
 pub use crate::listed_log_files::ListedLogFiles;
 #[cfg(not(feature = "internal-api"))]
 use crate::listed_log_files::ListedLogFiles;
-#[cfg(test)]
-use crate::schema::compare::SchemaComparison;
-#[cfg(test)]
-use crate::schema::{DataType, Schema, StructType};
 
 use itertools::Itertools;
 use tracing::{debug, warn};
@@ -776,8 +773,7 @@ impl LogSegment {
     /// use physical column names (not logical names), so direct name comparison is correct.
     ///
     /// Returns `false` if stats_parsed doesn't exist or has incompatible types.
-    #[cfg(test)]
-    fn schema_has_compatible_stats_parsed(
+    pub(crate) fn schema_has_compatible_stats_parsed(
         checkpoint_schema: &Schema,
         stats_schema: &StructType,
     ) -> bool {

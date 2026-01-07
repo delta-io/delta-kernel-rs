@@ -74,7 +74,11 @@ impl ScanLogReplayProcessor {
         };
         Ok(Self {
             partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            data_skipping_filter: DataSkippingFilter::new(
+                engine,
+                physical_predicate,
+                state_info.stats_schema.clone(),
+            ),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 get_log_add_schema().clone(),
                 get_add_transform_expr(),
@@ -483,6 +487,7 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),

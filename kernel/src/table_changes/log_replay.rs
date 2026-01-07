@@ -57,7 +57,12 @@ pub(crate) fn table_changes_action_iter(
     table_schema: SchemaRef,
     physical_predicate: Option<(PredicateRef, SchemaRef)>,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<TableChangesScanMetadata>>> {
-    let filter = DataSkippingFilter::new(engine.as_ref(), physical_predicate).map(Arc::new);
+    // Build stats_schema from the referenced schema if we have a predicate
+    let stats_schema = physical_predicate
+        .as_ref()
+        .and_then(|(_, schema)| crate::scan::data_skipping::build_stats_schema(schema));
+    let filter =
+        DataSkippingFilter::new(engine.as_ref(), physical_predicate, stats_schema).map(Arc::new);
 
     let mut current_configuration = start_table_configuration.clone();
     let result = commit_files
