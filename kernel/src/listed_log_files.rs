@@ -116,10 +116,13 @@ struct ListLogFilesResult {
     max_known_published_commit_version: Option<Version>,
 }
 
-/// Lists [`ParsedLogPath`]s over versions `start_version..=end_version`, taking into account the
-/// `log_tail` which was (ostensibly) returned from the catalog. If there are fewer files than
-/// requested (e.g. `end_version` is past the end of the log), the result will simply end before
-/// reaching `end_version`.
+/// Lists [`ParsedLogPath`]s over versions [start_version, end_version], taking into account the
+/// `log_tail`. If there are fewer files than requested (e.g. `end_version` is past the end of the
+/// log), the result will simply end before reaching `end_version`.
+///
+/// The `log_tail` may originate from a catalog (e.g. from `SnapshotBuilder::with_log_tail`) or
+/// from the connector itself, if it cached log state internally (e.g. from `Snapshot::try_new_from`).
+/// It may contain either published or staged commits.
 ///
 /// Note that the `log_tail` must strictly adhere to being a 'tail' - that is, it is a contiguous
 /// cover of versions `X..=Y` where `Y` is the latest version of the table. If it overlaps with
@@ -159,7 +162,7 @@ fn list_log_files(
     let list_end_version =
         log_tail_start.map_or(end_version, |first| first.version.saturating_sub(1));
 
-    let mut max_known_published_commit_version: Option<Version> = None;
+    let mut max_published_commit_version_from_listing: Option<Version> = None;
 
     // if the log_tail covers the entire requested range (i.e. starts at or before start_version),
     // we skip listing entirely. note that if we don't include this check, we will end up listing
@@ -167,7 +170,7 @@ fn list_log_files(
     let listed_files: Vec<ParsedLogPath> =
         if log_tail_start.is_none_or(|tail| start_version < tail.version) {
             // NOTE: since engine APIs don't limit listing, we list from start_version and filter.
-            // We list up to end_version (not list_end_version) to track max_known_published_commit_version,
+            // We list up to end_version (not list_end_version) to track max_published_commit_version_from_listing,
             // then filter to list_end_version for the returned files.
             let all_files: Vec<ParsedLogPath> = storage
                 .list_from(&start_from)?
@@ -188,7 +191,7 @@ fn list_log_files(
 
             // Track max published commit version from all filesystem-listed files (including those
             // that will be filtered out because log_tail takes precedence at those versions)
-            max_known_published_commit_version = all_files
+            max_published_commit_version_from_listing = all_files
                 .iter()
                 .filter(|f| matches!(f.file_type, LogPathFileType::Commit))
                 .map(|f| f.version)
@@ -204,15 +207,24 @@ fn list_log_files(
         };
 
     // Chain with filtered log_tail
-    let filtered_log_tail = log_tail
+    let filtered_log_tail: Vec<ParsedLogPath> = log_tail
         .into_iter()
-        .filter(|entry| entry.version >= start_version && entry.version <= end_version);
+        .filter(|entry| entry.version >= start_version && entry.version <= end_version)
+        .collect();
+
+    // Also consider published commits from log_tail
+    let max_published_commit_version_from_log_tail = filtered_log_tail
+        .iter()
+        .filter(|f| matches!(f.file_type, LogPathFileType::Commit))
+        .map(|f| f.version)
+        .max();
 
     let files: Vec<ParsedLogPath> = listed_files.into_iter().chain(filtered_log_tail).collect();
 
     Ok(ListLogFilesResult {
         files,
-        max_known_published_commit_version,
+        max_known_published_commit_version: max_published_commit_version_from_listing
+            .max(max_published_commit_version_from_log_tail),
     })
 }
 
