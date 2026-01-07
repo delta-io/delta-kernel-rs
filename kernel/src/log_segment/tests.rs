@@ -2594,7 +2594,7 @@ async fn test_max_known_published_commit_version_only_published_commits() {
 #[tokio::test]
 async fn test_max_known_published_commit_version_checkpoint_followed_by_published_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
-        published_commit_versions: &[0, 1, 2, 3, 5, 6, 7, 8],
+        published_commit_versions: &[5, 6, 7, 8],
         checkpoint_version: Some(5),
         ..Default::default()
     })
@@ -2615,7 +2615,7 @@ async fn test_max_known_published_commit_version_only_staged_commits() {
 #[tokio::test]
 async fn test_max_known_published_commit_version_checkpoint_followed_by_staged_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
-        staged_commit_versions: &[6, 7, 8],
+        staged_commit_versions: &[5, 6, 7, 8],
         checkpoint_version: Some(5),
         ..Default::default()
     })
@@ -2651,7 +2651,7 @@ async fn test_max_known_published_commit_version_checkpoint_followed_by_publishe
 async fn test_max_known_published_commit_version_published_and_staged_commits_with_overlap() {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[0, 1, 2],
-        staged_commit_versions: &[1, 2, 3, 4],
+        staged_commit_versions: &[2, 3, 4],
         ..Default::default()
     })
     .await;
