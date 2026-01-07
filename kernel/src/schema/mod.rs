@@ -26,7 +26,13 @@ pub(crate) mod compare;
 pub mod derive_macro_utils;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod derive_macro_utils;
+pub(crate) mod validation;
 pub(crate) mod variant_utils;
+
+pub(crate) use validation::{
+    validate_clustering_columns, validate_partition_columns, validate_schema_for_create,
+    MAX_CLUSTERING_COLUMNS,
+};
 
 pub type Schema = StructType;
 pub type SchemaRef = Arc<StructType>;

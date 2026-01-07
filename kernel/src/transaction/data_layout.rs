@@ -18,10 +18,11 @@
 use std::sync::Arc;
 
 use crate::actions::DomainMetadata;
-use crate::clustering::{
-    validate_clustering_columns, ClusteringMetadataDomain, MAX_CLUSTERING_COLUMNS as MAX_COLS,
+use crate::clustering::ClusteringMetadataDomain;
+use crate::schema::{
+    validate_clustering_columns, validate_partition_columns, ColumnName, StructType,
+    MAX_CLUSTERING_COLUMNS as MAX_COLS,
 };
-use crate::schema::{ColumnName, StructType};
 use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::DeltaResult;
 
@@ -29,7 +30,7 @@ use crate::DeltaResult;
 pub(crate) type SchemaRef = Arc<StructType>;
 
 /// Maximum number of clustering columns allowed per Delta specification.
-/// Re-exported from [`crate::clustering`] for public API compatibility.
+/// Re-exported from [`crate::schema`] for public API compatibility.
 pub const MAX_CLUSTERING_COLUMNS: usize = MAX_COLS;
 
 /// Specifies how data is organized in a Delta table.
@@ -195,14 +196,21 @@ pub(crate) fn process_data_layout(
             clustering_domain_metadata: None,
             additional_writer_features: vec![],
         }),
-        DataLayout::Partitioned(cols) => Ok(ProcessedDataLayout {
+        DataLayout::Partitioned(cols) => {
             // Convert ColumnName to String for Metadata compatibility
-            partition_columns: cols.iter().map(|c| c.to_string()).collect(),
-            clustering_domain_metadata: None,
-            additional_writer_features: vec![],
-        }),
+            let partition_columns: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+
+            // Validate partition columns exist and have valid types
+            validate_partition_columns(schema_with_cm, &partition_columns)?;
+
+            Ok(ProcessedDataLayout {
+                partition_columns,
+                clustering_domain_metadata: None,
+                additional_writer_features: vec![],
+            })
+        }
         DataLayout::Clustered(cols) => {
-            // Validate clustering columns
+            // Validate clustering columns exist, have valid types, and don't exceed limit
             validate_clustering_columns(cols, schema_with_cm)?;
 
             // Create clustering domain metadata (resolves to physical names if CM enabled)

@@ -368,8 +368,6 @@ impl Transaction {
         committer: Box<dyn Committer>,
         system_domain_metadata: Option<DomainMetadata>,
     ) -> DeltaResult<Self> {
-        let commit_timestamp = current_time_ms()?;
-
         Ok(Transaction {
             read_snapshot: None,
             committer,
@@ -378,7 +376,7 @@ impl Transaction {
             add_files_metadata: vec![],
             remove_files_metadata: vec![],
             set_transactions: vec![],
-            commit_timestamp,
+            commit_timestamp: current_time_ms()?,
             domain_metadata_additions: system_domain_metadata.into_iter().collect(),
             domain_removals: vec![],
             data_change: true,

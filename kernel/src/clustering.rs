@@ -6,23 +6,15 @@
 //!
 //! Clustering metadata is stored as domain metadata with the domain name `delta.clustering`.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
 use crate::actions::DomainMetadata;
-use crate::schema::{ColumnName, DataType, StructType};
+use crate::schema::{ColumnName, StructType};
 use crate::table_features::{resolve_logical_to_physical_path, ColumnMappingMode};
-use crate::{DeltaResult, Error};
+use crate::DeltaResult;
 
 /// The domain name for clustering metadata in Delta tables.
 pub(crate) const CLUSTERING_DOMAIN_NAME: &str = "delta.clustering";
-
-/// Maximum number of clustering columns allowed per Delta specification.
-pub(crate) const MAX_CLUSTERING_COLUMNS: usize = 4;
-
-/// Type alias for schema reference.
-pub(crate) type SchemaRef = Arc<StructType>;
 
 /// Represents the clustering metadata stored as domain metadata in Delta tables.
 ///
@@ -91,68 +83,6 @@ impl ClusteringMetadataDomain {
             configuration,
         ))
     }
-}
-
-/// Validates clustering columns against the schema and constraints.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - More than [`MAX_CLUSTERING_COLUMNS`] (4) clustering columns are specified
-/// - A clustering column doesn't exist in the schema
-/// - A clustering column path tries to traverse a non-struct field
-pub(crate) fn validate_clustering_columns(
-    columns: &[ColumnName],
-    schema: &SchemaRef,
-) -> DeltaResult<()> {
-    // Check maximum clustering columns
-    if columns.len() > MAX_CLUSTERING_COLUMNS {
-        return Err(Error::generic(format!(
-            "Cannot specify more than {} clustering columns. Found {}.",
-            MAX_CLUSTERING_COLUMNS,
-            columns.len()
-        )));
-    }
-
-    // Validate each column exists in the schema by traversing the path
-    for col in columns {
-        let path = col.path();
-        if path.is_empty() {
-            return Err(Error::generic("Clustering column path cannot be empty"));
-        }
-
-        // Traverse the schema tree to validate the path
-        let mut current_schema = schema.as_ref();
-        for (i, field_name) in path.iter().enumerate() {
-            match current_schema.field(field_name) {
-                Some(field) => {
-                    // If not the last element, we need to descend into a struct
-                    if i < path.len() - 1 {
-                        match field.data_type() {
-                            DataType::Struct(inner) => {
-                                current_schema = inner;
-                            }
-                            _ => {
-                                return Err(Error::generic(format!(
-                                    "Clustering column '{}': field '{}' is not a struct and cannot contain nested fields",
-                                    col, field_name
-                                )));
-                            }
-                        }
-                    }
-                    // If it's the last element, we found the column - validation passes
-                }
-                None => {
-                    return Err(Error::generic(format!(
-                        "Clustering column '{}' not found in schema: field '{}' does not exist",
-                        col, field_name
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

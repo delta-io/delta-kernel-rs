@@ -32,25 +32,21 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::actions::{
-    Metadata, Protocol, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
-};
+use crate::actions::{Metadata, Protocol};
 use crate::committer::Committer;
-use crate::schema::SchemaRef;
+use crate::error::CreateTableError;
+use crate::schema::{validate_schema_for_create, SchemaRef};
 use crate::table_features::{
     assign_column_mapping_metadata, extract_table_configuration,
     get_column_mapping_mode_from_properties, validate_schema_column_mapping, ColumnMappingMode,
     ExtractedTableConfiguration, TableFeature, COLUMN_MAPPING_MAX_COLUMN_ID_KEY,
+    TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
 };
+use crate::table_properties::{MIN_READER_VERSION_PROP, MIN_WRITER_VERSION_PROP};
 use crate::transaction::data_layout::{process_data_layout, DataLayout};
 use crate::transaction::Transaction;
 use crate::utils::{current_time_ms, try_parse_uri};
-use crate::{DeltaResult, Engine, Error};
-
-/// Table property key for specifying the minimum reader protocol version.
-const MIN_READER_VERSION_PROP: &str = "delta.minReaderVersion";
-/// Table property key for specifying the minimum writer protocol version.
-const MIN_WRITER_VERSION_PROP: &str = "delta.minWriterVersion";
+use crate::{DeltaResult, Engine};
 
 /// Creates a builder for creating a new Delta table.
 ///
@@ -97,6 +93,7 @@ pub fn create_table(
 /// If the table build fails, no transaction will be created.
 ///
 /// Created via [`create_table`].
+#[derive(Debug)]
 pub struct CreateTableTransactionBuilder {
     path: String,
     schema: SchemaRef,
@@ -142,7 +139,7 @@ impl CreateTableTransactionBuilder {
     ///
     /// ## Partitioned Table
     /// ```rust,no_run
-    /// # use delta_kernel::table_manager::TableManager;
+    /// # use delta_kernel::transaction::create_table;
     /// # use delta_kernel::transaction::DataLayout;
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
@@ -150,13 +147,13 @@ impl CreateTableTransactionBuilder {
     /// #     StructField::new("id", DataType::INTEGER, false),
     /// #     StructField::new("date", DataType::STRING, false),
     /// # ]).unwrap());
-    /// let builder = TableManager::create_table("/path/to/table", schema, "MyApp/1.0")
+    /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
     ///     .with_data_layout(DataLayout::partitioned(["date"]).unwrap());
     /// ```
     ///
     /// ## Clustered Table
     /// ```rust,ignore
-    /// # use delta_kernel::table_manager::TableManager;
+    /// # use delta_kernel::transaction::create_table;
     /// # use delta_kernel::transaction::DataLayout;
     /// # use delta_kernel::schema::{StructType, DataType, StructField};
     /// # use std::sync::Arc;
@@ -164,9 +161,13 @@ impl CreateTableTransactionBuilder {
     /// #     StructField::new("id", DataType::INTEGER, false),
     /// #     StructField::new("category", DataType::STRING, false),
     /// # ]).unwrap());
-    /// let builder = TableManager::create_table("/path/to/table", schema, "MyApp/1.0")
-    ///     .with_data_layout(DataLayout::clustered(["category"])?);
+    /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
+    ///     .with_data_layout(DataLayout::clustered(["category"]).unwrap());
     /// ```
+    ///
+    ///
+    /// Note: Validation of partition/clustering columns against the schema happens during
+    /// [`build()`](Self::build). Invalid configurations will cause `build()` to return an error.
     pub fn with_data_layout(mut self, layout: DataLayout) -> Self {
         self.data_layout = layout;
         self
@@ -235,38 +236,38 @@ impl CreateTableTransactionBuilder {
         // Helper to validate a protocol version property
         let validate_version = |key: &str, value: &str, expected: i32| -> DeltaResult<()> {
             let version: i32 = value.parse().map_err(|_| {
-                Error::generic(format!("Invalid {}: '{}'. Must be an integer.", key, value))
+                CreateTableError::invalid_protocol_property(
+                    key,
+                    format!("'{}' is not an integer", value),
+                )
             })?;
             if version != expected {
-                return Err(Error::generic(format!(
-                    "Invalid {}: {}. Only '{}' is supported.",
-                    key, version, expected
-                )));
+                return Err(CreateTableError::invalid_protocol_property(
+                    key,
+                    format!(
+                        "{} is not supported, only '{}' is allowed",
+                        version, expected
+                    ),
+                )
+                .into());
             }
             Ok(())
         };
 
-        // Validate reader version if provided
-        if let Some(reader_version) = properties.get(MIN_READER_VERSION_PROP) {
-            validate_version(
-                MIN_READER_VERSION_PROP,
-                reader_version,
-                TABLE_FEATURES_MIN_READER_VERSION,
-            )?;
-        }
+        // Validate and strip protocol version properties (minReaderVersion, minWriterVersion).
+        // These properties control protocol versions but are not stored in table metadata.
+        let protocol_props = [
+            (MIN_READER_VERSION_PROP, TABLE_FEATURES_MIN_READER_VERSION),
+            (MIN_WRITER_VERSION_PROP, TABLE_FEATURES_MIN_WRITER_VERSION),
+        ];
 
-        // Validate writer version if provided
-        if let Some(writer_version) = properties.get(MIN_WRITER_VERSION_PROP) {
-            validate_version(
-                MIN_WRITER_VERSION_PROP,
-                writer_version,
-                TABLE_FEATURES_MIN_WRITER_VERSION,
-            )?;
+        for (key, expected) in protocol_props {
+            if let Some(value) = properties.get(key) {
+                validate_version(key, value, expected)?;
+            }
+            // Remove the property from the map as this is a signal flag
+            properties.remove(key);
         }
-
-        // Strip protocol properties from the map (they're not stored in metadata)
-        properties.remove(MIN_READER_VERSION_PROP);
-        properties.remove(MIN_WRITER_VERSION_PROP);
 
         Ok(properties)
     }
@@ -353,10 +354,7 @@ impl CreateTableTransactionBuilder {
         match storage.list_from(&delta_log_url) {
             Ok(mut files) => {
                 if files.next().is_some() {
-                    return Err(Error::generic(format!(
-                        "Table already exists at path: {}",
-                        path
-                    )));
+                    return Err(CreateTableError::table_already_exists(path).into());
                 }
             }
             Err(_) => {
@@ -416,11 +414,17 @@ impl CreateTableTransactionBuilder {
 
         // Validate schema is non-empty
         if self.schema.fields().len() == 0 {
-            return Err(Error::generic("Schema cannot be empty"));
+            return Err(CreateTableError::EmptySchema.into());
         }
 
         // Validate and strip protocol version properties (before engine access for fail-fast)
         let table_properties = Self::validate_and_strip_protocol_properties(self.table_properties)?;
+
+        // Determine column mapping mode early for schema validation
+        let column_mapping_mode = get_column_mapping_mode_from_properties(&table_properties)?;
+
+        // Validate schema: duplicate columns, valid column names
+        validate_schema_for_create(&self.schema, column_mapping_mode)?;
 
         // Ensure no table exists at the path
         Self::ensure_table_does_not_exist(&table_url, &self.path, engine)?;
@@ -476,7 +480,7 @@ impl CreateTableTransactionBuilder {
             extracted.cleaned_properties,
         )?;
 
-        // Create Transaction with cached Protocol and Metadata
+        // Create Transaction with Protocol and Metadata
         Transaction::try_new_create_table(
             table_url,
             protocol,
@@ -611,7 +615,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("delta.minReaderVersion"));
-        assert!(err.contains("Only '3' is supported"));
+        assert!(err.contains("is not supported"));
     }
 
     #[test]
@@ -629,7 +633,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("delta.minWriterVersion"));
-        assert!(err.contains("Only '7' is supported"));
+        assert!(err.contains("is not supported"));
     }
 
     #[test]
@@ -646,7 +650,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Must be an integer"));
+        assert!(err.contains("not an integer"));
     }
 
     #[test]
@@ -663,7 +667,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Must be an integer"));
+        assert!(err.contains("not an integer"));
     }
 
     #[test]
@@ -733,14 +737,14 @@ mod tests {
             StructField::new("e", DataType::STRING, false),
         ]));
 
-        // Try to cluster on 5 columns (max is 4)
+        // Try to cluster on 5 columns (max is 4) - validation happens in build()
         let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
             .with_data_layout(DataLayout::clustered(["a", "b", "c", "d", "e"]).unwrap())
             .build(&engine, Box::new(FileSystemCommitter::new()));
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Cannot specify more than 4 clustering columns"));
+        assert!(err.contains("more than 4 clustering columns"));
     }
 
     #[test]
@@ -748,17 +752,16 @@ mod tests {
         let engine = SyncEngine::new();
         let temp_dir = tempfile::tempdir().unwrap();
         let table_path = temp_dir.path().to_str().unwrap();
-
         let schema = test_schema_with_columns();
 
-        // Try to cluster on a non-existent column
+        // Try to cluster on a non-existent column - validation happens in build()
         let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
             .with_data_layout(DataLayout::clustered(["nonexistent"]).unwrap())
             .build(&engine, Box::new(FileSystemCommitter::new()));
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not found in schema"));
+        assert!(err.contains("does not exist"));
     }
 
     #[test]
@@ -790,10 +793,9 @@ mod tests {
         let engine = SyncEngine::new();
         let temp_dir = tempfile::tempdir().unwrap();
         let table_path = temp_dir.path().to_str().unwrap();
-
         let schema = test_schema_with_columns();
 
-        // Try to access nested field on a non-struct column
+        // Try to access nested field on a non-struct column - validation happens in build()
         let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
             .with_data_layout(DataLayout::clustered(["name.nested"]).unwrap())
             .build(&engine, Box::new(FileSystemCommitter::new()));
@@ -801,5 +803,192 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("is not a struct"));
+    }
+
+    // ==================== Schema Validation Tests ====================
+
+    #[test]
+    fn test_rejects_duplicate_column_names_case_insensitive() {
+        // Create schema with case-insensitive duplicates
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("Name", DataType::STRING, false),
+            StructField::new("name", DataType::STRING, true),
+        ]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn test_rejects_duplicate_nested_column_names() {
+        // Create schema with duplicate nested paths
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new(
+                "outer",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                    "Inner",
+                    DataType::STRING,
+                    true,
+                )]))),
+                true,
+            ),
+            StructField::new(
+                "Outer",
+                DataType::Struct(Box::new(StructType::new_unchecked(vec![StructField::new(
+                    "inner",
+                    DataType::STRING,
+                    true,
+                )]))),
+                true,
+            ),
+        ]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn test_rejects_invalid_column_name_without_column_mapping() {
+        // Create schema with column name containing space (invalid for Parquet)
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "my column",
+            DataType::STRING,
+            false,
+        )]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid character"));
+    }
+
+    #[test]
+    fn test_accepts_special_column_name_with_column_mapping() {
+        // Create schema with column name containing space (valid with column mapping)
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "my column",
+            DataType::STRING,
+            false,
+        )]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        // Should succeed - spaces are allowed with column mapping
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_rejects_newline_in_column_name_even_with_column_mapping() {
+        // Create schema with column name containing newline (always invalid)
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "my\ncolumn",
+            DataType::STRING,
+            false,
+        )]));
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let mut props = HashMap::new();
+        props.insert("delta.columnMapping.mode".to_string(), "name".to_string());
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_table_properties(props)
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("newline") || err.contains("\\n"));
+    }
+
+    #[test]
+    fn test_rejects_partition_column_not_found() {
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+        let schema = test_schema_with_columns();
+
+        // Validation happens in build()
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::partitioned(["nonexistent"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn test_rejects_partition_column_complex_type() {
+        use crate::schema::ArrayType;
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(StructType::new_unchecked(vec![
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new(
+                "tags",
+                DataType::Array(Box::new(ArrayType::new(DataType::STRING, true))),
+                true,
+            ),
+        ]));
+
+        // Validation happens in build()
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::partitioned(["tags"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unsupported type"));
+    }
+
+    #[test]
+    fn test_accepts_valid_partition_column() {
+        let schema = test_schema_with_columns();
+
+        let engine = SyncEngine::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let result = CreateTableTransactionBuilder::new(table_path, schema, "TestApp/1.0")
+            .with_data_layout(DataLayout::partitioned(["name"]).unwrap())
+            .build(&engine, Box::new(FileSystemCommitter::new()));
+
+        assert!(result.is_ok());
     }
 }
