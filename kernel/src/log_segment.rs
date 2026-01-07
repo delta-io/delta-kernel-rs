@@ -18,8 +18,8 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
-    PredicateRef, RowVisitor, StorageHandler, Version,
+    DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
+    StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
 
@@ -585,12 +585,7 @@ impl LogSegment {
 
         // Read sidecars using cached sidecar files from earlier
         let sidecar_batches = if !sidecar_files.is_empty() {
-            Self::read_sidecars(
-                parquet_handler,
-                &sidecar_files,
-                action_schema,
-                meta_predicate,
-            )?
+            parquet_handler.read_parquet_files(&sidecar_files, action_schema, meta_predicate)?
         } else {
             Box::new(std::iter::empty())
         };
@@ -639,16 +634,6 @@ impl LogSegment {
             .iter()
             .map(|sidecar| sidecar.to_filemeta(&self.log_root))
             .try_collect()
-    }
-
-    /// Reads sidecar files with the given schema.
-    pub(crate) fn read_sidecars(
-        parquet_handler: Arc<dyn ParquetHandler>,
-        sidecar_files: &[FileMeta],
-        checkpoint_read_schema: SchemaRef,
-        meta_predicate: Option<PredicateRef>,
-    ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
-        parquet_handler.read_parquet_files(sidecar_files, checkpoint_read_schema, meta_predicate)
     }
 
     // Do a lightweight protocol+metadata log replay to find the latest Protocol and Metadata in

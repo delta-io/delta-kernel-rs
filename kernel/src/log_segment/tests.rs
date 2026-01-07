@@ -65,8 +65,7 @@ fn process_sidecars(
         .try_collect()?;
 
     // Read the sidecar files and return an iterator of sidecar file batches
-    Ok(Some(LogSegment::read_sidecars(
-        parquet_handler,
+    Ok(Some(parquet_handler.read_parquet_files(
         &sidecar_files,
         checkpoint_read_schema,
         meta_predicate,
