@@ -226,7 +226,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 struct MinMaxStatsTransform;
 
 impl<'a> SchemaTransform<'a> for MinMaxStatsTransform {
-    // array and map fields are not eligible for data skipping, so filter them out.
+    // array and map and variant fields are not eligible for data skipping, so filter them out.
     fn transform_array(&mut self, _: &'a ArrayType) -> Option<Cow<'a, ArrayType>> {
         None
     }
