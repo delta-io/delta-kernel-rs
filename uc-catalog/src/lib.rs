@@ -145,7 +145,7 @@ mod tests {
     async fn get_table(
         client: &UCClient,
         table_name: &str,
-    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         let res = client.get_table(table_name).await?;
         let table_id = res.table_id;
         let table_uri = res.storage_location;
@@ -162,7 +162,7 @@ mod tests {
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t read_uc_table --nocapture -- --ignored`
     #[ignore]
     #[tokio::test]
-    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
@@ -217,7 +217,7 @@ mod tests {
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
     #[ignore]
     #[tokio::test(flavor = "multi_thread")]
-    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
