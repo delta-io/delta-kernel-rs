@@ -535,6 +535,7 @@ impl Scan {
             listed_log_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
+            None, // No checkpoint in this incremental segment
         )?;
 
         let it = new_log_segment
