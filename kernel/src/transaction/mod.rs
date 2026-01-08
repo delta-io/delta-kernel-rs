@@ -809,14 +809,12 @@ impl Transaction {
                 field: &'a StructField,
             ) -> Option<Cow<'a, StructField>> {
                 use Cow::*;
-                let field = match self.transform(&field.data_type)? {
+                let field = match self.transform(field.data_type())? {
                     Borrowed(_) if field.is_nullable() => Borrowed(field),
-                    data_type => Owned(StructField {
-                        name: field.name.clone(),
-                        data_type: data_type.into_owned(),
-                        nullable: true,
-                        metadata: field.metadata.clone(),
-                    }),
+                    data_type => Owned(
+                        StructField::new(field.name().clone(), data_type.into_owned(), true)
+                            .with_metadata(field.metadata().clone()),
+                    ),
                 };
                 Some(field)
             }

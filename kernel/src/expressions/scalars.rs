@@ -134,7 +134,7 @@ impl MapData {
                         v.data_type()
                     )))
                 // vals can only be null if value_contains_null is true
-                } else if v.is_null() && !data_type.value_contains_null {
+                } else if v.is_null() && !data_type.value_contains_null() {
                     Err(Error::schema(
                         "Null map value disallowed if map value_contains_null is false",
                     ))
@@ -399,7 +399,7 @@ impl Display for Scalar {
                 write!(f, "{{")?;
                 let mut delim = "";
                 for (value, field) in data.values.iter().zip(data.fields.iter()) {
-                    write!(f, "{delim}{}: {value}", field.name)?;
+                    write!(f, "{delim}{}: {value}", field.name())?;
                     delim = ", ";
                 }
                 write!(f, "}}")

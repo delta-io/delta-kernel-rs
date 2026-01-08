@@ -294,14 +294,18 @@ mod tests {
             let write_schema = unsafe { get_write_schema(write_context.shallow_copy()) };
             let write_schema_ref = unsafe { write_schema.as_ref() };
             assert_eq!(write_schema_ref.num_fields(), 2);
-            assert_eq!(write_schema_ref.field_at_index(0).unwrap().name, "number");
+            assert_eq!(write_schema_ref.field_at_index(0).unwrap().name(), "number");
             assert_eq!(
-                write_schema_ref.field_at_index(0).unwrap().data_type,
-                DataType::INTEGER
+                write_schema_ref.field_at_index(0).unwrap().data_type(),
+                &DataType::INTEGER
             );
-            assert_eq!(write_schema_ref.field_at_index(1).unwrap().name, "string");
+            assert_eq!(write_schema_ref.field_at_index(1).unwrap().name(), "string");
             assert_eq!(
-                write_schema_ref.field_at_index(1).unwrap().data_type,
+                write_schema_ref
+                    .field_at_index(1)
+                    .unwrap()
+                    .data_type()
+                    .clone(),
                 DataType::STRING
             );
 

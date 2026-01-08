@@ -81,7 +81,7 @@ impl<'a> ValidateColumnMappings<'a> {
         // The iterator yields `&&str` but `ColumnName::new` needs `&str`
         let column_name = || ColumnName::new(self.path.iter().copied());
         let annotation = "delta.columnMapping.physicalName";
-        match (self.mode, field.metadata.get(annotation)) {
+        match (self.mode, field.metadata().get(annotation)) {
             // Both Id and Name modes require a physical name annotation; None mode forbids it.
             (ColumnMappingMode::None, None) => {}
             (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::String(_))) => {}
@@ -106,7 +106,7 @@ impl<'a> ValidateColumnMappings<'a> {
         }
 
         let annotation = "delta.columnMapping.id";
-        match (self.mode, field.metadata.get(annotation)) {
+        match (self.mode, field.metadata().get(annotation)) {
             // Both Id and Name modes require a field ID annotation; None mode forbids it.
             (ColumnMappingMode::None, None) => {}
             (ColumnMappingMode::Name | ColumnMappingMode::Id, Some(MetadataValue::Number(_))) => {}
@@ -145,7 +145,7 @@ impl<'a> SchemaTransform<'a> for ValidateColumnMappings<'a> {
     }
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         if self.err.is_none() {
-            self.path.push(&field.name);
+            self.path.push(field.name());
             self.check_annotations(field);
             let _ = self.recurse_into_struct_field(field);
             self.path.pop();
