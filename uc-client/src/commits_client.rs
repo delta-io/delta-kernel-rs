@@ -19,13 +19,13 @@ pub trait UCCommitsClient: Send + Sync {
 
 /// REST implementation of [UCCommitsClient].
 #[derive(Debug, Clone)]
-pub struct UCRestCommitsClient {
+pub struct UCCommitsRestClient {
     http_client: reqwest::Client,
     config: ClientConfig,
     base_url: Url,
 }
 
-impl UCRestCommitsClient {
+impl UCCommitsRestClient {
     /// Create from config.
     pub fn new(config: ClientConfig) -> Result<Self> {
         Ok(Self {
@@ -45,7 +45,7 @@ impl UCRestCommitsClient {
     }
 }
 
-impl UCCommitsClient for UCRestCommitsClient {
+impl UCCommitsClient for UCCommitsRestClient {
     #[instrument(skip(self))]
     async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
         let url = self.base_url.join("delta/preview/commits")?;
