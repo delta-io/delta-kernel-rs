@@ -166,18 +166,6 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
     ) -> DefaultEngineBuilder<executor::tokio::TokioBackgroundExecutor> {
         DefaultEngineBuilder::new(object_store)
     }
-
-    /// Set a metrics reporter for the engine to collect events and metrics during operations.
-    ///
-    /// # Parameters
-    ///
-    /// - `reporter`: An implementation of the [`MetricsReporter`] trait which will be used to
-    /// report metrics.
-    #[allow(dead_code)]
-    #[internal_api]
-    pub(crate) fn set_metrics_reporter(&mut self, reporter: Arc<dyn MetricsReporter>) {
-        self.metrics_reporter = Some(reporter);
-    }
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
