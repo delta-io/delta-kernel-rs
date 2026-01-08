@@ -20,7 +20,7 @@ pub trait UCCommitsClient: Send + Sync {
 /// REST implementation of [UCCommitsClient].
 #[derive(Debug, Clone)]
 pub struct UCRestCommitsClient {
-    client: reqwest::Client,
+    http_client: reqwest::Client,
     config: ClientConfig,
     base_url: Url,
 }
@@ -29,17 +29,17 @@ impl UCRestCommitsClient {
     /// Create from config.
     pub fn new(config: ClientConfig) -> Result<Self> {
         Ok(Self {
-            client: build_http_client(&config)?,
+            http_client: build_http_client(&config)?,
             base_url: config.workspace_url.clone(),
             config,
         })
     }
 
     /// Create from existing reqwest Client.
-    pub fn with_client(client: reqwest::Client, config: ClientConfig) -> Self {
+    pub fn with_client(http_client: reqwest::Client, config: ClientConfig) -> Self {
         Self {
             base_url: config.workspace_url.clone(),
-            client,
+            http_client,
             config,
         }
     }
@@ -50,7 +50,7 @@ impl UCCommitsClient for UCRestCommitsClient {
     async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
         let url = self.base_url.join("delta/preview/commits")?;
         let response = execute_with_retry(&self.config, || {
-            self.client
+            self.http_client
                 .request(reqwest::Method::GET, url.clone())
                 .json(&request)
                 .send()
@@ -64,7 +64,7 @@ impl UCCommitsClient for UCRestCommitsClient {
     async fn commit(&self, request: CommitRequest) -> Result<()> {
         let url = self.base_url.join("delta/preview/commits")?;
         let response = execute_with_retry(&self.config, || {
-            self.client
+            self.http_client
                 .request(reqwest::Method::POST, url.clone())
                 .json(&request)
                 .send()
