@@ -27,7 +27,6 @@ use crate::transaction::WriteContext;
 use crate::{
     DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
 };
-use delta_kernel_derive::internal_api;
 
 pub mod executor;
 pub mod file_stream;
