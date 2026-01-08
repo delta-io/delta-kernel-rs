@@ -2513,7 +2513,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     use crate::schema::{StructField, StructType};
 
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Create a V1 checkpoint (without sidecar column)
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
