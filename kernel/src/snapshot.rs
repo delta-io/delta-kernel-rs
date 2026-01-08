@@ -12,7 +12,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
-use crate::listed_log_files::ListedLogFiles;
+use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
@@ -142,8 +142,8 @@ impl Snapshot {
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
         // listing above will only return the checkpoint and not the commit.
-        if new_listed_files.ascending_commit_files.is_empty()
-            && new_listed_files.checkpoint_parts.is_empty()
+        if new_listed_files.ascending_commit_files().is_empty()
+            && new_listed_files.checkpoint_parts().is_empty()
         {
             match new_version {
                 Some(new_version) if new_version != old_version => {
@@ -162,9 +162,11 @@ impl Snapshot {
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
-        let new_latest_commit_file = new_listed_files.latest_commit_file.clone();
+        let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
+        // Note: new_log_segment won't have checkpoint_schema since we're listing without a hint.
+        // If it has a checkpoint, we use it as-is. Otherwise, we preserve the old checkpoint_schema.
         let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
+            LogSegment::try_new(new_listed_files, log_root.clone(), new_version, None)?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < old_version {
@@ -237,15 +239,18 @@ impl Snapshot {
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFiles {
+            ListedLogFilesBuilder {
                 ascending_commit_files,
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-            },
+            }
+            .build()?,
             log_root,
             new_version,
+            // Preserve checkpoint schema from old segment
+            old_log_segment.checkpoint_schema.clone(),
         )?;
         Ok(Arc::new(Snapshot::new(
             combined_log_segment,
@@ -555,7 +560,7 @@ mod tests {
     use crate::engine::default::DefaultEngine;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::listed_log_files::ListedLogFiles;
+    use crate::listed_log_files::ListedLogFilesBuilder;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
@@ -1491,15 +1496,14 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFiles {
-            ascending_commit_files: vec![],
-            ascending_compaction_files: vec![],
+        let listed_files = ListedLogFilesBuilder {
             checkpoint_parts,
-            latest_crc_file: None,
-            latest_commit_file: None, // No commit file
-        };
+            ..Default::default()
+        }
+        .build()?;
 
-        let log_segment = LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0))?;
+        let log_segment =
+            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment

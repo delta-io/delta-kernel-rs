@@ -536,7 +536,7 @@ impl OpaqueLessThanOp {
             panic!("Invalid arg count: {}", args.len());
         };
 
-        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::BOOLEAN));
+        let eval = |arg| evaluate_expression(arg, batch, Some(&KernelDataType::INTEGER));
         Ok(op_fn(&eval(left)?, &eval(right)?)?)
     }
 }

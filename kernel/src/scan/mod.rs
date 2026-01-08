@@ -18,11 +18,10 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
-use crate::listed_log_files::ListedLogFiles;
+use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
 use crate::scan::log_replay::BASE_ROW_ID_NAME;
-use crate::scan::state::{DvInfo, Stats};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
@@ -526,17 +525,17 @@ impl Scan {
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > existing_version);
-        let listed_log_files = ListedLogFiles {
+        let listed_log_files = ListedLogFilesBuilder {
             ascending_commit_files,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None,
             latest_commit_file: log_segment.latest_commit_file.clone(),
-        };
+            ..Default::default()
+        }
+        .build()?;
         let new_log_segment = LogSegment::try_new(
             listed_log_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
+            None, // No checkpoint in this incremental segment
         )?;
 
         let it = new_log_segment
@@ -590,27 +589,8 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        struct ScanFile {
-            path: String,
-            size: i64,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-        }
-        fn scan_metadata_callback(
-            batches: &mut Vec<ScanFile>,
-            path: &str,
-            size: i64,
-            _: Option<Stats>,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-            _: HashMap<String, String>,
-        ) {
-            batches.push(ScanFile {
-                path: path.to_string(),
-                size,
-                dv_info,
-                transform,
-            });
+        fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
+            batches.push(file);
         }
 
         debug!(

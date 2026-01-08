@@ -1,11 +1,14 @@
+#include <ctype.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "arrow.h"
 #include "read_table.h"
 #include "schema.h"
+#include "kernel_schema_visitor.h"
 #include "kernel_utils.h"
 
 // Print the content of a selection vector if `VERBOSE` is defined in read_table.h
@@ -28,7 +31,13 @@ void print_partition_info(struct EngineContext* context, const CStringMap* parti
   for (uintptr_t i = 0; i < context->partition_cols->len; i++) {
     char* col = context->partition_cols->cols[i];
     KernelStringSlice key = { col, strlen(col) };
-    char* partition_val = get_from_string_map(partition_values, key, allocate_string);
+    ExternResultNullableCvoid res = get_from_string_map(partition_values, key, allocate_string, context->engine);
+    if (res.tag != OkNullableCvoid) {
+      print_error("Failed to get from string map.", (Error*)res.err);
+      free_error((Error*)res.err);
+      continue;
+    }
+    char* partition_val = res.ok;
     if (partition_val) {
       print_diag("  partition '%s' here: %s\n", col, partition_val);
       free(partition_val);
@@ -48,12 +57,13 @@ void scan_row_callback(
   void* engine_context,
   KernelStringSlice path,
   int64_t size,
+  int64_t mod_time,
   const Stats* stats,
   const CDvInfo* cdv_info,
   const Expression* transform,
   const CStringMap* partition_values)
 {
-  (void)size; // not using this at the moment
+  (void)mod_time; // not using this at the moment
 #ifndef PRINT_ARROW_DATA
   (void)transform; // only used when PRINT_ARROW_DATA is defined
 #endif
@@ -113,7 +123,11 @@ void do_visit_scan_metadata(void* engine_context, HandleSharedScanMetadata scan_
 
   // Ask kernel to iterate each individual file and call us back with extracted metadata
   print_diag("Asking kernel to call us back for each scan row (file to read)\n");
-  visit_scan_metadata(scan_metadata, engine_context, scan_row_callback);
+  ExternResultbool visit_res = visit_scan_metadata(scan_metadata, context->engine, engine_context, scan_row_callback);
+  if (visit_res.tag != Okbool) {
+    print_error("Failed to visit scan metadata.", (Error*)visit_res.err);
+    free_error((Error*)visit_res.err);
+  }
   free_bool_slice(selection_vector);
   free_scan_metadata(scan_metadata);
 }
@@ -219,10 +233,38 @@ void log_line_callback(KernelStringSlice line) {
 
 int main(int argc, char* argv[])
 {
-  if (argc < 2) {
-    printf("Usage: %s table/path\n", argv[0]);
+  char* requested_cols = NULL;
+  int c;
+  while ((c = getopt (argc, argv, "c:")) != -1) {
+    switch (c) {
+    case 'c':
+      requested_cols = optarg;
+      break;
+    case '?':
+      if (optopt == 'c') {
+        fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+      }
+      else if (isprint(optopt)) {
+        fprintf (stderr, "Unknown option `-%c'.\n", optopt);
+      }
+      else {
+        fprintf (stderr,
+                 "Unknown option character `\\x%x'.\n",
+                 optopt);
+      }
+      return 1;
+    default:
+      abort ();
+    }
+  }
+
+  if (optind != (argc - 1)) {
+    printf("Usage: %s [-c top_level_column1,top_level_column2] table/path\n", argv[0]);
     return -1;
   }
+
+  char* table_path = argv[optind];
+  printf("Reading table at %s\n", table_path);
 
 #ifdef VERBOSE
   enable_event_tracing(tracing_callback, TRACE);
@@ -231,9 +273,6 @@ int main(int argc, char* argv[])
 #else
   enable_event_tracing(tracing_callback, INFO);
 #endif
-
-  char* table_path = argv[1];
-  printf("Reading table at %s\n", table_path);
 
   KernelStringSlice table_path_slice = { table_path, strlen(table_path) };
 
@@ -247,7 +286,9 @@ int main(int argc, char* argv[])
 
   // an example of using a builder to set options when building an engine
   EngineBuilder* engine_builder = engine_builder_res.ok;
-  set_builder_opt(engine_builder, "aws_region", "us-west-2");
+  if (!set_builder_opt(engine_builder, "aws_region", "us-west-2")) {
+    return -1;
+  }
   // potentially set credentials here
   // set_builder_opt(engine_builder, "aws_access_key_id" , "[redacted]");
   // set_builder_opt(engine_builder, "aws_secret_access_key", "[redacted]");
@@ -276,7 +317,9 @@ int main(int argc, char* argv[])
 
   uint64_t v = version(snapshot);
   printf("version: %" PRIu64 "\n\n", v);
-  print_schema(snapshot);
+
+  CSchema *cschema = get_cschema(snapshot, engine);
+  print_cschema(cschema);
 
   char* table_root = snapshot_table_root(snapshot, allocate_string);
   print_diag("Table root: %s\n", table_root);
@@ -285,9 +328,37 @@ int main(int argc, char* argv[])
 
   print_diag("Starting table scan\n\n");
 
-  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, NULL);
+  EngineSchema* engine_schema = NULL;
+  RequestedSchemaSpec *spec = NULL;
+  if (requested_cols != NULL) {
+    print_diag("Selecting columns: [%s]\n", requested_cols);
+    engine_schema = malloc(sizeof(EngineSchema));
+    spec = malloc(sizeof(RequestedSchemaSpec));
+    spec->cschema = cschema;
+    spec->requested_cols = requested_cols;
+    engine_schema->schema = spec;
+    engine_schema->visitor = visit_requested_spec;
+  }
+
+  ExternResultHandleSharedScan scan_res = scan(snapshot, engine, NULL, engine_schema);
+
+  if (engine_schema != NULL) {
+    free(engine_schema);
+  }
+
+  if (spec != NULL) {
+    free(spec);
+  }
+
+  free_cschema(cschema);
+
   if (scan_res.tag != OkHandleSharedScan) {
-    printf("Failed to create scan\n");
+    print_error("Failed to create scan", (Error*)scan_res.err);
+    free_error((Error*)scan_res.err);
+    free_snapshot(snapshot);
+    free_engine(engine);
+    free(table_root);
+    free_partition_list(partition_cols);
     return -1;
   }
 

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use delta_kernel::scan::state::DvInfo;
+use delta_kernel::scan::state::{DvInfo, ScanFile};
 use delta_kernel::scan::{Scan, ScanMetadata};
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::{DeltaResult, Error, Expression, ExpressionRef};
@@ -341,6 +341,7 @@ pub struct CDvInfo<'a> {
 /// * `context`: a `void*` context this can be anything that engine needs to pass through to each call
 /// * `path`: a `KernelStringSlice` which is the path to the file
 /// * `size`: an `i64` which is the size of the file
+/// * `mod_time`: an `i64` which is the time the file was created, as milliseconds since the epoch
 /// * `dv_info`: a [`CDvInfo`] struct, which allows getting the selection vector for this file
 /// * `transform`: An optional expression that, if not `NULL`, _must_ be applied to physical data to
 ///   convert it to the correct logical format. If this is `NULL`, no transform is needed.
@@ -349,6 +350,7 @@ type CScanCallback = extern "C" fn(
     engine_context: NullableCvoid,
     path: KernelStringSlice,
     size: i64,
+    mod_time: i64,
     stats: Option<&Stats>,
     dv_info: &CDvInfo,
     transform: Option<&Expression>,
@@ -378,12 +380,21 @@ pub unsafe extern "C" fn get_from_string_map(
     map: &CStringMap,
     key: KernelStringSlice,
     allocate_fn: AllocateStringFn,
-) -> NullableCvoid {
-    // TODO: Return ExternResult to caller instead of panicking?
-    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) };
-    map.values
-        .get(string_key.unwrap())
-        .and_then(|v| allocate_fn(kernel_string_slice!(v)))
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<NullableCvoid> {
+    let engine = unsafe { engine.as_ref() };
+    get_from_string_map_impl(map, key, allocate_fn).into_extern_result(&engine)
+}
+fn get_from_string_map_impl(
+    map: &CStringMap,
+    key: KernelStringSlice,
+    allocate_fn: AllocateStringFn,
+) -> DeltaResult<NullableCvoid> {
+    let string_key = unsafe { TryFromStringSlice::try_from_slice(&key) }?;
+    Ok(map
+        .values
+        .get(string_key)
+        .and_then(|v| allocate_fn(kernel_string_slice!(v))))
 }
 
 /// Visit all values in a CStringMap. The callback will be called once for each element of the map
@@ -499,30 +510,24 @@ fn row_indexes_from_dv_impl(
 
 // Wrapper function that gets called by the kernel, transforms the arguments to make the ffi-able,
 // and then calls the ffi specified callback
-fn rust_callback(
-    context: &mut ContextWrapper,
-    path: &str,
-    size: i64,
-    kernel_stats: Option<delta_kernel::scan::state::Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    partition_values: HashMap<String, String>,
-) {
-    let transform = transform.map(|e| e.as_ref().clone());
+fn rust_callback(context: &mut ContextWrapper, scan_file: ScanFile) {
+    let transform = scan_file.transform.map(|e| e.as_ref().clone());
     let partition_map = CStringMap {
-        values: partition_values,
+        values: scan_file.partition_values,
     };
-    let stats = kernel_stats.map(|ks| Stats {
+    let stats = scan_file.stats.map(|ks| Stats {
         num_records: ks.num_records,
     });
     let cdv_info = CDvInfo {
-        info: &dv_info,
-        has_vector: dv_info.has_vector(),
+        info: &scan_file.dv_info,
+        has_vector: scan_file.dv_info.has_vector(),
     };
+    let path = scan_file.path.as_str();
     (context.callback)(
         context.engine_context,
         kernel_string_slice!(path),
-        size,
+        scan_file.size,
+        scan_file.modification_time,
         stats.as_ref(),
         &cdv_info,
         transform.as_ref(),
@@ -544,19 +549,25 @@ struct ContextWrapper {
 #[no_mangle]
 pub unsafe extern "C" fn visit_scan_metadata(
     scan_metadata: Handle<SharedScanMetadata>,
+    engine: Handle<SharedExternEngine>,
     engine_context: NullableCvoid,
     callback: CScanCallback,
-) {
+) -> ExternResult<bool> {
     let scan_metadata = unsafe { scan_metadata.as_ref() };
+    let engine = unsafe { engine.as_ref() };
+    visit_scan_metadata_impl(scan_metadata, engine_context, callback).into_extern_result(&engine)
+}
+fn visit_scan_metadata_impl(
+    scan_metadata: &ScanMetadata,
+    engine_context: NullableCvoid,
+    callback: CScanCallback,
+) -> DeltaResult<bool> {
     let context_wrapper = ContextWrapper {
         engine_context,
         callback,
     };
-
-    // TODO: return ExternResult to caller instead of panicking?
-    scan_metadata
-        .visit_scan_files(context_wrapper, rust_callback)
-        .unwrap();
+    scan_metadata.visit_scan_files(context_wrapper, rust_callback)?;
+    Ok(true)
 }
 
 #[cfg(test)]
