@@ -3,7 +3,7 @@ use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use uc_client::{
     models::{commits::Commit, credentials::Operation, CommitsRequest},
-    UCClient, UCCommitsClient, UCRestCommitsClient,
+    UCClient, UCCommitsClient, UCCommitsRestClient,
 };
 
 #[derive(Parser)]
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create shared HTTP client and UC clients
     let http_client = uc_client::http::build_http_client(&config)?;
     let uc_client = UCClient::with_client(http_client.clone(), config.clone());
-    let commits_client = UCRestCommitsClient::with_client(http_client, config);
+    let commits_client = UCCommitsRestClient::with_client(http_client, config);
 
     // Execute command
     match cli.command {

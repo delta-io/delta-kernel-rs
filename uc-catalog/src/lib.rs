@@ -172,7 +172,7 @@ mod tests {
 
         // build clients
         let client = UCClient::new(config.clone())?;
-        let commits_client = UCRestCommitsClient::new(config)?;
+        let commits_client = UCCommitsRestClient::new(config)?;
 
         let (table_id, table_uri) = get_table(&client, &table_name).await?;
         let creds = client
@@ -227,7 +227,7 @@ mod tests {
 
         // build clients
         let client = UCClient::new(config.clone())?;
-        let commits_client = Arc::new(UCRestCommitsClient::new(config)?);
+        let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
 
         let (table_id, table_uri) = get_table(&client, &table_name).await?;
         let creds = client
