@@ -2,6 +2,10 @@
 //!
 //! Exposes that an engine needs to call from C/C++ to interface with kernel
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// we re-allow panics in tests
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 #[cfg(feature = "default-engine-base")]
 use std::collections::HashMap;
 use std::default::Default;
@@ -274,8 +278,10 @@ mod private {
             let len = val.len();
             let boxed = val.into_boxed_slice();
             let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            #[allow(clippy::expect_used)]
             let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be non-null please report this bug.");
+                .expect("This should never be null please report this bug.");
             KernelBoolSlice { ptr, len }
         }
     }
@@ -328,8 +334,10 @@ mod private {
             let len = vec.len();
             let boxed = vec.into_boxed_slice();
             let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            #[allow(clippy::expect_used)]
             let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be non-null please report this bug.");
+                .expect("This should never be null please report this bug.");
             KernelRowIndexArray { ptr, len }
         }
     }
@@ -489,11 +497,19 @@ pub unsafe extern "C" fn set_builder_option(
     builder: &mut EngineBuilder,
     key: KernelStringSlice,
     value: KernelStringSlice,
-) {
-    let key = unsafe { String::try_from_slice(&key) };
-    let value = unsafe { String::try_from_slice(&value) };
-    // TODO: Return ExternalError if key or value is invalid? (builder has an error allocator)
-    builder.set_option(key.unwrap(), value.unwrap());
+) -> ExternResult<bool> {
+    set_builder_option_impl(builder, key, value).into_extern_result(&builder.allocate_fn)
+}
+#[cfg(feature = "default-engine-base")]
+fn set_builder_option_impl(
+    builder: &mut EngineBuilder,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+) -> DeltaResult<bool> {
+    let key = unsafe { String::try_from_slice(&key) }?;
+    let value = unsafe { String::try_from_slice(&value) }?;
+    builder.set_option(key, value);
+    Ok(true)
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no

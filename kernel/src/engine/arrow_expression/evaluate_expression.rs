@@ -25,6 +25,7 @@ use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
 use crate::engine::arrow_utils::prim_array_cmp;
+use crate::engine::ensure_data_types::ensure_data_types;
 use crate::error::{DeltaResult, Error};
 use crate::expressions::{
     BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp, Expression,
@@ -228,8 +229,10 @@ pub fn evaluate_expression(
     use UnaryExpressionOp::*;
     use VariadicExpressionOp::*;
     match (expression, result_type) {
-        (Literal(scalar), _) => Ok(scalar.to_array(batch.num_rows())?),
-        (Column(name), _) => extract_column(batch, name),
+        (Literal(scalar), _) => {
+            validate_array_type(scalar.to_array(batch.num_rows())?, result_type)
+        }
+        (Column(name), _) => validate_array_type(extract_column(batch, name)?, result_type),
         (Struct(fields), Some(DataType::Struct(output_schema))) => {
             evaluate_struct_expression(fields, batch, output_schema)
         }
@@ -270,7 +273,7 @@ pub fn evaluate_expression(
                 Divide => div,
             };
 
-            Ok(eval(&left_arr, &right_arr)?)
+            validate_array_type(eval(&left_arr, &right_arr)?, result_type)
         }
         (
             Variadic(VariadicExpression {
@@ -595,6 +598,13 @@ pub fn coalesce_arrays(
     }
 
     Ok(make_array(mutable.freeze()))
+}
+
+fn validate_array_type(array: ArrayRef, expected: Option<&DataType>) -> DeltaResult<ArrayRef> {
+    if let Some(expected) = expected {
+        ensure_data_types(expected, array.data_type(), false)?;
+    }
+    Ok(array)
 }
 
 #[cfg(test)]
@@ -1267,5 +1277,49 @@ mod tests {
             .unwrap();
         validate_i32_column(nested_struct_result, 0, &[1, 2, 3]);
         validate_i32_column(nested_struct_result, 1, &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_literal_type_validation() {
+        let batch = create_test_batch();
+
+        // Valid: literal matches expected type
+        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Error: literal type mismatch
+        let result = evaluate_expression(&Expr::literal(42), &batch, Some(&DataType::STRING));
+        assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[test]
+    fn test_column_type_validation() {
+        let batch = create_test_batch();
+
+        // Valid: column matches expected type
+        let result = evaluate_expression(&column_expr_ref!("a"), &batch, Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Error: column type mismatch
+        let result = evaluate_expression(&column_expr_ref!("a"), &batch, Some(&DataType::STRING));
+        assert_result_error_with_message(result, "Incorrect datatype");
+    }
+
+    #[test]
+    fn test_binary_type_validation() {
+        let batch = create_test_batch();
+        let add_expr = Expr::binary(
+            crate::expressions::BinaryExpressionOp::Plus,
+            Expr::column(["a"]),
+            Expr::column(["b"]),
+        );
+
+        // Valid: binary result matches expected type
+        let result = evaluate_expression(&add_expr, &batch, Some(&DataType::INTEGER));
+        assert!(result.is_ok());
+
+        // Error: binary result type mismatch
+        let result = evaluate_expression(&add_expr, &batch, Some(&DataType::STRING));
+        assert_result_error_with_message(result, "Incorrect datatype");
     }
 }
