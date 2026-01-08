@@ -153,6 +153,7 @@ pub(crate) mod history_manager;
 
 pub use action_reconciliation::ActionReconciliationIterator;
 pub use delta_kernel_derive;
+use delta_kernel_derive::internal_api;
 pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
@@ -460,6 +461,7 @@ pub trait EvaluationHandler: AsAny {
 /// EvaluationHandlers.
 // For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
 #[allow(dead_code)]
+#[internal_api]
 trait EvaluationHandlerExtension: EvaluationHandler {
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
@@ -511,6 +513,7 @@ impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
 /// let engine = todo!(); // create an engine
 /// let engine_data = my_struct.into_engine_data(schema, engine);
 /// ```
+#[internal_api]
 pub(crate) trait IntoEngineData {
     /// Consume this type to produce a single-row EngineData using the provided schema.
     fn into_engine_data(
