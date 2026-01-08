@@ -3,14 +3,14 @@
 use crate::expressions::{
     SharedExpression, SharedOpaqueExpressionOp, SharedOpaquePredicateOp, SharedPredicate,
 };
-use crate::{handle::Handle, kernel_string_slice, KernelStringSlice};
+use crate::{handle::Handle, kernel_string_slice, KernelStringSlice, SharedSchema};
 
 use delta_kernel::expressions::{
     ArrayData, BinaryExpression, BinaryExpressionOp, BinaryPredicate, BinaryPredicateOp,
     ColumnName, Expression, ExpressionRef, JunctionPredicate, JunctionPredicateOp, MapData,
-    OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef, Predicate,
-    Scalar, StructData, Transform, UnaryExpression, UnaryExpressionOp, UnaryPredicate,
-    UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
+    OpaqueExpression, OpaqueExpressionOpRef, OpaquePredicate, OpaquePredicateOpRef,
+    ParseJsonExpression, Predicate, Scalar, StructData, Transform, UnaryExpression,
+    UnaryExpressionOp, UnaryPredicate, UnaryPredicateOp, VariadicExpression, VariadicExpressionOp,
 };
 
 use std::ffi::c_void;
@@ -22,6 +22,12 @@ type VisitVariadicFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
 type VisitJunctionFn =
     extern "C" fn(data: *mut c_void, sibling_list_id: usize, child_list_id: usize);
+type VisitParseJsonFn = extern "C" fn(
+    data: *mut c_void,
+    sibling_list_id: usize,
+    child_list_id: usize,
+    output_schema: Handle<SharedSchema>,
+);
 
 /// The [`EngineExpressionVisitor`] defines a visitor system to allow engines to build their own
 /// representation of a kernel expression or predicate.
@@ -138,6 +144,10 @@ pub struct EngineExpressionVisitor {
     /// Visits the `ToJson` unary operator belonging to the list identified by `sibling_list_id`.
     /// The sub-expression will be in a _one_ item list identified by `child_list_id`
     pub visit_to_json: VisitUnaryFn,
+    /// Visits the `ParseJson` expression belonging to the list identified by `sibling_list_id`.
+    /// The sub-expression (JSON string) will be in a _one_ item list identified by `child_list_id`.
+    /// The `output_schema` handle specifies the schema to parse the JSON into.
+    pub visit_parse_json: VisitParseJsonFn,
     /// Visits the `LessThan` binary operator belonging to the list identified by `sibling_list_id`.
     /// The operands will be in a _two_ item list identified by `child_list_id`
     pub visit_lt: VisitBinaryFn,
@@ -626,6 +636,21 @@ fn visit_expression_impl(
         }
         Expression::Opaque(OpaqueExpression { op, exprs }) => {
             visit_expression_opaque(visitor, op, exprs, sibling_list_id)
+        }
+        Expression::ParseJson(ParseJsonExpression {
+            json_expr,
+            output_schema,
+        }) => {
+            let child_list_id = call!(visitor, make_field_list, 1);
+            visit_expression_impl(visitor, json_expr, child_list_id);
+            let schema_handle = Handle::from(output_schema.clone());
+            call!(
+                visitor,
+                visit_parse_json,
+                sibling_list_id,
+                child_list_id,
+                schema_handle
+            );
         }
         Expression::Unknown(name) => visit_unknown(visitor, sibling_list_id, name),
     }
