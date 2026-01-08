@@ -1248,7 +1248,7 @@ struct DvMatchVisitor<'a> {
     /// Accumulated DV descriptors (or nulls) for each visited row, in visit order
     new_dv_entries: Vec<Scalar>,
     /// Indexes of rows that matched a file path in dv_update. These must be in
-    /// ascending order.s
+    /// ascending order
     matched_file_indexes: Vec<usize>,
 }
 
