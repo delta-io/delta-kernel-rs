@@ -91,16 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_retries(3)
         .build()?;
 
-    // Create clients
-    let client = UCClient::new(config.clone())?;
-    let commits_client = UCRestCommitsClient::new(config)?;
+    // Create shared HTTP client and UC clients
+    let http_client = uc_client::http::build_http_client(&config)?;
+    let uc_client = UCClient::with_client(http_client.clone(), config.clone());
+    let commits_client = UCRestCommitsClient::with_client(http_client, config);
 
     // Execute command
     match cli.command {
         Commands::Table { name } => {
             println!("Fetching table metadata for: {}", name);
 
-            match client.get_table(&name).await {
+            match uc_client.get_table(&name).await {
                 Ok(table) => {
                     println!("\n✓ Table metadata retrieved successfully\n");
                     println!("{}", table);
@@ -120,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Resolving table: {}", name);
 
             // First, get the table metadata to obtain table_id and storage_location
-            let table = match client.get_table(&name).await {
+            let table = match uc_client.get_table(&name).await {
                 Ok(table) => {
                     println!(
                         "✓ Table resolved: {} (ID: {})",
@@ -176,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 operation, table_id
             );
 
-            match client.get_credentials(&table_id, operation).await {
+            match uc_client.get_credentials(&table_id, operation).await {
                 Ok(creds) => {
                     println!("\n✓ Credentials retrieved successfully\n");
                     println!("URL:              {}", creds.url);
