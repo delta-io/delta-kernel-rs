@@ -7,8 +7,12 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::{DataType, Field};
+use crate::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
+};
+use crate::arrow::compute::{max, min};
+use crate::arrow::datatypes::{DataType, Field, Fields};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -38,6 +42,284 @@ use crate::{
     ParquetHandler, PredicateRef,
 };
 
+/// Collects statistics from a RecordBatch for Delta Lake file statistics.
+struct StatisticsCollector {
+    num_records: usize,
+    schema: Arc<crate::arrow::datatypes::Schema>,
+    // Store collected min/max/null stats as Arrow arrays
+    min_values: Vec<ArrayRef>,
+    max_values: Vec<ArrayRef>,
+    null_counts: Vec<i64>,
+}
+
+impl StatisticsCollector {
+    /// Create a new statistics collector from a RecordBatch.
+    fn new(batch: &RecordBatch) -> DeltaResult<Self> {
+        let num_records = batch.num_rows();
+        let schema = batch.schema();
+        let num_columns = batch.num_columns();
+
+        let mut min_values = Vec::with_capacity(num_columns);
+        let mut max_values = Vec::with_capacity(num_columns);
+        let mut null_counts = Vec::with_capacity(num_columns);
+
+        // Collect statistics for each column
+        for i in 0..num_columns {
+            let column = batch.column(i);
+            let null_count = column.null_count() as i64;
+            null_counts.push(null_count);
+
+            // Compute min/max if the column has non-null values
+            if null_count < num_records as i64 && num_records > 0 {
+                match Self::compute_min_max(column) {
+                    Ok((min_val, max_val)) => {
+                        min_values.push(min_val);
+                        max_values.push(max_val);
+                    }
+                    Err(_) => {
+                        // If we can't compute min/max, create typed null array
+                        let null_array = Self::create_null_array(column.data_type());
+                        min_values.push(null_array.clone());
+                        max_values.push(null_array);
+                    }
+                }
+            } else {
+                // All nulls or empty - create typed null array
+                let null_array = Self::create_null_array(column.data_type());
+                min_values.push(null_array.clone());
+                max_values.push(null_array);
+            }
+        }
+
+        Ok(Self {
+            num_records,
+            schema,
+            min_values,
+            max_values,
+            null_counts,
+        })
+    }
+
+    /// Create a null array with a single null value of the given data type.
+    fn create_null_array(data_type: &DataType) -> ArrayRef {
+        use crate::arrow::array::{
+            BinaryArray, Date32Array, Decimal128Array, Float32Array, Int16Array, Int8Array,
+            NullArray,
+        };
+
+        match data_type {
+            DataType::Int8 => Arc::new(Int8Array::from(vec![None::<i8>])) as ArrayRef,
+            DataType::Int16 => Arc::new(Int16Array::from(vec![None::<i16>])) as ArrayRef,
+            DataType::Int32 => Arc::new(Int32Array::from(vec![None::<i32>])) as ArrayRef,
+            DataType::Int64 => Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
+            DataType::Float32 => Arc::new(Float32Array::from(vec![None::<f32>])) as ArrayRef,
+            DataType::Float64 => Arc::new(Float64Array::from(vec![None::<f64>])) as ArrayRef,
+            DataType::Boolean => Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
+            DataType::Utf8 => Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            DataType::Binary => Arc::new(BinaryArray::from(vec![None::<&[u8]>])) as ArrayRef,
+            DataType::Date32 => Arc::new(Date32Array::from(vec![None::<i32>])) as ArrayRef,
+            DataType::Timestamp(unit, tz) => {
+                use crate::arrow::datatypes::TimeUnit;
+                let arr = match unit {
+                    TimeUnit::Microsecond => TimestampMicrosecondArray::from(vec![None::<i64>]),
+                    _ => TimestampMicrosecondArray::from(vec![None::<i64>]),
+                };
+                if let Some(tz) = tz {
+                    Arc::new(arr.with_timezone(tz.as_ref())) as ArrayRef
+                } else {
+                    Arc::new(arr) as ArrayRef
+                }
+            }
+            DataType::Decimal128(precision, scale) => Arc::new(
+                Decimal128Array::from(vec![None::<i128>])
+                    .with_precision_and_scale(*precision, *scale)
+                    .unwrap_or_else(|_| Decimal128Array::from(vec![None::<i128>])),
+            ) as ArrayRef,
+            DataType::Struct(fields) => {
+                // Create a null struct with the same schema
+                let null_children: Vec<ArrayRef> = fields
+                    .iter()
+                    .map(|f| Self::create_null_array(f.data_type()))
+                    .collect();
+                Arc::new(
+                    StructArray::try_new(fields.clone(), null_children, Some(vec![false].into()))
+                        .unwrap_or_else(|_| {
+                            StructArray::new_empty_fields(1, Some(vec![false].into()))
+                        }),
+                ) as ArrayRef
+            }
+            _ => Arc::new(NullArray::new(1)) as ArrayRef,
+        }
+    }
+
+    /// Compute min and max values for a column.
+    fn compute_min_max(column: &ArrayRef) -> DeltaResult<(ArrayRef, ArrayRef)> {
+        use crate::arrow::compute::{max_boolean, max_string, min_boolean, min_string};
+
+        // Use arrow compute functions based on the data type
+        let (min_scalar, max_scalar) = match column.data_type() {
+            DataType::Int32 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Int32Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Int32Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Int64 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Int64Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Int64Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Float64 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Float64Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Float64Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Utf8 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| Error::generic("Failed to downcast StringArray"))?;
+                let min_val = min_string(arr);
+                let max_val = max_string(arr);
+                (
+                    Arc::new(StringArray::from(vec![min_val])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Boolean => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| Error::generic("Failed to downcast BooleanArray"))?;
+                let min_val = min_boolean(arr);
+                let max_val = max_boolean(arr);
+                (
+                    Arc::new(BooleanArray::from(vec![min_val])) as ArrayRef,
+                    Arc::new(BooleanArray::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Timestamp(_, _) => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| Error::generic("Failed to downcast TimestampArray"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(TimestampMicrosecondArray::from(vec![min_val])) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            _ => {
+                // For unsupported types, return null
+                return Err(Error::generic(format!(
+                    "Unsupported data type for min/max: {:?}",
+                    column.data_type()
+                )));
+            }
+        };
+
+        Ok((min_scalar, max_scalar))
+    }
+
+    /// Build the statistics struct matching the expected Delta Lake stats schema.
+    fn build_stats_struct(&self) -> DeltaResult<StructArray> {
+        // Build null count struct
+        let null_count_fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| Field::new(f.name(), DataType::Int64, true))
+            .collect();
+
+        let null_count_arrays: Vec<ArrayRef> = self
+            .null_counts
+            .iter()
+            .map(|&count| Arc::new(Int64Array::from(vec![count])) as ArrayRef)
+            .collect();
+
+        let null_count_struct =
+            StructArray::try_new(Fields::from(null_count_fields), null_count_arrays, None)?;
+
+        // Build min values struct
+        let min_fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+            .collect();
+
+        let min_struct =
+            StructArray::try_new(Fields::from(min_fields), self.min_values.clone(), None)?;
+
+        // Build max values struct
+        let max_fields: Vec<Field> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| Field::new(f.name(), f.data_type().clone(), true))
+            .collect();
+
+        let max_struct =
+            StructArray::try_new(Fields::from(max_fields), self.max_values.clone(), None)?;
+
+        // Build the complete stats struct
+        let stats_fields = Fields::from(vec![
+            Field::new("numRecords", DataType::Int64, true),
+            Field::new(
+                "nullCount",
+                DataType::Struct(null_count_struct.fields().clone()),
+                true,
+            ),
+            Field::new(
+                "minValues",
+                DataType::Struct(min_struct.fields().clone()),
+                true,
+            ),
+            Field::new(
+                "maxValues",
+                DataType::Struct(max_struct.fields().clone()),
+                true,
+            ),
+            Field::new("tightBounds", DataType::Boolean, true),
+        ]);
+
+        let stats_array = StructArray::try_new(
+            stats_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![self.num_records as i64])),
+                Arc::new(null_count_struct),
+                Arc::new(min_struct),
+                Arc::new(max_struct),
+                Arc::new(BooleanArray::from(vec![true])), // tightBounds = true
+            ],
+            None,
+        )?;
+
+        Ok(stats_array)
+    }
+}
+
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
     store: Arc<DynObjectStore>,
@@ -47,13 +329,14 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 
 /// Metadata of a data file (typically a parquet file).
 ///
-/// Currently just includes the the number of records as statistics, but will expand to include
-/// more statistics and other metadata in the future.
+/// Includes full file statistics collected during write.
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
     // NB: We use usize instead of u64 since arrow uses usize for record batch sizes
     num_records: usize,
+    // Optional full statistics
+    stats: Option<StructArray>,
 }
 
 impl DataFileMetadata {
@@ -61,7 +344,13 @@ impl DataFileMetadata {
         Self {
             file_meta,
             num_records,
+            stats: None,
         }
+    }
+
+    pub fn with_stats(mut self, stats: StructArray) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
@@ -81,7 +370,9 @@ impl DataFileMetadata {
                     size,
                 },
             num_records,
+            stats,
         } = self;
+
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
         let key_builder = StringBuilder::new();
@@ -104,20 +395,44 @@ impl DataFileMetadata {
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let stats = Arc::new(StructArray::try_new_with_length(
-            vec![Field::new("numRecords", DataType::Int64, true)].into(),
-            vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
-            None,
-            1,
-        )?);
+
+        // Use full stats if available, otherwise minimal stats
+        let stats_array: Arc<StructArray> = if let Some(full_stats) = stats {
+            Arc::new(full_stats.clone())
+        } else {
+            Arc::new(StructArray::try_new_with_length(
+                vec![Field::new("numRecords", DataType::Int64, true)].into(),
+                vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
+                None,
+                1,
+            )?)
+        };
+
+        // Build schema dynamically based on the stats array's actual schema
+        use crate::arrow::datatypes::Schema as ArrowSchema;
+        let base_schema: ArrowSchema = crate::transaction::MINIMAL_ADD_FILES_SCHEMA
+            .as_ref()
+            .try_into_arrow()?;
+
+        // Replace the stats field with the actual stats schema
+        let mut fields: Vec<Field> = base_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        // The last field is stats - replace it with the actual stats schema
+        if let Some(last) = fields.last_mut() {
+            *last = Field::new(
+                "stats",
+                DataType::Struct(stats_array.fields().clone()),
+                true,
+            );
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(
-                crate::transaction::BASE_ADD_FILES_SCHEMA
-                    .as_ref()
-                    .try_into_arrow()?,
-            ),
-            vec![path, partitions, size, modification_time, stats],
+            schema,
+            vec![path, partitions, size, modification_time, stats_array],
         )?)))
     }
 }
@@ -157,6 +472,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         let mut writer = ArrowWriter::try_new(&mut buffer, record_batch.schema(), None)?;
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
+
+        // Note: For demonstration, we store metadata capability but don't extract full stats yet
+        // Full stats extraction from Parquet metadata would require reading column statistics
+        // from row groups, which is more complex and left as a TODO for engine implementations
 
         let size: u64 = buffer
             .len()
@@ -202,7 +521,18 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let parquet_metadata = self.write_parquet(path, data).await?;
+        // Collect statistics from the data before writing
+        use crate::engine::arrow_data::extract_record_batch;
+        let record_batch = extract_record_batch(data.as_ref())?;
+        let stats_collector = StatisticsCollector::new(record_batch)?;
+        let stats = stats_collector.build_stats_struct()?;
+
+        // Write the parquet file
+        let mut parquet_metadata = self.write_parquet(path, data).await?;
+
+        // Attach the collected statistics
+        parquet_metadata = parquet_metadata.with_stats(stats);
+
         parquet_metadata.as_record_batch(&partition_values)
     }
 }
@@ -626,7 +956,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::BASE_ADD_FILES_SCHEMA
+            crate::transaction::MINIMAL_ADD_FILES_SCHEMA
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),
@@ -694,6 +1024,7 @@ mod tests {
                     size,
                 },
             num_records,
+            ..
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 

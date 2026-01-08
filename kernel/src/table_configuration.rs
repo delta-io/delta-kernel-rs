@@ -13,8 +13,9 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
+use crate::scan::data_skipping::expected_stats_schema;
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef};
+use crate::schema::{InvariantChecker, Schema, SchemaRef, StructType};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
@@ -406,6 +407,27 @@ impl TableConfiguration {
             // it may have an empty enablement version and timestamp
             (None, None) => Ok(InCommitTimestampEnablement::Enabled { enablement: None }),
         }
+    }
+
+    /// Returns the expected schema for parsed table statistics written to checkpoints.
+    ///
+    /// The expected stats schema is controlled by the table properties.
+    /// * `dataSkippingStatsColumns` - used to explicitly specify the columns
+    ///   to be used for data skipping statistics. (takes precedence)
+    /// * `dataSkippingNumIndexedCols` - used to specify the number of columns
+    ///   to be used for data skipping statistics. Defaults to 32.
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn stats_schema(&self) -> Schema {
+        let partition_columns = self.metadata().partition_columns();
+        let column_mapping_mode = self.column_mapping_mode();
+        let physical_file_schema = StructType::new_unchecked(
+            self.schema()
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name()))
+                .map(|field| field.make_physical(column_mapping_mode)),
+        );
+        expected_stats_schema(&physical_file_schema, &self.table_properties)
     }
 
     /// Returns `true` if row tracking is suspended for this table.
