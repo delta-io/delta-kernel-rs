@@ -1,4 +1,15 @@
-//! Doctests for IntoEngineData derive macro
+//! Doctests for the `IntoEngineData` derive macro.
+//!
+//! `IntoEngineData` converts a Rust struct into the `EngineData` representation.
+//! See the `IntoEngineData` trait for details.
+//! `#[derive(IntoEngineData)]` implements the `IntoEngineData` trait for the struct.
+//!
+//! What is valid:
+//! - A **named-field struct** (a regular `struct Foo { a: T, b: U }`)
+//!
+//! What is not valid (and should fail to compile):
+//! - A **unit struct** (`struct Foo;`) — no fields to convert into engine data.
+//! - A **tuple struct** (`struct Foo(T, U);`) — the macro expects named fields.
 
 /// ```
 /// # use delta_kernel_derive::IntoEngineData;
