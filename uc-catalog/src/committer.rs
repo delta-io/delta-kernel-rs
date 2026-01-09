@@ -3,9 +3,9 @@ use std::sync::Arc;
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use uc_client::models::commits::{Commit, CommitRequest};
-use uc_client::prelude::UCClient;
+use uc_client::UCCommitsClient;
 
-// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
+/// A [UCCommitter] is a Unity Catalog [`Committer`] implementation for committing to a specific
 /// delta table in UC.
 ///
 /// NOTE: this [`Committer`] requires a multi-threaded tokio runtime. That is, whatever
@@ -13,15 +13,15 @@ use uc_client::prelude::UCClient;
 /// muti-threaded tokio runtime context. Since the default engine uses tokio, this is compatible,
 /// but must ensure that the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
-pub struct UCCommitter {
-    client: Arc<UCClient>,
+pub struct UCCommitter<C: UCCommitsClient> {
+    client: Arc<C>,
     table_id: String,
 }
 
-impl UCCommitter {
+impl<C: UCCommitsClient> UCCommitter<C> {
     /// Create a new [UCCommitter] to commit via the `client` to the specific table with the given
     /// `table_id`.
-    pub fn new(client: Arc<UCClient>, table_id: impl Into<String>) -> Self {
+    pub fn new(client: Arc<C>, table_id: impl Into<String>) -> Self {
         UCCommitter {
             client,
             table_id: table_id.into(),
@@ -29,7 +29,7 @@ impl UCCommitter {
     }
 }
 
-impl Committer for UCCommitter {
+impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
     /// Commit the given `actions` to the delta table in UC. UC's committer elects to write out a
     /// staged commit for the actions then call the UC commit API to 'finalize' (ratify) the staged
     /// commit. Note that this will accumulate staged commits, and separately clients are expected
