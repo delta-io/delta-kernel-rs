@@ -31,7 +31,7 @@ use url::Url;
 /// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
 /// - `latest_crc_file`: The CRC file with the highest version, if any.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
-/// - `max_known_published_commit_version`: The highest published commit file version, or `None` if no published commits were found.
+/// - `max_published_version`: The highest published commit file version, or `None` if no published commits were found.
 #[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
@@ -40,7 +40,7 @@ pub(crate) struct ListedLogFiles {
     checkpoint_parts: Vec<ParsedLogPath>,
     latest_crc_file: Option<ParsedLogPath>,
     latest_commit_file: Option<ParsedLogPath>,
-    max_known_published_commit_version: Option<Version>,
+    max_published_version: Option<Version>,
 }
 
 /// Builder for constructing a validated [`ListedLogFiles`].
@@ -54,7 +54,7 @@ pub(crate) struct ListedLogFilesBuilder {
     pub checkpoint_parts: Vec<ParsedLogPath>,
     pub latest_crc_file: Option<ParsedLogPath>,
     pub latest_commit_file: Option<ParsedLogPath>,
-    pub max_known_published_commit_version: Option<Version>,
+    pub max_published_version: Option<Version>,
 }
 
 impl ListedLogFilesBuilder {
@@ -106,14 +106,14 @@ impl ListedLogFilesBuilder {
             checkpoint_parts: self.checkpoint_parts,
             latest_crc_file: self.latest_crc_file,
             latest_commit_file: self.latest_commit_file,
-            max_known_published_commit_version: self.max_known_published_commit_version,
+            max_published_version: self.max_published_version,
         })
     }
 }
 
 struct ListLogFilesResult {
     files: Vec<ParsedLogPath>,
-    max_known_published_commit_version: Option<Version>,
+    max_published_version: Option<Version>,
 }
 
 /// Lists [`ParsedLogPath`]s over versions [start_version, end_version], taking into account the
@@ -162,7 +162,7 @@ fn list_log_files(
     let list_end_version =
         log_tail_start.map_or(end_version, |first| first.version.saturating_sub(1));
 
-    let mut max_published_commit_version_from_listing: Option<Version> = None;
+    let mut max_published_version_from_listing: Option<Version> = None;
 
     // if the log_tail covers the entire requested range (i.e. starts at or before start_version),
     // we skip listing entirely. note that if we don't include this check, we will end up listing
@@ -191,7 +191,7 @@ fn list_log_files(
 
             // Track max published commit version from all filesystem-listed files (including those
             // that will be filtered out because log_tail takes precedence at those versions)
-            max_published_commit_version_from_listing = all_files
+            max_published_version_from_listing = all_files
                 .iter()
                 .filter(|f| matches!(f.file_type, LogPathFileType::Commit))
                 .map(|f| f.version)
@@ -213,7 +213,7 @@ fn list_log_files(
         .collect();
 
     // Also consider published commits from log_tail
-    let max_published_commit_version_from_log_tail = filtered_log_tail
+    let max_published_version_from_log_tail = filtered_log_tail
         .iter()
         .filter(|f| matches!(f.file_type, LogPathFileType::Commit))
         .map(|f| f.version)
@@ -223,8 +223,8 @@ fn list_log_files(
 
     Ok(ListLogFilesResult {
         files,
-        max_known_published_commit_version: max_published_commit_version_from_listing
-            .max(max_published_commit_version_from_log_tail),
+        max_published_version: max_published_version_from_listing
+            .max(max_published_version_from_log_tail),
     })
 }
 
@@ -292,7 +292,7 @@ impl ListedLogFiles {
             self.checkpoint_parts,
             self.latest_crc_file,
             self.latest_commit_file,
-            self.max_known_published_commit_version,
+            self.max_published_version,
         )
     }
 
@@ -333,7 +333,7 @@ impl ListedLogFiles {
         ListedLogFilesBuilder {
             ascending_commit_files: listed_commits,
             latest_commit_file,
-            max_known_published_commit_version: result.max_known_published_commit_version,
+            max_published_version: result.max_published_version,
             ..Default::default()
         }
         .build()
@@ -469,7 +469,7 @@ impl ListedLogFiles {
             checkpoint_parts: builder.checkpoint_parts,
             latest_crc_file: builder.latest_crc_file,
             latest_commit_file: builder.latest_commit_file,
-            max_known_published_commit_version: result.max_known_published_commit_version,
+            max_published_version: result.max_published_version,
         }
         .build()
     }
@@ -644,10 +644,7 @@ mod list_log_files_with_log_tail_tests {
         // all should be from filesystem since log_tail is empty
         assert_source(&result[0], CommitSource::Filesystem);
         assert_source(&result[1], CommitSource::Filesystem);
-        assert_eq!(
-            total_listing_result.max_known_published_commit_version,
-            Some(2)
-        );
+        assert_eq!(total_listing_result.max_published_version, Some(2));
     }
 
     #[tokio::test]
@@ -686,10 +683,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[3], CommitSource::Catalog);
         assert_source(&result[4], CommitSource::Catalog);
         assert_source(&result[5], CommitSource::Catalog);
-        assert_eq!(
-            total_listing_result.max_known_published_commit_version,
-            Some(5)
-        );
+        assert_eq!(total_listing_result.max_published_version, Some(5));
     }
 
     #[tokio::test]
@@ -722,7 +716,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[1], CommitSource::Catalog);
         assert_source(&result[2], CommitSource::Catalog);
         assert_eq!(
-            total_listing_result.max_known_published_commit_version,
+            total_listing_result.max_published_version,
             Some(3) // Recall: we listed (with log tail) with end_version=3
         );
     }
@@ -734,7 +728,7 @@ mod list_log_files_with_log_tail_tests {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
-            (2, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_known_published_commit_version
+            (2, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
         ];
         let (storage, log_root) = create_storage(log_files).await;
 
@@ -755,10 +749,7 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result[1].version, 1);
         assert_source(&result[0], CommitSource::Filesystem);
         assert_source(&result[1], CommitSource::Catalog);
-        assert_eq!(
-            total_listing_result.max_known_published_commit_version,
-            Some(2)
-        );
+        assert_eq!(total_listing_result.max_published_version, Some(2));
     }
 
     #[test]
@@ -811,10 +802,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[0], CommitSource::Catalog);
         assert_source(&result[1], CommitSource::Catalog);
         assert_source(&result[2], CommitSource::Catalog);
-        assert_eq!(
-            total_listing_result.max_known_published_commit_version,
-            Some(1)
-        );
+        assert_eq!(total_listing_result.max_published_version, Some(1));
     }
 
     #[tokio::test]
@@ -826,7 +814,7 @@ mod list_log_files_with_log_tail_tests {
 
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
-            (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_known_published_commit_version
+            (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
             (1, LogPathFileType::StagedCommit, CommitSource::Filesystem),
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
@@ -842,17 +830,14 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result[1].version, 1);
         assert_source(&result[0], CommitSource::Filesystem);
         assert_source(&result[1], CommitSource::Filesystem);
-        assert_eq!(
-            total_listing_result.max_known_published_commit_version,
-            Some(1)
-        );
+        assert_eq!(total_listing_result.max_published_version, Some(1));
     }
 
     #[tokio::test]
     async fn test_listing_with_large_end_version() {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
-            (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_known_published_commit_version
+            (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
@@ -866,9 +851,6 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].version, 0);
         assert_eq!(result[1].version, 1);
-        assert_eq!(
-            total_listing_result.max_known_published_commit_version,
-            Some(1)
-        );
+        assert_eq!(total_listing_result.max_published_version, Some(1));
     }
 }

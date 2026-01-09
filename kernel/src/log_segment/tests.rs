@@ -2446,7 +2446,7 @@ fn test_publish_validation() {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
-        max_known_published_commit_version: None,
+        max_published_version: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2468,7 +2468,7 @@ fn test_publish_validation() {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
-        max_known_published_commit_version: None,
+        max_published_version: None,
     };
 
     // Should fail with staged commits
@@ -2582,61 +2582,61 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_only_published_commits() {
+async fn test_max_published_version_only_published_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[0, 1, 2, 3, 4],
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 4);
+    assert_eq!(log_segment.max_published_version.unwrap(), 4);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_checkpoint_followed_by_published_commits() {
+async fn test_max_published_version_checkpoint_followed_by_published_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[5, 6, 7, 8],
         checkpoint_version: Some(5),
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 8);
+    assert_eq!(log_segment.max_published_version.unwrap(), 8);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_only_staged_commits() {
+async fn test_max_published_version_only_staged_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
         staged_commit_versions: &[0, 1, 2, 3, 4],
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version, None);
+    assert_eq!(log_segment.max_published_version, None);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_checkpoint_followed_by_staged_commits() {
+async fn test_max_published_version_checkpoint_followed_by_staged_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
         staged_commit_versions: &[5, 6, 7, 8],
         checkpoint_version: Some(5),
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version, None);
+    assert_eq!(log_segment.max_published_version, None);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_published_and_staged_commits_no_overlap() {
+async fn test_max_published_version_published_and_staged_commits_no_overlap() {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[0, 1, 2],
         staged_commit_versions: &[3, 4],
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 2);
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_checkpoint_followed_by_published_and_staged_commits_no_overlap(
-) {
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_no_overlap()
+{
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[5, 6, 7],
         staged_commit_versions: &[8, 9, 10],
@@ -2644,22 +2644,22 @@ async fn test_max_known_published_commit_version_checkpoint_followed_by_publishe
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 7);
+    assert_eq!(log_segment.max_published_version.unwrap(), 7);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_published_and_staged_commits_with_overlap() {
+async fn test_max_published_version_published_and_staged_commits_with_overlap() {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[0, 1, 2],
         staged_commit_versions: &[2, 3, 4],
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 2);
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_checkpoint_followed_by_published_and_staged_commits_with_overlap(
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_with_overlap(
 ) {
     let log_segment = create_segment_for(LogSegmentConfig {
         published_commit_versions: &[5, 6, 7, 8, 9],
@@ -2668,15 +2668,15 @@ async fn test_max_known_published_commit_version_checkpoint_followed_by_publishe
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version.unwrap(), 9);
+    assert_eq!(log_segment.max_published_version.unwrap(), 9);
 }
 
 #[tokio::test]
-async fn test_max_known_published_commit_version_checkpoint_only() {
+async fn test_max_published_version_checkpoint_only() {
     let log_segment = create_segment_for(LogSegmentConfig {
         checkpoint_version: Some(5),
         ..Default::default()
     })
     .await;
-    assert_eq!(log_segment.max_known_published_commit_version, None);
+    assert_eq!(log_segment.max_published_version, None);
 }
