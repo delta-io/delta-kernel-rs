@@ -187,7 +187,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine::default::DefaultEngine;
-    use crate::path::LogRoot;
+    use crate::path::{LogPathFileType, LogRoot};
 
     use object_store::memory::InMemory;
     use object_store::ObjectStore as _;
@@ -269,5 +269,35 @@ mod tests {
             err,
             crate::Error::Generic(e) if e.contains("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_committer_returns_valid_commit_response() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let engine = DefaultEngine::new(storage.clone());
+
+        let committer = FileSystemCommitter::new();
+        let log_root = LogRoot::new(table_root).unwrap();
+        let commit_metadata = CommitMetadata::new(log_root, 1, 12345);
+        let actions = Box::new(std::iter::empty());
+
+        let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+
+        match result {
+            CommitResponse::Committed { data } => {
+                assert_eq!(data.version, 1);
+                assert_eq!(data.file_type, LogPathFileType::Commit);
+
+                let file_meta = data.location;
+                assert_eq!(file_meta.last_modified, 12345);
+                assert_eq!(file_meta.size, 0);
+                assert!(file_meta
+                    .location
+                    .as_str()
+                    .ends_with("00000000000000000001.json"));
+            }
+            CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
+        }
     }
 }
