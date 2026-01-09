@@ -256,6 +256,28 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Unknown)
     }
+
+    /// Parse and validate this is a published commit file.
+    #[internal_api]
+    pub(crate) fn try_parse_published_commit(location: Location) -> DeltaResult<Self> {
+        let parsed = Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("Could not parse path as a log path"))?;
+        if parsed.file_type != LogPathFileType::Commit {
+            return Err(Error::internal_error("Expected a published commit file"));
+        }
+        Ok(parsed)
+    }
+
+    /// Parse and validate this is a staged commit file.
+    #[internal_api]
+    pub(crate) fn try_parse_staged_commit(location: Location) -> DeltaResult<Self> {
+        let parsed = Self::try_from(location)?
+            .ok_or_else(|| Error::internal_error("Could not parse path as a log path"))?;
+        if parsed.file_type != LogPathFileType::StagedCommit {
+            return Err(Error::internal_error("Expected a staged commit file"));
+        }
+        Ok(parsed)
+    }
 }
 
 impl ParsedLogPath<FileMeta> {
