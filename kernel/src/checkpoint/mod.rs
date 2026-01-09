@@ -107,6 +107,50 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 
 use url::Url;
 
+/// Performs a complete checkpoint of a table using the provided engine.
+///
+/// This is an "all-in-one" checkpoint function that handles the entire workflow:
+/// 1. Creates the checkpoint data
+/// 2. Writes the checkpoint parquet file using [`Engine::parquet_handler`]
+/// 3. Gets file metadata using [`Engine::storage_handler`]
+/// 4. Writes the `_last_checkpoint` file
+///
+/// Note: This function uses [`ParquetHandler::write_parquet_file`] and [`StorageHandler::head`],
+/// which may not be implemented by all engines (e.g., `SyncEngine`).
+///
+/// # Parameters
+/// - `engine`: Implementation of [`Engine`] APIs.
+/// - `snapshot`: Reference to the snapshot to checkpoint.
+///
+/// # Returns
+/// `Ok(())` if the checkpoint was successfully created, or an error otherwise.
+pub fn perform_checkpoint(engine: &dyn Engine, snapshot: SnapshotRef) -> DeltaResult<()> {
+    let writer = snapshot.checkpoint()?;
+    let checkpoint_path = writer.checkpoint_path()?;
+    let mut data_iter = writer.checkpoint_data(engine)?;
+
+    // Collect batches while applying selection vectors
+    // We use by_ref() to retain access to data_iter's counts after exhaustion
+    let mut batches: Vec<Box<dyn EngineData>> = Vec::new();
+    for result in data_iter.by_ref() {
+        let filtered = result?;
+        let data = filtered.apply_selection_vector()?;
+        batches.push(data);
+    }
+
+    // Write the checkpoint parquet file
+    engine.parquet_handler().write_parquet_file(
+        checkpoint_path.clone(),
+        Box::new(batches.into_iter().map(Ok)),
+    )?;
+
+    // Get file metadata for the written checkpoint
+    let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+
+    // Finalize the checkpoint (writes _last_checkpoint file)
+    writer.finalize(engine, &file_meta, data_iter)
+}
+
 #[cfg(test)]
 mod tests;
 
