@@ -468,8 +468,8 @@ pub fn perform_checkpoint(engine: &dyn Engine, snapshot: SnapshotRef) -> DeltaRe
 
     let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
-    // As [`delta_kernel::ParquetHandler`] requires ownership of xxx, previous data_iter was taken ownership by `write_parquet_file`,
-    // We reconstruct exhausted iterator with captured counts for finalize
+    // write_parquet_file took ownership of data_iter, so we reconstruct an
+    // exhausted iterator with the captured counts for finalize
     let exhausted_iter = ActionReconciliationIterator::with_exhausted_counts(
         state.actions_count.load(Ordering::Acquire),
         state.add_actions_count.load(Ordering::Acquire),
