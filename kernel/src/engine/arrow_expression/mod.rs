@@ -24,6 +24,10 @@ mod apply_schema;
 pub mod evaluate_expression;
 pub mod opaque;
 
+// Re-export apply_schema for use in tests.
+#[doc(hidden)]
+pub use apply_schema::apply_schema as apply_schema_internal;
+
 #[cfg(test)]
 mod tests;
 
