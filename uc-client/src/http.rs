@@ -8,15 +8,16 @@ use crate::error::{Error, Result};
 
 /// Build a configured HTTP client from the given config.
 pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::AUTHORIZATION,
-        header::HeaderValue::from_str(&format!("Bearer {}", config.token))?,
-    );
-    headers.insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
-    );
+    let headers = header::HeaderMap::from_iter([
+        (
+            header::AUTHORIZATION,
+            header::HeaderValue::from_str(&format!("Bearer {}", config.token))?,
+        ),
+        (
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        ),
+    ]);
 
     let client = Client::builder()
         .default_headers(headers)
@@ -27,7 +28,8 @@ pub fn build_http_client(config: &ClientConfig) -> Result<Client> {
     Ok(client)
 }
 
-/// Execute a request with retry logic.
+/// Execute a request with retry logic for server errors and request failures.
+/// Retries up to `max_retries` times with linear backoff: delay = `retry_base_delay * attempt`.
 pub async fn execute_with_retry<F, Fut>(config: &ClientConfig, f: F) -> Result<Response>
 where
     F: Fn() -> Fut,
