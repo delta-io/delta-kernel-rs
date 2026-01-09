@@ -33,6 +33,7 @@
 //! # use std::sync::Arc;
 //! # use delta_kernel::ActionReconciliationIterator;
 //! # use delta_kernel::checkpoint::CheckpointWriter;
+//! # use delta_kernel::checkpoint::TransformingCheckpointIterator;
 //! # use delta_kernel::Engine;
 //! # use delta_kernel::Snapshot;
 //! # use delta_kernel::SnapshotRef;
@@ -40,7 +41,7 @@
 //! # use delta_kernel::Error;
 //! # use delta_kernel::FileMeta;
 //! # use url::Url;
-//! fn write_checkpoint_file(path: Url, data: &ActionReconciliationIterator) -> DeltaResult<FileMeta> {
+//! fn write_checkpoint_file(path: Url, data: &TransformingCheckpointIterator) -> DeltaResult<FileMeta> {
 //!     todo!() /* engine-specific logic to write data to object storage*/
 //! }
 //!
@@ -107,6 +108,13 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 
 use url::Url;
 
+mod stats_transform;
+
+use stats_transform::{
+    build_checkpoint_output_schema, build_checkpoint_read_schema_with_stats, build_stats_transform,
+    StatsTransformConfig,
+};
+
 #[cfg(test)]
 mod tests;
 
@@ -145,6 +153,90 @@ static CHECKPOINT_METADATA_ACTION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(||
         DataType::struct_type_unchecked([StructField::not_null("version", DataType::LONG)]),
     )]))
 });
+
+/// Iterator that applies stats transforms to checkpoint data batches.
+///
+/// This iterator wraps an [`ActionReconciliationIterator`] and applies an optional
+/// expression evaluator to each batch to populate stats fields.
+pub struct TransformingCheckpointIterator {
+    inner: ActionReconciliationIterator,
+    evaluator: Option<Arc<dyn crate::ExpressionEvaluator>>,
+    /// Optional CheckpointMetadata batch to yield after all actions (for V2 checkpoints).
+    /// This is kept separate because it has a different schema and shouldn't be transformed.
+    checkpoint_metadata: Option<FilteredEngineData>,
+    /// Track whether we had checkpoint metadata (for actions_count after consumption)
+    has_checkpoint_metadata: bool,
+    /// Schema for writing checkpoint data (includes/excludes stats fields based on config)
+    output_schema: SchemaRef,
+}
+
+impl TransformingCheckpointIterator {
+    /// Creates a new transforming iterator.
+    pub(crate) fn new(
+        inner: ActionReconciliationIterator,
+        evaluator: Option<Arc<dyn crate::ExpressionEvaluator>>,
+        checkpoint_metadata: Option<FilteredEngineData>,
+        output_schema: SchemaRef,
+    ) -> Self {
+        let has_checkpoint_metadata = checkpoint_metadata.is_some();
+        Self {
+            inner,
+            evaluator,
+            checkpoint_metadata,
+            has_checkpoint_metadata,
+            output_schema,
+        }
+    }
+
+    /// Returns the schema for writing checkpoint data.
+    ///
+    /// This schema reflects the table's stats configuration:
+    /// - Includes `stats` field when `writeStatsAsJson=true`
+    /// - Includes `stats_parsed` field when `writeStatsAsStruct=true`
+    pub fn output_schema(&self) -> &SchemaRef {
+        &self.output_schema
+    }
+
+    /// Returns true if the iterator has been fully consumed.
+    pub fn is_exhausted(&self) -> bool {
+        self.inner.is_exhausted() && self.checkpoint_metadata.is_none()
+    }
+
+    /// Returns the total count of actions processed.
+    pub fn actions_count(&self) -> i64 {
+        let metadata_count = if self.has_checkpoint_metadata { 1 } else { 0 };
+        self.inner.actions_count() + metadata_count
+    }
+
+    /// Returns the count of add actions processed.
+    pub fn add_actions_count(&self) -> i64 {
+        self.inner.add_actions_count()
+    }
+}
+
+impl Iterator for TransformingCheckpointIterator {
+    type Item = DeltaResult<FilteredEngineData>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // First, yield all transformed action batches
+        if let Some(batch) = self.inner.next() {
+            // If no evaluator, pass through unchanged
+            let Some(evaluator) = &self.evaluator else {
+                return Some(batch);
+            };
+
+            // Apply the transform to the batch
+            return Some(batch.and_then(|filtered_data| {
+                let (engine_data, selection_vector) = filtered_data.into_parts();
+                let transformed = evaluator.evaluate(engine_data.as_ref())?;
+                FilteredEngineData::try_new(transformed, selection_vector)
+            }));
+        }
+
+        // After all actions, yield the checkpoint metadata batch (if any) unchanged
+        self.checkpoint_metadata.take().map(Ok)
+    }
+}
 
 /// Orchestrates the process of creating a checkpoint for a table.
 ///
@@ -211,50 +303,92 @@ impl CheckpointWriter {
     }
     /// Returns the checkpoint data to be written to the checkpoint file.
     ///
-    /// This method reads the actions from the log segment and processes them
-    /// to create the checkpoint data.
+    /// This method reads actions from the log segment, processes them for checkpoint creation,
+    /// and applies stats transforms based on table properties:
+    /// - `delta.checkpoint.writeStatsAsJson` (default: true)
+    /// - `delta.checkpoint.writeStatsAsStruct` (default: false)
     ///
-    /// # Parameters
-    /// - `engine`: Implementation of [`Engine`] APIs.
+    /// The returned [`TransformingCheckpointIterator`] yields batches with stats transforms
+    /// already applied. Use [`TransformingCheckpointIterator::output_schema`] to get the
+    /// schema for writing the checkpoint file.
     ///
-    /// # Returns: [`ActionReconciliationIterator`] containing the checkpoint data
-    // This method is the core of the checkpoint generation process. It:
-    // 1. Determines whether to write a V1 or V2 checkpoint based on the table's
-    //    `v2Checkpoints` feature support
-    // 2. Reads actions from the log segment using the checkpoint read schema
-    // 3. Filters and deduplicates actions for the checkpoint
-    // 4. Chains the checkpoint metadata action if writing a V2 spec checkpoint
-    //    (i.e., if `v2Checkpoints` feature is supported by table)
-    // 5. Generates the appropriate checkpoint path
+    /// # Engine Usage
+    ///
+    /// ```ignore
+    /// let mut checkpoint_data = writer.checkpoint_data(&engine)?;
+    /// let output_schema = checkpoint_data.output_schema().clone();
+    /// while let Some(batch) = checkpoint_data.next() {
+    ///     let data = batch?.apply_selection_vector()?;
+    ///     parquet_writer.write(&data, &output_schema).await?;
+    /// }
+    /// writer.finalize(&engine, &metadata, checkpoint_data)?;
+    /// ```
     pub fn checkpoint_data(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<ActionReconciliationIterator> {
+    ) -> DeltaResult<TransformingCheckpointIterator> {
+        let config = StatsTransformConfig::from_table_properties(self.snapshot.table_properties());
+
+        // Get stats schema from table configuration.
+        // This already excludes partition columns and applies column mapping.
+        let stats_schema = self
+            .snapshot
+            .table_configuration()
+            .expected_stats_schema()?;
+
+        // Read schema includes stats_parsed so COALESCE expressions can operate on it.
+        // For commits, stats_parsed will be read as nulls (column doesn't exist in source).
+        let read_schema =
+            build_checkpoint_read_schema_with_stats(&CHECKPOINT_ACTIONS_SCHEMA, &stats_schema);
+
         let is_v2_checkpoints_supported = self
             .snapshot
             .table_configuration()
             .is_feature_supported(&TableFeature::V2Checkpoint);
 
-        let actions = self.snapshot.log_segment().read_actions(
-            engine,
-            CHECKPOINT_ACTIONS_SCHEMA.clone(),
-            None,
-        )?;
+        // Read actions from log segment
+        let actions =
+            self.snapshot
+                .log_segment()
+                .read_actions(engine, read_schema.clone(), None)?;
 
-        // Create iterator over actions for checkpoint data
+        // Process actions through reconciliation
         let checkpoint_data = ActionReconciliationProcessor::new(
             self.deleted_file_retention_timestamp()?,
             self.get_transaction_expiration_timestamp()?,
         )
         .process_actions_iter(actions);
 
-        let checkpoint_metadata =
-            is_v2_checkpoints_supported.then(|| self.create_checkpoint_metadata_batch(engine));
+        // Build output schema based on stats config (determines which fields are included)
+        let output_schema =
+            build_checkpoint_output_schema(&config, &CHECKPOINT_ACTIONS_SCHEMA, &stats_schema);
 
-        // Wrap the iterator to track action counts
-        Ok(ActionReconciliationIterator::new(Box::new(
-            checkpoint_data.chain(checkpoint_metadata),
-        )))
+        // Build transform expression and create expression evaluator
+        let transform_expr = build_stats_transform(&config, stats_schema);
+        let evaluator = engine.evaluation_handler().new_expression_evaluator(
+            read_schema,
+            transform_expr,
+            output_schema.clone().into(),
+        )?;
+
+        // Create action reconciliation iterator (without checkpoint metadata)
+        let inner = ActionReconciliationIterator::new(Box::new(checkpoint_data));
+
+        // Handle V2 checkpoint metadata separately - it has a different schema
+        // and shouldn't go through the stats transform
+        let checkpoint_metadata = if is_v2_checkpoints_supported {
+            let batch = self.create_checkpoint_metadata_batch(engine)?;
+            Some(batch.filtered_data)
+        } else {
+            None
+        };
+
+        Ok(TransformingCheckpointIterator::new(
+            inner,
+            Some(evaluator),
+            checkpoint_metadata,
+            output_schema,
+        ))
     }
 
     /// Finalizes checkpoint creation by saving metadata about the checkpoint.
@@ -278,7 +412,7 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
-        checkpoint_data: ActionReconciliationIterator,
+        checkpoint_data: TransformingCheckpointIterator,
     ) -> DeltaResult<()> {
         // Ensure the checkpoint data iterator is fully exhausted
         if !checkpoint_data.is_exhausted() {

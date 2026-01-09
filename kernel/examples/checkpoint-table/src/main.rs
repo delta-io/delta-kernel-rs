@@ -7,9 +7,10 @@ use futures::future::{BoxFuture, FutureExt};
 use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::arrow::AsyncArrowWriter;
 
+use delta_kernel::checkpoint::TransformingCheckpointIterator;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::engine::default::DefaultEngineBuilder;
-use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, FileMeta, Snapshot};
+use delta_kernel::{DeltaResult, Error, FileMeta, Snapshot};
 
 /// An example program that checkpoints a table.
 /// !!!WARNING!!!: This doesn't use put-if-absent, or a catalog based commit, so it is UNSAFE.
@@ -44,7 +45,7 @@ async fn main() -> ExitCode {
 
 async fn write_data<W: AsyncFileWriter>(
     first_batch: &RecordBatch,
-    batch_iter: &mut ActionReconciliationIterator,
+    batch_iter: &mut TransformingCheckpointIterator,
     parquet_writer: &mut AsyncArrowWriter<W>,
 ) -> DeltaResult<()> {
     parquet_writer.write(first_batch).await?;
