@@ -246,9 +246,9 @@ impl Snapshot {
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-                max_known_published_commit_version: new_log_segment
-                    .max_known_published_commit_version
-                    .max(old_log_segment.max_known_published_commit_version),
+                max_published_version: new_log_segment
+                    .max_published_version
+                    .max(old_log_segment.max_published_version),
             }
             .build()?,
             log_root,
