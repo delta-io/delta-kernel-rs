@@ -25,8 +25,8 @@
 //! [`log_tail`]: crate::snapshot::SnapshotBuilder::with_log_tail
 //! [`EngineData`]: crate::EngineData
 
-use crate::path::LogRoot;
-use crate::{AsAny, DeltaResult, Engine, Error, FilteredEngineData, Version};
+use crate::path::{LogRoot, ParsedLogPath};
+use crate::{AsAny, DeltaResult, Engine, Error, FileMeta, FilteredEngineData, Version};
 
 use url::Url;
 
@@ -101,7 +101,7 @@ impl CommitMetadata {
 /// [`Transaction`]: crate::transaction::Transaction
 #[derive(Debug)]
 pub enum CommitResponse {
-    Committed { version: Version },
+    Committed { data: ParsedLogPath<FileMeta> },
     Conflict { version: Version },
 }
 
@@ -152,14 +152,26 @@ impl Committer for FileSystemCommitter {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
+        let published_commit_path = commit_metadata.published_commit_path()?;
+
         match engine.json_handler().write_json_file(
-            &commit_metadata.published_commit_path()?,
+            &published_commit_path,
             Box::new(actions),
             false,
         ) {
-            Ok(()) => Ok(CommitResponse::Committed {
-                version: commit_metadata.version,
-            }),
+            Ok(()) => {
+                // For now, we don't need the real size of the written file, so we can use 0.
+                // If we need this in the future, we can get it from StorageHandler::head.
+                let file_meta = FileMeta::new(
+                    published_commit_path,
+                    commit_metadata.in_commit_timestamp(),
+                    0,
+                );
+                let parsed_log_path = ParsedLogPath::try_parse_published_commit(file_meta)?;
+                Ok(CommitResponse::Committed {
+                    data: parsed_log_path,
+                })
+            }
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResponse::Conflict {
                 version: commit_metadata.version,
             }),
