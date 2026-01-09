@@ -21,7 +21,7 @@ use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
-use crate::path::LogRoot;
+use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -464,8 +464,8 @@ impl Transaction {
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
-            Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(version),
+            Ok(CommitResponse::Committed { data }) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(data),
             )),
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
@@ -994,7 +994,7 @@ impl Transaction {
         }
     }
 
-    fn into_committed(self, version: Version) -> CommittedTransaction {
+    fn into_committed(self, data: ParsedLogPath) -> CommittedTransaction {
         let stats = PostCommitStats {
             commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
                 + 1,
@@ -1007,7 +1007,7 @@ impl Transaction {
 
         CommittedTransaction {
             transaction: self,
-            commit_version: version,
+            commit_version: data.version,
             post_commit_stats: stats,
         }
     }

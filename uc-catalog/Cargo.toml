@@ -14,7 +14,7 @@ version.workspace = true
 release = false
 
 [dependencies]
-delta_kernel = { path = "../kernel", features = ["catalog-managed"] }
+delta_kernel = { path = "../kernel", features = ["catalog-managed", "internal-api"] }
 uc-client = { path = "../uc-client" }
 itertools = "0.14"
 object_store = "0.12.3"
