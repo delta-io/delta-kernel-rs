@@ -27,7 +27,7 @@ impl UCClient {
     }
 
     /// Create from existing reqwest Client.
-    pub fn with_client(http_client: reqwest::Client, config: ClientConfig) -> Self {
+    pub fn with_http_client(http_client: reqwest::Client, config: ClientConfig) -> Self {
         Self {
             base_url: config.workspace_url.clone(),
             http_client,
