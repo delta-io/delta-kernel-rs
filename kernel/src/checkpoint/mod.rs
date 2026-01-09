@@ -108,93 +108,6 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 
 use url::Url;
 
-/// Shared state for tracking checkpoint iteration progress.
-///
-/// Used with [`LazyCheckpointData`] to capture counts after the iterator is consumed.
-#[derive(Default)]
-struct CheckpointIterState {
-    actions_count: AtomicI64,
-    add_actions_count: AtomicI64,
-    is_exhausted: AtomicBool,
-}
-
-/// A lazy wrapper around [`ActionReconciliationIterator`] that applies selection vectors on demand.
-///
-/// This wrapper processes batches lazily rather than collecting them all upfront,
-/// which reduces memory usage for large checkpoints. It shares state via [`CheckpointIterState`]
-/// to capture counts after the iterator is consumed by `write_parquet_file`.
-struct LazyCheckpointData {
-    inner: ActionReconciliationIterator,
-    state: Arc<CheckpointIterState>,
-}
-
-impl Iterator for LazyCheckpointData {
-    type Item = DeltaResult<Box<dyn EngineData>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next() {
-            Some(result) => Some(result.and_then(|filtered| filtered.apply_selection_vector())),
-            None => {
-                // Iterator exhausted - capture final counts to shared state
-                self.state
-                    .actions_count
-                    .store(self.inner.actions_count(), Ordering::Release);
-                self.state
-                    .add_actions_count
-                    .store(self.inner.add_actions_count(), Ordering::Release);
-                self.state.is_exhausted.store(true, Ordering::Release);
-                None
-            }
-        }
-    }
-}
-
-/// Performs a complete checkpoint of a table using the provided engine.
-///
-/// This is an "all-in-one" checkpoint function that handles the entire workflow:
-/// 1. Creates the checkpoint data
-/// 2. Writes the checkpoint parquet file using [`Engine::parquet_handler`]
-/// 3. Gets file metadata using [`Engine::storage_handler`]
-/// 4. Writes the `_last_checkpoint` file
-///
-/// Note: This function uses [`ParquetHandler::write_parquet_file`] and [`StorageHandler::head`],
-/// which may not be implemented by all engines (e.g., `SyncEngine`).
-///
-/// # Parameters
-/// - `engine`: Implementation of [`Engine`] APIs.
-/// - `snapshot`: Reference to the snapshot to checkpoint.
-///
-/// # Returns
-/// `Ok(())` if the checkpoint was successfully created, or an error otherwise.
-pub fn perform_checkpoint(engine: &dyn Engine, snapshot: SnapshotRef) -> DeltaResult<()> {
-    let writer = snapshot.checkpoint()?;
-    let checkpoint_path = writer.checkpoint_path()?;
-    let data_iter = writer.checkpoint_data(engine)?;
-
-    // Write the checkpoint parquet file with lazy processing
-    // LazyCheckpointData applies selection vectors on demand rather than collecting all upfront
-    let state = Arc::new(CheckpointIterState::default());
-    let lazy_data = LazyCheckpointData {
-        inner: data_iter,
-        state: Arc::clone(&state),
-    };
-    engine
-        .parquet_handler()
-        .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
-
-    // Get file metadata for the written checkpoint
-    let file_meta = engine.storage_handler().head(&checkpoint_path)?;
-
-    // Reconstruct exhausted iterator with captured counts for finalize
-    let exhausted_iter = ActionReconciliationIterator::with_exhausted_counts(
-        state.actions_count.load(Ordering::Acquire),
-        state.add_actions_count.load(Ordering::Acquire),
-    );
-
-    // Finalize the checkpoint (writes _last_checkpoint file)
-    writer.finalize(engine, &file_meta, exhausted_iter)
-}
-
 #[cfg(test)]
 mod tests;
 
@@ -477,4 +390,91 @@ pub(crate) fn create_last_checkpoint_data(
             add_actions_counter.into(),
         ],
     )
+}
+
+/// Shared state for tracking checkpoint iteration progress.
+///
+/// Used with [`LazyCheckpointData`] to capture counts after the iterator is consumed.
+#[derive(Default)]
+struct CheckpointIterState {
+    actions_count: AtomicI64,
+    add_actions_count: AtomicI64,
+    is_exhausted: AtomicBool,
+}
+
+/// A lazy wrapper around [`ActionReconciliationIterator`] that applies selection vectors on demand.
+///
+/// This wrapper processes batches lazily rather than collecting them all upfront,
+/// which reduces memory usage for large checkpoints. It shares state via [`CheckpointIterState`]
+/// to capture counts after the iterator is consumed by `write_parquet_file`.
+struct LazyCheckpointData {
+    inner: ActionReconciliationIterator,
+    state: Arc<CheckpointIterState>,
+}
+
+impl Iterator for LazyCheckpointData {
+    type Item = DeltaResult<Box<dyn EngineData>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(result) => Some(result.and_then(|filtered| filtered.apply_selection_vector())),
+            None => {
+                // Iterator exhausted - capture final counts to shared state
+                self.state
+                    .actions_count
+                    .store(self.inner.actions_count(), Ordering::Release);
+                self.state
+                    .add_actions_count
+                    .store(self.inner.add_actions_count(), Ordering::Release);
+                self.state.is_exhausted.store(true, Ordering::Release);
+                None
+            }
+        }
+    }
+}
+
+/// Performs a complete checkpoint of a table using the provided engine.
+///
+/// This is an "all-in-one" checkpoint function that handles the entire workflow:
+/// 1. Creates the checkpoint data
+/// 2. Writes the checkpoint parquet file using [`Engine::parquet_handler`]
+/// 3. Gets file metadata using [`Engine::storage_handler`]
+/// 4. Writes the `_last_checkpoint` file
+///
+/// Note: This function uses [`ParquetHandler::write_parquet_file`] and [`StorageHandler::head`],
+/// which may not be implemented by all engines (e.g., `SyncEngine`).
+///
+/// # Parameters
+/// - `engine`: Implementation of [`Engine`] APIs.
+/// - `snapshot`: Reference to the snapshot to checkpoint.
+///
+/// # Returns
+/// `Ok(())` if the checkpoint was successfully created, or an error otherwise.
+pub fn perform_checkpoint(engine: &dyn Engine, snapshot: SnapshotRef) -> DeltaResult<()> {
+    let writer = snapshot.checkpoint()?;
+    let checkpoint_path = writer.checkpoint_path()?;
+    let data_iter = writer.checkpoint_data(engine)?;
+
+    // Write the checkpoint parquet file with lazy processing
+    // LazyCheckpointData applies selection vectors on demand rather than collecting all upfront
+    let state = Arc::new(CheckpointIterState::default());
+    let lazy_data = LazyCheckpointData {
+        inner: data_iter,
+        state: Arc::clone(&state),
+    };
+    engine
+        .parquet_handler()
+        .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+
+    let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+
+    // As [`delta_kernel::ParquetHandler`] requires ownership of xxx, previous data_iter was taken ownership by `write_parquet_file`,
+    // We reconstruct exhausted iterator with captured counts for finalize
+    let exhausted_iter = ActionReconciliationIterator::with_exhausted_counts(
+        state.actions_count.load(Ordering::Acquire),
+        state.add_actions_count.load(Ordering::Acquire),
+    );
+
+    // Finalize the checkpoint (writes _last_checkpoint file)
+    writer.finalize(engine, &file_meta, exhausted_iter)
 }
