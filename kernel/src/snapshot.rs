@@ -557,7 +557,7 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
     use crate::listed_log_files::ListedLogFilesBuilder;
@@ -750,7 +750,7 @@ mod tests {
         // in each test we will modify versions 1 and 2 to test different scenarios
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
-            let engine = DefaultEngine::new(store);
+            let engine = DefaultEngineBuilder::new(store).build();
             let base_snapshot = Snapshot::builder_for(url.clone())
                 .at_version(0)
                 .build(&engine)?;
@@ -800,7 +800,7 @@ mod tests {
         // 3. new version > existing version
         // a. no new log segment
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(Arc::new(store.fork()));
+        let engine = DefaultEngineBuilder::new(Arc::new(store.fork())).build();
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
@@ -873,7 +873,7 @@ mod tests {
 
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store_3c_i);
+        let engine = DefaultEngineBuilder::new(store_3c_i).build();
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
@@ -917,7 +917,7 @@ mod tests {
     async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
         let protocol = |reader_version, writer_version| {
             json!({
                 "protocol": {
@@ -1183,7 +1183,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // commit0
         // - domain1: not removed
@@ -1326,7 +1326,7 @@ mod tests {
     async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let url = url::Url::parse("memory://test/")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create a basic commit without ICT enabled
         let commit0 = create_basic_commit(false, None);
@@ -1346,7 +1346,7 @@ mod tests {
     {
         let store = Arc::new(InMemory::new());
         let url = url::Url::parse("memory://test/")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit without ICT
         let commit0 = create_basic_commit(false, None);
@@ -1386,7 +1386,7 @@ mod tests {
         // Test invalid state where snapshot has enablement version in the future - should error
         let url = Url::parse("memory:///table2")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
             json!({
@@ -1435,7 +1435,7 @@ mod tests {
         // Test missing ICT when it should be present - should error
         let url = Url::parse("memory:///table3")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
             create_protocol(true, Some(3)),
@@ -1467,7 +1467,7 @@ mod tests {
 
         let url = Url::parse("memory:///missing_commit_test")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit with ICT enabled
         let commit_data = [
@@ -1521,7 +1521,7 @@ mod tests {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
         let url = Url::parse("memory:///checkpoint_commit_test")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
@@ -1590,7 +1590,7 @@ mod tests {
     async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit
         let commit0 = vec![
@@ -1628,7 +1628,7 @@ mod tests {
     async fn test_try_new_from_latest_commit_preservation() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits 0-2
         let base_commit = vec![
@@ -1705,7 +1705,7 @@ mod tests {
     async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits
         let base_commit = vec![

@@ -8,7 +8,7 @@ use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::arrow::AsyncArrowWriter;
 
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::{ActionReconciliationIterator, DeltaResult, Error, FileMeta, Snapshot};
 
 /// An example program that checkpoints a table.
@@ -64,7 +64,7 @@ async fn try_main() -> DeltaResult<()> {
 
     use delta_kernel::engine::default::storage::store_from_url;
     let store = store_from_url(&url)?;
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     // first we create a checkpoint writer

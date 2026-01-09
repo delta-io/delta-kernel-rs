@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::DefaultEngine;
+use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFilesBuilder;
@@ -1031,7 +1031,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
@@ -1073,7 +1073,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1100,7 +1100,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let checkpoint_batch =
@@ -1141,7 +1141,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
@@ -1189,7 +1189,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1259,7 +1259,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     add_checkpoint_to_store(
         &store,
@@ -1311,7 +1311,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1370,7 +1370,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
     add_sidecar_to_store(
@@ -2513,7 +2513,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     use crate::schema::{StructField, StructType};
 
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Create a V1 checkpoint (without sidecar column)
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::Snapshot;
 use object_store::local::LocalFileSystem;
 use serde_json::json;
@@ -110,7 +110,7 @@ fn test_dhat_large_table_log() -> Result<(), Box<dyn std::error::Error>> {
     let _profiler = dhat::Profiler::builder().testing().build();
     let store = Arc::new(LocalFileSystem::new());
     let url = Url::from_directory_path(table_path).unwrap();
-    let engine = DefaultEngine::new(store);
+    let engine = DefaultEngineBuilder::new(store).build();
 
     let snapshot = Snapshot::builder_for(url)
         .build(&engine)

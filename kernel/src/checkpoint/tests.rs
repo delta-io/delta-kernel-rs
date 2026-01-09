@@ -12,7 +12,7 @@ use crate::arrow::{
 };
 use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
-use crate::engine::default::DefaultEngine;
+use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
 use crate::utils::test_utils::Action;
@@ -59,7 +59,7 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -116,7 +116,7 @@ fn test_create_last_checkpoint_data() -> DeltaResult<()> {
     let add_actions_counter = 75;
     let size_in_bytes: i64 = 1024 * 1024; // 1MB
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Create last checkpoint metadata
     let last_checkpoint_batch = create_last_checkpoint_data(
@@ -269,7 +269,7 @@ async fn read_last_checkpoint_file(store: &Arc<InMemory>) -> DeltaResult<Value> 
 #[tokio::test]
 async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // 1st commit: adds `fake_path_1`
     write_commit_to_store(&store, vec![create_add_action("fake_path_1")], 0).await?;
@@ -341,7 +341,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // 1st commit (version 0) - metadata and protocol actions
     // Protocol action does not include the v2Checkpoint reader/writer feature.
@@ -405,7 +405,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // 1st commit (version 0) - metadata and protocol actions
     write_commit_to_store(
@@ -448,7 +448,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 #[tokio::test]
 async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // 1st commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
@@ -522,7 +522,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // normal commit
     write_commit_to_store(
