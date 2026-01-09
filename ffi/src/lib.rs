@@ -51,6 +51,7 @@ pub mod log_path;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
+pub mod v2;
 
 #[cfg(test)]
 mod ffi_test_utils;
