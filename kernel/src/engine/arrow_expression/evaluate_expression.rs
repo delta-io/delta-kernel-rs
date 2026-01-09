@@ -159,12 +159,19 @@ fn evaluate_transform_expression(
     }
 
     // Extract the input path, if any
-    let source_data = transform
+    let source_array = transform
         .input_path()
         .map(|path| extract_column(batch, path))
         .transpose()?;
 
-    let source_data: &dyn ProvidesColumnByName = match source_data {
+    // For nested transforms, get the source struct's null bitmap to preserve null rows
+    let source_null_buffer = source_array.as_ref().and_then(|arr| {
+        arr.as_any()
+            .downcast_ref::<StructArray>()
+            .and_then(|s| s.nulls().cloned())
+    });
+
+    let source_data: &dyn ProvidesColumnByName = match source_array {
         Some(ref array) => array
             .as_any()
             .downcast_ref::<StructArray>()
@@ -204,7 +211,7 @@ fn evaluate_transform_expression(
         return Err(Error::generic("Too many fields in output schema"));
     }
 
-    // Build the final struct
+    // Build the final struct, preserving null bitmap for nested transforms
     let output_fields: Vec<ArrowField> = output_cols
         .iter()
         .zip(output_schema.fields())
@@ -216,7 +223,7 @@ fn evaluate_transform_expression(
             )
         })
         .collect();
-    let data = StructArray::try_new(output_fields.into(), output_cols, None)?;
+    let data = StructArray::try_new(output_fields.into(), output_cols, source_null_buffer)?;
     Ok(Arc::new(data))
 }
 

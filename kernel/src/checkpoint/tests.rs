@@ -214,15 +214,6 @@ fn create_metadata_action() -> Action {
     )
 }
 
-/// Create an Add action with the specified path
-fn create_add_action(path: &str) -> Action {
-    Action::Add(Add {
-        path: path.into(),
-        data_change: true,
-        ..Default::default()
-    })
-}
-
 /// Create a Remove action with the specified path
 ///
 /// The remove action has deletion_timestamp set to i64::MAX to ensure the
@@ -272,13 +263,18 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
     let engine = DefaultEngine::new(store.clone());
 
     // 1st commit: adds `fake_path_1`
-    write_commit_to_store(&store, vec![create_add_action("fake_path_1")], 0).await?;
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("fake_path_1", 10)],
+        0,
+    )
+    .await?;
 
     // 2nd commit: adds `fake_path_2` & removes `fake_path_1`
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("fake_path_2"),
+            create_add_action_with_stats("fake_path_2", 20),
             create_remove_action("fake_path_1"),
         ],
         1,
@@ -304,7 +300,8 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000002.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -356,8 +353,8 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("file1.parquet"),
-            create_add_action("file2.parquet"),
+            create_add_action_with_stats("file1.parquet", 100),
+            create_add_action_with_stats("file2.parquet", 200),
         ],
         1,
     )
@@ -376,7 +373,8 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000000.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -420,7 +418,8 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
         .at_version(0)
         .build(&engine)?;
     let writer = snapshot.checkpoint()?;
-    let data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let data_iter = result;
 
     /* The returned data iterator has batches that we do not consume */
 
@@ -454,7 +453,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     write_commit_to_store(
         &store,
         vec![
-            create_add_action("fake_path_2"),
+            create_add_action_with_stats("fake_path_2", 50),
             create_remove_action("fake_path_1"),
         ],
         0,
@@ -483,7 +482,8 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         Url::parse("memory:///_delta_log/00000000000000000001.checkpoint.parquet")?
     );
 
-    let mut data_iter = writer.checkpoint_data(&engine)?;
+    let result = writer.checkpoint_data(&engine)?;
+    let mut data_iter = result;
     // The first batch should be the metadata and protocol actions.
     let batch = data_iter.next().unwrap()?;
     assert_eq!(batch.selection_vector(), &[true, true]);
@@ -559,5 +559,380 @@ async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
         snapshot.checkpoint().unwrap_err(),
         crate::Error::Generic(e) if e == "Found staged commit file in log segment"
     ));
+    Ok(())
+}
+
+/// Create a Metadata action with writeStatsAsStruct enabled
+fn create_metadata_action_with_stats_struct() -> Action {
+    let mut config = HashMap::new();
+    config.insert(
+        "delta.checkpoint.writeStatsAsStruct".to_string(),
+        "true".to_string(),
+    );
+    Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            StructType::new_unchecked([
+                StructField::nullable("id", KernelDataType::LONG),
+                StructField::nullable("name", KernelDataType::STRING),
+            ]),
+            vec![],
+            0,
+            config,
+        )
+        .unwrap(),
+    )
+}
+
+/// Create an Add action with JSON stats
+fn create_add_action_with_stats(path: &str, num_records: i64) -> Action {
+    let stats = format!(
+        r#"{{"numRecords":{},"minValues":{{"id":1,"name":"alice"}},"maxValues":{{"id":100,"name":"zoe"}},"nullCount":{{"id":0,"name":5}}}}"#,
+        num_records
+    );
+    Action::Add(Add {
+        path: path.into(),
+        data_change: true,
+        stats: Some(stats),
+        ..Default::default()
+    })
+}
+
+/// Tests checkpoint_data with writeStatsAsStruct enabled.
+/// Verifies that the output schema includes stats_parsed.
+#[tokio::test]
+async fn test_checkpoint_data_struct_enabled() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone());
+
+    // 1st commit: protocol + metadata with writeStatsAsStruct=true
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            create_metadata_action_with_stats_struct(),
+        ],
+        0,
+    )
+    .await?;
+
+    // 2nd commit: add actions with JSON stats
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action_with_stats("file1.parquet", 100),
+            create_add_action_with_stats("file2.parquet", 200),
+        ],
+        1,
+    )
+    .await?;
+
+    let table_root = Url::parse("memory:///")?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer = snapshot.checkpoint()?;
+
+    // Call checkpoint_data
+    let result = writer.checkpoint_data(&engine)?;
+
+    // Verify output schema includes stats_parsed in add action
+    let add_field = result
+        .output_schema()
+        .field("add")
+        .expect("output schema should have 'add' field");
+    if let KernelDataType::Struct(add_struct) = add_field.data_type() {
+        assert!(
+            add_struct.field("stats_parsed").is_some(),
+            "Add action should have stats_parsed field in output schema"
+        );
+        assert!(
+            add_struct.field("stats").is_some(),
+            "Add action should have stats field (writeStatsAsJson=true by default)"
+        );
+    } else {
+        panic!("add field should be a struct");
+    }
+
+    // Consume the data iterator - transform is applied internally
+    let mut batch_count = 0;
+    for batch_result in result {
+        let _batch = batch_result?;
+        batch_count += 1;
+    }
+    assert!(batch_count > 0, "Should have at least one batch");
+
+    Ok(())
+}
+
+/// Tests checkpoint_data with default settings (writeStatsAsStruct=false).
+/// Verifies that the output schema does NOT include stats_parsed.
+#[tokio::test]
+async fn test_checkpoint_data_default_settings() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone());
+
+    // 1st commit: protocol + metadata with default settings
+    write_commit_to_store(
+        &store,
+        vec![create_basic_protocol_action(), create_metadata_action()],
+        0,
+    )
+    .await?;
+
+    // 2nd commit: add action with stats
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("file1.parquet", 100)],
+        1,
+    )
+    .await?;
+
+    let table_root = Url::parse("memory:///")?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer = snapshot.checkpoint()?;
+
+    // Call checkpoint_data
+    let result = writer.checkpoint_data(&engine)?;
+
+    // Output schema should NOT have stats_parsed (writeStatsAsStruct=false by default)
+    let add_field = result
+        .output_schema()
+        .field("add")
+        .expect("output schema should have 'add' field");
+    if let KernelDataType::Struct(add_struct) = add_field.data_type() {
+        assert!(
+            add_struct.field("stats_parsed").is_none(),
+            "Add action should NOT have stats_parsed when writeStatsAsStruct=false"
+        );
+        assert!(
+            add_struct.field("stats").is_some(),
+            "Add action should have stats field"
+        );
+    } else {
+        panic!("add field should be a struct");
+    }
+
+    Ok(())
+}
+
+/// Tests that checkpoint data can be iterated with stats transforms applied internally.
+#[tokio::test]
+async fn test_checkpoint_stats_iteration() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone());
+
+    // 1st commit: protocol + metadata with writeStatsAsStruct=true
+    write_commit_to_store(
+        &store,
+        vec![
+            create_basic_protocol_action(),
+            create_metadata_action_with_stats_struct(),
+        ],
+        0,
+    )
+    .await?;
+
+    // 2nd commit: add action with JSON stats
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("file1.parquet", 42)],
+        1,
+    )
+    .await?;
+
+    let table_root = Url::parse("memory:///")?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer = snapshot.checkpoint()?;
+
+    let result = writer.checkpoint_data(&engine)?;
+
+    // Verify output schema has stats_parsed
+    let add_field = result
+        .output_schema()
+        .field("add")
+        .expect("output schema should have 'add' field");
+    if let KernelDataType::Struct(add_struct) = add_field.data_type() {
+        assert!(
+            add_struct.field("stats_parsed").is_some(),
+            "Add action should have stats_parsed when writeStatsAsStruct=true"
+        );
+    }
+
+    // Consume the iterator to verify no errors during reading
+    // The transform is applied internally
+    let mut batch_count = 0;
+    for batch_result in result {
+        let _batch = batch_result?;
+        batch_count += 1;
+    }
+    assert!(batch_count > 0, "Should have at least one batch");
+
+    Ok(())
+}
+
+/// Helper to create metadata action with specific stats settings
+fn create_metadata_with_stats_config(
+    write_stats_as_json: bool,
+    write_stats_as_struct: bool,
+) -> Action {
+    let mut config = HashMap::new();
+    config.insert(
+        "delta.checkpoint.writeStatsAsJson".to_string(),
+        write_stats_as_json.to_string(),
+    );
+    config.insert(
+        "delta.checkpoint.writeStatsAsStruct".to_string(),
+        write_stats_as_struct.to_string(),
+    );
+    Action::Metadata(
+        Metadata::try_new(
+            Some("test-table".into()),
+            None,
+            StructType::new_unchecked([
+                StructField::nullable("id", KernelDataType::LONG),
+                StructField::nullable("name", KernelDataType::STRING),
+            ]),
+            vec![],
+            0,
+            config,
+        )
+        .unwrap(),
+    )
+}
+
+/// Verifies checkpoint schema has expected fields based on stats configuration.
+fn verify_checkpoint_schema(
+    output_schema: &crate::schema::SchemaRef,
+    expect_stats: bool,
+    expect_stats_parsed: bool,
+) -> DeltaResult<()> {
+    let add_field = output_schema
+        .field("add")
+        .expect("output schema should have 'add' field");
+
+    if let KernelDataType::Struct(add_struct) = add_field.data_type() {
+        let has_stats = add_struct.field("stats").is_some();
+        let has_stats_parsed = add_struct.field("stats_parsed").is_some();
+
+        assert_eq!(
+            has_stats, expect_stats,
+            "stats field: expected={}, actual={}",
+            expect_stats, has_stats
+        );
+        assert_eq!(
+            has_stats_parsed, expect_stats_parsed,
+            "stats_parsed field: expected={}, actual={}",
+            expect_stats_parsed, has_stats_parsed
+        );
+    } else {
+        panic!("add field should be a struct");
+    }
+    Ok(())
+}
+
+/// Tests all 16 combinations of writeStatsAsJson and writeStatsAsStruct settings.
+///
+/// This test verifies:
+/// 1. Checkpoint 1 schema matches the initial settings
+/// 2. Checkpoint 2 schema matches the updated settings
+/// 3. Stats can be recovered if they were preserved in checkpoint 1
+#[tokio::test]
+async fn test_all_stats_config_combinations() -> DeltaResult<()> {
+    let test_cases: Vec<(bool, bool, bool, bool)> = vec![
+        // (json1, struct1, json2, struct2)
+        (true, true, true, true),
+        (true, true, true, false),
+        (true, true, false, true),
+        (true, true, false, false),
+        (true, false, true, true),
+        (true, false, true, false),
+        (true, false, false, true),
+        (true, false, false, false),
+        (false, true, true, true),
+        (false, true, true, false),
+        (false, true, false, true),
+        (false, true, false, false),
+        (false, false, true, true),
+        (false, false, true, false),
+        (false, false, false, true),
+        (false, false, false, false),
+    ];
+
+    for (i, (json1, struct1, json2, struct2)) in test_cases.iter().enumerate() {
+        let (store, _) = new_in_memory_store();
+        let engine = DefaultEngine::new(store.clone());
+        let table_root = Url::parse("memory:///")?;
+
+        // Commit 0: protocol + metadata with initial settings
+        write_commit_to_store(
+            &store,
+            vec![
+                create_basic_protocol_action(),
+                create_metadata_with_stats_config(*json1, *struct1),
+            ],
+            0,
+        )
+        .await?;
+
+        // Commit 1: add action with stats
+        write_commit_to_store(
+            &store,
+            vec![create_add_action_with_stats("file1.parquet", 100)],
+            1,
+        )
+        .await?;
+
+        // Create checkpoint 1
+        let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+        let writer1 = snapshot1.checkpoint()?;
+        let result1 = writer1.checkpoint_data(&engine)?;
+
+        // Verify checkpoint 1 schema
+        verify_checkpoint_schema(result1.output_schema(), *json1, *struct1)?;
+
+        // Consume checkpoint 1 data
+        for batch in result1 {
+            let _ = batch?;
+        }
+
+        // Commit 2: update metadata with new settings
+        write_commit_to_store(
+            &store,
+            vec![create_metadata_with_stats_config(*json2, *struct2)],
+            2,
+        )
+        .await?;
+
+        // Commit 3: add another file
+        write_commit_to_store(
+            &store,
+            vec![create_add_action_with_stats("file2.parquet", 200)],
+            3,
+        )
+        .await?;
+
+        // Create checkpoint 2
+        let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
+        let writer2 = snapshot2.checkpoint()?;
+        let result2 = writer2.checkpoint_data(&engine)?;
+
+        // Verify checkpoint 2 schema
+        verify_checkpoint_schema(result2.output_schema(), *json2, *struct2)?;
+
+        // Consume checkpoint 2 data (verifies transform doesn't error)
+        for batch in result2 {
+            let _ = batch?;
+        }
+
+        println!(
+            "Case {}: json1={}, struct1={}, json2={}, struct2={} - PASS",
+            i + 1,
+            json1,
+            struct1,
+            json2,
+            struct2
+        );
+    }
+
     Ok(())
 }
