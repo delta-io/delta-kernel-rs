@@ -171,16 +171,16 @@ mod tests {
         let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
 
         // build clients
-        let client = UCClient::new(config.clone())?;
-        let commits_client = UCCommitsRestClient::new(config)?;
+        let uc_client = UCClient::new(config.clone())?;
+        let uc_commits_client = UCCommitsRestClient::new(config)?;
 
-        let (table_id, table_uri) = get_table(&client, &table_name).await?;
-        let creds = client
+        let (table_id, table_uri) = get_table(&uc_client, &table_name).await?;
+        let creds = uc_client
             .get_credentials(&table_id, Operation::Read)
             .await
             .map_err(|e| format!("Failed to get credentials: {}", e))?;
 
-        let catalog = UCCatalog::new(&commits_client);
+        let catalog = UCCatalog::new(&uc_commits_client);
 
         // TODO: support non-AWS
         let creds = creds
