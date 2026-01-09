@@ -1,13 +1,13 @@
-use std::future::Future;
 use std::time::Duration;
 
-use reqwest::{header, Client, Response, StatusCode};
+use reqwest::StatusCode;
 use serde::Deserialize;
-use tracing::{instrument, warn};
+use tracing::instrument;
 use url::Url;
 
 use crate::config::{ClientConfig, ClientConfigBuilder};
 use crate::error::{Error, Result};
+use crate::http::{build_http_client, execute_with_retry, handle_response};
 use crate::models::commits::{CommitRequest, CommitsRequest, CommitsResponse};
 use crate::models::credentials::{CredentialsRequest, Operation, TemporaryTableCredentials};
 use crate::models::tables::TablesResponse;
@@ -15,7 +15,7 @@ use crate::models::tables::TablesResponse;
 /// An HTTP client for interacting with the Unity Catalog API.
 #[derive(Debug, Clone)]
 pub struct UCClient {
-    client: Client,
+    client: reqwest::Client,
     config: ClientConfig,
     base_url: Url,
 }
@@ -23,25 +23,8 @@ pub struct UCClient {
 impl UCClient {
     /// Create a new client from [ClientConfig].
     pub fn new(config: ClientConfig) -> Result<Self> {
-        // default headers with authorization and content type
-        let mut headers = header::HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", config.token))?,
-        );
-        headers.insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
-        );
-
-        let client = Client::builder()
-            .default_headers(headers)
-            .timeout(config.timeout)
-            .connect_timeout(config.connect_timeout)
-            .build()?;
-
         Ok(Self {
-            client,
+            client: build_http_client(&config)?,
             base_url: config.workspace_url.clone(),
             config,
         })
@@ -56,37 +39,32 @@ impl UCClient {
     #[instrument(skip(self))]
     pub async fn get_commits(&self, request: CommitsRequest) -> Result<CommitsResponse> {
         let url = self.base_url.join("delta/preview/commits")?;
-        let response = self
-            .execute_with_retry(|| {
-                self.client
-                    .request(reqwest::Method::GET, url.clone())
-                    .json(&request)
-                    .send()
-            })
-            .await?;
+        let response = execute_with_retry(&self.config, || {
+            self.client
+                .request(reqwest::Method::GET, url.clone())
+                .json(&request)
+                .send()
+        })
+        .await?;
 
-        self.handle_response(response).await
+        handle_response(response).await
     }
 
     /// Commit a new version to the table.
     #[instrument(skip(self))]
     pub async fn commit(&self, request: CommitRequest) -> Result<()> {
         let url = self.base_url.join("delta/preview/commits")?;
-        println!("Committing {request:?}");
-        let response = self
-            .execute_with_retry(|| {
-                self.client
-                    .request(reqwest::Method::POST, url.clone())
-                    .json(&request)
-                    .send()
-            })
-            .await?;
+        let response = execute_with_retry(&self.config, || {
+            self.client
+                .request(reqwest::Method::POST, url.clone())
+                .json(&request)
+                .send()
+        })
+        .await?;
 
-        // Note: can't just deserialize to () directly so we make an empty struct to deserialize
-        // the `{}` into. Externally we still return unit type for ease of use/understanding.
         #[derive(Deserialize)]
         struct EmptyResponse {}
-        let _: EmptyResponse = self.handle_response(response).await?;
+        let _: EmptyResponse = handle_response(response).await?;
         Ok(())
     }
 
@@ -95,13 +73,12 @@ impl UCClient {
     pub async fn get_table(&self, table_name: &str) -> Result<TablesResponse> {
         let url = self.base_url.join(&format!("tables/{}", table_name))?;
 
-        let response = self
-            .execute_with_retry(|| self.client.get(url.clone()).send())
-            .await?;
+        let response =
+            execute_with_retry(&self.config, || self.client.get(url.clone()).send()).await?;
 
         match response.status() {
             StatusCode::NOT_FOUND => Err(Error::TableNotFound(table_name.to_string())),
-            _ => self.handle_response(response).await,
+            _ => handle_response(response).await,
         }
     }
 
@@ -115,79 +92,12 @@ impl UCClient {
         let url = self.base_url.join("temporary-table-credentials")?;
 
         let request_body = CredentialsRequest::new(table_id, operation);
-        let response = self
-            .execute_with_retry(|| self.client.post(url.clone()).json(&request_body).send())
-            .await?;
+        let response = execute_with_retry(&self.config, || {
+            self.client.post(url.clone()).json(&request_body).send()
+        })
+        .await?;
 
-        self.handle_response(response).await
-    }
-
-    async fn execute_with_retry<F, Fut>(&self, f: F) -> Result<Response>
-    where
-        F: Fn() -> Fut,
-        Fut: Future<Output = std::result::Result<Response, reqwest::Error>>,
-    {
-        for retry in 0..=self.config.max_retries {
-            match f().await {
-                Ok(response) if !response.status().is_server_error() => return Ok(response),
-                Ok(response) if retry < self.config.max_retries => {
-                    warn!(
-                        "Server error {}, retrying (attempt {}/{})",
-                        response.status(),
-                        retry + 1,
-                        self.config.max_retries
-                    );
-                }
-                Ok(response) => {
-                    return Err(Error::ApiError {
-                        status: response.status().as_u16(),
-                        message: "Server error".to_string(),
-                    })
-                }
-                Err(e) if retry < self.config.max_retries => {
-                    warn!(
-                        "Request failed, retrying (attempt {}/{}): {}",
-                        retry + 1,
-                        self.config.max_retries,
-                        e
-                    );
-                }
-                Err(e) => return Err(Error::from(e)),
-            }
-
-            tokio::time::sleep(self.config.retry_base_delay * (retry + 1)).await;
-        }
-
-        // this is actually unreachable since we return in the loop for Ok/Err after all retries
-        Err(Error::MaxRetriesExceeded)
-    }
-
-    async fn handle_response<T>(&self, response: Response) -> Result<T>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let status = response.status();
-
-        if status.is_success() {
-            response.json::<T>().await.map_err(Error::from)
-        } else {
-            let error_body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            match status {
-                StatusCode::UNAUTHORIZED => Err(Error::AuthenticationFailed),
-                StatusCode::NOT_FOUND => Err(Error::ApiError {
-                    status: status.as_u16(),
-                    message: format!("Resource not found: {}", error_body),
-                }),
-                _ => Err(Error::ApiError {
-                    status: status.as_u16(),
-                    message: error_body,
-                }),
-            }
-        }
+        handle_response(response).await
     }
 }
 
