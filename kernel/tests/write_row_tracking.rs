@@ -75,7 +75,7 @@ async fn test_row_tracking_fields_in_add_and_remove_actions(
     )?;
 
     let engine_arc = Arc::new(engine);
-    let write_context = Arc::new(txn.get_write_context());
+    let write_context = Arc::new(txn.get_write_context()?);
     let add_files_metadata = engine_arc
         .write_parquet(
             &ArrowEngineData::new(data),
