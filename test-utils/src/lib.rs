@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
 };
-
+use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::storage::store_from_url;
@@ -501,4 +503,71 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
             );
         }
     }
+}
+
+/// Creates add file metadata for one or more files without partition values.
+/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+pub fn create_add_files_metadata(
+    add_files_schema: &SchemaRef,
+    files: Vec<(&str, i64, i64, i64)>,
+) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+    let num_files = files.len();
+
+    // Build arrays for each file
+    let path_array = StringArray::from(files.iter().map(|(p, _, _, _)| *p).collect::<Vec<_>>());
+    let size_array = Int64Array::from(files.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>());
+    let mod_time_array = Int64Array::from(files.iter().map(|(_, _, m, _)| *m).collect::<Vec<_>>());
+    let num_records_array =
+        Int64Array::from(files.iter().map(|(_, _, _, n)| *n).collect::<Vec<_>>());
+
+    // Create empty map for partitionValues (repeated for each file)
+    let entries_field = Arc::new(Field::new(
+        "key_value",
+        ArrowDataType::Struct(
+            vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+    let empty_keys = StringArray::from(Vec::<&str>::new());
+    let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+    let empty_entries = StructArray::from(vec![
+        (
+            Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+            Arc::new(empty_keys) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            Arc::new(empty_values) as ArrayRef,
+        ),
+    ]);
+    let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+    let partition_values_array = Arc::new(MapArray::new(
+        entries_field,
+        offsets,
+        empty_entries,
+        None,
+        false,
+    ));
+
+    let stats_struct = StructArray::from(vec![(
+        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+        Arc::new(num_records_array) as ArrayRef,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
+        vec![
+            Arc::new(path_array) as ArrayRef,
+            partition_values_array as ArrayRef,
+            Arc::new(size_array) as ArrayRef,
+            Arc::new(mod_time_array) as ArrayRef,
+            Arc::new(stats_struct) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Box::new(ArrowEngineData::new(batch)))
 }

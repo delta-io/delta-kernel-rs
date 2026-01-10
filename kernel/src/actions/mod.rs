@@ -86,6 +86,8 @@ static ALL_ACTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ))
 });
 
+/// Schema for Add actions in the Delta log.
+/// Wraps the Add action schema in a top-level struct with "add" field name.
 static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         ADD_NAME,
@@ -93,6 +95,8 @@ static LOG_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+/// Schema for Remove actions in the Delta log.
+/// Wraps the Remove action schema in a top-level struct with "remove" field name.
 static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         REMOVE_NAME,
@@ -100,6 +104,8 @@ static LOG_REMOVE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+/// Schema for CommitInfo actions in the Delta log.
+/// Wraps the CommitInfo schema in a top-level struct with "commitInfo" field name.
 static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         COMMIT_INFO_NAME,
@@ -107,6 +113,8 @@ static LOG_COMMIT_INFO_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
+/// Schema for transaction (txn) actions in the Delta log.
+/// Wraps the SetTransaction schema in a top-level struct with "txn" field name.
 static LOG_TXN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(StructType::new_unchecked([StructField::nullable(
         SET_TRANSACTION_NAME,

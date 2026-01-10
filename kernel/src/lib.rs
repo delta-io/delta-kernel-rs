@@ -153,6 +153,7 @@ pub(crate) mod history_manager;
 
 pub use action_reconciliation::ActionReconciliationIterator;
 pub use delta_kernel_derive;
+use delta_kernel_derive::internal_api;
 pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
 pub use error::{DeltaResult, Error};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
@@ -460,6 +461,7 @@ pub trait EvaluationHandler: AsAny {
 /// EvaluationHandlers.
 // For some reason rustc doesn't detect it's usage so we allow(dead_code) here...
 #[allow(dead_code)]
+#[internal_api]
 trait EvaluationHandlerExtension: EvaluationHandler {
     /// Create a single-row [`EngineData`] by applying the given schema to the leaf-values given in
     /// `values`.
@@ -511,6 +513,7 @@ impl<T: EvaluationHandler + ?Sized> EvaluationHandlerExtension for T {}
 /// let engine = todo!(); // create an engine
 /// let engine_data = my_struct.into_engine_data(schema, engine);
 /// ```
+#[internal_api]
 pub(crate) trait IntoEngineData {
     /// Consume this type to produce a single-row EngineData using the provided schema.
     fn into_engine_data(
@@ -882,68 +885,4 @@ compile_error!(
 // done in unit tests). This module is not exclusively for macro tests only so other doctests can also be added.
 // https://doc.rust-lang.org/rustdoc/write-documentation/documentation-tests.html#include-items-only-when-collecting-doctests
 #[cfg(doctest)]
-mod doc_tests {
-
-    /// ```
-    /// # use delta_kernel_derive::ToSchema;
-    /// #[derive(ToSchema)]
-    /// pub struct WithFields {
-    ///     some_name: String,
-    /// }
-    /// ```
-    #[cfg(doctest)]
-    pub struct MacroTestStructWithField;
-
-    /// ```compile_fail
-    /// # use delta_kernel_derive::ToSchema;
-    /// #[derive(ToSchema)]
-    /// pub struct NoFields;
-    /// ```
-    #[cfg(doctest)]
-    pub struct MacroTestStructWithoutField;
-
-    /// ```
-    /// # use delta_kernel_derive::ToSchema;
-    /// # use std::collections::HashMap;
-    /// #[derive(ToSchema)]
-    /// pub struct WithAngleBracketPath {
-    ///     map_field: HashMap<String, String>,
-    /// }
-    /// ```
-    #[cfg(doctest)]
-    pub struct MacroTestStructWithAngleBracketedPathField;
-
-    /// ```
-    /// # use delta_kernel_derive::ToSchema;
-    /// # use std::collections::HashMap;
-    /// #[derive(ToSchema)]
-    /// pub struct WithAttributedField {
-    ///     #[allow_null_container_values]
-    ///     map_field: HashMap<String, String>,
-    /// }
-    /// ```
-    #[cfg(doctest)]
-    pub struct MacroTestStructWithAttributedField;
-
-    /// ```compile_fail
-    /// # use delta_kernel_derive::ToSchema;
-    /// #[derive(ToSchema)]
-    /// pub struct WithInvalidAttributeTarget {
-    ///     #[allow_null_container_values]
-    ///     some_name: String,
-    /// }
-    /// ```
-    #[cfg(doctest)]
-    pub struct MacroTestStructWithInvalidAttributeTarget;
-
-    /// ```compile_fail
-    /// # use delta_kernel_derive::ToSchema;
-    /// # use syn::Token;
-    /// #[derive(ToSchema)]
-    /// pub struct WithInvalidFieldType {
-    ///     token: Token![struct],
-    /// }
-    /// ```
-    #[cfg(doctest)]
-    pub struct MacroTestStructWithInvalidFieldType;
-}
+mod doctests;
