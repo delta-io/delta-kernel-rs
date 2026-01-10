@@ -868,7 +868,7 @@ pub trait DataSkippingPredicateEvaluator {
                 // // The following case is not currently used but included for completeness and to ensure correctness in the future if logic is changed to use it.
                 // !(max > val) or max < val
                 (Ordering::Greater, true) | (Ordering::Less, false) => {
-                    return self.eval_partial_cmp(ord, max, &val, inverted);
+                    return self.eval_partial_cmp(ord, max, val, inverted);
                 }
                 // Equality comparison can't be applied as max stats is truncated to milliseconds, so actual microsecond value is unknown.
                 (Ordering::Equal, _) => return None,
