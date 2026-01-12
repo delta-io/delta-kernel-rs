@@ -8,6 +8,12 @@ use crate::http::{build_http_client, execute_with_retry, handle_response};
 use crate::models::commits::{CommitRequest, CommitsRequest, CommitsResponse};
 
 /// Trait for UC commits API operations.
+///
+/// Implementations of this trait are responsible for performing any necessary retries on transient
+/// failures. This trait is designed to be injected into a [`UCCommitter`], which itself does not
+/// perform any retries and relies on the underlying client implementation to handle retry logic.
+///
+/// [`UCCommitter`]: uc_catalog::committer::UCCommitter
 #[allow(async_fn_in_trait)]
 pub trait UCCommitsClient: Send + Sync {
     /// Get the latest commits for the table.
