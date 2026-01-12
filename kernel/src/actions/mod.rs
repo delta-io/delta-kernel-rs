@@ -786,6 +786,7 @@ pub(crate) struct Remove {
 
     /// A map from partition column to value for this logical file.
     #[cfg_attr(test, serde(skip_serializing_if = "Option::is_none"))]
+    //#[allow_null_container_values]
     pub(crate) partition_values: Option<HashMap<String, String>>,
 
     /// The size of this data file in bytes
@@ -1002,12 +1003,10 @@ mod tests {
             },
             datatypes::{DataType as ArrowDataType, Field, Schema},
             json::ReaderBuilder,
-        },
-        engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
-        schema::{ArrayType, DataType, MapType, StructField},
-        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+        }, engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler, default::{executor::tokio::TokioBackgroundExecutor, json::DefaultJsonHandler}}, schema::{ArrayType, DataType, MapType, StructField}, utils::test_utils::string_array_to_engine_data, Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler
     };
     use serde_json::json;
+
 
     // duplicated
     struct ExprEngine(Arc<dyn EvaluationHandler>);
@@ -1130,7 +1129,7 @@ mod tests {
     fn partition_values_field() -> StructField {
         StructField::nullable(
             "partitionValues",
-            MapType::new(DataType::STRING, DataType::STRING, false),
+            MapType::new(DataType::STRING, DataType::STRING, true),
         )
     }
 
@@ -2055,5 +2054,26 @@ mod tests {
             tags.get("MIN_INSERTION_TIME"),
             Some(&Some("1677811178336000".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn can_handle_null_in_partition_vals() -> Result<(), Box<dyn std::error::Error>> {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let handler = DefaultJsonHandler::new(store, Arc::new(TokioBackgroundExecutor::new()));
+        let json_strings = StringArray::from(vec![
+//            r#"{"add":{"path":"year=__HIVE_DEFAULT_PARTITION__/part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet","partitionValues":{"year":null},"size":635,"modificationTime":1677811178336,"dataChange":true}}"#,
+            r#"{"path":"year=__HIVE_DEFAULT_PARTITION__/part-00000-91c1b6e8-946f-4fda-9606-681bbc5e0060-c000.snappy.parquet","dataChange":false,"deletionTimestamp":1765404822621,"partitionValues":{"other": "yes", "year":null},"size":786}"#,
+        ]);
+        let schema = Remove::to_schema();
+        //let output_schema = get_commit_schema().clone();
+
+        println!("Array: {json_strings:?}");
+
+        let batch = handler
+            .parse_json(string_array_to_engine_data(json_strings), schema.into())?;
+        let record_batch = batch.try_into_record_batch().unwrap();
+        println!("Batch: {record_batch:#?}");
+        
+        Ok(())
     }
 }
