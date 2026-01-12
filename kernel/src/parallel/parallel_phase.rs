@@ -9,10 +9,14 @@ use std::sync::Arc;
 
 use delta_kernel_derive::internal_api;
 
-use crate::log_reader::checkpoint_leaf::CheckpointLeafReader;
+use crate::log_replay::ActionsBatch;
 use crate::log_replay::ParallelLogReplayProcessor;
 use crate::scan::CHECKPOINT_READ_SCHEMA;
+use crate::schema::SchemaRef;
+use crate::EngineData;
 use crate::{DeltaResult, Engine, FileMeta};
+
+use itertools::Itertools;
 
 /// Processes checkpoint leaf files in parallel using a shared processor.
 ///
@@ -21,7 +25,7 @@ use crate::{DeltaResult, Engine, FileMeta};
 #[allow(unused)]
 pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
     processor: P,
-    leaf_checkpoint_reader: CheckpointLeafReader,
+    leaf_checkpoint_reader: Box<dyn Iterator<Item = DeltaResult<ActionsBatch>>>,
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
@@ -38,12 +42,38 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
         processor: P,
         leaf_files: Vec<FileMeta>,
     ) -> DeltaResult<Self> {
-        let leaf_checkpoint_reader =
-            CheckpointLeafReader::try_new(engine, leaf_files, CHECKPOINT_READ_SCHEMA.clone())?;
+        let leaf_checkpoint_reader = engine
+            .parquet_handler()
+            .read_parquet_files(&leaf_files, Self::file_read_schema(), None)?
+            .map_ok(|batch| ActionsBatch::new(batch, false));
         Ok(Self {
             processor,
-            leaf_checkpoint_reader,
+            leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
         })
+    }
+
+    /// Creates a new parallel phase for processing checkpoint from an existing iterator of
+    /// EngineData.
+    ///
+    /// # Parameters
+    /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
+    /// - `iter`: An iterator of EngineData from reading a leaf-level Checkpoint file (ie; one that
+    ///   does not reference sidecar files).
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn try_new_from_iter(
+        processor: P,
+        iter: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
+    ) -> Self {
+        let leaf_checkpoint_reader = iter.map_ok(|batch| ActionsBatch::new(batch, false));
+        Self {
+            processor,
+            leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
+        }
+    }
+
+    pub(crate) fn file_read_schema() -> SchemaRef {
+        CHECKPOINT_READ_SCHEMA.clone()
     }
 }
 
@@ -63,30 +93,22 @@ mod tests {
     use super::*;
     use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
     use crate::scan::log_replay::ScanLogReplayProcessor;
+    use crate::scan::state::ScanFile;
     use crate::scan::state_info::StateInfo;
+    use crate::scan::ScanMetadata;
     use crate::utils::test_utils::load_test_table;
-    use crate::{ExpressionRef, SnapshotRef};
     use std::sync::Arc;
 
-    /// Helper to collect (path, transform) pairs from scan_metadata (single-threaded baseline).
-    fn get_files_from_scan_metadata(
-        snapshot: &SnapshotRef,
-        engine: &dyn crate::Engine,
-    ) -> DeltaResult<Vec<(String, Option<ExpressionRef>)>> {
-        let scan = snapshot.clone().scan_builder().build()?;
-        let scan_metadata_iter = scan.scan_metadata(engine)?;
-
+    fn collect_scan_metadata(
+        scan_metadata_iter: &mut impl Iterator<Item = DeltaResult<ScanMetadata>>,
+    ) -> DeltaResult<Vec<ScanFile>> {
         let mut files = vec![];
         for res in scan_metadata_iter {
             let scan_metadata = res?;
-            files = scan_metadata.visit_scan_files(
-                files,
-                |ps: &mut Vec<(String, Option<ExpressionRef>)>, path, _, _, _, transform, _| {
-                    ps.push((path.to_string(), transform.clone()));
-                },
-            )?;
+            files = scan_metadata.visit_scan_files(files, |files, scan_file| {
+                files.push(scan_file);
+            })?;
         }
-        files.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(files)
     }
 
@@ -110,7 +132,14 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         // Get expected results from single-threaded scan_metadata
-        let expected_files = get_files_from_scan_metadata(&snapshot, engine.as_ref())?;
+        let expected_files = {
+            let scan = snapshot.clone().scan_builder().build()?;
+            let mut scan_metadata_iter = scan.scan_metadata(engine.as_ref())?;
+
+            let mut files = collect_scan_metadata(scan_metadata_iter.by_ref())?;
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            files
+        };
 
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
@@ -122,24 +151,10 @@ mod tests {
         )?);
 
         let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+
         let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
-
-        // Process all batches in sequential phase and collect (path, transform) pairs
-        let mut sequential_files = Vec::new();
-        for result in sequential.by_ref() {
-            let metadata = result?;
-            sequential_files = metadata.visit_scan_files(
-                sequential_files,
-                |ps: &mut Vec<(String, Option<ExpressionRef>)>, path, _, _, _, transform, _| {
-                    ps.push((path.to_string(), transform.clone()));
-                },
-            )?;
-        }
-
-        // Call finish() to get processor and parallel files (if any)
+        let mut all_files = collect_scan_metadata(sequential.by_ref())?;
         let result = sequential.finish()?;
-
-        let mut all_parallel_files = sequential_files;
 
         match result {
             AfterSequential::Done(_processor) => {
@@ -171,34 +186,16 @@ mod tests {
                 for partition_files in partitions {
                     assert!(!partition_files.is_empty());
 
-                    let parallel =
+                    let mut parallel =
                         ParallelPhase::try_new(engine.clone(), processor.clone(), partition_files)?;
-
-                    // Collect results from this partition
-                    for result in parallel {
-                        let metadata = result?;
-                        all_parallel_files = metadata.visit_scan_files(
-                            all_parallel_files,
-                            |ps: &mut Vec<(String, Option<ExpressionRef>)>,
-                             path,
-                             _,
-                             _,
-                             _,
-                             transform,
-                             _| {
-                                ps.push((path.to_string(), transform.clone()));
-                            },
-                        )?;
-                    }
+                    all_files.extend(collect_scan_metadata(parallel.by_ref())?);
                 }
             }
         }
 
-        // Sort and compare results
-        all_parallel_files.sort_by(|a, b| a.0.cmp(&b.0));
-
+        all_files.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(
-            all_parallel_files,
+            all_files,
             expected_files,
             "Parallel workflow (sequential + parallel phases) should produce same (path, transform) pairs as single-threaded scan_metadata"
         );
