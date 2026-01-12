@@ -18,7 +18,7 @@ use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
 // names of fields, nullable, and metadata in the struct have been transformed to match those in
 // schema specified by `schema`
-pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
+pub fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(Error::generic(
             "apply_schema at top-level must be passed a struct schema",
