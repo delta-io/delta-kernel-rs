@@ -131,7 +131,7 @@ impl<'a> UCCatalog<'a> {
 mod tests {
     use std::env;
 
-    use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::transaction::CommitResult;
 
     use tracing::info;
@@ -193,7 +193,7 @@ mod tests {
 
         info!("created object store: {:?}\npath: {:?}\n", store, path);
 
-        let engine = DefaultEngine::new(store.into());
+        let engine = DefaultEngineBuilder::new(store.into()).build();
 
         // read table
         let snapshot = catalog
@@ -243,7 +243,7 @@ mod tests {
         let (store, _path) = object_store::parse_url_opts(&table_url, options)?;
         let store: Arc<dyn object_store::ObjectStore> = store.into();
 
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
         let committer = Box::new(UCCommitter::new(client.clone(), table_id.clone()));
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)

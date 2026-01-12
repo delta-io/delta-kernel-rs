@@ -163,7 +163,7 @@ pub(crate) mod test_utils {
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use crate::engine::arrow_data::ArrowEngineData;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::{DeltaResult, EngineData, Error, SnapshotRef};
     use crate::{Engine, Snapshot};
@@ -399,7 +399,7 @@ pub(crate) mod test_utils {
             .map_err(|_| Error::Generic("Failed to create URL from path".to_string()))?;
 
         let store = Arc::new(LocalFileSystem::new());
-        let engine = Arc::new(DefaultEngine::new(store));
+        let engine = Arc::new(DefaultEngineBuilder::new(store).build());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         Ok((engine, snapshot, tempdir))
     }

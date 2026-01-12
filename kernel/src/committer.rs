@@ -174,7 +174,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::path::LogRoot;
 
     use object_store::memory::InMemory;
@@ -232,7 +232,7 @@ mod tests {
     async fn disallow_filesystem_committer_for_catalog_managed_tables() {
         let storage = Arc::new(InMemory::new());
         let table_root = Url::parse("memory:///").unwrap();
-        let engine = DefaultEngine::new(storage.clone());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
         let actions = [
             r#"{"commitInfo":{"timestamp":12345678900,"inCommitTimestamp":12345678900}}"#,

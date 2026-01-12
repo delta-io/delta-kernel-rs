@@ -374,7 +374,7 @@ mod tests {
     use test_utils::delta_path_for_version;
 
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::utils::current_time_duration;
     use crate::Engine as _;
 
@@ -434,7 +434,7 @@ mod tests {
         store.put(&name, data.clone().into()).await.unwrap();
 
         let table_root = Url::parse("memory:///").expect("valid url");
-        let engine = DefaultEngine::new(store);
+        let engine = DefaultEngineBuilder::new(store).build();
         let files: Vec<_> = engine
             .storage_handler()
             .list_from(&table_root.join("_delta_log").unwrap().join("0").unwrap())
@@ -464,7 +464,7 @@ mod tests {
 
         let url = Url::from_directory_path(tmp.path()).unwrap();
         let store = Arc::new(LocalFileSystem::new());
-        let engine = DefaultEngine::new(store);
+        let engine = DefaultEngineBuilder::new(store).build();
         let files = engine
             .storage_handler()
             .list_from(&url.join("_delta_log").unwrap().join("0").unwrap())

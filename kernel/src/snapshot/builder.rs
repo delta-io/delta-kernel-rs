@@ -126,7 +126,9 @@ impl SnapshotBuilder {
 mod tests {
     use std::sync::Arc;
 
-    use crate::engine::default::{executor::tokio::TokioBackgroundExecutor, DefaultEngine};
+    use crate::engine::default::{
+        executor::tokio::TokioBackgroundExecutor, DefaultEngine, DefaultEngineBuilder,
+    };
 
     use itertools::Itertools;
     use object_store::memory::InMemory;
@@ -142,7 +144,7 @@ mod tests {
     ) {
         let table_root = Url::parse("memory:///test_table").unwrap();
         let store = Arc::new(InMemory::new());
-        let engine = Arc::new(DefaultEngine::new(store.clone()));
+        let engine = Arc::new(DefaultEngineBuilder::new(store.clone()).build());
         (engine, store, table_root)
     }
 
