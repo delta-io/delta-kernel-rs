@@ -257,7 +257,9 @@ pub mod tokio {
             use std::sync::Arc;
             use std::time::Duration;
 
-            let executor = Arc::new(TokioMultiThreadExecutor::new(tokio::runtime::Handle::current()));
+            let executor = Arc::new(TokioMultiThreadExecutor::new(
+                tokio::runtime::Handle::current(),
+            ));
             let executor_clone = executor.clone();
 
             let (tx, rx) = channel::<i32>();
