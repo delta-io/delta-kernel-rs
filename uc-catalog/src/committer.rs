@@ -14,16 +14,16 @@ use uc_client::UCCommitsClient;
 /// but must ensure that the multi-threaded runtime is used.
 #[derive(Debug, Clone)]
 pub struct UCCommitter<C: UCCommitsClient> {
-    client: Arc<C>,
+    commits_client: Arc<C>,
     table_id: String,
 }
 
 impl<C: UCCommitsClient> UCCommitter<C> {
-    /// Create a new [UCCommitter] to commit via the `client` to the specific table with the given
+    /// Create a new [UCCommitter] to commit via the `commits_client` to the specific table with the given
     /// `table_id`.
-    pub fn new(client: Arc<C>, table_id: impl Into<String>) -> Self {
+    pub fn new(commits_client: Arc<C>, table_id: impl Into<String>) -> Self {
         UCCommitter {
-            client,
+            commits_client: commits_client,
             table_id: table_id.into(),
         }
     }
@@ -79,7 +79,7 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         })?;
         tokio::task::block_in_place(|| {
             handle.block_on(async move {
-                self.client
+                self.commits_client
                     .commit(commit_req)
                     .await
                     .map_err(|e| DeltaError::Generic(format!("UC commit error: {e}")))
