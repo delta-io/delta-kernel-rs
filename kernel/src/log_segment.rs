@@ -328,7 +328,8 @@ impl LogSegment {
     }
 
     /// Creates a new LogSegment with the given commit file added to the end.
-    fn new_with_commit(self, tail_commit_file: ParsedLogPath) -> DeltaResult<Self> {
+    #[allow(unused)]
+    pub(crate) fn new_with_commit(self, tail_commit_file: ParsedLogPath) -> DeltaResult<Self> {
         require!(
             tail_commit_file.is_commit(),
             Error::internal_error(format!(
@@ -347,11 +348,14 @@ impl LogSegment {
         );
 
         let new_end_version = tail_commit_file.version;
+        let new_ascending_commit_files: Vec<_> = self
+            .ascending_commit_files
+            .iter()
+            .cloned()
+            .chain([tail_commit_file.clone()])
+            .collect();
 
-        let mut new_ascending_commit_files = self.ascending_commit_files.clone();
-        new_ascending_commit_files.push(tail_commit_file.clone());
-
-        // TODO: calculate new max published version, when applicable
+        // TODO: calculate new max published version, after #1587 is merged
 
         Ok(LogSegment {
             end_version: new_end_version,
