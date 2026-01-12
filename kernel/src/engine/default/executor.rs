@@ -191,9 +191,15 @@ pub mod tokio {
             // We throw away the handle, but it should continue on.
             self.handle.spawn(fut);
 
-            receiver
-                .recv()
-                .expect("TokioMultiThreadExecutor has crashed")
+            // Use block_in_place to tell Tokio we're about to block - this allows
+            // the runtime to move tasks off this worker's local queue so they can
+            // be stolen by other workers. Without this, spawned tasks can get stuck
+            // in the blocked worker's queue, causing deadlock.
+            tokio::task::block_in_place(|| {
+                receiver
+                    .recv()
+                    .expect("TokioMultiThreadExecutor has crashed")
+            })
         }
 
         fn spawn<F>(&self, task: F)
@@ -245,6 +251,47 @@ pub mod tokio {
         async fn test_tokio_multi_thread_executor() {
             let executor = TokioMultiThreadExecutor::new(tokio::runtime::Handle::current());
             test_executor(executor).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn test_nested_block_on_does_not_deadlock() {
+            use std::sync::Arc;
+            use std::time::Duration;
+
+            let executor = Arc::new(TokioMultiThreadExecutor::new(tokio::runtime::Handle::current()));
+            let executor_clone = executor.clone();
+
+            // Run the nested block_on in a spawned task with timeout
+            let (tx, rx) = channel::<i32>();
+
+            let handle = std::thread::spawn(move || {
+                // Outer block_on: simulates write_parquet_file calling block_on
+                let result = executor.block_on(async move {
+                    // Inner block_on: simulates BlockingStreamIterator::next() calling block_on
+                    let inner_result = executor_clone.block_on(async {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        42
+                    });
+                    inner_result + 1
+                });
+                tx.send(result).ok();
+            });
+
+            // Wait with timeout - if this times out, we have a deadlock
+            let timeout = Duration::from_secs(5);
+            match rx.recv_timeout(timeout) {
+                Ok(result) => {
+                    assert_eq!(result, 43);
+                    handle.join().expect("thread panicked");
+                }
+                Err(_) => {
+                    panic!(
+                        "Test timed out after {:?} - likely deadlock in nested block_on. \
+                         This indicates TokioMultiThreadExecutor.block_on is not working correctly.",
+                        timeout
+                    );
+                }
+            }
         }
     }
 }
