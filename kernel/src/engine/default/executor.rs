@@ -193,8 +193,7 @@ pub mod tokio {
 
             // Use block_in_place to tell Tokio we're about to block - this allows
             // the runtime to move tasks off this worker's local queue so they can
-            // be stolen by other workers. Without this, spawned tasks can get stuck
-            // in the blocked worker's queue, causing deadlock.
+            // be stolen by other workers.
             tokio::task::block_in_place(|| {
                 receiver
                     .recv()
@@ -261,13 +260,12 @@ pub mod tokio {
             let executor = Arc::new(TokioMultiThreadExecutor::new(tokio::runtime::Handle::current()));
             let executor_clone = executor.clone();
 
-            // Run the nested block_on in a spawned task with timeout
             let (tx, rx) = channel::<i32>();
 
             let handle = std::thread::spawn(move || {
-                // Outer block_on: simulates write_parquet_file calling block_on
+                // Outer block_on
                 let result = executor.block_on(async move {
-                    // Inner block_on: simulates BlockingStreamIterator::next() calling block_on
+                    // Inner block_on
                     let inner_result = executor_clone.block_on(async {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                         42
@@ -286,8 +284,8 @@ pub mod tokio {
                 }
                 Err(_) => {
                     panic!(
-                        "Test timed out after {:?} - likely deadlock in nested block_on. \
-                         This indicates TokioMultiThreadExecutor.block_on is not working correctly.",
+                        "Test timed out after {:?} seconds - likely deadlock in nested block_on. \
+                         This indicates TokioMultiThreadExecutor::block_on is not working correctly.",
                         timeout
                     );
                 }
