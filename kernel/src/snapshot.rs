@@ -1161,7 +1161,6 @@ mod tests {
         assert_eq!(
             ParsedLogPath::try_from(snapshot.log_segment.checkpoint_parts[0].location.clone())
                 .unwrap()
-                .unwrap()
                 .version,
             2,
         );
@@ -1172,7 +1171,6 @@ mod tests {
                     .location
                     .clone()
             )
-            .unwrap()
             .unwrap()
             .version,
             3,
@@ -1493,7 +1491,7 @@ mod tests {
             location: url.join("_delta_log/00000000000000000000.checkpoint.parquet")?,
             last_modified: 0,
             size: 100,
-        })?
+        })
         .unwrap()];
 
         let listed_files = ListedLogFilesBuilder {
@@ -1680,7 +1678,7 @@ mod tests {
             last_modified: 1234567890,
             size: 100,
         };
-        let parsed_path = ParsedLogPath::try_from(file_meta)?
+        let parsed_path = ParsedLogPath::try_from(file_meta)
             .ok_or_else(|| Error::Generic("Failed to parse log path".to_string()))?;
         let log_tail = vec![parsed_path];
 

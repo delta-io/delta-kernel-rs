@@ -242,7 +242,6 @@ fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
         size,
     })
     .unwrap()
-    .unwrap()
 }
 
 /// Gets the file size from the store for use in FileMeta
