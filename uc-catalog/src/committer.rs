@@ -23,7 +23,7 @@ impl<C: UCCommitsClient> UCCommitter<C> {
     /// `table_id`.
     pub fn new(commits_client: Arc<C>, table_id: impl Into<String>) -> Self {
         UCCommitter {
-            commits_client: commits_client,
+            commits_client,
             table_id: table_id.into(),
         }
     }
