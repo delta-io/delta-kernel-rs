@@ -74,6 +74,12 @@ pub(crate) enum TableFeature {
     ClusteredTable,
     /// Materialize partition columns in parquet data files.
     MaterializePartitionColumns,
+    /// Collation support for string columns.
+    Collations,
+    /// Collation support for string columns (preview).
+    #[strum(serialize = "collations-preview")]
+    #[serde(rename = "collations-preview")]
+    CollationsPreview,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -422,6 +428,28 @@ static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
 };
 
 #[allow(dead_code)]
+static COLLATIONS_INFO: FeatureInfo = FeatureInfo {
+    name: "collations",
+    min_reader_version: 3,
+    min_writer_version: 7,
+    feature_type: FeatureType::Writer,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+#[allow(dead_code)]
+static COLLATIONS_PREVIEW_INFO: FeatureInfo = FeatureInfo {
+    name: "collations-preview",
+    min_reader_version: 3,
+    min_writer_version: 7,
+    feature_type: FeatureType::Writer,
+    feature_requirements: &[],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
+#[allow(dead_code)]
 static CATALOG_MANAGED_INFO: FeatureInfo = FeatureInfo {
     name: "catalogManaged",
     min_reader_version: 3,
@@ -618,7 +646,9 @@ impl TableFeature {
             | TableFeature::IcebergCompatV1
             | TableFeature::IcebergCompatV2
             | TableFeature::ClusteredTable
-            | TableFeature::MaterializePartitionColumns => FeatureType::Writer,
+            | TableFeature::MaterializePartitionColumns
+            | TableFeature::Collations
+            | TableFeature::CollationsPreview => FeatureType::Writer,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -642,6 +672,8 @@ impl TableFeature {
             TableFeature::IcebergCompatV2 => Some(&ICEBERG_COMPAT_V2_INFO),
             TableFeature::ClusteredTable => Some(&CLUSTERED_TABLE_INFO),
             TableFeature::MaterializePartitionColumns => Some(&MATERIALIZE_PARTITION_COLUMNS_INFO),
+            TableFeature::Collations => Some(&COLLATIONS_INFO),
+            TableFeature::CollationsPreview => Some(&COLLATIONS_PREVIEW_INFO),
 
             // ReaderWriter features
             TableFeature::CatalogManaged => Some(&CATALOG_MANAGED_INFO),

@@ -17,6 +17,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 
 use delta_kernel::engine::arrow_conversion::{TryFromKernel, TryIntoArrow as _};
 use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_expression::apply_schema_internal as apply_schema;
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel::engine::default::parquet::DefaultParquetHandler;
 use delta_kernel::engine::default::DefaultEngine;
@@ -41,6 +42,23 @@ use test_utils::{
 };
 
 mod common;
+
+/// Helper function to count the total number of rows in a Delta table.
+async fn count_rows(
+    table_url: &Url,
+    engine: Arc<dyn Engine>,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let scan = snapshot.scan_builder().build()?;
+
+    let mut row_count = 0;
+    for scan_result in scan.execute(engine.clone())? {
+        let scan_data = scan_result?;
+        row_count += scan_data.len();
+    }
+
+    Ok(row_count)
+}
 
 fn validate_txn_id(commit_info: &serde_json::Value) {
     let txn_id = commit_info["txnId"]
@@ -2964,6 +2982,165 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
          This would require writing CDC files for DML operations, which is not yet supported. \
          Consider using separate transactions: one to add files, another to remove files."
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_append_collations() -> Result<(), Box<dyn std::error::Error>> {
+    // Test writing to a table with collations writer feature enabled.
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Copy the collations table to a temp directory so we can write to it.
+    let tmp_dir = tempdir()?;
+    let source_path = std::path::PathBuf::from("./tests/data/collations");
+    let dest_path = tmp_dir.path().join("collations");
+    copy_directory(&source_path, &dest_path)?;
+
+    let table_url = url::Url::from_directory_path(dest_path).unwrap();
+    let engine = create_default_engine(&table_url)?;
+
+    // Count rows before insert.
+    let initial_row_count = count_rows(&table_url, engine.clone()).await?;
+    assert_eq!(initial_row_count, 3, "Expected 3 rows initially");
+
+    // Create a snapshot and transaction.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let schema = snapshot.schema();
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("collations append test");
+
+    // Create a new row: id=4, name='test'.
+    let id_array = Int32Array::from(vec![4]);
+    let name_array = StringArray::from(vec!["test"]);
+
+    let data = RecordBatch::try_new(
+        Arc::new(schema.as_ref().try_into_arrow()?),
+        vec![Arc::new(id_array), Arc::new(name_array)],
+    )?;
+
+    // Write the data.
+    let write_context = Arc::new(txn.get_write_context());
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data.clone()),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+
+    txn.add_files(add_files_metadata);
+
+    // Commit the transaction.
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    // Count rows after insert.
+    let final_row_count = count_rows(&table_url, engine.clone()).await?;
+    assert_eq!(final_row_count, 4, "Expected 4 total rows after append");
+    assert_eq!(final_row_count, initial_row_count + 1, "Should have added exactly 1 row");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_append_collations_complex() -> Result<(), Box<dyn std::error::Error>> {
+    // Test writing to a table with collations on nested struct fields.
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Copy the collations-complex table to a temp directory so we can write to it.
+    let tmp_dir = tempdir()?;
+    let source_path = std::path::PathBuf::from("./tests/data/collations-complex");
+    let dest_path = tmp_dir.path().join("collations-complex");
+    copy_directory(&source_path, &dest_path)?;
+
+    let table_url = url::Url::from_directory_path(dest_path).unwrap();
+    let engine = create_default_engine(&table_url)?;
+
+    // Count rows before insert.
+    let initial_row_count = count_rows(&table_url, engine.clone()).await?;
+    assert_eq!(initial_row_count, 5, "Expected 5 rows initially");
+
+    // Create a snapshot and transaction.
+    let snapshot = Snapshot::builder_for(table_url.clone()).build(engine.as_ref())?;
+    let schema = snapshot.schema();
+    let mut txn = snapshot
+        .transaction(Box::new(FileSystemCommitter::new()))?
+        .with_engine_info("collations complex append test");
+
+    // Create a new row: id=6, name={first: "Test", last: "User"},
+    // email="test.user@example.com", department="Engineering".
+    let id_array = Int32Array::from(vec![6]);
+
+    // Create the nested struct for name field.
+    let first_array = StringArray::from(vec!["Test"]);
+    let last_array = StringArray::from(vec!["User"]);
+    let name_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("first", ArrowDataType::Utf8, true)),
+            Arc::new(first_array) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("last", ArrowDataType::Utf8, true)),
+            Arc::new(last_array) as ArrayRef,
+        ),
+    ]);
+
+    let email_array = StringArray::from(vec!["test.user@example.com"]);
+    let department_array = StringArray::from(vec!["Engineering"]);
+
+    // Create a simple Arrow schema without metadata first.
+    let name_fields = vec![
+        Field::new("first", ArrowDataType::Utf8, true),
+        Field::new("last", ArrowDataType::Utf8, true),
+    ];
+    let arrow_schema = Arc::new(delta_kernel::arrow::datatypes::Schema::new(vec![
+        Field::new("id", ArrowDataType::Int32, true),
+        Field::new(
+            "name",
+            ArrowDataType::Struct(name_fields.into()),
+            true,
+        ),
+        Field::new("email", ArrowDataType::Utf8, true),
+        Field::new("department", ArrowDataType::Utf8, true),
+    ]));
+
+    let data_no_metadata = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(id_array),
+            Arc::new(name_struct),
+            Arc::new(email_array),
+            Arc::new(department_array),
+        ],
+    )?;
+
+    // Apply the Delta schema to add collations metadata.
+    // Convert RecordBatch to StructArray, apply schema, get back RecordBatch with metadata.
+    let struct_array = StructArray::from(data_no_metadata);
+    let data = apply_schema(&struct_array, &DataType::Struct(Box::new(schema.as_ref().clone())))?;
+
+    // Write the data.
+    let write_context = Arc::new(txn.get_write_context());
+    let add_files_metadata = engine
+        .write_parquet(
+            &ArrowEngineData::new(data.clone()),
+            write_context.as_ref(),
+            HashMap::new(),
+        )
+        .await?;
+
+    txn.add_files(add_files_metadata);
+
+    // Commit the transaction.
+    assert!(txn.commit(engine.as_ref())?.is_committed());
+
+    // Count rows after insert.
+    let final_row_count = count_rows(&table_url, engine.clone()).await?;
+    assert_eq!(final_row_count, 6, "Expected 6 total rows after append");
+    assert_eq!(final_row_count, initial_row_count + 1, "Should have added exactly 1 row");
 
     Ok(())
 }
