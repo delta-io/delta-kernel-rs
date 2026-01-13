@@ -237,35 +237,35 @@ async fn read_parquet_files_impl(
         let stream = FileStream::new(files, arrow_schema, file_opener)?.map_ok(
             |record_batch| -> Box<dyn EngineData> { Box::new(ArrowEngineData::new(record_batch)) },
         );
-        Ok(Box::pin(stream))
-    } else {
-        // an iterator of futures that open each file
-        let file_futures = files.into_iter().map(move |file| {
-            let store = store.clone();
-            let schema = physical_schema.clone();
-            let predicate = predicate.clone();
-            async move {
-                open_parquet_file(
-                    store,
-                    schema,
-                    predicate,
-                    None,
-                    super::DEFAULT_BATCH_SIZE,
-                    file,
-                )
-                .await
-            }
-        });
-        // create a stream from that iterator which buffers up to `buffer_size` futures at a time
-        let result_stream = stream::iter(file_futures)
-            .buffered(super::DEFAULT_BUFFER_SIZE)
-            .try_flatten()
-            .map_ok(|record_batch| -> Box<dyn EngineData> {
-                Box::new(ArrowEngineData::new(record_batch))
-            });
-
-        Ok(Box::pin(result_stream))
+        return Ok(Box::pin(stream));
     }
+
+    // an iterator of futures that open each file
+    let file_futures = files.into_iter().map(move |file| {
+        let store = store.clone();
+        let schema = physical_schema.clone();
+        let predicate = predicate.clone();
+        async move {
+            open_parquet_file(
+                store,
+                schema,
+                predicate,
+                None,
+                super::DEFAULT_BATCH_SIZE,
+                file,
+            )
+            .await
+        }
+    });
+    // create a stream from that iterator which buffers up to `buffer_size` futures at a time
+    let result_stream = stream::iter(file_futures)
+        .buffered(super::DEFAULT_BUFFER_SIZE)
+        .try_flatten()
+        .map_ok(|record_batch| -> Box<dyn EngineData> {
+            Box::new(ArrowEngineData::new(record_batch))
+        });
+
+    Ok(Box::pin(result_stream))
 }
 
 impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
