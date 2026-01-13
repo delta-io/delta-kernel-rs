@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
+use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
@@ -220,6 +221,21 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
         }))
     }
 
+    /// Parse a location into a commit path (published or staged), returning an error if invalid or
+    /// not a commit.
+    pub(crate) fn parse_commit(location: Location) -> DeltaResult<Self> {
+        let url = location.as_url().to_string();
+        let parsed = Self::try_from(location)?.ok_or_else(|| Error::invalid_log_path(&url))?;
+        require!(
+            parsed.is_commit(),
+            Error::generic(format!(
+                "Expected a commit path, got {} of type {:?}",
+                url, parsed.file_type
+            ))
+        );
+        Ok(parsed)
+    }
+
     pub(crate) fn should_list(&self) -> bool {
         match self.file_type {
             LogPathFileType::Commit
@@ -255,28 +271,6 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
     #[allow(dead_code)] // currently only used in tests, which don't "count"
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self.file_type, LogPathFileType::Unknown)
-    }
-
-    /// Parse and validate this is a published commit file.
-    #[internal_api]
-    pub(crate) fn try_parse_published_commit(location: Location) -> DeltaResult<Self> {
-        let parsed = Self::try_from(location)?
-            .ok_or_else(|| Error::internal_error("Could not parse path as a log path"))?;
-        if parsed.file_type != LogPathFileType::Commit {
-            return Err(Error::internal_error("Expected a published commit file"));
-        }
-        Ok(parsed)
-    }
-
-    /// Parse and validate this is a staged commit file.
-    #[internal_api]
-    pub(crate) fn try_parse_staged_commit(location: Location) -> DeltaResult<Self> {
-        let parsed = Self::try_from(location)?
-            .ok_or_else(|| Error::internal_error("Could not parse path as a log path"))?;
-        if parsed.file_type != LogPathFileType::StagedCommit {
-            return Err(Error::internal_error("Expected a staged commit file"));
-        }
-        Ok(parsed)
     }
 }
 

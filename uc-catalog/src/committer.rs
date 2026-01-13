@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer};
-use delta_kernel::path::ParsedLogPath;
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use uc_client::models::commits::{Commit, CommitRequest};
 use uc_client::UCCommitsClient;
@@ -86,9 +85,8 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
                     .map_err(|e| DeltaError::Generic(format!("UC commit error: {e}")))
             })
         })?;
-        let parsed_log_path = ParsedLogPath::try_parse_staged_commit(committed)?;
         Ok(CommitResponse::Committed {
-            data: parsed_log_path,
+            file_meta: committed,
         })
     }
 }

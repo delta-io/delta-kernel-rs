@@ -25,7 +25,7 @@
 //! [`log_tail`]: crate::snapshot::SnapshotBuilder::with_log_tail
 //! [`EngineData`]: crate::EngineData
 
-use crate::path::{LogRoot, ParsedLogPath};
+use crate::path::LogRoot;
 use crate::{AsAny, DeltaResult, Engine, Error, FileMeta, FilteredEngineData, Version};
 
 use url::Url;
@@ -101,7 +101,7 @@ impl CommitMetadata {
 /// [`Transaction`]: crate::transaction::Transaction
 #[derive(Debug)]
 pub enum CommitResponse {
-    Committed { data: ParsedLogPath<FileMeta> },
+    Committed { file_meta: FileMeta },
     Conflict { version: Version },
 }
 
@@ -167,10 +167,7 @@ impl Committer for FileSystemCommitter {
                     commit_metadata.in_commit_timestamp(),
                     0,
                 );
-                let parsed_log_path = ParsedLogPath::try_parse_published_commit(file_meta)?;
-                Ok(CommitResponse::Committed {
-                    data: parsed_log_path,
-                })
+                Ok(CommitResponse::Committed { file_meta })
             }
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResponse::Conflict {
                 version: commit_metadata.version,
@@ -187,7 +184,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::engine::default::DefaultEngineBuilder;
-    use crate::path::{LogPathFileType, LogRoot};
+    use crate::path::LogRoot;
 
     use object_store::memory::InMemory;
     use object_store::ObjectStore as _;
@@ -285,11 +282,7 @@ mod tests {
         let result = committer.commit(&engine, actions, commit_metadata).unwrap();
 
         match result {
-            CommitResponse::Committed { data } => {
-                assert_eq!(data.version, 1);
-                assert_eq!(data.file_type, LogPathFileType::Commit);
-
-                let file_meta = data.location;
+            CommitResponse::Committed { file_meta } => {
                 assert_eq!(file_meta.last_modified, 12345);
                 assert_eq!(file_meta.size, 0);
                 assert!(file_meta
