@@ -61,10 +61,17 @@ void* allocate_string(const KernelStringSlice slice)
 }
 
 // utility function to convert key/val into slices and set them on a builder
-void set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
+// returns false on failure
+bool set_builder_opt(EngineBuilder* engine_builder, char* key, char* val)
 {
   KernelStringSlice key_slice = { key, strlen(key) };
   KernelStringSlice val_slice = { val, strlen(val) };
-  set_builder_option(engine_builder, key_slice, val_slice);
+  ExternResultbool res = set_builder_option(engine_builder, key_slice, val_slice);
+  if (res.tag != Okbool) {
+    print_error("Failed to set builder option.", (Error*)res.err);
+    free_error((Error*)res.err);
+    return false;
+  }
+  return true;
 }
 

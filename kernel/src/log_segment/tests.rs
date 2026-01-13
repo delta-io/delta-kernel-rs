@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::DefaultEngine;
+use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFilesBuilder;
@@ -24,15 +24,55 @@ use crate::parquet::arrow::ArrowWriter;
 use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
+    sidecar_batch_with_given_paths_and_sizes,
 };
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
 };
-use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
+use test_utils::{
+    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+};
 
 use super::*;
+
+use crate::actions::visitors::SidecarVisitor;
+use crate::ParquetHandler;
+
+/// Processes sidecar files for the given checkpoint batch.
+///
+/// This function extracts any sidecar file references from the provided batch.
+/// Each sidecar file is read and an iterator of file action batches is returned.
+fn process_sidecars(
+    parquet_handler: Arc<dyn ParquetHandler>,
+    log_root: Url,
+    batch: &dyn EngineData,
+    checkpoint_read_schema: SchemaRef,
+    meta_predicate: Option<PredicateRef>,
+) -> DeltaResult<Option<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>> {
+    // Visit the rows of the checkpoint batch to extract sidecar file references
+    let mut visitor = SidecarVisitor::default();
+    visitor.visit_rows_of(batch)?;
+
+    // If there are no sidecar files, return early
+    if visitor.sidecars.is_empty() {
+        return Ok(None);
+    }
+
+    let sidecar_files: Vec<_> = visitor
+        .sidecars
+        .iter()
+        .map(|sidecar| sidecar.to_filemeta(&log_root))
+        .try_collect()?;
+
+    // Read the sidecar files and return an iterator of sidecar file batches
+    Ok(Some(parquet_handler.read_parquet_files(
+        &sidecar_files,
+        checkpoint_read_schema,
+        meta_predicate,
+    )?))
+}
 
 // NOTE: In addition to testing the meta-predicate for metadata replay, this test also verifies
 // that the parquet reader properly infers nullcount = rowcount for missing columns. The two
@@ -194,13 +234,23 @@ async fn write_json_to_store(
 }
 
 fn create_log_path(path: &str) -> ParsedLogPath<FileMeta> {
+    create_log_path_with_size(path, 0)
+}
+
+fn create_log_path_with_size(path: &str, size: u64) -> ParsedLogPath<FileMeta> {
     ParsedLogPath::try_from(FileMeta {
         location: Url::parse(path).expect("Invalid file URL"),
         last_modified: 0,
-        size: 0,
+        size,
     })
     .unwrap()
     .unwrap()
+}
+
+/// Gets the file size from the store for use in FileMeta
+async fn get_file_size(store: &Arc<InMemory>, path: &str) -> u64 {
+    let object_meta = store.head(&Path::from(path)).await.unwrap();
+    object_meta.size
 }
 
 #[tokio::test]
@@ -964,7 +1014,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
     let engine = Arc::new(SyncEngine::new());
     let checkpoint_batch = add_batch_simple(get_all_actions_schema().clone());
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -983,7 +1033,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
@@ -1004,7 +1054,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
         read_schema.clone(),
     );
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -1025,14 +1075,14 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
         get_all_actions_schema().clone(),
     );
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -1052,7 +1102,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let checkpoint_batch =
@@ -1073,7 +1123,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
         ))
     });
 
-    let mut iter = LogSegment::process_sidecars(
+    let mut iter = process_sidecars(
         engine.parquet_handler(),
         log_root,
         checkpoint_batch.as_ref(),
@@ -1093,7 +1143,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
@@ -1116,6 +1166,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         }
         .build()?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1140,7 +1191,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1181,6 +1232,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         .build()?,
         log_root,
         None,
+        None,
     )?;
     let mut iter =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema.clone(), None)?;
@@ -1209,7 +1261,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     add_checkpoint_to_store(
         &store,
@@ -1222,16 +1274,24 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
 
+    // Get the actual file size for proper footer reading
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
+
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFilesBuilder {
-            checkpoint_parts: vec![create_log_path(&checkpoint_one_file)],
+            checkpoint_parts: vec![create_log_path_with_size(
+                &checkpoint_one_file,
+                checkpoint_size,
+            )],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
         .build()?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1253,7 +1313,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1280,6 +1340,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         }
         .build()?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1311,18 +1372,9 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
-    add_checkpoint_to_store(
-        &store,
-        sidecar_batch_with_given_paths(
-            vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
-            get_all_actions_schema().clone(),
-        ),
-        "00000000000000000001.checkpoint.parquet",
-    )
-    .await?;
-
+    // Write sidecars first so we can get their actual sizes
     add_sidecar_to_store(
         &store,
         add_batch_simple(get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?),
@@ -1336,20 +1388,46 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     )
     .await?;
 
+    // Get actual sidecar sizes for correct FileMeta creation
+    let sidecar1_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile1.parquet").await;
+    let sidecar2_size = get_file_size(&store, "_delta_log/_sidecars/sidecarfile2.parquet").await;
+
+    // Now create checkpoint with correct sidecar sizes
+    add_checkpoint_to_store(
+        &store,
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
+            get_all_actions_schema().clone(),
+        ),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
     let checkpoint_file_path = log_root
         .join("00000000000000000001.checkpoint.parquet")?
         .to_string();
+
+    // Get the actual file size for proper footer reading
+    let checkpoint_size =
+        get_file_size(&store, "_delta_log/00000000000000000001.checkpoint.parquet").await;
 
     let v2_checkpoint_read_schema = get_all_actions_schema().project(&[ADD_NAME])?;
 
     let log_segment = LogSegment::try_new(
         ListedLogFilesBuilder {
-            checkpoint_parts: vec![create_log_path(&checkpoint_file_path)],
+            checkpoint_parts: vec![create_log_path_with_size(
+                &checkpoint_file_path,
+                checkpoint_size,
+            )],
             latest_commit_file: Some(create_log_path("file:///00000000000000000001.json")),
             ..Default::default()
         }
         .build()?,
         log_root,
+        None,
         None,
     )?;
     let mut iter =
@@ -1365,8 +1443,11 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     // verify no behavior change.
     assert_batch_matches(
         first_batch,
-        sidecar_batch_with_given_paths(
-            vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
+        sidecar_batch_with_given_paths_and_sizes(
+            vec![
+                ("sidecarfile1.parquet", sidecar1_size),
+                ("sidecarfile2.parquet", sidecar2_size),
+            ],
             get_all_actions_schema().project(&[ADD_NAME, SIDECAR_NAME])?,
         ),
     );
@@ -1400,6 +1481,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 #[derive(Default)]
 struct LogSegmentConfig<'a> {
     published_commit_versions: &'a [u64],
+    staged_commit_versions: &'a [u64],
     compaction_versions: &'a [(u64, u64)],
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
@@ -1424,10 +1506,25 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+    let table_root = Url::parse("memory:///").expect("valid url");
+    let staged_commits_log_tail: Vec<ParsedLogPath> = segment
+        .staged_commit_versions
+        .iter()
+        .map(|version| staged_commit_path_for_version(*version))
+        .map(|path| {
+            ParsedLogPath::try_from(FileMeta {
+                location: table_root.join(path.as_ref()).unwrap(),
+                last_modified: 0,
+                size: 0,
+            })
+            .unwrap()
+            .unwrap()
+        })
+        .collect();
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root.clone(),
-        vec![], // log_tail
+        staged_commits_log_tail,
         None,
         segment.version_to_load,
     )
@@ -1477,6 +1574,7 @@ async fn test_compaction_listing(
         compaction_versions,
         checkpoint_version,
         version_to_load,
+        ..Default::default()
     })
     .await;
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
@@ -1631,6 +1729,7 @@ async fn test_commit_cover(
         compaction_versions,
         checkpoint_version,
         version_to_load,
+        ..Default::default()
     })
     .await;
     let cover = log_segment.find_commit_cover();
@@ -2309,7 +2408,8 @@ fn test_log_segment_contiguous_commit_files() {
     .build();
 
     // disallow gaps in LogSegment
-    let log_segment = LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None);
+    let log_segment =
+        LogSegment::try_new(listed.unwrap(), Url::parse("file:///").unwrap(), None, None);
     assert_result_error_with_message(
         log_segment,
         "Generic delta kernel error: Expected ordered \
@@ -2345,6 +2445,8 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
+        max_published_version: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2365,6 +2467,8 @@ fn test_publish_validation() {
         end_version: 2,
         latest_crc_file: None,
         latest_commit_file: None,
+        checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // Should fail with staged commits
@@ -2375,4 +2479,204 @@ fn test_publish_validation() {
     } else {
         panic!("Expected Error::Generic");
     }
+}
+
+/// Test that checkpoint_schema from _last_checkpoint hint is properly propagated to LogSegment
+#[tokio::test]
+async fn test_checkpoint_schema_propagation_from_hint() {
+    use crate::schema::{StructField, StructType};
+
+    // Create a sample schema that would be in _last_checkpoint
+    let sample_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable("add", StructType::new_unchecked([])),
+        StructField::nullable("remove", StructType::new_unchecked([])),
+    ]));
+
+    let checkpoint_metadata = LastCheckpointHint {
+        version: 5,
+        size: 10,
+        parts: Some(1),
+        size_in_bytes: None,
+        num_of_add_files: None,
+        checkpoint_schema: Some(sample_schema.clone()),
+        checksum: None,
+        tags: None,
+    };
+
+    let (storage, log_root) = build_log_with_paths_and_checkpoint(
+        &[
+            delta_path_for_version(0, "json"),
+            delta_path_for_version(5, "checkpoint.parquet"),
+            delta_path_for_version(5, "json"),
+            delta_path_for_version(6, "json"),
+        ],
+        Some(&checkpoint_metadata),
+    )
+    .await;
+
+    let log_segment = LogSegment::for_snapshot_impl(
+        storage.as_ref(),
+        log_root,
+        vec![], // log_tail
+        Some(checkpoint_metadata),
+        None,
+    )
+    .unwrap();
+
+    // Verify checkpoint_schema is propagated
+    assert!(log_segment.checkpoint_schema.is_some());
+    assert_eq!(log_segment.checkpoint_schema.unwrap(), sample_schema);
+}
+
+/// Test get_file_actions_schema_and_sidecars with V1 parquet checkpoint using hint schema
+/// This verifies the optimization path where hint schema is used directly (avoiding footer read)
+#[tokio::test]
+async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> {
+    use crate::schema::{StructField, StructType};
+
+    let (store, log_root) = new_in_memory_store();
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
+
+    // Create a V1 checkpoint (without sidecar column)
+    let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
+    add_checkpoint_to_store(
+        &store,
+        add_batch_simple(v1_schema.clone()),
+        "00000000000000000001.checkpoint.parquet",
+    )
+    .await?;
+
+    let checkpoint_file = log_root
+        .join("00000000000000000001.checkpoint.parquet")?
+        .to_string();
+
+    // Create a hint schema without sidecar field (indicates V1)
+    let hint_schema: SchemaRef = Arc::new(StructType::new_unchecked([
+        StructField::nullable("add", StructType::new_unchecked([])),
+        StructField::nullable("remove", StructType::new_unchecked([])),
+    ]));
+
+    let log_segment = LogSegment::try_new(
+        ListedLogFilesBuilder {
+            checkpoint_parts: vec![create_log_path(&checkpoint_file)],
+            latest_commit_file: Some(create_log_path("file:///00000000000000000002.json")),
+            ..Default::default()
+        }
+        .build()?,
+        log_root,
+        None,
+        Some(hint_schema.clone()), // V1 hint schema (no sidecar field)
+    )?;
+
+    // With V1 hint, should use hint schema and avoid footer read
+    let (schema, sidecars) = log_segment.get_file_actions_schema_and_sidecars(&engine)?;
+    assert!(schema.is_some(), "Should return hint schema for V1");
+    assert_eq!(
+        schema.unwrap(),
+        hint_schema,
+        "Should use hint schema directly"
+    );
+    assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_max_published_version_only_published_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7, 8],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 8);
+}
+
+#[tokio::test]
+async fn test_max_published_version_only_staged_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        staged_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_staged_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        staged_commit_versions: &[5, 6, 7, 8],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
+}
+
+#[tokio::test]
+async fn test_max_published_version_published_and_staged_commits_no_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_no_overlap()
+{
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7],
+        staged_commit_versions: &[8, 9, 10],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 7);
+}
+
+#[tokio::test]
+async fn test_max_published_version_published_and_staged_commits_with_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_with_overlap(
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7, 8, 9],
+        staged_commit_versions: &[7, 8, 9, 10],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 9);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_only() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
 }

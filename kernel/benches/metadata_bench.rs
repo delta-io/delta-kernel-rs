@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::try_parse_uri;
 
@@ -42,7 +42,7 @@ fn setup() -> (TempDir, Url, Arc<DefaultEngine<TokioBackgroundExecutor>>) {
     // TODO: use multi-threaded executor
     use delta_kernel::engine::default::storage::store_from_url;
     let store = store_from_url(&url).expect("Failed to create store");
-    let engine = DefaultEngine::new(store);
+    let engine = DefaultEngineBuilder::new(store).build();
 
     (tempdir, url, Arc::new(engine))
 }
