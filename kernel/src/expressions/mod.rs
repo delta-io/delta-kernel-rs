@@ -16,6 +16,7 @@ use crate::kernel_predicates::{
     DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
     IndirectDataSkippingPredicateEvaluator,
 };
+use crate::schema::SchemaRef;
 use crate::{DataType, DeltaResult, DynPartialEq};
 
 mod column_names;
@@ -234,6 +235,17 @@ pub struct VariadicExpression {
     pub exprs: Vec<Expression>,
 }
 
+/// An expression that parses a JSON string into a struct with the given schema.
+/// This is the inverse of `ToJson` - it converts a JSON-encoded string column into a
+/// struct column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParseJsonExpression {
+    /// The expression that evaluates to a STRING column containing JSON objects.
+    pub json_expr: Box<Expression>,
+    /// The schema defining the structure to parse the JSON into.
+    pub output_schema: SchemaRef,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct JunctionPredicate {
     /// The operator.
@@ -404,6 +416,8 @@ pub enum Expression {
     /// all rows -- almost certainly NOT what the query author intended. Use `Expression::Opaque`
     /// for expressions kernel doesn't understand but which engine can still evaluate.
     Unknown(String),
+    /// Parse a JSON string expression into a struct with the given schema.
+    ParseJson(ParseJsonExpression),
 }
 
 /// A SQL predicate.
@@ -512,6 +526,15 @@ impl VariadicExpression {
     ) -> Self {
         let exprs = exprs.into_iter().map(Into::into).collect();
         Self { op, exprs }
+    }
+}
+
+impl ParseJsonExpression {
+    fn new(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+        Self {
+            json_expr: Box::new(json_expr.into()),
+            output_schema,
+        }
     }
 }
 
@@ -643,6 +666,12 @@ impl Expression {
     /// Creates a new unknown expression
     pub fn unknown(name: impl Into<String>) -> Self {
         Self::Unknown(name.into())
+    }
+
+    /// Creates a new ParseJson expression that parses a JSON string column into a struct.
+    /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
+    pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+        Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
 }
 
@@ -898,6 +927,14 @@ impl Display for Expression {
                 write!(f, "{op:?}({})", format_child_list(exprs))
             }
             Unknown(name) => write!(f, "<unknown: {name}>"),
+            ParseJson(p) => {
+                write!(
+                    f,
+                    "PARSE_JSON({}, <schema:{} fields>)",
+                    p.json_expr,
+                    p.output_schema.fields().len()
+                )
+            }
         }
     }
 }
