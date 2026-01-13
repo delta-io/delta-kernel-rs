@@ -25,9 +25,6 @@ use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
-const DEFAULT_BUFFER_SIZE: usize = 1000;
-const DEFAULT_BATCH_SIZE: usize = 1000;
-
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The object store to read files from
@@ -48,8 +45,8 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: DEFAULT_BUFFER_SIZE,
-            batch_size: DEFAULT_BATCH_SIZE,
+            buffer_size: super::DEFAULT_BUFFER_SIZE,
+            batch_size: super::DEFAULT_BATCH_SIZE,
         }
     }
 
