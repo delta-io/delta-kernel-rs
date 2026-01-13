@@ -2582,7 +2582,6 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     Ok(())
 }
 
-
 #[tokio::test]
 async fn test_max_published_version_only_published_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2886,6 +2885,7 @@ fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     ));
 }
 
+/// Asserts that `new` is `orig` extended with exactly one commit via `LogSegment::new_with_commit`.
 fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
     // Check: What should have changed
     assert_eq!(orig.end_version + 1, new.end_version);
@@ -2902,6 +2902,7 @@ fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
     fn normalize(log_segment: LogSegment) -> LogSegment {
         LogSegment {
             end_version: 0,
+            max_published_version: None,
             ascending_commit_files: vec![],
             latest_commit_file: None,
             ..log_segment
@@ -2923,6 +2924,7 @@ async fn test_new_with_commit_published_commit() {
 
     let new_log_segment = log_segment.clone().new_with_commit(new_commit).unwrap();
 
+    assert_eq!(new_log_segment.max_published_version, Some(5));
     assert_log_segment_extended(log_segment, new_log_segment);
 }
 
@@ -2938,6 +2940,7 @@ async fn test_new_with_commit_staged_commit() {
 
     let new_log_segment = log_segment.clone().new_with_commit(new_commit).unwrap();
 
+    assert_eq!(new_log_segment.max_published_version, Some(4));
     assert_log_segment_extended(log_segment, new_log_segment);
 }
 
@@ -2952,11 +2955,10 @@ async fn test_new_with_commit_not_commit_type() {
 
     let result = log_segment.new_with_commit(checkpoint);
 
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Cannot extend and create new LogSegment. Tail log file is not a commit file."));
+    assert_result_error_with_message(
+        result,
+        "Cannot extend and create new LogSegment. Tail log file is not a commit file.",
+    );
 }
 
 #[tokio::test]
@@ -2971,9 +2973,8 @@ async fn test_new_with_commit_not_end_version_plus_one() {
 
     let result = log_segment.new_with_commit(wrong_version_commit);
 
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."));
+    assert_result_error_with_message(
+        result,
+        "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
+    );
 }

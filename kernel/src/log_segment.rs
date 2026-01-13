@@ -350,17 +350,25 @@ impl LogSegment {
         let new_end_version = tail_commit_file.version;
         let new_ascending_commit_files: Vec<_> = self
             .ascending_commit_files
-            .iter()
-            .cloned()
+            .into_iter()
             .chain([tail_commit_file.clone()])
             .collect();
-
-        // TODO: calculate new max published version, after #1587 is merged
+        let new_max_published_version = match tail_commit_file.file_type {
+            LogPathFileType::Commit => {
+                // Case 1: Tail is a published commit, so new max published is tail version.
+                Some(tail_commit_file.version)
+            }
+            _ => {
+                // Case 2: Tail is a staged commit, so max published version is unchanged.
+                self.max_published_version
+            }
+        };
 
         Ok(LogSegment {
             end_version: new_end_version,
             ascending_commit_files: new_ascending_commit_files,
             latest_commit_file: Some(tail_commit_file),
+            max_published_version: new_max_published_version,
             ..self
         })
     }
