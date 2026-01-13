@@ -14,14 +14,14 @@ use tracing::debug;
 use url::Url;
 
 /// The [UCCatalog] provides a high-level interface to interact with Delta Tables stored in Unity
-/// Catalog. For now this is a lightweight wrapper around a [UCClient].
-pub struct UCCatalog<'a> {
-    client: &'a UCClient,
+/// Catalog. For now this is a lightweight wrapper around a [UCCommitsClient].
+pub struct UCCatalog<'a, C: UCCommitsClient> {
+    client: &'a C,
 }
 
-impl<'a> UCCatalog<'a> {
-    /// Create a new [UCCatalog] instance with the provided [UCClient].
-    pub fn new(client: &'a UCClient) -> Self {
+impl<'a, C: UCCommitsClient> UCCatalog<'a, C> {
+    /// Create a new [UCCatalog] instance with the provided client.
+    pub fn new(client: &'a C) -> Self {
         UCCatalog { client }
     }
 
@@ -33,7 +33,7 @@ impl<'a> UCCatalog<'a> {
         table_id: &str,
         table_uri: &str,
         engine: &dyn Engine,
-    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error + Send + Sync>> {
         self.load_snapshot_inner(table_id, table_uri, None, engine)
             .await
     }
@@ -47,7 +47,7 @@ impl<'a> UCCatalog<'a> {
         table_uri: &str,
         version: Version,
         engine: &dyn Engine,
-    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error + Send + Sync>> {
         self.load_snapshot_inner(table_id, table_uri, Some(version), engine)
             .await
     }
@@ -58,7 +58,7 @@ impl<'a> UCCatalog<'a> {
         table_uri: &str,
         version: Option<Version>,
         engine: &dyn Engine,
-    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error>> {
+    ) -> Result<Arc<Snapshot>, Box<dyn std::error::Error + Send + Sync>> {
         let table_uri = table_uri.to_string();
         let req = CommitsRequest {
             table_id: table_id.to_string(),
@@ -106,15 +106,17 @@ impl<'a> UCCatalog<'a> {
             .commits
             .unwrap_or_default()
             .into_iter()
-            .map(|c| -> Result<LogPath, Box<dyn std::error::Error>> {
-                LogPath::staged_commit(
-                    table_url.clone(),
-                    &c.file_name,
-                    c.file_modification_timestamp,
-                    c.file_size.try_into()?,
-                )
-                .map_err(|e| e.into())
-            })
+            .map(
+                |c| -> Result<LogPath, Box<dyn std::error::Error + Send + Sync>> {
+                    LogPath::staged_commit(
+                        table_url.clone(),
+                        &c.file_name,
+                        c.file_modification_timestamp,
+                        c.file_size.try_into()?,
+                    )
+                    .map_err(|e| e.into())
+                },
+            )
             .try_collect()?;
 
         debug!("commits for kernel: {:?}\n", commits);
@@ -143,7 +145,7 @@ mod tests {
     async fn get_table(
         client: &UCClient,
         table_name: &str,
-    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         let res = client.get_table(table_name).await?;
         let table_id = res.table_id;
         let table_uri = res.storage_location;
@@ -160,21 +162,25 @@ mod tests {
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t read_uc_table --nocapture -- --ignored`
     #[ignore]
     #[tokio::test]
-    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+    async fn read_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
-        // build UC client, get table info and credentials
-        let client = UCClient::builder(endpoint, &token).build()?;
-        let (table_id, table_uri) = get_table(&client, &table_name).await?;
-        let creds = client
+        // build shared config
+        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+
+        // build clients
+        let uc_client = UCClient::new(config.clone())?;
+        let uc_commits_client = UCCommitsRestClient::new(config)?;
+
+        let (table_id, table_uri) = get_table(&uc_client, &table_name).await?;
+        let creds = uc_client
             .get_credentials(&table_id, Operation::Read)
             .await
             .map_err(|e| format!("Failed to get credentials: {}", e))?;
 
-        // build catalog
-        let catalog = UCCatalog::new(&client);
+        let catalog = UCCatalog::new(&uc_commits_client);
 
         // TODO: support non-AWS
         let creds = creds
@@ -211,21 +217,25 @@ mod tests {
     // `ENDPOINT=".." TABLENAME=".." TOKEN=".." cargo t write_uc_table --nocapture -- --ignored`
     #[ignore]
     #[tokio::test(flavor = "multi_thread")]
-    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error>> {
+    async fn write_uc_table() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let endpoint = env::var("ENDPOINT").expect("ENDPOINT environment variable not set");
         let token = env::var("TOKEN").expect("TOKEN environment variable not set");
         let table_name = env::var("TABLENAME").expect("TABLENAME environment variable not set");
 
-        // build UC client, get table info and credentials
-        let client = Arc::new(UCClient::builder(endpoint, &token).build()?);
+        // build shared config
+        let config = uc_client::ClientConfig::build(&endpoint, &token).build()?;
+
+        // build clients
+        let client = UCClient::new(config.clone())?;
+        let commits_client = Arc::new(UCCommitsRestClient::new(config)?);
+
         let (table_id, table_uri) = get_table(&client, &table_name).await?;
         let creds = client
             .get_credentials(&table_id, Operation::ReadWrite)
             .await
             .map_err(|e| format!("Failed to get credentials: {}", e))?;
 
-        // build catalog
-        let catalog = UCCatalog::new(&client);
+        let catalog = UCCatalog::new(commits_client.as_ref());
 
         // TODO: support non-AWS
         let creds = creds
@@ -244,7 +254,7 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = store.into();
 
         let engine = DefaultEngineBuilder::new(store.clone()).build();
-        let committer = Box::new(UCCommitter::new(client.clone(), table_id.clone()));
+        let committer = Box::new(UCCommitter::new(commits_client.clone(), table_id.clone()));
         let snapshot = catalog
             .load_snapshot(&table_id, &table_uri, &engine)
             .await?;
