@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::DefaultEngine;
+use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFilesBuilder;
@@ -31,7 +31,9 @@ use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
 };
-use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
+use test_utils::{
+    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+};
 
 use super::*;
 
@@ -1031,7 +1033,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
@@ -1073,7 +1075,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1100,7 +1102,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let checkpoint_batch =
@@ -1141,7 +1143,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
@@ -1189,7 +1191,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1259,7 +1261,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     add_checkpoint_to_store(
         &store,
@@ -1311,7 +1313,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1370,7 +1372,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
     add_sidecar_to_store(
@@ -1479,6 +1481,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 #[derive(Default)]
 struct LogSegmentConfig<'a> {
     published_commit_versions: &'a [u64],
+    staged_commit_versions: &'a [u64],
     compaction_versions: &'a [(u64, u64)],
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
@@ -1503,10 +1506,25 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+    let table_root = Url::parse("memory:///").expect("valid url");
+    let staged_commits_log_tail: Vec<ParsedLogPath> = segment
+        .staged_commit_versions
+        .iter()
+        .map(|version| staged_commit_path_for_version(*version))
+        .map(|path| {
+            ParsedLogPath::try_from(FileMeta {
+                location: table_root.join(path.as_ref()).unwrap(),
+                last_modified: 0,
+                size: 0,
+            })
+            .unwrap()
+            .unwrap()
+        })
+        .collect();
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root.clone(),
-        vec![], // log_tail
+        staged_commits_log_tail,
         None,
         segment.version_to_load,
     )
@@ -1556,6 +1574,7 @@ async fn test_compaction_listing(
         compaction_versions,
         checkpoint_version,
         version_to_load,
+        ..Default::default()
     })
     .await;
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
@@ -1710,6 +1729,7 @@ async fn test_commit_cover(
         compaction_versions,
         checkpoint_version,
         version_to_load,
+        ..Default::default()
     })
     .await;
     let cover = log_segment.find_commit_cover();
@@ -2426,6 +2446,7 @@ fn test_publish_validation() {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2447,6 +2468,7 @@ fn test_publish_validation() {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // Should fail with staged commits
@@ -2513,7 +2535,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     use crate::schema::{StructField, StructType};
 
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Create a V1 checkpoint (without sidecar column)
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
@@ -2557,4 +2579,104 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_max_published_version_only_published_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7, 8],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 8);
+}
+
+#[tokio::test]
+async fn test_max_published_version_only_staged_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        staged_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_staged_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        staged_commit_versions: &[5, 6, 7, 8],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
+}
+
+#[tokio::test]
+async fn test_max_published_version_published_and_staged_commits_no_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_no_overlap()
+{
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7],
+        staged_commit_versions: &[8, 9, 10],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 7);
+}
+
+#[tokio::test]
+async fn test_max_published_version_published_and_staged_commits_with_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_with_overlap(
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7, 8, 9],
+        staged_commit_versions: &[7, 8, 9, 10],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 9);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_only() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
 }
