@@ -205,7 +205,7 @@ impl ActionsBatch {
 
 #[internal_api]
 #[allow(unused)]
-pub(crate) trait ParallelizableLogReplayProcessor {
+pub(crate) trait ParallelLogReplayProcessor {
     type Output;
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output>;
 }

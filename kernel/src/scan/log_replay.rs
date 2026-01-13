@@ -15,7 +15,7 @@ use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateE
 use crate::log_replay::deduplicator::{CheckpointDeduplicator, Deduplicator};
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor,
-    ParallelizableLogReplayProcessor,
+    ParallelLogReplayProcessor,
 };
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
@@ -496,7 +496,7 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     EXPR.clone()
 }
 
-impl ParallelizableLogReplayProcessor for ScanLogReplayProcessor {
+impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     type Output = <ScanLogReplayProcessor as LogReplayProcessor>::Output;
 
     // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
@@ -546,7 +546,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
     // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // ParallelizableLogReplayProcessor>::process_actions_batch`]! (See trait impl block above) Any
+    // ParallelLogReplayProcessor>::process_actions_batch`]! (See trait impl block above) Any
     // changes performed to this function probably also need to be applied to the other copy of the
     // function. The copy occurs due to the different required mutability in self.
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
