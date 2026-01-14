@@ -5,8 +5,9 @@ use std::{collections::HashMap, sync::Arc};
 use clap::{Args, CommandFactory, FromArgMatches};
 use delta_kernel::{
     arrow::array::RecordBatch, engine::default::executor::tokio::TokioBackgroundExecutor,
-    engine::default::storage::store_from_url_opts, engine::default::DefaultEngine, scan::Scan,
-    schema::MetadataColumnSpec, DeltaResult, SnapshotRef,
+    engine::default::storage::store_from_url_opts, engine::default::DefaultEngine,
+    engine::default::DefaultEngineBuilder, scan::Scan, schema::MetadataColumnSpec, DeltaResult,
+    SnapshotRef,
 };
 
 use object_store::{
@@ -156,13 +157,13 @@ pub fn get_engine(
                 )));
             }
         };
-        Ok(DefaultEngine::new(Arc::new(store)))
+        Ok(DefaultEngineBuilder::new(Arc::new(store)).build())
     } else if !args.option.is_empty() {
         let opts = args.option.iter().map(|option| {
             let parts: Vec<&str> = option.split("=").collect();
             (parts[0].to_ascii_lowercase(), parts[1])
         });
-        Ok(DefaultEngine::new(store_from_url_opts(url, opts)?))
+        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, opts)?).build())
     } else {
         let mut options = if let Some(ref region) = args.region {
             HashMap::from([("region", region.clone())])
@@ -172,7 +173,7 @@ pub fn get_engine(
         if args.public {
             options.insert("skip_signature", "true".to_string());
         }
-        Ok(DefaultEngine::new(store_from_url_opts(url, options)?))
+        Ok(DefaultEngineBuilder::new(store_from_url_opts(url, options)?).build())
     }
 }
 

@@ -25,9 +25,6 @@ use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, JsonHandler, PredicateRef,
 };
 
-const DEFAULT_BUFFER_SIZE: usize = 1000;
-const DEFAULT_BATCH_SIZE: usize = 1000;
-
 #[derive(Debug)]
 pub struct DefaultJsonHandler<E: TaskExecutor> {
     /// The object store to read files from
@@ -48,8 +45,8 @@ impl<E: TaskExecutor> DefaultJsonHandler<E> {
         Self {
             store,
             task_executor,
-            buffer_size: DEFAULT_BUFFER_SIZE,
-            batch_size: DEFAULT_BATCH_SIZE,
+            buffer_size: super::DEFAULT_BUFFER_SIZE,
+            batch_size: super::DEFAULT_BATCH_SIZE,
         }
     }
 
@@ -625,7 +622,7 @@ mod tests {
         );
     }
 
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::schema::StructType;
     use crate::Engine;
     use std::io::Write;
@@ -648,7 +645,7 @@ mod tests {
         let (_temp_file2, file_url2) = make_invalid_named_temp();
         let field = StructField::nullable("name", crate::schema::DataType::BOOLEAN);
         let schema = Arc::new(StructType::try_new(vec![field]).unwrap());
-        let default_engine = DefaultEngine::new(Arc::new(LocalFileSystem::new()));
+        let default_engine = DefaultEngineBuilder::new(Arc::new(LocalFileSystem::new())).build();
 
         // Helper to check that we get expected number of errors then stream ends
         let check_errors = |file_urls: Vec<_>, expected_errors: usize| {

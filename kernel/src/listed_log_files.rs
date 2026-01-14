@@ -31,6 +31,7 @@ use url::Url;
 /// - `checkpoint_parts`: All parts of the most recent complete checkpoint (all same version). Empty if no checkpoint found.
 /// - `latest_crc_file`: The CRC file with the highest version, if any.
 /// - `latest_commit_file`: The commit file with the highest version, or `None` if no commits were found.
+/// - `max_published_version`: The highest published commit file version, or `None` if no published commits were found.
 #[derive(Debug)]
 #[internal_api]
 pub(crate) struct ListedLogFiles {
@@ -39,6 +40,7 @@ pub(crate) struct ListedLogFiles {
     checkpoint_parts: Vec<ParsedLogPath>,
     latest_crc_file: Option<ParsedLogPath>,
     latest_commit_file: Option<ParsedLogPath>,
+    max_published_version: Option<Version>,
 }
 
 /// Builder for constructing a validated [`ListedLogFiles`].
@@ -52,6 +54,7 @@ pub(crate) struct ListedLogFilesBuilder {
     pub checkpoint_parts: Vec<ParsedLogPath>,
     pub latest_crc_file: Option<ParsedLogPath>,
     pub latest_commit_file: Option<ParsedLogPath>,
+    pub max_published_version: Option<Version>,
 }
 
 impl ListedLogFilesBuilder {
@@ -103,14 +106,23 @@ impl ListedLogFilesBuilder {
             checkpoint_parts: self.checkpoint_parts,
             latest_crc_file: self.latest_crc_file,
             latest_commit_file: self.latest_commit_file,
+            max_published_version: self.max_published_version,
         })
     }
 }
 
-/// Returns a fallible iterator of [`ParsedLogPath`] over versions `start_version..=end_version`
-/// taking into account the `log_tail` which was (ostentibly) returned from the catalog. If there
-/// are fewer files than requested (e.g. `end_version` is past the end of the log), the iterator
-/// will simply end before reaching `end_version`.
+struct ListLogFilesResult {
+    files: Vec<ParsedLogPath>,
+    max_published_version: Option<Version>,
+}
+
+/// Lists [`ParsedLogPath`]s over versions [start_version, end_version], taking into account the
+/// `log_tail`. If there are fewer files than requested (e.g. `end_version` is past the end of the
+/// log), the result will simply end before reaching `end_version`.
+///
+/// The `log_tail` may originate from a catalog (e.g. from `SnapshotBuilder::with_log_tail`) or
+/// from the connector itself, if it cached log state internally (e.g. from `Snapshot::try_new_from`).
+/// It may contain either published or staged commits.
 ///
 /// Note that the `log_tail` must strictly adhere to being a 'tail' - that is, it is a contiguous
 /// cover of versions `X..=Y` where `Y` is the latest version of the table. If it overlaps with
@@ -132,7 +144,7 @@ fn list_log_files(
     log_tail: Vec<ParsedLogPath>,
     start_version: impl Into<Option<Version>>,
     end_version: impl Into<Option<Version>>,
-) -> DeltaResult<impl Iterator<Item = DeltaResult<ParsedLogPath>>> {
+) -> DeltaResult<ListLogFilesResult> {
     // check log_tail is only commits
     // note that LogSegment checks no gaps/duplicates so we don't duplicate that here
     debug_assert!(
@@ -150,39 +162,70 @@ fn list_log_files(
     let list_end_version =
         log_tail_start.map_or(end_version, |first| first.version.saturating_sub(1));
 
+    let mut max_published_version_from_listing: Option<Version> = None;
+
     // if the log_tail covers the entire requested range (i.e. starts at or before start_version),
     // we skip listing entirely. note that if we don't include this check, we will end up listing
     // and then just filtering out all the files we listed.
-    let listed_files = if log_tail_start.is_none_or(|tail| start_version < tail.version) {
-        // NOTE: since engine APIs don't limit listing, we list from start_version and filter
-        let files = storage
-            .list_from(&start_from)?
-            .map(|meta| ParsedLogPath::try_from(meta?))
-            // NOTE: this filters out .crc files etc which start with "." - some engines
-            // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
-            // doesn't care about these files. Critically, note these are _different_ than
-            // normal `version.crc` files which are listed + captured normally. Additionally
-            // we likely aren't even 'seeing' these files since lexicographically the string
-            // "." comes before the string "0".
-            .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
-            .take_while(move |path_res| match path_res {
-                // discard any path with too-large version; keep errors
-                Ok(path) => path.version <= list_end_version,
-                Err(_) => true,
-            });
-        Some(files)
-    } else {
-        None
-    };
+    let listed_files: Vec<ParsedLogPath> =
+        if log_tail_start.is_none_or(|tail| start_version < tail.version) {
+            // NOTE: since engine APIs don't limit listing, we list from start_version and filter.
+            // We list up to end_version (not list_end_version) to track max_published_commit_version_from_listing,
+            // then filter to list_end_version for the returned files.
+            let all_files: Vec<ParsedLogPath> = storage
+                .list_from(&start_from)?
+                .map(|meta| ParsedLogPath::try_from(meta?))
+                // NOTE: this filters out .crc files etc which start with "." - some engines
+                // produce `.something.parquet.crc` corresponding to `something.parquet`. Kernel
+                // doesn't care about these files. Critically, note these are _different_ than
+                // normal `version.crc` files which are listed + captured normally. Additionally
+                // we likely aren't even 'seeing' these files since lexicographically the string
+                // "." comes before the string "0".
+                .filter_map_ok(|path_opt| path_opt.filter(|p| p.should_list()))
+                .take_while(|path_res| match path_res {
+                    // discard any path with too-large version; keep errors
+                    Ok(path) => path.version <= end_version,
+                    Err(_) => true,
+                })
+                .try_collect()?;
 
-    // return chained [listed_files..log_tail], filtering log_tail by the requested range
-    let filtered_log_tail = log_tail
+            // Track max published commit version from all filesystem-listed files (including those
+            // that will be filtered out because log_tail takes precedence at those versions)
+            max_published_version_from_listing = all_files
+                .iter()
+                .filter(|f| matches!(f.file_type, LogPathFileType::Commit))
+                .map(|f| f.version)
+                .max();
+
+            // Filter to keep only files before log_tail starts
+            all_files
+                .into_iter()
+                .filter(|f| f.version <= list_end_version)
+                .collect()
+        } else {
+            vec![]
+        };
+
+    // Chain with filtered log_tail
+    let filtered_log_tail: Vec<ParsedLogPath> = log_tail
         .into_iter()
-        .filter(move |entry| entry.version >= start_version && entry.version <= end_version)
-        .map(Ok);
+        .filter(|entry| entry.version >= start_version && entry.version <= end_version)
+        .collect();
 
-    let listed_files = listed_files.into_iter().flatten();
-    Ok(listed_files.chain(filtered_log_tail))
+    // Also consider published commits from log_tail
+    let max_published_version_from_log_tail = filtered_log_tail
+        .iter()
+        .filter(|f| matches!(f.file_type, LogPathFileType::Commit))
+        .map(|f| f.version)
+        .max();
+
+    let files: Vec<ParsedLogPath> = listed_files.into_iter().chain(filtered_log_tail).collect();
+
+    Ok(ListLogFilesResult {
+        files,
+        max_published_version: max_published_version_from_listing
+            .max(max_published_version_from_log_tail),
+    })
 }
 
 /// Groups all checkpoint parts according to the checkpoint they belong to.
@@ -241,6 +284,7 @@ impl ListedLogFiles {
         Vec<ParsedLogPath>,
         Option<ParsedLogPath>,
         Option<ParsedLogPath>,
+        Option<Version>,
     ) {
         (
             self.ascending_commit_files,
@@ -248,6 +292,7 @@ impl ListedLogFiles {
             self.checkpoint_parts,
             self.latest_crc_file,
             self.latest_commit_file,
+            self.max_published_version,
         )
     }
 
@@ -277,15 +322,18 @@ impl ListedLogFiles {
     ) -> DeltaResult<Self> {
         // TODO: plumb through a log_tail provided by our caller
         let log_tail = vec![];
-        let listed_commits: Vec<ParsedLogPath> =
-            list_log_files(storage, log_root, log_tail, start_version, end_version)?
-                .filter_ok(|log_file| log_file.is_commit())
-                .try_collect()?;
+        let result = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
+        let listed_commits: Vec<ParsedLogPath> = result
+            .files
+            .into_iter()
+            .filter(|log_file| log_file.is_commit())
+            .collect();
         // .last() on a slice is an O(1) operation
         let latest_commit_file = listed_commits.last().cloned();
         ListedLogFilesBuilder {
             ascending_commit_files: listed_commits,
             latest_commit_file,
+            max_published_version: result.max_published_version,
             ..Default::default()
         }
         .build()
@@ -303,7 +351,7 @@ impl ListedLogFiles {
         start_version: Option<Version>,
         end_version: Option<Version>,
     ) -> DeltaResult<Self> {
-        let log_files = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
+        let result = list_log_files(storage, log_root, log_tail, start_version, end_version)?;
 
         // Helper that accumulates and groups log files during listing. Each "group" consists of all
         // files that share the same version number (e.g., commit, checkpoint parts, CRC files).
@@ -387,14 +435,14 @@ impl ListedLogFiles {
             ..Default::default()
         };
 
-        let mut log_files = log_files;
-        if let Some(file) = log_files.next().transpose()? {
+        let mut log_files = result.files.into_iter();
+        if let Some(file) = log_files.next() {
             // Process first file to establish an initial group
             let mut group_version = file.version;
             builder.process_file(file);
 
             // Process remaining files, flushing the previous groups first if the version changed
-            while let Some(file) = log_files.next().transpose()? {
+            for file in log_files {
                 if file.version != group_version {
                     builder.flush_checkpoint_group(group_version);
                     group_version = file.version;
@@ -421,6 +469,7 @@ impl ListedLogFiles {
             checkpoint_parts: builder.checkpoint_parts,
             latest_crc_file: builder.latest_crc_file,
             latest_commit_file: builder.latest_commit_file,
+            max_published_version: result.max_published_version,
         }
         .build()
     }
@@ -585,10 +634,9 @@ mod list_log_files_with_log_tail_tests {
         ];
         let (storage, log_root) = create_storage(log_files).await;
 
-        let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], Some(1), Some(2))
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let total_listing_result =
+            list_log_files(storage.as_ref(), &log_root, vec![], Some(1), Some(2)).unwrap();
+        let result = total_listing_result.files;
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].version, 1);
@@ -596,6 +644,7 @@ mod list_log_files_with_log_tail_tests {
         // all should be from filesystem since log_tail is empty
         assert_source(&result[0], CommitSource::Filesystem);
         assert_source(&result[1], CommitSource::Filesystem);
+        assert_eq!(total_listing_result.max_published_version, Some(2));
     }
 
     #[tokio::test]
@@ -615,11 +664,9 @@ mod list_log_files_with_log_tail_tests {
             make_parsed_log_path_with_source(5, LogPathFileType::Commit, CommitSource::Catalog),
         ];
 
-        let result: Vec<_> =
-            list_log_files(storage.as_ref(), &log_root, log_tail, Some(0), Some(5))
-                .unwrap()
-                .try_collect()
-                .unwrap();
+        let total_listing_result =
+            list_log_files(storage.as_ref(), &log_root, log_tail, Some(0), Some(5)).unwrap();
+        let result = total_listing_result.files;
 
         assert_eq!(result.len(), 6);
         // filesystem
@@ -636,6 +683,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[3], CommitSource::Catalog);
         assert_source(&result[4], CommitSource::Catalog);
         assert_source(&result[5], CommitSource::Catalog);
+        assert_eq!(total_listing_result.max_published_version, Some(5));
     }
 
     #[tokio::test]
@@ -655,11 +703,9 @@ mod list_log_files_with_log_tail_tests {
         ];
 
         // list for only versions 1-3
-        let result: Vec<_> =
-            list_log_files(storage.as_ref(), &log_root, log_tail, Some(1), Some(3))
-                .unwrap()
-                .try_collect()
-                .unwrap();
+        let total_listing_result =
+            list_log_files(storage.as_ref(), &log_root, log_tail, Some(1), Some(3)).unwrap();
+        let result = total_listing_result.files;
 
         // The result includes version 1 from filesystem, and log_tail until requested version (2-3)
         assert_eq!(result.len(), 3);
@@ -669,6 +715,10 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[0], CommitSource::Filesystem);
         assert_source(&result[1], CommitSource::Catalog);
         assert_source(&result[2], CommitSource::Catalog);
+        assert_eq!(
+            total_listing_result.max_published_version,
+            Some(3) // Recall: we listed (with log tail) with end_version=3
+        );
     }
 
     #[tokio::test]
@@ -678,7 +728,7 @@ mod list_log_files_with_log_tail_tests {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
             (1, LogPathFileType::Commit, CommitSource::Filesystem),
-            (2, LogPathFileType::Commit, CommitSource::Filesystem), // ignored!
+            (2, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
         ];
         let (storage, log_root) = create_storage(log_files).await;
 
@@ -689,10 +739,9 @@ mod list_log_files_with_log_tail_tests {
             CommitSource::Catalog,
         )];
 
-        let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, log_tail, Some(0), None)
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let total_listing_result =
+            list_log_files(storage.as_ref(), &log_root, log_tail, Some(0), None).unwrap();
+        let result = total_listing_result.files;
 
         // expect only 0 from file system and 1 from log tail
         assert_eq!(result.len(), 2);
@@ -700,6 +749,7 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result[1].version, 1);
         assert_source(&result[0], CommitSource::Filesystem);
         assert_source(&result[1], CommitSource::Catalog);
+        assert_eq!(total_listing_result.max_published_version, Some(2));
     }
 
     #[test]
@@ -741,10 +791,9 @@ mod list_log_files_with_log_tail_tests {
 
         let storage = StorageThatPanics {};
         let url = Url::parse("memory:///anything").unwrap();
-        let result: Vec<_> = list_log_files(&storage, &url, log_tail, Some(0), Some(2))
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let total_listing_result =
+            list_log_files(&storage, &url, log_tail, Some(0), Some(2)).unwrap();
+        let result = total_listing_result.files;
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].version, 0);
@@ -753,6 +802,7 @@ mod list_log_files_with_log_tail_tests {
         assert_source(&result[0], CommitSource::Catalog);
         assert_source(&result[1], CommitSource::Catalog);
         assert_source(&result[2], CommitSource::Catalog);
+        assert_eq!(total_listing_result.max_published_version, Some(1));
     }
 
     #[tokio::test]
@@ -764,16 +814,15 @@ mod list_log_files_with_log_tail_tests {
 
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
-            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
             (1, LogPathFileType::StagedCommit, CommitSource::Filesystem),
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
         let (storage, log_root) = create_storage(log_files).await;
-        let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], None, None)
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let total_listing_result =
+            list_log_files(storage.as_ref(), &log_root, vec![], None, None).unwrap();
+        let result = total_listing_result.files;
 
         // we must only see two regular commits
         assert_eq!(result.len(), 2);
@@ -781,26 +830,27 @@ mod list_log_files_with_log_tail_tests {
         assert_eq!(result[1].version, 1);
         assert_source(&result[0], CommitSource::Filesystem);
         assert_source(&result[1], CommitSource::Filesystem);
+        assert_eq!(total_listing_result.max_published_version, Some(1));
     }
 
     #[tokio::test]
     async fn test_listing_with_large_end_version() {
         let log_files = vec![
             (0, LogPathFileType::Commit, CommitSource::Filesystem),
-            (1, LogPathFileType::Commit, CommitSource::Filesystem),
+            (1, LogPathFileType::Commit, CommitSource::Filesystem), // <-- max_published_version
             (2, LogPathFileType::StagedCommit, CommitSource::Filesystem),
         ];
 
         let (storage, log_root) = create_storage(log_files).await;
         // note we let you request end version past the end of log. up to consumer to interpret
-        let result: Vec<_> = list_log_files(storage.as_ref(), &log_root, vec![], None, Some(3))
-            .unwrap()
-            .try_collect()
-            .unwrap();
+        let total_listing_result =
+            list_log_files(storage.as_ref(), &log_root, vec![], None, Some(3)).unwrap();
+        let result = total_listing_result.files;
 
         // we must only see two regular commits
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].version, 0);
         assert_eq!(result[1].version, 1);
+        assert_eq!(total_listing_result.max_published_version, Some(1));
     }
 }
