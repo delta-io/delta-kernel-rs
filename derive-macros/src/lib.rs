@@ -138,7 +138,7 @@ fn gen_schema_fields(data: &Data) -> TokenStream {
     quote! { #(#schema_fields),* }
 }
 
-/// Derive an IntoEngineData trait for a struct that has all fields implement `Into<Scalar>`.
+/// Derive an IntoEngineData trait for a struct that has all fields implement `TryInto<Scalar>`.
 ///
 /// This is a relatively simple macro to produce the boilerplate for converting a struct into
 /// EngineData using the `create_one` method. TODO: (doc)tests included in the delta_kernel crate:
@@ -163,13 +163,14 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 
     let fields = &fields.named;
     let field_idents = fields.iter().map(|f| &f.ident);
-    let field_types = fields.iter().map(|f| &f.ty);
+    let field_types: Vec<_> = fields.iter().map(|f| &f.ty).collect();
 
     let expanded = quote! {
         #[automatically_derived]
         impl delta_kernel::IntoEngineData for #struct_name
         where
-            #(#field_types: Into<delta_kernel::expressions::Scalar>),*
+            #(#field_types: TryInto<delta_kernel::expressions::Scalar>,)*
+            #(delta_kernel::Error: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>,)*
         {
             fn into_engine_data(
                 self,
@@ -179,7 +180,7 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
                 // NB: we `use` here to avoid polluting the caller's namespace
                 use delta_kernel::EvaluationHandlerExtension as _;
                 let values = [
-                    #(self.#field_idents.into()),*
+                    #(self.#field_idents.try_into()?),*
                 ];
                 let evaluator = engine.evaluation_handler();
                 evaluator.create_one(schema, &values)
