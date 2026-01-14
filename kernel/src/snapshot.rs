@@ -384,11 +384,7 @@ impl Snapshot {
 
     /// Performs a complete checkpoint of this snapshot using the provided engine.
     ///
-    /// This is an "all-in-one" checkpoint workflow:
-    /// 1. Creates the checkpoint data
-    /// 2. Writes the checkpoint parquet file using [`Engine::parquet_handler`]
-    /// 3. Gets file metadata using [`Engine::storage_handler`]
-    /// 4. Writes the `_last_checkpoint` file
+    /// Writes a checkpoint parquet file and the `_last_checkpoint` file.
     ///
     /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
     /// [`crate::StorageHandler::head`], which may not be implemented by all engines
@@ -415,11 +411,12 @@ impl Snapshot {
 
         let file_meta = engine.storage_handler().head(&checkpoint_path)?;
 
-        // `write_parquet_file` took ownership of the iterator, so reconstruct an exhausted iterator
-        // with the captured counts for finalize.
-        let exhausted_iter = ActionReconciliationIterator::with_exhausted_counts(
+        // `write_parquet_file` took ownership of the iterator, so reconstruct an empty iterator
+        // with the captured counts and exhaustion status for finalize.
+        let exhausted_iter = ActionReconciliationIterator::with_empty_iterator(
             state.actions_count.load(Ordering::Acquire),
             state.add_actions_count.load(Ordering::Acquire),
+            state.is_exhausted.load(Ordering::Acquire),
         );
 
         // Finalize the checkpoint (writes `_last_checkpoint` file).

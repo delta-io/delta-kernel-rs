@@ -109,13 +109,21 @@ impl ActionReconciliationIterator {
         }
     }
 
-    /// Create an exhausted iterator with the specified counts.
-    pub(crate) fn with_exhausted_counts(actions_count: i64, add_actions_count: i64) -> Self {
+    /// Create an empty iterator with the specified counts and exhausted state.
+    ///
+    /// This is useful when the original iterator has been moved/consumed elsewhere, but we still
+    /// need to pass counters and exhaustion status to downstream works (e.g. checkpoint
+    /// finalization).
+    pub(crate) fn with_empty_iterator(
+        actions_count: i64,
+        add_actions_count: i64,
+        is_exhausted: bool,
+    ) -> Self {
         Self {
             inner: Box::new(std::iter::empty()),
             actions_count,
             add_actions_count,
-            is_exhausted: true,
+            is_exhausted,
         }
     }
 
