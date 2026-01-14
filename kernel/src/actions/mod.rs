@@ -7,10 +7,8 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 
 use self::deletion_vector::DeletionVectorDescriptor;
-use crate::expressions::{ArrayData, MapData, Scalar, StructData};
-use crate::schema::{
-    ArrayType, DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _,
-};
+use crate::expressions::{MapData, Scalar, StructData};
+use crate::schema::{DataType, MapType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::table_features::{FeatureType, TableFeature};
 use crate::table_properties::TableProperties;
 use crate::utils::require;
@@ -348,7 +346,8 @@ impl Metadata {
     }
 }
 
-// TODO: derive IntoEngineData instead (see issue #1083)
+// NOTE: We can't derive IntoEngineData for Metadata because it has a nested Format struct,
+// and create_one expects flattened values for nested schemas.
 impl IntoEngineData for Metadata {
     fn into_engine_data(
         self,
@@ -372,7 +371,9 @@ impl IntoEngineData for Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize)]
+#[derive(
+    Default, Debug, Clone, PartialEq, Eq, ToSchema, Serialize, Deserialize, IntoEngineData,
+)]
 #[serde(rename_all = "camelCase")]
 #[internal_api]
 // TODO move to another module so that we disallow constructing this struct without using the
@@ -576,46 +577,7 @@ impl Protocol {
     }
 }
 
-// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
-impl IntoEngineData for Protocol {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        fn features_to_scalar<T>(
-            features: Option<impl IntoIterator<Item = T>>,
-        ) -> DeltaResult<Scalar>
-        where
-            T: Into<Scalar>,
-        {
-            match features {
-                Some(features) => {
-                    let features: Vec<Scalar> = features.into_iter().map(Into::into).collect();
-                    Ok(Scalar::Array(ArrayData::try_new(
-                        ArrayType::new(DataType::STRING, false),
-                        features,
-                    )?))
-                }
-                None => Ok(Scalar::Null(DataType::Array(Box::new(ArrayType::new(
-                    DataType::STRING,
-                    false,
-                ))))),
-            }
-        }
-
-        let values = [
-            self.min_reader_version.into(),
-            self.min_writer_version.into(),
-            features_to_scalar(self.reader_features)?,
-            features_to_scalar(self.writer_features)?,
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, IntoEngineData)]
 #[internal_api]
 #[cfg_attr(test, derive(Serialize, Default), serde(rename_all = "camelCase"))]
 pub(crate) struct CommitInfo {
@@ -655,32 +617,11 @@ impl CommitInfo {
             timestamp: Some(timestamp),
             in_commit_timestamp,
             operation: Some(operation.unwrap_or_else(|| UNKNOWN_OPERATION.to_string())),
-            operation_parameters: None,
+            operation_parameters: Some(HashMap::new()),
             kernel_version: Some(format!("v{KERNEL_VERSION}")),
             engine_info,
             txn_id: Some(uuid::Uuid::new_v4().to_string()),
         }
-    }
-}
-
-// TODO: implement Scalar::From<HashMap<K, V>> so we can derive IntoEngineData using a macro (issue#1083)
-impl IntoEngineData for CommitInfo {
-    fn into_engine_data(
-        self,
-        schema: SchemaRef,
-        engine: &dyn Engine,
-    ) -> DeltaResult<Box<dyn EngineData>> {
-        let values = [
-            self.timestamp.into(),
-            self.in_commit_timestamp.into(),
-            self.operation.into(),
-            self.operation_parameters.unwrap_or_default().try_into()?,
-            self.kernel_version.into(),
-            self.engine_info.into(),
-            self.txn_id.into(),
-        ];
-
-        engine.evaluation_handler().create_one(schema, &values)
     }
 }
 
@@ -1005,7 +946,7 @@ mod tests {
         },
         engine::{arrow_data::EngineDataArrowExt as _, arrow_expression::ArrowEvaluationHandler},
         schema::{ArrayType, DataType, MapType, StructField},
-        Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+        Engine, EvaluationHandler, IntoEngineData, JsonHandler, ParquetHandler, StorageHandler,
     };
     use serde_json::json;
 
