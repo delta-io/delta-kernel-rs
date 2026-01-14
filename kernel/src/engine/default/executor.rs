@@ -169,6 +169,9 @@ pub mod tokio {
     }
 
     impl TaskExecutor for TokioMultiThreadExecutor {
+        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's `max_blocking_threads`, this can deadlock
+        // See:
+        // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
         fn block_on<T>(&self, task: T) -> T::Output
         where
             T: Future + Send + 'static,
