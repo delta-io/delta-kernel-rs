@@ -86,7 +86,7 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
             })
         })?;
         Ok(CommitResponse::Committed {
-            version: commit_metadata.version(),
+            file_meta: committed,
         })
     }
 }

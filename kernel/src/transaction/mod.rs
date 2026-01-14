@@ -21,7 +21,7 @@ use crate::engine_data::{GetData, TypedGetData};
 use crate::error::Error;
 use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
-use crate::path::LogRoot;
+use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
@@ -34,6 +34,7 @@ use crate::schema::{
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
+use crate::FileMeta;
 use crate::{
     DataType, DeltaResult, Engine, EngineData, Expression, ExpressionRef, IntoEngineData,
     RowVisitor, SchemaTransform, Version,
@@ -464,8 +465,8 @@ impl Transaction {
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)
         {
-            Ok(CommitResponse::Committed { version }) => Ok(CommitResult::CommittedTransaction(
-                self.into_committed(version),
+            Ok(CommitResponse::Committed { file_meta }) => Ok(CommitResult::CommittedTransaction(
+                self.into_committed(file_meta)?,
             )),
             Ok(CommitResponse::Conflict { version }) => Ok(CommitResult::ConflictedTransaction(
                 self.into_conflicted(version),
@@ -994,7 +995,8 @@ impl Transaction {
         }
     }
 
-    fn into_committed(self, version: Version) -> CommittedTransaction {
+    fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
+        let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
         let stats = PostCommitStats {
             commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
                 + 1,
@@ -1005,11 +1007,11 @@ impl Transaction {
                 + 1,
         };
 
-        CommittedTransaction {
+        Ok(CommittedTransaction {
             transaction: self,
-            commit_version: version,
+            commit_version: parsed_commit.version,
             post_commit_stats: stats,
-        }
+        })
     }
 
     fn into_conflicted(self, conflict_version: Version) -> ConflictedTransaction {

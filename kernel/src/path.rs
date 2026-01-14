@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
+use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
@@ -218,6 +219,21 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             version,
             file_type,
         }))
+    }
+
+    /// Parse a location into a commit path (published or staged), returning an error if invalid or
+    /// not a commit.
+    pub(crate) fn parse_commit(location: Location) -> DeltaResult<Self> {
+        let url = location.as_url().to_string();
+        let parsed = Self::try_from(location)?.ok_or_else(|| Error::invalid_log_path(&url))?;
+        require!(
+            parsed.is_commit(),
+            Error::generic(format!(
+                "Expected a commit path, got {} of type {:?}",
+                url, parsed.file_type
+            ))
+        );
+        Ok(parsed)
     }
 
     pub(crate) fn should_list(&self) -> bool {
