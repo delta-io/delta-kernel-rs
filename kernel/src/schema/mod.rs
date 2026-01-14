@@ -1311,6 +1311,27 @@ impl PrimitiveType {
     pub fn decimal(precision: u8, scale: u8) -> DeltaResult<Self> {
         Ok(DecimalType::try_new(precision, scale)?.into())
     }
+
+    /// Returns `true` if this primitive type can be widened to the `target` type.
+    ///
+    /// Widening rules (based on Parquet reader behavior):
+    /// - Integer widening: byte → short → int → long
+    /// - Float widening: float → double
+    ///
+    /// Note: These widening rules assume the parquet reader supports reading narrower types
+    /// as wider types. This should be documented as a requirement in the `ParquetHandler` trait.
+    pub(crate) fn can_widen_to(&self, target: &Self) -> bool {
+        use PrimitiveType::*;
+        matches!(
+            (self, target),
+            // Integer widening: smaller types can be read as larger ones
+            (Byte, Short | Integer | Long)
+                | (Short, Integer | Long)
+                | (Integer, Long)
+                // Float widening: float can be read as double
+                | (Float, Double)
+        )
+    }
 }
 
 fn serialize_decimal<S: serde::Serializer>(
