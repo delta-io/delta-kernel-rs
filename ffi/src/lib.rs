@@ -712,6 +712,31 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
     snapshot.drop_handle();
 }
 
+/// Perform a full checkpoint of the specified snapshot using the supplied engine.
+///
+/// This writes the checkpoint parquet file and the `_last_checkpoint` file.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles.
+#[no_mangle]
+pub unsafe extern "C" fn snapshot_checkpoint(
+    snapshot: Handle<SharedSnapshot>,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<bool> {
+    let engine_ref = unsafe { engine.as_ref() };
+    let snapshot = unsafe { snapshot.clone_as_arc() };
+    snapshot_checkpoint_impl(snapshot, engine_ref).into_extern_result(&engine_ref)
+}
+
+fn snapshot_checkpoint_impl(
+    snapshot: Arc<Snapshot>,
+    extern_engine: &dyn ExternEngine,
+) -> DeltaResult<bool> {
+    snapshot.checkpoint(extern_engine.engine().as_ref())?;
+    Ok(true)
+}
+
 /// Get the version of the specified snapshot
 ///
 /// # Safety
