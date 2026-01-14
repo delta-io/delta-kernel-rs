@@ -68,6 +68,11 @@ pub(crate) struct LogSegment {
     /// Schema of the checkpoint file(s), if known from `_last_checkpoint` hint.
     /// Used to determine if `stats_parsed` is available for data skipping.
     pub checkpoint_schema: Option<SchemaRef>,
+    /// The maximum published commit version found during listing, if available.
+    /// Note that this published commit file maybe not be included in
+    /// [LogSegment::ascending_commit_files] if there is a catalog commit present for the same
+    /// version that took priority over it.
+    pub max_published_version: Option<Version>,
 }
 
 impl LogSegment {
@@ -84,6 +89,7 @@ impl LogSegment {
             checkpoint_parts,
             latest_crc_file,
             latest_commit_file,
+            max_published_version,
         ) = listed_files.into_parts();
 
         // Ensure commit file versions are contiguous
@@ -141,6 +147,7 @@ impl LogSegment {
             latest_crc_file,
             latest_commit_file,
             checkpoint_schema,
+            max_published_version,
         })
     }
 
