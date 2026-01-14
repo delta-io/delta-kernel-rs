@@ -169,8 +169,8 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
         #[automatically_derived]
         impl delta_kernel::IntoEngineData for #struct_name
         where
-            #(#field_types: TryInto<delta_kernel::expressions::Scalar>),*
-            #(crate::Error: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>),*
+            #(#field_types: TryInto<delta_kernel::expressions::Scalar>,)*
+            #(delta_kernel::Error: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>,)*
         {
             fn into_engine_data(
                 self,
