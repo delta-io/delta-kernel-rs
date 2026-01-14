@@ -12,7 +12,7 @@ use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
 use crate::checkpoint::CheckpointWriter;
 use crate::committer::Committer;
-use crate::listed_log_files::ListedLogFiles;
+use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
 use crate::metrics::{MetricEvent, MetricId};
 use crate::path::ParsedLogPath;
@@ -57,6 +57,7 @@ impl std::fmt::Debug for Snapshot {
             .field("path", &self.log_segment.log_root.as_str())
             .field("version", &self.version())
             .field("metadata", &self.table_configuration().metadata())
+            .field("log_segment", &self.log_segment)
             .finish()
     }
 }
@@ -142,8 +143,8 @@ impl Snapshot {
         // NB: we need to check both checkpoints and commits since we filter commits at and below
         // the checkpoint version. Example: if we have a checkpoint + commit at version 1, the log
         // listing above will only return the checkpoint and not the commit.
-        if new_listed_files.ascending_commit_files.is_empty()
-            && new_listed_files.checkpoint_parts.is_empty()
+        if new_listed_files.ascending_commit_files().is_empty()
+            && new_listed_files.checkpoint_parts().is_empty()
         {
             match new_version {
                 Some(new_version) if new_version != old_version => {
@@ -162,9 +163,11 @@ impl Snapshot {
         // create a log segment just from existing_checkpoint.version -> new_version
         // OR could be from 1 -> new_version
         // Save the latest_commit before moving new_listed_files
-        let new_latest_commit_file = new_listed_files.latest_commit_file.clone();
+        let new_latest_commit_file = new_listed_files.latest_commit_file().clone();
+        // Note: new_log_segment won't have checkpoint_schema since we're listing without a hint.
+        // If it has a checkpoint, we use it as-is. Otherwise, we preserve the old checkpoint_schema.
         let mut new_log_segment =
-            LogSegment::try_new(new_listed_files, log_root.clone(), new_version)?;
+            LogSegment::try_new(new_listed_files, log_root.clone(), new_version, None)?;
 
         let new_end_version = new_log_segment.end_version;
         if new_end_version < old_version {
@@ -237,15 +240,21 @@ impl Snapshot {
         // we can pass in just the old checkpoint parts since by the time we reach this line, we
         // know there are no checkpoints in the new log segment.
         let combined_log_segment = LogSegment::try_new(
-            ListedLogFiles {
+            ListedLogFilesBuilder {
                 ascending_commit_files,
                 ascending_compaction_files,
                 checkpoint_parts: old_log_segment.checkpoint_parts.clone(),
                 latest_crc_file,
                 latest_commit_file,
-            },
+                max_published_version: new_log_segment
+                    .max_published_version
+                    .max(old_log_segment.max_published_version),
+            }
+            .build()?,
             log_root,
             new_version,
+            // Preserve checkpoint schema from old segment
+            old_log_segment.checkpoint_schema.clone(),
         )?;
         Ok(Arc::new(Snapshot::new(
             combined_log_segment,
@@ -552,10 +561,10 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
     use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-    use crate::engine::default::DefaultEngine;
+    use crate::engine::default::DefaultEngineBuilder;
     use crate::engine::sync::SyncEngine;
     use crate::last_checkpoint_hint::LastCheckpointHint;
-    use crate::listed_log_files::ListedLogFiles;
+    use crate::listed_log_files::ListedLogFilesBuilder;
     use crate::log_segment::LogSegment;
     use crate::parquet::arrow::ArrowWriter;
     use crate::path::ParsedLogPath;
@@ -745,7 +754,7 @@ mod tests {
         // in each test we will modify versions 1 and 2 to test different scenarios
         fn test_new_from(store: Arc<InMemory>) -> DeltaResult<()> {
             let url = Url::parse("memory:///")?;
-            let engine = DefaultEngine::new(store);
+            let engine = DefaultEngineBuilder::new(store).build();
             let base_snapshot = Snapshot::builder_for(url.clone())
                 .at_version(0)
                 .build(&engine)?;
@@ -795,7 +804,7 @@ mod tests {
         // 3. new version > existing version
         // a. no new log segment
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(Arc::new(store.fork()));
+        let engine = DefaultEngineBuilder::new(Arc::new(store.fork())).build();
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
@@ -868,7 +877,7 @@ mod tests {
 
         // new commits AND request version > end of log
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store_3c_i);
+        let engine = DefaultEngineBuilder::new(store_3c_i).build();
         let base_snapshot = Snapshot::builder_for(url.clone())
             .at_version(0)
             .build(&engine)?;
@@ -912,7 +921,7 @@ mod tests {
     async fn test_snapshot_new_from_crc() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
         let protocol = |reader_version, writer_version| {
             json!({
                 "protocol": {
@@ -1178,7 +1187,7 @@ mod tests {
     async fn test_domain_metadata() -> DeltaResult<()> {
         let url = Url::parse("memory:///")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // commit0
         // - domain1: not removed
@@ -1321,7 +1330,7 @@ mod tests {
     async fn test_timestamp_with_ict_disabled() -> Result<(), Box<dyn std::error::Error>> {
         let store = Arc::new(InMemory::new());
         let url = url::Url::parse("memory://test/")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create a basic commit without ICT enabled
         let commit0 = create_basic_commit(false, None);
@@ -1341,7 +1350,7 @@ mod tests {
     {
         let store = Arc::new(InMemory::new());
         let url = url::Url::parse("memory://test/")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit without ICT
         let commit0 = create_basic_commit(false, None);
@@ -1381,7 +1390,7 @@ mod tests {
         // Test invalid state where snapshot has enablement version in the future - should error
         let url = Url::parse("memory:///table2")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
             json!({
@@ -1430,7 +1439,7 @@ mod tests {
         // Test missing ICT when it should be present - should error
         let url = Url::parse("memory:///table3")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         let commit_data = [
             create_protocol(true, Some(3)),
@@ -1462,7 +1471,7 @@ mod tests {
 
         let url = Url::parse("memory:///missing_commit_test")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit with ICT enabled
         let commit_data = [
@@ -1491,15 +1500,14 @@ mod tests {
         })?
         .unwrap()];
 
-        let listed_files = ListedLogFiles {
-            ascending_commit_files: vec![],
-            ascending_compaction_files: vec![],
+        let listed_files = ListedLogFilesBuilder {
             checkpoint_parts,
-            latest_crc_file: None,
-            latest_commit_file: None, // No commit file
-        };
+            ..Default::default()
+        }
+        .build()?;
 
-        let log_segment = LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0))?;
+        let log_segment =
+            LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(0), None)?;
         let table_config = snapshot.table_configuration().clone();
 
         // Create snapshot without commit file in log segment
@@ -1517,7 +1525,7 @@ mod tests {
         // Test the scenario where both checkpoint and commit exist at the same version with ICT enabled.
         let url = Url::parse("memory:///checkpoint_commit_test")?;
         let store = Arc::new(InMemory::new());
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create 00000000000000000000.json with ICT enabled
         let commit0_data = [
@@ -1586,7 +1594,7 @@ mod tests {
     async fn test_try_new_from_empty_log_tail() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create initial commit
         let commit0 = vec![
@@ -1624,7 +1632,7 @@ mod tests {
     async fn test_try_new_from_latest_commit_preservation() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits 0-2
         let base_commit = vec![
@@ -1701,7 +1709,7 @@ mod tests {
     async fn test_try_new_from_version_boundary_cases() -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngineBuilder::new(store.clone()).build();
 
         // Create commits
         let base_commit = vec![

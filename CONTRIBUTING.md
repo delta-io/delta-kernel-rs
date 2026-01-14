@@ -84,6 +84,33 @@ Our trunk branch is named `main`. Here's the typical workflow:
 
 **Note**: We require two approvals from code owners for any PR to be merged.
 
+## Pull Request Best Practices
+
+#### General Tips
+
+1. When making your first PR, please read our contributor guidelines: https://github.com/delta-incubator/delta-kernel-rs/blob/main/CONTRIBUTING.md
+2. Run `cargo t --all-features --all-targets` to get started testing, and run `cargo fmt`.
+3. Ensure you have added or run the appropriate tests for your PR.
+4. If the PR is unfinished, add '[WIP]' in your PR title, e.g., '[WIP] Your PR title ...'.
+5. Be sure to keep the PR description updated to reflect all changes.
+
+#### PR Title Formatting
+
+This project uses conventional commits: https://www.conventionalcommits.org/
+
+Each PR corresponds to a commit on the `main` branch, with the title of the PR (typically) being
+used for the commit message on main. In order to ensure proper formatting in the CHANGELOG please
+ensure your PR title adheres to the conventional commit specification.
+
+Examples:
+- new feature PR: "feat: new API for snapshot.update()"
+- bugfix PR: "fix: correctly apply DV in read-table example"
+
+#### PR Testing
+
+Please make sure to add test cases that check the changes thoroughly including negative and positive cases if possible.
+If it was tested in a way different from regular unit tests, please clarify how you tested, ideally via a reproducible test documented in the PR description.
+
 ## Resources
 
 - [Delta Protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)

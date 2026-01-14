@@ -18,15 +18,14 @@ use crate::engine_data::FilteredEngineData;
 use crate::expressions::transforms::ExpressionTransform;
 use crate::expressions::{ColumnName, ExpressionRef, Predicate, PredicateRef, Scalar};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, EmptyColumnResolver};
-use crate::listed_log_files::ListedLogFiles;
+use crate::listed_log_files::ListedLogFilesBuilder;
 use crate::log_replay::{ActionsBatch, HasSelectionVector};
 use crate::log_segment::LogSegment;
-use crate::scan::log_replay::BASE_ROW_ID_NAME;
-use crate::scan::state::{DvInfo, Stats};
+use crate::scan::log_replay::{BASE_ROW_ID_NAME, CLUSTERING_PROVIDER_NAME};
 use crate::scan::state_info::StateInfo;
 use crate::schema::{
     ArrayType, DataType, MapType, PrimitiveType, Schema, SchemaRef, SchemaTransform, StructField,
-    ToSchema as _,
+    StructType, ToSchema as _,
 };
 use crate::table_features::{ColumnMappingMode, Operation};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, SnapshotRef, Version};
@@ -273,6 +272,35 @@ impl<'a> ExpressionTransform<'a> for ApplyColumnMappings {
     }
 }
 
+static RESTORED_ADD_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
+
+    let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
+    StructType::new_unchecked(vec![StructField::nullable(
+        "add",
+        StructType::new_unchecked(vec![
+            StructField::not_null("path", DataType::STRING),
+            StructField::not_null("partitionValues", partition_values),
+            StructField::not_null("size", DataType::LONG),
+            StructField::nullable("modificationTime", DataType::LONG),
+            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable(
+                "tags",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
+            StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+            StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+            StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
+        ]),
+    )])
+    .into()
+});
+
+pub(crate) fn restored_add_schema() -> &'static SchemaRef {
+    &RESTORED_ADD_SCHEMA
+}
+
 /// utility method making it easy to get a transform for a particular row. If the requested row is
 /// outside the range of the passed slice returns `None`, otherwise returns the element at the index
 /// of the specified row
@@ -460,29 +488,6 @@ impl Scan {
         existing_data: impl IntoIterator<Item = Box<dyn EngineData>> + 'static,
         _existing_predicate: Option<PredicateRef>,
     ) -> DeltaResult<Box<dyn Iterator<Item = DeltaResult<ScanMetadata>>>> {
-        static RESTORED_ADD_SCHEMA: LazyLock<DataType> = LazyLock::new(|| {
-            use crate::scan::log_replay::DEFAULT_ROW_COMMIT_VERSION_NAME;
-
-            let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
-            DataType::struct_type_unchecked(vec![StructField::nullable(
-                "add",
-                DataType::struct_type_unchecked(vec![
-                    StructField::not_null("path", DataType::STRING),
-                    StructField::not_null("partitionValues", partition_values),
-                    StructField::not_null("size", DataType::LONG),
-                    StructField::nullable("modificationTime", DataType::LONG),
-                    StructField::nullable("stats", DataType::STRING),
-                    StructField::nullable(
-                        "tags",
-                        MapType::new(DataType::STRING, DataType::STRING, true),
-                    ),
-                    StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-                    StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
-                    StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
-                ]),
-            )])
-        });
-
         // TODO(#966): validate that the current predicate is compatible with the hint predicate.
 
         if existing_version > self.snapshot.version() {
@@ -499,7 +504,7 @@ impl Scan {
         let transform = engine.evaluation_handler().new_expression_evaluator(
             scan_row_schema(),
             get_scan_metadata_transform_expr(),
-            RESTORED_ADD_SCHEMA.clone(),
+            restored_add_schema().clone().into(),
         )?;
         let apply_transform = move |data: Box<dyn EngineData>| {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
@@ -526,17 +531,17 @@ impl Scan {
         // create a new log segment containing only the commits added after the version hint.
         let mut ascending_commit_files = log_segment.ascending_commit_files.clone();
         ascending_commit_files.retain(|f| f.version > existing_version);
-        let listed_log_files = ListedLogFiles {
+        let listed_log_files = ListedLogFilesBuilder {
             ascending_commit_files,
-            ascending_compaction_files: vec![],
-            checkpoint_parts: vec![],
-            latest_crc_file: None,
             latest_commit_file: log_segment.latest_commit_file.clone(),
-        };
+            ..Default::default()
+        }
+        .build()?;
         let new_log_segment = LogSegment::try_new(
             listed_log_files,
             log_segment.log_root.clone(),
             Some(log_segment.end_version),
+            None, // No checkpoint in this incremental segment
         )?;
 
         let it = new_log_segment
@@ -590,27 +595,8 @@ impl Scan {
         &self,
         engine: Arc<dyn Engine>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<Box<dyn EngineData>>>> {
-        struct ScanFile {
-            path: String,
-            size: i64,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-        }
-        fn scan_metadata_callback(
-            batches: &mut Vec<ScanFile>,
-            path: &str,
-            size: i64,
-            _: Option<Stats>,
-            dv_info: DvInfo,
-            transform: Option<ExpressionRef>,
-            _: HashMap<String, String>,
-        ) {
-            batches.push(ScanFile {
-                path: path.to_string(),
-                size,
-                dv_info,
-                transform,
-            });
+        fn scan_metadata_callback(batches: &mut Vec<state::ScanFile>, file: state::ScanFile) {
+            batches.push(file);
         }
 
         debug!(
@@ -716,6 +702,7 @@ impl Scan {
 ///      tags: map<string, string>,
 ///      baseRowId: long,
 ///      defaultRowCommitVersion: long,
+///      clusteringProvider: string,
 ///    }
 /// }
 /// ```

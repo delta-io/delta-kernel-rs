@@ -214,9 +214,7 @@ mod tests {
         match expected {
             Ok(expected_expr) => {
                 let actual_expr = schema_transform.try_into_expr().unwrap();
-                // TODO: we can't compare NULLs so we convert with .to_string to workaround
-                // see: https://github.com/delta-io/delta-kernel-rs/pull/677
-                assert_eq!(expected_expr.to_string(), actual_expr.to_string());
+                assert_eq!(expected_expr, actual_expr);
             }
             Err(()) => {
                 assert!(schema_transform.try_into_expr().is_err());

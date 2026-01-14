@@ -2,6 +2,10 @@
 //!
 //! Exposes that an engine needs to call from C/C++ to interface with kernel
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// we re-allow panics in tests
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 #[cfg(feature = "default-engine-base")]
 use std::collections::HashMap;
 use std::default::Default;
@@ -274,8 +278,10 @@ mod private {
             let len = val.len();
             let boxed = val.into_boxed_slice();
             let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            #[allow(clippy::expect_used)]
             let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be non-null please report this bug.");
+                .expect("This should never be null please report this bug.");
             KernelBoolSlice { ptr, len }
         }
     }
@@ -328,8 +334,10 @@ mod private {
             let len = vec.len();
             let boxed = vec.into_boxed_slice();
             let leaked_ptr = Box::leak(boxed).as_mut_ptr();
+            // safety: Box::leak always returns a valid, non-null pointer
+            #[allow(clippy::expect_used)]
             let ptr = NonNull::new(leaked_ptr)
-                .expect("This should never be non-null please report this bug.");
+                .expect("This should never be null please report this bug.");
             KernelRowIndexArray { ptr, len }
         }
     }
@@ -489,11 +497,19 @@ pub unsafe extern "C" fn set_builder_option(
     builder: &mut EngineBuilder,
     key: KernelStringSlice,
     value: KernelStringSlice,
-) {
-    let key = unsafe { String::try_from_slice(&key) };
-    let value = unsafe { String::try_from_slice(&value) };
-    // TODO: Return ExternalError if key or value is invalid? (builder has an error allocator)
-    builder.set_option(key.unwrap(), value.unwrap());
+) -> ExternResult<bool> {
+    set_builder_option_impl(builder, key, value).into_extern_result(&builder.allocate_fn)
+}
+#[cfg(feature = "default-engine-base")]
+fn set_builder_option_impl(
+    builder: &mut EngineBuilder,
+    key: KernelStringSlice,
+    value: KernelStringSlice,
+) -> DeltaResult<bool> {
+    let key = unsafe { String::try_from_slice(&key) }?;
+    let value = unsafe { String::try_from_slice(&value) }?;
+    builder.set_option(key, value);
+    Ok(true)
 }
 
 /// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
@@ -561,11 +577,10 @@ fn get_default_engine_impl(
     options: HashMap<String, String>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
     use delta_kernel::engine::default::storage::store_from_url_opts;
-    use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::engine::default::DefaultEngineBuilder;
     let store = store_from_url_opts(&url, options)?;
-    let engine = DefaultEngine::<TokioBackgroundExecutor>::new(store);
+    let engine = DefaultEngineBuilder::new(store).build();
     Ok(engine_to_handle(Arc::new(engine), allocate_error))
 }
 
@@ -880,7 +895,7 @@ mod tests {
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
     };
-    use delta_kernel::engine::default::DefaultEngine;
+    use delta_kernel::engine::default::DefaultEngineBuilder;
     use object_store::memory::InMemory;
     use test_utils::{actions_to_string, actions_to_string_partitioned, add_commit, TestAction};
 
@@ -927,7 +942,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
@@ -973,7 +988,7 @@ mod tests {
             actions_to_string_partitioned(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
@@ -1009,7 +1024,7 @@ mod tests {
             actions_to_string(vec![TestAction::Metadata]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_null_err);
         let path = "memory:///";
 
@@ -1039,7 +1054,7 @@ mod tests {
             actions_to_string(vec![TestAction::Add("path1".into())]),
         )
         .await?;
-        let engine = DefaultEngine::new(storage.clone());
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 

@@ -167,18 +167,18 @@ pub fn into_engine_data_derive(input: proc_macro::TokenStream) -> proc_macro::To
 
     let expanded = quote! {
         #[automatically_derived]
-        impl crate::IntoEngineData for #struct_name
+        impl delta_kernel::IntoEngineData for #struct_name
         where
-            #(#field_types: TryInto<crate::expressions::Scalar>),*,
-            #(crate::Error: From<<#field_types as TryInto<crate::expressions::Scalar>>::Error>),*
+            #(#field_types: TryInto<delta_kernel::expressions::Scalar>),*
+            #(crate::Error: From<<#field_types as TryInto<delta_kernel::expressions::Scalar>>::Error>),*
         {
             fn into_engine_data(
                 self,
-                schema: crate::schema::SchemaRef,
-                engine: &dyn crate::Engine)
-            -> crate::DeltaResult<Box<dyn crate::EngineData>> {
+                schema: delta_kernel::schema::SchemaRef,
+                engine: &dyn delta_kernel::Engine)
+            -> delta_kernel::DeltaResult<Box<dyn delta_kernel::EngineData>> {
                 // NB: we `use` here to avoid polluting the caller's namespace
-                use crate::EvaluationHandlerExtension as _;
+                use delta_kernel::EvaluationHandlerExtension as _;
                 let values = [
                     #(self.#field_idents.try_into()?),*
                 ];

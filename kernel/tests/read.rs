@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,14 +7,14 @@ use delta_kernel::arrow::compute::{concat_batches, filter_record_batch};
 use delta_kernel::arrow::datatypes::{Int64Type, Schema as ArrowSchema};
 use delta_kernel::engine::arrow_conversion::TryFromKernel as _;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt as _;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::DefaultEngineBuilder;
 use delta_kernel::expressions::{
     column_expr, column_pred, Expression as Expr, ExpressionRef, Predicate as Pred,
 };
 use delta_kernel::log_segment::LogSegment;
 use delta_kernel::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use delta_kernel::path::ParsedLogPath;
-use delta_kernel::scan::state::{transform_to_logical, DvInfo, Stats};
+use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{DataType, MetadataColumnSpec, Schema, StructField, StructType};
 use delta_kernel::{Engine, FileMeta, Snapshot};
@@ -63,7 +62,7 @@ async fn single_commit_two_add_files() -> Result<(), Box<dyn std::error::Error>>
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     let expected_data = vec![batch.clone(), batch];
 
@@ -114,7 +113,7 @@ async fn two_commits() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone());
+    let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
     let expected_data = vec![batch.clone(), batch];
 
@@ -166,7 +165,7 @@ async fn remove_action() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = DefaultEngine::new(storage.clone());
+    let engine = DefaultEngineBuilder::new(storage.clone()).build();
 
     let expected_data = vec![batch];
 
@@ -236,7 +235,7 @@ async fn stats() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let location = Url::parse("memory:///").unwrap();
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     // The first file has id between 1 and 3; the second has id between 5 and 7. For each operator,
@@ -317,28 +316,8 @@ fn read_with_execute(
     Ok(())
 }
 
-struct ScanFile {
-    path: String,
-    size: i64,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-}
-
-fn scan_metadata_callback(
-    batches: &mut Vec<ScanFile>,
-    path: &str,
-    size: i64,
-    _stats: Option<Stats>,
-    dv_info: DvInfo,
-    transform: Option<ExpressionRef>,
-    _: HashMap<String, String>,
-) {
-    batches.push(ScanFile {
-        path: path.to_string(),
-        size,
-        dv_info,
-        transform,
-    });
+fn scan_metadata_callback(batches: &mut Vec<ScanFile>, scan_file: ScanFile) {
+    batches.push(scan_file);
 }
 
 fn read_with_scan_metadata(
@@ -1043,7 +1022,7 @@ async fn predicate_on_non_nullable_partition_column() -> Result<(), Box<dyn std:
 
     let location = Url::parse("memory:///")?;
 
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("id"), Expr::literal(2));
@@ -1102,7 +1081,7 @@ async fn predicate_on_non_nullable_column_missing_stats() -> Result<(), Box<dyn 
 
     let location = Url::parse("memory:///")?;
 
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
     let snapshot = Snapshot::builder_for(location).build(engine.as_ref())?;
 
     let predicate = Pred::eq(column_expr!("val"), Expr::literal("g"));
@@ -1378,7 +1357,7 @@ async fn test_row_index_metadata_column() -> Result<(), Box<dyn std::error::Erro
     }
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes a row index metadata column
     let schema = Arc::new(StructType::try_new([
@@ -1468,7 +1447,7 @@ async fn test_file_path_metadata_column() -> Result<(), Box<dyn std::error::Erro
     }
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Create a schema that includes the file path metadata column
     let schema = Arc::new(StructType::try_new([
@@ -1578,7 +1557,7 @@ async fn test_unsupported_metadata_columns() -> Result<(), Box<dyn std::error::E
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     // Test that unsupported metadata columns fail with appropriate errors
     let test_cases = [
@@ -1644,7 +1623,7 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
         .await?;
 
     let location = Url::parse("memory:///")?;
-    let engine = Arc::new(DefaultEngine::new(storage.clone()));
+    let engine = Arc::new(DefaultEngineBuilder::new(storage.clone()).build());
 
     let invalid_files = [
         "_delta_log/0.zip",
