@@ -347,7 +347,6 @@ impl LogSegment {
             ))
         );
 
-        let new_end_version = tail_commit_file.version;
         let new_ascending_commit_files: Vec<_> = self
             .ascending_commit_files
             .into_iter()
@@ -365,7 +364,7 @@ impl LogSegment {
         };
 
         Ok(LogSegment {
-            end_version: new_end_version,
+            end_version: tail_commit_file.version,
             ascending_commit_files: new_ascending_commit_files,
             latest_commit_file: Some(tail_commit_file),
             max_published_version: new_max_published_version,
