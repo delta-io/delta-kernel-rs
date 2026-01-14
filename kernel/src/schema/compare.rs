@@ -139,13 +139,13 @@ impl SchemaComparison for StructType {
 
 impl SchemaComparison for DataType {
     /// Returns `Ok` if this [`DataType`] can be read as `read_type`. This is the case when:
-    ///     1. The data types are the same. Note: This condition will be relaxed to include
-    ///        compatible data types with type widening. See issue [`#623`]
+    ///     1. The data types are the same, OR the source type can be widened to the target type
+    ///        (see [`PrimitiveType::can_widen_to`])
     ///     2. For complex data types, the nested types must be compatible as defined by [`SchemaComparison`]
     ///     3. For array data types, the nullability may not be tightened in the `read_type`. See
     ///        [`Nullable::can_read_as`]
     ///
-    /// [`#623`]: <https://github.com/delta-io/delta-kernel-rs/issues/623>
+    /// [`PrimitiveType::can_widen_to`]: super::PrimitiveType::can_widen_to
     fn can_read_as(&self, read_type: &Self) -> SchemaComparisonResult {
         match (self, read_type) {
             (Self::Array(self_array), Self::Array(read_array)) => {
@@ -164,11 +164,12 @@ impl SchemaComparison for DataType {
                 self_map.key_type().can_read_as(read_map.key_type())?;
                 self_map.value_type().can_read_as(read_map.value_type())?;
             }
-            (a, b) => {
-                // TODO: In the future, we will change this to support type widening.
-                // See: #623
-                require!(a == b, Error::TypeMismatch);
-            }
+            // Exact match
+            (a, b) if a == b => {}
+            // Type widening: smaller primitive types can be read as larger ones
+            (Self::Primitive(a), Self::Primitive(b)) if a.can_widen_to(b) => {}
+            // Any other type change is incompatible
+            _ => return Err(Error::TypeMismatch),
         };
         Ok(())
     }
@@ -400,6 +401,81 @@ mod tests {
         assert!(matches!(
             read_schema.can_read_as(&existing_schema),
             Err(Error::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn type_widening_integer() {
+        // byte -> short -> int -> long
+        assert!(DataType::BYTE.can_read_as(&DataType::SHORT).is_ok());
+        assert!(DataType::BYTE.can_read_as(&DataType::INTEGER).is_ok());
+        assert!(DataType::BYTE.can_read_as(&DataType::LONG).is_ok());
+        assert!(DataType::SHORT.can_read_as(&DataType::INTEGER).is_ok());
+        assert!(DataType::SHORT.can_read_as(&DataType::LONG).is_ok());
+        assert!(DataType::INTEGER.can_read_as(&DataType::LONG).is_ok());
+
+        // Cannot narrow types
+        assert!(matches!(
+            DataType::LONG.can_read_as(&DataType::INTEGER),
+            Err(Error::TypeMismatch)
+        ));
+        assert!(matches!(
+            DataType::INTEGER.can_read_as(&DataType::SHORT),
+            Err(Error::TypeMismatch)
+        ));
+        assert!(matches!(
+            DataType::SHORT.can_read_as(&DataType::BYTE),
+            Err(Error::TypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn type_widening_float() {
+        // float -> double
+        assert!(DataType::FLOAT.can_read_as(&DataType::DOUBLE).is_ok());
+
+        // Cannot narrow
+        assert!(matches!(
+            DataType::DOUBLE.can_read_as(&DataType::FLOAT),
+            Err(Error::TypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn type_widening_in_struct() {
+        let source = StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, false),
+            StructField::new("value", DataType::FLOAT, true),
+        ]);
+        let target = StructType::new_unchecked([
+            StructField::new("id", DataType::LONG, false),
+            StructField::new("value", DataType::DOUBLE, true),
+        ]);
+
+        // Can widen types in struct fields
+        assert!(source.can_read_as(&target).is_ok());
+
+        // Cannot narrow
+        assert!(matches!(
+            target.can_read_as(&source),
+            Err(Error::TypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn incompatible_type_change() {
+        // Cannot change between incompatible types
+        assert!(matches!(
+            DataType::STRING.can_read_as(&DataType::INTEGER),
+            Err(Error::TypeMismatch)
+        ));
+        assert!(matches!(
+            DataType::INTEGER.can_read_as(&DataType::STRING),
+            Err(Error::TypeMismatch)
+        ));
+        assert!(matches!(
+            DataType::BOOLEAN.can_read_as(&DataType::INTEGER),
+            Err(Error::TypeMismatch)
         ));
     }
 }
