@@ -10,7 +10,7 @@ use crate::arrow::{
     array::{create_array, RecordBatch},
     datatypes::Field,
 };
-use crate::checkpoint::{create_last_checkpoint_data, perform_checkpoint};
+use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
@@ -564,7 +564,7 @@ async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_perform_checkpoint() -> DeltaResult<()> {
+async fn test_checkpoint() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
@@ -631,7 +631,7 @@ async fn test_perform_checkpoint() -> DeltaResult<()> {
     let table_root = Url::parse("memory:///")?;
     let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
 
-    perform_checkpoint(&engine, snapshot)?;
+    snapshot.checkpoint(&engine)?;
 
     // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
     let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
@@ -655,7 +655,7 @@ async fn test_perform_checkpoint() -> DeltaResult<()> {
 
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
 
-    perform_checkpoint(&engine, snapshot)?;
+    snapshot.checkpoint(&engine)?;
 
     // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
     let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");

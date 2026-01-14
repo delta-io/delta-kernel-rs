@@ -1,10 +1,12 @@
 //! In-memory representation of snapshots of tables (snapshot is a table at given point in time, it
 //! has schema etc.)
 
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::action_reconciliation::calculate_transaction_expiration_timestamp;
+use crate::action_reconciliation::ActionReconciliationIterator;
 use crate::actions::domain_metadata::{
     all_domain_metadata_configuration, domain_metadata_configuration,
 };
@@ -22,7 +24,7 @@ use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::LogCompactionWriter;
-use crate::{DeltaResult, Engine, Error, Version};
+use crate::{DeltaResult, Engine, EngineData, Error, Version};
 use delta_kernel_derive::internal_api;
 
 mod builder;
@@ -380,6 +382,50 @@ impl Snapshot {
         CheckpointWriter::try_new(self)
     }
 
+    /// Performs a complete checkpoint of this snapshot using the provided engine.
+    ///
+    /// This is an "all-in-one" checkpoint workflow:
+    /// 1. Creates the checkpoint data
+    /// 2. Writes the checkpoint parquet file using [`Engine::parquet_handler`]
+    /// 3. Gets file metadata using [`Engine::storage_handler`]
+    /// 4. Writes the `_last_checkpoint` file
+    ///
+    /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    /// [`crate::StorageHandler::head`], which may not be implemented by all engines
+    /// (e.g., `SyncEngine`).
+    ///
+    /// Note (default engine): **do not** use `TokioBackgroundExecutor` for this operation; nested
+    /// `block_on` **will deadlock**. Use a multi-threaded Tokio task executor instead (e.g.
+    /// `TokioMultiThreadExecutor`). See [issue #1605](https://github.com/delta-io/delta-kernel-rs/issues/1605).
+    pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
+        let writer = self.create_checkpoint_writer()?;
+        let checkpoint_path = writer.checkpoint_path()?;
+        let data_iter = writer.checkpoint_data(engine)?;
+
+        // Write the checkpoint parquet file with lazy processing:
+        // `LazyCheckpointData` applies selection vectors on demand rather than collecting all upfront.
+        let state = Arc::new(CheckpointIterState::default());
+        let lazy_data = LazyCheckpointData {
+            inner: data_iter,
+            state: Arc::clone(&state),
+        };
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+
+        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+
+        // `write_parquet_file` took ownership of the iterator, so reconstruct an exhausted iterator
+        // with the captured counts for finalize.
+        let exhausted_iter = ActionReconciliationIterator::with_exhausted_counts(
+            state.actions_count.load(Ordering::Acquire),
+            state.add_actions_count.load(Ordering::Acquire),
+        );
+
+        // Finalize the checkpoint (writes `_last_checkpoint` file).
+        writer.finalize(engine, &file_meta, exhausted_iter)
+    }
+
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
     ///
     /// Log compaction aggregates commit files in a version range into a single compacted file,
@@ -533,6 +579,47 @@ impl Snapshot {
                 Ok(Some(ict))
             }
             None => Err(Error::generic("Last commit file not found in log segment")),
+        }
+    }
+}
+
+/// Shared state for tracking checkpoint iteration progress.
+///
+/// Used with [`LazyCheckpointData`] to capture counts after the iterator is consumed.
+#[derive(Default)]
+struct CheckpointIterState {
+    actions_count: AtomicI64,
+    add_actions_count: AtomicI64,
+    is_exhausted: AtomicBool,
+}
+
+/// A lazy wrapper around [`ActionReconciliationIterator`] that applies selection vectors on demand.
+///
+/// This wrapper processes batches lazily rather than collecting them all upfront,
+/// which reduces memory usage for large checkpoints. It shares state via [`CheckpointIterState`]
+/// to capture counts after the iterator is consumed by `write_parquet_file`.
+struct LazyCheckpointData {
+    inner: ActionReconciliationIterator,
+    state: Arc<CheckpointIterState>,
+}
+
+impl Iterator for LazyCheckpointData {
+    type Item = DeltaResult<Box<dyn EngineData>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(result) => Some(result.and_then(|filtered| filtered.apply_selection_vector())),
+            None => {
+                // Iterator exhausted - capture final counts to shared state.
+                self.state
+                    .actions_count
+                    .store(self.inner.actions_count(), Ordering::Release);
+                self.state
+                    .add_actions_count
+                    .store(self.inner.add_actions_count(), Ordering::Release);
+                self.state.is_exhausted.store(true, Ordering::Release);
+                None
+            }
         }
     }
 }
