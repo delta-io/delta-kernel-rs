@@ -564,7 +564,7 @@ async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_checkpoint() -> DeltaResult<()> {
+async fn test_snapshot_checkpoint() -> DeltaResult<()> {
     let (store, _) = new_in_memory_store();
     let executor = Arc::new(TokioMultiThreadExecutor::new(
         tokio::runtime::Handle::current(),
