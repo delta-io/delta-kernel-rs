@@ -109,6 +109,16 @@ impl ActionReconciliationIterator {
         }
     }
 
+    /// Create an exhausted iterator with the specified counts.
+    pub(crate) fn with_exhausted_counts(actions_count: i64, add_actions_count: i64) -> Self {
+        Self {
+            inner: Box::new(std::iter::empty()),
+            actions_count,
+            add_actions_count,
+            is_exhausted: true,
+        }
+    }
+
     /// True if this iterator has been exhausted (ie all batches have been processed)
     pub(crate) fn is_exhausted(&self) -> bool {
         self.is_exhausted
