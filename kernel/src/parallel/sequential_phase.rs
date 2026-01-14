@@ -61,8 +61,7 @@ use crate::{DeltaResult, Engine, Error, FileMeta};
 ///     }
 /// }
 /// ```
-#[allow(unused)]
-pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
+pub struct SequentialPhase<P: LogReplayProcessor> {
     // The processor that will be used to process the action batches
     processor: P,
     // The commit reader that will be used to read the commit files
@@ -77,8 +76,7 @@ pub(crate) struct SequentialPhase<P: LogReplayProcessor> {
 }
 
 /// Result of sequential log replay processing.
-#[allow(unused)]
-pub(crate) enum AfterSequential<P: LogReplayProcessor> {
+pub enum AfterSequential<P: LogReplayProcessor> {
     /// All processing complete sequentially - no parallel phase needed.
     Done(P),
     /// Parallel phase needed - distribute files for parallel processing.
@@ -92,8 +90,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     /// - `processor`: The log replay processor
     /// - `log_segment`: The log segment to process
     /// - `engine`: Engine for reading files
-    #[allow(unused)]
-    pub(crate) fn try_new(
+    pub fn try_new(
         processor: P,
         log_segment: &LogSegment,
         engine: Arc<dyn Engine>,
@@ -141,8 +138,7 @@ impl<P: LogReplayProcessor> SequentialPhase<P> {
     ///
     /// # Errors
     /// Returns an error if called before iterator exhaustion.
-    #[allow(unused)]
-    pub(crate) fn finish(self) -> DeltaResult<AfterSequential<P>> {
+    pub fn finish(self) -> DeltaResult<AfterSequential<P>> {
         if !self.is_finished {
             return Err(Error::generic(
                 "Must exhaust iterator before calling finish()",
@@ -201,7 +197,7 @@ impl<P: LogReplayProcessor> Iterator for SequentialPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::AfterPhase1;
+    use crate::scan::AfterPhase1ScanMetadata;
     use crate::utils::test_utils::{assert_result_error_with_message, load_test_table};
 
     /// Core helper function to verify sequential processing with expected adds and sidecars.
@@ -213,7 +209,7 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
         let scan = snapshot.scan_builder().build()?;
-        let mut sequential = scan.distributed_scan_metadata(engine)?;
+        let mut sequential = scan.parallel_scan_metadata(engine)?;
 
         // Process all batches and collect Add file paths
         let mut file_paths = Vec::new();
@@ -235,7 +231,7 @@ mod tests {
         // Call finish() and verify result based on expected sidecars
         let result = sequential.finish()?;
         match (expected_sidecars, result) {
-            (sidecars, AfterPhase1::Done(_)) => {
+            (sidecars, AfterPhase1ScanMetadata::Done(_)) => {
                 assert!(
                     sidecars.is_empty(),
                     "Expected Done but got sidecars {:?}",
@@ -296,7 +292,7 @@ mod tests {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
 
         let scan = snapshot.scan_builder().build()?;
-        let sequential = scan.distributed_scan_metadata(engine)?;
+        let sequential = scan.parallel_scan_metadata(engine)?;
 
         // Try to call finish() before exhausting the iterator
         let result = sequential.finish();
