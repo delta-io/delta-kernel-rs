@@ -266,14 +266,6 @@ pub struct OpaquePredicate {
     pub op: OpaquePredicateOpRef,
     pub exprs: Vec<Expression>,
 }
-
-impl OpaquePredicate {
-    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
-        let exprs = exprs.into_iter().collect();
-        Self { op, exprs }
-    }
-}
-
 fn fail_serialize_opaque_predicate<S>(
     _value: &OpaquePredicate,
     _serializer: S,
@@ -289,6 +281,13 @@ where
     D: Deserializer<'de>,
 {
     Err(de::Error::custom("Cannot deserialize Opaque Expression"))
+}
+
+impl OpaquePredicate {
+    fn new(op: OpaquePredicateOpRef, exprs: impl IntoIterator<Item = Expression>) -> Self {
+        let exprs = exprs.into_iter().collect();
+        Self { op, exprs }
+    }
 }
 
 // NOTE: We have to use `Arc<dyn OpaqueExpressionOp>` instead of `Box<dyn OpaqueExpressionOp>`
@@ -449,19 +448,8 @@ pub enum Expression {
     Variadic(VariadicExpression),
     /// An expression that the engine defines and implements. Kernel interacts with the expression
     /// only through methods provided by the [`OpaqueExpressionOp`] trait.
-<<<<<<< HEAD
-    #[cfg_attr(
-        feature = "expr-serde",
-        serde(serialize_with = "fail_serialize_opaque_expression")
-    )]
-    #[cfg_attr(
-        feature = "expr-serde",
-        serde(deserialize_with = "fail_deserialize_opaque_expression")
-    )]
-=======
     #[serde(serialize_with = "fail_serialize_opaque_expression")]
     #[serde(deserialize_with = "fail_deserialize_opaque_expression")]
->>>>>>> 862d19f8 (Revert "add feature flag")
     Opaque(OpaqueExpression),
     /// An unknown expression (i.e. one that neither kernel nor engine attempts to evaluate). For
     /// data skipping purposes, kernel treats unknown expressions as if they were literal NULL
@@ -500,19 +488,8 @@ pub enum Predicate {
     Junction(JunctionPredicate),
     /// A predicate that the engine defines and implements. Kernel interacts with the predicate
     /// only through methods provided by the [`OpaquePredicateOp`] trait.
-<<<<<<< HEAD
-    #[cfg_attr(
-        feature = "expr-serde",
-        serde(serialize_with = "fail_serialize_opaque_predicate")
-    )]
-    #[cfg_attr(
-        feature = "expr-serde",
-        serde(deserialize_with = "fail_deserialize_opaque_predicate")
-    )]
-=======
     #[serde(serialize_with = "fail_serialize_opaque_predicate")]
     #[serde(deserialize_with = "fail_deserialize_opaque_predicate")]
->>>>>>> 862d19f8 (Revert "add feature flag")
     Opaque(OpaquePredicate),
     /// An unknown predicate (i.e. one that neither kernel nor engine attempts to evaluate). For
     /// data skipping purposes, kernel treats unknown predicates as if they were literal NULL values
