@@ -4,14 +4,13 @@ use crate::action_reconciliation::{
     deleted_file_retention_timestamp_with_time, DEFAULT_RETENTION_SECS,
 };
 use crate::actions::{Add, Metadata, Protocol, Remove};
-use crate::arrow::array::{ArrayRef, StructArray};
 use crate::arrow::datatypes::{DataType, Schema};
 use crate::arrow::{
     array::{create_array, RecordBatch},
     datatypes::Field,
 };
-use crate::checkpoint::create_last_checkpoint_data;
-use crate::engine::arrow_data::ArrowEngineData;
+use crate::checkpoint::{create_last_checkpoint_data, CheckpointDataIterator};
+use crate::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use crate::engine::default::DefaultEngine;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
@@ -58,11 +57,13 @@ fn test_deleted_file_retention_timestamp() -> DeltaResult<()> {
 
 #[tokio::test]
 async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
+    use crate::checkpoint::CHECKPOINT_ACTIONS_SCHEMA_V2;
+
     let (store, _) = new_in_memory_store();
     let engine = DefaultEngine::new(store.clone());
 
     // 1st commit (version 0) - metadata and protocol actions
-    // Protocol action does not include the v2Checkpoint reader/writer feature.
+    // Protocol action includes the v2Checkpoint reader/writer feature.
     write_commit_to_store(
         &store,
         vec![
@@ -77,32 +78,35 @@ async fn test_create_checkpoint_metadata_batch() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
     let writer = snapshot.checkpoint()?;
 
-    let checkpoint_batch = writer.create_checkpoint_metadata_batch(&engine)?;
+    // Use V2 schema for the checkpoint metadata batch
+    let checkpoint_batch =
+        writer.create_checkpoint_metadata_batch(&engine, &CHECKPOINT_ACTIONS_SCHEMA_V2)?;
     assert!(checkpoint_batch.filtered_data.has_selected_rows());
 
-    // Verify the underlying EngineData contains the expected CheckpointMetadata action
+    // Verify the underlying EngineData contains the expected fields
     let (underlying_data, _) = checkpoint_batch.filtered_data.into_parts();
     let arrow_engine_data = ArrowEngineData::try_from_engine_data(underlying_data)?;
     let record_batch = arrow_engine_data.record_batch();
 
-    // Build the expected RecordBatch
-    // Note: The schema is a struct with a single field "checkpointMetadata" of type struct
-    // containing a single field "version" of type long
-    let expected_schema = Arc::new(Schema::new(vec![Field::new(
-        "checkpointMetadata",
-        DataType::Struct(vec![Field::new("version", DataType::Int64, false)].into()),
-        true,
-    )]));
-    let expected = RecordBatch::try_new(
-        expected_schema,
-        vec![Arc::new(StructArray::from(vec![(
-            Arc::new(Field::new("version", DataType::Int64, false)),
-            create_array!(Int64, [0]) as ArrayRef,
-        )]))],
-    )
-    .unwrap();
+    // Verify the schema has the expected fields
+    let schema = record_batch.schema();
+    assert!(
+        schema.field_with_name("checkpointMetadata").is_ok(),
+        "Schema should have checkpointMetadata field"
+    );
+    assert!(
+        schema.field_with_name("add").is_ok(),
+        "Schema should have add field"
+    );
+    assert!(
+        schema.field_with_name("remove").is_ok(),
+        "Schema should have remove field"
+    );
 
-    assert_eq!(*record_batch, expected);
+    // Verify we have one row
+    assert_eq!(record_batch.num_rows(), 1);
+
+    // Verify action counts
     assert_eq!(checkpoint_batch.actions_count, 1);
     assert_eq!(checkpoint_batch.add_actions_count, 0);
 
@@ -515,6 +519,64 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
     // - numOfAddFiles: 1 add file from version 0
     // - sizeInBytes: passed to finalize (10)
     assert_last_checkpoint_contents(&store, 1, 5, 1, size_in_bytes).await?;
+
+    Ok(())
+}
+
+/// Test that V2 checkpoint batches all have the same schema.
+///
+/// This verifies that the checkpoint metadata batch has the same schema as
+/// regular action batches, allowing them to be written to the same Parquet file.
+#[tokio::test]
+async fn test_v2_checkpoint_unified_schema() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let engine = DefaultEngine::new(store.clone());
+
+    // Create a V2 checkpoint enabled table
+    write_commit_to_store(
+        &store,
+        vec![
+            create_v2_checkpoint_protocol_action(),
+            create_metadata_action(),
+        ],
+        0,
+    )
+    .await?;
+
+    write_commit_to_store(
+        &store,
+        vec![create_add_action_with_stats("file1.parquet", 100)],
+        1,
+    )
+    .await?;
+
+    let table_root = Url::parse("memory:///")?;
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+    let writer = snapshot.checkpoint()?;
+    let mut data_iter = writer.checkpoint_data(&engine)?;
+
+    // Get the expected schema from the iterator
+    let expected_schema = data_iter.output_schema().clone();
+
+    // Verify all batches have the same schema
+    while let Some(batch_result) = data_iter.next() {
+        let batch = batch_result?;
+        let data = batch.apply_selection_vector()?;
+        let record_batch = data.try_into_record_batch()?;
+        let batch_schema = record_batch.schema();
+
+        assert_eq!(
+            batch_schema.fields().len(),
+            expected_schema.fields().count(),
+            "All batches should have the same number of fields"
+        );
+    }
+
+    // Verify the schema includes checkpointMetadata for V2
+    assert!(
+        expected_schema.field("checkpointMetadata").is_some(),
+        "V2 checkpoint schema should include checkpointMetadata field"
+    );
 
     Ok(())
 }

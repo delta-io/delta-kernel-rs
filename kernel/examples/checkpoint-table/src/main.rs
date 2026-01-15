@@ -7,7 +7,7 @@ use futures::future::{BoxFuture, FutureExt};
 use parquet::arrow::async_writer::{AsyncFileWriter, ParquetObjectWriter};
 use parquet::arrow::AsyncArrowWriter;
 
-use delta_kernel::checkpoint::TransformingCheckpointIterator;
+use delta_kernel::checkpoint::CheckpointDataIterator;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::engine::default::DefaultEngine;
 use delta_kernel::{DeltaResult, Error, FileMeta, Snapshot};
@@ -45,7 +45,7 @@ async fn main() -> ExitCode {
 
 async fn write_data<W: AsyncFileWriter>(
     first_batch: &RecordBatch,
-    batch_iter: &mut TransformingCheckpointIterator,
+    batch_iter: &mut impl CheckpointDataIterator,
     parquet_writer: &mut AsyncArrowWriter<W>,
 ) -> DeltaResult<()> {
     parquet_writer.write(first_batch).await?;
