@@ -287,7 +287,6 @@ pub mod tokio {
                 .expect("Timeout - likely deadlock in TokioMultiThreadExecutor::block_on");
             assert_eq!(result, 43);
             handle.join().expect("thread panicked");
-            }
         }
     }
 }
