@@ -145,6 +145,8 @@ impl TableConfiguration {
     /// schema for statistics based on the table configuration. Often times the consfigration
     /// is based on operator experience or automates systems as to what statistics are most
     /// useful for a given table.
+    #[allow(unused)]
+    #[internal_api]
     pub fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
         let partition_columns = self.metadata().partition_columns();
         let column_mapping_mode = self.column_mapping_mode();
