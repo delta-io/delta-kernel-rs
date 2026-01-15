@@ -813,7 +813,8 @@ mod tests {
     fn trace_event_tracking() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
-        let (dispatch, _filter, _) = create_event_dispatch(event_callback_with_filter_1, Level::TRACE);
+        let (dispatch, _filter, _) =
+            create_event_dispatch(event_callback_with_filter_1, Level::TRACE);
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1", "Another line"];
             for line in lines {
