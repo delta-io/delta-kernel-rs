@@ -14,7 +14,7 @@ use crate::actions::{
 use crate::engine::arrow_data::ArrowEngineData;
 use crate::engine::default::executor::tokio::TokioBackgroundExecutor;
 use crate::engine::default::filesystem::ObjectStoreStorageHandler;
-use crate::engine::default::DefaultEngine;
+use crate::engine::default::DefaultEngineBuilder;
 use crate::engine::sync::SyncEngine;
 use crate::last_checkpoint_hint::LastCheckpointHint;
 use crate::listed_log_files::ListedLogFilesBuilder;
@@ -26,12 +26,15 @@ use crate::scan::test_utils::{
     add_batch_simple, add_batch_with_remove, sidecar_batch_with_given_paths,
     sidecar_batch_with_given_paths_and_sizes,
 };
+use crate::schema::{DataType, StructType};
 use crate::utils::test_utils::{assert_batch_matches, assert_result_error_with_message, Action};
 use crate::{
     DeltaResult, Engine as _, EngineData, Expression, FileMeta, PredicateRef, RowVisitor, Snapshot,
     StorageHandler,
 };
-use test_utils::{compacted_log_path_for_versions, delta_path_for_version};
+use test_utils::{
+    compacted_log_path_for_versions, delta_path_for_version, staged_commit_path_for_version,
+};
 
 use super::*;
 
@@ -1031,7 +1034,7 @@ fn test_checkpoint_batch_with_no_sidecars_returns_none() -> DeltaResult<()> {
 #[tokio::test]
 async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     add_sidecar_to_store(
@@ -1073,7 +1076,7 @@ async fn test_checkpoint_batch_with_sidecars_returns_sidecar_batches() -> DeltaR
 #[test]
 fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let checkpoint_batch = sidecar_batch_with_given_paths(
         vec!["sidecarfile1.parquet", "sidecarfile2.parquet"],
@@ -1100,7 +1103,7 @@ fn test_checkpoint_batch_with_sidecar_files_that_do_not_exist() -> DeltaResult<(
 #[tokio::test]
 async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     let read_schema = get_all_actions_schema().project(&[ADD_NAME, REMOVE_NAME, SIDECAR_NAME])?;
 
     let checkpoint_batch =
@@ -1141,7 +1144,7 @@ async fn test_reading_sidecar_files_with_predicate() -> DeltaResult<()> {
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schema_has_no_file_actions(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
     add_checkpoint_to_store(
         &store,
         // Create a checkpoint batch with sidecar actions to verify that the sidecar actions are not read.
@@ -1189,7 +1192,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
 async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_is_multi_part(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Multi-part checkpoints should never contain sidecar actions.
     // This test intentionally includes batches with sidecar actions in multi-part checkpoints
@@ -1259,7 +1262,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
 async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     add_checkpoint_to_store(
         &store,
@@ -1311,7 +1314,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
 async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidecars(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     let filename = "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json";
 
@@ -1370,7 +1373,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
 async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar_batches(
 ) -> DeltaResult<()> {
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Write sidecars first so we can get their actual sizes
     add_sidecar_to_store(
@@ -1479,6 +1482,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
 #[derive(Default)]
 struct LogSegmentConfig<'a> {
     published_commit_versions: &'a [u64],
+    staged_commit_versions: &'a [u64],
     compaction_versions: &'a [(u64, u64)],
     checkpoint_version: Option<u64>,
     version_to_load: Option<u64>,
@@ -1503,10 +1507,25 @@ async fn create_segment_for(segment: LogSegmentConfig<'_>) -> LogSegment {
         ));
     }
     let (storage, log_root) = build_log_with_paths_and_checkpoint(&paths, None).await;
+    let table_root = Url::parse("memory:///").expect("valid url");
+    let staged_commits_log_tail: Vec<ParsedLogPath> = segment
+        .staged_commit_versions
+        .iter()
+        .map(|version| staged_commit_path_for_version(*version))
+        .map(|path| {
+            ParsedLogPath::try_from(FileMeta {
+                location: table_root.join(path.as_ref()).unwrap(),
+                last_modified: 0,
+                size: 0,
+            })
+            .unwrap()
+            .unwrap()
+        })
+        .collect();
     LogSegment::for_snapshot_impl(
         storage.as_ref(),
         log_root.clone(),
-        vec![], // log_tail
+        staged_commits_log_tail,
         None,
         segment.version_to_load,
     )
@@ -1556,6 +1575,7 @@ async fn test_compaction_listing(
         compaction_versions,
         checkpoint_version,
         version_to_load,
+        ..Default::default()
     })
     .await;
     let version_to_load = version_to_load.unwrap_or(u64::MAX);
@@ -1710,6 +1730,7 @@ async fn test_commit_cover(
         compaction_versions,
         checkpoint_version,
         version_to_load,
+        ..Default::default()
     })
     .await;
     let cover = log_segment.find_commit_cover();
@@ -2426,6 +2447,7 @@ fn test_publish_validation() {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     assert!(log_segment.validate_no_staged_commits().is_ok());
@@ -2447,6 +2469,7 @@ fn test_publish_validation() {
         latest_crc_file: None,
         latest_commit_file: None,
         checkpoint_schema: None,
+        max_published_version: None,
     };
 
     // Should fail with staged commits
@@ -2513,7 +2536,7 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     use crate::schema::{StructField, StructType};
 
     let (store, log_root) = new_in_memory_store();
-    let engine = DefaultEngine::new(store.clone());
+    let engine = DefaultEngineBuilder::new(store.clone()).build();
 
     // Create a V1 checkpoint (without sidecar column)
     let v1_schema = get_commit_schema().project(&[ADD_NAME, REMOVE_NAME])?;
@@ -2557,4 +2580,306 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     assert!(sidecars.is_empty(), "V1 checkpoint should have no sidecars");
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_max_published_version_only_published_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7, 8],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 8);
+}
+
+#[tokio::test]
+async fn test_max_published_version_only_staged_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        staged_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_staged_commits() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        staged_commit_versions: &[5, 6, 7, 8],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
+}
+
+#[tokio::test]
+async fn test_max_published_version_published_and_staged_commits_no_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_no_overlap()
+{
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7],
+        staged_commit_versions: &[8, 9, 10],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 7);
+}
+
+#[tokio::test]
+async fn test_max_published_version_published_and_staged_commits_with_overlap() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2],
+        staged_commit_versions: &[2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_followed_by_published_and_staged_commits_with_overlap(
+) {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[5, 6, 7, 8, 9],
+        staged_commit_versions: &[7, 8, 9, 10],
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version.unwrap(), 9);
+}
+
+#[tokio::test]
+async fn test_max_published_version_checkpoint_only() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        checkpoint_version: Some(5),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(log_segment.max_published_version, None);
+}
+// Helper to create a checkpoint schema with stats_parsed for testing
+fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable(
+            "minValues",
+            StructType::new_unchecked(min_values_fields.clone()),
+        ),
+        StructField::nullable("maxValues", StructType::new_unchecked(min_values_fields)),
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+// Helper to create a checkpoint schema without stats_parsed
+fn create_checkpoint_schema_without_stats_parsed() -> StructType {
+    use crate::schema::StructType;
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats", DataType::STRING),
+    ]);
+
+    StructType::new_unchecked([StructField::nullable("add", add_schema)])
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_basic() {
+    // Create a checkpoint schema with stats_parsed containing an integer column
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    // Exact type match should work
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+
+    // Type widening (int -> long) should work
+    let stats_schema_widened =
+        StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema_widened
+    ));
+
+    // Incompatible type (string -> int) should fail
+    let checkpoint_schema_string =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::STRING,
+        )]);
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema_string,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_missing_column_ok() {
+    // Checkpoint has "id" column, stats schema needs "other" column (missing in checkpoint is OK)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema =
+        StructType::new_unchecked([StructField::nullable("other", DataType::INTEGER)]);
+
+    // Missing column in checkpoint is OK - it will just return NULL
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_extra_column_ok() {
+    // Checkpoint has extra columns not needed by stats schema (should be OK)
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("id", DataType::INTEGER),
+        StructField::nullable("extra", DataType::STRING),
+    ]);
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_no_stats_parsed() {
+    // Checkpoint schema without stats_parsed field
+    let checkpoint_schema = create_checkpoint_schema_without_stats_parsed();
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_empty_stats_schema() {
+    // Empty stats schema (no columns needed for data skipping)
+    let checkpoint_schema =
+        create_checkpoint_schema_with_stats_parsed(vec![StructField::nullable(
+            "id",
+            DataType::INTEGER,
+        )]);
+
+    let stats_schema = StructType::new_unchecked([]);
+
+    // If no columns are needed for data skipping, any stats_parsed is compatible
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_multiple_columns() {
+    // Multiple columns - check that we iterate over all columns and find incompatibility
+    let checkpoint_schema = create_checkpoint_schema_with_stats_parsed(vec![
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::STRING),
+    ]);
+
+    // First column matches, second is incompatible
+    let stats_schema = StructType::new_unchecked([
+        StructField::nullable("good_col", DataType::LONG),
+        StructField::nullable("bad_col", DataType::INTEGER),
+    ]);
+
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_missing_min_max_values() {
+    // stats_parsed exists but has no minValues/maxValues fields - unusual but valid (continue case)
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        // No minValues or maxValues fields
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    // Should return true - missing minValues/maxValues is handled gracefully with continue
+    assert!(LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
+}
+
+#[test]
+fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
+    // minValues/maxValues exist but are not Struct types - malformed schema (return false case)
+    let stats_parsed = StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        // minValues is a primitive type instead of a Struct
+        StructField::nullable("minValues", DataType::STRING),
+        StructField::nullable("maxValues", DataType::STRING),
+    ]);
+
+    let add_schema = StructType::new_unchecked([
+        StructField::nullable("path", DataType::STRING),
+        StructField::nullable("stats_parsed", stats_parsed),
+    ]);
+
+    let checkpoint_schema = StructType::new_unchecked([StructField::nullable("add", add_schema)]);
+
+    let stats_schema = StructType::new_unchecked([StructField::nullable("id", DataType::INTEGER)]);
+
+    // Should return false - minValues/maxValues must be Struct types
+    assert!(!LogSegment::schema_has_compatible_stats_parsed(
+        &checkpoint_schema,
+        &stats_schema
+    ));
 }
