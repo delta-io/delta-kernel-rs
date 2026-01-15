@@ -25,6 +25,8 @@ pub(crate) struct StateInfo {
     pub(crate) physical_predicate: PhysicalPredicate,
     /// Transform specification for converting physical to logical data
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
+    /// The column mapping mode for this scan
+    pub(crate) column_mapping_mode: ColumnMappingMode,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -79,6 +81,9 @@ fn validate_metadata_columns<'a>(
                 metadata_info.materialized_row_id_column_name = Some(row_id_col);
             }
             Some(MetadataColumnSpec::RowCommitVersion) => {}
+            Some(MetadataColumnSpec::FilePath) => {
+                // FilePath metadata column is handled by the parquet reader
+            }
             None => {}
         }
         metadata_info
@@ -167,9 +172,11 @@ impl StateInfo {
                     Some(MetadataColumnSpec::RowCommitVersion) => {
                         return Err(Error::unsupported("Row commit versions not supported"));
                     }
-                    Some(MetadataColumnSpec::RowIndex) | None => {
-                        // note that RowIndex is handled in the parquet reader so we just add it as
-                        // if it's a normal physical column
+                    Some(MetadataColumnSpec::RowIndex)
+                    | Some(MetadataColumnSpec::FilePath)
+                    | None => {
+                        // note that RowIndex and FilePath are handled in the parquet reader so we just add them as
+                        // if they're normal physical columns
                         let physical_field = logical_field.make_physical(column_mapping_mode);
                         debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
                         let physical_name = physical_field.name.clone();
@@ -192,7 +199,7 @@ impl StateInfo {
         let physical_schema = Arc::new(StructType::try_new(read_fields)?);
 
         let physical_predicate = match predicate {
-            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema)?,
+            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema, column_mapping_mode)?,
             None => PhysicalPredicate::None,
         };
 
@@ -208,6 +215,7 @@ impl StateInfo {
             physical_schema,
             physical_predicate,
             transform_spec,
+            column_mapping_mode,
         })
     }
 }

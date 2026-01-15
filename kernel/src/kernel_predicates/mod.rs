@@ -182,6 +182,7 @@ pub trait KernelPredicateEvaluator {
             | Expr::Unary(_)
             | Expr::Binary(_)
             | Expr::Variadic(_)
+            | Expr::ParseJson(_)
             | Expr::Unknown(_) => None,
         }
     }
@@ -209,6 +210,7 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Binary(_)
                 | Expr::Variadic(_)
                 | Expr::Opaque(_)
+                | Expr::ParseJson { .. }
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
@@ -510,15 +512,21 @@ impl KernelPredicateEvaluatorDefaults {
         Some(val.is_null() != inverted)
     }
 
-    /// A (possibly inverted) partial comparison of two scalars, leveraging the [`PartialOrd`]
-    /// trait.
+    /// A (possibly inverted) partial comparison of two scalars using SQL/logical semantics.
+    ///
+    /// Returns `None` if the scalars are incomparable (different types, NULL values, or
+    /// unsupported types like Struct/Array/Map).
+    ///
+    /// NOTE: This implements SQL NULL semantics where NULL is incomparable to everything,
+    /// including itself. For physical/structural comparison of query plans, use `==` on
+    /// `Scalar` directly (which provides physical equality).
     pub fn partial_cmp_scalars(
         ord: Ordering,
         a: &Scalar,
         b: &Scalar,
         inverted: bool,
     ) -> Option<bool> {
-        let cmp = a.partial_cmp(b)?;
+        let cmp = a.logical_partial_cmp(b)?;
         let matched = cmp == ord;
         Some(matched != inverted)
     }
@@ -633,6 +641,7 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                     warn!("Failed to evaluate {:?}: {err:?}", op.as_ref());
                 })
                 .ok(),
+            Expr::ParseJson(_) => None, // ParseJson is not expected to be a top-level predicate expression
             Expr::Unknown(_) => None,
         }
     }
