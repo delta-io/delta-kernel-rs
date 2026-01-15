@@ -291,7 +291,7 @@ mod tests {
 
         let committer = FileSystemCommitter::new();
         let log_root = LogRoot::new(table_root).unwrap();
-        let commit_metadata = CommitMetadata::new(log_root, 1, 12345);
+        let commit_metadata = CommitMetadata::new(log_root, 1, 12345, Some(0));
         let actions = Box::new(std::iter::empty());
 
         let result = committer.commit(&engine, actions, commit_metadata).unwrap();
