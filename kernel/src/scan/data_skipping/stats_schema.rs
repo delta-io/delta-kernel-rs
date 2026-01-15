@@ -35,6 +35,46 @@ use crate::{
 ///    maxValues: <derived min/max schema>,
 /// }
 /// ```
+///
+/// For a table with physical schema:
+///
+/// ```ignore
+/// {
+///    id: long,
+///    user: {
+///      name: string,
+///      age: integer,
+///    },
+/// }
+/// ```
+///
+/// the expected stats schema would be:
+/// ```ignore
+/// {
+///   numRecords: long,
+///   nullCount: {
+///     id: long,
+///     user: {
+///       name: long,
+///       age: long,
+///     },
+///   },
+///   minValues: {
+///     id: long,
+///     user: {
+///       name: string,
+///       age: integer,
+///     },
+///   },
+///   maxValues: {
+///     id: long,
+///     user: {
+///       name: string,
+///       age: integer,
+///     },
+///   },
+/// }
+/// ```
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
@@ -167,12 +207,13 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
 
         self.path.push(field.name.clone());
         let data_type = field.data_type();
+        let is_struct = matches!(data_type, DataType::Struct(_));
 
         // keep the field if it:
         // - is a struct field and we need to traverse its children
         // - OR it is referenced by the column names
         // - OR it is a primitive type / leaf field
-        let should_include = matches!(data_type, DataType::Struct(_))
+        let should_include = is_struct
             || self
                 .column_names
                 .as_ref()
@@ -185,7 +226,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
         }
 
         // increment count only for leaf columns.
-        if !matches!(data_type, DataType::Struct(_)) {
+        if !is_struct {
             self.added_columns += 1;
         }
 
