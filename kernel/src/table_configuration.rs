@@ -137,6 +137,22 @@ impl TableConfiguration {
         )
     }
 
+    /// Creates a new [`TableConfiguration`] representing the table configuration immediately
+    /// after a commit.
+    ///
+    /// This method takes a pre-commit table configuration and produces a post-commit
+    /// configuration at the committed version. This allows immediate use of the new table
+    /// configuration without re-reading metadata from storage.
+    ///
+    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
+    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
+    pub(crate) fn new_post_commit(table_configuration: &Self, new_version: Version) -> Self {
+        Self {
+            version: new_version,
+            ..table_configuration.clone()
+        }
+    }
+
     /// Generates the expected schema for file statistics.
     ///
     /// Engines can decide to provide statistics for files written to the delta table,
