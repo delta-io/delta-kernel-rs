@@ -460,7 +460,12 @@ impl Transaction {
             return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
         }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
-        let commit_metadata = CommitMetadata::new(log_root, commit_version, self.commit_timestamp);
+        let commit_metadata = CommitMetadata::new(
+            log_root,
+            commit_version,
+            self.commit_timestamp,
+            self.read_snapshot.log_segment().max_published_version,
+        );
         match self
             .committer
             .commit(engine, Box::new(filtered_actions), commit_metadata)

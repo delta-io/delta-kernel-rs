@@ -49,14 +49,12 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         let committed = engine.storage_handler().head(&staged_commit_path)?;
         tracing::debug!("wrote staged commit file: {:?}", committed);
 
-        // TODO: should plumb through last known backfilled version in CommitMetadata (#1487)
-        let last_backfilled_version = None;
         let commit_req = CommitRequest::new(
             self.table_id.clone(),
             commit_metadata.table_root().as_str(),
             Commit::new(
                 commit_metadata.version().try_into().map_err(|_| {
-                    DeltaError::generic("commit version does not fit into u32 for UC commit")
+                    DeltaError::generic("commit version does not fit into i64 for UC commit")
                 })?,
                 commit_metadata.in_commit_timestamp(),
                 staged_commit_path
@@ -69,10 +67,19 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
                 committed
                     .size
                     .try_into()
-                    .map_err(|_| DeltaError::generic("committed size does not fit into u32"))?,
+                    .map_err(|_| DeltaError::generic("committed size does not fit into i64"))?,
                 committed.last_modified,
             ),
-            last_backfilled_version,
+            commit_metadata
+                .max_published_version()
+                .map(|v| {
+                    v.try_into().map_err(|_| {
+                        DeltaError::Generic(format!(
+                            "Max published version {v} does not fit into i64 for UC commit"
+                        ))
+                    })
+                })
+                .transpose()?,
         );
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             DeltaError::generic("UCCommitter may only be used within a tokio runtime")

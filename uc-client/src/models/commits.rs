@@ -107,10 +107,5 @@ impl CommitRequest {
         }
     }
 
-    pub fn with_latest_backfilled_version(mut self, version: i64) -> Self {
-        self.latest_backfilled_version = Some(version);
-        self
-    }
-
     // TODO: expose metadata/protocol (with_metadata, with_protocol)
 }
