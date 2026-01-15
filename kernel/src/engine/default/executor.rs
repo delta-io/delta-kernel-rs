@@ -282,18 +282,11 @@ pub mod tokio {
 
             // Wait with timeout - if this times out, we have a deadlock
             let timeout = Duration::from_secs(5);
-            match rx.recv_timeout(timeout) {
-                Ok(result) => {
-                    assert_eq!(result, 43);
-                    handle.join().expect("thread panicked");
-                }
-                Err(_) => {
-                    panic!(
-                        "Test timed out after {:?} seconds - likely deadlock in nested block_on. \
-                         This indicates TokioMultiThreadExecutor::block_on is not working correctly.",
-                        timeout
-                    );
-                }
+            let result = rx
+                .recv_timeout(timeout)
+                .expect("Timeout - likely deadlock in TokioMultiThreadExecutor::block_on");
+            assert_eq!(result, 43);
+            handle.join().expect("thread panicked");
             }
         }
     }
