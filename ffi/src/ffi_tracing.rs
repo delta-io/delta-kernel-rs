@@ -575,7 +575,7 @@ mod tests {
     static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     static MESSAGES: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
-    fn record_callback_impl(line: KernelStringSlice, expected_log_lines: Vec<&str>) {
+    fn record_callback_with_filter(line: KernelStringSlice, expected_log_lines: Vec<&str>) {
         let line_str: &str = unsafe { TryFromStringSlice::try_from_slice(&line).unwrap() };
         let line_str = line_str.to_string();
         let ok = expected_log_lines.is_empty()
@@ -590,12 +590,13 @@ mod tests {
         }
     }
 
-    extern "C" fn record_callback(line: KernelStringSlice) {
-        record_callback_impl(line, vec!["Testing 1\n", "Another line\n"])
+    // Note: record callbacks must be extern "C". Thus we cannot construct test callback closures in runtime.
+    extern "C" fn record_callback_with_filter_1(line: KernelStringSlice) {
+        record_callback_with_filter(line, vec!["Testing 1\n", "Another line\n"])
     }
 
-    extern "C" fn record_callback_2(line: KernelStringSlice) {
-        record_callback_impl(line, vec!["Testing 2\n", "Yet another line\n"])
+    extern "C" fn record_callback_with_filter_2(line: KernelStringSlice) {
+        record_callback_with_filter(line, vec!["Testing 2\n", "Yet another line\n"])
     }
 
     fn setup_messages() {
@@ -645,7 +646,6 @@ mod tests {
         };
         assert_eq!(msgs.len(), expected_lines.len());
         for (got, expect) in msgs.iter().zip(expected_lines) {
-            println!("Got: {got}");
             assert!(got.ends_with(expect));
             assert!(got.contains(expected_level_str));
             assert!(got.contains("delta_kernel_ffi::ffi_tracing::tests"));
@@ -663,7 +663,8 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_messages();
         unsafe {
-            enable_log_line_tracing(record_callback, Level::INFO);
+            // record_callback_with_filter_1 filters only "Testing 1\n", "Another line\n"
+            enable_log_line_tracing(record_callback_with_filter_1, Level::INFO);
         }
         let lines = [
             "Testing 1\n",
@@ -671,26 +672,28 @@ mod tests {
             "Testing 2\n",
             "Yet another line\n",
         ];
+        // We registered record_callback_with_filter_1, which filters only the first two lines.
         let expected_lines = vec!["Testing 1\n", "Another line\n"];
         let test_time_str = get_time_test_str();
         for line in &lines {
-            // remove final newline which will be added back by logging
+            // Remove final newline which will be added back by logging
             info!("{}", &line[..(line.len() - 1)]);
         }
 
         check_messages(expected_lines, test_time_str, "INFO");
         setup_messages();
 
-        // ensure we can setup again with a new callback and a new tracing level
-        let ok = unsafe { enable_log_line_tracing(record_callback_2, Level::DEBUG) };
+        // Ensure we can setup again with a new callback and a new tracing level
+        let ok = unsafe { enable_log_line_tracing(record_callback_with_filter_2, Level::DEBUG) };
         assert!(ok, "Failed to set up second time");
 
-        // ensure both callback and tracing level are reloaded.
+        // Ensure both callback and tracing level are reloaded.
+        // We registered record_callback_with_filter_2, which filters the other logging lines.
         let expected_lines = vec!["Testing 2\n", "Yet another line\n"];
         let test_time_str = get_time_test_str();
         for line in &lines {
             debug!("{}", &line[..(line.len() - 1)]);
-            // trace must not be visible in messages, because we changed level to debug
+            // Trace must not be visible in messages, because we changed level to debug
             trace!("{}", &line[..(line.len() - 1)]);
         }
         check_messages(expected_lines, test_time_str, "DEBUG");
@@ -701,7 +704,7 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_messages();
         let (dispatch, _, _) = create_log_line_dispatch(
-            record_callback,
+            record_callback_with_filter_1,
             Level::INFO,
             LogLineFormat::COMPACT,
             false,
@@ -757,7 +760,7 @@ mod tests {
         }
     }
 
-    fn event_callback_impl(event: Event, expected_log_lines: Vec<&str>) {
+    fn event_callback_with_filter(event: Event, expected_log_lines: Vec<&str>) {
         let msg: &str = unsafe { TryFromStringSlice::try_from_slice(&event.message).unwrap() };
         let target: &str = unsafe { TryFromStringSlice::try_from_slice(&event.target).unwrap() };
         let file: &str = unsafe { TryFromStringSlice::try_from_slice(&event.file).unwrap() };
@@ -777,12 +780,12 @@ mod tests {
         }
     }
 
-    extern "C" fn event_callback(event: Event) {
-        event_callback_impl(event, vec!["Testing 1", "Another line"])
+    extern "C" fn event_callback_with_filter_1(event: Event) {
+        event_callback_with_filter(event, vec!["Testing 1", "Another line"])
     }
 
-    extern "C" fn event_callback_2(event: Event) {
-        event_callback_impl(event, vec!["Testing 2", "Yet another line"])
+    extern "C" fn event_callback_with_filter_2(event: Event) {
+        event_callback_with_filter(event, vec!["Testing 2", "Yet another line"])
     }
 
     fn check_events(expected_level: tracing::Level, expected_messages: Vec<&str>) {
@@ -810,7 +813,7 @@ mod tests {
     fn trace_event_tracking() {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
-        let (dispatch, _filter, _) = create_event_dispatch(event_callback, Level::TRACE);
+        let (dispatch, _filter, _) = create_event_dispatch(event_callback_with_filter_1, Level::TRACE);
         tracing_core::dispatcher::with_default(&dispatch, || {
             let lines = ["Testing 1", "Another line"];
             for line in lines {
@@ -826,9 +829,11 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         setup_events();
         unsafe {
-            enable_event_tracing(event_callback, Level::INFO);
+            // Filters only "Testing 1", "Another line"
+            enable_event_tracing(event_callback_with_filter_1, Level::INFO);
         }
         let lines = ["Testing 1", "Another line", "Testing 2", "Yet another line"];
+        // We registered record_callback_with_filter_1, which filters the first two logging lines
         let expected_lines = vec!["Testing 1", "Another line"];
         for line in &lines {
             info!("{}", &line);
@@ -842,12 +847,13 @@ mod tests {
             .as_ref()
             .is_none_or(|v| v.is_empty()));
 
-        // ensure we can setup again with a new callback and a new tracing level
+        // Ensure we can setup again with a new callback and a new tracing level
         unsafe {
-            enable_event_tracing(event_callback_2, Level::DEBUG);
+            enable_event_tracing(event_callback_with_filter_2, Level::DEBUG);
         };
 
-        // ensure both callback and tracing level are reloaded.
+        // Ensure both callback and tracing level are reloaded.
+        // We registered record_callback_with_filter_2, which filters the other logging lines
         let expected_lines = vec!["Testing 2", "Yet another line"];
         for line in &lines {
             debug!("{}", &line);
