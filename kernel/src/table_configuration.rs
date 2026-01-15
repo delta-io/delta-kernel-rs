@@ -147,7 +147,7 @@ impl TableConfiguration {
     /// useful for a given table.
     #[allow(unused)]
     #[internal_api]
-    pub fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
+    pub(crate) fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
         let partition_columns = self.metadata().partition_columns();
         let column_mapping_mode = self.column_mapping_mode();
         let physical_schema = StructType::try_new(
