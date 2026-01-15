@@ -380,7 +380,7 @@ impl Snapshot {
     ///
     /// See the [`crate::checkpoint`] module documentation for more details on checkpoint types
     /// and the overall checkpoint process.
-    pub fn checkpoint(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
+    pub fn create_checkpoint_writer(self: Arc<Self>) -> DeltaResult<CheckpointWriter> {
         CheckpointWriter::try_new(self)
     }
 

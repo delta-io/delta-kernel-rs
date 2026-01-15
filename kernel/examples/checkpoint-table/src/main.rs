@@ -68,7 +68,7 @@ async fn try_main() -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(url).build(&engine)?;
 
     // first we create a checkpoint writer
-    let writer = snapshot.checkpoint()?;
+    let writer = snapshot.create_checkpoint_writer()?;
 
     // this tells us the path where we should write the checkpoint file
     let checkpoint_path = writer.checkpoint_path()?;
