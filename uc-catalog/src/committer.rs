@@ -74,9 +74,9 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
                 .max_published_version()
                 .map(|v| {
                     v.try_into().map_err(|_| {
-                        DeltaError::generic(
-                            "Max published version does not fit into i64 for UC commit",
-                        )
+                        DeltaError::Generic(format!(
+                            "Max published version {v} does not fit into i64 for UC commit"
+                        ))
                     })
                 })
                 .transpose()?,
