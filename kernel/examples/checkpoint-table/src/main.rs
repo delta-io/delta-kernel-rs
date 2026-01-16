@@ -74,7 +74,7 @@ async fn try_main() -> DeltaResult<()> {
     let checkpoint_path = writer.checkpoint_path()?;
     // this gives us a iterator of `FilteredEngineData` that needs to be written to the file
     let mut data_iter = writer.checkpoint_data(&engine)?;
-    let state = data_iter.state_handle();
+    let state = data_iter.state();
 
     let batch_iter = data_iter.by_ref();
     // we'll use the first batch to determine the schema

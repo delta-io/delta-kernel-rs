@@ -132,8 +132,8 @@ impl ActionReconciliationIterator {
         }
     }
 
-    /// Get a handle to the shared state. This allows sharing of stats.
-    pub fn state_handle(&self) -> Arc<ActionReconciliationIteratorState> {
+    /// Get the shared state. This allows sharing of stats.
+    pub fn state(&self) -> Arc<ActionReconciliationIteratorState> {
         Arc::clone(&self.state)
     }
 
