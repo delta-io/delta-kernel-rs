@@ -66,14 +66,14 @@ jobs:
         uses: actions-ecosystem/action-add-labels@v1
         with:
           labels: breaking-change
-      - name: Remove breaking-change label
-        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
-        uses: actions-ecosystem/action-remove-labels@v1
-        with:
-          labels: breaking-change
       - name: On Success
         if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success'
-        run: echo "Checks succeed"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} --remove-label breaking-change 2>/dev/null || true
+          echo "Checks succeed"
       - name: Fail On Incorrect Previous Output
         if: needs.check_if_pr_breaks_semver.outputs.check_status != 'success' && needs.check_if_pr_breaks_semver.outputs.check_status != 'failure'
         run: exit 1
