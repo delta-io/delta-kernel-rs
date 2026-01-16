@@ -67,7 +67,7 @@ jobs:
         with:
           labels: breaking-change
       - name: On Success
-        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success'
+        if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success' && contains(github.event.pull_request.labels.*.name, 'breaking-change')
         uses: actions-ecosystem/action-remove-labels@v1
         with:
           labels: breaking-change
