@@ -86,10 +86,7 @@ impl HasSelectionVector for ActionReconciliationBatch {
     }
 }
 
-/// Shared state for tracking action reconciliation iteration progress.
-///
-/// This state is shared via `Arc` to allow callers to capture counts after the iterator
-/// is consumed (e.g., when passed to `write_parquet_file` which takes ownership).
+/// Stats for ActionReconciliationIterator
 #[derive(Debug, Default)]
 pub struct ActionReconciliationIteratorState {
     actions_count: AtomicI64,
