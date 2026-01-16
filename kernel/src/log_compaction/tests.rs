@@ -107,7 +107,7 @@ fn test_compaction_data() {
     let iterator = result.unwrap();
 
     // Test iterator stat initilize
-    let state = iterator.state_handle();
+    let state = iterator.state();
     assert_eq!(state.actions_count(), 0);
     assert_eq!(state.add_actions_count(), 0);
 
@@ -152,7 +152,7 @@ fn test_compaction_data_with_actual_iterator() {
 
     let iterator = writer.compaction_data(&engine).unwrap();
 
-    let state = iterator.state_handle();
+    let state = iterator.state();
     let mut batch_count = 0;
     let initial_actions = state.actions_count();
     let initial_add_actions = state.add_actions_count();
@@ -225,7 +225,7 @@ fn test_version_filtering() {
         );
 
         let iterator = result.unwrap();
-        let state = iterator.state_handle();
+        let state = iterator.state();
         assert!(state.actions_count() >= 0);
         assert!(state.add_actions_count() >= 0);
     }

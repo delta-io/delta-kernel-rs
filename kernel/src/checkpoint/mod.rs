@@ -57,8 +57,8 @@
 //! let checkpoint_path = writer.checkpoint_path()?;
 //! let checkpoint_data = writer.checkpoint_data(engine)?;
 //!
-//! // Get a handle to the iterator state
-//! let state = checkpoint_data.state_handle();
+//! // Get the iterator state
+//! let state = checkpoint_data.state();
 //!
 //! // Write the checkpoint data to the object store and collect metadata
 //! let metadata: FileMeta = write_checkpoint_file(checkpoint_path, &checkpoint_data)?;
