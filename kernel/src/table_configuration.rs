@@ -13,8 +13,9 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
+use crate::scan::data_skipping::stats_schema::expected_stats_schema;
 use crate::schema::variant_utils::validate_variant_type_feature_support;
-use crate::schema::{InvariantChecker, SchemaRef};
+use crate::schema::{InvariantChecker, SchemaRef, StructType};
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
     ColumnMappingMode, EnablementCheck, FeatureInfo, FeatureRequirement, FeatureType,
@@ -134,6 +135,31 @@ impl TableConfiguration {
             table_configuration.table_root.clone(),
             new_version,
         )
+    }
+
+    /// Generates the expected schema for file statistics.
+    ///
+    /// Engines can decide to provide statistics for files written to the delta table,
+    /// which enables data skipping and other optimizations. While it is not required to
+    /// provide statistics, it is strongly recommended. This method generates the expected
+    /// schema for statistics based on the table configuration. Often times the consfigration
+    /// is based on operator experience or automates systems as to what statistics are most
+    /// useful for a given table.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
+        let partition_columns = self.metadata().partition_columns();
+        let column_mapping_mode = self.column_mapping_mode();
+        let physical_schema = StructType::try_new(
+            self.schema()
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name()))
+                .map(|field| field.make_physical(column_mapping_mode)),
+        )?;
+        Ok(Arc::new(expected_stats_schema(
+            &physical_schema,
+            self.table_properties(),
+        )?))
     }
 
     /// The [`Metadata`] for this table at this version.
