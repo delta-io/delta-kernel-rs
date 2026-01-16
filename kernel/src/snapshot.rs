@@ -410,7 +410,7 @@ impl Snapshot {
         let new_table_configuration =
             TableConfiguration::new_post_commit(self.table_configuration(), commit.version);
 
-        let new_log_segment = self.log_segment.clone().new_with_commit(commit)?;
+        let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
 
         Ok(Snapshot {
             table_configuration: new_table_configuration,
