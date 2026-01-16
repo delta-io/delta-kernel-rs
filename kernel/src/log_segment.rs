@@ -354,15 +354,13 @@ impl LogSegment {
         let mut new_log_segment = self.clone();
 
         new_log_segment.end_version = tail_commit_file.version;
-        new_log_segment.ascending_commit_files.push(tail_commit_file.clone());
+        new_log_segment
+            .ascending_commit_files
+            .push(tail_commit_file.clone());
         new_log_segment.latest_commit_file = Some(tail_commit_file.clone());
         new_log_segment.max_published_version = match tail_commit_file.file_type {
-            LogPathFileType::Commit => {
-                Some(tail_commit_file.version)
-            }
-            _ => {
-                self.max_published_version
-            }
+            LogPathFileType::Commit => Some(tail_commit_file.version),
+            _ => self.max_published_version,
         };
 
         Ok(new_log_segment)
