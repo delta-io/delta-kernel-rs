@@ -2582,6 +2582,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     Ok(())
 }
 
+// ============================================================================
+// max_published_version tests
+// ============================================================================
+
 #[tokio::test]
 async fn test_max_published_version_only_published_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2681,6 +2685,10 @@ async fn test_max_published_version_checkpoint_only() {
     .await;
     assert_eq!(log_segment.max_published_version, None);
 }
+
+// ============================================================================
+// schema_has_compatible_stats_parsed tests
+// ============================================================================
 
 // Helper to create a checkpoint schema with stats_parsed for testing
 fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
@@ -2885,6 +2893,10 @@ fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
     ));
 }
 
+// ============================================================================
+// new_with_commit tests
+// ============================================================================
+
 /// Asserts that `new` is `orig` extended with exactly one commit via `LogSegment::new_with_commit`.
 fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
     // Check: What should have changed
@@ -2922,7 +2934,10 @@ async fn test_new_with_commit_published_commit() {
     let table_root = Url::parse("memory:///").unwrap();
     let new_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 5);
 
-    let new_log_segment = log_segment.clone().new_with_commit(new_commit).unwrap();
+    let new_log_segment = log_segment
+        .clone()
+        .new_with_commit_appended(new_commit)
+        .unwrap();
 
     assert_eq!(new_log_segment.max_published_version, Some(5));
     assert_log_segment_extended(log_segment, new_log_segment);
@@ -2938,7 +2953,10 @@ async fn test_new_with_commit_staged_commit() {
     let table_root = Url::parse("memory:///").unwrap();
     let new_commit = ParsedLogPath::create_parsed_staged_commit(&table_root, 5);
 
-    let new_log_segment = log_segment.clone().new_with_commit(new_commit).unwrap();
+    let new_log_segment = log_segment
+        .clone()
+        .new_with_commit_appended(new_commit)
+        .unwrap();
 
     assert_eq!(new_log_segment.max_published_version, Some(4));
     assert_log_segment_extended(log_segment, new_log_segment);
@@ -2953,7 +2971,7 @@ async fn test_new_with_commit_not_commit_type() {
     .await;
     let checkpoint = create_log_path("file:///_delta_log/00000000000000000005.checkpoint.parquet");
 
-    let result = log_segment.new_with_commit(checkpoint);
+    let result = log_segment.new_with_commit_appended(checkpoint);
 
     assert_result_error_with_message(
         result,
@@ -2969,9 +2987,9 @@ async fn test_new_with_commit_not_end_version_plus_one() {
     })
     .await;
     let table_root = Url::parse("memory:///").unwrap();
-    let wrong_version_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 10);
 
-    let result = log_segment.new_with_commit(wrong_version_commit);
+    let wrong_version_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 10);
+    let result = log_segment.new_with_commit_appended(wrong_version_commit);
 
     assert_result_error_with_message(
         result,

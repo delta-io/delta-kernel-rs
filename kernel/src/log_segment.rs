@@ -328,8 +328,12 @@ impl LogSegment {
     }
 
     /// Creates a new LogSegment with the given commit file added to the end.
+    /// TODO: Take in multiple commits when Kernel-RS supports txn retries and conflict rebasing.
     #[allow(unused)]
-    pub(crate) fn new_with_commit(self, tail_commit_file: ParsedLogPath) -> DeltaResult<Self> {
+    pub(crate) fn new_with_commit_appended(
+        &self,
+        tail_commit_file: ParsedLogPath,
+    ) -> DeltaResult<Self> {
         require!(
             tail_commit_file.is_commit(),
             Error::internal_error(format!(
@@ -347,29 +351,21 @@ impl LogSegment {
             ))
         );
 
-        let new_ascending_commit_files: Vec<_> = self
-            .ascending_commit_files
-            .into_iter()
-            .chain([tail_commit_file.clone()])
-            .collect();
-        let new_max_published_version = match tail_commit_file.file_type {
+        let mut new_log_segment = self.clone();
+
+        new_log_segment.end_version = tail_commit_file.version;
+        new_log_segment.ascending_commit_files.push(tail_commit_file.clone());
+        new_log_segment.latest_commit_file = Some(tail_commit_file.clone());
+        new_log_segment.max_published_version = match tail_commit_file.file_type {
             LogPathFileType::Commit => {
-                // Case 1: Tail is a published commit, so new max published is tail version.
                 Some(tail_commit_file.version)
             }
             _ => {
-                // Case 2: Tail is a staged commit, so max published version is unchanged.
                 self.max_published_version
             }
         };
 
-        Ok(LogSegment {
-            end_version: tail_commit_file.version,
-            ascending_commit_files: new_ascending_commit_files,
-            latest_commit_file: Some(tail_commit_file),
-            max_published_version: new_max_published_version,
-            ..self
-        })
+        Ok(new_log_segment)
     }
 
     /// Read a stream of actions from this log segment. This returns an iterator of
