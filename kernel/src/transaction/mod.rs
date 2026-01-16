@@ -845,6 +845,49 @@ impl Transaction {
         Ok(())
     }
 
+    /// Generate domain metadata actions for create-table transactions.
+    ///
+    /// For create-table, only system domain metadata (domains with `delta.` prefix) is allowed.
+    /// User domain operations are not yet supported for create-table transactions.
+    /// This includes system domains like `delta.clustering` for clustered tables.
+    fn generate_create_table_domain_metadata_actions<'a>(
+        &'a self,
+        engine: &'a dyn Engine,
+    ) -> DeltaResult<EngineDataResultIterator<'a>> {
+        // Domain removals are not allowed for create-table (nothing to remove)
+        if !self.domain_removals.is_empty() {
+            return Err(Error::unsupported(
+                "Domain metadata removals are not supported in create-table transactions",
+            ));
+        }
+
+        // Check that all additions are internal (system) domains
+        let has_user_domains = self
+            .domain_metadata_additions
+            .iter()
+            .any(|dm| !dm.is_internal());
+
+        if has_user_domains {
+            return Err(Error::unsupported(
+                "User domain metadata operations are not supported in create-table transactions",
+            ));
+        }
+
+        // If there are system domain additions (e.g., clustering), include them
+        if !self.domain_metadata_additions.is_empty() {
+            let schema = get_log_domain_metadata_schema();
+            return Ok(Box::new(
+                self.domain_metadata_additions
+                    .clone()
+                    .into_iter()
+                    .map(move |dm| dm.into_engine_data(schema.clone(), engine)),
+            ));
+        }
+
+        // For create table with no domain metadata, return empty
+        Ok(Box::new(iter::empty()))
+    }
+
     /// Generate domain metadata actions with validation. Handle both user and system domains.
     ///
     /// This function may perform an expensive log replay operation if there are any domain removals.
@@ -855,14 +898,9 @@ impl Transaction {
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
     ) -> DeltaResult<EngineDataResultIterator<'a>> {
-        // For create-table transactions, domain metadata is not supported
+        // For create-table transactions, delegate to specialized handler
         if self.is_create_table() {
-            if !self.domain_metadata_additions.is_empty() || !self.domain_removals.is_empty() {
-                return Err(Error::unsupported(
-                    "Domain metadata operations are not supported in create-table transactions",
-                ));
-            }
-            return Ok(Box::new(iter::empty()));
+            return self.generate_create_table_domain_metadata_actions(engine);
         }
 
         // Validate feature support for user domain operations
