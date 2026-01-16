@@ -52,6 +52,7 @@ mod transforms;
 
 use std::collections::{HashMap, HashSet};
 
+use crate::actions::DomainMetadata;
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::table_features::{
     column_mapping_mode, validate_schema_column_mapping, validate_timestamp_ntz_feature_support,
@@ -87,9 +88,10 @@ pub(crate) enum TransformId {
     DeltaPropertyValidation,
     /// Sets protocol version from properties or defaults
     ProtocolVersion,
+    /// Enables DomainMetadata writer feature
+    DomainMetadata,
     // Future transforms:
     // ColumnMapping,
-    // DomainMetadata,
     // Clustering,
     // DeletionVectors,
     // etc.
@@ -102,7 +104,7 @@ pub(crate) enum TransformDependency {
     ///
     /// Example: ClusteringTransform requires DomainMetadataTransform to have run,
     /// because Clustering needs to write domain metadata.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used when ClusteringTransform is added
     TransformRequired(TransformId),
 
     /// Soft ordering: If this transform is in the pipeline, run it before me.
@@ -111,8 +113,45 @@ pub(crate) enum TransformDependency {
     /// Example: If ColumnMappingTransform is in the pipeline, it should run before
     /// ClusteringTransform (to transform schema first), but Clustering doesn't
     /// require ColumnMapping to be enabled.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used when soft dependencies are needed
     TransformCompletedIfPresent(TransformId),
+}
+
+// ============================================================================
+// Transform Output
+// ============================================================================
+
+/// Output from a transform's `apply()` method.
+///
+/// Contains the updated config and any domain metadata actions produced by the transform.
+/// Domain metadata is collected by the pipeline and returned alongside the final config.
+#[derive(Debug)]
+pub(crate) struct TransformOutput {
+    /// The updated protocol/metadata configuration
+    pub config: TableProtocolMetadataConfig,
+    /// Domain metadata actions to be written to the commit (e.g., delta.clustering)
+    pub domain_metadata: Vec<DomainMetadata>,
+}
+
+impl TransformOutput {
+    /// Create output with just the config (no domain metadata)
+    pub(crate) fn new(config: TableProtocolMetadataConfig) -> Self {
+        Self {
+            config,
+            domain_metadata: vec![],
+        }
+    }
+
+    /// Create output with config and domain metadata
+    pub(crate) fn with_domain_metadata(
+        config: TableProtocolMetadataConfig,
+        domain_metadata: Vec<DomainMetadata>,
+    ) -> Self {
+        Self {
+            config,
+            domain_metadata,
+        }
+    }
 }
 
 // ============================================================================
@@ -147,9 +186,9 @@ pub(crate) enum TransformDependency {
 ///         "MyFeature: enables feature when delta.enableMyFeature is set"
 ///     }
 ///     
-///     fn apply(&self, mut config: TableProtocolMetadataConfig) -> DeltaResult<TableProtocolMetadataConfig> {
+///     fn apply(&self, mut config: TableProtocolMetadataConfig) -> DeltaResult<TransformOutput> {
 ///         config.protocol = config.protocol.with_feature(TableFeature::MyFeature)?;
-///         Ok(config)
+///         Ok(TransformOutput::new(config))
 ///     }
 /// }
 /// ```
@@ -170,9 +209,9 @@ pub(crate) trait ProtocolMetadataTransform: std::fmt::Debug {
     fn name(&self) -> &'static str;
 
     /// Dependencies that must be satisfied before this transform can run.
-    /// Returns empty slice if no dependencies.
-    fn dependencies(&self) -> &'static [TransformDependency] {
-        &[]
+    /// Returns empty vec if no dependencies.
+    fn dependencies(&self) -> Vec<TransformDependency> {
+        vec![]
     }
 
     /// Pre-validate the configuration before applying this transform.
@@ -198,12 +237,14 @@ pub(crate) trait ProtocolMetadataTransform: std::fmt::Debug {
     }
 
     /// Apply the transformation to protocol and metadata.
-    /// May: add features, set properties, transform schema, add domain metadata.
+    ///
+    /// Returns a [`TransformOutput`] containing the updated config and any domain
+    /// metadata actions produced by this transform.
     fn apply(
         &self,
         config: TableProtocolMetadataConfig,
         context: &TransformContext<'_>,
-    ) -> DeltaResult<TableProtocolMetadataConfig>;
+    ) -> DeltaResult<TransformOutput>;
 
     /// Validate the config AFTER this transform has been applied.
     /// Called immediately after apply() succeeds.
@@ -224,13 +265,11 @@ pub(crate) trait ProtocolMetadataTransform: std::fmt::Debug {
 /// - Dependency validation
 /// - Sequential execution with validation
 /// - Final protocol/metadata compatibility validation
-#[allow(dead_code)] // Used by create_table transaction
 pub(crate) struct TransformationPipeline {
     transforms: Vec<Box<dyn ProtocolMetadataTransform>>,
     completed: HashSet<TransformId>,
 }
 
-#[allow(dead_code)] // Used by create_table transaction
 impl TransformationPipeline {
     /// Create a new pipeline with the given transforms.
     pub(crate) fn new(transforms: Vec<Box<dyn ProtocolMetadataTransform>>) -> Self {
@@ -251,19 +290,20 @@ impl TransformationPipeline {
     ///
     /// # Steps
     ///
-    /// 1. Get applicable transforms from registry based on properties and schema
+    /// 1. Get applicable transforms from registry based on properties
     /// 2. Topological sort by dependencies
     /// 3. Apply each transform (with validation)
     /// 4. Run final validation
+    ///
+    /// Returns a [`TransformOutput`] containing the final config and any domain metadata
+    /// collected from all transforms.
     pub(crate) fn apply_transforms(
         config: TableProtocolMetadataConfig,
         properties: &HashMap<String, String>,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
-        // Parse schema for registry to check schema-triggered transforms
-        let schema = config.metadata.parse_schema()?;
-
-        // Get transforms from registry using raw properties and schema
-        let transforms = TRANSFORM_REGISTRY.select_transforms_to_trigger(properties, &schema)?;
+    ) -> DeltaResult<TransformOutput> {
+        // Get transforms from registry using raw properties
+        // The registry auto-resolves dependencies (e.g., ClusteringTransform -> DomainMetadataTransform)
+        let transforms = TRANSFORM_REGISTRY.select_transforms_to_trigger(properties)?;
 
         // Create context for transforms
         let context = TransformContext::new(properties);
@@ -277,13 +317,19 @@ impl TransformationPipeline {
     ///
     /// Transforms are selected by the registry based on properties, so the pipeline
     /// simply executes them in dependency order without re-checking triggers.
+    ///
+    /// Returns a [`TransformOutput`] containing the final config and collected
+    /// domain metadata from all transforms.
     pub(crate) fn apply_all(
         &mut self,
         mut config: TableProtocolMetadataConfig,
         context: &TransformContext<'_>,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
+    ) -> DeltaResult<TransformOutput> {
         // 1. Topological sort
         let ordered_indices = self.order_transform_dependencies()?;
+
+        // Collect domain metadata from all transforms
+        let mut all_domain_metadata = Vec::new();
 
         // 2. Apply each transform
         for idx in ordered_indices {
@@ -293,13 +339,12 @@ impl TransformationPipeline {
             self.check_transform_dependencies(transform.as_ref())?;
 
             // Validate no conflicting configurations and feature requirements
-            // TODO: When per-feature transforms are implemented (e.g., ColumnMappingTransform,
-            // DomainMetadataTransform), their validate_preconditions() should check
-            // FeatureInfo.feature_requirements to ensure dependent features are enabled.
             transform.validate_preconditions(&config, context)?;
 
             // Apply
-            config = transform.apply(config, context)?;
+            let output = transform.apply(config, context)?;
+            config = output.config;
+            all_domain_metadata.extend(output.domain_metadata);
 
             // Post-apply validation
             transform.validate_postconditions(&config)?;
@@ -311,7 +356,10 @@ impl TransformationPipeline {
         // 3. Final validation
         self.validate_final(&config)?;
 
-        Ok(config)
+        Ok(TransformOutput::with_domain_metadata(
+            config,
+            all_domain_metadata,
+        ))
     }
 
     /// Performs a topological sort of transforms based on their dependencies.
@@ -380,7 +428,7 @@ impl TransformationPipeline {
 
         // Visit dependencies first
         for dep in self.transforms[idx].dependencies() {
-            let dep_id = match dep {
+            let dep_id = match &dep {
                 TransformDependency::TransformRequired(id) => id,
                 TransformDependency::TransformCompletedIfPresent(id) => id,
             };
@@ -418,7 +466,7 @@ impl TransformationPipeline {
         transform: &dyn ProtocolMetadataTransform,
     ) -> DeltaResult<()> {
         for dep in transform.dependencies() {
-            match dep {
+            match &dep {
                 TransformDependency::TransformRequired(id) => {
                     // Hard dependency: transform MUST be in pipeline and completed
                     if !self.completed.contains(id) {
@@ -510,8 +558,8 @@ mod tests {
         let result = transform.apply(config, &context).unwrap();
 
         // Default to v3/v7 for table features support
-        assert_eq!(result.protocol.min_reader_version(), 3);
-        assert_eq!(result.protocol.min_writer_version(), 7);
+        assert_eq!(result.config.protocol.min_reader_version(), 3);
+        assert_eq!(result.config.protocol.min_writer_version(), 7);
     }
 
     #[test]
@@ -533,8 +581,8 @@ mod tests {
         let transform = ProtocolVersionTransform;
         let result = transform.apply(config, &context).unwrap();
 
-        assert_eq!(result.protocol.min_reader_version(), 3);
-        assert_eq!(result.protocol.min_writer_version(), 7);
+        assert_eq!(result.config.protocol.min_reader_version(), 3);
+        assert_eq!(result.config.protocol.min_writer_version(), 7);
     }
 
     #[test]
@@ -612,15 +660,18 @@ mod tests {
 
         // Version signals should NOT be in metadata (filtered in new_base_for_create)
         assert!(!result
+            .config
             .metadata
             .configuration()
             .contains_key("delta.minReaderVersion"));
         assert!(!result
+            .config
             .metadata
             .configuration()
             .contains_key("delta.minWriterVersion"));
         // User property should remain
         assert!(result
+            .config
             .metadata
             .configuration()
             .contains_key("myapp.version"));
@@ -740,7 +791,7 @@ mod tests {
         let result = TransformationPipeline::apply_transforms(config, &properties);
 
         assert!(result.is_ok());
-        let final_config = result.unwrap();
-        assert!(final_config.protocol.writer_features().unwrap().is_empty());
+        let output = result.unwrap();
+        assert!(output.config.protocol.writer_features().unwrap().is_empty());
     }
 }

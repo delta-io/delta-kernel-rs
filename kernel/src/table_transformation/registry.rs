@@ -6,17 +6,19 @@
 //!
 //! # Design
 //!
-//! Transforms are registered declaratively with trigger conditions:
+//! Transforms are registered declaratively with trigger conditions and context-aware factories:
 //!
 //! ```ignore
-//! registry.register_feature(
+//! registry.register_feature_transform(
+//!     TransformId::DeletionVectors,
 //!     TableFeature::DeletionVectors,
 //!     TransformTrigger::Property("delta.enableDeletionVectors"),
-//!     || Box::new(DeletionVectorsTransform),
+//!     |_ctx| Some(Box::new(DeletionVectorsTransform)),
 //! );
 //! ```
 //!
-//! The `select_transforms()` method automatically selects transforms whose triggers match.
+//! The `select_transforms_to_trigger()` method automatically selects transforms whose triggers match,
+//! passing runtime context to the factory functions.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -25,34 +27,39 @@ use crate::schema::{DataType, StructType};
 use crate::table_features::TableFeature;
 use crate::DeltaResult;
 
-use super::transforms::{DeltaPropertyValidationTransform, ProtocolVersionTransform};
-use super::{ProtocolMetadataTransform, TransformId};
+use super::transforms::{
+    DeltaPropertyValidationTransform, DomainMetadataTransform, ProtocolVersionTransform,
+};
+use super::{ProtocolMetadataTransform, TransformDependency, TransformId};
 
 // ============================================================================
 // Transform Context
 // ============================================================================
 
-/// Runtime context passed to transforms.
+/// Runtime context passed to transform factories.
 ///
-/// Contains all user-provided properties including delta.* signals.
-/// Transforms should read properties from this context rather than from
-/// the metadata configuration.
+/// Contains all information needed to decide whether to create a transform
+/// and how to configure it.
 #[derive(Debug)]
-#[allow(dead_code)] // Fields accessed by transforms
+#[allow(dead_code)] // Fields accessed by factory functions
 pub(crate) struct TransformContext<'a> {
-    /// Raw properties from the user (includes delta.* signals)
+    /// Raw properties from the user (includes signal flags like delta.feature.*)
     pub properties: &'a HashMap<String, String>,
 }
 
 impl<'a> TransformContext<'a> {
-    #[allow(dead_code)] // Used by TransformationPipeline in later commits
+    /// Create a new transform context.
     pub(crate) fn new(properties: &'a HashMap<String, String>) -> Self {
         Self { properties }
     }
 }
 
 /// Factory function to create a transform instance.
-type TransformFactory = fn() -> Box<dyn ProtocolMetadataTransform>;
+///
+/// Receives runtime context and returns:
+/// - `Some(transform)` if the transform should be created
+/// - `None` if the transform should not be created (e.g., conditions not met)
+type TransformFactory = fn(&TransformContext<'_>) -> Option<Box<dyn ProtocolMetadataTransform>>;
 
 // ============================================================================
 // Trigger Types
@@ -90,7 +97,6 @@ pub(crate) enum TransformTrigger {
     ///
     /// Example: `TransformTrigger::FeatureSignal(TableFeature::DeletionVectors)`
     /// triggers when `delta.feature.deletionVectors=supported` is present.
-    #[allow(dead_code)]
     FeatureSignal(TableFeature),
 
     /// Triggered by presence of a property.
@@ -122,9 +128,13 @@ pub(crate) enum TransformTrigger {
 /// Registration entry for a transform.
 ///
 /// Associates an optional feature with a trigger condition and factory.
-#[allow(dead_code)]
-pub(crate) struct FeatureTransformRegistration {
+pub(crate) struct TransformRegistration {
+    /// The transform ID this registration produces.
+    /// Used for dependency resolution - when a transform declares a required dependency,
+    /// the registry can find and create that dependency by looking up this ID.
+    pub transform_id: TransformId,
     /// The table feature this transform handles (None for core transforms).
+    #[allow(dead_code)] // Will be used for feature-specific validation
     pub feature: Option<TableFeature>,
     /// When to trigger this transform.
     pub trigger: TransformTrigger,
@@ -140,13 +150,11 @@ pub(crate) struct FeatureTransformRegistration {
 ///
 /// Transforms are selected based on trigger conditions matching the current context.
 /// The registry is a singleton - all builders share the same registry.
-#[allow(dead_code)] // Used by TransformationPipeline
 pub(crate) struct TransformRegistry {
     /// All registered transforms.
-    registrations: Vec<FeatureTransformRegistration>,
+    registrations: Vec<TransformRegistration>,
 }
 
-#[allow(dead_code)] // Methods used by TransformationPipeline
 impl TransformRegistry {
     fn new() -> Self {
         Self {
@@ -155,29 +163,37 @@ impl TransformRegistry {
     }
 
     /// Register a feature-associated transform.
-    fn register_feature(
+    ///
+    /// Use this for transforms that enable a specific Delta table feature
+    /// (e.g., DeletionVectors, ColumnMapping, DomainMetadata).
+    fn register_feature_transform(
         &mut self,
+        transform_id: TransformId,
         feature: TableFeature,
         trigger: TransformTrigger,
         factory: TransformFactory,
     ) {
-        self.registrations.push(FeatureTransformRegistration {
+        self.registrations.push(TransformRegistration {
+            transform_id,
             feature: Some(feature),
             trigger,
             factory,
         });
     }
 
-    /// Register an operation transform (not tied to a specific feature).
+    /// Register a builder transform (not tied to a specific feature).
     ///
-    /// These are transforms triggered by the operation (e.g., validation, protocol version)
-    /// rather than by enabling a specific table feature.
-    fn register_operation_transform(
+    /// Use this for transforms that are part of the table creation/modification process
+    /// but don't enable a specific table feature (e.g., validation, protocol version,
+    /// partitioning, clustering).
+    fn register_builder_transform(
         &mut self,
+        transform_id: TransformId,
         trigger: TransformTrigger,
         factory: TransformFactory,
     ) {
-        self.registrations.push(FeatureTransformRegistration {
+        self.registrations.push(TransformRegistration {
+            transform_id,
             feature: None,
             trigger,
             factory,
@@ -186,10 +202,15 @@ impl TransformRegistry {
 
     /// Select all transforms to trigger based on the current context.
     ///
+    /// This method:
+    /// 1. Selects transforms whose triggers match the context
+    /// 2. Resolves required dependencies - if a triggered transform declares
+    ///    `TransformDependency::TransformRequired(id)`, the registry automatically
+    ///    includes that dependency (even if it wasn't triggered directly)
+    ///
     /// # Arguments
     ///
     /// * `properties` - Raw properties map (for property and signal triggers)
-    /// * `schema` - Table schema (for schema type triggers)
     ///
     /// # Returns
     ///
@@ -198,11 +219,12 @@ impl TransformRegistry {
     pub(crate) fn select_transforms_to_trigger(
         &self,
         properties: &HashMap<String, String>,
-        schema: &StructType,
     ) -> DeltaResult<Vec<Box<dyn ProtocolMetadataTransform>>> {
+        let context = TransformContext::new(properties);
         let mut transforms: Vec<Box<dyn ProtocolMetadataTransform>> = Vec::new();
         let mut included_ids: HashSet<TransformId> = HashSet::new();
 
+        // Phase 1: Select transforms whose triggers match
         for registration in &self.registrations {
             let should_include = match &registration.trigger {
                 // Core transforms that always run
@@ -220,37 +242,85 @@ impl TransformRegistry {
                 // Property presence
                 TransformTrigger::Property(prop_name) => properties.contains_key(*prop_name),
 
-                // Schema type detection
-                TransformTrigger::SchemaType(check) => match check {
-                    SchemaTypeCheck::ContainsType(dtype) => schema_contains_type(schema, dtype),
-                },
+                // Schema type detection - requires schema parameter (future enhancement)
+                TransformTrigger::SchemaType(_check) => false,
 
-                // Data layout (placeholder - always false until DataLayout is added)
-                TransformTrigger::DataLayout(_kind) => {
-                    // TODO: When DataLayout is added, check:
-                    // match (kind, data_layout) {
-                    //     (DataLayoutKind::Partitioned, DataLayout::Partitioned { .. }) => true,
-                    //     (DataLayoutKind::Clustered, DataLayout::Clustered { .. }) => true,
-                    //     _ => false,
-                    // }
-                    false
-                }
+                // Data layout - requires data_layout parameter (added in partitioning commit)
+                TransformTrigger::DataLayout(_kind) => false,
             };
 
             if should_include {
-                // Create the transform and check for duplicates
-                let transform = (registration.factory)();
-                let id = transform.id();
+                // Call factory with context - it may return None if conditions aren't met
+                if let Some(transform) = (registration.factory)(&context) {
+                    let id = transform.id();
 
-                // Deduplicate: same transform may be triggered multiple ways
-                if !included_ids.contains(&id) {
-                    included_ids.insert(id);
-                    transforms.push(transform);
+                    // Deduplicate: same transform may be triggered multiple ways
+                    if !included_ids.contains(&id) {
+                        included_ids.insert(id);
+                        transforms.push(transform);
+                    }
                 }
             }
         }
 
+        // Phase 2: Resolve required dependencies
+        self.resolve_transform_dependencies(&context, &mut transforms, &mut included_ids);
+
         Ok(transforms)
+    }
+
+    /// Resolves required dependencies for the selected transforms.
+    ///
+    /// When a transform declares `TransformDependency::TransformRequired(id)`, this method
+    /// finds and creates that dependency (even if it wasn't directly triggered).
+    ///
+    /// This enables patterns like:
+    /// - `ClusteringTransform` requires `DomainMetadataTransform`
+    /// - When clustering is used, `DomainMetadataTransform` is auto-included
+    ///
+    /// The method iterates until no new dependencies are found, handling transitive dependencies.
+    fn resolve_transform_dependencies(
+        &self,
+        context: &TransformContext<'_>,
+        transforms: &mut Vec<Box<dyn ProtocolMetadataTransform>>,
+        included_ids: &mut HashSet<TransformId>,
+    ) {
+        loop {
+            let mut new_deps: Vec<TransformId> = Vec::new();
+
+            // Collect all required dependencies that aren't yet included
+            for transform in transforms.iter() {
+                for dep in transform.dependencies() {
+                    if let TransformDependency::TransformRequired(dep_id) = dep {
+                        if !included_ids.contains(&dep_id) {
+                            new_deps.push(dep_id);
+                        }
+                    }
+                }
+            }
+
+            if new_deps.is_empty() {
+                break;
+            }
+
+            // Find and create each missing dependency
+            for dep_id in new_deps {
+                if included_ids.contains(&dep_id) {
+                    continue; // Already added in this iteration
+                }
+
+                // Find the registration that produces this transform ID
+                if let Some(registration) =
+                    self.registrations.iter().find(|r| r.transform_id == dep_id)
+                {
+                    // Call factory - for dependencies, we always want to create them
+                    if let Some(transform) = (registration.factory)(context) {
+                        included_ids.insert(dep_id);
+                        transforms.push(transform);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -329,46 +399,67 @@ fn schema_contains_type(schema: &StructType, target: &DataType) -> bool {
 ///     registry
 /// }
 /// ```
-#[allow(dead_code)] // Used by TransformationPipeline
 pub(crate) static TRANSFORM_REGISTRY: LazyLock<TransformRegistry> = LazyLock::new(|| {
     let mut registry = TransformRegistry::new();
 
     // =========================================================================
-    // Operation transforms (triggered by the operation, not specific features)
+    // Builder transforms (triggered by the operation, not specific features)
     // =========================================================================
 
     // First: validate all delta.* properties are allowed
-    registry.register_operation_transform(TransformTrigger::Always, || {
-        Box::new(DeltaPropertyValidationTransform)
-    });
+    registry.register_builder_transform(
+        TransformId::DeltaPropertyValidation,
+        TransformTrigger::Always,
+        |_ctx| Some(Box::new(DeltaPropertyValidationTransform)),
+    );
 
     // Set protocol version from properties or defaults
-    registry.register_operation_transform(TransformTrigger::Always, || {
-        Box::new(ProtocolVersionTransform)
-    });
+    registry.register_builder_transform(
+        TransformId::ProtocolVersion,
+        TransformTrigger::Always,
+        |_ctx| Some(Box::new(ProtocolVersionTransform)),
+    );
 
     // =========================================================================
-    // Future: Feature-specific transforms
+    // Feature transforms
+    // =========================================================================
+
+    // DomainMetadata - enables domainMetadata writer feature
+    // Can be triggered by:
+    // 1. Explicit signal: delta.feature.domainMetadata=supported
+    // 2. Auto-included as a required dependency of ClusteringTransform
+    registry.register_feature_transform(
+        TransformId::DomainMetadata,
+        TableFeature::DomainMetadata,
+        TransformTrigger::FeatureSignal(TableFeature::DomainMetadata),
+        |_ctx| Some(Box::new(DomainMetadataTransform)),
+    );
+
+    // =========================================================================
+    // Future: Additional feature transforms
     // =========================================================================
     //
     // When implementing new features, register them here. Examples:
     //
-    // registry.register_feature(
+    // registry.register_feature_transform(
+    //     TransformId::DeletionVectors,
     //     TableFeature::DeletionVectors,
     //     TransformTrigger::Property("delta.enableDeletionVectors"),
-    //     || Box::new(DeletionVectorsTransform),
+    //     |_ctx| Some(Box::new(DeletionVectorsTransform)),
     // );
     //
-    // registry.register_feature(
+    // registry.register_feature_transform(
+    //     TransformId::ColumnMapping,
     //     TableFeature::ColumnMapping,
     //     TransformTrigger::Property("delta.columnMapping.mode"),
-    //     || Box::new(ColumnMappingTransform),
+    //     |_ctx| Some(Box::new(ColumnMappingTransform)),
     // );
     //
-    // registry.register_feature(
+    // registry.register_feature_transform(
+    //     TransformId::TimestampNtz,
     //     TableFeature::TimestampWithoutTimezone,
     //     TransformTrigger::SchemaType(SchemaTypeCheck::ContainsType(DataType::TIMESTAMP_NTZ)),
-    //     || Box::new(TimestampNtzTransform),
+    //     |_ctx| Some(Box::new(TimestampNtzTransform)),
     // );
 
     registry
@@ -383,17 +474,12 @@ mod tests {
     use super::*;
     use crate::schema::{DataType, StructField, StructType};
 
-    fn test_schema() -> StructType {
-        StructType::new_unchecked(vec![StructField::new("id", DataType::INTEGER, false)])
-    }
-
     #[test]
     fn test_always_triggers_select_core_transforms() {
         let props = HashMap::new();
-        let schema = test_schema();
 
         let transforms = TRANSFORM_REGISTRY
-            .select_transforms_to_trigger(&props, &schema)
+            .select_transforms_to_trigger(&props)
             .unwrap();
 
         // Should have validation and protocol version transforms

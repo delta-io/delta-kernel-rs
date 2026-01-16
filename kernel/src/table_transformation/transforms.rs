@@ -5,13 +5,15 @@
 //! - [`ProtocolVersionTransform`]: Sets protocol version from properties or defaults
 //! - [`DeltaPropertyValidationTransform`]: Validates `delta.*` properties are allowed
 
-use crate::table_features::{TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION};
+use crate::table_features::{
+    TableFeature, TABLE_FEATURES_MIN_READER_VERSION, TABLE_FEATURES_MIN_WRITER_VERSION,
+};
 use crate::table_properties::{MIN_READER_VERSION_PROP, MIN_WRITER_VERSION_PROP};
 use crate::{DeltaResult, Error};
 
 use crate::table_protocol_metadata_config::TableProtocolMetadataConfig;
 
-use super::{ProtocolMetadataTransform, TransformContext, TransformId};
+use super::{ProtocolMetadataTransform, TransformContext, TransformId, TransformOutput};
 
 // ============================================================================
 // ProtocolVersionTransform
@@ -32,7 +34,6 @@ use super::{ProtocolMetadataTransform, TransformContext, TransformId};
 /// The transform always runs, whether or not version properties are specified,
 /// because protocol needs a version set. If no properties, defaults to 3/7.
 #[derive(Debug)]
-#[allow(dead_code)] // Constructed by registry
 pub(crate) struct ProtocolVersionTransform;
 
 impl ProtocolMetadataTransform for ProtocolVersionTransform {
@@ -48,7 +49,7 @@ impl ProtocolMetadataTransform for ProtocolVersionTransform {
         &self,
         mut config: TableProtocolMetadataConfig,
         context: &TransformContext<'_>,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
+    ) -> DeltaResult<TransformOutput> {
         // Read version properties from context (raw user properties)
         // not from config.metadata which only has user properties (delta.* filtered)
 
@@ -105,7 +106,7 @@ impl ProtocolMetadataTransform for ProtocolVersionTransform {
         // No need to strip version properties from metadata - they were already
         // filtered out in new_base_for_create()
 
-        Ok(config)
+        Ok(TransformOutput::new(config))
     }
 }
 
@@ -125,7 +126,6 @@ impl ProtocolMetadataTransform for ProtocolVersionTransform {
 /// - `delta.minWriterVersion` - Protocol version (processed by ProtocolVersionTransform)
 /// - Non-delta properties (e.g., `myapp.version`) - passed through unmodified
 #[derive(Debug)]
-#[allow(dead_code)] // Constructed by registry
 pub(crate) struct DeltaPropertyValidationTransform;
 
 impl ProtocolMetadataTransform for DeltaPropertyValidationTransform {
@@ -193,8 +193,44 @@ impl ProtocolMetadataTransform for DeltaPropertyValidationTransform {
         &self,
         config: TableProtocolMetadataConfig,
         _context: &TransformContext<'_>,
-    ) -> DeltaResult<TableProtocolMetadataConfig> {
+    ) -> DeltaResult<TransformOutput> {
         // Validation-only transform - no modifications
-        Ok(config)
+        Ok(TransformOutput::new(config))
+    }
+}
+
+// ============================================================================
+// DomainMetadataTransform
+// ============================================================================
+
+/// Enables the DomainMetadata writer feature.
+///
+/// This transform is added as a dependency when clustering is enabled,
+/// since clustering writes domain metadata.
+#[derive(Debug)]
+pub(crate) struct DomainMetadataTransform;
+
+impl ProtocolMetadataTransform for DomainMetadataTransform {
+    fn id(&self) -> TransformId {
+        TransformId::DomainMetadata
+    }
+
+    fn name(&self) -> &'static str {
+        "DomainMetadata: enables domain metadata feature"
+    }
+
+    fn apply(
+        &self,
+        mut config: TableProtocolMetadataConfig,
+        _context: &TransformContext<'_>,
+    ) -> DeltaResult<TransformOutput> {
+        // Add DomainMetadata writer feature
+        if !config
+            .protocol
+            .has_table_feature(&TableFeature::DomainMetadata)
+        {
+            config.protocol = config.protocol.with_feature(TableFeature::DomainMetadata)?;
+        }
+        Ok(TransformOutput::new(config))
     }
 }
