@@ -441,7 +441,7 @@ impl Snapshot {
         let writer = self.create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
         let data_iter = writer.checkpoint_data(engine)?;
-        let state = data_iter.state_handle();
+        let state = data_iter.state();
         let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
         engine
             .parquet_handler()
