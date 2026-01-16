@@ -68,8 +68,9 @@ jobs:
           labels: breaking-change
       - name: On Success
         if: needs.check_if_pr_breaks_semver.outputs.check_status == 'success'
-        run: |
-          echo "Checks succeed"
+        uses: actions-ecosystem/action-remove-labels@v1
+        with:
+          labels: breaking-change
       - name: Fail On Incorrect Previous Output
         if: needs.check_if_pr_breaks_semver.outputs.check_status != 'success' && needs.check_if_pr_breaks_semver.outputs.check_status != 'failure'
         run: exit 1
