@@ -57,7 +57,7 @@
 //! let checkpoint_path = writer.checkpoint_path()?;
 //! let checkpoint_data = writer.checkpoint_data(engine)?;
 //!
-//! // Get a handle to the state before the iterator is consumed
+//! // Get a handle to the iterator state
 //! let state = checkpoint_data.state_handle();
 //!
 //! // Write the checkpoint data to the object store and collect metadata
@@ -272,7 +272,7 @@ impl CheckpointWriter {
     /// # Parameters
     /// - `engine`: Implementation of [`Engine`] apis.
     /// - `metadata`: The metadata of the written checkpoint file
-    /// - `state`: The state handle from the checkpoint data iterator
+    /// - `checkpoint_iter_state`: The state of the checkpoint data iterator
     ///
     /// # Returns: `Ok` if the checkpoint was successfully finalized
     // Internally, this method:
@@ -283,10 +283,10 @@ impl CheckpointWriter {
         self,
         engine: &dyn Engine,
         metadata: &FileMeta,
-        state: &ActionReconciliationIteratorState,
+        checkpoint_iter_state: &ActionReconciliationIteratorState,
     ) -> DeltaResult<()> {
         // Ensure the checkpoint data iterator is fully exhausted
-        if !state.is_exhausted() {
+        if !checkpoint_iter_state.is_exhausted() {
             return Err(Error::checkpoint_write(
                 "The checkpoint data iterator must be fully consumed and written to storage before calling finalize"
             ));
@@ -302,8 +302,8 @@ impl CheckpointWriter {
         let data = create_last_checkpoint_data(
             engine,
             self.version,
-            state.actions_count(),
-            state.add_actions_count(),
+            checkpoint_iter_state.actions_count(),
+            checkpoint_iter_state.add_actions_count(),
             size_in_bytes,
         );
 
