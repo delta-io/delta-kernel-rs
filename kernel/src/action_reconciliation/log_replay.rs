@@ -90,7 +90,7 @@ impl HasSelectionVector for ActionReconciliationBatch {
 ///
 /// This state is shared via `Arc` to allow callers to capture counts after the iterator
 /// is consumed (e.g., when passed to `write_parquet_file` which takes ownership).
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ActionReconciliationIteratorState {
     actions_count: AtomicI64,
     add_actions_count: AtomicI64,
@@ -134,10 +134,7 @@ impl ActionReconciliationIterator {
         }
     }
 
-    /// Get a handle to the shared state.
-    ///
-    /// This allows callers to access counts after the iterator has been consumed
-    /// (e.g., after passing ownership to `write_parquet_file`).
+    /// Get a handle to the shared state. This allows sharing of stats.
     pub fn state_handle(&self) -> Arc<ActionReconciliationIteratorState> {
         Arc::clone(&self.state)
     }
@@ -181,9 +178,7 @@ impl ActionReconciliationIterator {
 impl std::fmt::Debug for ActionReconciliationIterator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActionReconciliationIterator")
-            .field("actions_count", &self.state.actions_count())
-            .field("add_actions_count", &self.state.add_actions_count())
-            .field("is_exhausted", &self.state.is_exhausted())
+            .field("state", &self.state)
             .finish()
     }
 }
