@@ -2,7 +2,29 @@
 //!
 //! This module provides a type-safe API for creating Delta tables.
 //! Use the [`create_table`] function to get a [`CreateTableTransactionBuilder`] that can be
-//! configured before building the [`Transaction`].
+//! configured with table properties and other options before building the [`Transaction`].
+//!
+//! # Example
+//!
+//! ```rust,no_run
+//! use delta_kernel::transaction::create_table::create_table;
+//! use delta_kernel::schema::{StructType, StructField, DataType};
+//! use delta_kernel::committer::FileSystemCommitter;
+//! use std::sync::Arc;
+//! # use delta_kernel::Engine;
+//! # fn example(engine: &dyn Engine) -> delta_kernel::DeltaResult<()> {
+//!
+//! let schema = Arc::new(StructType::try_new(vec![
+//!     StructField::new("id", DataType::INTEGER, false),
+//! ])?);
+//!
+//! let result = create_table("/path/to/table", schema, "MyApp/1.0")
+//!     .with_table_properties([("delta.enableChangeDataFeed", "true")])
+//!     .build(engine, Box::new(FileSystemCommitter::new()))?
+//!     .commit(engine)?;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -91,6 +113,45 @@ impl CreateTableTransactionBuilder {
         }
     }
 
+    /// Sets table properties for the new Delta table.
+    ///
+    /// Table properties can include both Delta properties (e.g., `delta.enableChangeDataFeed`)
+    /// and custom application properties.
+    ///
+    /// This method can be called multiple times. If a property key already exists from a
+    /// previous call, the new value will overwrite the old one.
+    ///
+    /// # Arguments
+    ///
+    /// * `properties` - A map of table property names to their values
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use delta_kernel::transaction::create_table::create_table;
+    /// # use delta_kernel::schema::{StructType, DataType, StructField};
+    /// # use std::sync::Arc;
+    /// # fn example() -> delta_kernel::DeltaResult<()> {
+    /// # let schema = Arc::new(StructType::try_new(vec![StructField::new("id", DataType::INTEGER, false)])?);
+    /// let builder = create_table("/path/to/table", schema, "MyApp/1.0")
+    ///     .with_table_properties([
+    ///         ("delta.enableChangeDataFeed", "true"),
+    ///         ("myapp.version", "1.0"),
+    ///     ]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_table_properties<I, K, V>(mut self, properties: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.table_properties
+            .extend(properties.into_iter().map(|(k, v)| (k.into(), v.into())));
+        self
+    }
+
     /// Builds a [`Transaction`] that can be committed to create the table.
     ///
     /// This method performs validation:
@@ -162,13 +223,6 @@ impl CreateTableTransactionBuilder {
         // Create pre-commit snapshot from protocol/metadata
         let log_root = table_url.join("_delta_log/")?;
         let log_segment = LogSegment::for_pre_commit(log_root);
-
-        // We validate that the table properties are empty. Supported
-        // table properties for create table will be allowlisted in the future.
-        assert!(
-            metadata.configuration().is_empty(),
-            "Base create table API does not support table properties"
-        );
         let table_configuration =
             TableConfiguration::try_new(metadata, protocol, table_url, PRE_COMMIT_VERSION)?;
 
@@ -202,5 +256,44 @@ mod tests {
         assert_eq!(builder.path, "/path/to/table");
         assert_eq!(builder.engine_info, "TestApp/1.0");
         assert!(builder.table_properties.is_empty());
+    }
+
+    #[test]
+    fn test_with_table_properties() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "id",
+            DataType::INTEGER,
+            false,
+        )]));
+
+        let builder = CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0")
+            .with_table_properties([("key1", "value1")]);
+
+        assert_eq!(
+            builder.table_properties.get("key1"),
+            Some(&"value1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_with_multiple_table_properties() {
+        let schema = Arc::new(StructType::new_unchecked(vec![StructField::new(
+            "id",
+            DataType::INTEGER,
+            false,
+        )]));
+
+        let builder = CreateTableTransactionBuilder::new("/path/to/table", schema, "TestApp/1.0")
+            .with_table_properties([("key1", "value1")])
+            .with_table_properties([("key2", "value2")]);
+
+        assert_eq!(
+            builder.table_properties.get("key1"),
+            Some(&"value1".to_string())
+        );
+        assert_eq!(
+            builder.table_properties.get("key2"),
+            Some(&"value2".to_string())
+        );
     }
 }
