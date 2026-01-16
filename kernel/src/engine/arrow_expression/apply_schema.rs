@@ -5,8 +5,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 
 use crate::arrow::array::{
-    Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
+    make_array, Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
+use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::Schema as ArrowSchema;
 use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
 
@@ -18,6 +19,10 @@ use crate::schema::{ArrayType, DataType, MapType, Schema, StructField};
 // Apply a schema to an array. The array _must_ be a `StructArray`. Returns a `RecordBatch where the
 // names of fields, nullable, and metadata in the struct have been transformed to match those in
 // schema specified by `schema`
+//
+// If the struct array has top-level nulls (rows where the entire struct is null), those nulls are
+// propagated to all child columns. This allows expressions like `add.stats_parsed` to return null
+// for rows where `add` is null, rather than erroring.
 pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<RecordBatch> {
     let DataType::Struct(struct_schema) = schema else {
         return Err(Error::generic(
@@ -26,17 +31,38 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
     };
     let applied = apply_schema_to_struct(array, struct_schema)?;
     let (fields, columns, nulls) = applied.into_parts();
-    if let Some(nulls) = nulls {
-        if nulls.null_count() != 0 {
-            return Err(Error::invalid_struct_data(
-                "Top-level nulls in struct are not supported",
-            ));
+
+    // If there are top-level nulls, propagate them to each child column.
+    // This handles cases where we're extracting a struct from a nullable parent
+    // (e.g., `add.stats_parsed` where `add` can be null for non-add rows).
+    let columns = if let Some(ref struct_nulls) = nulls {
+        if struct_nulls.null_count() > 0 {
+            columns
+                .into_iter()
+                .map(|column| propagate_nulls_to_column(&column, struct_nulls))
+                .collect()
+        } else {
+            columns
         }
-    }
+    } else {
+        columns
+    };
+
     Ok(RecordBatch::try_new(
         Arc::new(ArrowSchema::new(fields)),
         columns,
     )?)
+}
+
+/// Propagate a parent null buffer to a column, combining it with the column's existing nulls.
+fn propagate_nulls_to_column(column: &ArrayRef, parent_nulls: &NullBuffer) -> ArrayRef {
+    let data = column.to_data();
+    let combined_nulls = NullBuffer::union(Some(parent_nulls), data.nulls());
+    let builder = data.into_builder().nulls(combined_nulls);
+    // SAFETY: We're only adding more nulls to an existing valid array.
+    // The union can only grow the set of NULL rows, preserving data validity.
+    let data = unsafe { builder.build_unchecked() };
+    make_array(data)
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified
