@@ -1701,3 +1701,91 @@ async fn test_invalid_files_are_skipped() -> Result<(), Box<dyn std::error::Erro
 
     Ok(())
 }
+
+/// Test that data skipping works with parsed stats from checkpoint.
+/// The parsed-stats table has 6 files with id ranges (4 from checkpoint, 2 from commits):
+/// - File 1: id 1-100, salary 50100-60000 (checkpoint)
+/// - File 2: id 101-200, salary 60100-70000 (checkpoint)
+/// - File 3: id 201-300, salary 70100-80000 (checkpoint)
+/// - File 4: id 301-400, salary 80100-90000 (checkpoint)
+/// - File 5: id 401-500, salary 90100-100000 (commit 4)
+/// - File 6: id 501-600, salary 100100-110000 (commit 5)
+#[test]
+fn data_skipping_with_parsed_stats() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let path = std::fs::canonicalize(PathBuf::from("./tests/data/parsed-stats/"))?;
+    let url = url::Url::from_directory_path(path).unwrap();
+    let engine = test_utils::create_default_engine(&url)?;
+
+    let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
+
+    // Test 1: Predicate that should skip all files (id > 700)
+    // All files have max id of 600, so no files should match
+    let predicate = Pred::gt(column_expr!("id"), Expr::literal(700i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let files_scanned: usize = scan.execute(engine.clone())?.count();
+    assert_eq!(
+        files_scanned, 0,
+        "Expected 0 files when id > 700 (all files have max id 600)"
+    );
+
+    // Test 2: Predicate that should return only first file (id < 50)
+    // Only file 1 has ids 1-100 and min < 50
+    let predicate = Pred::lt(column_expr!("id"), Expr::literal(50i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine.clone())? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 1,
+        "Expected 1 file when id < 50 (only file 1 has min id 1)"
+    );
+
+    // Test 3: Predicate using salary column (salary > 105000)
+    // Only file 6 has salary range 100100-110000, with max 110000
+    let predicate = Pred::gt(column_expr!("salary"), Expr::literal(105000i64));
+    let scan = snapshot
+        .clone()
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine.clone())? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 1,
+        "Expected 1 file when salary > 105000 (only file 6 has salary up to 110000)"
+    );
+
+    // Test 4: Predicate that matches multiple files (id > 350)
+    // Files 4, 5, 6 have ids starting from 301, 401, 501
+    let predicate = Pred::gt(column_expr!("id"), Expr::literal(350i64));
+    let scan = snapshot
+        .scan_builder()
+        .with_predicate(Arc::new(predicate))
+        .build()?;
+
+    let mut files_scanned = 0;
+    for _data in scan.execute(engine)? {
+        files_scanned += 1;
+    }
+    assert_eq!(
+        files_scanned, 3,
+        "Expected 3 files when id > 350 (files 4, 5, 6 have ids > 350)"
+    );
+
+    Ok(())
+}

@@ -6,14 +6,13 @@ use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
-use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
+use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
 use crate::transforms::{get_transform_expr, parse_partition_values};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
@@ -53,30 +52,39 @@ pub(crate) struct ScanLogReplayProcessor {
 
 impl ScanLogReplayProcessor {
     /// Create a new [`ScanLogReplayProcessor`] instance
-    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
-        // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
-        // The DataSkippingFilter and partition_filter components expect the predicate
-        // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
-        // the enum representation to the tuple format.
-        let physical_predicate = match &state_info.physical_predicate {
-            PhysicalPredicate::Some(predicate, schema) => {
-                // Valid predicate that can be used for data skipping and partition filtering
-                Some((predicate.clone(), schema.clone()))
-            }
+    ///
+    /// `checkpoint_read_schema` is the schema used to read checkpoint files, which includes
+    /// `stats_parsed` for data skipping optimization. This schema is needed both for creating
+    /// the data skipping filter (to extract stats_parsed) and for the add_transform evaluator.
+    ///
+    /// `has_compatible_stats_parsed` indicates whether the checkpoint has compatible pre-parsed
+    /// stats that can be used for coalescing in data skipping.
+    pub(crate) fn new(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        checkpoint_read_schema: SchemaRef,
+        has_compatible_stats_parsed: bool,
+    ) -> DeltaResult<Self> {
+        // Extract the predicate from StateInfo's PhysicalPredicate enum.
+        let predicate = match &state_info.physical_predicate {
+            PhysicalPredicate::Some(predicate, _) => Some(predicate.clone()),
             PhysicalPredicate::StaticSkipAll => {
                 debug_assert!(false, "StaticSkipAll case should be handled at a higher level and not reach this code");
                 None
             }
-            PhysicalPredicate::None => {
-                // No predicate provided
-                None
-            }
+            PhysicalPredicate::None => None,
         };
         Ok(Self {
-            partition_filter: physical_predicate.as_ref().map(|(e, _)| e.clone()),
-            data_skipping_filter: DataSkippingFilter::new(engine, physical_predicate),
+            partition_filter: predicate.clone(),
+            data_skipping_filter: DataSkippingFilter::new(
+                engine,
+                predicate,
+                state_info.stats_schema.clone(),
+                checkpoint_read_schema.clone(),
+                has_compatible_stats_parsed,
+            ),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
-                get_log_add_schema().clone(),
+                checkpoint_read_schema,
                 get_add_transform_expr(),
                 SCAN_ROW_DATATYPE.clone(),
             )?,
@@ -367,7 +375,7 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         // Build an initial selection vector for the batch which has had the data skipping filter
         // applied. The selection vector is further updated by the deduplication visitor to remove
         // rows that are not valid adds.
-        let selection_vector = self.build_selection_vector(actions.as_ref())?;
+        let selection_vector = self.build_selection_vector(actions.as_ref(), is_log_batch)?;
         assert_eq!(selection_vector.len(), actions.len());
 
         let mut visitor = AddRemoveDedupVisitor::new(
@@ -401,19 +409,33 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
+///
+/// `checkpoint_read_schema` is the schema used to read checkpoint files, which includes
+/// `stats_parsed` for data skipping optimization.
+///
+/// `has_compatible_stats_parsed` indicates whether the checkpoint has compatible pre-parsed
+/// stats that can be used for coalescing in data skipping.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
+    checkpoint_read_schema: SchemaRef,
+    has_compatible_stats_parsed: bool,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(engine, state_info)?.process_actions_iter(action_iter))
+    Ok(ScanLogReplayProcessor::new(
+        engine,
+        state_info,
+        checkpoint_read_schema,
+        has_compatible_stats_parsed,
+    )?
+    .process_actions_iter(action_iter))
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use crate::actions::get_commit_schema;
+    use crate::actions::{get_commit_schema, get_log_add_schema};
     use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
     use crate::scan::state::ScanFile;
@@ -488,13 +510,17 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+            stats_schema: None,
         });
+        let checkpoint_read_schema = get_log_add_schema().clone();
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
+            checkpoint_read_schema,
+            false, // has_compatible_stats_parsed
         )
         .unwrap();
         for res in iter {
@@ -515,12 +541,15 @@ mod tests {
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
+        let checkpoint_read_schema = get_log_add_schema().clone();
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            checkpoint_read_schema,
+            false, // has_compatible_stats_parsed
         )
         .unwrap();
 
@@ -599,6 +628,8 @@ mod tests {
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
+            get_log_add_schema().clone(),
+            false, // has_compatible_stats_parsed
         )
         .unwrap();
 

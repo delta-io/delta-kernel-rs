@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Deref;
@@ -23,6 +22,7 @@ use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
@@ -40,28 +40,6 @@ use crate::{
     RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
-
-// This is a workaround due to the fact that expression evaluation happens
-// on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
-// required fields.
-// TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
-// on FilteredEngineData directly.
-struct NullableStatsTransform;
-impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-        let field = match self.transform(&field.data_type)? {
-            Borrowed(_) if field.is_nullable() => Borrowed(field),
-            data_type => Owned(StructField {
-                name: field.name.clone(),
-                data_type: data_type.into_owned(),
-                nullable: true,
-                metadata: field.metadata.clone(),
-            }),
-        };
-        Some(field)
-    }
-}
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
