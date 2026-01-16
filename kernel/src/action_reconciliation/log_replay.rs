@@ -40,7 +40,8 @@ use crate::utils::require;
 use crate::{DeltaResult, Error};
 
 use std::collections::HashSet;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 /// The [`ActionReconciliationProcessor`] is an implementation of the [`LogReplayProcessor`]
 /// trait that filters log segment actions.
@@ -85,15 +86,41 @@ impl HasSelectionVector for ActionReconciliationBatch {
     }
 }
 
+/// Shared state for tracking action reconciliation iteration progress.
+///
+/// This state is shared via `Arc` to allow callers to capture counts after the iterator
+/// is consumed (e.g., when passed to `write_parquet_file` which takes ownership).
+#[derive(Default)]
+pub struct ActionReconciliationIteratorState {
+    actions_count: AtomicI64,
+    add_actions_count: AtomicI64,
+    is_exhausted: AtomicBool,
+}
+
+impl ActionReconciliationIteratorState {
+    /// Get the total number of actions processed
+    pub fn actions_count(&self) -> i64 {
+        self.actions_count.load(Ordering::Acquire)
+    }
+
+    /// Get the total number of add actions processed
+    pub fn add_actions_count(&self) -> i64 {
+        self.add_actions_count.load(Ordering::Acquire)
+    }
+
+    /// True if the iterator has been exhausted (all batches processed)
+    pub fn is_exhausted(&self) -> bool {
+        self.is_exhausted.load(Ordering::Acquire)
+    }
+}
+
 /// Iterator over action reconciliation data.
 ///
 /// This iterator yields a stream of [`FilteredEngineData`] items while, tracking action
 /// counts. Used by both checkpoint and log compaction workflows.
 pub struct ActionReconciliationIterator {
     inner: Box<dyn Iterator<Item = DeltaResult<ActionReconciliationBatch>> + Send>,
-    actions_count: i64,
-    add_actions_count: i64,
-    is_exhausted: bool,
+    state: Arc<ActionReconciliationIteratorState>,
 }
 
 impl ActionReconciliationIterator {
@@ -103,25 +130,31 @@ impl ActionReconciliationIterator {
     ) -> Self {
         Self {
             inner,
-            actions_count: 0,
-            add_actions_count: 0,
-            is_exhausted: false,
+            state: Arc::new(ActionReconciliationIteratorState::default()),
         }
+    }
+
+    /// Get a handle to the shared state.
+    ///
+    /// This allows callers to access counts after the iterator has been consumed
+    /// (e.g., after passing ownership to `write_parquet_file`).
+    pub fn state_handle(&self) -> Arc<ActionReconciliationIteratorState> {
+        Arc::clone(&self.state)
     }
 
     /// True if this iterator has been exhausted (ie all batches have been processed)
     pub(crate) fn is_exhausted(&self) -> bool {
-        self.is_exhausted
+        self.state.is_exhausted()
     }
 
     /// Get the total number of actions processed so far
     pub(crate) fn actions_count(&self) -> i64 {
-        self.actions_count
+        self.state.actions_count()
     }
 
     /// Get the total number of add actions processed so far
     pub(crate) fn add_actions_count(&self) -> i64 {
-        self.add_actions_count
+        self.state.add_actions_count()
     }
 
     /// Helper to transform a batch: update metrics and extract filtered data
@@ -130,12 +163,16 @@ impl ActionReconciliationIterator {
         batch: Option<DeltaResult<ActionReconciliationBatch>>,
     ) -> Option<DeltaResult<FilteredEngineData>> {
         let Some(batch) = batch else {
-            self.is_exhausted = true;
+            self.state.is_exhausted.store(true, Ordering::Release);
             return None;
         };
         Some(batch.map(|batch| {
-            self.actions_count += batch.actions_count;
-            self.add_actions_count += batch.add_actions_count;
+            self.state
+                .actions_count
+                .fetch_add(batch.actions_count, Ordering::Release);
+            self.state
+                .add_actions_count
+                .fetch_add(batch.add_actions_count, Ordering::Release);
             batch.filtered_data
         }))
     }
@@ -144,9 +181,9 @@ impl ActionReconciliationIterator {
 impl std::fmt::Debug for ActionReconciliationIterator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActionReconciliationIterator")
-            .field("actions_count", &self.actions_count)
-            .field("add_actions_count", &self.add_actions_count)
-            .field("is_exhausted", &self.is_exhausted)
+            .field("actions_count", &self.state.actions_count())
+            .field("add_actions_count", &self.state.add_actions_count())
+            .field("is_exhausted", &self.state.is_exhausted())
             .finish()
     }
 }
