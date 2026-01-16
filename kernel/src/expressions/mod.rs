@@ -273,14 +273,14 @@ fn fail_serialize_opaque_predicate<S>(
 where
     S: Serializer,
 {
-    Err(ser::Error::custom("Cannot serialize Opaque Expression"))
+    Err(ser::Error::custom("Cannot serialize an Opaque Predicate"))
 }
 
 fn fail_deserialize_opaque_predicate<'de, D>(_deserializer: D) -> Result<OpaquePredicate, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Err(de::Error::custom("Cannot deserialize Opaque Expression"))
+    Err(de::Error::custom("Cannot deserialize an Opaque Predicate"))
 }
 
 impl OpaquePredicate {
@@ -316,7 +316,7 @@ fn fail_serialize_opaque_expression<S>(
 where
     S: Serializer,
 {
-    Err(ser::Error::custom("Cannot serialize Opaque Expression"))
+    Err(ser::Error::custom("Cannot serialize an Opaque Expression"))
 }
 
 fn fail_deserialize_opaque_expression<'de, D>(
@@ -325,7 +325,7 @@ fn fail_deserialize_opaque_expression<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    Err(de::Error::custom("Cannot deserialize Opaque Expression"))
+    Err(de::Error::custom("Cannot deserialize an Opaque Expression"))
 }
 
 /// A transformation affecting a single field (one pieces of a [`Transform`]). The transformation
@@ -1161,6 +1161,7 @@ mod tests {
             Expression, Predicate, Scalar, Transform, UnaryExpressionOp, VariadicExpressionOp,
         };
         use crate::schema::{ArrayType, DataType, DecimalType, MapType, StructField};
+        use crate::utils::test_utils::assert_result_error_with_message;
 
         use super::assert_roundtrip;
 
@@ -1552,17 +1553,7 @@ mod tests {
 
             let expr = Expression::opaque(TestOpaqueExprOp, [Expression::literal(1)]);
             let result = serde_json::to_string(&expr);
-            assert!(
-                result.is_err(),
-                "Opaque expression serialization should fail"
-            );
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Cannot serialize Opaque Expression"),
-                "Error should mention opaque expression"
-            );
+            assert_result_error_with_message(result, "Cannot serialize an Opaque Expression");
         }
 
         #[test]
@@ -1610,17 +1601,7 @@ mod tests {
 
             let pred = Predicate::opaque(TestOpaquePredOp, [Expression::literal(1)]);
             let result = serde_json::to_string(&pred);
-            assert!(
-                result.is_err(),
-                "Opaque predicate serialization should fail"
-            );
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("Cannot serialize Opaque Expression"),
-                "Error should mention opaque expression"
-            );
+            assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
         }
     }
 }
