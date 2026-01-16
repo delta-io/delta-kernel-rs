@@ -273,7 +273,7 @@ fn fail_serialize_opaque_predicate<S>(
 where
     S: Serializer,
 {
-    Err(ser::Error::custom("Cannot serialize Opaque Expression"))
+    Err(ser::Error::custom("Cannot serialize an Opaque Expression"))
 }
 
 fn fail_deserialize_opaque_predicate<'de, D>(_deserializer: D) -> Result<OpaquePredicate, D::Error>
