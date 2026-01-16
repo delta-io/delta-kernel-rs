@@ -139,21 +139,6 @@ impl ActionReconciliationIterator {
         Arc::clone(&self.state)
     }
 
-    /// True if this iterator has been exhausted (ie all batches have been processed)
-    pub(crate) fn is_exhausted(&self) -> bool {
-        self.state.is_exhausted()
-    }
-
-    /// Get the total number of actions processed so far
-    pub(crate) fn actions_count(&self) -> i64 {
-        self.state.actions_count()
-    }
-
-    /// Get the total number of add actions processed so far
-    pub(crate) fn add_actions_count(&self) -> i64 {
-        self.state.add_actions_count()
-    }
-
     /// Helper to transform a batch: update metrics and extract filtered data
     fn transform_batch(
         &mut self,
