@@ -327,6 +327,45 @@ impl LogSegment {
         LogSegment::try_new(listed_commits, log_root, Some(end_version), None)
     }
 
+    /// Creates a new LogSegment with the given commit file added to the end.
+    /// TODO: Take in multiple commits when Kernel-RS supports txn retries and conflict rebasing.
+    #[allow(unused)]
+    pub(crate) fn new_with_commit_appended(
+        &self,
+        tail_commit_file: ParsedLogPath,
+    ) -> DeltaResult<Self> {
+        require!(
+            tail_commit_file.is_commit(),
+            Error::internal_error(format!(
+                "Cannot extend and create new LogSegment. Tail log file is not a commit file. \
+                Path: {}, Type: {:?}.",
+                tail_commit_file.location.location, tail_commit_file.file_type
+            ))
+        );
+        require!(
+            tail_commit_file.version == self.end_version + 1,
+            Error::internal_error(format!(
+                "Cannot extend and create new LogSegment. Tail commit file version ({}) does not \
+                equal LogSegment end_version ({}) + 1.",
+                tail_commit_file.version, self.end_version
+            ))
+        );
+
+        let mut new_log_segment = self.clone();
+
+        new_log_segment.end_version = tail_commit_file.version;
+        new_log_segment
+            .ascending_commit_files
+            .push(tail_commit_file.clone());
+        new_log_segment.latest_commit_file = Some(tail_commit_file.clone());
+        new_log_segment.max_published_version = match tail_commit_file.file_type {
+            LogPathFileType::Commit => Some(tail_commit_file.version),
+            _ => self.max_published_version,
+        };
+
+        Ok(new_log_segment)
+    }
+
     /// Read a stream of actions from this log segment. This returns an iterator of
     /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
     /// the data was read from a commit file (true) or a checkpoint file (false).
