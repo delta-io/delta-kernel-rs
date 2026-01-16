@@ -178,14 +178,14 @@ mod tests {
         schema: SchemaRef,
         expected: Result<Expr, ()>,
     ) {
-        let mut schema_transform = LiteralExpressionTransform::new(values);
+        let schema_transform = LiteralExpressionTransform::new(values);
         match expected {
             Ok(expected_expr) => {
-                let actual_expr = transform.transform(&schema).unwrap();
+                let actual_expr = schema_transform.transform(&schema).unwrap();
                 assert_eq!(expected_expr.to_string(), actual_expr.to_string());
             }
             Err(()) => {
-                assert!(schema_transform.try_into_expr().is_err());
+                assert!(schema_transform.transform(&schema).is_err());
             }
         }
     }
