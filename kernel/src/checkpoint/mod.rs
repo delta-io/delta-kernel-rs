@@ -1,6 +1,6 @@
 //! This module implements the API for writing single-file checkpoints.
 //!
-//! The entry point for this API is [`Snapshot::checkpoint`].
+//! The entry point for this API is [`Snapshot::create_checkpoint_writer`].
 //!
 //! ## Checkpoint Types and Selection Logic
 //! This API supports two checkpoint types, selected based on table features:
@@ -22,7 +22,7 @@
 //!
 //! The following steps outline the process of creating a checkpoint:
 //!
-//! 1. Create a [`CheckpointWriter`] using [`Snapshot::checkpoint`]
+//! 1. Create a [`CheckpointWriter`] using [`Snapshot::create_checkpoint_writer`]
 //! 2. Get the checkpoint path from [`CheckpointWriter::checkpoint_path`]
 //! 2. Get the checkpoint data from [`CheckpointWriter::checkpoint_data`]
 //! 3. Write the data to the path in object storage (engine-specific)
@@ -51,7 +51,7 @@
 //! let snapshot = Snapshot::builder_for(url).build(engine)?;
 //!
 //! // Create a checkpoint writer from the snapshot
-//! let mut writer = snapshot.checkpoint()?;
+//! let mut writer = snapshot.create_checkpoint_writer()?;
 //!
 //! // Get the checkpoint path and data
 //! let checkpoint_path = writer.checkpoint_path()?;
@@ -80,7 +80,7 @@
 //!
 //! [`CheckpointMetadata`]: crate::actions::CheckpointMetadata
 //! [`LastCheckpointHint`]: crate::last_checkpoint_hint::LastCheckpointHint
-//! [`Snapshot::checkpoint`]: crate::Snapshot::checkpoint
+//! [`Snapshot::create_checkpoint_writer`]: crate::Snapshot::create_checkpoint_writer
 // Future extensions:
 // - TODO(#837): Multi-file V2 checkpoints are not supported yet. The API is designed to be extensible for future
 //   multi-file support, but the current implementation only supports single-file checkpoints.

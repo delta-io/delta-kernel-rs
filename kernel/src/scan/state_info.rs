@@ -15,7 +15,7 @@ use crate::transforms::{FieldTransformSpec, TransformSpec};
 use crate::{DeltaResult, Error, PredicateRef, StructField};
 
 /// All the state needed to process a scan.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct StateInfo {
     /// The logical schema for this scan
     pub(crate) logical_schema: SchemaRef,

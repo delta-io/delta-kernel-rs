@@ -26,7 +26,7 @@
 //! [`EngineData`]: crate::EngineData
 
 use crate::path::LogRoot;
-use crate::{AsAny, DeltaResult, Engine, Error, FilteredEngineData, Version};
+use crate::{AsAny, DeltaResult, Engine, Error, FileMeta, FilteredEngineData, Version};
 
 use url::Url;
 
@@ -46,15 +46,22 @@ pub struct CommitMetadata {
     pub(crate) log_root: LogRoot,
     pub(crate) version: Version,
     pub(crate) in_commit_timestamp: i64,
+    pub(crate) max_published_version: Option<Version>,
     // in the future this will include Protocol, Metadata, CommitInfo, Domain Metadata, etc.
 }
 
 impl CommitMetadata {
-    pub(crate) fn new(log_root: LogRoot, version: Version, in_commit_timestamp: i64) -> Self {
+    pub(crate) fn new(
+        log_root: LogRoot,
+        version: Version,
+        in_commit_timestamp: i64,
+        max_published_version: Option<Version>,
+    ) -> Self {
         Self {
             log_root,
             version,
             in_commit_timestamp,
+            max_published_version,
         }
     }
 
@@ -85,6 +92,11 @@ impl CommitMetadata {
         self.in_commit_timestamp
     }
 
+    /// The maximum published version of the table.
+    pub fn max_published_version(&self) -> Option<Version> {
+        self.max_published_version
+    }
+
     pub fn table_root(&self) -> &Url {
         self.log_root.table_root()
     }
@@ -101,7 +113,7 @@ impl CommitMetadata {
 /// [`Transaction`]: crate::transaction::Transaction
 #[derive(Debug)]
 pub enum CommitResponse {
-    Committed { version: Version },
+    Committed { file_meta: FileMeta },
     Conflict { version: Version },
 }
 
@@ -152,14 +164,23 @@ impl Committer for FileSystemCommitter {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse> {
+        let published_commit_path = commit_metadata.published_commit_path()?;
+
         match engine.json_handler().write_json_file(
-            &commit_metadata.published_commit_path()?,
+            &published_commit_path,
             Box::new(actions),
             false,
         ) {
-            Ok(()) => Ok(CommitResponse::Committed {
-                version: commit_metadata.version,
-            }),
+            Ok(()) => {
+                // For now, we don't need the real size of the written file, so we can use 0.
+                // If we need this in the future, we can get it from StorageHandler::head.
+                let file_meta = FileMeta::new(
+                    published_commit_path,
+                    commit_metadata.in_commit_timestamp(),
+                    0,
+                );
+                Ok(CommitResponse::Committed { file_meta })
+            }
             Err(Error::FileAlreadyExists(_)) => Ok(CommitResponse::Conflict {
                 version: commit_metadata.version,
             }),
@@ -187,13 +208,16 @@ mod tests {
         let log_root = LogRoot::new(table_root).unwrap();
         let version = 42;
         let ts = 1234;
+        let max_published_version = Some(42);
 
-        let commit_metadata = CommitMetadata::new(log_root, version, ts);
+        let commit_metadata = CommitMetadata::new(log_root, version, ts, max_published_version);
 
         // version
         assert_eq!(commit_metadata.version(), 42);
         // in_commit_timestamp
         assert_eq!(commit_metadata.in_commit_timestamp(), 1234);
+        // max_published_version
+        assert_eq!(commit_metadata.max_published_version(), Some(42));
 
         // published commit path
         let published_path = commit_metadata.published_commit_path().unwrap();
@@ -257,5 +281,31 @@ mod tests {
             err,
             crate::Error::Generic(e) if e.contains("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer().")
         ));
+    }
+
+    #[tokio::test]
+    async fn test_filesystem_committer_returns_valid_commit_response() {
+        let storage = Arc::new(InMemory::new());
+        let table_root = Url::parse("memory:///").unwrap();
+        let engine = DefaultEngineBuilder::new(storage).build();
+
+        let committer = FileSystemCommitter::new();
+        let log_root = LogRoot::new(table_root).unwrap();
+        let commit_metadata = CommitMetadata::new(log_root, 1, 12345, Some(0));
+        let actions = Box::new(std::iter::empty());
+
+        let result = committer.commit(&engine, actions, commit_metadata).unwrap();
+
+        match result {
+            CommitResponse::Committed { file_meta } => {
+                assert_eq!(file_meta.last_modified, 12345);
+                assert_eq!(file_meta.size, 0);
+                assert!(file_meta
+                    .location
+                    .as_str()
+                    .ends_with("00000000000000000001.json"));
+            }
+            CommitResponse::Conflict { .. } => panic!("Expected Committed, got Conflict"),
+        }
     }
 }

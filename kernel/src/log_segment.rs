@@ -15,7 +15,7 @@ use crate::log_reader::commit::CommitReader;
 use crate::log_replay::ActionsBatch;
 use crate::metrics::{MetricEvent, MetricId, MetricsReporter};
 use crate::path::{LogPathFileType, ParsedLogPath};
-use crate::schema::{SchemaRef, StructField, StructType, ToSchema as _};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
     DeltaResult, Engine, Error, Expression, FileMeta, Predicate, PredicateRef, RowVisitor,
@@ -27,6 +27,7 @@ use delta_kernel_derive::internal_api;
 pub use crate::listed_log_files::ListedLogFiles;
 #[cfg(not(feature = "internal-api"))]
 use crate::listed_log_files::ListedLogFiles;
+use crate::schema::compare::SchemaComparison;
 
 use itertools::Itertools;
 use tracing::{debug, warn};
@@ -749,5 +750,90 @@ impl LogSegment {
             )]))
         });
         SIDECAR_SCHEMA.clone()
+    }
+
+    /// Checks if a checkpoint schema contains a usable `add.stats_parsed` field.
+    ///
+    /// This validates that:
+    /// 1. The `add.stats_parsed` field exists in the checkpoint schema
+    /// 2. The types in `stats_parsed` are compatible with the stats schema for data skipping
+    ///
+    /// The `stats_schema` parameter contains only the columns referenced in the data skipping
+    /// predicate. This is built from the predicate and passed in by the caller.
+    ///
+    /// Both the checkpoint's `stats_parsed` schema and the `stats_schema` for data skipping
+    /// use physical column names (not logical names), so direct name comparison is correct.
+    ///
+    /// Returns `false` if stats_parsed doesn't exist or has incompatible types.
+    #[allow(dead_code)]
+    fn schema_has_compatible_stats_parsed(
+        checkpoint_schema: &StructType,
+        stats_schema: &StructType,
+    ) -> bool {
+        // Get add.stats_parsed from the checkpoint schema
+        let Some(stats_parsed) = checkpoint_schema
+            .field("add")
+            .and_then(|f| match f.data_type() {
+                DataType::Struct(s) => s.field("stats_parsed"),
+                _ => None,
+            })
+        else {
+            debug!("stats_parsed not compatible: checkpoint schema does not contain add.stats_parsed field");
+            return false;
+        };
+
+        let DataType::Struct(stats_struct) = stats_parsed.data_type() else {
+            debug!(
+                "stats_parsed not compatible: add.stats_parsed field is not a Struct, got {:?}",
+                stats_parsed.data_type()
+            );
+            return false;
+        };
+
+        // Check type compatibility for both minValues and maxValues structs.
+        // While these typically have the same schema, the protocol doesn't guarantee it,
+        // so we check both to be safe.
+        for field_name in ["minValues", "maxValues"] {
+            let Some(values_field) = stats_struct.field(field_name) else {
+                // stats_parsed exists but no minValues/maxValues - unusual but valid
+                continue;
+            };
+
+            // minValues/maxValues must be a Struct containing per-column statistics.
+            // If it exists but isn't a Struct, the schema is malformed and unusable.
+            let DataType::Struct(values_struct) = values_field.data_type() else {
+                debug!(
+                    "stats_parsed not compatible: stats_parsed.{} is not a Struct, got {:?}",
+                    field_name,
+                    values_field.data_type()
+                );
+                return false;
+            };
+
+            // Check type compatibility for each column in the checkpoint's stats_parsed
+            // that also exists in the stats schema (columns needed for data skipping)
+            for checkpoint_field in values_struct.fields() {
+                if let Some(stats_field) = stats_schema.field(&checkpoint_field.name) {
+                    if checkpoint_field
+                        .data_type()
+                        .can_read_as(stats_field.data_type())
+                        .is_err()
+                    {
+                        debug!(
+                            "stats_parsed not compatible: incompatible type for column '{}' in {}: checkpoint has {:?}, stats schema has {:?}",
+                            checkpoint_field.name,
+                            field_name,
+                            checkpoint_field.data_type(),
+                            stats_field.data_type()
+                        );
+                        return false;
+                    }
+                }
+                // If column doesn't exist in stats schema, it's fine (not needed for data skipping)
+            }
+        }
+
+        debug!("Checkpoint schema has compatible stats_parsed for data skipping");
+        true
     }
 }

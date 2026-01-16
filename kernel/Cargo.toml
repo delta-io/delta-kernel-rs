@@ -59,7 +59,7 @@ z85 = "3.0.6"
 # optional deps
 futures = { version = "0.3", optional = true }
 # Used for fetching direct urls (like pre-signed urls)
-reqwest = { version = "0.12.23", default-features = false, optional = true }
+reqwest = { version = "0.13", optional = true }
 # optionally used with default engine (though not required)
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
@@ -122,10 +122,9 @@ default-engine-base = [
 ]
 # the default-engine-native-tls use the reqwest crate with default features which uses native-tls. if you want
 # to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency
-default-engine-native-tls = ["default-engine-base", "reqwest/default"]
+default-engine-native-tls = ["default-engine-base", "reqwest/native-tls"]
 default-engine-rustls = [
   "default-engine-base",
-  "reqwest/rustls-tls-native-roots",
   "reqwest/http2",
 ]
 
