@@ -151,7 +151,7 @@ pub mod history_manager;
 #[cfg(not(feature = "internal-api"))]
 pub(crate) mod history_manager;
 
-pub use action_reconciliation::ActionReconciliationIterator;
+pub use action_reconciliation::{ActionReconciliationIterator, ActionReconciliationIteratorState};
 pub use delta_kernel_derive;
 use delta_kernel_derive::internal_api;
 pub use engine_data::{EngineData, FilteredEngineData, RowVisitor};
