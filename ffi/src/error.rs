@@ -120,9 +120,11 @@ impl From<Error> for KernelError {
             Error::Unsupported(_) => KernelError::UnsupportedError,
             Error::ParseIntervalError(_) => KernelError::ParseIntervalError,
             Error::ChangeDataFeedUnsupported(_) => KernelError::ChangeDataFeedUnsupported,
-            Error::ChangeDataFeedIncompatibleSchema(_, _) => {
-                KernelError::ChangeDataFeedIncompatibleSchema
-            }
+            Error::ChangeDataFeedIncompatibleSchema {
+                version: _,
+                expected: _,
+                actual: _,
+            } => KernelError::ChangeDataFeedIncompatibleSchema,
             Error::InvalidCheckpoint(_) => KernelError::InvalidCheckpoint,
             Error::LiteralExpressionTransformError(_) => {
                 KernelError::LiteralExpressionTransformError
