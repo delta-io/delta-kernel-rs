@@ -189,6 +189,53 @@ impl Committer for FileSystemCommitter {
     }
 }
 
+/// Marker trait to pass arbitrary context to the StagedCommitter.
+pub trait Context: std::fmt::Debug + AsAny {}
+
+#[derive(Debug)]
+pub struct StagedCommitter {
+    catalog_committer: Box<dyn CatalogCommitter>,
+    context: Box<dyn Context>,
+}
+
+impl StagedCommitter {
+    pub fn new(catalog_committer: Box<dyn CatalogCommitter>, context: Box<dyn Context>) -> Self {
+        Self {
+            catalog_committer,
+            context,
+        }
+    }
+}
+
+pub trait CatalogCommitter: Send + AsAny + std::fmt::Debug {
+    fn commit_request(
+        &self,
+        engine: &dyn Engine,
+        staged_commit_path: &Url,
+        context: &dyn Context,
+    ) -> DeltaResult<CommitResponse>;
+}
+
+impl Committer for StagedCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let staged_commit_path = commit_metadata.staged_commit_path()?;
+        engine
+            .json_handler()
+            .write_json_file(&staged_commit_path, Box::new(actions), false)?;
+
+        let committed = engine.storage_handler().head(&staged_commit_path)?;
+        tracing::debug!("wrote staged commit file: {:?}", committed);
+
+        self.catalog_committer
+            .commit_request(engine, &staged_commit_path, self.context.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
