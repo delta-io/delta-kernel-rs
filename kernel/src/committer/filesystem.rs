@@ -3,6 +3,7 @@
 use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData};
 
 use super::commit_types::{CommitMetadata, CommitResponse};
+use super::publish::{PublishMetadata, PublishResult};
 use super::Committer;
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which
@@ -48,6 +49,18 @@ impl Committer for FileSystemCommitter {
             }),
             Err(e) => Err(e),
         }
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        false
+    }
+
+    fn publish(
+        &self,
+        _engine: &dyn Engine,
+        _publish_metadata: PublishMetadata,
+    ) -> DeltaResult<PublishResult> {
+        Ok(PublishResult::NotApplicable)
     }
 }
 

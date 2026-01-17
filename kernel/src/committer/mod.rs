@@ -27,9 +27,11 @@
 
 mod commit_types;
 mod filesystem;
+mod publish;
 
 pub use commit_types::{CommitMetadata, CommitResponse};
 pub use filesystem::FileSystemCommitter;
+pub use publish::{CatalogCommit, PublishMetadata, PublishResult};
 
 use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 
@@ -57,4 +59,48 @@ pub trait Committer: Send + AsAny {
         actions: Box<dyn Iterator<Item = DeltaResult<FilteredEngineData>> + Send + '_>,
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
+
+    fn is_catalog_committer(&self) -> bool;
+
+    /// Publishes catalog commits to the Delta log. Applicable only to catalog-managed tables.
+    ///
+    /// Publishing is the act of copying ratified catalog commits to the Delta log as published
+    /// Delta files (e.g., `_delta_log/00000000000000000001.json`).
+    ///
+    /// # When to call
+    ///
+    /// This method should only be called on catalog committers (i.e., when
+    /// [`is_catalog_committer`] returns `true`). Callers should check this before invoking
+    /// `publish`. Calling `publish` on a non-catalog committer like [`FileSystemCommitter`]
+    /// returns [`PublishResult::NotApplicable`] but is considered a misuse of the API.
+    ///
+    /// # Benefits
+    ///
+    /// - Reduces the number of commits the catalog needs to store internally and serve to readers
+    /// - Enables table maintenance operations that must operate on published versions only, such
+    ///   as checkpointing and log compaction
+    ///
+    /// # Requirements
+    ///
+    /// - This method must ensure that all catalog commits are published to the Delta log up to and
+    ///   including the snapshot version specified in [`PublishMetadata`]
+    /// - Commits must be published in order: version V-1 must be published before version V
+    ///
+    /// # Catalog-specific semantics
+    ///
+    /// Each catalog implementation may specify its own rules and semantics for publishing,
+    /// including whether it expects to be notified immediately upon publishing success, whether
+    /// published commits must appear with PUT-if-absent semantics in the Delta log, and whether
+    /// publishing happens in the client-side or server-side catalog component.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the publish operation fails.
+    ///
+    /// [`is_catalog_committer`]: Committer::is_catalog_committer
+    fn publish(
+        &self,
+        engine: &dyn Engine,
+        publish_metadata: PublishMetadata,
+    ) -> DeltaResult<PublishResult>;
 }
