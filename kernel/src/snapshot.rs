@@ -384,6 +384,33 @@ impl Snapshot {
         CheckpointWriter::try_new(self)
     }
 
+    /// Performs a complete checkpoint of this snapshot using the provided engine.
+    ///
+    /// Writes a checkpoint parquet file and the `_last_checkpoint` file.
+    ///
+    /// Note: This function uses [`crate::ParquetHandler::write_parquet_file`] and
+    /// [`crate::StorageHandler::head`], which may not be implemented by all engines
+    /// (e.g., `SyncEngine`).
+    ///
+    /// Note (default engine): **do not** use `TokioBackgroundExecutor` for this operation; nested
+    /// `block_on` **will deadlock**. Use a multi-threaded Tokio task executor instead (e.g.
+    /// `TokioMultiThreadExecutor`). See [issue #1605](https://github.com/delta-io/delta-kernel-rs/issues/1605).
+    pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
+        let writer = self.create_checkpoint_writer()?;
+        let checkpoint_path = writer.checkpoint_path()?;
+        let data_iter = writer.checkpoint_data(engine)?;
+        let state = data_iter.state();
+        let lazy_data = data_iter.map(|r| r.and_then(|f| f.apply_selection_vector()));
+        engine
+            .parquet_handler()
+            .write_parquet_file(checkpoint_path.clone(), Box::new(lazy_data))?;
+
+        let file_meta = engine.storage_handler().head(&checkpoint_path)?;
+
+        // Finalize the checkpoint (writes `_last_checkpoint` file).
+        writer.finalize(engine, &file_meta, &state)
+    }
+
     /// Creates a [`LogCompactionWriter`] for generating a log compaction file.
     ///
     /// Log compaction aggregates commit files in a version range into a single compacted file,
