@@ -53,6 +53,11 @@ use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 // Committer then we can remove this bound and possibly just do an alias like CommitterRef =
 // Arc<dyn Committer + Send>.
 pub trait Committer: Send + AsAny {
+    /// Commits actions to the table at the version specified in [`CommitMetadata`].
+    ///
+    /// Implementations must ensure that actions are committed atomically and either:
+    /// 1. Persisted directly to object storage as published deltas (for filesystem-based tables), or
+    /// 2. Persisted as per the managing catalog's semantics (for catalog-managed tables)
     fn commit(
         &self,
         engine: &dyn Engine,
@@ -60,6 +65,7 @@ pub trait Committer: Send + AsAny {
         commit_metadata: CommitMetadata,
     ) -> DeltaResult<CommitResponse>;
 
+    /// Returns `true` if this committer is for a catalog-managed table, else `false`.
     fn is_catalog_committer(&self) -> bool;
 
     /// Publishes catalog commits to the Delta log. Applicable only to catalog-managed tables.
