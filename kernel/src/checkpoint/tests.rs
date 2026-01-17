@@ -12,6 +12,7 @@ use crate::arrow::{
 };
 use crate::checkpoint::create_last_checkpoint_data;
 use crate::engine::arrow_data::ArrowEngineData;
+use crate::engine::default::executor::tokio::TokioMultiThreadExecutor;
 use crate::engine::default::DefaultEngineBuilder;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{DataType as KernelDataType, StructField, StructType};
@@ -324,7 +325,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    writer.finalize(&engine, &metadata, &data_iter.state())?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
@@ -391,7 +392,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    writer.finalize(&engine, &metadata, &data_iter.state())?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
@@ -433,7 +434,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 
     // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
     let err = writer
-        .finalize(&engine, &metadata, data_iter)
+        .finalize(&engine, &metadata, &data_iter.state())
         .expect_err("finalize should fail");
     assert!(
         err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
@@ -508,7 +509,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    writer.finalize(&engine, &metadata, &data_iter.state())?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
@@ -559,5 +560,107 @@ async fn test_no_checkpoint_staged_commits() -> DeltaResult<()> {
         snapshot.create_checkpoint_writer().unwrap_err(),
         crate::Error::Generic(e) if e == "Found staged commit file in log segment"
     ));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_checkpoint() -> DeltaResult<()> {
+    let (store, _) = new_in_memory_store();
+    let executor = Arc::new(TokioMultiThreadExecutor::new(
+        tokio::runtime::Handle::current(),
+    ));
+    let engine = DefaultEngineBuilder::new(store.clone())
+        .with_task_executor(executor)
+        .build();
+
+    // Version 0: metadata & protocol
+    write_commit_to_store(
+        &store,
+        vec![create_metadata_action(), create_basic_protocol_action()],
+        0,
+    )
+    .await?;
+
+    // Version 1: add 3 files
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file1.parquet"),
+            create_add_action("file2.parquet"),
+            create_add_action("file3.parquet"),
+        ],
+        1,
+    )
+    .await?;
+
+    // Version 2: add 2 more files, remove 1
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file4.parquet"),
+            create_add_action("file5.parquet"),
+            create_remove_action("file1.parquet"),
+        ],
+        2,
+    )
+    .await?;
+
+    // Version 3: add 1 file, remove 2
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file6.parquet"),
+            create_remove_action("file2.parquet"),
+            create_remove_action("file3.parquet"),
+        ],
+        3,
+    )
+    .await?;
+
+    // Version 4: add 2 files
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file7.parquet"),
+            create_add_action("file8.parquet"),
+        ],
+        4,
+    )
+    .await?;
+
+    let table_root = Url::parse("memory:///")?;
+    let snapshot = Snapshot::builder_for(table_root.clone()).build(&engine)?;
+
+    snapshot.checkpoint(&engine)?;
+
+    // First checkpoint: 1 metadata + 1 protocol + 5 add + 3 remove = 10, numOfAddFiles = 5
+    let checkpoint_path = Path::from("_delta_log/00000000000000000004.checkpoint.parquet");
+    let checkpoint_size = store.head(&checkpoint_path).await?.size;
+    assert_last_checkpoint_contents(&store, 4, 10, 5, checkpoint_size).await?;
+
+    // Version 5: add 2 files, remove 1
+    write_commit_to_store(
+        &store,
+        vec![
+            create_add_action("file9.parquet"),
+            create_add_action("file10.parquet"),
+            create_remove_action("file4.parquet"),
+        ],
+        5,
+    )
+    .await?;
+
+    // Version 6: add 1 file
+    write_commit_to_store(&store, vec![create_add_action("file11.parquet")], 6).await?;
+
+    let snapshot = Snapshot::builder_for(table_root).build(&engine)?;
+
+    snapshot.checkpoint(&engine)?;
+
+    // Second checkpoint: 1 metadata + 1 protocol + 7 add + 4 remove = 13, numOfAddFiles = 7
+    let checkpoint_path = Path::from("_delta_log/00000000000000000006.checkpoint.parquet");
+    let checkpoint_size = store.head(&checkpoint_path).await?.size;
+    assert_last_checkpoint_contents(&store, 6, 13, 7, checkpoint_size).await?;
+
     Ok(())
 }
