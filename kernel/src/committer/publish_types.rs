@@ -31,7 +31,7 @@ impl CatalogCommit {
         require!(
             catalog_commit.file_type == LogPathFileType::StagedCommit,
             Error::Generic(format!(
-                "Cannot construct CatalogCommit. Expected a staged commit, got {:?}",
+                "Cannot construct CatalogCommit. Expected a StagedCommit, got {:?}",
                 catalog_commit.file_type
             ))
         );
@@ -167,23 +167,86 @@ pub enum PublishResult {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_catalog_commit_construction_with_valid_staged_commit() {}
+    use super::*;
+    use crate::utils::test_utils::assert_result_error_with_message;
+
+    fn log_root() -> LogRoot {
+        let table_root = Url::parse("memory:///").unwrap();
+        LogRoot::new(table_root).unwrap()
+    }
 
     #[test]
-    fn test_catalog_commit_construction_rejects_non_staged_commit() {}
+    fn test_catalog_commit_construction_with_valid_staged_commit() {
+        let log_root = log_root();
+        let parsed_staged_commit =
+            ParsedLogPath::create_parsed_staged_commit(log_root.table_root(), 10);
+        let catalog_commit = CatalogCommit::new(&log_root, &parsed_staged_commit).unwrap();
+        assert_eq!(catalog_commit.version(), 10);
+        assert!(catalog_commit
+            .location()
+            .as_str()
+            .starts_with("memory:///_delta_log/_staged_commits/00000000000000000010"));
+        assert_eq!(
+            catalog_commit.published_location().as_str(),
+            "memory:///_delta_log/00000000000000000010.json"
+        );
+    }
 
     #[test]
-    fn test_publish_metadata_construction_with_valid_catalog_commits() {}
+    fn test_catalog_commit_construction_rejects_non_staged_commit() {
+        let log_root = log_root();
+        let parsed_commit =
+            ParsedLogPath::create_parsed_published_commit(log_root.table_root(), 10);
+
+        assert_result_error_with_message(
+            CatalogCommit::new(&log_root, &parsed_commit),
+            "Cannot construct CatalogCommit. Expected a StagedCommit, got Commit"
+        )
+    }
+
+    fn create_catalog_commits(versions: &[Version]) -> Vec<CatalogCommit> {
+        let log_root = log_root();
+        versions
+            .iter()
+            .map(|v| {
+                let parsed_staged_commit =
+                    ParsedLogPath::create_parsed_staged_commit(log_root.table_root(), *v);
+                CatalogCommit::new(&log_root, &parsed_staged_commit).unwrap()
+            })
+            .collect()
+    }
 
     #[test]
-    fn test_publish_metadata_construction_rejects_empty_catalog_commits() {}
+    fn test_publish_metadata_construction_with_valid_catalog_commits() {
+        let catalog_commits = create_catalog_commits(&[10, 11, 12]);
+        let publish_metadata = PublishMetadata::new(12, catalog_commits).unwrap();
+        assert_eq!(publish_metadata.snapshot_version(), 12);
+        assert_eq!(publish_metadata.ascending_catalog_commits().len(), 3);
+    }
 
     #[test]
-    fn test_publish_metadata_construction_rejects_non_contiguous_catalog_commits() {}
+    fn test_publish_metadata_construction_rejects_empty_catalog_commits() {
+        assert_result_error_with_message(
+            PublishMetadata::new(12, vec![]),
+            "Catalog commits are empty, expected snapshot version 12"
+        )
+    }
 
     #[test]
-    fn test_publish_metadata_construction_rejects_catalog_commits_not_ending_with_snapshot_version()
-    {
+    fn test_publish_metadata_construction_rejects_non_contiguous_catalog_commits() {
+        let catalog_commits = create_catalog_commits(&[10, 12]);
+        assert_result_error_with_message(
+            PublishMetadata::new(12, catalog_commits),
+            "Catalog commits must be contiguous: got versions [10, 12]"
+        )
+    }
+
+    #[test]
+    fn test_publish_metadata_construction_rejects_catalog_commits_not_ending_with_snapshot_version() {
+        let catalog_commits = create_catalog_commits(&[10, 11]);
+        assert_result_error_with_message(
+            PublishMetadata::new(12, catalog_commits),
+            "Catalog commits must end with snapshot version 12, but got 11"
+        )
     }
 }
