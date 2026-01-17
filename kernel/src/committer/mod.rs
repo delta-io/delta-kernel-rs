@@ -27,11 +27,11 @@
 
 mod commit_types;
 mod filesystem;
-mod publish;
+mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitResponse};
 pub use filesystem::FileSystemCommitter;
-pub use publish::{CatalogCommit, PublishMetadata, PublishResult};
+pub use publish_types::{CatalogCommit, PublishMetadata, PublishResult};
 
 use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 
