@@ -74,6 +74,7 @@ async fn try_main() -> DeltaResult<()> {
     let checkpoint_path = writer.checkpoint_path()?;
     // this gives us a iterator of `FilteredEngineData` that needs to be written to the file
     let mut data_iter = writer.checkpoint_data(&engine)?;
+    let state = data_iter.state();
 
     let batch_iter = data_iter.by_ref();
     // we'll use the first batch to determine the schema
@@ -107,7 +108,7 @@ async fn try_main() -> DeltaResult<()> {
         };
         // It's important to call `finalize` on the writer, which will create a `_last_checkpoint`
         // file
-        writer.finalize(&engine, &file_meta, data_iter)?;
+        writer.finalize(&engine, &file_meta, &state)?;
         println!("Table checkpointed");
     } else {
         println!("--unsafe-i-know-what-im-doing not specified, just doing a dry run");

@@ -324,7 +324,7 @@ async fn test_v1_checkpoint_latest_version_by_default() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    writer.finalize(&engine, &metadata, &data_iter.state())?;
     // Asserts the checkpoint file contents:
     // - version: latest version (2)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action
@@ -391,7 +391,7 @@ async fn test_v1_checkpoint_specific_version() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    writer.finalize(&engine, &metadata, &data_iter.state())?;
     // Asserts the checkpoint file contents:
     // - version: specified version (0)
     // - size: 1 metadata + 1 protocol
@@ -433,7 +433,7 @@ async fn test_finalize_errors_if_checkpoint_data_iterator_is_not_exhausted() -> 
 
     // Attempt to finalize the checkpoint with an iterator that has not been fully consumed
     let err = writer
-        .finalize(&engine, &metadata, data_iter)
+        .finalize(&engine, &metadata, &data_iter.state())
         .expect_err("finalize should fail");
     assert!(
         err.to_string().contains("Error writing checkpoint: The checkpoint data iterator must be fully consumed and written to storage before calling finalize")
@@ -508,7 +508,7 @@ async fn test_v2_checkpoint_supported_table() -> DeltaResult<()> {
         last_modified: 0,
         size: size_in_bytes,
     };
-    writer.finalize(&engine, &metadata, data_iter)?;
+    writer.finalize(&engine, &metadata, &data_iter.state())?;
     // Asserts the checkpoint file contents:
     // - version: latest version (1)
     // - size: 1 metadata + 1 protocol + 1 add action + 1 remove action + 1 checkpointMetadata
