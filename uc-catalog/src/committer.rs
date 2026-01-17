@@ -101,7 +101,25 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         true
     }
 
-    fn publish(&self, _engine: &dyn Engine, _publish_metadata: PublishMetadata) -> DeltaResult<()> {
-        todo!("implement publish")
+    fn publish(
+        &self,
+        engine: &dyn Engine,
+        publish_metadata: PublishMetadata,
+    ) -> DeltaResult<()> {
+        if publish_metadata.ascending_catalog_commits().is_empty() {
+            return Ok(());
+        }
+
+        for catalog_commit in publish_metadata.ascending_catalog_commits() {
+            let src = catalog_commit.location();
+            let dest = catalog_commit.published_location();
+            match engine.storage_handler().copy_atomic(src, dest) {
+                Ok(_) => (),
+                Err(DeltaError::FileAlreadyExists(_)) => (),
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
     }
 }
