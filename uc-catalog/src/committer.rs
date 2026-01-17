@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer};
+use delta_kernel::committer::{
+    CommitMetadata, CommitResponse, Committer, PublishMetadata, PublishResult,
+};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use uc_client::models::commits::{Commit, CommitRequest};
 use uc_client::UCCommitsClient;
@@ -95,5 +97,17 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         Ok(CommitResponse::Committed {
             file_meta: committed,
         })
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        true
+    }
+
+    fn publish(
+        &self,
+        _engine: &dyn Engine,
+        _publish_metadata: PublishMetadata,
+    ) -> DeltaResult<PublishResult> {
+        todo!("implement publish")
     }
 }
