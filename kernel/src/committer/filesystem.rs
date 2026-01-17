@@ -2,7 +2,7 @@
 
 use crate::{DeltaResult, Engine, Error, FileMeta, FilteredEngineData};
 
-use super::metadata::{CommitMetadata, CommitResponse};
+use super::commit_types::{CommitMetadata, CommitResponse};
 use super::Committer;
 
 /// The `FileSystemCommitter` is an internal implementation of the `Committer` trait which

@@ -26,10 +26,10 @@
 //! [`EngineData`]: crate::EngineData
 
 mod filesystem;
-mod metadata;
+mod commit_types;
 
 pub use filesystem::FileSystemCommitter;
-pub use metadata::{CommitMetadata, CommitResponse};
+pub use commit_types::{CommitMetadata, CommitResponse};
 
 use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 
