@@ -22,9 +22,8 @@ pub struct CatalogCommit {
     published_location: Url,
 }
 
-#[allow(dead_code)] // pub(crate) constructor will be used in future PRs
 impl CatalogCommit {
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         log_root: &Url,
         catalog_commit: &ParsedLogPath<FileMeta>,
     ) -> DeltaResult<Self> {
@@ -60,6 +59,18 @@ impl CatalogCommit {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+impl CatalogCommit {
+    /// Creates a new `CatalogCommit` with explicit locations. Test-only.
+    pub fn new(version: Version, location: Url, published_location: Url) -> Self {
+        Self {
+            version,
+            location,
+            published_location,
+        }
+    }
+}
+
 /// Metadata required for publishing catalog commits to the Delta log.
 ///
 /// `PublishMetadata` bundles all the information needed to publish catalog commits: the version up
@@ -80,8 +91,8 @@ pub struct PublishMetadata {
     commits_to_publish: Vec<CatalogCommit>,
 }
 
-#[allow(dead_code)] // pub(crate) constructor will be used in future PRs
 impl PublishMetadata {
+    /// Creates a new `PublishMetadata` with the given publish to version and catalog commits.
     pub(crate) fn new(
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
@@ -150,9 +161,9 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_commit_construction_with_valid_staged_commit() {
+    fn test_catalog_commit_try_new_with_valid_staged_commit() {
         let parsed_staged_commit = ParsedLogPath::create_parsed_staged_commit(&table_root(), 10);
-        let catalog_commit = CatalogCommit::new(&log_root(), &parsed_staged_commit).unwrap();
+        let catalog_commit = CatalogCommit::try_new(&log_root(), &parsed_staged_commit).unwrap();
         assert_eq!(catalog_commit.version(), 10);
         assert!(catalog_commit
             .location()
@@ -165,11 +176,11 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_commit_construction_rejects_non_staged_commit() {
+    fn test_catalog_commit_try_new_rejects_non_staged_commit() {
         let parsed_commit = ParsedLogPath::create_parsed_published_commit(&table_root(), 10);
 
         assert_result_error_with_message(
-            CatalogCommit::new(&log_root(), &parsed_commit),
+            CatalogCommit::try_new(&log_root(), &parsed_commit),
             "Cannot construct CatalogCommit. Expected a StagedCommit, got Commit",
         )
     }
@@ -182,7 +193,7 @@ mod tests {
             .map(|v| {
                 let parsed_staged_commit =
                     ParsedLogPath::create_parsed_staged_commit(&table_root, *v);
-                CatalogCommit::new(&log_root, &parsed_staged_commit).unwrap()
+                CatalogCommit::try_new(&log_root, &parsed_staged_commit).unwrap()
             })
             .collect()
     }
