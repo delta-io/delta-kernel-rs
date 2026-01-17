@@ -213,8 +213,8 @@ impl ScanLogReplayProcessor {
         state: SerializableScanState,
     ) -> DeltaResult<Arc<Self>> {
         // Deserialize internal state from json
-        let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
-            .map_err(|e| Error::generic(format!("Failed to deserialize internal state: {}", e)))?;
+        let internal_state: InternalScanState =
+            serde_json::from_slice(&state.internal_state_blob).map_err(Error::MalformedJson)?;
 
         // Reconstruct PhysicalPredicate from predicate and predicate schema
         let physical_predicate = match state.predicate {
@@ -502,7 +502,9 @@ impl ParallelLogReplayProcessor for ScanLogReplayProcessor {
     // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
     // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
     // performed to this function probably also need to be applied to the other copy of the
-    // function. The copy occurs due to the different required mutability in self.
+    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
+    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
+    // cannot easily be unified.
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,
@@ -546,9 +548,11 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
     type Output = ScanMetadata;
 
     // WARNING: This function performs all the same operations as [`<ScanLogReplayProcessor as
-    // ParallelLogReplayProcessor>::process_actions_batch`]! (See trait impl block above) Any
-    // changes performed to this function probably also need to be applied to the other copy of the
-    // function. The copy occurs due to the different required mutability in self.
+    // LogReplayProcessor>::process_actions_batch`]! (See trait impl block below) Any changes
+    // performed to this function probably also need to be applied to the other copy of the
+    // function. The copy exists because [`LogReplayProcessor`] requires a `&mut self`, while
+    // [`ParallelLogReplayProcessor`] requires `&self`. Presently, the different in mutabilities
+    // cannot easily be unified.
     fn process_actions_batch(&mut self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
         let ActionsBatch {
             actions,

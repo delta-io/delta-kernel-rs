@@ -218,7 +218,7 @@ where
     type Output = T::Output;
 
     fn process_actions_batch(&self, actions_batch: ActionsBatch) -> DeltaResult<Self::Output> {
-        self.as_ref().process_actions_batch(actions_batch)
+        T::process_actions_batch(&self, actions_batch)
     }
 }
 

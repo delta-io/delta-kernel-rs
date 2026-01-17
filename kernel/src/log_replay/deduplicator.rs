@@ -21,7 +21,7 @@ pub(crate) trait Deduplicator {
     /// Extracts a file action key from the data. Returns `(key, is_add)` if found.
     ///
     /// TODO: Remove the skip_removes field in the future. The caller is responsible for using the
-    /// correct Deduplicator instance depeding on whether the batch belongs to a commit or to a
+    /// correct Deduplicator instance depending on whether the batch belongs to a commit or to a
     /// checkpoint.
     fn extract_file_action<'a>(
         &self,
