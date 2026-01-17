@@ -211,6 +211,65 @@ pub enum Error {
     /// Schema mismatch has occurred or invalid schema used somewhere
     #[error("Schema error: {0}")]
     Schema(String),
+
+    /// Error during table creation
+    #[error("Create table error: {0}")]
+    CreateTable(#[from] CreateTableError),
+}
+
+/// Errors that can occur during table creation
+#[derive(Debug, thiserror::Error)]
+pub enum CreateTableError {
+    /// Table already exists at the specified path
+    #[error("Table already exists at path: {path}")]
+    TableAlreadyExists { path: String },
+
+    /// Schema cannot be empty
+    #[error("Schema cannot be empty")]
+    EmptySchema,
+
+    /// Invalid protocol property (e.g., invalid version format or unsupported version)
+    #[error("Invalid protocol property '{property}': {reason}")]
+    InvalidProtocolProperty { property: String, reason: String },
+
+    /// Invalid partition or clustering column configuration
+    #[error("Invalid {layout_type} column '{column}': {reason}")]
+    InvalidLayoutColumn {
+        layout_type: &'static str,
+        column: String,
+        reason: String,
+    },
+}
+
+impl CreateTableError {
+    pub fn table_already_exists(path: impl ToString) -> Self {
+        Self::TableAlreadyExists {
+            path: path.to_string(),
+        }
+    }
+
+    pub fn invalid_protocol_property(property: impl ToString, reason: impl ToString) -> Self {
+        Self::InvalidProtocolProperty {
+            property: property.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn invalid_partition_column(column: impl ToString, reason: impl ToString) -> Self {
+        Self::InvalidLayoutColumn {
+            layout_type: "partition",
+            column: column.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn invalid_clustering_column(column: impl ToString, reason: impl ToString) -> Self {
+        Self::InvalidLayoutColumn {
+            layout_type: "clustering",
+            column: column.to_string(),
+            reason: reason.to_string(),
+        }
+    }
 }
 
 // Convenience constructors for Error types that take a String argument
@@ -294,6 +353,10 @@ impl Error {
 
     pub fn schema(msg: impl ToString) -> Self {
         Self::Schema(msg.to_string())
+    }
+
+    pub fn create_table(err: CreateTableError) -> Self {
+        Self::CreateTable(err)
     }
 
     // Capture a backtrace when the error is constructed.

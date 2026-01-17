@@ -20,6 +20,11 @@ use crate::{Error, Version};
 
 use strum::EnumString;
 
+/// Table property key for specifying the minimum reader protocol version.
+pub const MIN_READER_VERSION_PROP: &str = "delta.minReaderVersion";
+/// Table property key for specifying the minimum writer protocol version.
+pub const MIN_WRITER_VERSION_PROP: &str = "delta.minWriterVersion";
+
 mod deserialize;
 pub use deserialize::ParseIntervalError;
 
