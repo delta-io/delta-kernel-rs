@@ -25,11 +25,11 @@
 //! [`log_tail`]: crate::snapshot::SnapshotBuilder::with_log_tail
 //! [`EngineData`]: crate::EngineData
 
-mod filesystem;
 mod commit_types;
+mod filesystem;
 
-pub use filesystem::FileSystemCommitter;
 pub use commit_types::{CommitMetadata, CommitResponse};
+pub use filesystem::FileSystemCommitter;
 
 use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 
