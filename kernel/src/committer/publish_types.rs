@@ -200,7 +200,7 @@ mod tests {
 
         assert_result_error_with_message(
             CatalogCommit::new(&log_root, &parsed_commit),
-            "Cannot construct CatalogCommit. Expected a StagedCommit, got Commit"
+            "Cannot construct CatalogCommit. Expected a StagedCommit, got Commit",
         )
     }
 
@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_metadata_construction_with_valid_catalog_commits() {
+    fn test_publish_metadata_construction_with_valid_commits() {
         let catalog_commits = create_catalog_commits(&[10, 11, 12]);
         let publish_metadata = PublishMetadata::new(12, catalog_commits).unwrap();
         assert_eq!(publish_metadata.snapshot_version(), 12);
@@ -225,28 +225,28 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_metadata_construction_rejects_empty_catalog_commits() {
+    fn test_publish_metadata_construction_rejects_empty_commits() {
         assert_result_error_with_message(
             PublishMetadata::new(12, vec![]),
-            "Catalog commits are empty, expected snapshot version 12"
+            "Catalog commits are empty, expected snapshot version 12",
         )
     }
 
     #[test]
-    fn test_publish_metadata_construction_rejects_non_contiguous_catalog_commits() {
+    fn test_publish_metadata_construction_rejects_non_contiguous_commits() {
         let catalog_commits = create_catalog_commits(&[10, 12]);
         assert_result_error_with_message(
             PublishMetadata::new(12, catalog_commits),
-            "Catalog commits must be contiguous: got versions [10, 12]"
+            "Catalog commits must be contiguous: got versions [10, 12]",
         )
     }
 
     #[test]
-    fn test_publish_metadata_construction_rejects_catalog_commits_not_ending_with_snapshot_version() {
+    fn test_publish_metadata_construction_rejects_commits_not_ending_with_snapshot_version() {
         let catalog_commits = create_catalog_commits(&[10, 11]);
         assert_result_error_with_message(
             PublishMetadata::new(12, catalog_commits),
-            "Catalog commits must end with snapshot version 12, but got 11"
+            "Catalog commits must end with snapshot version 12, but got 11",
         )
     }
 }
