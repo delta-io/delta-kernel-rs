@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::read_to_string;
 use std::fs::{create_dir_all, write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -93,7 +94,83 @@ async fn try_main() -> DeltaResult<()> {
         .with_engine_info("default_engine/write-table-example")
         .with_data_change(true);
 
-    // Write the data using the engine
+    // DEMONSTRATION: Query which statistics to collect
+    // The transaction provides two ways to determine which columns need statistics:
+
+    // 1. Get the full stats schema (useful for schema-aware engines)
+    let stats_schema = txn.stats_schema();
+    println!("\n=== Statistics Schema ===");
+    println!("The stats schema shows the full structure for statistics:");
+    println!("{:#?}", stats_schema);
+
+    // 2. Get a flat list of column names (simpler API)
+    let stats_columns = txn.stats_columns();
+    println!("\n=== Statistics Columns ===");
+    println!(
+        "Collect statistics for these {} columns:",
+        stats_columns.len()
+    );
+    for col in &stats_columns {
+        println!("  - {}", col);
+    }
+
+    // 3. Get the full add_files_schema that engines must conform to
+    let add_files_schema = txn.add_files_schema();
+    println!("\n=== Add Files Schema ===");
+    println!("Engines must return data matching this schema:");
+    println!("{:#?}", add_files_schema);
+
+    /*
+    HOW AN ENGINE WOULD COLLECT STATISTICS:
+
+    When writing a Parquet file, the engine would:
+
+    1. Query txn.stats_columns() or txn.stats_schema() to know which columns to track
+    2. While writing data, track for each column:
+       - numRecords: total row count
+       - nullCount: count of null values
+       - minValues: minimum value seen
+       - maxValues: maximum value seen
+    3. After writing, construct a stats struct matching the schema:
+
+    ```rust
+    use arrow::array::{Int64Array, StructArray};
+
+    // Example: For a table with columns "id" and "name"
+    let stats = StructArray::try_new_with_length(
+        vec![
+            Field::new("numRecords", DataType::Int64, true),
+            Field::new("nullCount", DataType::Struct(Fields::from(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("name", DataType::Int64, true),
+            ])), true),
+            Field::new("minValues", DataType::Struct(Fields::from(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("name", DataType::Utf8, true),
+            ])), true),
+            Field::new("maxValues", DataType::Struct(Fields::from(vec![
+                Field::new("id", DataType::Int32, true),
+                Field::new("name", DataType::Utf8, true),
+            ])), true),
+            Field::new("tightBounds", DataType::Boolean, true),
+        ].into(),
+        vec![
+            Arc::new(Int64Array::from(vec![1000])), // numRecords
+            Arc::new(StructArray::try_new(...)?),    // nullCount: {id: 0, name: 5}
+            Arc::new(StructArray::try_new(...)?),    // minValues: {id: 1, name: "Alice"}
+            Arc::new(StructArray::try_new(...)?),    // maxValues: {id: 1000, name: "Zoe"}
+            Arc::new(BooleanArray::from(vec![true])), // tightBounds
+        ],
+        None,
+        1,
+    )?;
+    ```
+
+    The engine returns this stats struct as part of the file metadata, and Kernel
+    automatically converts it to JSON when committing the transaction.
+    */
+
+    // Write the data using the engine (which internally collects statistics)
     let write_context = Arc::new(txn.get_write_context());
     let file_metadata = engine
         .write_parquet(&sample_data, write_context.as_ref(), HashMap::new())
@@ -126,12 +203,16 @@ async fn try_main() -> DeltaResult<()> {
     };
 
     let version = committed.commit_version();
-    println!("✓ Committed transaction at version {version}");
+    println!("\n✓ Committed transaction at version {version}");
     println!("✓ Successfully wrote {} rows to the table", cli.num_rows);
+
+    // Display the commit JSON to inspect statistics
+    println!("\n=== Inspecting Commit JSON ===");
+    display_commit_json(&url, version)?;
 
     // Read and display the data
     read_and_display_data(&url, engine).await?;
-    println!("✓ Successfully read data from the table");
+    println!("\n✓ Successfully read data from the table");
 
     Ok(())
 }
@@ -305,6 +386,65 @@ fn create_sample_data(schema: &SchemaRef, num_rows: usize) -> DeltaResult<ArrowE
     let record_batch = RecordBatch::try_new(Arc::new(arrow_schema), columns)?;
 
     Ok(ArrowEngineData::new(record_batch))
+}
+
+/// Display the commit JSON to inspect statistics.
+fn display_commit_json(table_url: &Url, version: u64) -> DeltaResult<()> {
+    // Construct path to the commit JSON file
+    let commit_file = format!("{:020}.json", version);
+    let delta_log_path = table_url
+        .join("_delta_log/")?
+        .join(&commit_file)?
+        .to_file_path()
+        .map_err(|_e| Error::generic("URL cannot be converted to local file path"))?;
+
+    println!("Reading commit file: {}", delta_log_path.display());
+
+    // Read and parse the commit JSON
+    let content = read_to_string(&delta_log_path)
+        .map_err(|e| Error::generic(format!("Failed to read commit file: {e}")))?;
+
+    println!("\nCommit JSON content:");
+    println!("{}", "=".repeat(80));
+
+    // Pretty print each JSON line
+    for (idx, line) in content.lines().enumerate() {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+            // Check if this is an Add action with stats
+            if let Some(add) = json.get("add") {
+                println!("\nAdd Action #{}:", idx + 1);
+                println!("{}", serde_json::to_string_pretty(&add)?);
+
+                // Highlight the stats field
+                if let Some(stats_str) = add.get("stats").and_then(|s| s.as_str()) {
+                    println!("\n📊 Statistics (parsed):");
+                    if let Ok(stats_json) = serde_json::from_str::<serde_json::Value>(stats_str) {
+                        println!("{}", serde_json::to_string_pretty(&stats_json)?);
+
+                        // Extract and display key statistics
+                        if let Some(num_records) = stats_json.get("numRecords") {
+                            println!("\n  • Total records: {}", num_records);
+                        }
+                        if let Some(null_count) = stats_json.get("nullCount") {
+                            println!("  • Null counts: {}", null_count);
+                        }
+                        if let Some(min_values) = stats_json.get("minValues") {
+                            println!("  • Min values: {}", min_values);
+                        }
+                        if let Some(max_values) = stats_json.get("maxValues") {
+                            println!("  • Max values: {}", max_values);
+                        }
+                        if let Some(tight_bounds) = stats_json.get("tightBounds") {
+                            println!("  • Tight bounds: {}", tight_bounds);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    println!("{}", "=".repeat(80));
+    Ok(())
 }
 
 /// Read and display data from the table.

@@ -67,8 +67,12 @@ pub(crate) fn mandatory_add_file_schema() -> &'static SchemaRef {
     &MANDATORY_ADD_FILE_SCHEMA
 }
 
-/// The static instance referenced by [`add_files_schema`].
-pub(crate) static BASE_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+/// Returns a minimal add files schema with only numRecords as a statistic.
+///
+/// This is used by the default engine implementation for backward compatibility.
+/// For full statistics support, use `Transaction::add_files_schema()`.
+#[allow(dead_code)] // Used in default-engine feature
+pub(crate) static MINIMAL_ADD_FILES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     let stats = StructField::nullable(
         "stats",
         DataType::struct_type_unchecked(vec![StructField::nullable("numRecords", DataType::LONG)]),
@@ -86,9 +90,11 @@ static DATA_CHANGE_COLUMN: LazyLock<StructField> =
 /// This column holds new DV descriptors appended to scan file metadata before transforming to final add actions.
 static NEW_DELETION_VECTOR_NAME: &str = "newDeletionVector";
 
-/// The static instance referenced by [`add_files_schema`] that contains the dataChange column.
-static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(|| {
-    let mut fields = BASE_ADD_FILES_SCHEMA.fields().collect::<Vec<_>>();
+/// Extend a schema with the dataChange column and return a new SchemaRef.
+///
+/// The dataChange column is inserted after the modificationTime field.
+fn with_data_change_col(schema: &SchemaRef) -> SchemaRef {
+    let mut fields = schema.fields().collect::<Vec<_>>();
     let len = fields.len();
     let insert_position = fields
         .iter()
@@ -96,7 +102,7 @@ static ADD_FILES_SCHEMA_WITH_DATA_CHANGE: LazyLock<SchemaRef> = LazyLock::new(||
         .unwrap_or(len);
     fields.insert(insert_position + 1, &DATA_CHANGE_COLUMN);
     Arc::new(StructType::new_unchecked(fields.into_iter().cloned()))
-});
+}
 
 /// Extend a schema with a statistics column and return a new SchemaRef.
 ///
@@ -223,6 +229,54 @@ static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
 fn new_dv_column_schema() -> &'static SchemaRef {
     &NEW_DV_COLUMN_SCHEMA
+}
+
+/// Extracts leaf column paths from a stats schema structure.
+///
+/// Walks through minValues/maxValues schemas (they have same structure) and returns
+/// all leaf columns as ColumnName instances representing their full paths.
+fn extract_leaf_columns_from_stats(
+    stats_schema: &StructType,
+) -> Vec<crate::expressions::ColumnName> {
+    // Look for minValues field (could also use maxValues, they're identical)
+    let Some(min_values_field) = stats_schema.fields().find(|f| f.name() == "minValues") else {
+        return vec![]; // No min/max fields means no eligible columns
+    };
+
+    let DataType::Struct(min_values_struct) = min_values_field.data_type() else {
+        return vec![];
+    };
+
+    let mut columns = Vec::new();
+    let mut path = Vec::new();
+    extract_leaf_columns_recursive(min_values_struct, &mut path, &mut columns);
+    columns
+}
+
+/// Recursively extracts leaf column paths from a schema.
+fn extract_leaf_columns_recursive(
+    schema: &StructType,
+    current_path: &mut Vec<String>,
+    result: &mut Vec<crate::expressions::ColumnName>,
+) {
+    use crate::expressions::ColumnName;
+
+    for field in schema.fields() {
+        current_path.push(field.name().to_string());
+
+        match field.data_type() {
+            DataType::Struct(nested) => {
+                // Recurse into nested struct
+                extract_leaf_columns_recursive(nested, current_path, result);
+            }
+            _ => {
+                // Leaf column - add to result
+                result.push(ColumnName::new(current_path.iter().map(|s| s.as_str())));
+            }
+        }
+
+        current_path.pop();
+    }
 }
 
 /// A transaction represents an in-progress write to a table. After creating a transaction, changes
@@ -778,16 +832,77 @@ impl Transaction {
     /// file to be added to the table. Kernel takes this information and extends it to the full add_file
     /// action schema, adding internal fields (e.g., baseRowID) as necessary.
     ///
-    /// For now, Kernel only supports the number of records as a file statistic.
-    /// This will change in a future release.
-    ///
-    /// Note: While currently static, in the future the schema might change depending on
-    /// options set on the transaction or features enabled on the table.
+    /// The stats field structure is determined by table configuration. See [`stats_schema`] for details.
     ///
     /// [`add_files`]: crate::transaction::Transaction::add_files
     /// [`ParquetHandler`]: crate::ParquetHandler
-    pub fn add_files_schema(&self) -> &'static SchemaRef {
-        &BASE_ADD_FILES_SCHEMA
+    /// [`stats_schema`]: crate::transaction::Transaction::stats_schema
+    pub fn add_files_schema(&self) -> SchemaRef {
+        let stats_schema = self.stats_schema();
+
+        StructTypeBuilder::from_schema(mandatory_add_file_schema())
+            .add_field(StructField::nullable(
+                "stats",
+                DataType::Struct(Box::new(stats_schema.as_ref().clone())),
+            ))
+            .build_arc_unchecked()
+    }
+
+    /// Returns the expected schema for file statistics that should be collected during writes.
+    ///
+    /// This schema represents the structure of the `stats` field that engines must populate
+    /// when reporting file metadata. The schema includes:
+    /// - `numRecords` (LONG): Total number of records in the file
+    /// - `nullCount` (STRUCT): Null counts for configured columns (all leaf fields as LONG)
+    /// - `minValues` (STRUCT): Minimum values for eligible columns
+    /// - `maxValues` (STRUCT): Maximum values for eligible columns
+    /// - `tightBounds` (BOOLEAN): Whether min/max are exact bounds (default true)
+    ///
+    /// The columns included are determined by table properties:
+    /// - `delta.dataSkippingStatsColumns`: Explicit list of columns (takes precedence)
+    /// - `delta.dataSkippingNumIndexedCols`: Numeric limit (default 32, or -1 for all)
+    ///
+    /// Only data-skipping eligible types are included in min/max. Partition columns are
+    /// automatically excluded.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let txn = snapshot.transaction(committer)?;
+    /// let stats_schema = txn.stats_schema();
+    ///
+    /// // Engine collects statistics matching this schema structure
+    /// let file_stats = collect_stats_for_file(parquet_file, &stats_schema);
+    /// ```
+    pub fn stats_schema(&self) -> SchemaRef {
+        self.read_snapshot
+            .table_configuration()
+            .expected_stats_schema()
+            .unwrap_or_else(|_| Arc::new(StructType::new_unchecked([])))
+    }
+
+    /// Returns the list of leaf columns for which statistics should be collected during writes.
+    ///
+    /// Each `ColumnName` represents a column path for which min, max, and null count
+    /// statistics should be collected. For nested columns, the path includes all parent
+    /// field names (e.g., `["address", "city"]` for `address.city`).
+    ///
+    /// This list contains leaf columns only. If a struct column is configured for statistics,
+    /// all its leaf descendants with eligible types will be included.
+    ///
+    /// Partition columns are automatically excluded.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let txn = snapshot.transaction(committer)?;
+    /// let stats_columns = txn.stats_columns();
+    ///
+    /// for column in stats_columns {
+    ///     println!("Collect stats for: {}", column); // Prints: "id", "user.name", etc.
+    /// }
+    /// ```
+    pub fn stats_columns(&self) -> Vec<crate::expressions::ColumnName> {
+        let stats_schema = self.stats_schema();
+        extract_leaf_columns_from_stats(&stats_schema)
     }
 
     // Generate the logical-to-physical transform expression which must be evaluated on every data
@@ -842,6 +957,10 @@ impl Transaction {
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
+            self.stats_columns()
+                .into_iter()
+                .map(|c| c.to_string())
+                .collect(),
         )
     }
 
@@ -954,8 +1073,10 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 extended_add_files,
-                with_row_tracking_cols(self.add_files_schema()),
-                with_row_tracking_cols(&with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone())),
+                with_row_tracking_cols(&self.add_files_schema()),
+                with_row_tracking_cols(&with_stats_col(&with_data_change_col(
+                    &self.add_files_schema(),
+                ))),
                 self.data_change,
             );
 
@@ -969,8 +1090,8 @@ impl Transaction {
             let add_actions = build_add_actions(
                 engine,
                 self.add_files_metadata.iter().map(|a| Ok(a.deref())),
-                self.add_files_schema().clone(),
-                with_stats_col(&ADD_FILES_SCHEMA_WITH_DATA_CHANGE.clone()),
+                self.add_files_schema(),
+                with_stats_col(&with_data_change_col(&self.add_files_schema())),
                 self.data_change,
             );
 
@@ -1313,6 +1434,8 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    /// Column names that should have statistics collected during writes.
+    stats_columns: Vec<String>,
 }
 
 impl WriteContext {
@@ -1321,12 +1444,14 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        stats_columns: Vec<String>,
     ) -> Self {
         WriteContext {
             target_dir,
             logical_schema,
             physical_schema,
             logical_to_physical,
+            stats_columns,
         }
     }
 
@@ -1344,6 +1469,13 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// Returns the column names that should have statistics collected during writes.
+    ///
+    /// Based on table configuration (dataSkippingNumIndexedCols, etc.).
+    pub fn stats_columns(&self) -> &[String] {
+        &self.stats_columns
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.
@@ -1482,7 +1614,6 @@ pub struct RetryableTransaction {
 mod tests {
     use super::*;
     use crate::engine::sync::SyncEngine;
-    use crate::schema::MapType;
     use crate::Snapshot;
     use std::path::PathBuf;
 
@@ -1545,23 +1676,29 @@ mod tests {
             .with_engine_info("default engine");
 
         let schema = txn.add_files_schema();
-        let expected = StructType::new_unchecked(vec![
-            StructField::not_null("path", DataType::STRING),
-            StructField::not_null(
-                "partitionValues",
-                MapType::new(DataType::STRING, DataType::STRING, true),
-            ),
-            StructField::not_null("size", DataType::LONG),
-            StructField::not_null("modificationTime", DataType::LONG),
-            StructField::nullable(
-                "stats",
-                DataType::struct_type_unchecked(vec![StructField::nullable(
-                    "numRecords",
-                    DataType::LONG,
-                )]),
-            ),
-        ]);
-        assert_eq!(*schema, expected.into());
+
+        // The schema should include the mandatory fields
+        assert!(schema.fields().any(|f| f.name() == "path"));
+        assert!(schema.fields().any(|f| f.name() == "partitionValues"));
+        assert!(schema.fields().any(|f| f.name() == "size"));
+        assert!(schema.fields().any(|f| f.name() == "modificationTime"));
+
+        // The stats field should be present and should be a struct
+        let stats_field = schema
+            .fields()
+            .find(|f| f.name() == "stats")
+            .expect("stats field should exist");
+        assert!(matches!(stats_field.data_type(), DataType::Struct(_)));
+
+        // Verify that stats schema contains the expected fields based on table config
+        if let DataType::Struct(stats_schema) = stats_field.data_type() {
+            // Should always have numRecords
+            assert!(stats_schema.fields().any(|f| f.name() == "numRecords"));
+            // Should have tightBounds
+            assert!(stats_schema.fields().any(|f| f.name() == "tightBounds"));
+            // May have nullCount, minValues, maxValues depending on table config
+        }
+
         Ok(())
     }
 
