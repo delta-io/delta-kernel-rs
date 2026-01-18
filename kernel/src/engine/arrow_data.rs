@@ -133,8 +133,9 @@ where
     }
 
     fn materialize(&self, row_index: usize) -> Vec<String> {
-        let mut result = vec![];
-        for i in 0..EngineList::len(self, row_index) {
+        let len = EngineList::len(self, row_index);
+        let mut result = Vec::with_capacity(len);
+        for i in 0..len {
             result.push(self.get(row_index, i));
         }
         result
