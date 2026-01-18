@@ -7,8 +7,12 @@ use std::sync::Arc;
 use delta_kernel_derive::internal_api;
 
 use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
-use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
-use crate::arrow::datatypes::{DataType, Field};
+use crate::arrow::array::{
+    Array, ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray,
+};
+use crate::arrow::compute::{max, min};
+use crate::arrow::datatypes::{DataType, Field, Fields};
 use crate::parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
@@ -37,6 +41,752 @@ use crate::{
     DeltaResult, EngineData, Error, FileDataReadResultIterator, FileMeta, ParquetFooter,
     ParquetHandler, PredicateRef,
 };
+use std::collections::HashSet;
+
+/// Collects statistics from RecordBatches for Delta Lake file statistics.
+/// Supports streaming accumulation across multiple batches.
+///
+/// Only collects statistics for columns specified in `stats_columns`.
+struct StatisticsCollector {
+    num_records: usize,
+    /// Column names from the data schema, indexed by column position.
+    column_names: Vec<String>,
+    /// Column names that should have stats collected.
+    stats_columns: HashSet<String>,
+    /// Collected min values per column (single-element arrays).
+    min_values: Vec<ArrayRef>,
+    /// Collected max values per column (single-element arrays).
+    max_values: Vec<ArrayRef>,
+    /// Null counts per column. For structs, this is a StructArray with nested Int64Arrays.
+    null_counts: Vec<ArrayRef>,
+}
+
+impl StatisticsCollector {
+    /// Create a new statistics collector.
+    ///
+    /// Only collects statistics for columns in `stats_columns`.
+    fn new(data_schema: Arc<crate::arrow::datatypes::Schema>, stats_columns: &[String]) -> Self {
+        let num_columns = data_schema.fields().len();
+        let stats_columns: HashSet<String> = stats_columns.iter().cloned().collect();
+
+        // Initialize with null/zero values for each column
+        let mut column_names = Vec::with_capacity(num_columns);
+        let mut min_values = Vec::with_capacity(num_columns);
+        let mut max_values = Vec::with_capacity(num_columns);
+        let mut null_counts = Vec::with_capacity(num_columns);
+
+        for field in data_schema.fields() {
+            let col_name = field.name().to_string();
+            column_names.push(col_name.clone());
+
+            // Initialize arrays for all columns (placeholders for non-stats columns)
+            let null_array = Self::create_null_array(field.data_type());
+            min_values.push(null_array.clone());
+            max_values.push(null_array);
+            null_counts.push(Self::create_zero_null_count(field.data_type()));
+        }
+
+        Self {
+            num_records: 0,
+            column_names,
+            stats_columns,
+            min_values,
+            max_values,
+            null_counts,
+        }
+    }
+
+    /// Check if a column should have stats collected.
+    fn should_collect_stats(&self, column_name: &str) -> bool {
+        self.stats_columns.contains(column_name)
+    }
+
+    /// Create a zero-initialized null count structure for the given data type.
+    /// For leaf types, returns Int64Array([0]). For structs, returns nested structure.
+    fn create_zero_null_count(data_type: &DataType) -> ArrayRef {
+        match data_type {
+            DataType::Struct(fields) => {
+                let children: Vec<ArrayRef> = fields
+                    .iter()
+                    .map(|f| Self::create_zero_null_count(f.data_type()))
+                    .collect();
+                let null_count_fields: Fields = fields
+                    .iter()
+                    .map(|f| {
+                        let child_type = Self::null_count_data_type(f.data_type());
+                        Field::new(f.name(), child_type, true)
+                    })
+                    .collect();
+                Arc::new(
+                    StructArray::try_new(null_count_fields, children, None)
+                        .unwrap_or_else(|_| StructArray::new_empty_fields(1, None)),
+                ) as ArrayRef
+            }
+            _ => Arc::new(Int64Array::from(vec![0i64])) as ArrayRef,
+        }
+    }
+
+    /// Get the data type for null count of a given data type.
+    /// Leaf types -> Int64, Structs -> nested struct with Int64 leaves.
+    fn null_count_data_type(data_type: &DataType) -> DataType {
+        match data_type {
+            DataType::Struct(fields) => {
+                let null_count_fields: Fields = fields
+                    .iter()
+                    .map(|f| Field::new(f.name(), Self::null_count_data_type(f.data_type()), true))
+                    .collect();
+                DataType::Struct(null_count_fields)
+            }
+            _ => DataType::Int64,
+        }
+    }
+
+    /// Compute null counts for a column, recursively for nested structs.
+    fn compute_null_counts(column: &ArrayRef) -> ArrayRef {
+        match column.data_type() {
+            DataType::Struct(fields) => {
+                let Some(struct_arr) = column.as_any().downcast_ref::<StructArray>() else {
+                    return Arc::new(StructArray::new_empty_fields(1, None)) as ArrayRef;
+                };
+                // For struct columns, count nulls in each child field
+                // When the struct itself is null, each child is considered null
+                let struct_nulls = column.null_count();
+
+                let children: Vec<ArrayRef> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        let child_col = struct_arr.column(i);
+                        let child_counts = Self::compute_null_counts(child_col);
+                        // Add struct-level nulls to each child's count
+                        Self::add_to_null_count(
+                            &child_counts,
+                            struct_nulls as i64,
+                            field.data_type(),
+                        )
+                    })
+                    .collect();
+
+                let null_count_fields: Fields = fields
+                    .iter()
+                    .map(|f| Field::new(f.name(), Self::null_count_data_type(f.data_type()), true))
+                    .collect();
+                Arc::new(
+                    StructArray::try_new(null_count_fields, children, None)
+                        .unwrap_or_else(|_| StructArray::new_empty_fields(1, None)),
+                ) as ArrayRef
+            }
+            _ => {
+                // Leaf field - count nulls directly
+                Arc::new(Int64Array::from(vec![column.null_count() as i64])) as ArrayRef
+            }
+        }
+    }
+
+    /// Add a value to all leaf null counts in a null count structure.
+    fn add_to_null_count(null_count: &ArrayRef, add: i64, data_type: &DataType) -> ArrayRef {
+        if add == 0 {
+            return null_count.clone();
+        }
+        match data_type {
+            DataType::Struct(fields) => {
+                let Some(struct_arr) = null_count.as_any().downcast_ref::<StructArray>() else {
+                    return null_count.clone();
+                };
+                let children: Vec<ArrayRef> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        Self::add_to_null_count(struct_arr.column(i), add, field.data_type())
+                    })
+                    .collect();
+                let null_count_fields: Fields = fields
+                    .iter()
+                    .map(|f| Field::new(f.name(), Self::null_count_data_type(f.data_type()), true))
+                    .collect();
+                Arc::new(
+                    StructArray::try_new(null_count_fields, children, None)
+                        .unwrap_or_else(|_| StructArray::new_empty_fields(1, None)),
+                ) as ArrayRef
+            }
+            _ => {
+                let Some(arr) = null_count.as_any().downcast_ref::<Int64Array>() else {
+                    return null_count.clone();
+                };
+                Arc::new(Int64Array::from(vec![arr.value(0) + add])) as ArrayRef
+            }
+        }
+    }
+
+    /// Merge two null count structures by adding corresponding values.
+    fn merge_null_counts(current: &ArrayRef, new_val: &ArrayRef, data_type: &DataType) -> ArrayRef {
+        match data_type {
+            DataType::Struct(fields) => {
+                let (Some(struct_a), Some(struct_b)) = (
+                    current.as_any().downcast_ref::<StructArray>(),
+                    new_val.as_any().downcast_ref::<StructArray>(),
+                ) else {
+                    return current.clone();
+                };
+                let children: Vec<ArrayRef> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        Self::merge_null_counts(
+                            struct_a.column(i),
+                            struct_b.column(i),
+                            field.data_type(),
+                        )
+                    })
+                    .collect();
+                let null_count_fields: Fields = fields
+                    .iter()
+                    .map(|f| Field::new(f.name(), Self::null_count_data_type(f.data_type()), true))
+                    .collect();
+                Arc::new(
+                    StructArray::try_new(null_count_fields, children, None)
+                        .unwrap_or_else(|_| StructArray::new_empty_fields(1, None)),
+                ) as ArrayRef
+            }
+            _ => {
+                let (Some(arr_a), Some(arr_b)) = (
+                    current.as_any().downcast_ref::<Int64Array>(),
+                    new_val.as_any().downcast_ref::<Int64Array>(),
+                ) else {
+                    return current.clone();
+                };
+                Arc::new(Int64Array::from(vec![arr_a.value(0) + arr_b.value(0)])) as ArrayRef
+            }
+        }
+    }
+
+    /// Update statistics with a new batch. Call this for each batch during write.
+    fn update(&mut self, batch: &RecordBatch) -> DeltaResult<()> {
+        self.num_records += batch.num_rows();
+
+        for i in 0..batch.num_columns() {
+            let column = batch.column(i);
+            let column_name = &self.column_names[i];
+
+            // Only collect stats for columns in stats_columns
+            if !self.should_collect_stats(column_name) {
+                continue;
+            }
+
+            // Accumulate null counts
+            let batch_null_counts = Self::compute_null_counts(column);
+            self.null_counts[i] = Self::merge_null_counts(
+                &self.null_counts[i],
+                &batch_null_counts,
+                column.data_type(),
+            );
+
+            // Update min/max if column has non-null values and type supports it
+            if column.null_count() < column.len() && !column.is_empty() {
+                match Self::compute_min_max(column) {
+                    Ok((batch_min, batch_max)) => {
+                        self.min_values[i] =
+                            Self::merge_min(&self.min_values[i], &batch_min, column.data_type())?;
+                        self.max_values[i] =
+                            Self::merge_max(&self.max_values[i], &batch_max, column.data_type())?;
+                    }
+                    Err(_) => {
+                        // Type not supported for min/max - keep existing (null) values
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Merge two min values, returning the smaller one.
+    fn merge_min(
+        current: &ArrayRef,
+        new_val: &ArrayRef,
+        data_type: &DataType,
+    ) -> DeltaResult<ArrayRef> {
+        // If current is null, use new value
+        if current.null_count() == current.len() {
+            return Ok(new_val.clone());
+        }
+        // If new is null, keep current
+        if new_val.null_count() == new_val.len() {
+            return Ok(current.clone());
+        }
+
+        // Compare and return the smaller value
+        Self::compare_and_select(current, new_val, data_type, true)
+    }
+
+    /// Merge two max values, returning the larger one.
+    fn merge_max(
+        current: &ArrayRef,
+        new_val: &ArrayRef,
+        data_type: &DataType,
+    ) -> DeltaResult<ArrayRef> {
+        // If current is null, use new value
+        if current.null_count() == current.len() {
+            return Ok(new_val.clone());
+        }
+        // If new is null, keep current
+        if new_val.null_count() == new_val.len() {
+            return Ok(current.clone());
+        }
+
+        // Compare and return the larger value
+        Self::compare_and_select(current, new_val, data_type, false)
+    }
+
+    /// Compare two single-element arrays and return the min (if select_min=true) or max.
+    fn compare_and_select(
+        a: &ArrayRef,
+        b: &ArrayRef,
+        data_type: &DataType,
+        select_min: bool,
+    ) -> DeltaResult<ArrayRef> {
+        macro_rules! compare_primitive {
+            ($array_type:ty, $a:expr, $b:expr, $select_min:expr) => {{
+                let arr_a = $a.as_any().downcast_ref::<$array_type>().unwrap();
+                let arr_b = $b.as_any().downcast_ref::<$array_type>().unwrap();
+                let val_a = arr_a.value(0);
+                let val_b = arr_b.value(0);
+                if $select_min {
+                    if val_a <= val_b {
+                        Ok($a.clone())
+                    } else {
+                        Ok($b.clone())
+                    }
+                } else if val_a >= val_b {
+                    Ok($a.clone())
+                } else {
+                    Ok($b.clone())
+                }
+            }};
+        }
+
+        use crate::arrow::array::{
+            Date32Array, Decimal128Array, Float32Array, Int16Array, Int8Array,
+        };
+
+        match data_type {
+            DataType::Int8 => compare_primitive!(Int8Array, a, b, select_min),
+            DataType::Int16 => compare_primitive!(Int16Array, a, b, select_min),
+            DataType::Int32 => compare_primitive!(Int32Array, a, b, select_min),
+            DataType::Int64 => compare_primitive!(Int64Array, a, b, select_min),
+            DataType::Float32 => compare_primitive!(Float32Array, a, b, select_min),
+            DataType::Float64 => compare_primitive!(Float64Array, a, b, select_min),
+            DataType::Boolean => compare_primitive!(BooleanArray, a, b, select_min),
+            DataType::Date32 => compare_primitive!(Date32Array, a, b, select_min),
+            DataType::Timestamp(_, _) => {
+                compare_primitive!(TimestampMicrosecondArray, a, b, select_min)
+            }
+            DataType::Decimal128(_, _) => compare_primitive!(Decimal128Array, a, b, select_min),
+            DataType::Utf8 => {
+                let (Some(arr_a), Some(arr_b)) = (
+                    a.as_any().downcast_ref::<StringArray>(),
+                    b.as_any().downcast_ref::<StringArray>(),
+                ) else {
+                    return Ok(a.clone());
+                };
+                let val_a = arr_a.value(0);
+                let val_b = arr_b.value(0);
+                if select_min {
+                    if val_a <= val_b {
+                        Ok(a.clone())
+                    } else {
+                        Ok(b.clone())
+                    }
+                } else if val_a >= val_b {
+                    Ok(a.clone())
+                } else {
+                    Ok(b.clone())
+                }
+            }
+            DataType::Struct(fields) => {
+                // Recursively merge each child field
+                let (Some(struct_a), Some(struct_b)) = (
+                    a.as_any().downcast_ref::<StructArray>(),
+                    b.as_any().downcast_ref::<StructArray>(),
+                ) else {
+                    return Ok(a.clone());
+                };
+
+                let merged_children: Vec<ArrayRef> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        let child_a = struct_a.column(i);
+                        let child_b = struct_b.column(i);
+                        if select_min {
+                            Self::merge_min(child_a, child_b, field.data_type())
+                        } else {
+                            Self::merge_max(child_a, child_b, field.data_type())
+                        }
+                    })
+                    .collect::<DeltaResult<Vec<_>>>()?;
+
+                Ok(
+                    Arc::new(StructArray::try_new(fields.clone(), merged_children, None)?)
+                        as ArrayRef,
+                )
+            }
+            _ => Ok(a.clone()), // Unsupported type, keep current
+        }
+    }
+
+    /// Create a null array with a single null value of the given data type.
+    fn create_null_array(data_type: &DataType) -> ArrayRef {
+        use crate::arrow::array::{
+            BinaryArray, Date32Array, Decimal128Array, Float32Array, Int16Array, Int8Array,
+            NullArray,
+        };
+
+        match data_type {
+            DataType::Int8 => Arc::new(Int8Array::from(vec![None::<i8>])) as ArrayRef,
+            DataType::Int16 => Arc::new(Int16Array::from(vec![None::<i16>])) as ArrayRef,
+            DataType::Int32 => Arc::new(Int32Array::from(vec![None::<i32>])) as ArrayRef,
+            DataType::Int64 => Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
+            DataType::Float32 => Arc::new(Float32Array::from(vec![None::<f32>])) as ArrayRef,
+            DataType::Float64 => Arc::new(Float64Array::from(vec![None::<f64>])) as ArrayRef,
+            DataType::Boolean => Arc::new(BooleanArray::from(vec![None::<bool>])) as ArrayRef,
+            DataType::Utf8 => Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef,
+            DataType::Binary => Arc::new(BinaryArray::from(vec![None::<&[u8]>])) as ArrayRef,
+            DataType::Date32 => Arc::new(Date32Array::from(vec![None::<i32>])) as ArrayRef,
+            DataType::Timestamp(unit, tz) => {
+                use crate::arrow::datatypes::TimeUnit;
+                let arr = match unit {
+                    TimeUnit::Microsecond => TimestampMicrosecondArray::from(vec![None::<i64>]),
+                    _ => TimestampMicrosecondArray::from(vec![None::<i64>]),
+                };
+                if let Some(tz) = tz {
+                    Arc::new(arr.with_timezone(tz.as_ref())) as ArrayRef
+                } else {
+                    Arc::new(arr) as ArrayRef
+                }
+            }
+            DataType::Decimal128(precision, scale) => Arc::new(
+                Decimal128Array::from(vec![None::<i128>])
+                    .with_precision_and_scale(*precision, *scale)
+                    .unwrap_or_else(|_| Decimal128Array::from(vec![None::<i128>])),
+            ) as ArrayRef,
+            DataType::Struct(fields) => {
+                // Create a null struct with the same schema
+                let null_children: Vec<ArrayRef> = fields
+                    .iter()
+                    .map(|f| Self::create_null_array(f.data_type()))
+                    .collect();
+                Arc::new(
+                    StructArray::try_new(fields.clone(), null_children, Some(vec![false].into()))
+                        .unwrap_or_else(|_| {
+                            StructArray::new_empty_fields(1, Some(vec![false].into()))
+                        }),
+                ) as ArrayRef
+            }
+            _ => Arc::new(NullArray::new(1)) as ArrayRef,
+        }
+    }
+
+    /// Default prefix length for string truncation in statistics.
+    const STRING_PREFIX_LENGTH: usize = 32;
+
+    /// Truncate a string to the prefix length for statistics.
+    fn truncate_string(s: &str, max_len: usize) -> String {
+        if s.len() <= max_len {
+            s.to_string()
+        } else {
+            // Truncate at char boundary
+            s.char_indices()
+                .take_while(|(i, _)| *i < max_len)
+                .map(|(_, c)| c)
+                .collect()
+        }
+    }
+
+    /// Compute min and max values for a column.
+    fn compute_min_max(column: &ArrayRef) -> DeltaResult<(ArrayRef, ArrayRef)> {
+        use crate::arrow::array::{
+            Date32Array, Decimal128Array, Float32Array, Int16Array, Int8Array,
+        };
+        use crate::arrow::compute::{max_boolean, max_string, min_boolean, min_string};
+
+        // Use arrow compute functions based on the data type
+        let (min_scalar, max_scalar) = match column.data_type() {
+            DataType::Int8 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Int8Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Int8Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Int8Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Int16 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Int16Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Int16Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Int16Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Int32 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Int32Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Int32Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Int64 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Int64Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Int64Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Float32 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Float32Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Float32Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Float32Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Float64 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Float64Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Float64Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Float64Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Date32 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Date32Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(Date32Array::from(vec![min_val])) as ArrayRef,
+                    Arc::new(Date32Array::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Utf8 => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| Error::generic("Failed to downcast StringArray"))?;
+                let min_val = min_string(arr);
+                let max_val = max_string(arr);
+                // Truncate strings to prefix length for statistics
+                let min_truncated =
+                    min_val.map(|s| Self::truncate_string(s, Self::STRING_PREFIX_LENGTH));
+                let max_truncated =
+                    max_val.map(|s| Self::truncate_string(s, Self::STRING_PREFIX_LENGTH));
+                (
+                    Arc::new(StringArray::from(vec![min_truncated])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![max_truncated])) as ArrayRef,
+                )
+            }
+            DataType::Boolean => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| Error::generic("Failed to downcast BooleanArray"))?;
+                let min_val = min_boolean(arr);
+                let max_val = max_boolean(arr);
+                (
+                    Arc::new(BooleanArray::from(vec![min_val])) as ArrayRef,
+                    Arc::new(BooleanArray::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Timestamp(_, _) => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .ok_or_else(|| Error::generic("Failed to downcast TimestampArray"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(TimestampMicrosecondArray::from(vec![min_val])) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Decimal128(precision, scale) => {
+                let arr = column
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| Error::generic("Failed to downcast Decimal128Array"))?;
+                let min_val = min(arr);
+                let max_val = max(arr);
+                (
+                    Arc::new(
+                        Decimal128Array::from(vec![min_val])
+                            .with_precision_and_scale(*precision, *scale)
+                            .unwrap_or_else(|_| Decimal128Array::from(vec![min_val])),
+                    ) as ArrayRef,
+                    Arc::new(
+                        Decimal128Array::from(vec![max_val])
+                            .with_precision_and_scale(*precision, *scale)
+                            .unwrap_or_else(|_| Decimal128Array::from(vec![max_val])),
+                    ) as ArrayRef,
+                )
+            }
+            DataType::Struct(fields) => {
+                // Recursively compute min/max for each child field
+                let struct_arr = column
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| Error::generic("Failed to downcast StructArray"))?;
+
+                let mut min_children = Vec::with_capacity(fields.len());
+                let mut max_children = Vec::with_capacity(fields.len());
+
+                for (i, field) in fields.iter().enumerate() {
+                    let child_col = struct_arr.column(i);
+                    match Self::compute_min_max(child_col) {
+                        Ok((child_min, child_max)) => {
+                            min_children.push(child_min);
+                            max_children.push(child_max);
+                        }
+                        Err(_) => {
+                            // Child type not supported - use null
+                            let null_array = Self::create_null_array(field.data_type());
+                            min_children.push(null_array.clone());
+                            max_children.push(null_array);
+                        }
+                    }
+                }
+
+                (
+                    Arc::new(StructArray::try_new(fields.clone(), min_children, None)?) as ArrayRef,
+                    Arc::new(StructArray::try_new(fields.clone(), max_children, None)?) as ArrayRef,
+                )
+            }
+            _ => {
+                // For unsupported types, return null
+                return Err(Error::generic(format!(
+                    "Unsupported data type for min/max: {:?}",
+                    column.data_type()
+                )));
+            }
+        };
+
+        Ok((min_scalar, max_scalar))
+    }
+
+    /// Finalize and build the statistics struct matching the expected Delta Lake stats schema.
+    ///
+    /// Only includes columns that appear in stats_columns.
+    fn finalize(&self) -> DeltaResult<StructArray> {
+        // Collect stats data - only include columns in stats_columns
+        let stats_data: Vec<_> = self
+            .column_names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| self.should_collect_stats(name))
+            .map(|(i, name)| {
+                (
+                    name.clone(),
+                    self.null_counts[i].clone(),
+                    self.min_values[i].clone(),
+                    self.max_values[i].clone(),
+                )
+            })
+            .collect();
+
+        // Build the complete stats struct
+        let mut stats_fields_vec = vec![Field::new("numRecords", DataType::Int64, true)];
+        let mut stats_arrays: Vec<ArrayRef> =
+            vec![Arc::new(Int64Array::from(vec![self.num_records as i64]))];
+
+        if !stats_data.is_empty() {
+            // Build nullCount, minValues, maxValues from stats_data
+            let mut null_count_fields = Vec::new();
+            let mut null_count_values = Vec::new();
+            let mut min_fields = Vec::new();
+            let mut min_values = Vec::new();
+            let mut max_fields = Vec::new();
+            let mut max_values = Vec::new();
+
+            for (name, null_count, min_val, max_val) in stats_data {
+                // Always add null count
+                null_count_fields.push(Field::new(&name, null_count.data_type().clone(), true));
+                null_count_values.push(null_count);
+
+                // Only add min/max if not all nulls (type supported it)
+                if min_val.null_count() < min_val.len() {
+                    min_fields.push(Field::new(&name, min_val.data_type().clone(), true));
+                    max_fields.push(Field::new(&name, max_val.data_type().clone(), true));
+                    min_values.push(min_val);
+                    max_values.push(max_val);
+                }
+            }
+
+            // Add nullCount
+            let null_count_struct =
+                StructArray::try_new(Fields::from(null_count_fields), null_count_values, None)?;
+            stats_fields_vec.push(Field::new(
+                "nullCount",
+                DataType::Struct(null_count_struct.fields().clone()),
+                true,
+            ));
+            stats_arrays.push(Arc::new(null_count_struct));
+
+            // Add minValues/maxValues if any columns support it
+            if !min_fields.is_empty() {
+                let min_struct = StructArray::try_new(Fields::from(min_fields), min_values, None)?;
+                let max_struct = StructArray::try_new(Fields::from(max_fields), max_values, None)?;
+
+                stats_fields_vec.push(Field::new(
+                    "minValues",
+                    DataType::Struct(min_struct.fields().clone()),
+                    true,
+                ));
+                stats_fields_vec.push(Field::new(
+                    "maxValues",
+                    DataType::Struct(max_struct.fields().clone()),
+                    true,
+                ));
+                stats_arrays.push(Arc::new(min_struct));
+                stats_arrays.push(Arc::new(max_struct));
+            }
+        }
+
+        // Always add tightBounds
+        stats_fields_vec.push(Field::new("tightBounds", DataType::Boolean, true));
+        stats_arrays.push(Arc::new(BooleanArray::from(vec![true])));
+
+        let stats_array = StructArray::try_new(Fields::from(stats_fields_vec), stats_arrays, None)?;
+
+        Ok(stats_array)
+    }
+}
 
 #[derive(Debug)]
 pub struct DefaultParquetHandler<E: TaskExecutor> {
@@ -47,13 +797,14 @@ pub struct DefaultParquetHandler<E: TaskExecutor> {
 
 /// Metadata of a data file (typically a parquet file).
 ///
-/// Currently just includes the the number of records as statistics, but will expand to include
-/// more statistics and other metadata in the future.
+/// Includes full file statistics collected during write.
 #[derive(Debug)]
 pub struct DataFileMetadata {
     file_meta: FileMeta,
     // NB: We use usize instead of u64 since arrow uses usize for record batch sizes
     num_records: usize,
+    // Optional full statistics
+    stats: Option<StructArray>,
 }
 
 impl DataFileMetadata {
@@ -61,7 +812,13 @@ impl DataFileMetadata {
         Self {
             file_meta,
             num_records,
+            stats: None,
         }
+    }
+
+    pub fn with_stats(mut self, stats: StructArray) -> Self {
+        self.stats = Some(stats);
+        self
     }
 
     /// Convert DataFileMetadata into a record batch which matches the schema returned by
@@ -81,7 +838,9 @@ impl DataFileMetadata {
                     size,
                 },
             num_records,
+            stats,
         } = self;
+
         // create the record batch of the write metadata
         let path = Arc::new(StringArray::from(vec![location.to_string()]));
         let key_builder = StringBuilder::new();
@@ -104,20 +863,44 @@ impl DataFileMetadata {
             .map_err(|_| Error::generic("Failed to convert parquet metadata 'size' to i64"))?;
         let size = Arc::new(Int64Array::from(vec![size]));
         let modification_time = Arc::new(Int64Array::from(vec![*last_modified]));
-        let stats = Arc::new(StructArray::try_new_with_length(
-            vec![Field::new("numRecords", DataType::Int64, true)].into(),
-            vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
-            None,
-            1,
-        )?);
+
+        // Use full stats if available, otherwise minimal stats
+        let stats_array: Arc<StructArray> = if let Some(full_stats) = stats {
+            Arc::new(full_stats.clone())
+        } else {
+            Arc::new(StructArray::try_new_with_length(
+                vec![Field::new("numRecords", DataType::Int64, true)].into(),
+                vec![Arc::new(Int64Array::from(vec![*num_records as i64]))],
+                None,
+                1,
+            )?)
+        };
+
+        // Build schema dynamically based on the stats array's actual schema
+        use crate::arrow::datatypes::Schema as ArrowSchema;
+        let base_schema: ArrowSchema = crate::transaction::MINIMAL_ADD_FILES_SCHEMA
+            .as_ref()
+            .try_into_arrow()?;
+
+        // Replace the stats field with the actual stats schema
+        let mut fields: Vec<Field> = base_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        // The last field is stats - replace it with the actual stats schema
+        if let Some(last) = fields.last_mut() {
+            *last = Field::new(
+                "stats",
+                DataType::Struct(stats_array.fields().clone()),
+                true,
+            );
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
 
         Ok(Box::new(ArrowEngineData::new(RecordBatch::try_new(
-            Arc::new(
-                crate::transaction::BASE_ADD_FILES_SCHEMA
-                    .as_ref()
-                    .try_into_arrow()?,
-            ),
-            vec![path, partitions, size, modification_time, stats],
+            schema,
+            vec![path, partitions, size, modification_time, stats_array],
         )?)))
     }
 }
@@ -158,6 +941,10 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         writer.write(record_batch)?;
         writer.close()?; // writer must be closed to write footer
 
+        // Note: For demonstration, we store metadata capability but don't extract full stats yet
+        // Full stats extraction from Parquet metadata would require reading column statistics
+        // from row groups, which is more complex and left as a TODO for engine implementations
+
         let size: u64 = buffer
             .len()
             .try_into()
@@ -192,6 +979,8 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
     /// metadata as an EngineData batch which matches the [add file metadata] schema (where `<uuid>`
     /// is a generated UUIDv4).
     ///
+    /// Only collects statistics for columns in `stats_columns`.
+    ///
     /// Note that the schema does not contain the dataChange column. In order to set `data_change` flag,
     /// use [`crate::transaction::Transaction::with_data_change`].
     ///
@@ -201,8 +990,23 @@ impl<E: TaskExecutor> DefaultParquetHandler<E> {
         path: &url::Url,
         data: Box<dyn EngineData>,
         partition_values: HashMap<String, String>,
+        stats_columns: &[String],
     ) -> DeltaResult<Box<dyn EngineData>> {
-        let parquet_metadata = self.write_parquet(path, data).await?;
+        // Collect statistics from the data during write
+        use crate::engine::arrow_data::extract_record_batch;
+        let record_batch = extract_record_batch(data.as_ref())?;
+
+        // Initialize stats collector and update with this batch
+        let mut stats_collector = StatisticsCollector::new(record_batch.schema(), stats_columns);
+        stats_collector.update(record_batch)?;
+        let stats = stats_collector.finalize()?;
+
+        // Write the parquet file
+        let mut parquet_metadata = self.write_parquet(path, data).await?;
+
+        // Attach the collected statistics
+        parquet_metadata = parquet_metadata.with_stats(stats);
+
         parquet_metadata.as_record_batch(&partition_values)
     }
 }
@@ -614,7 +1418,7 @@ mod tests {
         let actual = ArrowEngineData::try_from_engine_data(actual).unwrap();
 
         let schema = Arc::new(
-            crate::transaction::BASE_ADD_FILES_SCHEMA
+            crate::transaction::MINIMAL_ADD_FILES_SCHEMA
                 .as_ref()
                 .try_into_arrow()
                 .unwrap(),
@@ -682,6 +1486,7 @@ mod tests {
                     size,
                 },
             num_records,
+            ..
         } = write_metadata;
         let expected_location = Url::parse("memory:///data/").unwrap();
 

@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+    new_null_array, ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch,
+    StringArray, StructArray,
 };
 use delta_kernel::arrow::buffer::OffsetBuffer;
 use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
@@ -553,13 +554,33 @@ pub fn create_add_files_metadata(
         false,
     ));
 
-    let stats_struct = StructArray::from(vec![(
-        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
-        Arc::new(num_records_array) as ArrayRef,
-    )]);
+    // Build the stats struct from the schema's stats field
+    // The schema dictates what stats fields are expected
+    let arrow_schema: delta_kernel::arrow::datatypes::Schema =
+        TryFromKernel::try_from_kernel(add_files_schema.as_ref())?;
+    let stats_field = arrow_schema
+        .field_with_name("stats")
+        .expect("stats field should exist in add_files_schema");
+    let stats_arrow_schema = match stats_field.data_type() {
+        ArrowDataType::Struct(fields) => fields.clone(),
+        _ => panic!("stats field should be a struct"),
+    };
+
+    // Build arrays for each field in the stats schema
+    let mut stats_fields: Vec<(Arc<Field>, ArrayRef)> = Vec::new();
+    for field in stats_arrow_schema.iter() {
+        let array: ArrayRef = match field.name().as_str() {
+            "numRecords" => Arc::new(num_records_array.clone()),
+            "tightBounds" => Arc::new(BooleanArray::from(vec![Some(true); num_files])),
+            // For other fields (nullCount, minValues, maxValues), create null arrays
+            _ => Arc::new(new_null_array(field.data_type(), num_files)),
+        };
+        stats_fields.push((field.clone(), array));
+    }
+    let stats_struct = StructArray::from(stats_fields);
 
     let batch = RecordBatch::try_new(
-        Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
+        Arc::new(arrow_schema),
         vec![
             Arc::new(path_array) as ArrayRef,
             partition_values_array as ArrayRef,

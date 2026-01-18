@@ -104,7 +104,7 @@ async fn create_dv_table_with_files(
             )
         })
         .collect();
-    let metadata = create_add_files_metadata(add_files_schema, files)?;
+    let metadata = create_add_files_metadata(&add_files_schema, files)?;
     txn.add_files(metadata);
 
     let _ = txn.commit(engine.as_ref())?;
@@ -398,7 +398,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": true,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":1},\"maxValues\":{\"number\":3},\"tightBounds\":true}"
                 }
             }),
             json!({
@@ -408,7 +408,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": true,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":4},\"maxValues\":{\"number\":6},\"tightBounds\":true}"
                 }
             }),
         ];
@@ -612,7 +612,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": false,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":1},\"maxValues\":{\"number\":3},\"tightBounds\":true}"
                 }
             }),
             json!({
@@ -624,7 +624,7 @@ async fn test_append_partitioned() -> Result<(), Box<dyn std::error::Error>> {
                     "size": size,
                     "modificationTime": 0,
                     "dataChange": false,
-                    "stats": "{\"numRecords\":3}"
+                    "stats": "{\"numRecords\":3,\"nullCount\":{\"number\":0},\"minValues\":{\"number\":4},\"maxValues\":{\"number\":6},\"tightBounds\":true}"
                 }
             }),
         ];
@@ -1092,6 +1092,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
+            write_context.stats_columns(),
         )
         .await?;
 
@@ -1265,6 +1266,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
             write_context.target_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
             HashMap::new(),
+            write_context.stats_columns(),
         )
         .await?;
 

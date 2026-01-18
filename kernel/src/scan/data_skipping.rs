@@ -79,25 +79,7 @@ impl DataSkippingFilter {
 
         // Convert all fields into nullable, as stats may not be available for all columns
         // (and usually aren't for partition columns).
-        struct NullableStatsTransform;
-        impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-            fn transform_struct_field(
-                &mut self,
-                field: &'a StructField,
-            ) -> Option<Cow<'a, StructField>> {
-                use Cow::*;
-                let field = match self.transform(&field.data_type)? {
-                    Borrowed(_) if field.is_nullable() => Borrowed(field),
-                    data_type => Owned(StructField {
-                        name: field.name.clone(),
-                        data_type: data_type.into_owned(),
-                        nullable: true,
-                        metadata: field.metadata.clone(),
-                    }),
-                };
-                Some(field)
-            }
-        }
+        use stats_schema::NullableStatsTransform;
 
         // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
         struct NullCountStatsTransform;

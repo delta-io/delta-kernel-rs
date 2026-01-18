@@ -24,7 +24,7 @@ use crate::{
 /// to data type LONG. Maps, arrays, and variant are considered leaf fields in this case.
 ///
 /// For the min / max schemas, we non-eligible leaf fields from the base schema.
-/// Field eligibility is determined by the fields data type via [`is_skipping_eligeble_datatype`].
+/// Field eligibility is determined by the fields data type via [`is_skipping_eligible_datatype`].
 ///
 /// The overall schema is then:
 /// ```ignored
@@ -108,7 +108,26 @@ pub(crate) fn expected_stats_schema(
         }
     }
 
+    fields.push(StructField::nullable("tightBounds", DataType::BOOLEAN));
+
     StructType::try_new(fields)
+}
+
+pub(crate) struct NullableStatsTransform;
+impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+        let field = match self.transform(&field.data_type)? {
+            Borrowed(_) if field.is_nullable() => Borrowed(field),
+            data_type => Owned(StructField {
+                name: field.name.clone(),
+                data_type: data_type.into_owned(),
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+        };
+        Some(field)
+    }
 }
 
 // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
@@ -243,7 +262,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
         self.path.pop();
 
         // exclude struct fields with no children
-        if matches!(field.data_type(), DataType::Struct(dt) if dt.fields().len() == 0) {
+        if matches!(field.data_type(), DataType::Struct(dt) if dt.fields().next().is_none()) {
             None
         } else {
             Some(field)
@@ -366,6 +385,7 @@ mod tests {
             StructField::nullable("nullCount", file_schema.clone()),
             StructField::nullable("minValues", file_schema.clone()),
             StructField::nullable("maxValues", file_schema),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -401,6 +421,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -458,6 +479,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -498,6 +520,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -530,6 +553,7 @@ mod tests {
             StructField::nullable("nullCount", null_count),
             StructField::nullable("minValues", expected_fields.clone()),
             StructField::nullable("maxValues", expected_fields.clone()),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -567,6 +591,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -620,6 +645,7 @@ mod tests {
             StructField::nullable("nullCount", expected_null_count),
             StructField::nullable("minValues", expected_min_max.clone()),
             StructField::nullable("maxValues", expected_min_max),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
@@ -654,6 +680,7 @@ mod tests {
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", expected_null_count),
             // No minValues or maxValues fields since no primitive fields are eligible
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
         assert_eq!(&expected, &stats_schema);
