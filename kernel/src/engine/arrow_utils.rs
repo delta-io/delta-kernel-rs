@@ -107,7 +107,7 @@ pub(crate) struct RowIndexBuilder {
 
 impl RowIndexBuilder {
     pub(crate) fn new(row_groups: &[RowGroupMetaData]) -> Self {
-        let mut row_group_row_index_ranges = vec![];
+        let mut row_group_row_index_ranges = Vec::with_capacity(row_groups.len());
         let mut offset = 0;
         for row_group in row_groups {
             let num_rows = row_group.num_rows();
