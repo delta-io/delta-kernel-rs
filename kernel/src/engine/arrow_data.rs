@@ -240,7 +240,8 @@ impl EngineData for ArrowEngineData {
         // Collect the names of all leaf columns we want to extract, along with their parents, to
         // guide our depth-first extraction. If the list contains any non-leaf, duplicate, or
         // missing column references, the extracted column list will be too short (error out below).
-        let mut mask = HashSet::new();
+        let mask_capacity: usize = leaf_columns.iter().map(|c| c.len()).sum();
+        let mut mask = HashSet::with_capacity(mask_capacity);
         for column in leaf_columns {
             for i in 0..column.len() {
                 mask.insert(&column[..i + 1]);
@@ -248,7 +249,7 @@ impl EngineData for ArrowEngineData {
         }
         debug!("Column mask for selected columns {leaf_columns:?} is {mask:#?}");
 
-        let mut getters = vec![];
+        let mut getters = Vec::with_capacity(leaf_columns.len());
         Self::extract_columns(&mut vec![], &mut getters, leaf_types, &mask, &self.data)?;
         if getters.len() != leaf_columns.len() {
             return Err(Error::MissingColumn(format!(
