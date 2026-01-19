@@ -375,9 +375,8 @@ fn test_replay_for_scan_metadata() {
     let snapshot = Snapshot::builder_for(url).build(&engine).unwrap();
     let scan = snapshot.clone().scan_builder().build().unwrap();
 
-    // replay_for_scan_metadata returns (iter, has_stats_parsed, checkpoint_schema)
-    let (data_iter, _has_stats_parsed, _checkpoint_schema) =
-        scan.replay_for_scan_metadata(&engine).unwrap();
+    // replay_for_scan_metadata returns (iter, checkpoint_info)
+    let (data_iter, _checkpoint_info) = scan.replay_for_scan_metadata(&engine).unwrap();
 
     let data: Vec<_> = data_iter.try_collect().unwrap();
     // No predicate pushdown attempted, because at most one part of a multi-part checkpoint

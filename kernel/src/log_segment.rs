@@ -36,6 +36,18 @@ use url::Url;
 #[cfg(test)]
 mod tests;
 
+/// Information about checkpoint reading for data skipping optimization.
+///
+/// Returned alongside the actions iterator from checkpoint reading functions.
+#[derive(Debug, Clone)]
+pub struct CheckpointReadInfo {
+    /// Whether the checkpoint has compatible pre-parsed stats for data skipping.
+    /// When `true`, checkpoint batches can use stats_parsed directly instead of parsing JSON.
+    pub has_stats_parsed: bool,
+    /// The schema used to read checkpoint files, potentially including stats_parsed.
+    pub checkpoint_read_schema: SchemaRef,
+}
+
 /// A [`LogSegment`] represents a contiguous section of the log and is made of checkpoint files
 /// and commit files and guarantees the following:
 ///     1. Commit file versions will not have any gaps between them.
@@ -388,9 +400,7 @@ impl LogSegment {
     /// [`ActionsBatch`]s which includes EngineData of actions + a boolean flag indicating whether
     /// the data was read from a commit file (true) or a checkpoint file (false).
     ///
-    /// Also returns:
-    /// - `Option<bool>` indicating if checkpoint has compatible stats_parsed
-    /// - The checkpoint read schema (with stats_parsed if compatible)
+    /// Also returns [`CheckpointReadInfo`] with stats_parsed compatibility and the checkpoint schema.
     #[internal_api]
     pub(crate) fn read_actions_with_projected_checkpoint_actions(
         &self,
@@ -401,25 +411,19 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
-        Option<bool>,
-        SchemaRef,
+        CheckpointReadInfo,
     )> {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
         let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
 
-        let (checkpoint_stream, has_stats_parsed, checkpoint_schema) = self
-            .create_checkpoint_stream(
-                engine,
-                checkpoint_read_schema,
-                meta_predicate,
-                stats_schema,
-            )?;
+        let (checkpoint_stream, checkpoint_info) = self.create_checkpoint_stream(
+            engine,
+            checkpoint_read_schema,
+            meta_predicate,
+            stats_schema,
+        )?;
 
-        Ok((
-            commit_stream.chain(checkpoint_stream),
-            has_stats_parsed,
-            checkpoint_schema,
-        ))
+        Ok((commit_stream.chain(checkpoint_stream), checkpoint_info))
     }
 
     // Same as above, but uses the same schema for reading checkpoints and commits.
@@ -430,7 +434,7 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
-        let (actions_iter, _has_stats_parsed, _checkpoint_schema) = self
+        let (actions_iter, _checkpoint_info) = self
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 action_schema.clone(),
@@ -581,10 +585,7 @@ impl LogSegment {
     /// 2. Extracts sidecar file references if present (V2 checkpoints)
     /// 3. Reads checkpoint and sidecar data using cached sidecar refs
     ///
-    /// Returns a tuple of:
-    /// - Iterator over action batches from checkpoint and sidecar files
-    /// - `Option<bool>` indicating if checkpoint has compatible stats_parsed
-    /// - The checkpoint read schema (with stats_parsed if compatible)
+    /// Returns a tuple of the actions iterator and [`CheckpointReadInfo`].
     fn create_checkpoint_stream(
         &self,
         engine: &dyn Engine,
@@ -593,8 +594,7 @@ impl LogSegment {
         stats_schema: Option<&StructType>,
     ) -> DeltaResult<(
         impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
-        Option<bool>,
-        SchemaRef,
+        CheckpointReadInfo,
     )> {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
@@ -612,13 +612,13 @@ impl LogSegment {
         let has_stats_parsed =
             stats_schema
                 .zip(file_actions_schema.as_ref())
-                .map(|(stats, file_schema)| {
+                .is_some_and(|(stats, file_schema)| {
                     Self::schema_has_compatible_stats_parsed(file_schema, stats)
                 });
 
-        // Build checkpoint read schema with any additional fields needed
+        // Build final schema with any additional fields needed (stats_parsed, sidecar)
         // Only modify the schema if it has an "add" field (i.e., we need file actions)
-        let checkpoint_read_schema = if let Some(add_field) = action_schema.field("add") {
+        let final_schema = if let Some(add_field) = action_schema.field("add") {
             let DataType::Struct(add_struct) = add_field.data_type() else {
                 return Err(Error::internal_error(
                     "add field in action schema must be a struct",
@@ -627,9 +627,7 @@ impl LogSegment {
             let mut add_fields: Vec<StructField> = add_struct.fields().cloned().collect();
 
             // Add stats_parsed if checkpoint has compatible parsed stats
-            // Note: has_stats_parsed == Some(true) implies stats_schema.is_some() because
-            // has_stats_parsed is computed via stats_schema.zip(...).map(...)
-            if let (Some(true), Some(stats_schema)) = (has_stats_parsed, stats_schema) {
+            if let (true, Some(stats_schema)) = (has_stats_parsed, stats_schema) {
                 add_fields.push(StructField::nullable(
                     "stats_parsed",
                     DataType::Struct(Box::new(stats_schema.clone())),
@@ -684,14 +682,14 @@ impl LogSegment {
             Some(parsed_log_path) if parsed_log_path.extension == "json" => {
                 engine.json_handler().read_json_files(
                     &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
+                    final_schema.clone(),
                     meta_predicate.clone(),
                 )?
             }
             Some(parsed_log_path) if parsed_log_path.extension == "parquet" => parquet_handler
                 .read_parquet_files(
                     &checkpoint_file_meta,
-                    checkpoint_read_schema.clone(),
+                    final_schema.clone(),
                     meta_predicate.clone(),
                 )?,
             Some(parsed_log_path) => {
@@ -719,7 +717,11 @@ impl LogSegment {
             .map_ok(|batch| ActionsBatch::new(batch, false))
             .chain(sidecar_batches.map_ok(|batch| ActionsBatch::new(batch, false)));
 
-        Ok((actions_iter, has_stats_parsed, checkpoint_read_schema))
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed,
+            checkpoint_read_schema: final_schema,
+        };
+        Ok((actions_iter, checkpoint_info))
     }
 
     /// Extracts sidecar file references from a checkpoint file.

@@ -1170,7 +1170,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
         None,
         None,
     )?;
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let (mut iter, _checkpoint_info) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1239,7 +1239,7 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
         None,
         None,
     )?;
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let (mut iter, _checkpoint_info) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1303,7 +1303,7 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
         None,
         None,
     )?;
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let (mut iter, _checkpoint_info) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,
@@ -1356,7 +1356,7 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
         None,
         None,
     )?;
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) =
+    let (mut iter, _checkpoint_info) =
         log_segment.create_checkpoint_stream(&engine, v2_checkpoint_read_schema, None, None)?;
 
     // Assert that the first batch returned is from reading checkpoint file 1
@@ -1443,7 +1443,7 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
         None,
         None,
     )?;
-    let (mut iter, _has_stats_parsed, _checkpoint_schema) = log_segment.create_checkpoint_stream(
+    let (mut iter, _checkpoint_info) = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
         None,

@@ -13,6 +13,7 @@ use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, Pre
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
 use crate::log_replay::deduplicator::Deduplicator;
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
+use crate::log_segment::CheckpointReadInfo;
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, SchemaRef, StructField, StructType};
@@ -45,10 +46,8 @@ pub struct SerializableScanState {
     pub internal_state_blob: Vec<u8>,
     /// Set of file action keys that have already been processed.
     pub seen_file_keys: HashSet<FileActionKey>,
-    /// Schema used to read checkpoint files
-    pub checkpoint_read_schema: SchemaRef,
-    /// Whether checkpoint has compatible pre-parsed stats for data skipping
-    pub has_compatible_stats_parsed: bool,
+    /// Information about checkpoint reading for data skipping optimization
+    pub checkpoint_info: CheckpointReadInfo,
 }
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
@@ -95,26 +94,12 @@ impl ScanLogReplayProcessor {
     const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
 
     /// Create a new [`ScanLogReplayProcessor`] instance
-    ///
-    /// `checkpoint_read_schema` is the schema used to read checkpoint files, which includes
-    /// `stats_parsed` for data skipping optimization. This schema is needed both for creating
-    /// the data skipping filter (to extract stats_parsed) and for the add_transform evaluator.
-    ///
-    /// `has_compatible_stats_parsed` indicates whether the checkpoint has compatible pre-parsed
-    /// stats that can be used for coalescing in data skipping.
     pub(crate) fn new(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
-        checkpoint_read_schema: SchemaRef,
-        has_compatible_stats_parsed: bool,
+        checkpoint_info: CheckpointReadInfo,
     ) -> DeltaResult<Self> {
-        Self::new_with_seen_files(
-            engine,
-            state_info,
-            checkpoint_read_schema,
-            has_compatible_stats_parsed,
-            Default::default(),
-        )
+        Self::new_with_seen_files(engine, state_info, checkpoint_info, Default::default())
     }
 
     /// Create new [`ScanLogReplayProcessor`] with pre-populated seen_file_keys.
@@ -125,14 +110,12 @@ impl ScanLogReplayProcessor {
     /// # Parameters
     /// - `engine`: Engine for creating evaluators and filters
     /// - `state_info`: StateInfo containing schemas, transforms, and predicates
-    /// - `checkpoint_read_schema`: Schema used to read checkpoint files
-    /// - `has_compatible_stats_parsed`: Whether checkpoint has compatible pre-parsed stats
+    /// - `checkpoint_info`: Information about checkpoint reading for data skipping
     /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
     pub(crate) fn new_with_seen_files(
         engine: &dyn Engine,
         state_info: Arc<StateInfo>,
-        checkpoint_read_schema: SchemaRef,
-        has_compatible_stats_parsed: bool,
+        checkpoint_info: CheckpointReadInfo,
         seen_file_keys: HashSet<FileActionKey>,
     ) -> DeltaResult<Self> {
         // Extract the predicate from StateInfo's PhysicalPredicate enum.
@@ -144,6 +127,10 @@ impl ScanLogReplayProcessor {
             }
             PhysicalPredicate::None => None,
         };
+        let CheckpointReadInfo {
+            has_stats_parsed,
+            checkpoint_read_schema,
+        } = checkpoint_info;
         Ok(Self {
             partition_filter: predicate.clone(),
             data_skipping_filter: DataSkippingFilter::new(
@@ -151,7 +138,7 @@ impl ScanLogReplayProcessor {
                 predicate,
                 state_info.stats_schema.clone(),
                 checkpoint_read_schema.clone(),
-                has_compatible_stats_parsed,
+                has_stats_parsed,
             ),
             add_transform: engine.evaluation_handler().new_expression_evaluator(
                 checkpoint_read_schema,
@@ -180,8 +167,7 @@ impl ScanLogReplayProcessor {
     #[allow(unused)]
     pub(crate) fn into_serializable_state(
         self,
-        checkpoint_read_schema: SchemaRef,
-        has_compatible_stats_parsed: bool,
+        checkpoint_info: CheckpointReadInfo,
     ) -> DeltaResult<SerializableScanState> {
         let StateInfo {
             logical_schema,
@@ -210,15 +196,12 @@ impl ScanLogReplayProcessor {
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
 
-        let state = SerializableScanState {
+        Ok(SerializableScanState {
             predicate,
             internal_state_blob,
             seen_file_keys: self.seen_file_keys,
-            checkpoint_read_schema,
-            has_compatible_stats_parsed,
-        };
-
-        Ok(state)
+            checkpoint_info,
+        })
     }
 
     /// Reconstruct a processor from serialized state.
@@ -269,8 +252,7 @@ impl ScanLogReplayProcessor {
         let processor = Self::new_with_seen_files(
             engine,
             state_info,
-            state.checkpoint_read_schema,
-            state.has_compatible_stats_parsed,
+            state.checkpoint_info,
             state.seen_file_keys,
         )?;
 
@@ -583,26 +565,16 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
 ///
 /// Note: The iterator of [`ActionsBatch`]s ('action_iter' parameter) must be sorted by the order of
 /// the actions in the log from most recent to least recent.
-///
-/// `checkpoint_read_schema` is the schema used to read checkpoint files, which includes
-/// `stats_parsed` for data skipping optimization.
-///
-/// `has_compatible_stats_parsed` indicates whether the checkpoint has compatible pre-parsed
-/// stats that can be used for coalescing in data skipping.
 pub(crate) fn scan_action_iter(
     engine: &dyn Engine,
     action_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     state_info: Arc<StateInfo>,
-    checkpoint_read_schema: SchemaRef,
-    has_compatible_stats_parsed: bool,
+    checkpoint_info: CheckpointReadInfo,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-    Ok(ScanLogReplayProcessor::new(
-        engine,
-        state_info,
-        checkpoint_read_schema,
-        has_compatible_stats_parsed,
-    )?
-    .process_actions_iter(action_iter))
+    Ok(
+        ScanLogReplayProcessor::new(engine, state_info, checkpoint_info)?
+            .process_actions_iter(action_iter),
+    )
 }
 
 #[cfg(test)]
@@ -611,6 +583,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::actions::{get_commit_schema, get_log_add_schema};
+    use crate::log_segment::CheckpointReadInfo;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
@@ -688,15 +661,17 @@ mod tests {
             column_mapping_mode: ColumnMappingMode::None,
             stats_schema: None,
         });
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             state_info,
-            checkpoint_read_schema,
-            false, // has_compatible_stats_parsed
+            checkpoint_info,
         )
         .unwrap();
         for res in iter {
@@ -717,15 +692,17 @@ mod tests {
         let partition_cols = vec!["date".to_string()];
         let state_info = get_simple_state_info(schema, partition_cols).unwrap();
         let batch = vec![add_batch_with_partition_col()];
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-            checkpoint_read_schema,
-            false, // has_compatible_stats_parsed
+            checkpoint_info,
         )
         .unwrap();
 
@@ -798,14 +775,17 @@ mod tests {
         );
 
         let batch = vec![add_batch_for_row_id(get_commit_schema().clone())];
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
             Arc::new(state_info),
-            get_log_add_schema().clone(),
-            false, // has_compatible_stats_parsed
+            checkpoint_info,
         )
         .unwrap();
 
@@ -848,12 +828,14 @@ mod tests {
             StructField::new("id", DataType::INTEGER, true),
             StructField::new("value", DataType::STRING, true),
         ]));
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let mut processor = ScanLogReplayProcessor::new(
             &engine,
             Arc::new(get_simple_state_info(schema.clone(), vec![]).unwrap()),
-            checkpoint_read_schema.clone(),
-            false,
+            checkpoint_info.clone(),
         )
         .unwrap();
 
@@ -868,9 +850,7 @@ mod tests {
         let state_info = processor.state_info.clone();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
-            processor
-                .into_serializable_state(checkpoint_read_schema, false)
-                .unwrap(),
+            processor.into_serializable_state(checkpoint_info).unwrap(),
         )
         .unwrap();
 
@@ -903,7 +883,10 @@ mod tests {
             StructField::new("id", DataType::INTEGER, true),
             StructField::new("value", DataType::STRING, true),
         ]));
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let predicate = Arc::new(crate::expressions::Predicate::eq(
             Expr::column(["id"]),
             Expr::literal(10i32),
@@ -922,18 +905,12 @@ mod tests {
             PhysicalPredicate::Some(_, s) => s.clone(),
             _ => panic!("Expected predicate"),
         };
-        let processor = ScanLogReplayProcessor::new(
-            &engine,
-            state_info.clone(),
-            checkpoint_read_schema.clone(),
-            false,
-        )
-        .unwrap();
+        let processor =
+            ScanLogReplayProcessor::new(&engine, state_info.clone(), checkpoint_info.clone())
+                .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
-            processor
-                .into_serializable_state(checkpoint_read_schema, false)
-                .unwrap(),
+            processor.into_serializable_state(checkpoint_info).unwrap(),
         )
         .unwrap();
 
@@ -954,7 +931,10 @@ mod tests {
             StructField::new("value", DataType::INTEGER, true),
             StructField::new("date", DataType::DATE, true),
         ]));
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let state_info = Arc::new(
             get_state_info(
                 schema,
@@ -976,18 +956,12 @@ mod tests {
         );
         let original_transform = state_info.transform_spec.clone();
         assert!(original_transform.is_some());
-        let processor = ScanLogReplayProcessor::new(
-            &engine,
-            state_info.clone(),
-            checkpoint_read_schema.clone(),
-            false,
-        )
-        .unwrap();
+        let processor =
+            ScanLogReplayProcessor::new(&engine, state_info.clone(), checkpoint_info.clone())
+                .unwrap();
         let deserialized = ScanLogReplayProcessor::from_serializable_state(
             &engine,
-            processor
-                .into_serializable_state(checkpoint_read_schema, false)
-                .unwrap(),
+            processor.into_serializable_state(checkpoint_info).unwrap(),
         )
         .unwrap();
         assert_eq!(deserialized.state_info.transform_spec, original_transform);
@@ -997,12 +971,15 @@ mod tests {
     fn test_serialization_column_mapping_modes() {
         // Test that different ColumnMappingMode values are preserved
         let engine = SyncEngine::new();
-        let checkpoint_read_schema = get_log_add_schema().clone();
         for mode in [
             ColumnMappingMode::None,
             ColumnMappingMode::Id,
             ColumnMappingMode::Name,
         ] {
+            let checkpoint_info = CheckpointReadInfo {
+                has_stats_parsed: false,
+                checkpoint_read_schema: get_log_add_schema().clone(),
+            };
             let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
                 "id",
                 DataType::INTEGER,
@@ -1016,18 +993,11 @@ mod tests {
                 column_mapping_mode: mode,
                 stats_schema: None,
             });
-            let processor = ScanLogReplayProcessor::new(
-                &engine,
-                state_info,
-                checkpoint_read_schema.clone(),
-                false,
-            )
-            .unwrap();
+            let processor =
+                ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone()).unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
                 &engine,
-                processor
-                    .into_serializable_state(checkpoint_read_schema.clone(), false)
-                    .unwrap(),
+                processor.into_serializable_state(checkpoint_info).unwrap(),
             )
             .unwrap();
             assert_eq!(deserialized.state_info.column_mapping_mode, mode);
@@ -1038,7 +1008,10 @@ mod tests {
     fn test_serialization_edge_cases() {
         // Test edge cases: empty seen_file_keys, no predicate, no transform_spec
         let engine = SyncEngine::new();
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
             "id",
             DataType::INTEGER,
@@ -1053,11 +1026,8 @@ mod tests {
             stats_schema: None,
         });
         let processor =
-            ScanLogReplayProcessor::new(&engine, state_info, checkpoint_read_schema.clone(), false)
-                .unwrap();
-        let serialized = processor
-            .into_serializable_state(checkpoint_read_schema, false)
-            .unwrap();
+            ScanLogReplayProcessor::new(&engine, state_info, checkpoint_info.clone()).unwrap();
+        let serialized = processor.into_serializable_state(checkpoint_info).unwrap();
         assert!(serialized.predicate.is_none());
         let deserialized =
             ScanLogReplayProcessor::from_serializable_state(&engine, serialized).unwrap();
@@ -1069,13 +1039,15 @@ mod tests {
     fn test_serialization_invalid_json() {
         // Test that invalid JSON blobs are properly rejected
         let engine = SyncEngine::new();
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let invalid_state = SerializableScanState {
             predicate: None,
             internal_state_blob: vec![0, 1, 2, 3, 255], // Invalid JSON
             seen_file_keys: HashSet::new(),
-            checkpoint_read_schema,
-            has_compatible_stats_parsed: false,
+            checkpoint_info,
         };
         assert!(ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state).is_err());
     }
@@ -1084,7 +1056,10 @@ mod tests {
     fn test_serialization_missing_predicate_schema() {
         // Test that missing predicate_schema when predicate exists is detected
         let engine = SyncEngine::new();
-        let checkpoint_read_schema = get_log_add_schema().clone();
+        let checkpoint_info = CheckpointReadInfo {
+            has_stats_parsed: false,
+            checkpoint_read_schema: get_log_add_schema().clone(),
+        };
         let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
             "id",
             DataType::INTEGER,
@@ -1104,8 +1079,7 @@ mod tests {
             predicate: Some(predicate), // Predicate exists but schema is None
             internal_state_blob: invalid_blob,
             seen_file_keys: HashSet::new(),
-            checkpoint_read_schema,
-            has_compatible_stats_parsed: false,
+            checkpoint_info,
         };
         let result = ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state);
         assert!(result.is_err());

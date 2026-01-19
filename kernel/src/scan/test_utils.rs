@@ -6,6 +6,7 @@ use itertools::Itertools;
 use std::sync::Arc;
 
 use crate::log_replay::ActionsBatch;
+use crate::log_segment::CheckpointReadInfo;
 use crate::{
     actions::{get_commit_schema, get_log_add_schema},
     engine::{
@@ -148,15 +149,17 @@ pub(crate) fn run_with_validate_callback<T: Clone>(
         column_mapping_mode: ColumnMappingMode::None,
         stats_schema: None,
     });
-    let checkpoint_read_schema = get_log_add_schema().clone();
+    let checkpoint_info = CheckpointReadInfo {
+        has_stats_parsed: false,
+        checkpoint_read_schema: get_log_add_schema().clone(),
+    };
     let iter = scan_action_iter(
         &SyncEngine::new(),
         batch
             .into_iter()
             .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
         state_info,
-        checkpoint_read_schema,
-        false, // has_compatible_stats_parsed
+        checkpoint_info,
     )
     .unwrap();
     let mut batch_count = 0;
