@@ -23,6 +23,7 @@ pub struct CatalogCommit {
 }
 
 impl CatalogCommit {
+    #[allow(dead_code)] // pub(crate) constructor will be used in future PRs
     pub(crate) fn try_new(
         log_root: &Url,
         catalog_commit: &ParsedLogPath<FileMeta>,
