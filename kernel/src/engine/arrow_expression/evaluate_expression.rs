@@ -336,6 +336,29 @@ pub fn evaluate_expression(
             // Return as StructArray
             Ok(Arc::new(StructArray::from(result)) as ArrayRef)
         }
+        (ParsePartitionValues(p), _) => {
+            use crate::engine::arrow_utils::parse_partition_values_impl;
+
+            // Evaluate the map expression
+            let map_arr = evaluate_expression(&p.map_expr, batch, None)?;
+
+            // Convert kernel schema to Arrow schema
+            let arrow_schema = Arc::new(ArrowSchema::try_from_kernel(p.output_schema.as_ref())?);
+
+            // Parse partition values from map to typed struct
+            let result = parse_partition_values_impl(&map_arr, arrow_schema)?;
+            Ok(Arc::new(result) as ArrayRef)
+        }
+        (PartitionValuesToMap(p), _) => {
+            use crate::engine::arrow_utils::partition_values_to_map_impl;
+
+            // Evaluate the struct expression
+            let struct_arr = evaluate_expression(&p.struct_expr, batch, None)?;
+
+            // Convert typed struct to map of strings
+            let result = partition_values_to_map_impl(&struct_arr)?;
+            Ok(Arc::new(result) as ArrayRef)
+        }
         (Unknown(name), _) => Err(Error::unsupported(format!("Unknown expression: {name:?}"))),
     }
 }

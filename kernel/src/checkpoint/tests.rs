@@ -945,7 +945,7 @@ async fn test_all_stats_config_combinations() -> DeltaResult<()> {
 
         // Create checkpoint 1
         let snapshot1 = Snapshot::builder_for(table_root.clone()).build(&engine)?;
-        let writer1 = snapshot1.checkpoint()?;
+        let writer1 = snapshot1.create_checkpoint_writer()?;
         let result1 = writer1.checkpoint_data(&engine)?;
 
         // Verify checkpoint 1 schema
@@ -974,7 +974,7 @@ async fn test_all_stats_config_combinations() -> DeltaResult<()> {
 
         // Create checkpoint 2
         let snapshot2 = Snapshot::builder_for(table_root).build(&engine)?;
-        let writer2 = snapshot2.checkpoint()?;
+        let writer2 = snapshot2.create_checkpoint_writer()?;
         let result2 = writer2.checkpoint_data(&engine)?;
 
         // Verify checkpoint 2 schema

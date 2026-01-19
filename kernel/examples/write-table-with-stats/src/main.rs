@@ -1,9 +1,10 @@
-//! Example: Write a Delta table with parsed stats (stats_parsed) enabled.
+//! Example: Write a partitioned Delta table with parsed stats (stats_parsed) and
+//! parsed partition values (partitionValues_parsed) enabled.
 //!
 //! This example demonstrates the full workflow:
-//! 1. Create a new Delta table with `writeStatsAsStruct=true`
+//! 1. Create a new partitioned Delta table with `writeStatsAsStruct=true`
 //! 2. Write data to the table (stats are automatically captured)
-//! 3. Create a checkpoint (transforms JSON stats to stats_parsed)
+//! 3. Create a checkpoint (transforms JSON stats to stats_parsed and partitionValues to partitionValues_parsed)
 //! 4. Read the table to verify stats-based data skipping works
 //!
 //! Run with: cargo run -p write-table-with-stats -- /tmp/my-stats-table
@@ -18,7 +19,7 @@ use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use url::Url;
 
-use delta_kernel::arrow::array::{Int64Array, RecordBatch, StringArray};
+use delta_kernel::arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use delta_kernel::checkpoint::CheckpointDataIterator;
 use delta_kernel::committer::FileSystemCommitter;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
@@ -78,7 +79,7 @@ async fn try_main() -> DeltaResult<()> {
     let table_url = delta_kernel::try_parse_uri(&cli.location_args.path)?;
     let table_path = Path::new(&cli.location_args.path).to_path_buf();
 
-    println!("=== Delta Kernel: Write Table with Parsed Stats ===\n");
+    println!("=== Delta Kernel: Partitioned Table with Parsed Stats ===\n");
     println!("Table location: {}\n", table_url);
 
     // Create the engine
@@ -86,21 +87,22 @@ async fn try_main() -> DeltaResult<()> {
     let store = store_from_url(&table_url)?;
     let engine = DefaultEngineBuilder::new(store).build();
 
-    // Define the table schema
+    // Define the table schema (with partition column 'year')
     let schema: SchemaRef = Arc::new(StructType::new_unchecked(vec![
         StructField::nullable("id", DataType::LONG),
         StructField::nullable("name", DataType::STRING),
+        StructField::nullable("year", DataType::INTEGER), // partition column
     ]));
 
     // Step 1: Create the table with writeStatsAsStruct=true
     println!("Step 1: Creating table with stats configuration...");
     create_table_with_stats_config(&table_path, &table_url, &schema)?;
 
-    // Step 2: Write data in multiple commits to create multiple files
-    println!("\nStep 2: Writing data to table...");
-    write_data_to_table(&engine, &table_url, &schema, 1..=25).await?;
-    write_data_to_table(&engine, &table_url, &schema, 26..=50).await?;
-    write_data_to_table(&engine, &table_url, &schema, 51..=100).await?;
+    // Step 2: Write data in multiple commits to create multiple files (different partitions)
+    println!("\nStep 2: Writing data to table (partitioned by year)...");
+    write_data_to_table(&engine, &table_url, &schema, 1..=25, 2023).await?;
+    write_data_to_table(&engine, &table_url, &schema, 26..=50, 2024).await?;
+    write_data_to_table(&engine, &table_url, &schema, 51..=100, 2025).await?;
 
     // Step 3: Create a checkpoint
     println!("\nStep 3: Creating checkpoint with stats_parsed...");
@@ -138,7 +140,7 @@ fn create_table_with_stats_config(
             "id": "example-table-with-stats",
             "format": {"provider": "parquet", "options": {}},
             "schemaString": schema_json,
-            "partitionColumns": [],
+            "partitionColumns": ["year"],
             "configuration": {
                 "delta.checkpoint.writeStatsAsStruct": "true",
                 "delta.checkpoint.writeStatsAsJson": "false"
@@ -174,6 +176,7 @@ async fn write_data_to_table(
     table_url: &Url,
     schema: &SchemaRef,
     id_range: std::ops::RangeInclusive<i64>,
+    year: i32,
 ) -> DeltaResult<()> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
     let committer = Box::new(FileSystemCommitter::new());
@@ -187,26 +190,37 @@ async fn write_data_to_table(
     let arrow_schema: Arc<delta_kernel::arrow::datatypes::Schema> =
         Arc::new(schema.as_ref().try_into_arrow()?);
 
-    // Create data
+    // Create data with partition column
+    let num_rows = id_range.clone().count();
     let ids: Vec<i64> = id_range.clone().collect();
     let names: Vec<String> = id_range.map(|i| format!("name_{}", i)).collect();
+    let years: Vec<i32> = vec![year; num_rows];
     let batch = RecordBatch::try_new(
         arrow_schema,
         vec![
             Arc::new(Int64Array::from(ids)),
             Arc::new(StringArray::from(names)),
+            Arc::new(Int32Array::from(years)),
         ],
     )?;
 
+    // Pass partition values when writing
+    let mut partition_values = HashMap::new();
+    partition_values.insert("year".to_string(), year.to_string());
+
     let engine_data = Box::new(ArrowEngineData::new(batch));
     let file_metadata = engine
-        .write_parquet(&engine_data, write_context.as_ref(), HashMap::new())
+        .write_parquet(&engine_data, write_context.as_ref(), partition_values)
         .await?;
     txn.add_files(file_metadata);
 
     match txn.commit(engine)? {
         CommitResult::CommittedTransaction(committed) => {
-            println!("Committed version {}", committed.commit_version());
+            println!(
+                "Committed version {} (year={})",
+                committed.commit_version(),
+                year
+            );
             Ok(())
         }
         _ => Err(Error::generic("Commit failed")),
@@ -227,15 +241,27 @@ fn create_checkpoint(
     let checkpoint_path = writer.checkpoint_path()?;
     let mut data_iter = writer.checkpoint_data(engine)?;
 
-    // Check that output schema includes stats_parsed
+    // Check that output schema includes stats_parsed and partitionValues_parsed
     let output_schema = data_iter.output_schema();
     if let Some(add_field) = output_schema.field("add") {
         if let DataType::Struct(add_struct) = add_field.data_type() {
             println!(
-                "Checkpoint schema: stats={}, stats_parsed={}",
+                "Checkpoint Add schema fields: stats={}, stats_parsed={}, partitionValues={}, partitionValues_parsed={}",
                 add_struct.field("stats").is_some(),
-                add_struct.field("stats_parsed").is_some()
+                add_struct.field("stats_parsed").is_some(),
+                add_struct.field("partitionValues").is_some(),
+                add_struct.field("partitionValues_parsed").is_some()
             );
+            // Print partitionValues_parsed schema if present
+            if let Some(pv_parsed) = add_struct.field("partitionValues_parsed") {
+                if let DataType::Struct(pv_struct) = pv_parsed.data_type() {
+                    let fields: Vec<_> = pv_struct
+                        .fields()
+                        .map(|f| format!("{}: {:?}", f.name, f.data_type))
+                        .collect();
+                    println!("  partitionValues_parsed schema: {{{}}}", fields.join(", "));
+                }
+            }
         }
     }
 

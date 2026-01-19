@@ -183,6 +183,8 @@ pub trait KernelPredicateEvaluator {
             | Expr::Binary(_)
             | Expr::Variadic(_)
             | Expr::ParseJson(_)
+            | Expr::ParsePartitionValues(_)
+            | Expr::PartitionValuesToMap(_)
             | Expr::Unknown(_) => None,
         }
     }
@@ -211,6 +213,8 @@ pub trait KernelPredicateEvaluator {
                 | Expr::Variadic(_)
                 | Expr::Opaque(_)
                 | Expr::ParseJson { .. }
+                | Expr::ParsePartitionValues(_)
+                | Expr::PartitionValuesToMap(_)
                 | Expr::Unknown(_) => {
                     debug!("Unsupported operand: IS [NOT] NULL: {expr:?}");
                     None
@@ -642,6 +646,8 @@ impl<R: ResolveColumnAsScalar> DefaultKernelPredicateEvaluator<R> {
                 })
                 .ok(),
             Expr::ParseJson(_) => None, // ParseJson is not expected to be a top-level predicate expression
+            Expr::ParsePartitionValues(_) => None, // ParsePartitionValues is not expected to be a top-level predicate expression
+            Expr::PartitionValuesToMap(_) => None, // PartitionValuesToMap is not expected to be a top-level predicate expression
             Expr::Unknown(_) => None,
         }
     }

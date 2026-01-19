@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, Transform,
-    UnaryExpression, UnaryPredicate, VariadicExpression,
+    OpaqueExpression, OpaquePredicate, ParseJsonExpression, ParsePartitionValuesExpression,
+    PartitionValuesToMapExpression, Predicate, Scalar, Transform, UnaryExpression, UnaryPredicate,
+    VariadicExpression,
 };
 use crate::utils::CowExt as _;
 
@@ -76,6 +77,26 @@ pub trait ExpressionTransform<'a> {
         expr: &'a ParseJsonExpression,
     ) -> Option<Cow<'a, ParseJsonExpression>> {
         self.recurse_into_expr_parse_json(expr)
+    }
+
+    /// Called for each [`ParsePartitionValuesExpression`] encountered during the traversal.
+    /// Implementations can call [`Self::recurse_into_expr_parse_partition_values`] if they wish
+    /// to recursively transform the child expression.
+    fn transform_expr_parse_partition_values(
+        &mut self,
+        expr: &'a ParsePartitionValuesExpression,
+    ) -> Option<Cow<'a, ParsePartitionValuesExpression>> {
+        self.recurse_into_expr_parse_partition_values(expr)
+    }
+
+    /// Called for each [`PartitionValuesToMapExpression`] encountered during the traversal.
+    /// Implementations can call [`Self::recurse_into_expr_partition_values_to_map`] if they wish
+    /// to recursively transform the child expression.
+    fn transform_expr_partition_values_to_map(
+        &mut self,
+        expr: &'a PartitionValuesToMapExpression,
+    ) -> Option<Cow<'a, PartitionValuesToMapExpression>> {
+        self.recurse_into_expr_partition_values_to_map(expr)
     }
 
     /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
@@ -195,6 +216,12 @@ pub trait ExpressionTransform<'a> {
             Expression::ParseJson(p) => self
                 .transform_expr_parse_json(p)?
                 .map_owned_or_else(expr, Expression::ParseJson),
+            Expression::ParsePartitionValues(p) => self
+                .transform_expr_parse_partition_values(p)?
+                .map_owned_or_else(expr, Expression::ParsePartitionValues),
+            Expression::PartitionValuesToMap(p) => self
+                .transform_expr_partition_values_to_map(p)?
+                .map_owned_or_else(expr, Expression::PartitionValuesToMap),
             Expression::Unknown(u) => self
                 .transform_expr_unknown(u)?
                 .map_owned_or_else(expr, Expression::Unknown),
@@ -254,6 +281,30 @@ pub trait ExpressionTransform<'a> {
         Some(nested.map_owned_or_else(expr, |json_expr| {
             ParseJsonExpression::new(json_expr, expr.output_schema.clone())
         }))
+    }
+
+    /// Recursively transforms the child expression of a [`ParsePartitionValuesExpression`]. The
+    /// schema is not transformed. Returns `None` if the child was removed, `Some(Cow::Owned)` if
+    /// the child was changed, and `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_parse_partition_values(
+        &mut self,
+        expr: &'a ParsePartitionValuesExpression,
+    ) -> Option<Cow<'a, ParsePartitionValuesExpression>> {
+        let nested = self.transform_expr(&expr.map_expr)?;
+        Some(nested.map_owned_or_else(expr, |map_expr| {
+            ParsePartitionValuesExpression::new(map_expr, expr.output_schema.clone())
+        }))
+    }
+
+    /// Recursively transforms the child expression of a [`PartitionValuesToMapExpression`]. Returns
+    /// `None` if the child was removed, `Some(Cow::Owned)` if the child was changed, and
+    /// `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_partition_values_to_map(
+        &mut self,
+        expr: &'a PartitionValuesToMapExpression,
+    ) -> Option<Cow<'a, PartitionValuesToMapExpression>> {
+        let nested = self.transform_expr(&expr.struct_expr)?;
+        Some(nested.map_owned_or_else(expr, PartitionValuesToMapExpression::new))
     }
 
     /// Recursively transforms the children of an [`OpaqueExpression`]. Returns `None` if all

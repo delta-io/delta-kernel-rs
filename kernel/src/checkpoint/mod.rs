@@ -364,6 +364,12 @@ impl CheckpointWriter {
             .table_configuration()
             .expected_stats_schema()?;
 
+        // Get partition values schema (None if table is not partitioned)
+        let partition_schema = self
+            .snapshot
+            .table_configuration()
+            .partition_values_schema()?;
+
         // Select schema based on V2 checkpoint support
         let is_v2_checkpoints_supported = self
             .snapshot
@@ -376,9 +382,13 @@ impl CheckpointWriter {
             &CHECKPOINT_ACTIONS_SCHEMA_V1
         };
 
-        // Read schema includes stats_parsed so COALESCE expressions can operate on it.
-        // For commits, stats_parsed will be read as nulls (column doesn't exist in source).
-        let read_schema = build_checkpoint_read_schema_with_stats(base_schema, &stats_schema);
+        // Read schema includes stats_parsed and partition_values_parsed so COALESCE expressions
+        // can operate on them. For commits, these will be read as nulls (columns don't exist).
+        let read_schema = build_checkpoint_read_schema_with_stats(
+            base_schema,
+            &stats_schema,
+            partition_schema.as_ref().map(|s| s.as_ref()),
+        );
 
         // Read actions from log segment
         let actions =
@@ -394,10 +404,15 @@ impl CheckpointWriter {
         .process_actions_iter(actions);
 
         // Build output schema based on stats config (determines which fields are included)
-        let output_schema = build_checkpoint_output_schema(&config, base_schema, &stats_schema);
+        let output_schema = build_checkpoint_output_schema(
+            &config,
+            base_schema,
+            &stats_schema,
+            partition_schema.as_ref().map(|s| s.as_ref()),
+        );
 
         // Build transform expression and create expression evaluator
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, stats_schema, partition_schema);
         let evaluator = engine.evaluation_handler().new_expression_evaluator(
             read_schema.clone(),
             transform_expr,

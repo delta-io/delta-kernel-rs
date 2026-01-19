@@ -15,13 +15,15 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use crate::arrow::array::{
-    cast::AsArray, make_array, new_null_array, Array as ArrowArray, GenericListArray, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray, StringArray, StructArray,
+    cast::AsArray, make_array, new_null_array, Array as ArrowArray, ArrayRef, BooleanArray,
+    GenericListArray, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, RunArray,
+    StringArray, StructArray,
 };
 use crate::arrow::buffer::NullBuffer;
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, FieldRef as ArrowFieldRef,
-    Fields as ArrowFields, Int64Type, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    DataType as ArrowDataType, Date32Type, Field as ArrowField, FieldRef as ArrowFieldRef,
+    Fields as ArrowFields, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, TimestampMicrosecondType,
 };
 use crate::arrow::json::{LineDelimitedWriter, ReaderBuilder};
 use crate::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -1109,6 +1111,293 @@ pub(crate) fn parse_json_impl(
     Err(Error::generic(
         "Malformed JSON: exited parse_json_impl without deserializing anything useful",
     ))
+}
+
+/// Parse partition values from a Map<String, String> array into a typed StructArray.
+///
+/// For each field in the output schema, this function:
+/// 1. Looks up the field name as a key in the input map
+/// 2. Parses the string value to the target data type
+/// 3. Returns a StructArray with the typed values
+///
+/// Null map entries or missing keys result in null values in the output struct.
+pub(crate) fn parse_partition_values_impl(
+    map_arr: &ArrayRef,
+    output_schema: ArrowSchemaRef,
+) -> DeltaResult<StructArray> {
+    use crate::arrow::array::{
+        builder::StringBuilder, Date32Array, Float32Array, Float64Array, Int16Array,
+        Int32Array as ArrowInt32Array, Int64Array, Int8Array, MapArray, TimestampMicrosecondArray,
+    };
+    use crate::arrow::datatypes::DataType as ArrowDataType;
+
+    let num_rows = map_arr.len();
+
+    // Handle empty input
+    if num_rows == 0 {
+        let empty_columns: Vec<ArrayRef> = output_schema
+            .fields()
+            .iter()
+            .map(|field| crate::arrow::array::new_null_array(field.data_type(), 0))
+            .collect();
+        return Ok(StructArray::try_new(
+            output_schema.fields().clone(),
+            empty_columns,
+            None,
+        )?);
+    }
+
+    // Downcast to MapArray
+    let map_array = map_arr
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .ok_or_else(|| Error::generic("ParsePartitionValues input must be a Map array"))?;
+
+    // Build output columns for each field in the schema
+    let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    for field in output_schema.fields() {
+        let field_name = field.name();
+        let target_type = field.data_type();
+
+        // Extract string values for this partition column from each row's map
+        let mut string_values: Vec<Option<String>> = Vec::with_capacity(num_rows);
+
+        for row_idx in 0..num_rows {
+            if map_array.is_null(row_idx) {
+                string_values.push(None);
+                continue;
+            }
+
+            // Get the map entry for this row
+            let entry = map_array.value(row_idx);
+            let keys = entry.column(0);
+            let values = entry.column(1);
+
+            // Find the key matching field_name
+            let key_array = keys
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| Error::generic("Map keys must be strings"))?;
+            let value_array = values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| Error::generic("Map values must be strings"))?;
+
+            let mut found_value: Option<String> = None;
+            for i in 0..key_array.len() {
+                if !key_array.is_null(i) && key_array.value(i) == field_name {
+                    found_value = if value_array.is_null(i) {
+                        None
+                    } else {
+                        Some(value_array.value(i).to_string())
+                    };
+                    break;
+                }
+            }
+            string_values.push(found_value);
+        }
+
+        // Parse string values to target type
+        let typed_array: ArrayRef = match target_type {
+            ArrowDataType::Utf8 => {
+                let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
+                for val in &string_values {
+                    match val {
+                        Some(s) => builder.append_value(s),
+                        None => builder.append_null(),
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            ArrowDataType::Int8 => {
+                let values: Vec<Option<i8>> = string_values
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|s| s.parse().ok()))
+                    .collect();
+                Arc::new(Int8Array::from(values))
+            }
+            ArrowDataType::Int16 => {
+                let values: Vec<Option<i16>> = string_values
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|s| s.parse().ok()))
+                    .collect();
+                Arc::new(Int16Array::from(values))
+            }
+            ArrowDataType::Int32 => {
+                let values: Vec<Option<i32>> = string_values
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|s| s.parse().ok()))
+                    .collect();
+                Arc::new(ArrowInt32Array::from(values))
+            }
+            ArrowDataType::Int64 => {
+                let values: Vec<Option<i64>> = string_values
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|s| s.parse().ok()))
+                    .collect();
+                Arc::new(Int64Array::from(values))
+            }
+            ArrowDataType::Float32 => {
+                let values: Vec<Option<f32>> = string_values
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|s| s.parse().ok()))
+                    .collect();
+                Arc::new(Float32Array::from(values))
+            }
+            ArrowDataType::Float64 => {
+                let values: Vec<Option<f64>> = string_values
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|s| s.parse().ok()))
+                    .collect();
+                Arc::new(Float64Array::from(values))
+            }
+            ArrowDataType::Boolean => {
+                let values: Vec<Option<bool>> = string_values
+                    .iter()
+                    .map(|v| {
+                        v.as_ref().and_then(|s| match s.to_lowercase().as_str() {
+                            "true" => Some(true),
+                            "false" => Some(false),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                Arc::new(BooleanArray::from(values))
+            }
+            ArrowDataType::Date32 => {
+                // Parse dates in yyyy-MM-dd format to days since epoch
+                let values: Vec<Option<i32>> = string_values
+                    .iter()
+                    .map(|v| {
+                        v.as_ref().and_then(|s| {
+                            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                                .ok()
+                                .map(|d| {
+                                    (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                                        .num_days() as i32
+                                })
+                        })
+                    })
+                    .collect();
+                Arc::new(Date32Array::from(values))
+            }
+            ArrowDataType::Timestamp(crate::arrow::datatypes::TimeUnit::Microsecond, tz) => {
+                // Parse timestamps
+                let values: Vec<Option<i64>> = string_values
+                    .iter()
+                    .map(|v| {
+                        v.as_ref().and_then(|s| {
+                            chrono::DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| dt.timestamp_micros())
+                        })
+                    })
+                    .collect();
+                Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(tz.clone()))
+            }
+            _ => {
+                return Err(Error::generic(format!(
+                    "Unsupported partition value type: {:?}",
+                    target_type
+                )));
+            }
+        };
+
+        output_columns.push(typed_array);
+    }
+
+    Ok(StructArray::try_new(
+        output_schema.fields().clone(),
+        output_columns,
+        None,
+    )?)
+}
+
+/// Convert a typed partition values StructArray back to a Map<String, String>.
+///
+/// For each field in the input struct, this function:
+/// 1. Converts the typed value to its string representation
+/// 2. Creates a map entry with the field name as key
+///
+/// Null struct fields are represented as null values in the output map.
+pub(crate) fn partition_values_to_map_impl(struct_arr: &ArrayRef) -> DeltaResult<MapArray> {
+    use crate::arrow::array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+
+    let struct_array = struct_arr
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| Error::generic("PartitionValuesToMap input must be a Struct array"))?;
+
+    let num_rows = struct_array.len();
+    let fields = struct_array.fields();
+
+    // Create MapBuilder with String keys and String values
+    // Use field names that match Delta's expected schema: "key_value" containing "key" and "value"
+    let key_builder = StringBuilder::new();
+    let value_builder = StringBuilder::new();
+    let field_names = MapFieldNames {
+        entry: "key_value".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut map_builder = MapBuilder::new(Some(field_names), key_builder, value_builder);
+
+    for row_idx in 0..num_rows {
+        // For each row, add all partition columns as map entries
+        for (field_idx, field) in fields.iter().enumerate() {
+            let column = struct_array.column(field_idx);
+            let field_name = field.name();
+
+            map_builder.keys().append_value(field_name);
+
+            if column.is_null(row_idx) {
+                map_builder.values().append_null();
+            } else {
+                // Convert value to string based on type
+                let string_value = value_to_string(column, row_idx, field.data_type())?;
+                map_builder.values().append_value(&string_value);
+            }
+        }
+        map_builder.append(true)?;
+    }
+
+    Ok(map_builder.finish())
+}
+
+/// Helper function to convert an array value at a given index to a string.
+fn value_to_string(array: &ArrayRef, idx: usize, data_type: &ArrowDataType) -> DeltaResult<String> {
+    use crate::arrow::array::cast::AsArray;
+    use crate::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+
+    match data_type {
+        ArrowDataType::Utf8 => Ok(array.as_string::<i32>().value(idx).to_string()),
+        ArrowDataType::Int8 => Ok(array.as_primitive::<Int8Type>().value(idx).to_string()),
+        ArrowDataType::Int16 => Ok(array.as_primitive::<Int16Type>().value(idx).to_string()),
+        ArrowDataType::Int32 => Ok(array.as_primitive::<Int32Type>().value(idx).to_string()),
+        ArrowDataType::Int64 => Ok(array.as_primitive::<Int64Type>().value(idx).to_string()),
+        ArrowDataType::Float32 => Ok(array.as_primitive::<Float32Type>().value(idx).to_string()),
+        ArrowDataType::Float64 => Ok(array.as_primitive::<Float64Type>().value(idx).to_string()),
+        ArrowDataType::Boolean => Ok(array.as_boolean().value(idx).to_string()),
+        ArrowDataType::Date32 => {
+            let days = array.as_primitive::<Date32Type>().value(idx);
+            let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .unwrap()
+                .checked_add_signed(chrono::Duration::days(days as i64))
+                .ok_or_else(|| Error::generic("Invalid date value"))?;
+            Ok(date.format("%Y-%m-%d").to_string())
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let micros = array.as_primitive::<TimestampMicrosecondType>().value(idx);
+            let dt = chrono::DateTime::from_timestamp_micros(micros)
+                .ok_or_else(|| Error::generic("Invalid timestamp value"))?;
+            Ok(dt.to_rfc3339())
+        }
+        _ => Err(Error::generic(format!(
+            "Unsupported partition value type for string conversion: {:?}",
+            data_type
+        ))),
+    }
 }
 
 pub(crate) fn filter_to_record_batch(

@@ -247,6 +247,26 @@ pub struct ParseJsonExpression {
     pub output_schema: SchemaRef,
 }
 
+/// An expression that parses partition values from a Map<String, String> into a typed struct.
+/// This is used in checkpoints when `writeStatsAsStruct=true` to convert the string-valued
+/// `partitionValues` map into a typed `partitionValues_parsed` struct.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ParsePartitionValuesExpression {
+    /// The expression that evaluates to a Map<String, String> column containing partition values.
+    pub map_expr: Box<Expression>,
+    /// The schema defining the structure to parse the partition values into.
+    /// Each field corresponds to a partition column with its original data type.
+    pub output_schema: SchemaRef,
+}
+
+/// An expression that converts a typed partition values struct back to a Map<String, String>.
+/// This is the inverse of `ParsePartitionValues` - it converts a typed struct back to string values.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PartitionValuesToMapExpression {
+    /// The expression that evaluates to a struct column containing typed partition values.
+    pub struct_expr: Box<Expression>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JunctionPredicate {
     /// The operator.
@@ -462,6 +482,10 @@ pub enum Expression {
     Unknown(String),
     /// Parse a JSON string expression into a struct with the given schema.
     ParseJson(ParseJsonExpression),
+    /// Parse partition values from Map<String, String> into a typed struct.
+    ParsePartitionValues(ParsePartitionValuesExpression),
+    /// Convert a typed partition values struct to Map<String, String>.
+    PartitionValuesToMap(PartitionValuesToMapExpression),
 }
 
 /// A SQL predicate.
@@ -580,6 +604,23 @@ impl ParseJsonExpression {
         Self {
             json_expr: Box::new(json_expr.into()),
             output_schema,
+        }
+    }
+}
+
+impl ParsePartitionValuesExpression {
+    fn new(map_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+        Self {
+            map_expr: Box::new(map_expr.into()),
+            output_schema,
+        }
+    }
+}
+
+impl PartitionValuesToMapExpression {
+    fn new(struct_expr: impl Into<Expression>) -> Self {
+        Self {
+            struct_expr: Box::new(struct_expr.into()),
         }
     }
 }
@@ -718,6 +759,21 @@ impl Expression {
     /// This is the inverse of `ToJson` - it converts a JSON-encoded string into a struct.
     pub fn parse_json(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
+    }
+
+    /// Creates a new ParsePartitionValues expression that parses partition values from a
+    /// Map<String, String> into a typed struct with the given schema.
+    pub fn parse_partition_values(
+        map_expr: impl Into<Expression>,
+        output_schema: SchemaRef,
+    ) -> Self {
+        Self::ParsePartitionValues(ParsePartitionValuesExpression::new(map_expr, output_schema))
+    }
+
+    /// Creates a new PartitionValuesToMap expression that converts a typed partition values
+    /// struct back to a Map<String, String>.
+    pub fn partition_values_to_map(struct_expr: impl Into<Expression>) -> Self {
+        Self::PartitionValuesToMap(PartitionValuesToMapExpression::new(struct_expr))
     }
 }
 
@@ -980,6 +1036,17 @@ impl Display for Expression {
                     p.json_expr,
                     p.output_schema.fields().len()
                 )
+            }
+            ParsePartitionValues(p) => {
+                write!(
+                    f,
+                    "PARSE_PARTITION_VALUES({}, <schema:{} fields>)",
+                    p.map_expr,
+                    p.output_schema.fields().len()
+                )
+            }
+            PartitionValuesToMap(p) => {
+                write!(f, "PARTITION_VALUES_TO_MAP({})", p.struct_expr)
             }
         }
     }

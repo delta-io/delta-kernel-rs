@@ -1,11 +1,11 @@
-//! Transforms for populating stats_parsed and stats fields in checkpoint data.
+//! Transforms for populating stats and partition values fields in checkpoint data.
 //!
-//! When writing checkpoints, statistics can be stored in two formats:
-//! - `stats`: JSON string format (controlled by `writeStatsAsJson` table property)
-//! - `stats_parsed`: Native struct format (controlled by `writeStatsAsStruct` table property)
+//! When writing checkpoints, statistics and partition values can be stored in two formats:
+//! - `stats`/`partitionValues`: JSON string/map format (controlled by `writeStatsAsJson`)
+//! - `stats_parsed`/`partitionValues_parsed`: Native struct format (controlled by `writeStatsAsStruct`)
 //!
 //! This module provides transforms to populate these fields using COALESCE expressions,
-//! ensuring that stats are preserved regardless of the source format (commits vs checkpoints).
+//! ensuring that data is preserved regardless of the source format (commits vs checkpoints).
 
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ use crate::table_properties::TableProperties;
 
 pub(crate) const STATS_FIELD: &str = "stats";
 pub(crate) const STATS_PARSED_FIELD: &str = "stats_parsed";
+pub(crate) const PARTITION_VALUES_FIELD: &str = "partitionValues";
+pub(crate) const PARTITION_VALUES_PARSED_FIELD: &str = "partitionValues_parsed";
 
 /// Configuration for stats transformation based on table properties.
 #[derive(Debug, Clone, Copy)]
@@ -35,19 +37,26 @@ impl StatsTransformConfig {
     }
 }
 
-/// Builds a transform for the Add action to populate and/or drop stats fields.
+/// Builds a transform for the Add action to populate and/or drop stats and partition values fields.
 ///
-/// The transform handles all four scenarios based on table properties:
+/// The transform handles all scenarios based on table properties:
+///
+/// Stats fields:
 /// - When `writeStatsAsJson=true`: `stats = COALESCE(stats, ToJson(stats_parsed))`
 /// - When `writeStatsAsJson=false`: drop `stats` field
 /// - When `writeStatsAsStruct=true`: `stats_parsed = COALESCE(stats_parsed, ParseJson(stats))`
 /// - When `writeStatsAsStruct=false`: drop `stats_parsed` field
+///
+/// Partition values fields (when table is partitioned and writeStatsAsStruct=true):
+/// - `partitionValues_parsed = COALESCE(partitionValues_parsed, ParsePartitionValues(partitionValues))`
+/// - `partitionValues = COALESCE(partitionValues, PartitionValuesToMap(partitionValues_parsed))`
 ///
 /// Returns a top-level transform that wraps the nested Add transform, ensuring the
 /// full checkpoint batch is produced with the modified Add action.
 pub(crate) fn build_stats_transform(
     config: &StatsTransformConfig,
     stats_schema: SchemaRef,
+    partition_schema: Option<SchemaRef>,
 ) -> ExpressionRef {
     let mut add_transform = Transform::new_nested([ADD_NAME]);
 
@@ -71,6 +80,23 @@ pub(crate) fn build_stats_transform(
     } else {
         // Drop stats_parsed field when not writing as struct
         add_transform = add_transform.with_dropped_field(STATS_PARSED_FIELD);
+    }
+
+    // Handle partition values fields (only for partitioned tables)
+    if let Some(partition_schema) = partition_schema {
+        if config.write_stats_as_struct {
+            // Add partitionValues_parsed with COALESCE expression
+            let pv_parsed_expr = build_partition_values_parsed_expr(partition_schema);
+            add_transform =
+                add_transform.with_replaced_field(PARTITION_VALUES_PARSED_FIELD, pv_parsed_expr);
+        } else {
+            // Drop partitionValues_parsed field when not writing as struct
+            add_transform = add_transform.with_dropped_field(PARTITION_VALUES_PARSED_FIELD);
+        }
+
+        // Always populate partitionValues for backward compatibility
+        let pv_map_expr = build_partition_values_map_expr();
+        add_transform = add_transform.with_replaced_field(PARTITION_VALUES_FIELD, pv_map_expr);
     }
 
     // Wrap the nested Add transform in a top-level transform that replaces the Add field
@@ -114,21 +140,56 @@ fn build_stats_json_expr() -> ExpressionRef {
     ))
 }
 
-/// Builds a read schema that includes `stats_parsed` in the Add action.
+/// Builds expression: `partitionValues_parsed = COALESCE(partitionValues_parsed, ParsePartitionValues(partitionValues, schema))`
 ///
-/// The read schema must include `stats_parsed` for ALL reads (checkpoints + commits)
-/// even though commits don't have `stats_parsed`. This ensures the column exists
+/// This expression prefers existing partitionValues_parsed, falling back to parsing the string map.
+fn build_partition_values_parsed_expr(partition_schema: SchemaRef) -> ExpressionRef {
+    Arc::new(Expression::variadic(
+        VariadicExpressionOp::Coalesce,
+        vec![
+            Expression::column([ADD_NAME, PARTITION_VALUES_PARSED_FIELD]),
+            Expression::parse_partition_values(
+                Expression::column([ADD_NAME, PARTITION_VALUES_FIELD]),
+                partition_schema,
+            ),
+        ],
+    ))
+}
+
+/// Builds expression: `partitionValues = COALESCE(partitionValues, PartitionValuesToMap(partitionValues_parsed))`
+///
+/// This expression prefers existing partitionValues map, falling back to converting from typed struct.
+fn build_partition_values_map_expr() -> ExpressionRef {
+    Arc::new(Expression::variadic(
+        VariadicExpressionOp::Coalesce,
+        vec![
+            Expression::column([ADD_NAME, PARTITION_VALUES_FIELD]),
+            Expression::partition_values_to_map(Expression::column([
+                ADD_NAME,
+                PARTITION_VALUES_PARSED_FIELD,
+            ])),
+        ],
+    ))
+}
+
+/// Builds a read schema that includes `stats_parsed` and optionally `partitionValues_parsed`
+/// in the Add action.
+///
+/// The read schema must include these fields for ALL reads (checkpoints + commits)
+/// even though commits don't have them. This ensures the columns exist
 /// (as nulls) so COALESCE can operate correctly.
 pub(crate) fn build_checkpoint_read_schema_with_stats(
     base_schema: &StructType,
     stats_schema: &StructType,
+    partition_schema: Option<&StructType>,
 ) -> SchemaRef {
     let fields: Vec<StructField> = base_schema
         .fields()
         .map(|field| {
             if field.name == ADD_NAME {
                 if let DataType::Struct(add_struct) = &field.data_type {
-                    let modified_add = add_stats_parsed_to_add_schema(add_struct, stats_schema);
+                    let modified_add =
+                        add_parsed_fields_to_add_schema(add_struct, stats_schema, partition_schema);
                     return StructField {
                         name: field.name.clone(),
                         data_type: DataType::Struct(Box::new(modified_add)),
@@ -144,16 +205,25 @@ pub(crate) fn build_checkpoint_read_schema_with_stats(
     Arc::new(StructType::new_unchecked(fields))
 }
 
-/// Adds `stats_parsed` field after `stats` in the Add action schema.
-fn add_stats_parsed_to_add_schema(
+/// Adds `stats_parsed` and optionally `partitionValues_parsed` fields to the Add action schema.
+fn add_parsed_fields_to_add_schema(
     add_schema: &StructType,
     stats_schema: &StructType,
+    partition_schema: Option<&StructType>,
 ) -> StructType {
     let mut fields: Vec<StructField> = Vec::new();
 
     for field in add_schema.fields() {
         fields.push(field.clone());
-        if field.name == STATS_FIELD {
+        if field.name == PARTITION_VALUES_FIELD {
+            // Insert partitionValues_parsed right after partitionValues (if partitioned)
+            if let Some(pv_schema) = partition_schema {
+                fields.push(StructField::nullable(
+                    PARTITION_VALUES_PARSED_FIELD,
+                    DataType::Struct(Box::new(pv_schema.clone())),
+                ));
+            }
+        } else if field.name == STATS_FIELD {
             // Insert stats_parsed right after stats
             fields.push(StructField::nullable(
                 STATS_PARSED_FIELD,
@@ -169,18 +239,20 @@ fn add_stats_parsed_to_add_schema(
 ///
 /// The output schema determines which fields are included in the checkpoint:
 /// - If `writeStatsAsJson=false`: `stats` field is excluded
-/// - If `writeStatsAsStruct=true`: `stats_parsed` field is included
+/// - If `writeStatsAsStruct=true`: `stats_parsed` and `partitionValues_parsed` fields are included
 pub(crate) fn build_checkpoint_output_schema(
     config: &StatsTransformConfig,
     base_schema: &StructType,
     stats_schema: &StructType,
+    partition_schema: Option<&StructType>,
 ) -> SchemaRef {
     let fields: Vec<StructField> = base_schema
         .fields()
         .map(|field| {
             if field.name == ADD_NAME {
                 if let DataType::Struct(add_struct) = &field.data_type {
-                    let modified_add = build_add_output_schema(config, add_struct, stats_schema);
+                    let modified_add =
+                        build_add_output_schema(config, add_struct, stats_schema, partition_schema);
                     return StructField {
                         name: field.name.clone(),
                         data_type: DataType::Struct(Box::new(modified_add)),
@@ -200,11 +272,24 @@ fn build_add_output_schema(
     config: &StatsTransformConfig,
     add_schema: &StructType,
     stats_schema: &StructType,
+    partition_schema: Option<&StructType>,
 ) -> StructType {
     let mut fields: Vec<StructField> = Vec::new();
 
     for field in add_schema.fields() {
-        if field.name == STATS_FIELD {
+        if field.name == PARTITION_VALUES_FIELD {
+            // Always include partitionValues for backward compatibility
+            fields.push(field.clone());
+            // Add partitionValues_parsed after partitionValues position if writing as struct
+            if config.write_stats_as_struct {
+                if let Some(pv_schema) = partition_schema {
+                    fields.push(StructField::nullable(
+                        PARTITION_VALUES_PARSED_FIELD,
+                        DataType::Struct(Box::new(pv_schema.clone())),
+                    ));
+                }
+            }
+        } else if field.name == STATS_FIELD {
             // Include stats if writing as JSON
             if config.write_stats_as_json {
                 fields.push(field.clone());
@@ -257,7 +342,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, stats_schema, None);
 
         // Verify we get a Transform expression
         let Expression::Transform(_) = transform_expr.as_ref() else {
@@ -274,7 +359,7 @@ mod tests {
             write_stats_as_struct: false,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, stats_schema, None);
 
         // Verify we get a Transform expression
         let Expression::Transform(_) = transform_expr.as_ref() else {
@@ -291,7 +376,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, stats_schema, None);
 
         // Verify we get a Transform expression
         let Expression::Transform(_) = transform_expr.as_ref() else {
@@ -308,7 +393,7 @@ mod tests {
             write_stats_as_struct: true,
         };
         let stats_schema = Arc::new(StructType::new_unchecked([]));
-        let transform_expr = build_stats_transform(&config, stats_schema);
+        let transform_expr = build_stats_transform(&config, stats_schema, None);
 
         // Verify we get a Transform expression
         let Expression::Transform(_) = transform_expr.as_ref() else {
@@ -317,7 +402,70 @@ mod tests {
     }
 
     #[test]
-    fn test_add_stats_parsed_to_add_schema() {
+    fn test_build_transform_with_partition_values() {
+        // Test transform with partition values
+        let config = StatsTransformConfig {
+            write_stats_as_json: true,
+            write_stats_as_struct: true,
+        };
+        let stats_schema = Arc::new(StructType::new_unchecked([]));
+        let partition_schema = Arc::new(StructType::new_unchecked([
+            StructField::nullable("year", DataType::INTEGER),
+            StructField::nullable("month", DataType::INTEGER),
+        ]));
+        let transform_expr = build_stats_transform(&config, stats_schema, Some(partition_schema));
+
+        // Verify we get a Transform expression
+        let Expression::Transform(_) = transform_expr.as_ref() else {
+            panic!("Expected Transform expression");
+        };
+    }
+
+    #[test]
+    fn test_add_parsed_fields_to_add_schema() {
+        use crate::schema::MapType;
+        let add_schema = StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::nullable(
+                "partitionValues",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+            ),
+            StructField::nullable("stats", DataType::STRING),
+            StructField::nullable("tags", DataType::STRING),
+        ]);
+
+        let stats_schema =
+            StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
+
+        let partition_schema =
+            StructType::new_unchecked([StructField::nullable("year", DataType::INTEGER)]);
+
+        let result =
+            add_parsed_fields_to_add_schema(&add_schema, &stats_schema, Some(&partition_schema));
+
+        // Should have 6 fields: path, partitionValues, partitionValues_parsed, stats, stats_parsed, tags
+        assert_eq!(result.fields().count(), 6);
+
+        let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec![
+                "path",
+                "partitionValues",
+                "partitionValues_parsed",
+                "stats",
+                "stats_parsed",
+                "tags"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_add_parsed_fields_to_add_schema_no_partition() {
         let add_schema = StructType::new_unchecked([
             StructField::not_null("path", DataType::STRING),
             StructField::nullable("stats", DataType::STRING),
@@ -327,7 +475,7 @@ mod tests {
         let stats_schema =
             StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
 
-        let result = add_stats_parsed_to_add_schema(&add_schema, &stats_schema);
+        let result = add_parsed_fields_to_add_schema(&add_schema, &stats_schema, None);
 
         // Should have 4 fields: path, stats, stats_parsed, tags
         assert_eq!(result.fields().count(), 4);
@@ -350,7 +498,7 @@ mod tests {
 
         let stats_schema = StructType::new_unchecked([]);
 
-        let result = build_add_output_schema(&config, &add_schema, &stats_schema);
+        let result = build_add_output_schema(&config, &add_schema, &stats_schema, None);
 
         // Should have path and stats, no stats_parsed
         let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
@@ -372,7 +520,7 @@ mod tests {
         let stats_schema =
             StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
 
-        let result = build_add_output_schema(&config, &add_schema, &stats_schema);
+        let result = build_add_output_schema(&config, &add_schema, &stats_schema, None);
 
         // Should have path and stats_parsed (stats dropped)
         let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
@@ -394,10 +542,53 @@ mod tests {
         let stats_schema =
             StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
 
-        let result = build_add_output_schema(&config, &add_schema, &stats_schema);
+        let result = build_add_output_schema(&config, &add_schema, &stats_schema, None);
 
         // Should have path, stats, and stats_parsed
         let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
         assert_eq!(field_names, vec!["path", "stats", "stats_parsed"]);
+    }
+
+    #[test]
+    fn test_build_add_output_schema_with_partition_values() {
+        use crate::schema::MapType;
+        let config = StatsTransformConfig {
+            write_stats_as_json: true,
+            write_stats_as_struct: true,
+        };
+
+        let add_schema = StructType::new_unchecked([
+            StructField::not_null("path", DataType::STRING),
+            StructField::nullable(
+                "partitionValues",
+                DataType::Map(Box::new(MapType::new(
+                    DataType::STRING,
+                    DataType::STRING,
+                    true,
+                ))),
+            ),
+            StructField::nullable("stats", DataType::STRING),
+        ]);
+
+        let stats_schema =
+            StructType::new_unchecked([StructField::nullable("numRecords", DataType::LONG)]);
+        let partition_schema =
+            StructType::new_unchecked([StructField::nullable("year", DataType::INTEGER)]);
+
+        let result =
+            build_add_output_schema(&config, &add_schema, &stats_schema, Some(&partition_schema));
+
+        // Should have path, partitionValues, partitionValues_parsed, stats, stats_parsed
+        let field_names: Vec<&str> = result.fields().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            field_names,
+            vec![
+                "path",
+                "partitionValues",
+                "partitionValues_parsed",
+                "stats",
+                "stats_parsed"
+            ]
+        );
     }
 }

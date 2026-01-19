@@ -162,6 +162,42 @@ impl TableConfiguration {
         )?))
     }
 
+    /// Generates the expected schema for partition values when written in struct format.
+    ///
+    /// When `delta.checkpoint.writeStatsAsStruct` is enabled, partition values can be stored
+    /// in their native data types (instead of all strings) via the `partitionValues_parsed` field.
+    /// This method generates the schema for that struct based on partition column definitions.
+    ///
+    /// Returns `None` if the table is not partitioned.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn partition_values_schema(&self) -> DeltaResult<Option<SchemaRef>> {
+        let partition_columns = self.metadata().partition_columns();
+        if partition_columns.is_empty() {
+            return Ok(None);
+        }
+
+        let column_mapping_mode = self.column_mapping_mode();
+        let fields: Vec<crate::schema::StructField> = partition_columns
+            .iter()
+            .filter_map(|col_name| {
+                self.schema().field(col_name).map(|field| {
+                    // Make partition field nullable (null values are valid)
+                    crate::schema::StructField::nullable(
+                        field.physical_name(column_mapping_mode),
+                        field.data_type().clone(),
+                    )
+                })
+            })
+            .collect();
+
+        if fields.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Arc::new(StructType::try_new(fields)?)))
+    }
+
     /// The [`Metadata`] for this table at this version.
     #[internal_api]
     pub(crate) fn metadata(&self) -> &Metadata {
