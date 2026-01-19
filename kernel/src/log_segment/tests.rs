@@ -2582,6 +2582,10 @@ async fn test_get_file_actions_schema_v1_parquet_with_hint() -> DeltaResult<()> 
     Ok(())
 }
 
+// ============================================================================
+// max_published_version tests
+// ============================================================================
+
 #[tokio::test]
 async fn test_max_published_version_only_published_commits() {
     let log_segment = create_segment_for(LogSegmentConfig {
@@ -2681,6 +2685,11 @@ async fn test_max_published_version_checkpoint_only() {
     .await;
     assert_eq!(log_segment.max_published_version, None);
 }
+
+// ============================================================================
+// schema_has_compatible_stats_parsed tests
+// ============================================================================
+
 // Helper to create a checkpoint schema with stats_parsed for testing
 fn create_checkpoint_schema_with_stats_parsed(min_values_fields: Vec<StructField>) -> StructType {
     let stats_parsed = StructType::new_unchecked([
@@ -2882,4 +2891,108 @@ fn test_schema_has_compatible_stats_parsed_min_values_not_struct() {
         &checkpoint_schema,
         &stats_schema
     ));
+}
+
+// ============================================================================
+// new_with_commit tests
+// ============================================================================
+
+/// Asserts that `new` is `orig` extended with exactly one commit via `LogSegment::new_with_commit`.
+fn assert_log_segment_extended(orig: LogSegment, new: LogSegment) {
+    // Check: What should have changed
+    assert_eq!(orig.end_version + 1, new.end_version);
+    assert_eq!(
+        orig.ascending_commit_files.len() + 1,
+        new.ascending_commit_files.len()
+    );
+    assert_eq!(
+        orig.latest_commit_file.as_ref().unwrap().version + 1,
+        new.latest_commit_file.as_ref().unwrap().version
+    );
+
+    // Check: What should be the same
+    fn normalize(log_segment: LogSegment) -> LogSegment {
+        LogSegment {
+            end_version: 0,
+            max_published_version: None,
+            ascending_commit_files: vec![],
+            latest_commit_file: None,
+            ..log_segment
+        }
+    }
+
+    assert_eq!(normalize(orig), normalize(new));
+}
+
+#[tokio::test]
+async fn test_new_with_commit_published_commit() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let table_root = Url::parse("memory:///").unwrap();
+    let new_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 5);
+
+    let new_log_segment = log_segment
+        .clone()
+        .new_with_commit_appended(new_commit)
+        .unwrap();
+
+    assert_eq!(new_log_segment.max_published_version, Some(5));
+    assert_log_segment_extended(log_segment, new_log_segment);
+}
+
+#[tokio::test]
+async fn test_new_with_commit_staged_commit() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let table_root = Url::parse("memory:///").unwrap();
+    let new_commit = ParsedLogPath::create_parsed_staged_commit(&table_root, 5);
+
+    let new_log_segment = log_segment
+        .clone()
+        .new_with_commit_appended(new_commit)
+        .unwrap();
+
+    assert_eq!(new_log_segment.max_published_version, Some(4));
+    assert_log_segment_extended(log_segment, new_log_segment);
+}
+
+#[tokio::test]
+async fn test_new_with_commit_not_commit_type() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let checkpoint = create_log_path("file:///_delta_log/00000000000000000005.checkpoint.parquet");
+
+    let result = log_segment.new_with_commit_appended(checkpoint);
+
+    assert_result_error_with_message(
+        result,
+        "Cannot extend and create new LogSegment. Tail log file is not a commit file.",
+    );
+}
+
+#[tokio::test]
+async fn test_new_with_commit_not_end_version_plus_one() {
+    let log_segment = create_segment_for(LogSegmentConfig {
+        published_commit_versions: &[0, 1, 2, 3, 4],
+        ..Default::default()
+    })
+    .await;
+    let table_root = Url::parse("memory:///").unwrap();
+
+    let wrong_version_commit = ParsedLogPath::create_parsed_published_commit(&table_root, 10);
+    let result = log_segment.new_with_commit_appended(wrong_version_commit);
+
+    assert_result_error_with_message(
+        result,
+        "Cannot extend and create new LogSegment. Tail commit file version (10) does not equal LogSegment end_version (4) + 1."
+    );
 }

@@ -31,6 +31,7 @@
 //!      actions selected
 //!
 use crate::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
+use crate::log_replay::deduplicator::Deduplicator as _;
 use crate::log_replay::{
     ActionsBatch, FileActionDeduplicator, FileActionKey, HasSelectionVector, LogReplayProcessor,
 };
