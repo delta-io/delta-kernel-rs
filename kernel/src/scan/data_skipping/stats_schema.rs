@@ -1,11 +1,12 @@
 //! This module contains logic to compute the expected schema for file statistics
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::{
     schema::{
-        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaTransform,
-        StructField, StructType,
+        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef,
+        SchemaTransform, StructField, StructType,
     },
     table_properties::{DataSkippingNumIndexedCols, TableProperties},
     DeltaResult,
@@ -111,8 +112,48 @@ pub(crate) fn expected_stats_schema(
     StructType::try_new(fields)
 }
 
-// Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
-#[allow(unused)]
+/// Creates a stats schema from a referenced schema (columns from predicate).
+/// Returns schema: `{ numRecords, nullCount, minValues, maxValues }`
+///
+/// This is used to build the schema for parsing JSON stats and for reading stats_parsed
+/// from checkpoints.
+pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
+    let stats_schema = NullableStatsTransform
+        .transform_struct(referenced_schema)?
+        .into_owned();
+
+    let nullcount_schema = NullCountStatsTransform
+        .transform_struct(&stats_schema)?
+        .into_owned();
+
+    Some(Arc::new(StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable("nullCount", nullcount_schema),
+        StructField::nullable("minValues", stats_schema.clone()),
+        StructField::nullable("maxValues", stats_schema),
+    ])))
+}
+
+/// Transforms a schema to make all fields nullable.
+/// Used for stats schemas where stats may not be available for all columns.
+pub(crate) struct NullableStatsTransform;
+impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+        let field = match self.transform(&field.data_type)? {
+            Borrowed(_) if field.is_nullable() => Borrowed(field),
+            data_type => Owned(StructField {
+                name: field.name.clone(),
+                data_type: data_type.into_owned(),
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+        };
+        Some(field)
+    }
+}
+
+/// Transforms a schema to convert all primitive fields to LONG (for null count stats).
 pub(crate) struct NullCountStatsTransform;
 impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
     fn transform_primitive(&mut self, _ptype: &'a PrimitiveType) -> Option<Cow<'a, PrimitiveType>> {
@@ -316,26 +357,6 @@ mod tests {
     use crate::schema::ArrayType;
 
     use super::*;
-
-    pub(crate) struct NullableStatsTransform;
-    impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-        fn transform_struct_field(
-            &mut self,
-            field: &'a StructField,
-        ) -> Option<Cow<'a, StructField>> {
-            use Cow::*;
-            let field = match self.transform(&field.data_type)? {
-                Borrowed(_) if field.is_nullable() => Borrowed(field),
-                data_type => Owned(StructField {
-                    name: field.name.clone(),
-                    data_type: data_type.into_owned(),
-                    nullable: true,
-                    metadata: field.metadata.clone(),
-                }),
-            };
-            Some(field)
-        }
-    }
 
     #[test]
     fn test_should_include_column() {

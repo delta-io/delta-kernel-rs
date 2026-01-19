@@ -435,7 +435,14 @@ impl Scan {
         &self,
         engine: &dyn Engine,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        self.scan_metadata_inner(engine, self.replay_for_scan_metadata(engine)?)
+        let (action_batch_iter, has_stats_parsed, checkpoint_read_schema) =
+            self.replay_for_scan_metadata(engine)?;
+        self.scan_metadata_inner(
+            engine,
+            action_batch_iter,
+            checkpoint_read_schema,
+            has_stats_parsed.unwrap_or(false),
+        )
     }
 
     /// Get an updated iterator of [`ScanMetadata`]s based on an existing iterator of [`EngineData`]s.
@@ -510,14 +517,21 @@ impl Scan {
             Ok(ActionsBatch::new(transform.evaluate(data.as_ref())?, false))
         };
 
+        let log_segment = self.snapshot.log_segment();
+
         // If the snapshot version corresponds to the hint version, we process the existing data
         // to apply file skipping and provide the required transformations.
+        // Since we're only processing existing data (no checkpoint), we use the base schema
+        // and no stats_parsed optimization.
         if existing_version == self.snapshot.version() {
             let scan = existing_data.into_iter().map(apply_transform);
-            return Ok(Box::new(self.scan_metadata_inner(engine, scan)?));
+            return Ok(Box::new(self.scan_metadata_inner(
+                engine,
+                scan,
+                CHECKPOINT_READ_SCHEMA.clone(),
+                false,
+            )?));
         }
-
-        let log_segment = self.snapshot.log_segment();
 
         // If the current log segment contains a checkpoint newer than the hint version
         // we disregard the existing data hint, and perform a full scan. The current log segment
@@ -544,27 +558,43 @@ impl Scan {
             None, // No checkpoint in this incremental segment
         )?;
 
-        let it = new_log_segment
+        // For incremental reads, new_log_segment has no checkpoint but we use the
+        // checkpoint schema returned by the function for consistency.
+        let (action_batch_iter, has_stats_parsed, checkpoint_read_schema) = new_log_segment
             .read_actions_with_projected_checkpoint_actions(
                 engine,
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
-            )?
-            .chain(existing_data.into_iter().map(apply_transform));
+                self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
+            )?;
+        let it = action_batch_iter.chain(existing_data.into_iter().map(apply_transform));
 
-        Ok(Box::new(self.scan_metadata_inner(engine, it)?))
+        Ok(Box::new(self.scan_metadata_inner(
+            engine,
+            it,
+            checkpoint_read_schema,
+            has_stats_parsed.unwrap_or(false),
+        )?))
     }
 
     fn scan_metadata_inner(
         &self,
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
+        checkpoint_read_schema: SchemaRef,
+        has_compatible_stats_parsed: bool,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
         if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
             return Ok(None.into_iter().flatten());
         }
-        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone())?;
+        let it = scan_action_iter(
+            engine,
+            action_batch_iter,
+            self.state_info.clone(),
+            checkpoint_read_schema,
+            has_compatible_stats_parsed,
+        )?;
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -572,7 +602,11 @@ impl Scan {
     fn replay_for_scan_metadata(
         &self,
         engine: &dyn Engine,
-    ) -> DeltaResult<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
+    ) -> DeltaResult<(
+        impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
+        Option<bool>,
+        SchemaRef,
+    )> {
         // NOTE: We don't pass any meta-predicate because we expect no meaningful row group skipping
         // when ~every checkpoint file will contain the adds and removes we are looking for.
         self.snapshot
@@ -582,6 +616,7 @@ impl Scan {
                 COMMIT_READ_SCHEMA.clone(),
                 CHECKPOINT_READ_SCHEMA.clone(),
                 None,
+                self.state_info.stats_schema.as_ref().map(|s| s.as_ref()),
             )
     }
 
