@@ -195,10 +195,9 @@ mod tests {
         let publish_metadata = PublishMetadata::new(12, catalog_commits).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "testUcTableId");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
-        let result = committer.publish(&engine, publish_metadata).unwrap();
+        committer.publish(&engine, publish_metadata).unwrap();
 
         // ===== THEN =====
-        assert_eq!(result, PublishResult::Success);
         for v in versions {
             let path = published_commit_url(&table_root, v).to_file_path().unwrap();
             assert!(path.exists());
