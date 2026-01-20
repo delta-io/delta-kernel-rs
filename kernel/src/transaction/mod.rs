@@ -30,7 +30,7 @@ use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{
     ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema,
 };
-use crate::snapshot::SnapshotRef;
+use crate::snapshot::{Snapshot, SnapshotRef};
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
 use crate::FileMeta;
@@ -1118,7 +1118,10 @@ impl Transaction {
 
     fn into_committed(self, file_meta: FileMeta) -> DeltaResult<CommittedTransaction> {
         let parsed_commit = ParsedLogPath::parse_commit(file_meta)?;
-        let stats = PostCommitStats {
+
+        let commit_version = parsed_commit.version;
+
+        let post_commit_stats = PostCommitStats {
             commits_since_checkpoint: self.read_snapshot.log_segment().commits_since_checkpoint()
                 + 1,
             commits_since_log_compaction: self
@@ -1129,9 +1132,11 @@ impl Transaction {
         };
 
         Ok(CommittedTransaction {
-            transaction: self,
-            commit_version: parsed_commit.version,
-            post_commit_stats: stats,
+            commit_version,
+            post_commit_stats,
+            post_commit_snapshot: Some(Arc::new(
+                self.read_snapshot.new_post_commit(parsed_commit)?,
+            )),
         })
     }
 
@@ -1572,17 +1577,22 @@ impl CommitResult {
 }
 
 /// This is the result of a successfully committed [Transaction]. One can retrieve the
-/// [PostCommitStats] and [commit version] from this struct.
+/// [post_commit_stats], [commit version], and optionally the [post-commit snapshot] from this struct.
 ///
+/// [post_commit_stats]: Self::post_commit_stats
 /// [commit version]: Self::commit_version
+/// [post-commit snapshot]: Self::post_commit_snapshot
 #[derive(Debug)]
 pub struct CommittedTransaction {
-    #[allow(dead_code)]
-    transaction: Transaction,
-    /// the version of the table that was just committed
+    /// The version of the table that was just committed.
     commit_version: Version,
-    /// The [`PostCommitStats`] for this transaction
+    /// The [`PostCommitStats`] for this transaction.
     post_commit_stats: PostCommitStats,
+    /// The [`Snapshot`] of the table after this transaction was committed.
+    ///
+    /// This is optional to allow incremental development of new features (e.g., table creation,
+    /// transaction retries) without blocking on implementing post-commit snapshot support.
+    post_commit_snapshot: Option<Arc<Snapshot>>,
 }
 
 impl CommittedTransaction {
@@ -1594,6 +1604,11 @@ impl CommittedTransaction {
     /// The [`PostCommitStats`] for this transaction
     pub fn post_commit_stats(&self) -> &PostCommitStats {
         &self.post_commit_stats
+    }
+
+    /// The [`Snapshot`] of the table after this transaction was committed.
+    pub fn post_commit_snapshot(&self) -> Option<Arc<Snapshot>> {
+        self.post_commit_snapshot.clone()
     }
 }
 
