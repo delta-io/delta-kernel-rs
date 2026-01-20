@@ -76,8 +76,7 @@ impl Snapshot {
     /// We implement a simple heuristic:
     /// 1. if the new version == existing version, just return the existing snapshot
     /// 2. if the new version < existing version, error: there is no optimization to do here
-    /// 3. list from (existing checkpoint version + 1) onward (or just existing snapshot version if
-    ///    no checkpoint)
+    /// 3. list from (existing snapshot version + 1) onward
     /// 4. a. if new checkpoint is found: just create a new snapshot from that checkpoint (and
     ///    commits after it)
     ///    b. if no new checkpoint is found: do lightweight P+M replay on the latest commits (after
@@ -128,8 +127,7 @@ impl Snapshot {
         let log_root = old_log_segment.log_root.clone();
         let storage = engine.storage_handler();
 
-        // Start listing just after the previous segment's checkpoint, if any
-        let listing_start = old_log_segment.checkpoint_version.unwrap_or(0) + 1;
+        let listing_start = old_version + 1;
 
         // Check for new commits (and CRC)
         let new_listed_files = ListedLogFiles::list(
