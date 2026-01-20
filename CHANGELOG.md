@@ -1,5 +1,13 @@
 # Changelog
 
+## [v0.19.1](https://github.com/delta-io/delta-kernel-rs/tree/v0.19.0/) (2026-01-20)
+
+[Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.19.0...v0.19.1)
+
+### 🐛 Bug Fixes
+
+1. fix: deadlock for `TokioMultiThreadExecutor` ([#1606]) (see #1605 for a description of the issue)
+
 ## [v0.19.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.19.0/) (2025-12-19)
 
 [Full Changelog](https://github.com/delta-io/delta-kernel-rs/compare/v0.18.2...v0.19.0)
