@@ -2,7 +2,7 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
-    OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::DeltaResult;
@@ -188,7 +188,6 @@ mod tests {
             ok_or_panic(snapshot(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
-                OptionalValue::None,
             ))
         };
 

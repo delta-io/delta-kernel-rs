@@ -608,71 +608,49 @@ pub struct SharedSnapshot;
 pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
-    old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    let old_snapshot_handle = match old_snapshot {
-        OptionalValue::Some(handle) => Some(handle),
-        OptionalValue::None => None,
-    };
-    snapshot_impl(url, engine, old_snapshot_handle, None, Vec::new()).into_extern_result(&engine)
+    snapshot_impl(url, engine, None, None, Vec::new()).into_extern_result(&engine)
 }
 
-/// Get the latest snapshot from the specified table with optional log tail
+/// Get a snapshot with optional parameters for optimization and customization.
+///
+/// This extended version allows you to:
+/// - Pass an old snapshot for optimized snapshot creation (avoids re-reading the entire log)
+/// - Specify a version to get a snapshot at a specific table version
 ///
 /// # Safety
 ///
 /// Caller is responsible for passing valid handles and path pointer.
-/// The log_paths array and its contents must remain valid for the duration of this call.
-#[cfg(feature = "catalog-managed")]
 #[no_mangle]
-pub unsafe extern "C" fn snapshot_with_log_tail(
+pub unsafe extern "C" fn snapshot_extended(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
     old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
-    log_paths: log_path::LogPathArray,
+    version: OptionalValue<Version>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
+
     let old_snapshot_handle = match old_snapshot {
         OptionalValue::Some(handle) => Some(handle),
         OptionalValue::None => None,
     };
 
-    // Convert LogPathArray to Vec<LogPath>
-    let log_tail = match unsafe { log_paths.log_paths() } {
-        Ok(paths) => paths,
-        Err(err) => return Err(err).into_extern_result(&engine_ref),
-    };
-
-    snapshot_impl(url, engine_ref, old_snapshot_handle, None, log_tail).into_extern_result(&engine_ref)
-}
-
-/// Get the snapshot from the specified table at a specific version. Note this is only safe for
-/// non-catalog-managed tables.
-///
-/// # Safety
-///
-/// Caller is responsible for passing valid handles and path pointer.
-#[no_mangle]
-pub unsafe extern "C" fn snapshot_at_version(
-    path: KernelStringSlice,
-    engine: Handle<SharedExternEngine>,
-    old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
-    version: Version,
-) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
-    let engine = unsafe { engine.as_ref() };
-    let old_snapshot_handle = match old_snapshot {
-        OptionalValue::Some(handle) => Some(handle),
+    let version_opt = match version {
+        OptionalValue::Some(v) => Some(v),
         OptionalValue::None => None,
     };
-    snapshot_impl(url, engine, old_snapshot_handle, version.into(), Vec::new())
-        .into_extern_result(&engine)
+
+    snapshot_impl(url, engine_ref, old_snapshot_handle, version_opt, Vec::new())
+        .into_extern_result(&engine_ref)
 }
 
-/// Get the snapshot from the specified table at a specific version with log tail.
+/// Get a snapshot with log tail support for catalog-managed tables.
+///
+/// This version includes all the parameters from `snapshot_extended` plus the ability to
+/// provide a log tail for catalog-managed tables.
 ///
 /// # Safety
 ///
@@ -680,27 +658,35 @@ pub unsafe extern "C" fn snapshot_at_version(
 /// The log_tail array and its contents must remain valid for the duration of this call.
 #[cfg(feature = "catalog-managed")]
 #[no_mangle]
-pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
+pub unsafe extern "C" fn snapshot_with_log_tail(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
     old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
-    version: Version,
-    log_tail: log_path::LogPathArray,
+    version: OptionalValue<Version>,
+    log_tail: OptionalValue<log_path::LogPathArray>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
+
     let old_snapshot_handle = match old_snapshot {
         OptionalValue::Some(handle) => Some(handle),
         OptionalValue::None => None,
     };
 
-    // Convert LogPathArray to Vec<LogPath>
-    let log_tail = match unsafe { log_tail.log_paths() } {
-        Ok(paths) => paths,
-        Err(err) => return Err(err).into_extern_result(&engine_ref),
+    let version_opt = match version {
+        OptionalValue::Some(v) => Some(v),
+        OptionalValue::None => None,
     };
 
-    snapshot_impl(url, engine_ref, old_snapshot_handle, version.into(), log_tail)
+    let log_tail_vec = match log_tail {
+        OptionalValue::Some(paths) => match unsafe { paths.log_paths() } {
+            Ok(paths) => paths,
+            Err(err) => return Err(err).into_extern_result(&engine_ref),
+        },
+        OptionalValue::None => Vec::new(),
+    };
+
+    snapshot_impl(url, engine_ref, old_snapshot_handle, version_opt, log_tail_vec)
         .into_extern_result(&engine_ref)
 }
 
@@ -976,22 +962,18 @@ mod tests {
 
         // Test getting latest snapshot
         let snapshot1 = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(path),
-                engine.shallow_copy(),
-                OptionalValue::None,
-            ))
+            ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy()))
         };
         let version1 = unsafe { version(snapshot1.shallow_copy()) };
         assert_eq!(version1, 0);
 
-        // Test getting snapshot at version
+        // Test getting snapshot at version using snapshot_extended
         let snapshot2 = unsafe {
-            ok_or_panic(snapshot_at_version(
+            ok_or_panic(snapshot_extended(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
                 OptionalValue::None,
-                0,
+                OptionalValue::Some(0),
             ))
         };
         let version2 = unsafe { version(snapshot2.shallow_copy()) };
@@ -999,11 +981,11 @@ mod tests {
 
         // Test getting non-existent snapshot
         let snapshot_at_non_existent_version = unsafe {
-            snapshot_at_version(
+            snapshot_extended(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
                 OptionalValue::None,
-                1,
+                OptionalValue::Some(1),
             )
         };
         assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, "Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1");
@@ -1032,13 +1014,8 @@ mod tests {
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
-        let snapshot = unsafe {
-            ok_or_panic(snapshot(
-                kernel_string_slice!(path),
-                engine.shallow_copy(),
-                OptionalValue::None,
-            ))
-        };
+        let snapshot =
+            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
 
         let partition_count = unsafe { get_partition_column_count(snapshot.shallow_copy()) };
         assert_eq!(partition_count, 1, "Should have one partition");
@@ -1075,11 +1052,11 @@ mod tests {
 
         // Get a non-existent snapshot, this will call allocate_null_err
         let snapshot_at_non_existent_version = unsafe {
-            snapshot_at_version(
+            snapshot_extended(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
                 OptionalValue::None,
-                1,
+                OptionalValue::Some(1),
             )
         };
         assert!(snapshot_at_non_existent_version.is_err());
@@ -1126,7 +1103,8 @@ mod tests {
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
                 OptionalValue::None,
-                log_tail.clone(),
+                OptionalValue::None,
+                OptionalValue::Some(log_tail.clone()),
             ))
         };
         let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
@@ -1134,15 +1112,15 @@ mod tests {
 
         // Test getting snapshot at version
         let snapshot2 = unsafe {
-            ok_or_panic(snapshot_at_version_with_log_tail(
+            ok_or_panic(snapshot_with_log_tail(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
                 OptionalValue::None,
-                1,
-                log_tail,
+                OptionalValue::Some(1),
+                OptionalValue::Some(log_tail),
             ))
         };
-        let snapshot_version = unsafe { version(snapshot.shallow_copy()) };
+        let snapshot_version = unsafe { version(snapshot2.shallow_copy()) };
         assert_eq!(snapshot_version, 1);
 
         unsafe { free_snapshot(snapshot) }
