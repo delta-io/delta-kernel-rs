@@ -141,30 +141,6 @@ impl PublishMetadata {
     }
 }
 
-/// The result of a [`Committer::publish`] operation.
-///
-/// This enum distinguishes between committers that support publishing (catalog committers) and
-/// those that do not (e.g., [`FileSystemCommitter`]).
-///
-/// [`Committer::publish`]: super::Committer::publish
-/// [`FileSystemCommitter`]: super::FileSystemCommitter
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublishResult {
-    /// Publishing is not applicable for this committer type.
-    ///
-    /// This is returned by committers that don't support publishing, such as
-    /// [`FileSystemCommitter`] for non-catalog-managed tables. Callers should check
-    /// [`Committer::is_catalog_committer`] before calling [`Committer::publish`] to avoid
-    /// this case.
-    ///
-    /// [`FileSystemCommitter`]: super::FileSystemCommitter
-    /// [`Committer::is_catalog_committer`]: super::Committer::is_catalog_committer
-    /// [`Committer::publish`]: super::Committer::publish
-    NotApplicable,
-    /// Successfully published all catalog commits to the Delta log.
-    Success,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

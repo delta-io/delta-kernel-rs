@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use delta_kernel::committer::{
-    CommitMetadata, CommitResponse, Committer, PublishMetadata, PublishResult,
-};
+use delta_kernel::committer::{CommitMetadata, CommitResponse, Committer, PublishMetadata};
 use delta_kernel::{DeltaResult, Engine, Error as DeltaError, FilteredEngineData};
 use uc_client::models::commits::{Commit, CommitRequest};
 use uc_client::UCCommitsClient;
@@ -103,11 +101,7 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         true
     }
 
-    fn publish(
-        &self,
-        _engine: &dyn Engine,
-        _publish_metadata: PublishMetadata,
-    ) -> DeltaResult<PublishResult> {
+    fn publish(&self, _engine: &dyn Engine, _publish_metadata: PublishMetadata) -> DeltaResult<()> {
         todo!("implement publish")
     }
 }

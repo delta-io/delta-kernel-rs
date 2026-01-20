@@ -31,7 +31,7 @@ mod publish_types;
 
 pub use commit_types::{CommitMetadata, CommitResponse};
 pub use filesystem::FileSystemCommitter;
-pub use publish_types::{CatalogCommit, PublishMetadata, PublishResult};
+pub use publish_types::{CatalogCommit, PublishMetadata};
 
 use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 
@@ -77,8 +77,7 @@ pub trait Committer: Send + AsAny {
     ///
     /// This method should only be called on catalog committers (i.e., when
     /// [`is_catalog_committer`] returns `true`). Callers should check this before invoking
-    /// `publish`. Calling `publish` on a non-catalog committer like [`FileSystemCommitter`]
-    /// returns [`PublishResult::NotApplicable`] but is considered a misuse of the API.
+    /// `publish`.
     ///
     /// # Benefits
     ///
@@ -104,9 +103,5 @@ pub trait Committer: Send + AsAny {
     /// Returns an error if the publish operation fails.
     ///
     /// [`is_catalog_committer`]: Committer::is_catalog_committer
-    fn publish(
-        &self,
-        engine: &dyn Engine,
-        publish_metadata: PublishMetadata,
-    ) -> DeltaResult<PublishResult>;
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()>;
 }
