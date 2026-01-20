@@ -8,8 +8,8 @@
 
 1. fix: deadlock for `TokioMultiThreadExecutor` ([#1606]) (see #1605 for a description of the issue)
 
-[#1606] https://github.com/delta-io/delta-kernel-rs/pull/1606
-[#1605] https://github.com/delta-io/delta-kernel-rs/issues/1605
+[#1606]: https://github.com/delta-io/delta-kernel-rs/pull/1606
+[#1605]: https://github.com/delta-io/delta-kernel-rs/issues/1605
 
 ## [v0.19.0](https://github.com/delta-io/delta-kernel-rs/tree/v0.19.0/) (2025-12-19)
 
