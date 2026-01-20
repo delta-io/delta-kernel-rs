@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use crate::actions::visitors::InCommitTimestampVisitor;
 use crate::engine_data::RowVisitor;
+use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, FileMeta, Version};
 use delta_kernel_derive::internal_api;
 
@@ -218,6 +219,21 @@ impl<Location: AsUrl> ParsedLogPath<Location> {
             version,
             file_type,
         }))
+    }
+
+    /// Parse a location into a commit path (published or staged), returning an error if invalid or
+    /// not a commit.
+    pub(crate) fn parse_commit(location: Location) -> DeltaResult<Self> {
+        let url = location.as_url().to_string();
+        let parsed = Self::try_from(location)?.ok_or_else(|| Error::invalid_log_path(&url))?;
+        require!(
+            parsed.is_commit(),
+            Error::generic(format!(
+                "Expected a commit path, got {} of type {:?}",
+                url, parsed.file_type
+            ))
+        );
+        Ok(parsed)
     }
 
     pub(crate) fn should_list(&self) -> bool {
@@ -444,7 +460,7 @@ impl LogRoot {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -454,6 +470,39 @@ mod tests {
     use crate::utils::test_utils::assert_result_error_with_message;
     use object_store::memory::InMemory;
     use test_utils::add_commit;
+
+    impl ParsedLogPath<FileMeta> {
+        pub(crate) fn create_parsed_published_commit(table_root: &Url, version: Version) -> Self {
+            let filename = format!("{version:020}.json");
+            let location = table_root
+                .join(DELTA_LOG_DIR_WITH_SLASH)
+                .unwrap()
+                .join(&filename)
+                .unwrap();
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+                .unwrap()
+                .unwrap();
+            assert!(parsed.file_type == LogPathFileType::Commit);
+            parsed
+        }
+
+        pub(crate) fn create_parsed_staged_commit(table_root: &Url, version: Version) -> Self {
+            let uuid = Uuid::new_v4();
+            let filename = format!("{version:020}.{uuid}.json");
+            let location = table_root
+                .join(DELTA_LOG_DIR_WITH_SLASH)
+                .unwrap()
+                .join(STAGED_COMMITS_DIR)
+                .unwrap()
+                .join(&filename)
+                .unwrap();
+            let parsed = ParsedLogPath::try_from(FileMeta::new(location, 0, 0))
+                .unwrap()
+                .unwrap();
+            assert!(parsed.file_type == LogPathFileType::StagedCommit);
+            parsed
+        }
+    }
 
     fn table_root_dir_url() -> Url {
         let path = PathBuf::from("./tests/data/table-with-dv-small/");
