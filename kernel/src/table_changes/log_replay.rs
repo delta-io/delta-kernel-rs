@@ -26,6 +26,7 @@ use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
 use itertools::Itertools;
+use tracing::info;
 
 #[cfg(test)]
 mod tests;
@@ -210,6 +211,17 @@ impl LogReplayScanner {
                     protocol_opt,
                     commit_file.version,
                 )?;
+
+                info!(
+                    version = commit_file.version,
+                    table_id = table_configuration.metadata().id(),
+                    writer_features = ?table_configuration.protocol().writer_features(),
+                    min_reader_version = table_configuration.protocol().min_reader_version(),
+                    min_writer_version = table_configuration.protocol().min_writer_version(),
+                    schema_string = %table_configuration.metadata().schema_string(),
+                    table_properties = ?table_configuration.metadata().configuration(),
+                    "Table configuration updated during CDF query"
+                ); 
             }
 
             // If metadata is updated, check if Change Data Feed is enabled
