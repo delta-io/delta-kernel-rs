@@ -101,11 +101,7 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
         true
     }
 
-    fn publish(
-        &self,
-        engine: &dyn Engine,
-        publish_metadata: PublishMetadata,
-    ) -> DeltaResult<()> {
+    fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
         if publish_metadata.ascending_catalog_commits().is_empty() {
             return Ok(());
         }
