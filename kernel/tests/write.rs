@@ -2911,3 +2911,46 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_post_commit_snapshot_simple() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let schema = Arc::new(
+        StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap(),
+    );
+
+    for (table_url, engine, _store, _table_name) in
+        setup_test_tables(schema.clone(), &[], None, "test_table")
+            .await
+            .unwrap()
+    {
+        let mut current_snapshot = Snapshot::builder_for(table_url).build(&engine).unwrap();
+
+        for i in 0..10 {
+            let base_version = current_snapshot.version();
+
+            let txn = current_snapshot
+                .clone()
+                .transaction(Box::new(FileSystemCommitter::new()))
+                .unwrap()
+                .with_engine_info("test");
+
+            match txn.commit(&engine).unwrap() {
+                CommitResult::CommittedTransaction(committed) => {
+                    let post_snapshot = committed
+                        .post_commit_snapshot()
+                        .expect("should have post_commit_snapshot");
+
+                    assert_eq!(post_snapshot.version(), base_version + 1);
+                    assert_eq!(post_snapshot.version(), committed.commit_version());
+                    assert_eq!(post_snapshot.schema(), current_snapshot.schema());
+                    assert_eq!(post_snapshot.table_root(), current_snapshot.table_root());
+
+                    current_snapshot = post_snapshot;
+                }
+                _ => panic!("Commit {} should succeed", i),
+            }
+        }
+    }
+}
