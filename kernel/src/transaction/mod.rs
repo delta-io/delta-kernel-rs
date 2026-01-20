@@ -30,7 +30,7 @@ use crate::scan::{restored_add_schema, scan_row_schema};
 use crate::schema::{
     ArrayType, MapType, SchemaRef, StructField, StructType, StructTypeBuilder, ToSchema,
 };
-use crate::snapshot::{Snapshot, SnapshotRef};
+use crate::snapshot::SnapshotRef;
 use crate::table_features::{Operation, TableFeature};
 use crate::utils::{current_time_ms, require};
 use crate::FileMeta;
@@ -1592,7 +1592,7 @@ pub struct CommittedTransaction {
     ///
     /// This is optional to allow incremental development of new features (e.g., table creation,
     /// transaction retries) without blocking on implementing post-commit snapshot support.
-    post_commit_snapshot: Option<Arc<Snapshot>>,
+    post_commit_snapshot: Option<SnapshotRef>,
 }
 
 impl CommittedTransaction {
@@ -1607,8 +1607,8 @@ impl CommittedTransaction {
     }
 
     /// The [`Snapshot`] of the table after this transaction was committed.
-    pub fn post_commit_snapshot(&self) -> Option<Arc<Snapshot>> {
-        self.post_commit_snapshot.clone()
+    pub fn post_commit_snapshot(&self) -> Option<&SnapshotRef> {
+        self.post_commit_snapshot.as_ref()
     }
 }
 

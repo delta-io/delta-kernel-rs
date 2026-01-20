@@ -2916,9 +2916,7 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
 async fn test_post_commit_snapshot_simple() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(
-        StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap(),
-    );
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table")
@@ -2947,7 +2945,7 @@ async fn test_post_commit_snapshot_simple() {
                     assert_eq!(post_snapshot.schema(), current_snapshot.schema());
                     assert_eq!(post_snapshot.table_root(), current_snapshot.table_root());
 
-                    current_snapshot = post_snapshot;
+                    current_snapshot = post_snapshot.clone();
                 }
                 _ => panic!("Commit {} should succeed", i),
             }
