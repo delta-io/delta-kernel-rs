@@ -2,7 +2,7 @@ use crate::error::{ExternResult, IntoExternResult};
 use crate::handle::Handle;
 use crate::{
     kernel_string_slice, AllocateStringFn, ExternEngine, KernelStringSlice, NullableCvoid,
-    SharedExternEngine, SharedSnapshot, TryFromStringSlice,
+    OptionalValue, SharedExternEngine, SharedSnapshot, TryFromStringSlice,
 };
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::DeltaResult;
@@ -184,8 +184,13 @@ mod tests {
 
         add_commit(storage.as_ref(), 1, commit).await.unwrap();
 
-        let snapshot =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::None,
+            ))
+        };
 
         let get_domain_metadata_helper = |domain: &str| unsafe {
             get_domain_metadata(

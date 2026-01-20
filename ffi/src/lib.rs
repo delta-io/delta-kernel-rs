@@ -608,10 +608,15 @@ pub struct SharedSnapshot;
 pub unsafe extern "C" fn snapshot(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
+    old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, None, Vec::new()).into_extern_result(&engine)
+    let old_snapshot_handle = match old_snapshot {
+        OptionalValue::Some(handle) => Some(handle),
+        OptionalValue::None => None,
+    };
+    snapshot_impl(url, engine, old_snapshot_handle, None, Vec::new()).into_extern_result(&engine)
 }
 
 /// Get the latest snapshot from the specified table with optional log tail
@@ -625,10 +630,15 @@ pub unsafe extern "C" fn snapshot(
 pub unsafe extern "C" fn snapshot_with_log_tail(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
+    old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
     log_paths: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
+    let old_snapshot_handle = match old_snapshot {
+        OptionalValue::Some(handle) => Some(handle),
+        OptionalValue::None => None,
+    };
 
     // Convert LogPathArray to Vec<LogPath>
     let log_tail = match unsafe { log_paths.log_paths() } {
@@ -636,7 +646,7 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
         Err(err) => return Err(err).into_extern_result(&engine_ref),
     };
 
-    snapshot_impl(url, engine_ref, None, log_tail).into_extern_result(&engine_ref)
+    snapshot_impl(url, engine_ref, old_snapshot_handle, None, log_tail).into_extern_result(&engine_ref)
 }
 
 /// Get the snapshot from the specified table at a specific version. Note this is only safe for
@@ -649,11 +659,17 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
 pub unsafe extern "C" fn snapshot_at_version(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
+    old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
     version: Version,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, version.into(), Vec::new()).into_extern_result(&engine)
+    let old_snapshot_handle = match old_snapshot {
+        OptionalValue::Some(handle) => Some(handle),
+        OptionalValue::None => None,
+    };
+    snapshot_impl(url, engine, old_snapshot_handle, version.into(), Vec::new())
+        .into_extern_result(&engine)
 }
 
 /// Get the snapshot from the specified table at a specific version with log tail.
@@ -667,11 +683,16 @@ pub unsafe extern "C" fn snapshot_at_version(
 pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
     path: KernelStringSlice,
     engine: Handle<SharedExternEngine>,
+    old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
     version: Version,
     log_tail: log_path::LogPathArray,
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
+    let old_snapshot_handle = match old_snapshot {
+        OptionalValue::Some(handle) => Some(handle),
+        OptionalValue::None => None,
+    };
 
     // Convert LogPathArray to Vec<LogPath>
     let log_tail = match unsafe { log_tail.log_paths() } {
@@ -679,16 +700,23 @@ pub unsafe extern "C" fn snapshot_at_version_with_log_tail(
         Err(err) => return Err(err).into_extern_result(&engine_ref),
     };
 
-    snapshot_impl(url, engine_ref, version.into(), log_tail).into_extern_result(&engine_ref)
+    snapshot_impl(url, engine_ref, old_snapshot_handle, version.into(), log_tail)
+        .into_extern_result(&engine_ref)
 }
 
 fn snapshot_impl(
     url: DeltaResult<Url>,
     extern_engine: &dyn ExternEngine,
+    old_snapshot_handle: Option<Handle<SharedSnapshot>>,
     version: Option<Version>,
     #[allow(unused_variables)] log_tail: Vec<LogPath>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
-    let mut builder = Snapshot::builder_for(url?);
+    let mut builder = if let Some(handle) = old_snapshot_handle {
+        let snapshot_arc = unsafe { handle.into_inner() };
+        Snapshot::builder_from(snapshot_arc)
+    } else {
+        Snapshot::builder_for(url?)
+    };
 
     if let Some(v) = version {
         builder = builder.at_version(v);
@@ -947,8 +975,13 @@ mod tests {
         let path = "memory:///";
 
         // Test getting latest snapshot
-        let snapshot1 =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot1 = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::None,
+            ))
+        };
         let version1 = unsafe { version(snapshot1.shallow_copy()) };
         assert_eq!(version1, 0);
 
@@ -957,6 +990,7 @@ mod tests {
             ok_or_panic(snapshot_at_version(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
+                OptionalValue::None,
                 0,
             ))
         };
@@ -964,8 +998,14 @@ mod tests {
         assert_eq!(version2, 0);
 
         // Test getting non-existent snapshot
-        let snapshot_at_non_existent_version =
-            unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
+        let snapshot_at_non_existent_version = unsafe {
+            snapshot_at_version(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::None,
+                1,
+            )
+        };
         assert_extern_result_error_with_message(snapshot_at_non_existent_version, KernelError::GenericError, "Generic delta kernel error: LogSegment end version 0 not the same as the specified end version 1");
 
         let table_root = unsafe { snapshot_table_root(snapshot1.shallow_copy(), allocate_str) };
@@ -992,8 +1032,13 @@ mod tests {
         let engine = engine_to_handle(Arc::new(engine), allocate_err);
         let path = "memory:///";
 
-        let snapshot =
-            unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
+        let snapshot = unsafe {
+            ok_or_panic(snapshot(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::None,
+            ))
+        };
 
         let partition_count = unsafe { get_partition_column_count(snapshot.shallow_copy()) };
         assert_eq!(partition_count, 1, "Should have one partition");
@@ -1029,8 +1074,14 @@ mod tests {
         let path = "memory:///";
 
         // Get a non-existent snapshot, this will call allocate_null_err
-        let snapshot_at_non_existent_version =
-            unsafe { snapshot_at_version(kernel_string_slice!(path), engine.shallow_copy(), 1) };
+        let snapshot_at_non_existent_version = unsafe {
+            snapshot_at_version(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::None,
+                1,
+            )
+        };
         assert!(snapshot_at_non_existent_version.is_err());
 
         unsafe { free_engine(engine) }
@@ -1074,6 +1125,7 @@ mod tests {
             ok_or_panic(snapshot_with_log_tail(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
+                OptionalValue::None,
                 log_tail.clone(),
             ))
         };
@@ -1085,6 +1137,7 @@ mod tests {
             ok_or_panic(snapshot_at_version_with_log_tail(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
+                OptionalValue::None,
                 1,
                 log_tail,
             ))
