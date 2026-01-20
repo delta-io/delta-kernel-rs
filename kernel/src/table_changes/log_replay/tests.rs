@@ -20,6 +20,7 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tracing_test::traced_test;
 
 fn get_schema() -> StructType {
     StructType::new_unchecked([
@@ -914,4 +915,66 @@ async fn file_meta_timestamp() {
     )
     .unwrap();
     assert_eq!(scanner.timestamp, file_meta_ts);
+}
+
+
+#[tokio::test]
+#[traced_test]
+async fn print_table_configuration() {
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+    mock_table
+        .commit([
+            Action::Metadata(
+                Metadata::try_new(
+                    None,
+                    None,
+                    get_schema(),
+                    vec![],
+                    0,
+                    HashMap::from([
+                        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+                        (
+                            "delta.enableDeletionVectors".to_string(),
+                            "true".to_string(),
+                        ),
+                        ("delta.columnMapping.mode".to_string(), "none".to_string()),
+                    ]),
+                )
+                .unwrap(),
+            ),
+            Action::Protocol(
+                Protocol::try_new(
+                    3,
+                    7,
+                    Some([TableFeature::DeletionVectors]),
+                    Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+                )
+                .unwrap(),
+            ),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url); //table config object
+    
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap().try_collect();
+
+    assert!(logs_contain("Table configuration updated during CDF query"));
+    assert!(logs_contain("version=0"));
+    assert!(logs_contain("table_id="));
+    assert!(logs_contain("writer_features=Some([DeletionVectors, ChangeDataFeed])"));
+    assert!(logs_contain("min_reader_version=3"));
+    assert!(logs_contain("min_writer_version=7"));
+    assert!(logs_contain("schema_string={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
+    assert!(logs_contain("table_properties="));
+    assert!(logs_contain("\"delta.enableChangeDataFeed\": \"true\""));
+    assert!(logs_contain("\"delta.columnMapping.mode\": \"none\""));
+    assert!(logs_contain("\"delta.enableDeletionVectors\": \"true\""));
 }
