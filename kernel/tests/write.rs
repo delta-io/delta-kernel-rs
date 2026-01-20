@@ -127,16 +127,17 @@ fn get_scan_files(
         .collect())
 }
 
+fn get_simple_int_schema() -> Arc<StructType> {
+    Arc::new(StructType::try_new(vec![StructField::nullable("number", DataType::INTEGER)]).unwrap())
+}
+
 #[tokio::test]
 async fn test_commit_info() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
@@ -287,10 +288,7 @@ async fn test_commit_info_action() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -340,10 +338,7 @@ async fn test_append() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -432,10 +427,7 @@ async fn test_no_add_actions() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -470,10 +462,7 @@ async fn test_append_twice() -> Result<(), Box<dyn std::error::Error>> {
     // setup tracing
     let _ = tracing_subscriber::fmt::try_init();
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, _, _) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -714,10 +703,7 @@ async fn test_write_txn_actions() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, store, table_name) in
         setup_test_tables(schema, &[], None, "test_table").await?
@@ -1302,10 +1288,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
 async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_basic";
 
@@ -1381,10 +1364,7 @@ async fn test_set_domain_metadata_basic() -> Result<(), Box<dyn std::error::Erro
 async fn test_set_domain_metadata_errors() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_errors";
     let (store, engine, table_location) = engine_store_setup(table_name, None);
@@ -1434,10 +1414,7 @@ async fn test_set_domain_metadata_unsupported_writer_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1470,10 +1447,7 @@ async fn test_remove_domain_metadata_unsupported_writer_feature(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_remove_domain_metadata_unsupported";
 
@@ -1506,10 +1480,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
 {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1563,10 +1534,7 @@ async fn test_remove_domain_metadata_non_existent_domain() -> Result<(), Box<dyn
 async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1642,10 +1610,7 @@ async fn test_domain_metadata_set_remove_conflicts() -> Result<(), Box<dyn std::
 async fn test_domain_metadata_set_then_remove() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let table_name = "test_domain_metadata_unsupported";
 
@@ -1773,10 +1738,7 @@ async fn test_ict_commit_e2e() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number' with ICT enabled
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let tmp_dir = TempDir::new()?;
     let tmp_test_dir_url = Url::from_file_path(&tmp_dir).unwrap();
@@ -2530,10 +2492,7 @@ async fn test_remove_files_verify_files_excluded_from_scan(
     let _ = tracing_subscriber::fmt::try_init();
 
     // create a simple table: one int column named 'number'
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -2610,10 +2569,7 @@ async fn test_remove_files_with_modified_selection_vector() -> Result<(), Box<dy
 
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     for (table_url, engine, _store, _table_name) in
         setup_test_tables(schema.clone(), &[], None, "test_table").await?
@@ -2821,10 +2777,7 @@ async fn test_cdf_write_all_adds_succeeds() -> Result<(), Box<dyn std::error::Er
     // This test verifies that add-only transactions work with CDF enabled
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_all_adds", schema.clone()).await?;
@@ -2841,10 +2794,7 @@ async fn test_cdf_write_all_removes_succeeds() -> Result<(), Box<dyn std::error:
     // This test verifies that remove-only transactions work with CDF enabled
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_all_removes", schema.clone()).await?;
@@ -2884,10 +2834,7 @@ async fn test_cdf_write_mixed_no_data_change_succeeds() -> Result<(), Box<dyn st
     // This can happen when a table is being optimized/compacted.
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_mixed_no_data_change", schema.clone()).await?;
@@ -2929,10 +2876,7 @@ async fn test_cdf_write_mixed_with_data_change_fails() -> Result<(), Box<dyn std
     // This test verifies that mixed add+remove transactions fail with helpful error when dataChange=true
     let _ = tracing_subscriber::fmt::try_init();
 
-    let schema = Arc::new(StructType::try_new(vec![StructField::nullable(
-        "number",
-        DataType::INTEGER,
-    )])?);
+    let schema = get_simple_int_schema();
 
     let (table_url, engine, _tmp_dir) =
         create_cdf_table("test_cdf_mixed_with_data_change", schema.clone()).await?;
