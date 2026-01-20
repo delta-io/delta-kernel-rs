@@ -81,6 +81,9 @@ impl<T: Send + 'static, E: executor::TaskExecutor> Iterator for BlockingStreamIt
     }
 }
 
+const DEFAULT_BUFFER_SIZE: usize = 1000;
+const DEFAULT_BATCH_SIZE: usize = 1000;
+
 #[derive(Debug)]
 pub struct DefaultEngine<E: TaskExecutor> {
     object_store: Arc<DynObjectStore>,
