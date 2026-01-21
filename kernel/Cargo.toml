@@ -147,7 +147,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "fmt",
 ] }
-tracing-test = "0.2.5"
 
 [[bench]]
 name = "metadata_bench"

@@ -20,7 +20,8 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tracing_test::traced_test;
+use std::sync::Mutex;
+use tracing_subscriber::layer::SubscriberExt;
 
 fn get_schema() -> StructType {
     StructType::new_unchecked([
@@ -917,9 +918,85 @@ async fn file_meta_timestamp() {
     assert_eq!(scanner.timestamp, file_meta_ts);
 }
 
+// #[tokio::test]
+// #[traced_test]
+// async fn print_table_configuration() {
+//     let _ = tracing_subscriber::fmt::try_init();
+//     let engine = Arc::new(SyncEngine::new());
+//     let mut mock_table = LocalMockTable::new();
+//     mock_table
+//         .commit([
+//             Action::Metadata(
+//                 Metadata::try_new(
+//                     None,
+//                     None,
+//                     get_schema(),
+//                     vec![],
+//                     0,
+//                     HashMap::from([
+//                         ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+//                         (
+//                             "delta.enableDeletionVectors".to_string(),
+//                             "true".to_string(),
+//                         ),
+//                         ("delta.columnMapping.mode".to_string(), "none".to_string()),
+//                     ]),
+//                 )
+//                 .unwrap(),
+//             ),
+//             Action::Protocol(
+//                 Protocol::try_new(
+//                     3,
+//                     7,
+//                     Some([TableFeature::DeletionVectors]),
+//                     Some([TableFeature::DeletionVectors, TableFeature::ChangeDataFeed]),
+//                 )
+//                 .unwrap(),
+//             ),
+//         ])
+//         .await;
+
+//     let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+//         .unwrap()
+//         .into_iter();
+
+//     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+//     let table_config = get_default_table_config(&table_root_url); //table config object
+
+//     let _scan_batches: DeltaResult<Vec<_>> =
+//         table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+//             .unwrap()
+//             .try_collect();
+
+//     assert!(logs_contain("Table configuration updated during CDF query"));
+//     assert!(logs_contain("version=0"));
+//     assert!(logs_contain("id="));
+//     assert!(logs_contain(
+//         "writerFeatures=[deletionVectors, changeDataFeed]"
+//     ));
+//     assert!(logs_contain("minReaderVersion=3"));
+//     assert!(logs_contain("minWriterVersion=7"));
+//     assert!(logs_contain("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
+//     assert!(logs_contain("configuration="));
+//     assert!(logs_contain("\"delta.enableChangeDataFeed\":\"true\""));
+//     assert!(logs_contain("\"delta.columnMapping.mode\":\"none\""));
+//     assert!(logs_contain("\"delta.enableDeletionVectors\":\"true\""));
+// }
+
 #[tokio::test]
-#[traced_test]
 async fn print_table_configuration() {
+    // Capture logs in a buffer
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let logs_clone = logs.clone();
+
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(move || LogWriter(logs_clone.clone()))
+            .with_ansi(false),
+    );
+
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
@@ -959,24 +1036,45 @@ async fn print_table_configuration() {
         .into_iter();
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
-    let table_config = get_default_table_config(&table_root_url); //table config object
+    let table_config = get_default_table_config(&table_root_url);
 
     let _scan_batches: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
             .unwrap()
             .try_collect();
 
-    assert!(logs_contain("Table configuration updated during CDF query"));
-    assert!(logs_contain("version=0"));
-    assert!(logs_contain("id="));
-    assert!(logs_contain(
-        "writerFeatures=[deletionVectors, changeDataFeed]"
-    ));
-    assert!(logs_contain("minReaderVersion=3"));
-    assert!(logs_contain("minWriterVersion=7"));
-    assert!(logs_contain("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
-    assert!(logs_contain("configuration="));
-    assert!(logs_contain("\"delta.enableChangeDataFeed\":\"true\""));
-    assert!(logs_contain("\"delta.columnMapping.mode\":\"none\""));
-    assert!(logs_contain("\"delta.enableDeletionVectors\":\"true\""));
+    // Convert logs to string for assertions
+    let log_output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+
+    assert!(log_output.contains("Table configuration updated during CDF query"));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("id="));
+    assert!(log_output.contains("writerFeatures=[deletionVectors, changeDataFeed]"));
+    assert!(log_output.contains("minReaderVersion=3"));
+    assert!(log_output.contains("minWriterVersion=7"));
+    assert!(log_output.contains("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
+    assert!(log_output.contains("configuration="));
+    assert!(log_output.contains("\"delta.enableChangeDataFeed\":\"true\""));
+    assert!(log_output.contains("\"delta.columnMapping.mode\":\"none\""));
+    assert!(log_output.contains("\"delta.enableDeletionVectors\":\"true\""));
+}
+
+// Helper struct for capturing logs
+#[derive(Clone)]
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
