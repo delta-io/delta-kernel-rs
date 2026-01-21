@@ -434,9 +434,7 @@ impl Snapshot {
     /// [`crate::StorageHandler::head`], which may not be implemented by all engines
     /// (e.g., `SyncEngine`).
     ///
-    /// Note (default engine): **do not** use `TokioBackgroundExecutor` for this operation; nested
-    /// `block_on` **will deadlock**. Use a multi-threaded Tokio task executor instead (e.g.
-    /// `TokioMultiThreadExecutor`). See [issue #1605](https://github.com/delta-io/delta-kernel-rs/issues/1605).
+    /// If you are using the default engine, make sure to build it with the multi-threaded executor if you want to use this method.
     pub fn checkpoint(self: Arc<Self>, engine: &dyn Engine) -> DeltaResult<()> {
         let writer = self.create_checkpoint_writer()?;
         let checkpoint_path = writer.checkpoint_path()?;
