@@ -75,9 +75,8 @@ pub trait Committer: Send + AsAny {
     ///
     /// # When to call
     ///
-    /// This method should only be called on catalog committers (i.e., when
-    /// [`is_catalog_committer`] returns `true`). Callers should check this before invoking
-    /// `publish`.
+    /// This method should only be called on catalog committers (i.e., when [`is_catalog_committer`]
+    /// returns `true`). On a filesystem committer, this is a no-op and returns `Ok(())`.
     ///
     /// # Benefits
     ///

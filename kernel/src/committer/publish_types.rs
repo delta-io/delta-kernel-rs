@@ -62,62 +62,57 @@ impl CatalogCommit {
 
 /// Metadata required for publishing catalog commits to the Delta log.
 ///
-/// `PublishMetadata` bundles all the information needed to publish catalog commits: the snapshot
-/// version up to which commits should be published, and the list of catalog commits themselves.
+/// `PublishMetadata` bundles all the information needed to publish catalog commits: the version up
+/// to which commits should be published, and the list of catalog commits themselves.
 ///
 /// # Invariants
 ///
 /// The following invariants are enforced at construction time:
-/// - `ascending_catalog_commits` must be non-empty
-/// - `ascending_catalog_commits` must be contiguous (no version gaps)
-/// - The last catalog commit version must equal `snapshot_version`
+/// - `commits_to_publish` must be non-empty
+/// - `commits_to_publish` must be contiguous (no version gaps) in ascending order of version
+/// - The last catalog commit version must equal `publish_to_version`
 ///
 /// See [`Committer::publish`] for details on the publish operation.
 ///
 /// [`Committer::publish`]: super::Committer::publish
 pub struct PublishMetadata {
-    snapshot_version: Version,
-    ascending_catalog_commits: Vec<CatalogCommit>,
+    publish_to_version: Version,
+    commits_to_publish: Vec<CatalogCommit>,
 }
 
 #[allow(dead_code)] // pub(crate) constructor will be used in future PRs
 impl PublishMetadata {
     pub(crate) fn new(
-        snapshot_version: Version,
-        ascending_catalog_commits: Vec<CatalogCommit>,
+        publish_to_version: Version,
+        commits_to_publish: Vec<CatalogCommit>,
     ) -> DeltaResult<Self> {
-        Self::validate_catalog_commits_contiguous(&ascending_catalog_commits)?;
-        Self::validate_catalog_commits_end_with_snapshot_version(
-            &ascending_catalog_commits,
-            snapshot_version,
-        )?;
+        Self::validate_contiguous(&commits_to_publish)?;
+        Self::validate_end_version(&commits_to_publish, publish_to_version)?;
         Ok(Self {
-            snapshot_version,
-            ascending_catalog_commits,
+            publish_to_version,
+            commits_to_publish,
         })
     }
 
     /// The snapshot version up to which all catalog commits must be published.
-    pub fn snapshot_version(&self) -> Version {
-        self.snapshot_version
+    pub fn publish_version(&self) -> Version {
+        self.publish_to_version
     }
 
     /// The list of contiguous catalog commits to be published, in ascending order of version.
-    pub fn ascending_catalog_commits(&self) -> &[CatalogCommit] {
-        &self.ascending_catalog_commits
+    pub fn commits_to_publish(&self) -> &[CatalogCommit] {
+        &self.commits_to_publish
     }
 
-    fn validate_catalog_commits_contiguous(
-        ascending_catalog_commits: &[CatalogCommit],
-    ) -> DeltaResult<()> {
-        ascending_catalog_commits
+    fn validate_contiguous(commits_to_publish: &[CatalogCommit]) -> DeltaResult<()> {
+        commits_to_publish
             .windows(2)
             .all(|c| c[0].version() + 1 == c[1].version())
             .then_some(())
             .ok_or_else(|| {
                 Error::Generic(format!(
                     "Catalog commits must be contiguous: got versions {:?}",
-                    ascending_catalog_commits
+                    commits_to_publish
                         .iter()
                         .map(|c| c.version())
                         .collect::<Vec<_>>()
@@ -125,17 +120,17 @@ impl PublishMetadata {
             })
     }
 
-    fn validate_catalog_commits_end_with_snapshot_version(
-        ascending_catalog_commits: &[CatalogCommit],
-        snapshot_version: Version,
+    fn validate_end_version(
+        commits_to_publish: &[CatalogCommit],
+        publish_to_version: Version,
     ) -> DeltaResult<()> {
-        match ascending_catalog_commits.last().map(|c| c.version()) {
-            Some(v) if v == snapshot_version => Ok(()),
+        match commits_to_publish.last().map(|c| c.version()) {
+            Some(v) if v == publish_to_version => Ok(()),
             Some(v) => Err(Error::Generic(format!(
-                "Catalog commits must end with snapshot version {snapshot_version}, but got {v}"
+                "Catalog commits must end with snapshot version {publish_to_version}, but got {v}"
             ))),
             None => Err(Error::Generic(format!(
-                "Catalog commits are empty, expected snapshot version {snapshot_version}"
+                "Catalog commits are empty, expected snapshot version {publish_to_version}"
             ))),
         }
     }
@@ -196,8 +191,8 @@ mod tests {
     fn test_publish_metadata_construction_with_valid_commits() {
         let catalog_commits = create_catalog_commits(&[10, 11, 12]);
         let publish_metadata = PublishMetadata::new(12, catalog_commits).unwrap();
-        assert_eq!(publish_metadata.snapshot_version(), 12);
-        assert_eq!(publish_metadata.ascending_catalog_commits().len(), 3);
+        assert_eq!(publish_metadata.publish_version(), 12);
+        assert_eq!(publish_metadata.commits_to_publish().len(), 3);
     }
 
     #[test]
@@ -218,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_metadata_construction_rejects_commits_not_ending_with_snapshot_version() {
+    fn test_publish_metadata_construction_rejects_commits_not_ending_with_publish_to_version() {
         let catalog_commits = create_catalog_commits(&[10, 11]);
         assert_result_error_with_message(
             PublishMetadata::new(12, catalog_commits),

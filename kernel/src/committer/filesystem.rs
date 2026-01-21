@@ -58,7 +58,7 @@ impl Committer for FileSystemCommitter {
     /// The FileSystemCommitter should never be invoked to publish catalog commits. If it is,
     /// something has gone wrong upstream.
     fn publish(&self, _engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
-        if !publish_metadata.ascending_catalog_commits().is_empty() {
+        if !publish_metadata.commits_to_publish().is_empty() {
             return Err(Error::generic(
                 "The FilesystemCommitter does not support publishing catalog commits.",
             ));
