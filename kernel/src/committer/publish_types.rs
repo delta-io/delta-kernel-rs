@@ -94,6 +94,7 @@ pub struct PublishMetadata {
 
 impl PublishMetadata {
     /// Creates a new `PublishMetadata` with the given publish to version and catalog commits.
+    #[allow(dead_code)] // pub(crate) constructor will be used in future PRs
     pub(crate) fn new(
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
