@@ -21,6 +21,7 @@ use crate::schema::SchemaRef;
 use crate::table_configuration::{InCommitTimestampEnablement, TableConfiguration};
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
+use crate::utils::require;
 use crate::LogCompactionWriter;
 use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
@@ -374,6 +375,47 @@ impl Snapshot {
                 Err(e)
             }
         }
+    }
+
+    /// Creates a new [`Snapshot`] representing the table state immediately after a commit.
+    ///
+    /// This method takes a pre-commit snapshot (i.e. the read_snapshot) and incorporates a newly
+    /// committed transaction to produce a post-commit snapshot at the committed version. This
+    /// allows immediate use of the new and latest table state without re-reading metadata from
+    /// storage.
+    ///
+    /// TODO: Take in ICT.
+    /// TODO: Take in Protocol (when Kernel-RS supports protocol changes)
+    /// TODO: Take in Metadata (when Kernel-RS supports metadata changes)
+    #[allow(unused)]
+    pub(crate) fn new_post_commit(&self, commit: ParsedLogPath) -> DeltaResult<Self> {
+        require!(
+            commit.is_commit(),
+            Error::internal_error(format!(
+                "Cannot create post-commit Snapshot. Log file is not a commit file. \
+                Path: {}, Type: {:?}.",
+                commit.location.location, commit.file_type
+            ))
+        );
+        require!(
+            commit.version == self.version() + 1,
+            Error::internal_error(format!(
+                "Cannot create post-commit Snapshot. Log file version ({}) does not \
+                equal Snapshot version ({}) + 1.",
+                commit.version,
+                self.version()
+            ))
+        );
+
+        let new_table_configuration =
+            TableConfiguration::new_post_commit(self.table_configuration(), commit.version);
+
+        let new_log_segment = self.log_segment.new_with_commit_appended(commit)?;
+
+        Ok(Snapshot {
+            table_configuration: new_table_configuration,
+            log_segment: new_log_segment,
+        })
     }
 
     /// Creates a [`CheckpointWriter`] for generating a checkpoint from this snapshot.
@@ -1752,5 +1794,23 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_new_post_commit_simple() {
+        // GIVEN
+        let path = std::fs::canonicalize(PathBuf::from("./tests/data/basic_partitioned/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let engine = SyncEngine::new();
+        let base_snapshot = Snapshot::builder_for(url.clone()).build(&engine).unwrap();
+        let next_version = base_snapshot.version() + 1;
+
+        // WHEN
+        let fake_new_commit = ParsedLogPath::create_parsed_published_commit(&url, next_version);
+        let post_commit_snapshot = base_snapshot.new_post_commit(fake_new_commit).unwrap();
+
+        // THEN
+        assert_eq!(post_commit_snapshot.version(), next_version);
+        assert_eq!(post_commit_snapshot.log_segment().end_version, next_version);
     }
 }
