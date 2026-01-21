@@ -485,7 +485,7 @@ impl Snapshot {
 
     /// Create a [`Transaction`] for this `SnapshotRef`. With the specified [`Committer`].
     pub fn transaction(self: Arc<Self>, committer: Box<dyn Committer>) -> DeltaResult<Transaction> {
-        Transaction::try_new(self, committer)
+        Transaction::try_new_existing_table(self, committer)
     }
 
     /// Fetch the latest version of the provided `application_id` for this snapshot. Filters the txn based on the SetTransactionRetentionDuration property and lastUpdated
@@ -537,6 +537,17 @@ impl Snapshot {
             .into_iter()
             .filter(|domain| !domain.is_internal())
             .collect())
+    }
+
+    /// Get all domain metadata including system-controlled domains (delta.*).
+    /// This is intended for testing purposes to validate system domain metadata.
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn get_all_domain_metadata_unfiltered(
+        &self,
+        engine: &dyn Engine,
+    ) -> DeltaResult<Vec<DomainMetadata>> {
+        all_domain_metadata_configuration(self.log_segment(), engine)
     }
 
     /// Get the In-Commit Timestamp (ICT) for this snapshot.
