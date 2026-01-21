@@ -12,11 +12,10 @@ use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
-use crate::utils::test_utils::{
-    assert_result_error_with_message, Action, LocalMockTable, LogWriter,
-};
+use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
+use test_utils::LogWriter;
 
 use itertools::Itertools;
 use std::collections::HashMap;
