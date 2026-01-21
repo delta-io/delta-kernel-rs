@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::expressions::{
     BinaryExpression, BinaryPredicate, ColumnName, Expression, ExpressionRef, JunctionPredicate,
-    OpaqueExpression, OpaquePredicate, Predicate, Scalar, Transform, UnaryExpression,
-    UnaryPredicate, VariadicExpression,
+    OpaqueExpression, OpaquePredicate, ParseJsonExpression, Predicate, Scalar, Transform,
+    UnaryExpression, UnaryPredicate, VariadicExpression,
 };
 use crate::utils::CowExt as _;
 
@@ -66,6 +66,16 @@ pub trait ExpressionTransform<'a> {
     /// that simply returns its argument and does _NOT_ recurse into its children.
     fn transform_expr_transform(&mut self, transform: &'a Transform) -> Option<Cow<'a, Transform>> {
         Some(Cow::Borrowed(transform))
+    }
+
+    /// Called for each [`ParseJsonExpression`] encountered during the traversal. Implementations
+    /// can call [`Self::recurse_into_expr_parse_json`] if they wish to recursively transform the
+    /// child expression.
+    fn transform_expr_parse_json(
+        &mut self,
+        expr: &'a ParseJsonExpression,
+    ) -> Option<Cow<'a, ParseJsonExpression>> {
+        self.recurse_into_expr_parse_json(expr)
     }
 
     /// Called for the child predicate of each [`Expression::Predicate`] encountered during the
@@ -182,6 +192,9 @@ pub trait ExpressionTransform<'a> {
             Expression::Opaque(o) => self
                 .transform_expr_opaque(o)?
                 .map_owned_or_else(expr, Expression::Opaque),
+            Expression::ParseJson(p) => self
+                .transform_expr_parse_json(p)?
+                .map_owned_or_else(expr, Expression::ParseJson),
             Expression::Unknown(u) => self
                 .transform_expr_unknown(u)?
                 .map_owned_or_else(expr, Expression::Unknown),
@@ -228,6 +241,19 @@ pub trait ExpressionTransform<'a> {
             self.transform_expr(f)
                 .map(|cow| cow.map_owned_or_else(f, Arc::new))
         })
+    }
+
+    /// Recursively transforms the child expression of a [`ParseJsonExpression`]. The schema is
+    /// not transformed. Returns `None` if the child was removed, `Some(Cow::Owned)` if the child
+    /// was changed, and `Some(Cow::Borrowed)` otherwise.
+    fn recurse_into_expr_parse_json(
+        &mut self,
+        expr: &'a ParseJsonExpression,
+    ) -> Option<Cow<'a, ParseJsonExpression>> {
+        let nested = self.transform_expr(&expr.json_expr)?;
+        Some(nested.map_owned_or_else(expr, |json_expr| {
+            ParseJsonExpression::new(json_expr, expr.output_schema.clone())
+        }))
     }
 
     /// Recursively transforms the children of an [`OpaqueExpression`]. Returns `None` if all
@@ -519,12 +545,13 @@ mod tests {
     use crate::expressions::VariadicExpressionOp::Coalesce;
     use crate::expressions::{
         column_expr, column_pred, Expression as Expr, OpaqueExpressionOp, OpaquePredicateOp,
-        Predicate as Pred, ScalarExpressionEvaluator,
+        ParseJsonExpression, Predicate as Pred, ScalarExpressionEvaluator,
     };
     use crate::kernel_predicates::{
         DirectDataSkippingPredicateEvaluator, DirectPredicateEvaluator,
         IndirectDataSkippingPredicateEvaluator,
     };
+    use crate::schema::{DataType, StructField, StructType};
     use crate::DeltaResult;
 
     #[derive(Debug, PartialEq)]
@@ -799,6 +826,151 @@ mod tests {
             }
 
             assert_eq!(result_expr.exprs[3], Expr::literal("keep"));
+        }
+    }
+
+    fn test_output_schema() -> Arc<StructType> {
+        Arc::new(StructType::new_unchecked(vec![
+            StructField::new("a", DataType::LONG, true),
+            StructField::new("b", DataType::STRING, true),
+        ]))
+    }
+
+    #[test]
+    fn test_transform_expr_parse_json_noop() {
+        // Test default no-op behavior - should return Cow::Borrowed
+        let parse_json_expr =
+            ParseJsonExpression::new(column_expr!("json_col"), test_output_schema());
+
+        let mut transform = NoopTransform;
+        let result = transform.transform_expr_parse_json(&parse_json_expr);
+
+        assert!(matches!(result, Some(Cow::Borrowed(_))));
+        if let Some(Cow::Borrowed(result_expr)) = result {
+            assert_eq!(result_expr, &parse_json_expr);
+        }
+    }
+
+    #[test]
+    fn test_transform_expr_parse_json_child_transformation() {
+        // Test transformation of child expression - should return Cow::Owned
+        struct ColumnReplacer;
+        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
+            fn transform_expr_column(
+                &mut self,
+                name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                if name.len() == 1 && name[0] == "old_json_col" {
+                    Some(Cow::Owned(ColumnName::new(["new_json_col"])))
+                } else {
+                    Some(Cow::Borrowed(name))
+                }
+            }
+        }
+
+        let parse_json_expr =
+            ParseJsonExpression::new(column_expr!("old_json_col"), test_output_schema());
+
+        let mut transform = ColumnReplacer;
+        let result = transform.transform_expr_parse_json(&parse_json_expr);
+
+        assert!(matches!(result, Some(Cow::Owned(_))));
+        if let Some(Cow::Owned(result_expr)) = result {
+            // Check that the column was replaced
+            if let Expr::Column(col) = result_expr.json_expr.as_ref() {
+                assert_eq!(col.len(), 1);
+                assert_eq!(col[0], "new_json_col");
+            } else {
+                panic!("Expected column expression");
+            }
+            // Schema should be preserved
+            assert_eq!(result_expr.output_schema, test_output_schema());
+        }
+    }
+
+    #[test]
+    fn test_transform_expr_parse_json_child_unchanged() {
+        // Test when child column doesn't match replacement criteria - should return Cow::Borrowed
+        struct ColumnReplacer;
+        impl<'a> ExpressionTransform<'a> for ColumnReplacer {
+            fn transform_expr_column(
+                &mut self,
+                name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                if name.len() == 1 && name[0] == "other_col" {
+                    Some(Cow::Owned(ColumnName::new(["replaced"])))
+                } else {
+                    Some(Cow::Borrowed(name))
+                }
+            }
+        }
+
+        let parse_json_expr =
+            ParseJsonExpression::new(column_expr!("json_col"), test_output_schema());
+
+        let mut transform = ColumnReplacer;
+        let result = transform.transform_expr_parse_json(&parse_json_expr);
+
+        // Since "json_col" doesn't match "other_col", nothing changes
+        assert!(matches!(result, Some(Cow::Borrowed(_))));
+    }
+
+    #[test]
+    fn test_transform_expr_parse_json_child_removal() {
+        // Test removal of child expression - should return None
+        struct ColumnRemover;
+        impl<'a> ExpressionTransform<'a> for ColumnRemover {
+            fn transform_expr_column(
+                &mut self,
+                _name: &'a ColumnName,
+            ) -> Option<Cow<'a, ColumnName>> {
+                None // Remove all column references
+            }
+        }
+
+        let parse_json_expr =
+            ParseJsonExpression::new(column_expr!("json_col"), test_output_schema());
+
+        let mut transform = ColumnRemover;
+        let result = transform.transform_expr_parse_json(&parse_json_expr);
+
+        // Child was removed, so the whole ParseJson should be None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_transform_expr_parse_json_nested_child() {
+        // Test with a more complex nested child expression
+        struct LiteralDoubler;
+        impl<'a> ExpressionTransform<'a> for LiteralDoubler {
+            fn transform_expr_literal(&mut self, value: &'a Scalar) -> Option<Cow<'a, Scalar>> {
+                if let Scalar::Integer(n) = value {
+                    Some(Cow::Owned(Scalar::Integer(n * 2)))
+                } else {
+                    Some(Cow::Borrowed(value))
+                }
+            }
+        }
+
+        // ParseJson with a binary expression as child: column + 5
+        let child_expr = column_expr!("x") + Expr::literal(5);
+        let parse_json_expr = ParseJsonExpression::new(child_expr, test_output_schema());
+
+        let mut transform = LiteralDoubler;
+        let result = transform.transform_expr_parse_json(&parse_json_expr);
+
+        assert!(matches!(result, Some(Cow::Owned(_))));
+        if let Some(Cow::Owned(result_expr)) = result {
+            // The literal 5 should have been doubled to 10
+            if let Expr::Binary(binary) = result_expr.json_expr.as_ref() {
+                if let Expr::Literal(Scalar::Integer(n)) = &*binary.right {
+                    assert_eq!(*n, 10);
+                } else {
+                    panic!("Expected integer literal");
+                }
+            } else {
+                panic!("Expected binary expression");
+            }
         }
     }
 

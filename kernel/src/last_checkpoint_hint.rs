@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::schema::Schema;
+use crate::schema::SchemaRef;
 use crate::{DeltaResult, Error, StorageHandler, Version};
 use delta_kernel_derive::internal_api;
 
@@ -33,7 +33,7 @@ pub(crate) struct LastCheckpointHint {
     /// The number of AddFile actions in the checkpoint.
     pub(crate) num_of_add_files: Option<i64>,
     /// The schema of the checkpoint file.
-    pub(crate) checkpoint_schema: Option<Schema>,
+    pub(crate) checkpoint_schema: Option<SchemaRef>,
     /// The checksum of the last checkpoint JSON.
     pub(crate) checksum: Option<String>,
     /// Additional metadata about the last checkpoint.

@@ -3,15 +3,17 @@
 use std::sync::Arc;
 
 use delta_kernel::arrow::array::{
-    ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, BooleanArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
 };
-
+use delta_kernel::arrow::buffer::OffsetBuffer;
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Field};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::arrow::util::pretty::pretty_format_batches;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_data::{ArrowEngineData, EngineDataArrowExt};
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::executor::TaskExecutor;
-use delta_kernel::engine::default::DefaultEngine;
+use delta_kernel::engine::default::storage::store_from_url;
+use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::parquet::arrow::arrow_writer::ArrowWriter;
 use delta_kernel::parquet::file::properties::WriterProperties;
 use delta_kernel::scan::Scan;
@@ -37,6 +39,44 @@ pub fn load_test_data(
     let temp_dir = tempfile::tempdir()?;
     archive.unpack(temp_dir.path())?;
     Ok(temp_dir)
+}
+
+/// Recursively copies a directory and all its contents from source to destination.
+///
+/// This function is used to create isolated copies of test tables, enabling parallel
+/// test execution without interference. Each test gets its own copy of the table data,
+/// preventing race conditions and cross-test pollution.
+///
+/// # Arguments
+///
+/// * `source` - Path to the source directory to copy from
+/// * `dest` - Path to the destination directory (will be created if it doesn't exist)
+///
+/// # Note
+///
+/// This function copies ALL files and subdirectories, including any test artifacts
+/// that may have been created in the source directory. Ensure the source directory
+/// contains only the intended baseline data.
+pub fn copy_directory(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dest)?;
+
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let dest_path = dest.join(&file_name);
+
+        if path.is_dir() {
+            copy_directory(&path, &dest_path)?;
+        } else {
+            std::fs::copy(&path, &dest_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// A common useful initial metadata and protocol. Also includes a single commitInfo
@@ -193,27 +233,14 @@ pub fn into_record_batch(engine_data: Box<dyn EngineData>) -> RecordBatch {
         .into()
 }
 
-/// Simple extension trait with helpful methods (just constuctor for now) for creating/using
-/// DefaultEngine in our tests.
+/// Helper to create a DefaultEngine with the default executor for tests.
 ///
-/// Note: we implment this extension trait here so that we can import this trait (from test-utils
-/// crate) and get to use all these test-only helper methods from places where we don't have access
-pub trait DefaultEngineExtension {
-    type Executor: TaskExecutor;
-
-    fn new_local() -> Arc<DefaultEngine<Self::Executor>>;
-}
-
-impl DefaultEngineExtension for DefaultEngine<TokioBackgroundExecutor> {
-    type Executor = TokioBackgroundExecutor;
-
-    fn new_local() -> Arc<DefaultEngine<TokioBackgroundExecutor>> {
-        let object_store = Arc::new(LocalFileSystem::new());
-        Arc::new(DefaultEngine::new(
-            object_store,
-            TokioBackgroundExecutor::new().into(),
-        ))
-    }
+/// Uses `TokioBackgroundExecutor` as the default executor.
+pub fn create_default_engine(
+    table_root: &url::Url,
+) -> DeltaResult<Arc<DefaultEngine<TokioBackgroundExecutor>>> {
+    let store = store_from_url(table_root)?;
+    Ok(Arc::new(DefaultEngineBuilder::new(store).build()))
 }
 
 // setup default engine with in-memory (local_directory=None) or local fs (local_directory=Some(Url))
@@ -235,8 +262,7 @@ pub fn engine_store_setup(
             Url::parse(format!("{dir}{table_name}/").as_str()).expect("valid url"),
         ),
     };
-    let executor = Arc::new(TokioBackgroundExecutor::new());
-    let engine = DefaultEngine::new(Arc::clone(&storage), executor);
+    let engine = DefaultEngineBuilder::new(Arc::clone(&storage)).build();
 
     (storage, engine, url)
 }
@@ -300,6 +326,9 @@ pub async fn create_table(
                 "delta.inCommitTimestampEnablementTimestamp".to_string(),
                 json!("1612345678"),
             );
+        }
+        if writer_features.contains(&"changeDataFeed") {
+            config.insert("delta.enableChangeDataFeed".to_string(), json!("true"));
         }
 
         config
@@ -420,21 +449,10 @@ pub async fn setup_test_tables(
     ])
 }
 
-pub fn to_arrow(data: Box<dyn EngineData>) -> DeltaResult<RecordBatch> {
-    Ok(data
-        .into_any()
-        .downcast::<ArrowEngineData>()
-        .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-        .into())
-}
-
 pub fn read_scan(scan: &Scan, engine: Arc<dyn Engine>) -> DeltaResult<Vec<RecordBatch>> {
     let scan_results = scan.execute(engine)?;
     scan_results
-        .map(|data| -> DeltaResult<_> {
-            let data = data?;
-            to_arrow(data)
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()
 }
 
@@ -485,4 +503,71 @@ pub fn assert_result_error_with_message<T, E: ToString>(res: Result<T, E>, messa
             );
         }
     }
+}
+
+/// Creates add file metadata for one or more files without partition values.
+/// Each tuple contains: (file_path, file_size, mod_time, num_records)
+pub fn create_add_files_metadata(
+    add_files_schema: &SchemaRef,
+    files: Vec<(&str, i64, i64, i64)>,
+) -> Result<Box<dyn delta_kernel::EngineData>, Box<dyn std::error::Error>> {
+    let num_files = files.len();
+
+    // Build arrays for each file
+    let path_array = StringArray::from(files.iter().map(|(p, _, _, _)| *p).collect::<Vec<_>>());
+    let size_array = Int64Array::from(files.iter().map(|(_, s, _, _)| *s).collect::<Vec<_>>());
+    let mod_time_array = Int64Array::from(files.iter().map(|(_, _, m, _)| *m).collect::<Vec<_>>());
+    let num_records_array =
+        Int64Array::from(files.iter().map(|(_, _, _, n)| *n).collect::<Vec<_>>());
+
+    // Create empty map for partitionValues (repeated for each file)
+    let entries_field = Arc::new(Field::new(
+        "key_value",
+        ArrowDataType::Struct(
+            vec![
+                Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+                Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            ]
+            .into(),
+        ),
+        false,
+    ));
+    let empty_keys = StringArray::from(Vec::<&str>::new());
+    let empty_values = StringArray::from(Vec::<Option<&str>>::new());
+    let empty_entries = StructArray::from(vec![
+        (
+            Arc::new(Field::new("key", ArrowDataType::Utf8, false)),
+            Arc::new(empty_keys) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("value", ArrowDataType::Utf8, true)),
+            Arc::new(empty_values) as ArrayRef,
+        ),
+    ]);
+    let offsets = OffsetBuffer::from_lengths(vec![0; num_files]);
+    let partition_values_array = Arc::new(MapArray::new(
+        entries_field,
+        offsets,
+        empty_entries,
+        None,
+        false,
+    ));
+
+    let stats_struct = StructArray::from(vec![(
+        Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+        Arc::new(num_records_array) as ArrayRef,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(TryFromKernel::try_from_kernel(add_files_schema.as_ref())?),
+        vec![
+            Arc::new(path_array) as ArrayRef,
+            partition_values_array as ArrayRef,
+            Arc::new(size_array) as ArrayRef,
+            Arc::new(mod_time_array) as ArrayRef,
+            Arc::new(stats_struct) as ArrayRef,
+        ],
+    )?;
+
+    Ok(Box::new(ArrowEngineData::new(batch)))
 }

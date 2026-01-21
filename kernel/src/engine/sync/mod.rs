@@ -65,7 +65,7 @@ fn read_files<F, I>(
 ) -> DeltaResult<FileDataReadResultIterator>
 where
     I: Iterator<Item = DeltaResult<ArrowEngineData>> + Send + 'static,
-    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>) -> DeltaResult<I>
+    F: FnMut(File, SchemaRef, ArrowSchemaRef, Option<PredicateRef>, String) -> DeltaResult<I>
         + Send
         + 'static,
 {
@@ -79,6 +79,7 @@ where
         .into_iter()
         // Produces Iterator<DeltaResult<Iterator<DeltaResult<ArrowEngineData>>>>
         .map(move |file| {
+            let location_string = file.location.to_string();
             let location = file.location;
             debug!("Reading {location:#?} with schema {schema:#?} and predicate {predicate:#?}");
             let path = location
@@ -89,6 +90,7 @@ where
                 schema.clone(),
                 arrow_schema.clone(),
                 predicate.clone(),
+                location_string,
             )
         })
         // Flatten to Iterator<DeltaResult<DeltaResult<ArrowEngineData>>>

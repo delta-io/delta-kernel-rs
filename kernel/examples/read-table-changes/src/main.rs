@@ -4,7 +4,7 @@ use clap::Parser;
 use common::{LocationArgs, ParseWithExamples};
 use delta_kernel::arrow::array::RecordBatch;
 use delta_kernel::arrow::util::pretty::print_batches;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
+use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::table_changes::TableChanges;
 use delta_kernel::DeltaResult;
 use itertools::Itertools;
@@ -38,14 +38,7 @@ fn main() -> DeltaResult<()> {
     let table_changes_scan = table_changes.into_scan_builder().build()?;
     let batches: Vec<RecordBatch> = table_changes_scan
         .execute(Arc::new(engine))?
-        .map(|data| -> DeltaResult<_> {
-            let record_batch: RecordBatch = data?
-                .into_any()
-                .downcast::<ArrowEngineData>()
-                .map_err(|_| delta_kernel::Error::EngineDataType("ArrowEngineData".to_string()))?
-                .into();
-            Ok(record_batch)
-        })
+        .map(EngineDataArrowExt::try_into_record_batch)
         .try_collect()?;
     print_batches(&batches)?;
     Ok(())

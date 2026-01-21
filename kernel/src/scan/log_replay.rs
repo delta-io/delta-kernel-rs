@@ -2,6 +2,8 @@ use std::clone::Clone;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
+use delta_kernel_derive::internal_api;
+
 use super::data_skipping::DataSkippingFilter;
 use super::state_info::StateInfo;
 use super::{PhysicalPredicate, ScanMetadata};
@@ -10,13 +12,40 @@ use crate::actions::get_log_add_schema;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
 use crate::expressions::{column_name, ColumnName, Expression, ExpressionRef, PredicateRef};
 use crate::kernel_predicates::{DefaultKernelPredicateEvaluator, KernelPredicateEvaluator as _};
+use crate::log_replay::deduplicator::Deduplicator;
 use crate::log_replay::{ActionsBatch, FileActionDeduplicator, FileActionKey, LogReplayProcessor};
 use crate::scan::Scalar;
 use crate::schema::ToSchema as _;
 use crate::schema::{ColumnNamesAndTypes, DataType, MapType, StructField, StructType};
-use crate::transforms::{get_transform_expr, parse_partition_values};
+use crate::table_features::ColumnMappingMode;
+use crate::transforms::{get_transform_expr, parse_partition_values, TransformSpec};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, Error, ExpressionEvaluator};
+
+/// Internal serializable state (schemas, transform spec, column mapping, etc.)
+/// NOTE: This is opaque to the user - it is passed through as a blob.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct InternalScanState {
+    logical_schema: Arc<StructType>,
+    physical_schema: Arc<StructType>,
+    predicate_schema: Option<Arc<StructType>>,
+    transform_spec: Option<Arc<TransformSpec>>,
+    column_mapping_mode: ColumnMappingMode,
+}
+
+/// Public-facing serialized processor state for distributed processing.
+///
+/// This struct contains all the information needed to reconstruct a `ScanLogReplayProcessor`
+/// on remote compute nodes, enabling distributed log replay processing.
+pub struct SerializableScanState {
+    /// Optional predicate for data skipping (if provided)
+    pub predicate: Option<PredicateRef>,
+    /// Opaque internal state blob
+    pub internal_state_blob: Vec<u8>,
+    /// Set of file action keys that have already been processed.
+    pub seen_file_keys: HashSet<FileActionKey>,
+}
 
 /// [`ScanLogReplayProcessor`] performs log replay (processes actions) specifically for doing a table scan.
 ///
@@ -52,8 +81,34 @@ pub(crate) struct ScanLogReplayProcessor {
 }
 
 impl ScanLogReplayProcessor {
+    // These index positions correspond to the order of columns defined in
+    // `selected_column_names_and_types()`
+    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
+    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
+    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
+    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
+    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
+    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
+
     /// Create a new [`ScanLogReplayProcessor`] instance
-    fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+    pub(crate) fn new(engine: &dyn Engine, state_info: Arc<StateInfo>) -> DeltaResult<Self> {
+        Self::new_with_seen_files(engine, state_info, Default::default())
+    }
+
+    /// Create new [`ScanLogReplayProcessor`] with pre-populated seen_file_keys.
+    ///
+    /// This is useful when reconstructing a processor from serialized state, where the
+    /// seen_file_keys have already been computed during a previous phase of log replay.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for creating evaluators and filters
+    /// - `state_info`: StateInfo containing schemas, transforms, and predicates
+    /// - `seen_file_keys`: Pre-computed set of file action keys that have been seen
+    pub(crate) fn new_with_seen_files(
+        engine: &dyn Engine,
+        state_info: Arc<StateInfo>,
+        seen_file_keys: HashSet<FileActionKey>,
+    ) -> DeltaResult<Self> {
         // Extract the physical predicate from StateInfo's PhysicalPredicate enum.
         // The DataSkippingFilter and partition_filter components expect the predicate
         // in the format Option<(PredicateRef, SchemaRef)>, so we need to convert from
@@ -80,9 +135,108 @@ impl ScanLogReplayProcessor {
                 get_add_transform_expr(),
                 SCAN_ROW_DATATYPE.clone(),
             )?,
-            seen_file_keys: Default::default(),
+            seen_file_keys,
             state_info,
         })
+    }
+
+    /// Serialize the processor state for distributed processing.
+    ///
+    /// Consumes the processor and returns a `SerializableScanState` containing:
+    /// - The predicate (if any) for data skipping
+    /// - An opaque internal state blob (schemas, transform spec, column mapping mode)
+    /// - The set of seen file keys including their deletion vector information
+    ///
+    /// The returned state can be used with `from_serializable_state` to reconstruct the
+    /// processor on remote compute nodes.
+    ///
+    /// WARNING: The SerializableScanState may only be deserialized using an equal binary version
+    /// of delta-kernel-rs. Using different versions for serialization and deserialization leads to
+    /// undefined behaviour!
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn into_serializable_state(self) -> DeltaResult<SerializableScanState> {
+        let StateInfo {
+            logical_schema,
+            physical_schema,
+            physical_predicate,
+            transform_spec,
+            column_mapping_mode,
+        } = self.state_info.as_ref().clone();
+
+        // Extract predicate from PhysicalPredicate
+        let (predicate, predicate_schema) = match physical_predicate {
+            PhysicalPredicate::Some(pred, schema) => (Some(pred), Some(schema)),
+            _ => (None, None),
+        };
+
+        // Serialize internal state to JSON blob (schemas, transform spec, and column mapping mode)
+        let internal_state = InternalScanState {
+            logical_schema,
+            physical_schema,
+            transform_spec,
+            predicate_schema,
+            column_mapping_mode,
+        };
+        let internal_state_blob = serde_json::to_vec(&internal_state)
+            .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
+
+        let state = SerializableScanState {
+            predicate,
+            internal_state_blob,
+            seen_file_keys: self.seen_file_keys,
+        };
+
+        Ok(state)
+    }
+
+    /// Reconstruct a processor from serialized state.
+    ///
+    /// Creates a new processor with the provided state. All fields (partition_filter,
+    /// data_skipping_filter, add_transform, and seen_file_keys) are reconstructed from
+    /// the serialized state and engine.
+    ///
+    /// # Parameters
+    /// - `engine`: Engine for creating evaluators and filters
+    /// - `state`: The serialized state containing predicate, internal state blob, and seen file keys
+    ///
+    /// # Returns
+    /// A new `ScanLogReplayProcessor` wrapped in an Arc.
+    ///
+    #[internal_api]
+    #[allow(unused)]
+    pub(crate) fn from_serializable_state(
+        engine: &dyn Engine,
+        state: SerializableScanState,
+    ) -> DeltaResult<Arc<Self>> {
+        // Deserialize internal state from json
+        let internal_state: InternalScanState = serde_json::from_slice(&state.internal_state_blob)
+            .map_err(|e| Error::generic(format!("Failed to deserialize internal state: {}", e)))?;
+
+        // Reconstruct PhysicalPredicate from predicate and predicate schema
+        let physical_predicate = match state.predicate {
+            Some(predicate) => {
+                let Some(predicate_schema) = internal_state.predicate_schema else {
+                    return Err(Error::generic(
+                        "Invalid serialized internal state. Expected predicate schema.",
+                    ));
+                };
+                PhysicalPredicate::Some(predicate, predicate_schema)
+            }
+            None => PhysicalPredicate::None,
+        };
+
+        let state_info = Arc::new(StateInfo {
+            logical_schema: internal_state.logical_schema,
+            physical_schema: internal_state.physical_schema,
+            physical_predicate,
+            transform_spec: internal_state.transform_spec,
+            column_mapping_mode: internal_state.column_mapping_mode,
+        });
+
+        let processor = Self::new_with_seen_files(engine, state_info, state.seen_file_keys)?;
+
+        Ok(Arc::new(processor))
     }
 }
 
@@ -90,40 +244,23 @@ impl ScanLogReplayProcessor {
 /// replay visits actions newest-first, so once we've seen a file action for a given (path, dvId)
 /// pair, we should ignore all subsequent (older) actions for that same (path, dvId) pair. If the
 /// first action for a given file is a remove, then that file does not show up in the result at all.
-struct AddRemoveDedupVisitor<'seen> {
-    deduplicator: FileActionDeduplicator<'seen>,
+struct AddRemoveDedupVisitor<D: Deduplicator> {
+    deduplicator: D,
     selection_vector: Vec<bool>,
     state_info: Arc<StateInfo>,
     partition_filter: Option<PredicateRef>,
     row_transform_exprs: Vec<Option<ExpressionRef>>,
 }
 
-impl AddRemoveDedupVisitor<'_> {
-    // These index positions correspond to the order of columns defined in
-    // `selected_column_names_and_types()`
-    const ADD_PATH_INDEX: usize = 0; // Position of "add.path" in getters
-    const ADD_PARTITION_VALUES_INDEX: usize = 1; // Position of "add.partitionValues" in getters
-    const ADD_DV_START_INDEX: usize = 2; // Start position of add deletion vector columns
-    const BASE_ROW_ID_INDEX: usize = 5; // Position of add.baseRowId in getters
-    const REMOVE_PATH_INDEX: usize = 6; // Position of "remove.path" in getters
-    const REMOVE_DV_START_INDEX: usize = 7; // Start position of remove deletion vector columns
-
+impl<D: Deduplicator> AddRemoveDedupVisitor<D> {
     fn new(
-        seen: &mut HashSet<FileActionKey>,
+        deduplicator: D,
         selection_vector: Vec<bool>,
         state_info: Arc<StateInfo>,
         partition_filter: Option<PredicateRef>,
-        is_log_batch: bool,
-    ) -> AddRemoveDedupVisitor<'_> {
+    ) -> AddRemoveDedupVisitor<D> {
         AddRemoveDedupVisitor {
-            deduplicator: FileActionDeduplicator::new(
-                seen,
-                is_log_batch,
-                Self::ADD_PATH_INDEX,
-                Self::REMOVE_PATH_INDEX,
-                Self::ADD_DV_START_INDEX,
-                Self::REMOVE_DV_START_INDEX,
-            ),
+            deduplicator,
             selection_vector,
             state_info,
             partition_filter,
@@ -175,8 +312,8 @@ impl AddRemoveDedupVisitor<'_> {
         // encounter if the table's schema was replaced after the most recent checkpoint.
         let partition_values = match &self.state_info.transform_spec {
             Some(transform) if is_add => {
-                let partition_values =
-                    getters[Self::ADD_PARTITION_VALUES_INDEX].get(i, "add.partitionValues")?;
+                let partition_values = getters[ScanLogReplayProcessor::ADD_PARTITION_VALUES_INDEX]
+                    .get(i, "add.partitionValues")?;
                 let partition_values = parse_partition_values(
                     &self.state_info.logical_schema,
                     transform,
@@ -196,7 +333,7 @@ impl AddRemoveDedupVisitor<'_> {
             return Ok(false);
         }
         let base_row_id: Option<i64> =
-            getters[Self::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
+            getters[ScanLogReplayProcessor::BASE_ROW_ID_INDEX].get_opt(i, "add.baseRowId")?;
         let transform = self
             .state_info
             .transform_spec
@@ -219,7 +356,7 @@ impl AddRemoveDedupVisitor<'_> {
     }
 }
 
-impl RowVisitor for AddRemoveDedupVisitor<'_> {
+impl<D: Deduplicator> RowVisitor for AddRemoveDedupVisitor<D> {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
         // NOTE: The visitor assumes a schema with adds first and removes optionally afterward.
         static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> = LazyLock::new(|| {
@@ -272,6 +409,12 @@ impl RowVisitor for AddRemoveDedupVisitor<'_> {
     }
 }
 
+pub(crate) static FILE_CONSTANT_VALUES_NAME: &str = "fileConstantValues";
+pub(crate) static BASE_ROW_ID_NAME: &str = "baseRowId";
+pub(crate) static DEFAULT_ROW_COMMIT_VERSION_NAME: &str = "defaultRowCommitVersion";
+pub(crate) static CLUSTERING_PROVIDER_NAME: &str = "clusteringProvider";
+pub(crate) static TAGS_NAME: &str = "tags";
+
 // NB: If you update this schema, ensure you update the comment describing it in the doc comment
 // for `scan_row_schema` in scan/mod.rs! You'll also need to update ScanFileVisitor as the
 // indexes will be off, and [`get_add_transform_expr`] below to match it.
@@ -280,7 +423,17 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
     let partition_values = MapType::new(DataType::STRING, DataType::STRING, true);
     let file_constant_values = StructType::new_unchecked([
         StructField::nullable("partitionValues", partition_values),
-        StructField::nullable("baseRowId", DataType::LONG),
+        StructField::nullable(BASE_ROW_ID_NAME, DataType::LONG),
+        StructField::nullable(DEFAULT_ROW_COMMIT_VERSION_NAME, DataType::LONG),
+        StructField::nullable(
+            "tags",
+            MapType::new(
+                DataType::STRING,
+                DataType::STRING,
+                /*valueContainsNull*/ true,
+            ),
+        ),
+        StructField::nullable(CLUSTERING_PROVIDER_NAME, DataType::STRING),
     ]);
     Arc::new(StructType::new_unchecked([
         StructField::nullable("path", DataType::STRING),
@@ -288,7 +441,7 @@ pub(crate) static SCAN_ROW_SCHEMA: LazyLock<Arc<StructType>> = LazyLock::new(|| 
         StructField::nullable("modificationTime", DataType::LONG),
         StructField::nullable("stats", DataType::STRING),
         StructField::nullable("deletionVector", DeletionVectorDescriptor::to_schema()),
-        StructField::nullable("fileConstantValues", file_constant_values),
+        StructField::nullable(FILE_CONSTANT_VALUES_NAME, file_constant_values),
     ]))
 });
 
@@ -307,13 +460,17 @@ fn get_add_transform_expr() -> ExpressionRef {
             Arc::new(Expression::Struct(vec![
                 column_expr_ref!("add.partitionValues"),
                 column_expr_ref!("add.baseRowId"),
+                column_expr_ref!("add.defaultRowCommitVersion"),
+                column_expr_ref!("add.tags"),
+                column_expr_ref!("add.clusteringProvider"),
             ])),
         ]))
     });
     EXPR.clone()
 }
 
-// TODO: remove once `scan_metadata_from` is pub.
+// TODO: Move this to transaction/mod.rs once `scan_metadata_from` is pub, as this is used for
+// deletion vector update transformations.
 #[allow(unused)]
 pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
     use crate::expressions::column_expr_ref;
@@ -325,8 +482,11 @@ pub(crate) fn get_scan_metadata_transform_expr() -> ExpressionRef {
                 column_expr_ref!("size"),
                 column_expr_ref!("modificationTime"),
                 column_expr_ref!("stats"),
+                column_expr_ref!("fileConstantValues.tags"),
                 column_expr_ref!("deletionVector"),
                 column_expr_ref!("fileConstantValues.baseRowId"),
+                column_expr_ref!("fileConstantValues.defaultRowCommitVersion"),
+                column_expr_ref!("fileConstantValues.clusteringProvider"),
             ],
         ))]))
     });
@@ -347,12 +507,19 @@ impl LogReplayProcessor for ScanLogReplayProcessor {
         let selection_vector = self.build_selection_vector(actions.as_ref())?;
         assert_eq!(selection_vector.len(), actions.len());
 
-        let mut visitor = AddRemoveDedupVisitor::new(
+        let deduplicator = FileActionDeduplicator::new(
             &mut self.seen_file_keys,
+            is_log_batch,
+            Self::ADD_PATH_INDEX,
+            Self::REMOVE_PATH_INDEX,
+            Self::ADD_DV_START_INDEX,
+            Self::REMOVE_DV_START_INDEX,
+        );
+        let mut visitor = AddRemoveDedupVisitor::new(
+            deduplicator,
             selection_vector,
             self.state_info.clone(),
             self.partition_filter.clone(),
-            is_log_batch,
         );
         visitor.visit_rows_of(actions.as_ref())?;
 
@@ -388,12 +555,14 @@ pub(crate) fn scan_action_iter(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
     use crate::actions::get_commit_schema;
+    use crate::engine::sync::SyncEngine;
     use crate::expressions::{BinaryExpressionOp, Scalar, VariadicExpressionOp};
     use crate::log_replay::ActionsBatch;
-    use crate::scan::state::{DvInfo, Stats};
+    use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::{
         assert_transform_spec, get_simple_state_info, get_state_info,
     };
@@ -404,36 +573,31 @@ mod tests {
     };
     use crate::scan::PhysicalPredicate;
     use crate::schema::MetadataColumnSpec;
+    use crate::schema::{DataType, SchemaRef, StructField, StructType};
     use crate::table_features::ColumnMappingMode;
+    use crate::utils::test_utils::assert_result_error_with_message;
     use crate::Expression as Expr;
-    use crate::{
-        engine::sync::SyncEngine,
-        schema::{DataType, SchemaRef, StructField, StructType},
-        ExpressionRef,
-    };
+    use crate::ExpressionRef;
 
-    use super::scan_action_iter;
+    use super::{
+        scan_action_iter, InternalScanState, ScanLogReplayProcessor, SerializableScanState,
+    };
 
     // dv-info is more complex to validate, we validate that works in the test for visit_scan_files
     // in state.rs
-    fn validate_simple(
-        _: &mut (),
-        path: &str,
-        size: i64,
-        stats: Option<Stats>,
-        _: DvInfo,
-        _: Option<ExpressionRef>,
-        part_vals: HashMap<String, String>,
-    ) {
+    fn validate_simple(_: &mut (), scan_file: ScanFile) {
         assert_eq!(
-            path,
+            scan_file.path,
             "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
         );
-        assert_eq!(size, 635);
-        assert!(stats.is_some());
-        assert_eq!(stats.as_ref().unwrap().num_records, 10);
-        assert_eq!(part_vals.get("date"), Some(&"2017-12-10".to_string()));
-        assert_eq!(part_vals.get("non-existent"), None);
+        assert_eq!(scan_file.size, 635);
+        assert!(scan_file.stats.is_some());
+        assert_eq!(scan_file.stats.as_ref().unwrap().num_records, 10);
+        assert_eq!(
+            scan_file.partition_values.get("date"),
+            Some(&"2017-12-10".to_string())
+        );
+        assert_eq!(scan_file.partition_values.get("non-existent"), None);
     }
 
     #[test]
@@ -613,5 +777,256 @@ mod tests {
                 panic!("Should have been a transform expression");
             }
         }
+    }
+
+    #[test]
+    fn test_serialization_basic_state_and_dv_dropping() {
+        // Test basic StateInfo preservation and FileActionKey preservation
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("value", DataType::STRING, true),
+        ]));
+        let mut processor = ScanLogReplayProcessor::new(
+            &engine,
+            Arc::new(get_simple_state_info(schema.clone(), vec![]).unwrap()),
+        )
+        .unwrap();
+
+        // Add file keys with and without DV info
+        let key1 = crate::log_replay::FileActionKey::new("file1.parquet", None);
+        let key2 = crate::log_replay::FileActionKey::new("file2.parquet", Some("dv-1".to_string()));
+        let key3 = crate::log_replay::FileActionKey::new("file3.parquet", Some("dv-2".to_string()));
+        processor.seen_file_keys.insert(key1.clone());
+        processor.seen_file_keys.insert(key2.clone());
+        processor.seen_file_keys.insert(key3.clone());
+
+        let state_info = processor.state_info.clone();
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+
+        // Verify StateInfo fields preserved
+        assert_eq!(
+            deserialized.state_info.logical_schema,
+            state_info.logical_schema
+        );
+        assert_eq!(
+            deserialized.state_info.physical_schema,
+            state_info.physical_schema
+        );
+        assert_eq!(
+            deserialized.state_info.column_mapping_mode,
+            state_info.column_mapping_mode
+        );
+
+        // Verify all file keys are preserved with their DV info
+        assert_eq!(deserialized.seen_file_keys.len(), 3);
+        assert!(deserialized.seen_file_keys.contains(&key1));
+        assert!(deserialized.seen_file_keys.contains(&key2));
+        assert!(deserialized.seen_file_keys.contains(&key3));
+    }
+
+    #[test]
+    fn test_serialization_with_predicate() {
+        // Test that PhysicalPredicate and predicate schema are preserved
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::new("id", DataType::INTEGER, true),
+            StructField::new("value", DataType::STRING, true),
+        ]));
+        let predicate = Arc::new(crate::expressions::Predicate::eq(
+            Expr::column(["id"]),
+            Expr::literal(10i32),
+        ));
+        let state_info = Arc::new(
+            get_state_info(
+                schema.clone(),
+                vec![],
+                Some(predicate.clone()),
+                HashMap::new(),
+                vec![],
+            )
+            .unwrap(),
+        );
+        let original_pred_schema = match &state_info.physical_predicate {
+            PhysicalPredicate::Some(_, s) => s.clone(),
+            _ => panic!("Expected predicate"),
+        };
+        let processor = ScanLogReplayProcessor::new(&engine, state_info.clone()).unwrap();
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+
+        match &deserialized.state_info.physical_predicate {
+            PhysicalPredicate::Some(pred, pred_schema) => {
+                assert_eq!(pred.as_ref(), predicate.as_ref());
+                assert_eq!(pred_schema.as_ref(), original_pred_schema.as_ref());
+            }
+            _ => panic!("Expected PhysicalPredicate::Some"),
+        }
+    }
+
+    #[test]
+    fn test_serialization_with_transforms() {
+        // Test transform_spec preservation (partition columns + row tracking)
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([
+            StructField::new("value", DataType::INTEGER, true),
+            StructField::new("date", DataType::DATE, true),
+        ]));
+        let state_info = Arc::new(
+            get_state_info(
+                schema,
+                vec!["date".to_string()],
+                None,
+                [
+                    ("delta.enableRowTracking", "true"),
+                    (
+                        "delta.rowTracking.materializedRowIdColumnName",
+                        "row_id_col",
+                    ),
+                ]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+                vec![("row_id", MetadataColumnSpec::RowId)],
+            )
+            .unwrap(),
+        );
+        let original_transform = state_info.transform_spec.clone();
+        assert!(original_transform.is_some());
+        let processor = ScanLogReplayProcessor::new(&engine, state_info.clone()).unwrap();
+        let deserialized = ScanLogReplayProcessor::from_serializable_state(
+            &engine,
+            processor.into_serializable_state().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(deserialized.state_info.transform_spec, original_transform);
+    }
+
+    #[test]
+    fn test_serialization_column_mapping_modes() {
+        // Test that different ColumnMappingMode values are preserved
+        let engine = SyncEngine::new();
+        for mode in [
+            ColumnMappingMode::None,
+            ColumnMappingMode::Id,
+            ColumnMappingMode::Name,
+        ] {
+            let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+                "id",
+                DataType::INTEGER,
+                true,
+            )]));
+            let state_info = Arc::new(StateInfo {
+                logical_schema: schema.clone(),
+                physical_schema: schema,
+                physical_predicate: PhysicalPredicate::None,
+                transform_spec: None,
+                column_mapping_mode: mode,
+            });
+            let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
+            let deserialized = ScanLogReplayProcessor::from_serializable_state(
+                &engine,
+                processor.into_serializable_state().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(deserialized.state_info.column_mapping_mode, mode);
+        }
+    }
+
+    #[test]
+    fn test_serialization_edge_cases() {
+        // Test edge cases: empty seen_file_keys, no predicate, no transform_spec
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )]));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+        });
+        let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
+        let serialized = processor.into_serializable_state().unwrap();
+        assert!(serialized.predicate.is_none());
+        let deserialized =
+            ScanLogReplayProcessor::from_serializable_state(&engine, serialized).unwrap();
+        assert_eq!(deserialized.seen_file_keys.len(), 0);
+        assert!(deserialized.state_info.transform_spec.is_none());
+    }
+
+    #[test]
+    fn test_serialization_invalid_json() {
+        // Test that invalid JSON blobs are properly rejected
+        let engine = SyncEngine::new();
+        let invalid_state = SerializableScanState {
+            predicate: None,
+            internal_state_blob: vec![0, 1, 2, 3, 255], // Invalid JSON
+            seen_file_keys: HashSet::new(),
+        };
+        assert!(ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state).is_err());
+    }
+
+    #[test]
+    fn test_serialization_missing_predicate_schema() {
+        // Test that missing predicate_schema when predicate exists is detected
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )]));
+        let invalid_internal_state = InternalScanState {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            predicate_schema: None, // Missing!
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+        };
+        let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
+        let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
+        let invalid_state = SerializableScanState {
+            predicate: Some(predicate), // Predicate exists but schema is None
+            internal_state_blob: invalid_blob,
+            seen_file_keys: HashSet::new(),
+        };
+        let result = ScanLogReplayProcessor::from_serializable_state(&engine, invalid_state);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("predicate schema"));
+        }
+    }
+
+    #[test]
+    fn deserialize_internal_state_with_extry_fields_fails() {
+        let schema: SchemaRef = Arc::new(StructType::new_unchecked([StructField::new(
+            "id",
+            DataType::INTEGER,
+            true,
+        )]));
+        let invalid_internal_state = InternalScanState {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            predicate_schema: None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+        };
+        let blob = serde_json::to_string(&invalid_internal_state).unwrap();
+        let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();
+        obj["new_field"] = serde_json::json!("my_new_value");
+        let invalid_blob = obj.to_string();
+
+        let res: Result<InternalScanState, _> = serde_json::from_str(&invalid_blob);
+        assert_result_error_with_message(res, "unknown field");
     }
 }

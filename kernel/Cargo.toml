@@ -39,7 +39,7 @@ pre-release-hook = [
 ]
 
 [dependencies]
-delta_kernel_derive = { path = "../derive-macros", version = "0.17.1" }
+delta_kernel_derive = { path = "../derive-macros", version = "0.19.0" }
 bytes = "1.10"
 chrono = "0.4.41"
 crc = "3.2.2"
@@ -59,25 +59,12 @@ z85 = "3.0.6"
 # optional deps
 futures = { version = "0.3", optional = true }
 # Used for fetching direct urls (like pre-signed urls)
-reqwest = { version = "0.12.23", default-features = false, optional = true }
+reqwest = { version = "0.13", optional = true }
 # optionally used with default engine (though not required)
 tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
-# TODO: Remove this once https://github.com/apache/arrow-rs/pull/8244 ships
-comfy-table = { version = "~7.1", optional = true }
-
-# arrow 55
-[dependencies.arrow_55]
-package = "arrow"
-version = "55"
-features = ["chrono-tz", "ffi", "json", "prettyprint"]
-optional = true
-[dependencies.parquet_55]
-package = "parquet"
-version = "55"
-features = ["async", "object_store"]
-optional = true
+comfy-table = { version = "7.1", optional = true }
 
 # arrow 56
 [dependencies.arrow_56]
@@ -115,7 +102,6 @@ integration-test = ["hdfs-native-object-store/integration-test"]
 arrow = ["arrow-57"] # latest arrow version
 need-arrow = [] # need-arrow is a marker that the feature needs arrow dep
 
-arrow-55 = ["dep:arrow_55", "dep:parquet_55", "object_store", "comfy-table"]
 arrow-56 = ["dep:arrow_56", "dep:parquet_56", "object_store", "comfy-table"]
 arrow-57 = ["dep:arrow_57", "dep:parquet_57", "object_store", "comfy-table"]
 arrow-conversion = ["need-arrow"]
@@ -139,10 +125,9 @@ default-engine-base = [
 ]
 # the default-engine-native-tls use the reqwest crate with default features which uses native-tls. if you want
 # to instead use rustls, use 'default-engine-rustls' which has no native-tls dependency
-default-engine-native-tls = ["default-engine-base", "reqwest/default"]
+default-engine-native-tls = ["default-engine-base", "reqwest/native-tls"]
 default-engine-rustls = [
   "default-engine-base",
-  "reqwest/rustls-tls-native-roots",
   "reqwest/http2",
 ]
 
