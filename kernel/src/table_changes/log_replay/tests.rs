@@ -925,8 +925,12 @@ async fn print_table_configuration() {
     let logs = Arc::new(Mutex::new(Vec::new()));
     let logs_clone = logs.clone();
 
-    let subscriber = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(move || LogWriter(logs_clone.clone())));
+    let subscriber = tracing_subscriber::registry() //the layer tells program what to do with events
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || LogWriter(logs_clone.clone()))
+                .with_ansi(false),
+        );
 
     let _guard = tracing::subscriber::set_default(subscriber);
 
