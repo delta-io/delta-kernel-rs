@@ -102,11 +102,11 @@ impl<C: UCCommitsClient + 'static> Committer for UCCommitter<C> {
     }
 
     fn publish(&self, engine: &dyn Engine, publish_metadata: PublishMetadata) -> DeltaResult<()> {
-        if publish_metadata.ascending_catalog_commits().is_empty() {
+        if publish_metadata.commits_to_publish().is_empty() {
             return Ok(());
         }
 
-        for catalog_commit in publish_metadata.ascending_catalog_commits() {
+        for catalog_commit in publish_metadata.commits_to_publish() {
             let src = catalog_commit.location();
             let dest = catalog_commit.published_location();
             match engine.storage_handler().copy_atomic(src, dest) {
@@ -169,7 +169,7 @@ mod tests {
         let catalog_commits: Vec<CatalogCommit> = versions
             .into_iter()
             .map(|v| {
-                CatalogCommit::new(
+                CatalogCommit::new_unchecked(
                     v,
                     staged_commit_url(&table_root, v),
                     published_commit_url(&table_root, v),
@@ -192,7 +192,7 @@ mod tests {
         fs::write(&existing_published, "version: 10").unwrap();
 
         // ===== WHEN =====
-        let publish_metadata = PublishMetadata::new(12, catalog_commits).unwrap();
+        let publish_metadata = PublishMetadata::try_new(12, catalog_commits).unwrap();
         let committer = UCCommitter::new(Arc::new(MockCommitsClient), "testUcTableId");
         let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
         committer.publish(&engine, publish_metadata).unwrap();

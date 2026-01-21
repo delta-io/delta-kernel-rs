@@ -63,7 +63,7 @@ impl CatalogCommit {
 #[cfg(any(test, feature = "test-utils"))]
 impl CatalogCommit {
     /// Creates a new `CatalogCommit` with explicit locations. Test-only.
-    pub fn new(version: Version, location: Url, published_location: Url) -> Self {
+    pub fn new_unchecked(version: Version, location: Url, published_location: Url) -> Self {
         Self {
             version,
             location,
@@ -94,8 +94,8 @@ pub struct PublishMetadata {
 
 impl PublishMetadata {
     /// Creates a new `PublishMetadata` with the given publish to version and catalog commits.
-    #[allow(dead_code)] // pub(crate) constructor will be used in future PRs
-    pub(crate) fn new(
+    #[allow(dead_code)] // constructor will be used in future PRs
+    pub fn try_new(
         publish_to_version: Version,
         commits_to_publish: Vec<CatalogCommit>,
     ) -> DeltaResult<Self> {
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn test_publish_metadata_construction_with_valid_commits() {
         let catalog_commits = create_catalog_commits(&[10, 11, 12]);
-        let publish_metadata = PublishMetadata::new(12, catalog_commits).unwrap();
+        let publish_metadata = PublishMetadata::try_new(12, catalog_commits).unwrap();
         assert_eq!(publish_metadata.publish_version(), 12);
         assert_eq!(publish_metadata.commits_to_publish().len(), 3);
     }
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn test_publish_metadata_construction_rejects_empty_commits() {
         assert_result_error_with_message(
-            PublishMetadata::new(12, vec![]),
+            PublishMetadata::try_new(12, vec![]),
             "Catalog commits are empty, expected snapshot version 12",
         )
     }
@@ -220,7 +220,7 @@ mod tests {
     fn test_publish_metadata_construction_rejects_non_contiguous_commits() {
         let catalog_commits = create_catalog_commits(&[10, 12]);
         assert_result_error_with_message(
-            PublishMetadata::new(12, catalog_commits),
+            PublishMetadata::try_new(12, catalog_commits),
             "Catalog commits must be contiguous: got versions [10, 12]",
         )
     }
@@ -229,7 +229,7 @@ mod tests {
     fn test_publish_metadata_construction_rejects_commits_not_ending_with_publish_to_version() {
         let catalog_commits = create_catalog_commits(&[10, 11]);
         assert_result_error_with_message(
-            PublishMetadata::new(12, catalog_commits),
+            PublishMetadata::try_new(12, catalog_commits),
             "Catalog commits must end with snapshot version 12, but got 11",
         )
     }
