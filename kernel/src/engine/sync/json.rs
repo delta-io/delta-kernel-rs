@@ -28,6 +28,7 @@ fn try_create_from_json(
     _file_location: String,
 ) -> DeltaResult<impl Iterator<Item = DeltaResult<ArrowEngineData>>> {
     let json = ReaderBuilder::new(arrow_schema)
+        .with_coerce_primitive(true)
         .build(BufReader::new(file))?
         .map(|data| Ok(ArrowEngineData::new(data?)));
     Ok(json)
