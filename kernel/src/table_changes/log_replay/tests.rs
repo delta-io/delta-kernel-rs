@@ -143,7 +143,6 @@ fn result_to_sv(iter: impl Iterator<Item = DeltaResult<TableChangesScanMetadata>
 
 #[tokio::test]
 async fn metadata_protocol() {
-    let _ = tracing_subscriber::fmt::try_init();
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
     mock_table
