@@ -92,7 +92,7 @@ mod tests {
         allocate_err, allocate_str, assert_extern_result_error_with_message, ok_or_panic,
         recover_string,
     };
-    use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot};
+    use crate::{engine_to_handle, free_engine, free_snapshot, kernel_string_slice, snapshot, OptionalValue};
     use delta_kernel::engine::default::DefaultEngineBuilder;
     use delta_kernel::DeltaResult;
     use object_store::memory::InMemory;
@@ -188,6 +188,8 @@ mod tests {
             ok_or_panic(snapshot(
                 kernel_string_slice!(path),
                 engine.shallow_copy(),
+                OptionalValue::None,
+                OptionalValue::None,
             ))
         };
 
