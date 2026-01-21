@@ -111,6 +111,25 @@ pub(crate) fn expected_stats_schema(
     StructType::try_new(fields)
 }
 
+/// Transforms a schema to make all fields nullable.
+/// Used for stats schemas where stats may not be available for all columns.
+pub(crate) struct NullableStatsTransform;
+impl<'a> SchemaTransform<'a> for NullableStatsTransform {
+    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
+        use Cow::*;
+        let field = match self.transform(&field.data_type)? {
+            Borrowed(_) if field.is_nullable() => Borrowed(field),
+            data_type => Owned(StructField {
+                name: field.name.clone(),
+                data_type: data_type.into_owned(),
+                nullable: true,
+                metadata: field.metadata.clone(),
+            }),
+        };
+        Some(field)
+    }
+}
+
 // Convert a min/max stats schema into a nullcount schema (all leaf fields are LONG)
 #[allow(unused)]
 pub(crate) struct NullCountStatsTransform;
@@ -316,26 +335,6 @@ mod tests {
     use crate::schema::ArrayType;
 
     use super::*;
-
-    pub(crate) struct NullableStatsTransform;
-    impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-        fn transform_struct_field(
-            &mut self,
-            field: &'a StructField,
-        ) -> Option<Cow<'a, StructField>> {
-            use Cow::*;
-            let field = match self.transform(&field.data_type)? {
-                Borrowed(_) if field.is_nullable() => Borrowed(field),
-                data_type => Owned(StructField {
-                    name: field.name.clone(),
-                    data_type: data_type.into_owned(),
-                    nullable: true,
-                    metadata: field.metadata.clone(),
-                }),
-            };
-            Some(field)
-        }
-    }
 
     #[test]
     fn test_should_include_column() {
