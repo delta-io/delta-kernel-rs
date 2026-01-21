@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumCount, EnumString};
+use itertools::Itertools;
 
 use crate::actions::Protocol;
 use crate::expressions::Scalar;
@@ -680,6 +681,14 @@ impl TableFeature {
     pub(crate) fn unknown(s: impl ToString) -> Self {
         TableFeature::Unknown(s.to_string())
     }
+}
+
+/// Formats a slice of table features using Delta's standard serialization (camelCase).
+pub(crate) fn format_features(features: &[TableFeature]) -> String {
+    let feature_strings: Vec<&str> = features.iter()
+        .map(|f| f.as_ref())
+        .collect_vec();
+    format!("[{}]", feature_strings.join(", "))
 }
 
 #[cfg(test)]

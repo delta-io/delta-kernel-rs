@@ -20,8 +20,7 @@ use crate::schema::{
 };
 use crate::table_changes::scan_file::{cdf_scan_row_expression, cdf_scan_row_schema};
 use crate::table_configuration::TableConfiguration;
-use crate::table_features::Operation;
-use crate::table_features::TableFeature;
+use crate::table_features::{format_features, Operation, TableFeature};
 use crate::utils::require;
 use crate::{DeltaResult, Engine, EngineData, Error, PredicateRef, RowVisitor};
 
@@ -212,14 +211,20 @@ impl LogReplayScanner {
                     commit_file.version,
                 )?;
 
+                let writer_features_str = table_configuration.protocol().writer_features()
+                    .map(format_features)
+                    .unwrap_or_else(|| "None".to_string());
+                let table_properties_str = serde_json::to_string(table_configuration.metadata().configuration())
+                    .unwrap_or_else(|_| "{}".to_string()); 
+                
                 info!(
                     version = commit_file.version,
                     table_id = table_configuration.metadata().id(),
-                    writer_features = ?table_configuration.protocol().writer_features(),
+                    writer_features = %writer_features_str,
                     min_reader_version = table_configuration.protocol().min_reader_version(),
                     min_writer_version = table_configuration.protocol().min_writer_version(),
                     schema_string = %table_configuration.metadata().schema_string(),
-                    table_properties = ?table_configuration.metadata().configuration(),
+                    table_properties = %table_properties_str,
                     "Table configuration updated during CDF query"
                 ); 
             }
