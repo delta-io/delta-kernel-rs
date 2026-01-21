@@ -186,7 +186,7 @@ mod tests {
 
         let snapshot = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::None,

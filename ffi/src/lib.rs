@@ -601,16 +601,18 @@ pub struct SharedSnapshot;
 
 /// Get a snapshot from the specified table.
 ///
-/// Optional parameters allow for optimization and customization:
+/// Parameters:
+/// - `path`: Table path (required when `old_snapshot` is not provided, ignored otherwise)
+/// - `engine`: The engine handle
 /// - `old_snapshot`: Pass an existing snapshot for optimized creation (avoids re-reading the entire log)
 /// - `version`: Specify a version to get a snapshot at a specific table version
 ///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles and path pointer.
+/// Caller is responsible for passing valid handles. Path must be valid when `old_snapshot` is None.
 #[no_mangle]
 pub unsafe extern "C" fn snapshot(
-    path: KernelStringSlice,
+    path: OptionalValue<KernelStringSlice>,
     engine: Handle<SharedExternEngine>,
     old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
     version: OptionalValue<Version>,
@@ -629,7 +631,15 @@ pub unsafe extern "C" fn snapshot(
 
     // Only parse URL if we don't have an old snapshot
     let url = if old_snapshot_handle.is_none() {
-        Some(unsafe { unwrap_and_parse_path_as_url(path) })
+        match path {
+            OptionalValue::Some(p) => Some(unsafe { unwrap_and_parse_path_as_url(p) }),
+            OptionalValue::None => {
+                return Err(delta_kernel::Error::generic(
+                    "Path is required when not using an old snapshot",
+                ))
+                .into_extern_result(&engine_ref)
+            }
+        }
     } else {
         None
     };
@@ -643,14 +653,21 @@ pub unsafe extern "C" fn snapshot(
 /// This version includes all the parameters from `snapshot` plus the ability to
 /// provide a log tail for catalog-managed tables.
 ///
+/// Parameters:
+/// - `path`: Table path (required when `old_snapshot` is not provided, ignored otherwise)
+/// - `engine`: The engine handle
+/// - `old_snapshot`: Pass an existing snapshot for optimized creation (avoids re-reading the entire log)
+/// - `version`: Specify a version to get a snapshot at a specific table version
+/// - `log_tail`: Log tail for catalog-managed tables
+///
 /// # Safety
 ///
-/// Caller is responsible for passing valid handles and path pointer.
+/// Caller is responsible for passing valid handles. Path must be valid when `old_snapshot` is None.
 /// The log_tail array and its contents must remain valid for the duration of this call.
 #[cfg(feature = "catalog-managed")]
 #[no_mangle]
 pub unsafe extern "C" fn snapshot_with_log_tail(
-    path: KernelStringSlice,
+    path: OptionalValue<KernelStringSlice>,
     engine: Handle<SharedExternEngine>,
     old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
     version: OptionalValue<Version>,
@@ -678,7 +695,15 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
 
     // Only parse URL if we don't have an old snapshot
     let url = if old_snapshot_handle.is_none() {
-        Some(unsafe { unwrap_and_parse_path_as_url(path) })
+        match path {
+            OptionalValue::Some(p) => Some(unsafe { unwrap_and_parse_path_as_url(p) }),
+            OptionalValue::None => {
+                return Err(delta_kernel::Error::generic(
+                    "Path is required when not using an old snapshot",
+                ))
+                .into_extern_result(&engine_ref)
+            }
+        }
     } else {
         None
     };
@@ -960,7 +985,7 @@ mod tests {
         // Test getting latest snapshot
         let snapshot1 = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::None,
@@ -972,7 +997,7 @@ mod tests {
         // Test getting snapshot at version
         let snapshot2 = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::Some(0),
@@ -984,7 +1009,7 @@ mod tests {
         // Test getting non-existent snapshot
         let snapshot_at_non_existent_version = unsafe {
             snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::Some(1),
@@ -1018,7 +1043,7 @@ mod tests {
 
         let snapshot = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::None,
@@ -1061,7 +1086,7 @@ mod tests {
         // Get a non-existent snapshot, this will call allocate_null_err
         let snapshot_at_non_existent_version = unsafe {
             snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::Some(1),
@@ -1154,7 +1179,7 @@ mod tests {
         // Create initial snapshot at version 0
         let old_snapshot = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::None,
                 OptionalValue::None,
@@ -1180,7 +1205,7 @@ mod tests {
         // Create new snapshot using old snapshot for optimization (latest version)
         let new_snapshot = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::Some(old_snapshot.shallow_copy()),
                 OptionalValue::None,
@@ -1192,7 +1217,7 @@ mod tests {
         // Create snapshot at specific version using old snapshot for optimization
         let snapshot_at_v1 = unsafe {
             ok_or_panic(snapshot(
-                kernel_string_slice!(path),
+                OptionalValue::Some(kernel_string_slice!(path)),
                 engine.shallow_copy(),
                 OptionalValue::Some(old_snapshot.shallow_copy()),
                 OptionalValue::Some(1),
