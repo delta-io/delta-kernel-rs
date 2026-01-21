@@ -17,6 +17,7 @@ use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
 
 use itertools::Itertools;
+use serial_test::serial;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -919,6 +920,7 @@ async fn file_meta_timestamp() {
 
 #[tokio::test]
 #[traced_test]
+#[serial]
 async fn print_table_configuration() {
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
