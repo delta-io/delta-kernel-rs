@@ -415,13 +415,6 @@ pub(crate) mod test_utils {
             self.0.lock().unwrap().flush()
         }
     }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
 }
 
 #[cfg(test)]
