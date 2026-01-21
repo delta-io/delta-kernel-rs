@@ -33,7 +33,7 @@ pub use commit_types::{CommitMetadata, CommitResponse};
 pub use filesystem::FileSystemCommitter;
 pub use publish_types::{CatalogCommit, PublishMetadata};
 
-use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
+use crate::{DeltaResult, Engine, FilteredEngineData};
 
 /// A Committer is the system by which transactions are committed to a table. Transactions are
 /// effectively a collection of actions performed on the table at a specific version. The kernel
@@ -52,7 +52,7 @@ use crate::{AsAny, DeltaResult, Engine, FilteredEngineData};
 // Arc<dyn Committer> (instead of Arc<dyn Committer + Send>). If there is a strong case for a !Send
 // Committer then we can remove this bound and possibly just do an alias like CommitterRef =
 // Arc<dyn Committer + Send>.
-pub trait Committer: Send + AsAny {
+pub trait Committer: Send {
     /// Commits actions to the table at the version specified in [`CommitMetadata`].
     ///
     /// Implementations must ensure that actions are committed atomically and either:
