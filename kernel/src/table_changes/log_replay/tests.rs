@@ -968,12 +968,12 @@ async fn print_table_configuration() {
 
     assert!(logs_contain("Table configuration updated during CDF query"));
     assert!(logs_contain("version=0"));
-    assert!(logs_contain("table_id="));
-    assert!(logs_contain("writer_features=[deletionVectors, changeDataFeed]"));
-    assert!(logs_contain("min_reader_version=3"));
-    assert!(logs_contain("min_writer_version=7"));
-    assert!(logs_contain("schema_string={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
-    assert!(logs_contain("table_properties="));
+    assert!(logs_contain("id="));
+    assert!(logs_contain("writerFeatures=[deletionVectors, changeDataFeed]"));
+    assert!(logs_contain("minReaderVersion=3"));
+    assert!(logs_contain("minWriterVersion=7"));
+    assert!(logs_contain("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
+    assert!(logs_contain("configuration="));
     assert!(logs_contain("\"delta.enableChangeDataFeed\":\"true\""));
     assert!(logs_contain("\"delta.columnMapping.mode\":\"none\""));
     assert!(logs_contain("\"delta.enableDeletionVectors\":\"true\""));
