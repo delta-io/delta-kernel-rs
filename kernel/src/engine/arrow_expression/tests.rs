@@ -827,6 +827,8 @@ fn test_create_one_mismatching_scalar_types() {
 
 #[test]
 fn test_create_one_not_null_struct() {
+    // Creating a NOT NULL struct field with null values should error.
+    // The error comes from Arrow's RecordBatch validation (non-nullable column has nulls).
     let values: &[Scalar] = &[
         Scalar::Null(KernelDataType::INTEGER),
         Scalar::Null(KernelDataType::INTEGER),
@@ -841,12 +843,14 @@ fn test_create_one_not_null_struct() {
     let handler = ArrowEvaluationHandler;
     assert_result_error_with_message(
         handler.create_one(schema, values),
-        "Invalid struct data: Top-level nulls in struct are not supported",
+        "Column 'a' is declared as non-nullable but contains null values",
     );
 }
 
 #[test]
 fn test_create_one_top_level_null() {
+    // Creating a NOT NULL field with null value should error.
+    // The error comes from Arrow's RecordBatch validation.
     let values = &[Scalar::Null(KernelDataType::INTEGER)];
     let handler = ArrowEvaluationHandler;
 
@@ -854,10 +858,10 @@ fn test_create_one_top_level_null() {
         "col_1",
         KernelDataType::INTEGER,
     )]));
-    assert!(matches!(
+    assert_result_error_with_message(
         handler.create_one(schema, values),
-        Err(Error::InvalidStructData(_))
-    ));
+        "Column 'col_1' is declared as non-nullable but contains null values",
+    );
 }
 
 #[test]
