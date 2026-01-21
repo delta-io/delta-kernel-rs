@@ -720,7 +720,7 @@ pub unsafe extern "C" fn free_snapshot(snapshot: Handle<SharedSnapshot>) {
 ///
 /// Caller is responsible for passing valid handles.
 #[no_mangle]
-pub unsafe extern "C" fn snapshot_checkpoint(
+pub unsafe extern "C" fn checkpoint_snapshot(
     snapshot: Handle<SharedSnapshot>,
     engine: Handle<SharedExternEngine>,
 ) -> ExternResult<bool> {
@@ -1055,7 +1055,7 @@ mod tests {
             unsafe { ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy())) };
 
         let did_checkpoint = unsafe {
-            ok_or_panic(snapshot_checkpoint(
+            ok_or_panic(checkpoint_snapshot(
                 snapshot.shallow_copy(),
                 engine.shallow_copy(),
             ))
