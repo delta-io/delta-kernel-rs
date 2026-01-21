@@ -216,9 +216,6 @@ impl LogReplayScanner {
                     .writer_features()
                     .map(format_features)
                     .unwrap_or_else(|| "[]".to_string());
-                let table_properties_str =
-                    serde_json::to_string(table_configuration.metadata().configuration())
-                        .unwrap_or_else(|_| "{}".to_string());
 
                 info!(
                     version = commit_file.version,
@@ -227,7 +224,7 @@ impl LogReplayScanner {
                     minReaderVersion = table_configuration.protocol().min_reader_version(),
                     minWriterVersion = table_configuration.protocol().min_writer_version(),
                     schemaString = %table_configuration.metadata().schema_string(),
-                    configuration = %table_properties_str,
+                    configuration = ?table_configuration.metadata().configuration(),
                     "Table configuration updated during CDF query"
                 );
             }

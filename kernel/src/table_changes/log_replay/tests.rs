@@ -12,7 +12,9 @@ use crate::schema::{DataType, StructField, StructType};
 use crate::table_changes::log_replay::LogReplayScanner;
 use crate::table_configuration::TableConfiguration;
 use crate::table_features::{ColumnMappingMode, TableFeature};
-use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
+use crate::utils::test_utils::{
+    assert_result_error_with_message, Action, LocalMockTable, LogWriter,
+};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
 
@@ -987,26 +989,7 @@ async fn print_table_configuration() {
     assert!(log_output.contains("minWriterVersion=7"));
     assert!(log_output.contains("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));
     assert!(log_output.contains("configuration="));
-    assert!(log_output.contains("\"delta.enableChangeDataFeed\":\"true\""));
-    assert!(log_output.contains("\"delta.columnMapping.mode\":\"none\""));
-    assert!(log_output.contains("\"delta.enableDeletionVectors\":\"true\""));
-}
-
-#[derive(Clone)]
-struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().flush()
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
+    assert!(log_output.contains("\"delta.enableChangeDataFeed\": \"true\""));
+    assert!(log_output.contains("\"delta.columnMapping.mode\": \"none\""));
+    assert!(log_output.contains("\"delta.enableDeletionVectors\": \"true\""));
 }

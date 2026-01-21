@@ -147,7 +147,7 @@ impl<'a, T: ToOwned + ?Sized> CowExt<(Cow<'a, T>, Cow<'a, T>)> for (Cow<'a, T>, 
 #[cfg(test)]
 pub(crate) mod test_utils {
     use std::path::PathBuf;
-    use std::{path::Path, sync::Arc};
+    use std::{path::Path, sync::Arc, sync::Mutex};
 
     use itertools::Itertools;
     use object_store::local::LocalFileSystem;
@@ -402,6 +402,25 @@ pub(crate) mod test_utils {
         let engine = Arc::new(DefaultEngineBuilder::new(store).build());
         let snapshot = Snapshot::builder_for(url).build(engine.as_ref())?;
         Ok((engine, snapshot, tempdir))
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct LogWriter(pub(crate) Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }
 
