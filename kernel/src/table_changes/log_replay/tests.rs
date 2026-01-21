@@ -917,7 +917,6 @@ async fn file_meta_timestamp() {
     assert_eq!(scanner.timestamp, file_meta_ts);
 }
 
-
 #[tokio::test]
 #[traced_test]
 async fn print_table_configuration() {
@@ -961,15 +960,18 @@ async fn print_table_configuration() {
 
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url); //table config object
-    
+
     let _scan_batches: DeltaResult<Vec<_>> =
         table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
-            .unwrap().try_collect();
+            .unwrap()
+            .try_collect();
 
     assert!(logs_contain("Table configuration updated during CDF query"));
     assert!(logs_contain("version=0"));
     assert!(logs_contain("id="));
-    assert!(logs_contain("writerFeatures=[deletionVectors, changeDataFeed]"));
+    assert!(logs_contain(
+        "writerFeatures=[deletionVectors, changeDataFeed]"
+    ));
     assert!(logs_contain("minReaderVersion=3"));
     assert!(logs_contain("minWriterVersion=7"));
     assert!(logs_contain("schemaString={\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}"));

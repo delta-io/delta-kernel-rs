@@ -211,12 +211,15 @@ impl LogReplayScanner {
                     commit_file.version,
                 )?;
 
-                let writer_features_str = table_configuration.protocol().writer_features()
+                let writer_features_str = table_configuration
+                    .protocol()
+                    .writer_features()
                     .map(format_features)
                     .unwrap_or_else(|| "[]".to_string());
-                let table_properties_str = serde_json::to_string(table_configuration.metadata().configuration())
-                    .unwrap_or_else(|_| "{}".to_string()); 
-                
+                let table_properties_str =
+                    serde_json::to_string(table_configuration.metadata().configuration())
+                        .unwrap_or_else(|_| "{}".to_string());
+
                 info!(
                     version = commit_file.version,
                     id = table_configuration.metadata().id(),
@@ -226,7 +229,7 @@ impl LogReplayScanner {
                     schemaString = %table_configuration.metadata().schema_string(),
                     configuration = %table_properties_str,
                     "Table configuration updated during CDF query"
-                ); 
+                );
             }
 
             // If metadata is updated, check if Change Data Feed is enabled
