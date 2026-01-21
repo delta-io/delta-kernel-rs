@@ -611,7 +611,7 @@ pub unsafe extern "C" fn snapshot(
 ) -> ExternResult<Handle<SharedSnapshot>> {
     let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine = unsafe { engine.as_ref() };
-    snapshot_impl(url, engine, None, None, Vec::new()).into_extern_result(&engine)
+    snapshot_impl(Some(url), engine, None, None, Vec::new()).into_extern_result(&engine)
 }
 
 /// Get a snapshot with optional parameters for optimization and customization.
@@ -630,7 +630,6 @@ pub unsafe extern "C" fn snapshot_extended(
     old_snapshot: OptionalValue<Handle<SharedSnapshot>>,
     version: OptionalValue<Version>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
 
     let old_snapshot_handle = match old_snapshot {
@@ -641,6 +640,13 @@ pub unsafe extern "C" fn snapshot_extended(
     let version_opt = match version {
         OptionalValue::Some(v) => Some(v),
         OptionalValue::None => None,
+    };
+
+    // Only parse URL if we don't have an old snapshot
+    let url = if old_snapshot_handle.is_none() {
+        Some(unsafe { unwrap_and_parse_path_as_url(path) })
+    } else {
+        None
     };
 
     snapshot_impl(url, engine_ref, old_snapshot_handle, version_opt, Vec::new())
@@ -665,7 +671,6 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
     version: OptionalValue<Version>,
     log_tail: OptionalValue<log_path::LogPathArray>,
 ) -> ExternResult<Handle<SharedSnapshot>> {
-    let url = unsafe { unwrap_and_parse_path_as_url(path) };
     let engine_ref = unsafe { engine.as_ref() };
 
     let old_snapshot_handle = match old_snapshot {
@@ -686,22 +691,29 @@ pub unsafe extern "C" fn snapshot_with_log_tail(
         OptionalValue::None => Vec::new(),
     };
 
+    // Only parse URL if we don't have an old snapshot
+    let url = if old_snapshot_handle.is_none() {
+        Some(unsafe { unwrap_and_parse_path_as_url(path) })
+    } else {
+        None
+    };
+
     snapshot_impl(url, engine_ref, old_snapshot_handle, version_opt, log_tail_vec)
         .into_extern_result(&engine_ref)
 }
 
 fn snapshot_impl(
-    url: DeltaResult<Url>,
+    url: Option<DeltaResult<Url>>,
     extern_engine: &dyn ExternEngine,
     old_snapshot_handle: Option<Handle<SharedSnapshot>>,
     version: Option<Version>,
     #[allow(unused_variables)] log_tail: Vec<LogPath>,
 ) -> DeltaResult<Handle<SharedSnapshot>> {
     let mut builder = if let Some(handle) = old_snapshot_handle {
-        let snapshot_arc = unsafe { handle.into_inner() };
+        let snapshot_arc = unsafe { handle.clone_as_arc() };
         Snapshot::builder_from(snapshot_arc)
     } else {
-        Snapshot::builder_for(url?)
+        Snapshot::builder_for(url.ok_or_else(|| delta_kernel::Error::generic("URL is required when not using an old snapshot"))??)
     };
 
     if let Some(v) = version {
@@ -1125,6 +1137,164 @@ mod tests {
 
         unsafe { free_snapshot(snapshot) }
         unsafe { free_snapshot(snapshot2) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_with_old_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        let storage = Arc::new(InMemory::new());
+        // Create initial commit (version 0)
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        // Create initial snapshot at version 0
+        let old_snapshot = unsafe {
+            ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy()))
+        };
+        let old_version = unsafe { version(old_snapshot.shallow_copy()) };
+        assert_eq!(old_version, 0);
+
+        // Add more commits to the table (version 1 and 2)
+        add_commit(
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("file1.parquet".into())]),
+        )
+        .await?;
+        add_commit(
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![TestAction::Add("file2.parquet".into())]),
+        )
+        .await?;
+
+        // Create new snapshot using old snapshot for optimization (latest version)
+        let new_snapshot = unsafe {
+            ok_or_panic(snapshot_extended(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::Some(old_snapshot.shallow_copy()),
+                OptionalValue::None,
+            ))
+        };
+        let new_version = unsafe { version(new_snapshot.shallow_copy()) };
+        assert_eq!(new_version, 2);
+
+        // Create snapshot at specific version using old snapshot for optimization
+        let snapshot_at_v1 = unsafe {
+            ok_or_panic(snapshot_extended(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::Some(old_snapshot.shallow_copy()),
+                OptionalValue::Some(1),
+            ))
+        };
+        let v1_version = unsafe { version(snapshot_at_v1.shallow_copy()) };
+        assert_eq!(v1_version, 1);
+
+        unsafe { free_snapshot(old_snapshot) }
+        unsafe { free_snapshot(new_snapshot) }
+        unsafe { free_snapshot(snapshot_at_v1) }
+        unsafe { free_engine(engine) }
+        Ok(())
+    }
+
+    #[cfg(feature = "catalog-managed")]
+    #[tokio::test]
+    async fn test_snapshot_with_log_tail_and_old_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+        use test_utils::add_staged_commit;
+        let storage = Arc::new(InMemory::new());
+
+        // Create initial commit (version 0)
+        add_commit(
+            storage.as_ref(),
+            0,
+            actions_to_string(vec![TestAction::Metadata]),
+        )
+        .await?;
+        let engine = DefaultEngineBuilder::new(storage.clone()).build();
+        let engine = engine_to_handle(Arc::new(engine), allocate_err);
+        let path = "memory:///";
+
+        // Create initial snapshot at version 0
+        let old_snapshot = unsafe {
+            ok_or_panic(snapshot(kernel_string_slice!(path), engine.shallow_copy()))
+        };
+        let old_version = unsafe { version(old_snapshot.shallow_copy()) };
+        assert_eq!(old_version, 0);
+
+        // Add staged commit (version 1)
+        let commit1 = add_staged_commit(
+            storage.as_ref(),
+            1,
+            actions_to_string(vec![TestAction::Add("path1.parquet".into())]),
+        )
+        .await?;
+
+        // Add another staged commit (version 2)
+        let commit2 = add_staged_commit(
+            storage.as_ref(),
+            2,
+            actions_to_string(vec![TestAction::Add("path2.parquet".into())]),
+        )
+        .await?;
+
+        // Build log tail with both commits
+        let commit1_path = format!(
+            "{}_delta_log/_staged_commits/{}",
+            path,
+            commit1.filename().unwrap()
+        );
+        let commit2_path = format!(
+            "{}_delta_log/_staged_commits/{}",
+            path,
+            commit2.filename().unwrap()
+        );
+        let log_path1 = log_path::FfiLogPath::new(kernel_string_slice!(commit1_path), 123456789, 100);
+        let log_path2 = log_path::FfiLogPath::new(kernel_string_slice!(commit2_path), 123456790, 101);
+        let log_tail = [log_path1, log_path2];
+        let log_tail_array = log_path::LogPathArray {
+            ptr: log_tail.as_ptr(),
+            len: log_tail.len(),
+        };
+
+        // Create new snapshot using old snapshot for optimization with log tail
+        let new_snapshot = unsafe {
+            ok_or_panic(snapshot_with_log_tail(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::Some(old_snapshot.shallow_copy()),
+                OptionalValue::None,
+                OptionalValue::Some(log_tail_array.clone()),
+            ))
+        };
+        let new_version = unsafe { version(new_snapshot.shallow_copy()) };
+        assert_eq!(new_version, 2);
+
+        // Create snapshot at specific version using old snapshot with log tail
+        let snapshot_at_v1 = unsafe {
+            ok_or_panic(snapshot_with_log_tail(
+                kernel_string_slice!(path),
+                engine.shallow_copy(),
+                OptionalValue::Some(old_snapshot.shallow_copy()),
+                OptionalValue::Some(1),
+                OptionalValue::Some(log_tail_array),
+            ))
+        };
+        let v1_version = unsafe { version(snapshot_at_v1.shallow_copy()) };
+        assert_eq!(v1_version, 1);
+
+        unsafe { free_snapshot(old_snapshot) }
+        unsafe { free_snapshot(new_snapshot) }
+        unsafe { free_snapshot(snapshot_at_v1) }
         unsafe { free_engine(engine) }
         Ok(())
     }
