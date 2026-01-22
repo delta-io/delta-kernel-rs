@@ -12,7 +12,7 @@ use crate::actions::{
 };
 use crate::engine_data::{GetData, TypedGetData};
 use crate::expressions::{column_name, ColumnName};
-use crate::path::ParsedLogPath;
+use crate::path::{AsUrl, ParsedLogPath};
 use crate::scan::data_skipping::DataSkippingFilter;
 use crate::scan::state::DvInfo;
 use crate::schema::{
@@ -252,6 +252,16 @@ impl LogReplayScanner {
             // same as an `add` action.
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
+
+        info!(
+            remove_dvs_size = remove_dvs.len(),
+            has_cdc_action = has_cdc_action,
+            file_path = %commit_file.location.as_url(),
+            version = commit_file.version,
+            timestamp = commit_file.location.last_modified,
+            "Phase 1 of CDF query processing completed"
+        );
+
         Ok(LogReplayScanner {
             timestamp: commit_file.location.last_modified,
             commit_file,
