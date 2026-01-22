@@ -89,9 +89,20 @@ pub const METADATA_WITH_PARTITION_COLS: &str = r#"{"commitInfo":{"timestamp":158
 {"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
 {"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":["val"],"configuration":{},"createdTime":1587968585495}}"#;
 
+/// Just the protocol action
+pub const PROTOCOL_ACTION: &str = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#;
+
+/// Just the metadata action
+pub const METADATA_ACTION: &str = r#"{"metaData":{"id":"5fba94ed-9794-4965-ba6e-6ee3c0d22af9","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"val\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1587968585495}}"#;
+
 pub enum TestAction {
     Add(String),
     Remove(String),
+    /// Includes commitInfo, protocol, and metadata actions (full table initialization)
+    AllMetadata,
+    /// Just the protocol action
+    Protocol,
+    /// Just the metadata action
     Metadata,
 }
 
@@ -113,7 +124,9 @@ pub fn actions_to_string_with_metadata(actions: Vec<TestAction>, metadata: &str)
         .map(|test_action| match test_action {
             TestAction::Add(path) => format!(r#"{{"add":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true, "stats":"{{\"numRecords\":2,\"nullCount\":{{\"id\":0}},\"minValues\":{{\"id\": 1}},\"maxValues\":{{\"id\":3}}}}"}}}}"#),
             TestAction::Remove(path) => format!(r#"{{"remove":{{"path":"{path}","partitionValues":{{}},"size":262,"modificationTime":1587968586000,"dataChange":true}}}}"#),
-            TestAction::Metadata => metadata.into(),
+            TestAction::AllMetadata => metadata.into(),
+            TestAction::Protocol => PROTOCOL_ACTION.into(),
+            TestAction::Metadata => METADATA_ACTION.into(),
         })
         .join("\n")
 }
@@ -198,6 +211,11 @@ pub fn staged_commit_path_for_version(version: u64) -> Path {
     Path::from(path.as_str())
 }
 
+pub fn crc_path_for_version(version: u64) -> Path {
+    let path = format!("_delta_log/{version:020}.crc");
+    Path::from(path.as_str())
+}
+
 /// get an ObjectStore path for a compressed log file, based on the start/end versions
 pub fn compacted_log_path_for_versions(start_version: u64, end_version: u64, suffix: &str) -> Path {
     let path = format!("_delta_log/{start_version:020}.{end_version:020}.compacted.{suffix}");
@@ -221,6 +239,16 @@ pub async fn add_staged_commit(
     data: String,
 ) -> Result<Path, Box<dyn std::error::Error>> {
     let path = staged_commit_path_for_version(version);
+    store.put(&path, data.into()).await?;
+    Ok(path)
+}
+
+pub async fn add_crc(
+    store: &dyn ObjectStore,
+    version: u64,
+    data: String,
+) -> Result<Path, Box<dyn std::error::Error>> {
+    let path = crc_path_for_version(version);
     store.put(&path, data.into()).await?;
     Ok(path)
 }

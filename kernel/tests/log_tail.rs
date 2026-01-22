@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use rstest::rstest;
 use url::Url;
 
 use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
@@ -9,7 +10,7 @@ use delta_kernel::engine::default::{DefaultEngine, DefaultEngineBuilder};
 use delta_kernel::{FileMeta, LogPath, Snapshot};
 
 use test_utils::{
-    actions_to_string, add_commit, add_staged_commit, delta_path_for_version, TestAction,
+    actions_to_string, add_commit, add_crc, add_staged_commit, delta_path_for_version, TestAction,
 };
 
 /// Helper function to create a LogPath for a commit at the given version
@@ -47,7 +48,7 @@ async fn basic_snapshot_with_log_tail_staged_commits() -> Result<(), Box<dyn std
     // _delta_log/_staged_commits/1.uuid.json
     // _delta_log/_staged_commits/1.uuid.json // add an unused staged commit at version 1
     // _delta_log/_staged_commits/2.uuid.json
-    let actions = vec![TestAction::Metadata];
+    let actions = vec![TestAction::AllMetadata];
     add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
     let path1 = add_staged_commit(storage.as_ref(), 1, String::from("{}")).await?;
     let _ = add_staged_commit(storage.as_ref(), 1, String::from("{}")).await?;
@@ -158,7 +159,7 @@ async fn basic_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::Error>
     // _delta_log/0.json
     // _delta_log/1.json
     // _delta_log/2.json
-    let actions = vec![TestAction::Metadata];
+    let actions = vec![TestAction::AllMetadata];
     add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
@@ -184,7 +185,7 @@ async fn log_tail_behind_filesystem() -> Result<(), Box<dyn std::error::Error>> 
     let (storage, engine, table_root) = setup_test();
 
     // Create commits 0, 1, 2 in storage
-    let actions = vec![TestAction::Metadata];
+    let actions = vec![TestAction::AllMetadata];
     add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
@@ -215,7 +216,7 @@ async fn incremental_snapshot_with_log_tail() -> Result<(), Box<dyn std::error::
     let (storage, engine, table_root) = setup_test();
 
     // commits 0, 1, 2 in storage
-    let actions = vec![TestAction::Metadata];
+    let actions = vec![TestAction::AllMetadata];
     add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
@@ -257,7 +258,7 @@ async fn log_tail_exceeds_requested_version() -> Result<(), Box<dyn std::error::
     let (storage, engine, table_root) = setup_test();
 
     // commits 0, 1, 2, 3, 4 in storage
-    let actions = vec![TestAction::Metadata];
+    let actions = vec![TestAction::AllMetadata];
     add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
@@ -292,7 +293,7 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
     let (storage, engine, table_root) = setup_test();
 
     // create commits 0, 1, 2, 3, 4 in storage
-    let actions = vec![TestAction::Metadata];
+    let actions = vec![TestAction::AllMetadata];
     add_commit(storage.as_ref(), 0, actions_to_string(actions)).await?;
     let actions = vec![TestAction::Add("file_1.parquet".to_string())];
     add_commit(storage.as_ref(), 1, actions_to_string(actions)).await?;
@@ -321,6 +322,58 @@ async fn log_tail_behind_requested_version() -> Result<(), Box<dyn std::error::E
         .unwrap_err()
         .to_string()
         .contains("LogSegment end version 3 not the same as the specified end version 4"));
+
+    Ok(())
+}
+
+#[rstest]
+#[case::crc_unpublished_latest(10)]
+#[case::crc_unpublished_not_latest(7)]
+#[case::crc_published_not_latest(5)]
+#[tokio::test]
+async fn snapshot_with_staged_commits_log_tail_with_crc(
+    #[case] crc_target_version: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (storage, engine, table_root) = setup_test();
+
+    // Create published commits 0.json in storage
+    let metadata_actions = vec![TestAction::AllMetadata];
+    add_commit(storage.as_ref(), 0, actions_to_string(metadata_actions)).await?;
+
+    // Create published commits 1 to 5 in storage
+    for i in 1..=5 {
+        let add_actions = vec![TestAction::Add(format!("file_{}.parquet", i))];
+        add_commit(storage.as_ref(), i, actions_to_string(add_actions)).await?;
+    }
+
+    // Create the checksum (CRC) file
+    let crc_actions = vec![TestAction::Protocol, TestAction::Metadata];
+    add_crc(
+        storage.as_ref(),
+        crc_target_version,
+        actions_to_string(crc_actions),
+    )
+    .await?;
+
+    // Create staged commits 6 to 10 in storage, and then add to log_tail
+    let mut log_tail = Vec::new();
+    for i in 6..=10 {
+        let add_actions = vec![TestAction::Add(format!("file_{}.parquet", i))];
+        let path = add_staged_commit(storage.as_ref(), i, actions_to_string(add_actions)).await?;
+        log_tail.push(create_log_path(&table_root, path));
+    }
+
+    // Load our snapshot
+    let snapshot = Snapshot::builder_for(table_root.clone())
+        .with_log_tail(log_tail)
+        .build(engine.as_ref())?;
+
+
+    assert_eq!(snapshot.version(), 10);
+    assert_eq!(
+        snapshot.log_segment().latest_crc_file.as_ref().map(|p| p.version),
+        Some(crc_target_version)
+    );
 
     Ok(())
 }
