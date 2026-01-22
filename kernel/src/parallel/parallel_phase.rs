@@ -26,7 +26,7 @@ use itertools::Itertools;
 /// processor (typically wrapped in `Arc`) to coordinate deduplication.
 ///
 /// Implements `Iterator` to yield processed batches. The processor is responsible for filtering
-/// actions based on files seen in the sequential phase.
+/// out actions for files already seen in the sequential_phase.
 ///
 /// # Example workflow
 /// - Partition leaf files across N executors
@@ -72,17 +72,15 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     /// # Parameters
     /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
     /// - `iter`: Iterator yielding checkpoint action batches, typically from individual row groups
-    ///
-    /// # Returns
-    /// Returns `Self` directly (infallible) since the iterator is already constructed.
-    /// Use `try_new` if you need file reading with error handling.
     #[internal_api]
     #[allow(unused)]
-    pub(crate) fn try_new_from_iter(
+    pub(crate) fn new_from_iter(
         processor: P,
-        iter: impl Iterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
+        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
     ) -> Self {
-        let leaf_checkpoint_reader = iter.map_ok(|batch| ActionsBatch::new(batch, false));
+        let leaf_checkpoint_reader = iter
+            .into_iter()
+            .map_ok(|batch| ActionsBatch::new(batch, false));
         Self {
             processor,
             leaf_checkpoint_reader: Box::new(leaf_checkpoint_reader),
@@ -93,6 +91,8 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
     ///
     /// This schema defines the structure expected when reading checkpoint parquet files,
     /// including the action types (add, remove, etc.) and their fields.
+    #[internal_api]
+    #[allow(unused)]
     pub(crate) fn file_read_schema() -> SchemaRef {
         CHECKPOINT_READ_SCHEMA.clone()
     }
@@ -122,10 +122,8 @@ impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::array::StringArray;
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngine;
-    use crate::engine::sync::json::SyncJsonHandler;
     use crate::log_replay::FileActionKey;
     use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
@@ -134,15 +132,14 @@ mod tests {
     use crate::scan::state_info::tests::get_simple_state_info;
     use crate::scan::state_info::StateInfo;
     use crate::schema::{DataType, StructField, StructType};
-    use crate::utils::test_utils::load_test_table;
-    use crate::utils::test_utils::string_array_to_engine_data;
-    use crate::JsonHandler;
+    use crate::utils::test_utils::{load_test_table, parse_json_batch};
     use crate::SnapshotRef;
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::thread;
     use url::Url;
 
     // ============================================================
@@ -166,18 +163,6 @@ mod tests {
         store.put(&Path::from(path), buffer.into()).await?;
 
         Ok(())
-    }
-
-    /// Creates EngineData containing add actions from JSON strings.
-    fn create_add_batch(json_adds: &[&str]) -> Box<dyn EngineData> {
-        let handler = SyncJsonHandler {};
-        let json_strings: StringArray = json_adds.to_vec().into();
-        handler
-            .parse_json(
-                string_array_to_engine_data(json_strings),
-                ParallelPhase::<Arc<ScanLogReplayProcessor>>::file_read_schema(),
-            )
-            .unwrap()
     }
 
     /// Gets the file size from the store for use in FileMeta
@@ -226,10 +211,10 @@ mod tests {
     ) -> DeltaResult<()> {
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngine::builder(store.clone()).build();
 
         // Create sidecar with add actions
-        let json_adds: Vec<String> = add_paths
+        let json_adds = add_paths
             .iter()
             .enumerate()
             .map(|(i, path)| {
@@ -239,10 +224,8 @@ mod tests {
                     (i + 1) * 100,
                     (i + 1) * 1000
                 )
-            })
-            .collect();
-        let json_refs: Vec<&str> = json_adds.iter().map(|s| s.as_str()).collect();
-        let sidecar_data = create_add_batch(&json_refs);
+            }).collect_vec();
+        let sidecar_data = parse_json_batch(json_adds.into());
 
         // Write sidecar to store
         let sidecar_path = "_delta_log/_sidecars/test.parquet";
@@ -259,17 +242,14 @@ mod tests {
         };
 
         // Run ParallelPhase and collect paths
-        let parallel =
+        let mut parallel =
             ParallelPhase::try_new(Arc::new(engine), processor.clone(), vec![file_meta])?;
 
-        let mut all_paths: Vec<String> = Vec::new();
-        for result in parallel {
-            let metadata = result?;
-            all_paths =
-                metadata.visit_scan_files(all_paths, |ps: &mut Vec<String>, scan_file| {
-                    ps.push(scan_file.path);
-                })?;
-        }
+        let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                ps.push(scan_file.path);
+            })
+        })?;
 
         // Verify results
         all_paths.sort();
@@ -315,16 +295,16 @@ mod tests {
         // This test uses multiple sidecar files, so we need custom logic
         let store = Arc::new(InMemory::new());
         let url = Url::parse("memory:///")?;
-        let engine = DefaultEngine::new(store.clone());
+        let engine = DefaultEngine::builder(store.clone()).build();
 
         // Create two sidecars
-        let sidecar1_data = create_add_batch(&[
+        let sidecar1_data = parse_json_batch(vec![
             r#"{"add":{"path":"sidecar1_file1.parquet","partitionValues":{},"size":100,"modificationTime":1000,"dataChange":true}}"#,
             r#"{"add":{"path":"sidecar1_file2.parquet","partitionValues":{},"size":200,"modificationTime":2000,"dataChange":true}}"#,
-        ]);
-        let sidecar2_data = create_add_batch(&[
+        ].into());
+        let sidecar2_data = parse_json_batch(vec![
             r#"{"add":{"path":"sidecar2_file1.parquet","partitionValues":{},"size":300,"modificationTime":3000,"dataChange":true}}"#,
-        ]);
+        ].into());
 
         let sidecar1_path = "_delta_log/_sidecars/sidecar1.parquet";
         let sidecar2_path = "_delta_log/_sidecars/sidecar2.parquet";
@@ -349,16 +329,13 @@ mod tests {
             },
         ];
 
-        let parallel = ParallelPhase::try_new(Arc::new(engine), processor.clone(), file_metas)?;
+        let mut parallel = ParallelPhase::try_new(Arc::new(engine), processor.clone(), file_metas)?;
 
-        let mut all_paths: Vec<String> = Vec::new();
-        for result in parallel {
-            let metadata = result?;
-            all_paths =
-                metadata.visit_scan_files(all_paths, |ps: &mut Vec<String>, scan_file| {
-                    ps.push(scan_file.path);
-                })?;
-        }
+        let mut all_paths = parallel.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                ps.push(scan_file.path);
+            })
+        })?;
 
         all_paths.sort();
         assert_eq!(
@@ -373,38 +350,19 @@ mod tests {
     // Integration tests using real test tables
     // ============================================================
 
-    /// Helper to create a ScanLogReplayProcessor from a snapshot.
-    fn create_scan_processor(
-        engine: &dyn crate::Engine,
-        snapshot: &SnapshotRef,
-    ) -> DeltaResult<ScanLogReplayProcessor> {
-        let state_info = Arc::new(StateInfo::try_new(
-            snapshot.schema(),
-            snapshot.table_configuration(),
-            None,
-            (),
-        )?);
-        ScanLogReplayProcessor::new(engine, state_info)
-    }
-
     /// Get expected file paths using the scan_metadata API (single-node approach).
     fn get_expected_paths(
         engine: &dyn crate::Engine,
         snapshot: &SnapshotRef,
     ) -> DeltaResult<Vec<String>> {
         let scan = snapshot.clone().scan_builder().build()?;
-        let scan_metadata_iter = scan.scan_metadata(engine)?;
+        let mut scan_metadata_iter = scan.scan_metadata(engine)?;
 
-        let mut paths = vec![];
-        for res in scan_metadata_iter {
-            let scan_metadata = res?;
-            paths = scan_metadata.visit_scan_files(
-                paths,
-                |ps: &mut Vec<String>, scan_file: ScanFile| {
-                    ps.push(scan_file.path);
-                },
-            )?;
-        }
+        let mut paths = scan_metadata_iter.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file: ScanFile| {
+                ps.push(scan_file.path);
+            })
+        })?;
         paths.sort();
         Ok(paths)
     }
@@ -428,18 +386,21 @@ mod tests {
 
         let log_segment = Arc::new(snapshot.log_segment().clone());
 
-        let processor = create_scan_processor(engine.as_ref(), &snapshot)?;
+        let state_info = Arc::new(StateInfo::try_new(
+            snapshot.schema(),
+            snapshot.table_configuration(),
+            None,
+            (),
+        )?);
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
         let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
 
         // Process all batches in sequential phase and collect paths
-        let mut all_paths: Vec<String> = Vec::new();
-        for result in sequential.by_ref() {
-            let metadata = result?;
-            all_paths =
-                metadata.visit_scan_files(all_paths, |ps: &mut Vec<String>, scan_file| {
-                    ps.push(scan_file.path);
-                })?;
-        }
+        let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
+            metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
+                ps.push(scan_file.path);
+            })
+        })?;
 
         // Call finish() to get processor and parallel files (if any)
         let result = sequential.finish()?;
@@ -467,22 +428,36 @@ mod tests {
                     vec![files]
                 };
 
-                // Run a ParallelPhase instance for each partition with shared processor.
-                for partition_files in partitions {
-                    assert!(!partition_files.is_empty());
+                let handles = partitions
+                    .into_iter()
+                    .map(|partition_files| {
+                        let engine = engine.clone();
+                        let processor = processor.clone();
 
-                    let parallel: ParallelPhase<Arc<ScanLogReplayProcessor>> =
-                        ParallelPhase::try_new(engine.clone(), processor.clone(), partition_files)?;
+                        thread::spawn(move || -> DeltaResult<Vec<String>> {
+                            assert!(!partition_files.is_empty());
+                            let mut parallel = ParallelPhase::try_new(
+                                engine.clone(),
+                                processor.clone(),
+                                partition_files,
+                            )?;
 
-                    for result in parallel {
-                        let metadata = result?;
-                        all_paths = metadata.visit_scan_files(
-                            all_paths,
-                            |ps: &mut Vec<String>, scan_file| {
-                                ps.push(scan_file.path);
-                            },
-                        )?;
-                    }
+                            parallel.try_fold(Vec::new(), |acc, metadata_res| {
+                                metadata_res?.visit_scan_files(
+                                    acc,
+                                    |ps: &mut Vec<String>, scan_file| {
+                                        ps.push(scan_file.path);
+                                    },
+                                )
+                            })
+                        })
+                    })
+                    .collect_vec();
+
+                // Collect results from all threads
+                for handle in handles {
+                    let paths = handle.join().expect("Thread panicked")?;
+                    all_paths.extend(paths);
                 }
             }
         }
