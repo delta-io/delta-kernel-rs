@@ -40,12 +40,6 @@ pub(crate) struct ParallelPhase<P: ParallelLogReplayProcessor> {
 }
 
 impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
-    /// Creates a new parallel phase for processing checkpoint leaf files.
-    ///
-    /// # Parameters
-    /// - `engine`: Engine for reading parquet files
-    /// - `processor`: Shared processor (wrap in `Arc` for distribution across executors)
-    /// - `leaf_files`: Checkpoint leaf files (sidecars or multi-part checkpoint parts)
     #[internal_api]
     #[allow(unused)]
     pub(crate) fn try_new(
@@ -126,15 +120,14 @@ mod tests {
     use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::default::DefaultEngine;
     use crate::log_replay::FileActionKey;
-    use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
+    use crate::parallel::sequential_phase::AfterSequential;
     use crate::parquet::arrow::arrow_writer::ArrowWriter;
     use crate::scan::log_replay::ScanLogReplayProcessor;
     use crate::scan::state::ScanFile;
     use crate::scan::state_info::tests::get_simple_state_info;
-    use crate::scan::state_info::StateInfo;
     use crate::schema::{DataType, StructField, StructType};
     use crate::utils::test_utils::{load_test_table, parse_json_batch};
-    use crate::SnapshotRef;
+    use crate::{PredicateRef, SnapshotRef};
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::ObjectStore;
@@ -242,7 +235,6 @@ mod tests {
             size: get_file_size(&store, sidecar_path).await,
         };
 
-        // Run ParallelPhase and collect paths
         let mut parallel =
             ParallelPhase::try_new(Arc::new(engine), processor.clone(), vec![file_meta])?;
 
@@ -355,8 +347,13 @@ mod tests {
     fn get_expected_paths(
         engine: &dyn crate::Engine,
         snapshot: &SnapshotRef,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<Vec<String>> {
-        let scan = snapshot.clone().scan_builder().build()?;
+        let mut builder = snapshot.clone().scan_builder();
+        if let Some(pred) = predicate {
+            builder = builder.with_predicate(pred);
+        }
+        let scan = builder.build()?;
         let mut scan_metadata_iter = scan.scan_metadata(engine)?;
 
         let mut paths = scan_metadata_iter.try_fold(Vec::new(), |acc, metadata_res| {
@@ -368,50 +365,32 @@ mod tests {
         Ok(paths)
     }
 
-    /// Core helper function to verify the parallel workflow end-to-end.
-    ///
-    /// This function:
-    /// 1. Runs SequentialPhase to completion
-    /// 2. Calls finish() to check if parallel phase is needed
-    /// 3. If needed, runs ParallelPhase with the processor and files
-    /// 4. Verifies results match the scan_metadata API
     fn verify_parallel_workflow(
         table_name: &str,
+        predicate: Option<PredicateRef>,
         with_serde: bool,
         one_file_per_worker: bool,
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
-        // Get expected paths using scan_metadata API
-        let expected_paths = get_expected_paths(engine.as_ref(), &snapshot)?;
+        let expected_paths = get_expected_paths(engine.as_ref(), &snapshot, predicate.clone())?;
 
-        let log_segment = Arc::new(snapshot.log_segment().clone());
+        let mut builder = snapshot.scan_builder();
+        if let Some(pred) = predicate {
+            builder = builder.with_predicate(pred);
+        }
+        let scan = builder.build()?;
+        let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
 
-        let state_info = Arc::new(StateInfo::try_new(
-            snapshot.schema(),
-            snapshot.table_configuration(),
-            None,
-            (),
-        )?);
-        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
-        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
-
-        // Process all batches in sequential phase and collect paths
-        let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
+        let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 ps.push(scan_file.path);
             })
         })?;
 
-        // Call finish() to get processor and parallel files (if any)
-        let result = sequential.finish()?;
-
-        match result {
-            AfterSequential::Done(_processor) => {
-                // No parallel phase - all files processed in sequential phase
-            }
+        match phase1.finish()? {
+            AfterSequential::Done(_) => {}
             AfterSequential::Parallel { processor, files } => {
-                // Optionally serialize and deserialize the processor
                 let processor = if with_serde {
                     let serialized_state = processor.into_serializable_state()?;
                     ScanLogReplayProcessor::from_serializable_state(
@@ -422,7 +401,6 @@ mod tests {
                     Arc::new(processor)
                 };
 
-                // Choose distribution strategy based on test mode
                 let partitions: Vec<Vec<FileMeta>> = if one_file_per_worker {
                     files.into_iter().map(|f| vec![f]).collect()
                 } else {
@@ -455,7 +433,6 @@ mod tests {
                     })
                     .collect_vec();
 
-                // Collect results from all threads
                 for handle in handles {
                     let paths = handle.join().expect("Thread panicked")?;
                     all_paths.extend(paths);
@@ -463,7 +440,6 @@ mod tests {
             }
         }
 
-        // Sort and compare against expected paths from scan_metadata
         all_paths.sort();
         assert_eq!(
             all_paths, expected_paths,
@@ -480,6 +456,7 @@ mod tests {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(
                     "v2-checkpoints-json-with-sidecars",
+                    None,
                     with_serde,
                     one_file_per_worker,
                 )?;
@@ -494,6 +471,7 @@ mod tests {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(
                     "v2-checkpoints-parquet-with-sidecars",
+                    None,
                     with_serde,
                     one_file_per_worker,
                 )?;
@@ -508,6 +486,25 @@ mod tests {
             for one_file_per_worker in [false, true] {
                 verify_parallel_workflow(
                     "table-without-dv-small",
+                    None,
+                    with_serde,
+                    one_file_per_worker,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_with_dataskipping_predicate() -> DeltaResult<()> {
+        use crate::expressions::{column_expr, Expression as Expr};
+
+        let predicate = Arc::new(Expr::gt(column_expr!("id"), Expr::literal(20i64)));
+        for with_serde in [false, true] {
+            for one_file_per_worker in [false, true] {
+                verify_parallel_workflow(
+                    "v2-checkpoints-json-with-sidecars",
+                    Some(predicate.clone()),
                     with_serde,
                     one_file_per_worker,
                 )?;
