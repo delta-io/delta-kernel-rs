@@ -21,6 +21,8 @@ struct TableData {
 }
 
 impl TableData {
+    const MAX_UNPUBLISHED_COMMITS: u16 = 50;
+
     /// Creates a new `TableData` representing a UC Delta table that has just been created.
     /// The table starts with no commits and version 0.
     fn new_post_table_create() -> Self {
@@ -47,7 +49,8 @@ impl TableData {
         })
     }
 
-    /// Registers a new commit. Returns an error if the version is not the expected next version.
+    /// Registers a new commit. Returns an error if the version is not the expected next version
+    /// or if the number of unpublished commits exceeds the maximum.
     fn commit(&mut self, request: CommitRequest) -> Result<()> {
         let Some(commit) = request.commit_info else {
             return Err(Error::UnsupportedOperation(
@@ -62,6 +65,12 @@ impl TableData {
                 "Expected commit version {} but got {}",
                 expected_version, commit.version
             )));
+        }
+
+        if self.catalog_commits.len() as u16 >= Self::MAX_UNPUBLISHED_COMMITS {
+            return Err(Error::MaxUnpublishedCommitsExceeded(
+                Self::MAX_UNPUBLISHED_COMMITS,
+            ));
         }
 
         if let Some(v) = request.latest_backfilled_version {
@@ -254,5 +263,18 @@ mod tests {
         let response = client.get_commits(get_commits_request()).await.unwrap();
         assert!(response.commits.unwrap().is_empty());
         assert_eq!(response.latest_table_version, 0);
+    }
+
+    #[tokio::test]
+    async fn test_commit_max_unpublished_commits_exceeded() {
+        let client = InMemoryCommitsClient::new();
+        client.create_table(TABLE_ID).unwrap();
+        for v in 1..=50 {
+            client.commit(commit_request(v, None)).await.unwrap();
+        }
+        assert!(matches!(
+            client.commit(commit_request(51, None)).await,
+            Err(Error::MaxUnpublishedCommitsExceeded(_))
+        ));
     }
 }
