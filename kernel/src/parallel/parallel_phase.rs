@@ -103,7 +103,6 @@ impl<P: ParallelLogReplayProcessor> ParallelPhase<P> {
 /// - File reading failures
 /// - Parquet parsing errors
 /// - Processing errors from the processor
-
 impl<P: ParallelLogReplayProcessor> Iterator for ParallelPhase<P> {
     type Item = DeltaResult<P::Output>;
 
