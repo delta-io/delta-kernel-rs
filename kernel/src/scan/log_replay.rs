@@ -1166,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_with_opaque_predicate_fails() {
+    fn serializng_scan_state_with_opaque_predicate_fails() {
         // Opaque predicates cannot be serialized. Connectors requiring opaque expression support
         // must serialize the predicate separately using their own mechanism.
 
@@ -1182,6 +1182,6 @@ mod tests {
 
         // Serialization should fail because opaque expressions cannot be serialized
         let result = serde_json::to_string(&state);
-        assert_result_error_with_message(result, "Cannot serialize Opaque Expression");
+        assert_result_error_with_message(result, "Cannot serialize an Opaque Predicate");
     }
 }
