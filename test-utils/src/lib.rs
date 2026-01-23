@@ -604,9 +604,13 @@ impl LoggingTest {
     pub fn new() -> Self {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let logs_clone = logs.clone();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer().with_writer(move || LogWriter(logs_clone.clone())),
-        ));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || LogWriter(logs_clone.clone()))
+                    .with_ansi(false),
+            ),
+        );
         Self { logs, _guard }
     }
 
