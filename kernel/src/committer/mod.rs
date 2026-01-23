@@ -76,7 +76,7 @@ pub trait Committer: Send {
     /// # When to call
     ///
     /// This method should only be called on catalog committers (i.e., when [`is_catalog_committer`]
-    /// returns `true`). On a filesystem committer, this is a no-op and returns `Ok(())`.
+    /// returns `true`). Filesystem committers will error if called with catalog commits to publish.
     ///
     /// # Benefits
     ///
