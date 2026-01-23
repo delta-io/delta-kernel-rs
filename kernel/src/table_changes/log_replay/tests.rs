@@ -988,7 +988,7 @@ async fn print_table_info_post_phase1() {
 
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
-    // This specific commit (with these actions) isn't necessary to test the tracing, we just need to have one commit with any actions
+    // This specific commit (with these actions) isn't necessary to test the tracing for this test, we just need to have one commit with any actions
     mock_table
         .commit([
             Action::Metadata(
@@ -1038,6 +1038,49 @@ async fn print_table_info_post_phase1() {
     assert!(log_output.contains("Phase 1 of CDF query processing completed"));
     assert!(log_output.contains("remove_dvs_size=0"));
     assert!(log_output.contains("has_cdc_action=false"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
+}
+
+#[tokio::test]
+async fn print_table_info_post_phase1_has_cdc() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    mock_table
+        .commit([
+            Action::Add(Add {
+                path: "fake_path_1".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Cdc(Cdc {
+                path: "fake_path_2".into(),
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains("remove_dvs_size=0"));
+    assert!(log_output.contains("has_cdc_action=true"));
     assert!(log_output.contains("file_path="));
     assert!(log_output.contains("version=0"));
     assert!(log_output.contains("timestamp="));
