@@ -1085,3 +1085,77 @@ async fn print_table_info_post_phase1_has_cdc() {
     assert!(log_output.contains("version=0"));
     assert!(log_output.contains("timestamp="));
 }
+
+#[tokio::test]
+async fn print_table_info_post_phase1_has_dv() {
+    let tracing_guard = LoggingTest::new();
+
+    let engine = Arc::new(SyncEngine::new());
+    let mut mock_table = LocalMockTable::new();
+
+    let deletion_vector1 = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+        offset: Some(1),
+        size_in_bytes: 36,
+        cardinality: 2,
+    };
+    let deletion_vector2 = DeletionVectorDescriptor {
+        storage_type: DeletionVectorStorageType::PersistedRelative,
+        path_or_inline_dv: "U5OWRz5k%CFT.Td}yCPW".to_string(),
+        offset: Some(1),
+        size_in_bytes: 38,
+        cardinality: 3,
+    };
+    // - fake_path_1 undergoes a restore. All rows are restored, so the deletion vector is removed.
+    // - All remaining rows of fake_path_2 are deleted
+    mock_table
+        .commit([
+            Action::Remove(Remove {
+                path: "fake_path_1".into(),
+                data_change: true,
+                deletion_vector: Some(deletion_vector1.clone()),
+                ..Default::default()
+            }),
+            Action::Add(Add {
+                path: "fake_path_1".into(),
+                data_change: true,
+                ..Default::default()
+            }),
+            Action::Remove(Remove {
+                path: "fake_path_2".into(),
+                data_change: true,
+                deletion_vector: Some(deletion_vector2.clone()),
+                ..Default::default()
+            }),
+        ])
+        .await;
+
+    let commits = get_segment(engine.as_ref(), mock_table.table_root(), 0, None)
+        .unwrap()
+        .into_iter();
+
+    let expected_remove_dvs: Arc<HashMap<String, DvInfo>> = HashMap::from([(
+        "fake_path_1".to_string(),
+        DvInfo {
+            deletion_vector: Some(deletion_vector1.clone()),
+        },
+    )])
+    .into();
+
+    let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
+    let table_config = get_default_table_config(&table_root_url);
+    let _scan_batches: DeltaResult<Vec<_>> =
+        table_changes_action_iter(engine, &table_config, commits, get_schema().into(), None)
+            .unwrap()
+            .try_collect();
+
+    let log_output = tracing_guard.logs();
+
+    assert!(log_output.contains("Phase 1 of CDF query processing completed"));
+    assert!(log_output.contains(&format!("remove_dvs_size={}", expected_remove_dvs.len())));
+    assert!(log_output.contains("has_cdc_action=false"));
+    assert!(log_output.contains("file_path="));
+    assert!(log_output.contains("version=0"));
+    assert!(log_output.contains("timestamp="));
+}
