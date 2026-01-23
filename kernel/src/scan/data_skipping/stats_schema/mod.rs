@@ -3,11 +3,12 @@
 mod column_filter;
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::{
     schema::{
-        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaTransform,
-        StructField, StructType,
+        ArrayType, ColumnName, DataType, MapType, PrimitiveType, Schema, SchemaRef,
+        SchemaTransform, StructField, StructType,
     },
     table_properties::TableProperties,
     DeltaResult,
@@ -149,6 +150,28 @@ pub(crate) fn stats_column_names(
     let mut columns = Vec::new();
     filter.collect_columns(physical_file_schema, &mut columns);
     columns
+}
+
+/// Creates a stats schema from a referenced schema (columns from predicate).
+/// Returns schema: `{ numRecords, nullCount, minValues, maxValues }`
+///
+/// This is used to build the schema for parsing JSON stats and for reading stats_parsed
+/// from checkpoints.
+pub(crate) fn build_stats_schema(referenced_schema: &StructType) -> Option<SchemaRef> {
+    let stats_schema = NullableStatsTransform
+        .transform_struct(referenced_schema)?
+        .into_owned();
+
+    let nullcount_schema = NullCountStatsTransform
+        .transform_struct(&stats_schema)?
+        .into_owned();
+
+    Some(Arc::new(StructType::new_unchecked([
+        StructField::nullable("numRecords", DataType::LONG),
+        StructField::nullable("nullCount", nullcount_schema),
+        StructField::nullable("minValues", stats_schema.clone()),
+        StructField::nullable("maxValues", stats_schema),
+    ])))
 }
 
 /// Transforms a schema to make all fields nullable.
