@@ -257,10 +257,11 @@ impl LogReplayScanner {
         let timestamp = commit_file.location.last_modified;
 
         info!(
+            version = commit_file.version,
+            id = table_configuration.metadata().id(),
             remove_dvs_size = remove_dvs.len(),
             has_cdc_action = has_cdc_action,
             file_path = %commit_file.location.as_url(),
-            version = commit_file.version,
             timestamp = timestamp,
             "Phase 1 of CDF query processing completed"
         );
