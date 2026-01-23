@@ -22,7 +22,7 @@ use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
+use crate::scan::data_skipping::stats_schema::{expected_stats_schema, NullableStatsTransform};
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
@@ -40,6 +40,15 @@ use crate::{
     RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
+use serde::Deserialize;
+
+/// Configuration for clustering columns stored in domain metadata.
+/// The JSON format is: `{"clusteringColumns": ["col1", "col2"]}`
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusteringConfiguration {
+    clustering_columns: Vec<String>,
+}
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -790,6 +799,112 @@ impl Transaction {
         &BASE_ADD_FILES_SCHEMA
     }
 
+    /// Returns the expected schema for file statistics.
+    ///
+    /// The schema structure is derived from table configuration:
+    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
+    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
+    /// - Clustering columns: Always included regardless of limits
+    /// - Partition columns: Always excluded
+    ///
+    /// The returned schema has the following structure:
+    /// ```ignore
+    /// {
+    ///   numRecords: long,
+    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
+    ///   minValues: { ... },   // Nested struct, only min/max eligible types
+    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
+    ///   tightBounds: boolean,
+    /// }
+    /// ```
+    ///
+    /// Engines should collect statistics matching this schema structure when writing files.
+    #[allow(unused)]
+    pub fn stats_schema(&self, engine: &dyn Engine) -> DeltaResult<SchemaRef> {
+        let table_config = self.read_snapshot.table_configuration();
+        let table_properties = table_config.table_properties();
+        let physical_schema = self.read_snapshot.schema();
+
+        // Get clustering columns from domain metadata
+        let clustering_columns = self.get_clustering_columns(engine)?;
+
+        let stats_schema = expected_stats_schema(
+            physical_schema.as_ref(),
+            table_properties,
+            clustering_columns.as_deref(),
+        )?;
+        Ok(Arc::new(stats_schema))
+    }
+
+    /// Returns the list of column names that should have statistics collected.
+    ///
+    /// This returns the leaf column paths from `stats_schema()` as a flat list
+    /// of dotted column names (e.g., `["id", "nested.field"]`).
+    ///
+    /// Engines can use this to determine which columns need stats during writes.
+    #[allow(unused)]
+    pub fn stats_columns(&self, engine: &dyn Engine) -> DeltaResult<Vec<ColumnName>> {
+        let stats_schema = self.stats_schema(engine)?;
+
+        // Extract column names from nullCount schema (has all stats columns)
+        let null_count_field = stats_schema
+            .fields()
+            .find(|f| f.name() == "nullCount")
+            .ok_or_else(|| Error::generic("stats schema missing nullCount field"))?;
+
+        fn collect_leaf_columns(
+            data_type: &DataType,
+            prefix: &ColumnName,
+            result: &mut Vec<ColumnName>,
+        ) {
+            match data_type {
+                DataType::Struct(struct_type) => {
+                    for field in struct_type.fields() {
+                        let field_col = ColumnName::new([field.name()]);
+                        let col_name = prefix.join(&field_col);
+                        collect_leaf_columns(field.data_type(), &col_name, result);
+                    }
+                }
+                _ => {
+                    result.push(prefix.clone());
+                }
+            }
+        }
+
+        let mut columns = Vec::new();
+        let empty_prefix: ColumnName = ColumnName::new(std::iter::empty::<&str>());
+        collect_leaf_columns(null_count_field.data_type(), &empty_prefix, &mut columns);
+        Ok(columns)
+    }
+
+    /// Extract clustering columns from domain metadata.
+    fn get_clustering_columns(&self, engine: &dyn Engine) -> DeltaResult<Option<Vec<ColumnName>>> {
+        // Read clustering domain metadata
+        let domain_map = scan_domain_metadatas(
+            self.read_snapshot.log_segment(),
+            Some("delta.clustering"),
+            engine,
+        )?;
+
+        if let Some(domain) = domain_map.get("delta.clustering") {
+            let config_str = domain.configuration();
+            if !config_str.is_empty() {
+                let config: ClusteringConfiguration =
+                    serde_json::from_str(config_str).map_err(|e| {
+                        Error::generic(format!("Failed to parse clustering config: {e}"))
+                    })?;
+                let columns: Vec<ColumnName> = config
+                    .clustering_columns
+                    .into_iter()
+                    .map(|c| ColumnName::new([c]))
+                    .collect();
+                return Ok(Some(columns));
+            }
+        }
+
+        Ok(None)
+    }
+
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
@@ -820,7 +935,9 @@ impl Transaction {
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
     // that engines cannot call this method after a metadata change, since the write context could
     // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
+    // Note: Callers that use get_write_context may be writing data to the table and they might
+    // have invalid metadata.
+    pub fn get_write_context(&self, engine: &dyn Engine) -> DeltaResult<WriteContext> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
@@ -837,12 +954,20 @@ impl Transaction {
             .cloned();
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
-        WriteContext::new(
+        // Get stats columns from table configuration
+        let stats_columns = self
+            .stats_columns(engine)?
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+
+        Ok(WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
-        )
+            stats_columns,
+        ))
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -1313,6 +1438,8 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    /// Column names that should have statistics collected during writes.
+    stats_columns: Vec<String>,
 }
 
 impl WriteContext {
@@ -1321,12 +1448,14 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        stats_columns: Vec<String>,
     ) -> Self {
         WriteContext {
             target_dir,
             logical_schema,
             physical_schema,
             logical_to_physical,
+            stats_columns,
         }
     }
 
@@ -1346,6 +1475,14 @@ impl WriteContext {
         self.logical_to_physical.clone()
     }
 
+    /// Returns the column names that should have statistics collected during writes.
+    ///
+    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns,
+    /// and clustering columns).
+    pub fn stats_columns(&self) -> &[String] {
+        &self.stats_columns
+    }
+
     /// Generate a new unique absolute URL for a deletion vector file.
     ///
     /// This method generates a unique file name in the table directory.
@@ -1362,7 +1499,7 @@ impl WriteContext {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// let write_context = transaction.get_write_context();
+    /// let write_context = transaction.get_write_context(engine)?;
     /// let dv_path = write_context.new_deletion_vector_path(String::from(rand_string()));
     /// // dv_url might be: s3://bucket/table/deletion_vector_d2c639aa-8816-431a-aaf6-d3fe2512ff61.bin
     /// ```
@@ -1578,7 +1715,7 @@ mod tests {
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context(&engine)?;
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -1610,7 +1747,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
 
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context(&engine)?;
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
@@ -1674,7 +1811,7 @@ mod tests {
 
         // Create a transaction and get write context
         let txn_without = snapshot_without.transaction(Box::new(FileSystemCommitter::new()))?;
-        let write_context_without = txn_without.get_write_context();
+        let write_context_without = txn_without.get_write_context(&engine)?;
         let expr_without = write_context_without.logical_to_physical();
 
         // Without materializePartitionColumns, partition column should be excluded
@@ -1724,7 +1861,7 @@ mod tests {
 
         // Create a transaction and get write context
         let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()))?;
-        let write_context_with = txn_with.get_write_context();
+        let write_context_with = txn_with.get_write_context(&engine)?;
         let expr_with = write_context_with.logical_to_physical();
 
         // With materializePartitionColumns, ALL columns including partition columns should be included

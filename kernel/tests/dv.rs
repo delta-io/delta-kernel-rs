@@ -103,7 +103,7 @@ fn get_write_context(
 ) -> Result<delta_kernel::transaction::WriteContext, Box<dyn std::error::Error>> {
     let snapshot = Snapshot::builder_for(table_url.clone()).build(engine)?;
     let txn = snapshot.transaction(Box::new(FileSystemCommitter::new()))?;
-    Ok(txn.get_write_context())
+    Ok(txn.get_write_context(engine)?)
 }
 
 /// Helper to write a deletion vector to object store and return its descriptor.
