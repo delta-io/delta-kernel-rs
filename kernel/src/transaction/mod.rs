@@ -919,6 +919,45 @@ impl Transaction {
         &BASE_ADD_FILES_SCHEMA
     }
 
+    /// Returns the expected schema for file statistics.
+    ///
+    /// The schema structure is derived from table configuration:
+    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
+    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
+    /// - Partition columns: Always excluded
+    ///
+    /// The returned schema has the following structure:
+    /// ```ignore
+    /// {
+    ///   numRecords: long,
+    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
+    ///   minValues: { ... },   // Nested struct, only min/max eligible types
+    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
+    ///   tightBounds: boolean,
+    /// }
+    /// ```
+    ///
+    /// Engines should collect statistics matching this schema structure when writing files.
+    #[allow(unused)]
+    pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
+        self.read_snapshot
+            .table_configuration()
+            .expected_stats_schema()
+    }
+
+    /// Returns the list of column names that should have statistics collected.
+    ///
+    /// This returns the leaf column paths as a flat list of column names
+    /// (e.g., `["id", "nested.field"]`).
+    ///
+    /// Engines can use this to determine which columns need stats during writes.
+    #[allow(unused)]
+    pub fn stats_columns(&self) -> Vec<ColumnName> {
+        self.read_snapshot
+            .table_configuration()
+            .stats_column_names()
+    }
+
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
@@ -950,6 +989,8 @@ impl Transaction {
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
     // that engines cannot call this method after a metadata change, since the write context could
     // have invalid metadata.
+    // Note: Callers that use get_write_context may be writing data to the table and they might
+    // have invalid metadata.
     pub fn get_write_context(&self) -> WriteContext {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
@@ -968,11 +1009,19 @@ impl Transaction {
             .cloned();
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
+        // Get stats columns from table configuration
+        let stats_columns = self
+            .stats_columns()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
+            stats_columns,
         )
     }
 
@@ -1471,6 +1520,8 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    /// Column names that should have statistics collected during writes.
+    stats_columns: Vec<String>,
 }
 
 impl WriteContext {
@@ -1479,12 +1530,14 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        stats_columns: Vec<String>,
     ) -> Self {
         WriteContext {
             target_dir,
             logical_schema,
             physical_schema,
             logical_to_physical,
+            stats_columns,
         }
     }
 
@@ -1502,6 +1555,13 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// Returns the column names that should have statistics collected during writes.
+    ///
+    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
+    pub fn stats_columns(&self) -> &[String] {
+        &self.stats_columns
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.

@@ -133,6 +133,120 @@ pub(crate) fn expected_stats_schema(
     StructType::try_new(fields)
 }
 
+/// Returns the list of column names that should have statistics collected.
+///
+/// This extracts just the column names without building the full stats schema,
+/// making it more efficient when only the column list is needed.
+#[allow(unused)]
+pub(crate) fn stats_column_names(
+    physical_file_schema: &Schema,
+    table_properties: &TableProperties,
+) -> Vec<ColumnName> {
+    let mut filter = StatsColumnFilter::new(table_properties);
+    let mut columns = Vec::new();
+    filter.collect_columns(physical_file_schema, &mut columns);
+    columns
+}
+
+/// Handles column filtering logic for statistics based on table properties.
+///
+/// Filters columns according to:
+/// * `dataSkippingStatsColumns` - explicit list of columns to include (takes precedence)
+/// * `dataSkippingNumIndexedCols` - number of leaf columns to include (default 32)
+struct StatsColumnFilter {
+    n_columns: Option<DataSkippingNumIndexedCols>,
+    added_columns: u64,
+    column_names: Option<Vec<ColumnName>>,
+    path: Vec<String>,
+}
+
+impl StatsColumnFilter {
+    fn new(props: &TableProperties) -> Self {
+        // If data_skipping_stats_columns is specified, it takes precedence
+        // over data_skipping_num_indexed_cols, even if that is also specified.
+        if let Some(column_names) = &props.data_skipping_stats_columns {
+            Self {
+                n_columns: None,
+                added_columns: 0,
+                column_names: Some(column_names.clone()),
+                path: Vec::new(),
+            }
+        } else {
+            let n_cols = props
+                .data_skipping_num_indexed_cols
+                .unwrap_or(DataSkippingNumIndexedCols::NumColumns(32));
+            Self {
+                n_columns: Some(n_cols),
+                added_columns: 0,
+                column_names: None,
+                path: Vec::new(),
+            }
+        }
+    }
+
+    /// Collects column names that should have statistics.
+    fn collect_columns(&mut self, schema: &Schema, result: &mut Vec<ColumnName>) {
+        for field in schema.fields() {
+            self.collect_field(field, result);
+        }
+    }
+
+    fn collect_field(&mut self, field: &StructField, result: &mut Vec<ColumnName>) {
+        if self.at_column_limit() {
+            return;
+        }
+
+        self.path.push(field.name.clone());
+
+        match field.data_type() {
+            DataType::Struct(struct_type) => {
+                for child in struct_type.fields() {
+                    self.collect_field(child, result);
+                }
+            }
+            _ => {
+                if self.should_include_current() {
+                    result.push(ColumnName::new(&self.path));
+                    self.added_columns += 1;
+                }
+            }
+        }
+
+        self.path.pop();
+    }
+
+    /// Returns true if the column limit has been reached.
+    fn at_column_limit(&self) -> bool {
+        matches!(
+            self.n_columns,
+            Some(DataSkippingNumIndexedCols::NumColumns(n)) if self.added_columns >= n
+        )
+    }
+
+    /// Returns true if the current path should be included based on column_names config.
+    fn should_include_current(&self) -> bool {
+        self.column_names
+            .as_ref()
+            .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
+            .unwrap_or(true)
+    }
+
+    /// Enters a field path for filtering decisions.
+    fn enter_field(&mut self, name: &str) {
+        self.path.push(name.to_string());
+    }
+
+    /// Exits the current field path.
+    fn exit_field(&mut self) {
+        self.path.pop();
+    }
+
+    /// Records that a leaf column was included.
+    fn record_included(&mut self) {
+        self.added_columns += 1;
+    }
+}
+
 /// Transforms a schema to make all fields nullable.
 /// Used for stats schemas where stats may not be available for all columns.
 pub(crate) struct NullableStatsTransform;
@@ -178,44 +292,19 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 /// Base stats schema in this case refers the subsets of fields in the table schema
 /// that may be considered for stats collection. Depending on the type of stats - min/max/nullcount/... -
 /// additional transformations may be applied.
+/// Transforms a schema to filter columns for statistics based on table properties.
 ///
-/// The concrete shape of the schema depends on the table configuration.
-/// * `dataSkippingStatsColumns` - used to explicitly specify the columns
-///   to be used for data skipping statistics. (takes precedence)
-/// * `dataSkippingNumIndexedCols` - used to specify the number of columns
-///   to be used for data skipping statistics. Defaults to 32.
-///
-/// All fields are nullable.
+/// All fields in the output are nullable.
 #[allow(unused)]
 struct BaseStatsTransform {
-    n_columns: Option<DataSkippingNumIndexedCols>,
-    added_columns: u64,
-    column_names: Option<Vec<ColumnName>>,
-    path: Vec<String>,
+    filter: StatsColumnFilter,
 }
 
 impl BaseStatsTransform {
     #[allow(unused)]
     fn new(props: &TableProperties) -> Self {
-        // If data_skipping_stats_columns is specified, it takes precedence
-        // over data_skipping_num_indexed_cols, even if that is also specified.
-        if let Some(column_names) = &props.data_skipping_stats_columns {
-            Self {
-                n_columns: None,
-                added_columns: 0,
-                column_names: Some(column_names.clone()),
-                path: Vec::new(),
-            }
-        } else {
-            let n_cols = props
-                .data_skipping_num_indexed_cols
-                .unwrap_or(DataSkippingNumIndexedCols::NumColumns(32));
-            Self {
-                n_columns: Some(n_cols),
-                added_columns: 0,
-                column_names: None,
-                path: Vec::new(),
-            }
+        Self {
+            filter: StatsColumnFilter::new(props),
         }
     }
 }
@@ -224,34 +313,22 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         use Cow::*;
 
-        // Check if the number of columns is set and if the added columns exceed the limit
-        // In the constructor we assert this will always be None if column_names are specified
-        if let Some(DataSkippingNumIndexedCols::NumColumns(n_cols)) = self.n_columns {
-            if self.added_columns >= n_cols {
-                return None;
-            }
+        if self.filter.at_column_limit() {
+            return None;
         }
 
-        self.path.push(field.name.clone());
+        self.filter.enter_field(field.name());
         let data_type = field.data_type();
 
         // We always traverse struct fields (they don't count against the column limit),
         // but we only include leaf fields if they qualify based on column_names config.
         // When column_names is None, all leaf fields are included (up to n_columns limit).
         if !matches!(data_type, DataType::Struct(_)) {
-            let should_include = self
-                .column_names
-                .as_ref()
-                .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
-                .unwrap_or(true);
-
-            if !should_include {
-                self.path.pop();
+            if !self.filter.should_include_current() {
+                self.filter.exit_field();
                 return None;
             }
-
-            // Increment count only for leaf columns
-            self.added_columns += 1;
+            self.filter.record_included();
         }
 
         let field = match self.transform(&field.data_type)? {
@@ -264,7 +341,7 @@ impl<'a> SchemaTransform<'a> for BaseStatsTransform {
             }),
         };
 
-        self.path.pop();
+        self.filter.exit_field();
 
         // exclude struct fields with no children
         if matches!(field.data_type(), DataType::Struct(dt) if dt.fields().len() == 0) {
