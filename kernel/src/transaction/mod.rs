@@ -12,8 +12,6 @@ use crate::actions::{
     get_log_commit_info_schema, get_log_domain_metadata_schema, get_log_remove_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
-#[cfg(feature = "catalog-managed")]
-use crate::committer::FileSystemCommitter;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
@@ -428,14 +426,17 @@ impl Transaction {
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
-        if self.committer.any_ref().is::<FileSystemCommitter>()
+        if !self.committer.is_catalog_committer()
             && self
                 .read_snapshot
                 .table_configuration()
                 .protocol()
                 .is_catalog_managed()
         {
-            return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
+            return Err(Error::generic(
+                "A catalog committer must be used to commit to catalog-managed tables. Please \
+                    provide a committer for your catalog via Transaction::with_committer().",
+            ));
         }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
         let commit_metadata = CommitMetadata::new(
@@ -1481,6 +1482,7 @@ pub struct RetryableTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
     use crate::Snapshot;
