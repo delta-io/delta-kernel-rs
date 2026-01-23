@@ -1,5 +1,4 @@
-#![allow(dead_code)] // TODO: Remove when integrated in checkpoint_data()
-//! Transforms for populating `stats_parsed` and `stats` fields on the `Add` action in checkpoint data.
+//! Transforms for populating stats_parsed and stats fields in checkpoint data.
 //!
 //! This module ensures that Add actions in checkpoints have the correct statistics format
 //! based on the table configuration. Statistics can be stored in two formats as fields on

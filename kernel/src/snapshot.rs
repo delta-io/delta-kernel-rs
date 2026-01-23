@@ -10,7 +10,7 @@ use crate::actions::domain_metadata::{
 };
 use crate::actions::set_transaction::SetTransactionScanner;
 use crate::actions::INTERNAL_DOMAIN_PREFIX;
-use crate::checkpoint::CheckpointWriter;
+use crate::checkpoint::{CheckpointDataIterator, CheckpointWriter};
 use crate::committer::Committer;
 use crate::listed_log_files::{ListedLogFiles, ListedLogFilesBuilder};
 use crate::log_segment::LogSegment;
