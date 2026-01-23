@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::ops::Deref;
@@ -13,8 +12,6 @@ use crate::actions::{
     get_log_commit_info_schema, get_log_domain_metadata_schema, get_log_remove_schema,
     get_log_txn_schema, CommitInfo, DomainMetadata, SetTransaction, INTERNAL_DOMAIN_PREFIX,
 };
-#[cfg(feature = "catalog-managed")]
-use crate::committer::FileSystemCommitter;
 use crate::committer::{CommitMetadata, CommitResponse, Committer};
 use crate::engine_data::FilteredEngineData;
 use crate::engine_data::{GetData, TypedGetData};
@@ -23,6 +20,7 @@ use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
+use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
@@ -40,28 +38,6 @@ use crate::{
     RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
-
-// This is a workaround due to the fact that expression evaluation happens
-// on the whole EngineData instead of accounting for filtered rows, which can lead to null values in
-// required fields.
-// TODO: Move this to a common place (dedupe from data_skipping.rs) or remove when evaluations work
-// on FilteredEngineData directly.
-struct NullableStatsTransform;
-impl<'a> SchemaTransform<'a> for NullableStatsTransform {
-    fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
-        use Cow::*;
-        let field = match self.transform(&field.data_type)? {
-            Borrowed(_) if field.is_nullable() => Borrowed(field),
-            data_type => Owned(StructField {
-                name: field.name.clone(),
-                data_type: data_type.into_owned(),
-                nullable: true,
-                metadata: field.metadata.clone(),
-            }),
-        };
-        Some(field)
-    }
-}
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -450,14 +426,17 @@ impl Transaction {
 
         // Step 6: Commit via the committer
         #[cfg(feature = "catalog-managed")]
-        if self.committer.any_ref().is::<FileSystemCommitter>()
+        if !self.committer.is_catalog_committer()
             && self
                 .read_snapshot
                 .table_configuration()
                 .protocol()
                 .is_catalog_managed()
         {
-            return Err(Error::generic("The FileSystemCommitter cannot be used to commit to catalog-managed tables. Please provide a committer for your catalog via Transaction::with_committer()."));
+            return Err(Error::generic(
+                "A catalog committer must be used to commit to catalog-managed tables. Please \
+                    provide a committer for your catalog via Transaction::with_committer().",
+            ));
         }
         let log_root = LogRoot::new(self.read_snapshot.table_root().clone())?;
         let commit_metadata = CommitMetadata::new(
@@ -1503,6 +1482,7 @@ pub struct RetryableTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::committer::FileSystemCommitter;
     use crate::engine::sync::SyncEngine;
     use crate::schema::MapType;
     use crate::Snapshot;
