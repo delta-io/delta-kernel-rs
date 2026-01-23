@@ -1135,14 +1135,6 @@ async fn print_table_info_post_phase1_has_dv() {
         .unwrap()
         .into_iter();
 
-    let expected_remove_dvs: Arc<HashMap<String, DvInfo>> = HashMap::from([(
-        "fake_path_1".to_string(),
-        DvInfo {
-            deletion_vector: Some(deletion_vector1.clone()),
-        },
-    )])
-    .into();
-
     let table_root_url = url::Url::from_directory_path(mock_table.table_root()).unwrap();
     let table_config = get_default_table_config(&table_root_url);
     let _scan_batches: DeltaResult<Vec<_>> =
@@ -1151,6 +1143,14 @@ async fn print_table_info_post_phase1_has_dv() {
             .try_collect();
 
     let log_output = tracing_guard.logs();
+
+    let expected_remove_dvs: Arc<HashMap<String, DvInfo>> = HashMap::from([(
+        "fake_path_1".to_string(),
+        DvInfo {
+            deletion_vector: Some(deletion_vector1.clone()),
+        },
+    )])
+    .into();
 
     assert!(log_output.contains("Phase 1 of CDF query processing completed"));
     assert!(log_output.contains(&format!("remove_dvs_size={}", expected_remove_dvs.len())));
