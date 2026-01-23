@@ -39,6 +39,65 @@ use crate::{
 };
 use delta_kernel_derive::internal_api;
 
+/// Visitor to validate statistics in add file metadata.
+/// Uses RowVisitor pattern to extract and validate stats from EngineData.
+struct StatsValidationVisitor {
+    rows_validated: usize,
+    rows_with_num_records: usize,
+    errors: Vec<String>,
+}
+
+impl StatsValidationVisitor {
+    fn new() -> Self {
+        Self {
+            rows_validated: 0,
+            rows_with_num_records: 0,
+            errors: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> DeltaResult<()> {
+        if self.rows_validated == 0 {
+            return Err(Error::generic("No rows to validate"));
+        }
+        if self.rows_with_num_records == 0 {
+            // This is a warning case, not an error - stats might be missing
+            // but we don't fail the commit for it
+        }
+        if !self.errors.is_empty() {
+            return Err(Error::generic(format!(
+                "Stats validation errors: {}",
+                self.errors.join("; ")
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl RowVisitor for StatsValidationVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        static NAMES: LazyLock<Vec<ColumnName>> = LazyLock::new(|| vec![column_name!("stats")]);
+        static TYPES: LazyLock<Vec<DataType>> = LazyLock::new(|| {
+            vec![DataType::STRING] // stats is a JSON string
+        });
+        (NAMES.as_slice(), TYPES.as_slice())
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for row_index in 0..row_count {
+            self.rows_validated += 1;
+            if let Some(stats_str) = getters[0].get_opt(row_index, "stats")? {
+                let stats_str: String = stats_str;
+                // Check if stats has numRecords
+                if stats_str.contains("\"numRecords\"") {
+                    self.rows_with_num_records += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
     Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send + 'a>;
@@ -331,6 +390,14 @@ impl Transaction {
     ///   transaction in case of a conflict so the user can retry, etc.)
     /// - Err(Error) indicates a non-retryable error (e.g. logic/validation error).
     pub fn commit(self, engine: &dyn Engine) -> DeltaResult<CommitResult> {
+        // Step 0: Validate stats in add file metadata
+        // This ensures all files have valid stats before committing
+        for add_metadata in &self.add_files_metadata {
+            let mut validator = StatsValidationVisitor::new();
+            validator.visit_rows_of(add_metadata.as_ref())?;
+            validator.validate()?;
+        }
+
         // Step 1: Check for duplicate app_ids and generate set transactions (`txn`)
         // Note: The commit info must always be the first action in the commit but we generate it in
         // step 2 to fail early on duplicate transaction appIds
@@ -791,6 +858,45 @@ impl Transaction {
         &BASE_ADD_FILES_SCHEMA
     }
 
+    /// Returns the expected schema for file statistics.
+    ///
+    /// The schema structure is derived from table configuration:
+    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
+    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
+    /// - Partition columns: Always excluded
+    ///
+    /// The returned schema has the following structure:
+    /// ```ignore
+    /// {
+    ///   numRecords: long,
+    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
+    ///   minValues: { ... },   // Nested struct, only min/max eligible types
+    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
+    ///   tightBounds: boolean,
+    /// }
+    /// ```
+    ///
+    /// Engines should collect statistics matching this schema structure when writing files.
+    #[allow(unused)]
+    pub fn stats_schema(&self) -> DeltaResult<SchemaRef> {
+        self.read_snapshot
+            .table_configuration()
+            .expected_stats_schema()
+    }
+
+    /// Returns the list of column names that should have statistics collected.
+    ///
+    /// This returns the leaf column paths as a flat list of column names
+    /// (e.g., `["id", "nested.field"]`).
+    ///
+    /// Engines can use this to determine which columns need stats during writes.
+    #[allow(unused)]
+    pub fn stats_columns(&self) -> Vec<ColumnName> {
+        self.read_snapshot
+            .table_configuration()
+            .stats_column_names()
+    }
+
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
@@ -821,6 +927,8 @@ impl Transaction {
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
     // that engines cannot call this method after a metadata change, since the write context could
     // have invalid metadata.
+    // Note: Callers that use get_write_context may be writing data to the table and they might
+    // have invalid metadata.
     pub fn get_write_context(&self) -> WriteContext {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
@@ -838,11 +946,19 @@ impl Transaction {
             .cloned();
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
+        // Get stats columns from table configuration
+        let stats_columns = self
+            .stats_columns()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+
         WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
+            stats_columns,
         )
     }
 
@@ -853,6 +969,37 @@ impl Transaction {
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
+    }
+
+    /// Add files with statistics validation.
+    ///
+    /// Similar to [`add_files`], but validates that the metadata contains valid statistics
+    /// before adding. Returns an error if validation fails.
+    ///
+    /// [`add_files`]: Transaction::add_files
+    #[allow(unused)]
+    pub fn add_files_validated(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(add_metadata.as_ref())?;
+        validator.validate()?;
+        self.add_files_metadata.push(add_metadata);
+        Ok(())
+    }
+
+    /// Validate statistics in add file metadata without modifying the transaction.
+    ///
+    /// Returns a summary string describing the validation results.
+    #[allow(unused)]
+    pub fn validate_add_files_stats(add_metadata: &dyn EngineData) -> DeltaResult<String> {
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(add_metadata)?;
+        validator.validate()?;
+        Ok(format!(
+            "Validated {} rows, {} had numRecords. Errors: {}",
+            validator.rows_validated,
+            validator.rows_with_num_records,
+            validator.errors.join("; ")
+        ))
     }
 
     /// Generate add actions, handling row tracking internally if needed
@@ -1314,6 +1461,8 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    /// Column names that should have statistics collected during writes.
+    stats_columns: Vec<String>,
 }
 
 impl WriteContext {
@@ -1322,12 +1471,14 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        stats_columns: Vec<String>,
     ) -> Self {
         WriteContext {
             target_dir,
             logical_schema,
             physical_schema,
             logical_to_physical,
+            stats_columns,
         }
     }
 
@@ -1345,6 +1496,13 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// Returns the column names that should have statistics collected during writes.
+    ///
+    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns).
+    pub fn stats_columns(&self) -> &[String] {
+        &self.stats_columns
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.

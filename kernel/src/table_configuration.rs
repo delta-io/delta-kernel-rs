@@ -13,7 +13,8 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::actions::{Metadata, Protocol};
-use crate::scan::data_skipping::stats_schema::expected_stats_schema;
+use crate::expressions::ColumnName;
+use crate::scan::data_skipping::stats_schema::{expected_stats_schema, stats_column_names};
 use crate::schema::variant_utils::validate_variant_type_feature_support;
 use crate::schema::{InvariantChecker, SchemaRef, StructType};
 use crate::table_features::{
@@ -181,21 +182,38 @@ impl TableConfiguration {
     #[allow(unused)]
     #[internal_api]
     pub(crate) fn expected_stats_schema(&self) -> DeltaResult<SchemaRef> {
-        let partition_columns = self.metadata().partition_columns();
-        let column_mapping_mode = self.column_mapping_mode();
-        // Partition columns are excluded because statistics are only collected for data columns
-        // that are physically stored in the parquet files. Partition values are stored in the
-        // file path, not in the file content, so they don't have file-level statistics.
-        let physical_schema = StructType::try_new(
-            self.schema()
-                .fields()
-                .filter(|field| !partition_columns.contains(field.name()))
-                .map(|field| field.make_physical(column_mapping_mode)),
-        )?;
+        let physical_schema = self.physical_data_schema();
         Ok(Arc::new(expected_stats_schema(
             &physical_schema,
             self.table_properties(),
         )?))
+    }
+
+    /// Returns the list of column names that should have statistics collected.
+    ///
+    /// This returns the leaf column paths as a flat list of column names
+    /// (e.g., `["id", "nested.field"]`).
+    #[allow(unused)]
+    #[internal_api]
+    pub(crate) fn stats_column_names(&self) -> Vec<ColumnName> {
+        let physical_schema = self.physical_data_schema();
+        stats_column_names(&physical_schema, self.table_properties())
+    }
+
+    /// Returns the physical schema for data columns (excludes partition columns).
+    ///
+    /// Partition columns are excluded because statistics are only collected for data columns
+    /// that are physically stored in the parquet files. Partition values are stored in the
+    /// file path, not in the file content, so they don't have file-level statistics.
+    fn physical_data_schema(&self) -> StructType {
+        let partition_columns = self.metadata().partition_columns();
+        let column_mapping_mode = self.column_mapping_mode();
+        StructType::new_unchecked(
+            self.schema()
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name()))
+                .map(|field| field.make_physical(column_mapping_mode)),
+        )
     }
 
     /// The [`Metadata`] for this table at this version.
