@@ -253,17 +253,25 @@ impl LogReplayScanner {
             remove_dvs.retain(|rm_path, _| add_paths.contains(rm_path));
         }
 
+        // If ICT is enabled, then set the timestamp to be the ICT; otherwise, default to the last_modified timestamp value
+        let mut timestamp = commit_file.location.last_modified;
+        if table_configuration.is_feature_enabled(&TableFeature::InCommitTimestamp) {
+            if let Ok(in_commit_timestamp) = commit_file.read_in_commit_timestamp(engine) {
+                timestamp = in_commit_timestamp;
+            }
+        }
+
         info!(
             remove_dvs_size = remove_dvs.len(),
             has_cdc_action = has_cdc_action,
             file_path = %commit_file.location.as_url(),
             version = commit_file.version,
-            timestamp = commit_file.location.last_modified,
+            timestamp = timestamp,
             "Phase 1 of CDF query processing completed"
         );
 
         Ok(LogReplayScanner {
-            timestamp: commit_file.location.last_modified,
+            timestamp,
             commit_file,
             has_cdc_action,
             remove_dvs,
