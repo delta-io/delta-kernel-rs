@@ -112,6 +112,8 @@ use crate::{DeltaResult, Engine, EngineData, Error, EvaluationHandlerExtension, 
 
 use url::Url;
 
+mod stats_transform;
+
 #[cfg(test)]
 mod tests;
 
