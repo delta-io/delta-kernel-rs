@@ -26,6 +26,8 @@ use object_store::memory::InMemory;
 use object_store::{path::Path, ObjectStore};
 use serde_json::{json, to_vec};
 use std::sync::Mutex;
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::layer::SubscriberExt;
 use url::Url;
 
 /// unpack the test data from {test_parent_dir}/{test_name}.tar.zst into a temp dir, and return the
@@ -573,6 +575,7 @@ pub fn create_add_files_metadata(
     Ok(Box::new(ArrowEngineData::new(batch)))
 }
 
+// Writer that captures log output into a shared buffer for test assertions
 pub struct LogWriter(pub Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for LogWriter {
@@ -581,5 +584,27 @@ impl std::io::Write for LogWriter {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         self.0.lock().unwrap().flush()
+    }
+}
+
+// Test helper that sets up tracing to capture log output
+// The guard keeps the tracing subscriber active for the lifetime of the struct
+pub struct LoggingTest {
+    logs: Arc<Mutex<Vec<u8>>>,
+    _guard: DefaultGuard,
+}
+
+impl LoggingTest {
+    pub fn new() -> Self {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let logs_clone = logs.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer().with_writer(move || LogWriter(logs_clone.clone())),
+        ));
+        Self { logs, _guard }
+    }
+
+    pub fn logs(&self) -> String {
+        String::from_utf8(self.logs.lock().unwrap().clone()).unwrap()
     }
 }

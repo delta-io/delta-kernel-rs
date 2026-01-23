@@ -15,14 +15,12 @@ use crate::table_features::{ColumnMappingMode, TableFeature};
 use crate::utils::test_utils::{assert_result_error_with_message, Action, LocalMockTable};
 use crate::Predicate;
 use crate::{DeltaResult, Engine, Error, Version};
-use test_utils::LogWriter;
+use test_utils::LoggingTest;
 
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
-use tracing_subscriber::layer::SubscriberExt;
 
 fn get_schema() -> StructType {
     StructType::new_unchecked([
@@ -921,16 +919,7 @@ async fn file_meta_timestamp() {
 
 #[tokio::test]
 async fn print_table_configuration() {
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let logs_clone = logs.clone();
-
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(move || LogWriter(logs_clone.clone()))
-            .with_ansi(false),
-    );
-
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let tracing_guard = LoggingTest::new();
 
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
@@ -978,7 +967,7 @@ async fn print_table_configuration() {
             .unwrap()
             .try_collect();
 
-    let log_output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    let log_output = tracing_guard.logs();
 
     assert!(log_output.contains("Table configuration updated during CDF query"));
     assert!(log_output.contains("version=0"));
@@ -995,16 +984,7 @@ async fn print_table_configuration() {
 
 #[tokio::test]
 async fn print_table_info_post_phase1() {
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let logs_clone = logs.clone();
-
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(move || LogWriter(logs_clone.clone()))
-            .with_ansi(false),
-    );
-
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let tracing_guard = LoggingTest::new();
 
     let engine = Arc::new(SyncEngine::new());
     let mut mock_table = LocalMockTable::new();
@@ -1053,7 +1033,7 @@ async fn print_table_info_post_phase1() {
             .unwrap()
             .try_collect();
 
-    let log_output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    let log_output = tracing_guard.logs();
 
     assert!(log_output.contains("Phase 1 of CDF query processing completed"));
     assert!(log_output.contains("remove_dvs_size=0"));
