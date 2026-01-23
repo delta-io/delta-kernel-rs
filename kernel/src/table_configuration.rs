@@ -192,9 +192,11 @@ impl TableConfiguration {
                 .filter(|field| !partition_columns.contains(field.name()))
                 .map(|field| field.make_physical(column_mapping_mode)),
         )?;
+        // TODO: Pass clustering columns from domain metadata when available
         Ok(Arc::new(expected_stats_schema(
             &physical_schema,
             self.table_properties(),
+            None, // clustering_columns
         )?))
     }
 

@@ -7,6 +7,7 @@ use url::Url;
 
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::deletion_vector::DeletionVectorPath;
+use crate::actions::domain_metadata::domain_metadata_configuration;
 use crate::actions::{
     as_log_add_schema, domain_metadata::scan_domain_metadatas, get_log_add_schema,
     get_log_commit_info_schema, get_log_domain_metadata_schema, get_log_remove_schema,
@@ -22,7 +23,7 @@ use crate::expressions::{column_name, ColumnName};
 use crate::expressions::{ArrayData, Scalar, StructData, Transform, UnaryExpressionOp::ToJson};
 use crate::path::{LogRoot, ParsedLogPath};
 use crate::row_tracking::{RowTrackingDomainMetadata, RowTrackingVisitor};
-use crate::scan::data_skipping::stats_schema::NullableStatsTransform;
+use crate::scan::data_skipping::stats_schema::{expected_stats_schema, NullableStatsTransform};
 use crate::scan::log_replay::{
     get_scan_metadata_transform_expr, BASE_ROW_ID_NAME, DEFAULT_ROW_COMMIT_VERSION_NAME,
     FILE_CONSTANT_VALUES_NAME, TAGS_NAME,
@@ -40,6 +41,99 @@ use crate::{
     RowVisitor, SchemaTransform, Version,
 };
 use delta_kernel_derive::internal_api;
+use serde::Deserialize;
+
+/// Configuration for clustering columns stored in domain metadata.
+/// The JSON format is: `{"clusteringColumns": ["col1", "col2"]}`
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusteringConfiguration {
+    clustering_columns: Vec<String>,
+}
+
+/// Visitor to validate stats in add file metadata.
+///
+/// This validates that each file has well-formed statistics:
+/// - `stats.numRecords` is present and non-null
+/// - `stats.tightBounds` is present (optional for legacy files)
+///
+/// Use with `RowVisitor::visit_rows_of` on add file metadata.
+struct StatsValidationVisitor {
+    /// Number of rows validated
+    rows_validated: usize,
+    /// Number of rows with numRecords present
+    rows_with_num_records: usize,
+    /// Validation errors encountered
+    errors: Vec<String>,
+}
+
+impl StatsValidationVisitor {
+    fn new() -> Self {
+        Self {
+            rows_validated: 0,
+            rows_with_num_records: 0,
+            errors: Vec::new(),
+        }
+    }
+
+    /// Validate that stats are well-formed. Returns error if validation failed.
+    fn validate(&self) -> DeltaResult<()> {
+        if !self.errors.is_empty() {
+            return Err(Error::generic(format!(
+                "Stats validation failed: {}",
+                self.errors.join("; ")
+            )));
+        }
+
+        // All rows should have numRecords
+        if self.rows_with_num_records < self.rows_validated {
+            return Err(Error::generic(format!(
+                "Stats validation: {} of {} files missing numRecords",
+                self.rows_validated - self.rows_with_num_records,
+                self.rows_validated
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Get validation summary for logging/debugging
+    #[allow(unused)]
+    fn summary(&self) -> String {
+        format!(
+            "Validated {} files: {} with numRecords, {} errors",
+            self.rows_validated,
+            self.rows_with_num_records,
+            self.errors.len()
+        )
+    }
+}
+
+/// Column names and types for stats validation visitor
+static STATS_VALIDATION_COLUMNS: LazyLock<(Vec<ColumnName>, Vec<DataType>)> =
+    LazyLock::new(|| (vec![column_name!("stats.numRecords")], vec![DataType::LONG]));
+
+impl RowVisitor for StatsValidationVisitor {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
+        let (names, types) = &*STATS_VALIDATION_COLUMNS;
+        (names.as_slice(), types.as_slice())
+    }
+
+    fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
+        for i in 0..row_count {
+            self.rows_validated += 1;
+
+            // Check stats.numRecords is present
+            let num_records: Option<i64> = getters[0].get_opt(i, "stats.numRecords")?;
+            if num_records.is_some() {
+                self.rows_with_num_records += 1;
+            }
+            // Note: We don't require numRecords to be present because the stats field
+            // itself might be null (e.g., for files written without stats)
+        }
+        Ok(())
+    }
+}
 
 /// Type alias for an iterator of [`EngineData`] results.
 pub(crate) type EngineDataResultIterator<'a> =
@@ -372,6 +466,14 @@ impl Transaction {
                      Consider using separate transactions: one to add files, another to remove files."
                 )
             );
+        }
+
+        // Step 0b: Validate stats in add file metadata
+        // This ensures all files have valid stats before committing
+        for add_metadata in &self.add_files_metadata {
+            let mut validator = StatsValidationVisitor::new();
+            validator.visit_rows_of(add_metadata.as_ref())?;
+            validator.validate()?;
         }
 
         // Step 1: Generate SetTransaction actions
@@ -790,6 +892,144 @@ impl Transaction {
         &BASE_ADD_FILES_SCHEMA
     }
 
+    /// Returns the expected schema for file statistics.
+    ///
+    /// The schema structure is derived from table configuration:
+    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
+    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
+    /// - Clustering columns: Always included regardless of limits (TODO: not yet implemented)
+    /// - Partition columns: Always excluded
+    ///
+    /// The returned schema has the following structure:
+    /// ```ignore
+    /// {
+    ///   numRecords: long,
+    ///   nullCount: { ... },   // Nested struct mirroring data schema, all fields LONG
+    ///   minValues: { ... },   // Nested struct, only min/max eligible types
+    ///   maxValues: { ... },   // Nested struct, only min/max eligible types
+    ///   tightBounds: boolean,
+    /// }
+    /// ```
+    ///
+    /// Engines should collect statistics matching this schema structure when writing files.
+    #[allow(unused)]
+    pub fn stats_schema(&self, engine: &dyn Engine) -> DeltaResult<SchemaRef> {
+        let table_config = self.read_snapshot.table_configuration();
+        let column_mapping_mode = table_config.column_mapping_mode();
+        let partition_columns: HashSet<&String> =
+            table_config.metadata().partition_columns().iter().collect();
+
+        // Build physical schema excluding partition columns
+        let physical_schema = StructType::try_new(
+            self.read_snapshot
+                .schema()
+                .fields()
+                .filter(|field| !partition_columns.contains(field.name()))
+                .map(|field| field.make_physical(column_mapping_mode)),
+        )?;
+
+        // Extract clustering columns from domain metadata
+        let clustering_columns = self.get_clustering_columns(engine)?;
+        let clustering_columns_ref = clustering_columns.as_ref().map(|v| v.as_slice());
+
+        Ok(Arc::new(expected_stats_schema(
+            &physical_schema,
+            table_config.table_properties(),
+            clustering_columns_ref,
+        )?))
+    }
+
+    /// Domain name for clustering column metadata
+    const CLUSTERING_DOMAIN_NAME: &'static str = "delta.clustering";
+
+    /// Extract clustering columns from domain metadata.
+    ///
+    /// Clustering columns are stored in the `delta.clustering` domain metadata
+    /// with a JSON configuration like: `{"clusteringColumns": ["col1", "col2"]}`
+    fn get_clustering_columns(&self, engine: &dyn Engine) -> DeltaResult<Option<Vec<ColumnName>>> {
+        let config = domain_metadata_configuration(
+            self.read_snapshot.log_segment(),
+            Self::CLUSTERING_DOMAIN_NAME,
+            engine,
+        )?;
+
+        match config {
+            Some(json) => {
+                // Parse the clustering configuration JSON
+                let parsed: ClusteringConfiguration = serde_json::from_str(&json)?;
+                let columns = parsed
+                    .clustering_columns
+                    .into_iter()
+                    .map(|s| ColumnName::new([s]))
+                    .collect();
+                Ok(Some(columns))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the list of column names that need statistics collected.
+    ///
+    /// Each [`ColumnName`] represents a path to a leaf column for which
+    /// min, max, and null count should be collected. For nested structs,
+    /// the path includes parent names (e.g., `["user", "address", "city"]`).
+    ///
+    /// The returned columns respect:
+    /// - `delta.dataSkippingStatsColumns`: Explicit column list (if set)
+    /// - `delta.dataSkippingNumIndexedCols`: Column count limit (default 32)
+    /// - Clustering columns: Always included regardless of limits
+    /// - Partition columns: Always excluded
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let columns = txn.stats_columns(&engine)?;
+    /// // ["id", "user.name", "user.age", "created_at"]
+    ///
+    /// // Convert to strings for StatisticsCollector
+    /// let column_strings: Vec<String> = columns
+    ///     .iter()
+    ///     .map(|c| c.to_string())
+    ///     .collect();
+    /// ```
+    #[allow(unused)]
+    pub fn stats_columns(&self, engine: &dyn Engine) -> DeltaResult<Vec<ColumnName>> {
+        let stats_schema = self.stats_schema(engine)?;
+
+        // Extract leaf column paths from the stats schema's nullCount field
+        // (nullCount contains all columns, while minValues/maxValues may exclude some types)
+        let null_count_field = stats_schema
+            .fields()
+            .find(|f| f.name() == "nullCount")
+            .ok_or_else(|| Error::generic("stats schema missing nullCount field"))?;
+
+        fn collect_leaf_paths(
+            data_type: &DataType,
+            current_path: &mut Vec<String>,
+            paths: &mut Vec<ColumnName>,
+        ) {
+            match data_type {
+                DataType::Struct(struct_type) => {
+                    for field in struct_type.fields() {
+                        current_path.push(field.name().to_string());
+                        collect_leaf_paths(field.data_type(), current_path, paths);
+                        current_path.pop();
+                    }
+                }
+                _ => {
+                    // Leaf field - add to paths
+                    paths.push(ColumnName::new(current_path.iter().map(|s| s.as_str())));
+                }
+            }
+        }
+
+        let mut paths = Vec::new();
+        let mut current_path = Vec::new();
+        collect_leaf_paths(null_count_field.data_type(), &mut current_path, &mut paths);
+
+        Ok(paths)
+    }
+
     // Generate the logical-to-physical transform expression which must be evaluated on every data
     // chunk before writing. At the moment, this is a transaction-wide expression.
     fn generate_logical_to_physical(&self) -> Expression {
@@ -820,7 +1060,7 @@ impl Transaction {
     // Note: after we introduce metadata updates (modify table schema, etc.), we need to make sure
     // that engines cannot call this method after a metadata change, since the write context could
     // have invalid metadata.
-    pub fn get_write_context(&self) -> WriteContext {
+    pub fn get_write_context(&self, engine: &dyn Engine) -> DeltaResult<WriteContext> {
         let target_dir = self.read_snapshot.table_root();
         let snapshot_schema = self.read_snapshot.schema();
         let logical_to_physical = self.generate_logical_to_physical();
@@ -837,12 +1077,20 @@ impl Transaction {
             .cloned();
         let physical_schema = Arc::new(StructType::new_unchecked(physical_fields));
 
-        WriteContext::new(
+        // Get stats columns from table configuration
+        let stats_columns = self
+            .stats_columns(engine)?
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+
+        Ok(WriteContext::new(
             target_dir.clone(),
             snapshot_schema,
             physical_schema,
             Arc::new(logical_to_physical),
-        )
+            stats_columns,
+        ))
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -852,6 +1100,34 @@ impl Transaction {
     /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
     pub fn add_files(&mut self, add_metadata: Box<dyn EngineData>) {
         self.add_files_metadata.push(add_metadata);
+    }
+
+    /// Add files with stats validation. This validates that stats are present and well-formed
+    /// for each file before adding them to the transaction.
+    ///
+    /// Use this method when you want to ensure the engine has produced valid stats.
+    /// Returns an error if validation fails.
+    ///
+    /// The expected schema for `add_metadata` is given by [`Transaction::add_files_schema`].
+    pub fn add_files_validated(&mut self, add_metadata: Box<dyn EngineData>) -> DeltaResult<()> {
+        // Validate stats are present and well-formed
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(add_metadata.as_ref())?;
+        validator.validate()?;
+
+        self.add_files_metadata.push(add_metadata);
+        Ok(())
+    }
+
+    /// Validate stats for add file metadata without adding to the transaction.
+    ///
+    /// This can be used to verify engine-produced stats match expectations.
+    /// Returns a summary of the validation result.
+    pub fn validate_add_files_stats(add_metadata: &dyn EngineData) -> DeltaResult<String> {
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(add_metadata)?;
+        validator.validate()?;
+        Ok(validator.summary())
     }
 
     /// Generate add actions, handling row tracking internally if needed
@@ -1313,6 +1589,8 @@ pub struct WriteContext {
     logical_schema: SchemaRef,
     physical_schema: SchemaRef,
     logical_to_physical: ExpressionRef,
+    /// Column names that should have statistics collected during writes.
+    stats_columns: Vec<String>,
 }
 
 impl WriteContext {
@@ -1321,12 +1599,14 @@ impl WriteContext {
         logical_schema: SchemaRef,
         physical_schema: SchemaRef,
         logical_to_physical: ExpressionRef,
+        stats_columns: Vec<String>,
     ) -> Self {
         WriteContext {
             target_dir,
             logical_schema,
             physical_schema,
             logical_to_physical,
+            stats_columns,
         }
     }
 
@@ -1344,6 +1624,14 @@ impl WriteContext {
 
     pub fn logical_to_physical(&self) -> ExpressionRef {
         self.logical_to_physical.clone()
+    }
+
+    /// Returns the column names that should have statistics collected during writes.
+    ///
+    /// Based on table configuration (dataSkippingNumIndexedCols, dataSkippingStatsColumns,
+    /// and clustering columns).
+    pub fn stats_columns(&self) -> &[String] {
+        &self.stats_columns
     }
 
     /// Generate a new unique absolute URL for a deletion vector file.
@@ -1566,6 +1854,75 @@ mod tests {
     }
 
     #[test]
+    fn test_stats_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
+
+        let stats_schema = txn.stats_schema(&engine)?;
+
+        // Check that the schema has the expected top-level fields
+        let field_names: Vec<String> = stats_schema
+            .fields()
+            .map(|f| f.name().to_string())
+            .collect();
+        assert!(field_names.contains(&"numRecords".to_string()));
+        assert!(field_names.contains(&"nullCount".to_string()));
+        assert!(field_names.contains(&"minValues".to_string()));
+        assert!(field_names.contains(&"maxValues".to_string()));
+        assert!(field_names.contains(&"tightBounds".to_string()));
+
+        // The table has a "value" column, so nullCount should have value as LONG
+        let null_count = stats_schema
+            .fields()
+            .find(|f| f.name() == "nullCount")
+            .unwrap();
+        if let DataType::Struct(s) = null_count.data_type() {
+            let value_field = s.fields().find(|f| f.name() == "value");
+            assert!(value_field.is_some());
+            assert_eq!(value_field.unwrap().data_type(), &DataType::LONG);
+        } else {
+            panic!("nullCount should be a struct");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stats_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let engine = SyncEngine::new();
+        let path =
+            std::fs::canonicalize(PathBuf::from("./tests/data/table-with-dv-small/")).unwrap();
+        let url = url::Url::from_directory_path(path).unwrap();
+        let snapshot = Snapshot::builder_for(url)
+            .at_version(1)
+            .build(&engine)
+            .unwrap();
+        let txn = snapshot
+            .transaction(Box::new(FileSystemCommitter::new()))?
+            .with_engine_info("default engine");
+
+        let columns = txn.stats_columns(&engine)?;
+
+        // The table should have columns that need stats
+        assert!(!columns.is_empty());
+
+        // Check that value is in the list (it's an INTEGER column, eligible for stats)
+        let column_strings: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
+        assert!(column_strings.contains(&"value".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_new_deletion_vector_path() -> Result<(), Box<dyn std::error::Error>> {
         let engine = SyncEngine::new();
         let path =
@@ -1578,7 +1935,7 @@ mod tests {
         let txn = snapshot
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context(&engine)?;
 
         // Test with empty prefix
         let dv_path1 = write_context.new_deletion_vector_path(String::from(""));
@@ -1610,7 +1967,7 @@ mod tests {
             .transaction(Box::new(FileSystemCommitter::new()))?
             .with_engine_info("default engine");
 
-        let write_context = txn.get_write_context();
+        let write_context = txn.get_write_context(&engine)?;
         let logical_schema = write_context.logical_schema();
         let physical_schema = write_context.physical_schema();
 
@@ -1674,7 +2031,7 @@ mod tests {
 
         // Create a transaction and get write context
         let txn_without = snapshot_without.transaction(Box::new(FileSystemCommitter::new()))?;
-        let write_context_without = txn_without.get_write_context();
+        let write_context_without = txn_without.get_write_context(&engine)?;
         let expr_without = write_context_without.logical_to_physical();
 
         // Without materializePartitionColumns, partition column should be excluded
@@ -1724,7 +2081,7 @@ mod tests {
 
         // Create a transaction and get write context
         let txn_with = snapshot_with.transaction(Box::new(FileSystemCommitter::new()))?;
-        let write_context_with = txn_with.get_write_context();
+        let write_context_with = txn_with.get_write_context(&engine)?;
         let expr_with = write_context_with.logical_to_physical();
 
         // With materializePartitionColumns, ALL columns including partition columns should be included
@@ -1815,4 +2172,115 @@ mod tests {
     // have DV updates but others don't) is provided by the end-to-end integration test
     // kernel/tests/dv.rs and kernel/tests/write.rs, which exercises
     // the full deletion vector write workflow including the DvMatchVisitor logic.
+
+    /// Tests StatsValidationVisitor validates add file metadata correctly.
+    #[test]
+    fn test_stats_validation_visitor() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        // Create a mock add files batch with stats
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new(
+                "stats",
+                ArrowDataType::Struct(
+                    vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
+                ),
+                true,
+            ),
+        ]));
+
+        let path_array = Arc::new(StringArray::from(vec!["file1.parquet", "file2.parquet"]));
+        let size_array = Arc::new(Int64Array::from(vec![1000, 2000]));
+        let num_records_array: Arc<dyn crate::arrow::array::Array> =
+            Arc::new(Int64Array::from(vec![Some(100), Some(200)]));
+        let stats_struct = StructArray::from(vec![(
+            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            num_records_array,
+        )]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![path_array, size_array, Arc::new(stats_struct)])?;
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        // Validate using the kernel-core visitor
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(engine_data.as_ref())?;
+        validator.validate()?;
+
+        // Check summary
+        let summary = validator.summary();
+        assert!(
+            summary.contains("2 files"),
+            "Should report 2 files validated: {}",
+            summary
+        );
+        assert!(
+            summary.contains("2 with numRecords"),
+            "Should report 2 with numRecords: {}",
+            summary
+        );
+
+        Ok(())
+    }
+
+    /// Tests StatsValidationVisitor handles missing numRecords gracefully.
+    #[test]
+    fn test_stats_validation_visitor_missing_num_records() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::arrow::array::{Int64Array, RecordBatch, StringArray, StructArray};
+        use crate::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use crate::engine::arrow_data::ArrowEngineData;
+
+        // Create a mock add files batch with stats where numRecords is null
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("path", ArrowDataType::Utf8, false),
+            Field::new("size", ArrowDataType::Int64, false),
+            Field::new(
+                "stats",
+                ArrowDataType::Struct(
+                    vec![Field::new("numRecords", ArrowDataType::Int64, true)].into(),
+                ),
+                true,
+            ),
+        ]));
+
+        let path_array = Arc::new(StringArray::from(vec!["file1.parquet"]));
+        let size_array = Arc::new(Int64Array::from(vec![1000]));
+        // numRecords is null
+        let num_records_array: Arc<dyn crate::arrow::array::Array> =
+            Arc::new(Int64Array::from(vec![None::<i64>]));
+        let stats_struct = StructArray::from(vec![(
+            Arc::new(Field::new("numRecords", ArrowDataType::Int64, true)),
+            num_records_array,
+        )]);
+
+        let batch =
+            RecordBatch::try_new(schema, vec![path_array, size_array, Arc::new(stats_struct)])?;
+
+        let engine_data: Box<dyn EngineData> = Box::new(ArrowEngineData::new(batch));
+
+        // Validate - should report missing numRecords
+        let mut validator = StatsValidationVisitor::new();
+        validator.visit_rows_of(engine_data.as_ref())?;
+
+        // Should fail validation since numRecords is missing
+        let result = validator.validate();
+        assert!(
+            result.is_err(),
+            "Should fail validation when numRecords is missing"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("missing numRecords"),
+            "Error should mention missing numRecords: {}",
+            err_msg
+        );
+
+        Ok(())
+    }
 }

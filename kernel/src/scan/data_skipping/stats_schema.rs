@@ -93,10 +93,19 @@ use crate::{
 ///   tightBounds: boolean,
 /// }
 /// ```
+/// Generates the expected schema for file statistics.
+///
+/// # Arguments
+///
+/// * `physical_file_schema` - The physical schema of the data files (no partition columns)
+/// * `table_properties` - Table properties containing stats configuration
+/// * `clustering_columns` - Optional list of clustering columns that must always be included
+///   in statistics regardless of `dataSkippingNumIndexedCols` limits
 #[allow(unused)]
 pub(crate) fn expected_stats_schema(
     physical_file_schema: &Schema,
     table_properties: &TableProperties,
+    clustering_columns: Option<&[ColumnName]>,
 ) -> DeltaResult<Schema> {
     let mut fields = Vec::with_capacity(5);
     fields.push(StructField::nullable("numRecords", DataType::LONG));
@@ -104,7 +113,8 @@ pub(crate) fn expected_stats_schema(
     // generate the base stats schema:
     // - make all fields nullable
     // - include fields according to table properties (num_indexed_cols, stats_columns, ...)
-    let mut base_transform = BaseStatsTransform::new(table_properties);
+    // - always include clustering columns (they don't count against the column limit)
+    let mut base_transform = BaseStatsTransform::new(table_properties, clustering_columns);
     if let Some(base_schema) = base_transform.transform_struct(physical_file_schema) {
         let base_schema = base_schema.into_owned();
 
@@ -184,19 +194,22 @@ impl<'a> SchemaTransform<'a> for NullCountStatsTransform {
 ///   to be used for data skipping statistics. (takes precedence)
 /// * `dataSkippingNumIndexedCols` - used to specify the number of columns
 ///   to be used for data skipping statistics. Defaults to 32.
+/// * Clustering columns are always included regardless of the above limits.
 ///
 /// All fields are nullable.
 #[allow(unused)]
-struct BaseStatsTransform {
+struct BaseStatsTransform<'a> {
     n_columns: Option<DataSkippingNumIndexedCols>,
     added_columns: u64,
     column_names: Option<Vec<ColumnName>>,
+    /// Clustering columns that must always be included (don't count against limit)
+    clustering_columns: Option<&'a [ColumnName]>,
     path: Vec<String>,
 }
 
-impl BaseStatsTransform {
+impl<'a> BaseStatsTransform<'a> {
     #[allow(unused)]
-    fn new(props: &TableProperties) -> Self {
+    fn new(props: &TableProperties, clustering_columns: Option<&'a [ColumnName]>) -> Self {
         // If data_skipping_stats_columns is specified, it takes precedence
         // over data_skipping_num_indexed_cols, even if that is also specified.
         if let Some(column_names) = &props.data_skipping_stats_columns {
@@ -204,6 +217,7 @@ impl BaseStatsTransform {
                 n_columns: None,
                 added_columns: 0,
                 column_names: Some(column_names.clone()),
+                clustering_columns,
                 path: Vec::new(),
             }
         } else {
@@ -214,44 +228,67 @@ impl BaseStatsTransform {
                 n_columns: Some(n_cols),
                 added_columns: 0,
                 column_names: None,
+                clustering_columns,
                 path: Vec::new(),
             }
         }
     }
+
+    /// Checks if the current path matches a clustering column.
+    /// Clustering columns are always included regardless of column limits.
+    fn is_clustering_column(&self) -> bool {
+        self.clustering_columns
+            .map(|cols| {
+                let current = ColumnName::new(&self.path);
+                cols.iter().any(|c| c == &current)
+            })
+            .unwrap_or(false)
+    }
 }
 
-impl<'a> SchemaTransform<'a> for BaseStatsTransform {
+impl<'a, 'b> SchemaTransform<'a> for BaseStatsTransform<'b> {
     fn transform_struct_field(&mut self, field: &'a StructField) -> Option<Cow<'a, StructField>> {
         use Cow::*;
-
-        // Check if the number of columns is set and if the added columns exceed the limit
-        // In the constructor we assert this will always be None if column_names are specified
-        if let Some(DataSkippingNumIndexedCols::NumColumns(n_cols)) = self.n_columns {
-            if self.added_columns >= n_cols {
-                return None;
-            }
-        }
 
         self.path.push(field.name.clone());
         let data_type = field.data_type();
 
+        // Clustering columns are always included, regardless of limits
+        let is_clustering = self.is_clustering_column();
+
+        // Check if the number of columns is set and if the added columns exceed the limit
+        // Clustering columns bypass this limit
+        if !is_clustering {
+            if let Some(DataSkippingNumIndexedCols::NumColumns(n_cols)) = self.n_columns {
+                if self.added_columns >= n_cols {
+                    self.path.pop();
+                    return None;
+                }
+            }
+        }
+
         // We always traverse struct fields (they don't count against the column limit),
         // but we only include leaf fields if they qualify based on column_names config.
         // When column_names is None, all leaf fields are included (up to n_columns limit).
+        // Clustering columns are always included regardless of column_names config.
         if !matches!(data_type, DataType::Struct(_)) {
-            let should_include = self
-                .column_names
-                .as_ref()
-                .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
-                .unwrap_or(true);
+            let should_include = is_clustering
+                || self
+                    .column_names
+                    .as_ref()
+                    .map(|ns| should_include_column(&ColumnName::new(&self.path), ns))
+                    .unwrap_or(true);
 
             if !should_include {
                 self.path.pop();
                 return None;
             }
 
-            // Increment count only for leaf columns
-            self.added_columns += 1;
+            // Increment count only for non-clustering leaf columns
+            // Clustering columns don't count against the limit
+            if !is_clustering {
+                self.added_columns += 1;
+            }
         }
 
         let field = match self.transform(&field.data_type)? {
@@ -363,7 +400,7 @@ mod tests {
         let properties: TableProperties = [("key", "value")].into();
         let file_schema = StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
         let expected = StructType::new_unchecked([
             StructField::nullable("numRecords", DataType::LONG),
             StructField::nullable("nullCount", file_schema.clone()),
@@ -387,7 +424,7 @@ mod tests {
             StructField::not_null("id", DataType::LONG),
             StructField::not_null("user", DataType::Struct(Box::new(user_struct.clone()))),
         ]);
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // Expected result: The stats schema should maintain the nested structure
         // but make all fields nullable
@@ -437,7 +474,7 @@ mod tests {
             ),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         let expected_null_nested = StructType::new_unchecked([
             StructField::nullable("name", DataType::LONG),
@@ -486,7 +523,7 @@ mod tests {
             StructField::nullable("user.info", DataType::Struct(Box::new(user_struct.clone()))),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         let expected_nested =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
@@ -523,7 +560,7 @@ mod tests {
             StructField::nullable("age", DataType::INTEGER),
         ]);
 
-        let stats_schema = expected_stats_schema(&logical_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&logical_schema, &properties, None).unwrap();
 
         let expected_fields =
             StructType::new_unchecked([StructField::nullable("name", DataType::STRING)]);
@@ -557,7 +594,7 @@ mod tests {
             StructField::nullable("metadata", DataType::BINARY),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // Expected nullCount schema: all fields converted to LONG
         let expected_null_count = StructType::new_unchecked([
@@ -599,7 +636,7 @@ mod tests {
             StructField::nullable("is_deleted", DataType::BOOLEAN), // NOT eligible for min/max
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // Expected nullCount schema: all fields converted to LONG, maintaining structure
         let expected_null_user = StructType::new_unchecked([
@@ -649,7 +686,7 @@ mod tests {
             ),
         ]);
 
-        let stats_schema = expected_stats_schema(&file_schema, &properties).unwrap();
+        let stats_schema = expected_stats_schema(&file_schema, &properties, None).unwrap();
 
         // Expected nullCount schema: all fields converted to LONG
         let expected_null_count = StructType::new_unchecked([
@@ -667,6 +704,105 @@ mod tests {
             StructField::nullable("tightBounds", DataType::BOOLEAN),
         ]);
 
+        assert_eq!(&expected, &stats_schema);
+    }
+
+    #[test]
+    fn test_stats_schema_clustering_columns_bypass_limit() {
+        // Set limit to 1 column, but clustering columns should still be included
+        let properties: TableProperties = [(
+            "delta.dataSkippingNumIndexedCols".to_string(),
+            "1".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("cluster_col", DataType::INTEGER),
+        ]);
+
+        // Without clustering columns: only first column (id) should be included
+        let stats_schema_no_cluster =
+            expected_stats_schema(&file_schema, &properties, None).unwrap();
+
+        let expected_no_cluster =
+            StructType::new_unchecked([StructField::nullable("id", DataType::LONG)]);
+        let null_count_no_cluster = NullCountStatsTransform
+            .transform_struct(&expected_no_cluster)
+            .unwrap()
+            .into_owned();
+
+        let expected_no_cluster = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", null_count_no_cluster),
+            StructField::nullable("minValues", expected_no_cluster.clone()),
+            StructField::nullable("maxValues", expected_no_cluster),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+        assert_eq!(&expected_no_cluster, &stats_schema_no_cluster);
+
+        // With clustering columns: id (from limit) + cluster_col (clustering) should be included
+        let clustering_cols = vec![ColumnName::new(["cluster_col"])];
+        let stats_schema_with_cluster =
+            expected_stats_schema(&file_schema, &properties, Some(&clustering_cols)).unwrap();
+
+        let expected_with_cluster = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("cluster_col", DataType::INTEGER),
+        ]);
+        let null_count_with_cluster = NullCountStatsTransform
+            .transform_struct(&expected_with_cluster)
+            .unwrap()
+            .into_owned();
+
+        let expected_with_cluster = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", null_count_with_cluster),
+            StructField::nullable("minValues", expected_with_cluster.clone()),
+            StructField::nullable("maxValues", expected_with_cluster),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
+        assert_eq!(&expected_with_cluster, &stats_schema_with_cluster);
+    }
+
+    #[test]
+    fn test_stats_schema_clustering_columns_with_stats_columns() {
+        // When dataSkippingStatsColumns is set, clustering columns should still be included
+        let properties: TableProperties = [(
+            "delta.dataSkippingStatsColumns".to_string(),
+            "id".to_string(),
+        )]
+        .into();
+
+        let file_schema = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("name", DataType::STRING),
+            StructField::nullable("cluster_col", DataType::INTEGER),
+        ]);
+
+        // With dataSkippingStatsColumns=id and clustering_columns=[cluster_col],
+        // both should be included
+        let clustering_cols = vec![ColumnName::new(["cluster_col"])];
+        let stats_schema =
+            expected_stats_schema(&file_schema, &properties, Some(&clustering_cols)).unwrap();
+
+        let expected_fields = StructType::new_unchecked([
+            StructField::nullable("id", DataType::LONG),
+            StructField::nullable("cluster_col", DataType::INTEGER),
+        ]);
+        let null_count = NullCountStatsTransform
+            .transform_struct(&expected_fields)
+            .unwrap()
+            .into_owned();
+
+        let expected = StructType::new_unchecked([
+            StructField::nullable("numRecords", DataType::LONG),
+            StructField::nullable("nullCount", null_count),
+            StructField::nullable("minValues", expected_fields.clone()),
+            StructField::nullable("maxValues", expected_fields),
+            StructField::nullable("tightBounds", DataType::BOOLEAN),
+        ]);
         assert_eq!(&expected, &stats_schema);
     }
 }
