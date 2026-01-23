@@ -6,9 +6,19 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StructArray};
-use crate::arrow::datatypes::{DataType, Field, Fields};
+use crate::arrow::array::{
+    new_null_array, Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray,
+    RecordBatch, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
+};
+use crate::arrow::compute::{max, min};
+use crate::arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use crate::{DeltaResult, Error};
+
+/// Maximum prefix length for string statistics (Delta protocol requirement).
+const STRING_PREFIX_LENGTH: usize = 32;
 
 /// Collects statistics from RecordBatches for Delta Lake file statistics.
 /// Supports streaming accumulation across multiple batches.
@@ -19,8 +29,12 @@ pub(crate) struct StatisticsCollector {
     column_names: Vec<String>,
     /// Column names that should have stats collected.
     stats_columns: HashSet<String>,
-    /// Null counts per column. For structs, this is a StructArray with nested Int64Arrays.
+    /// Null counts per column.
     null_counts: Vec<ArrayRef>,
+    /// Min values per column (single-element arrays).
+    min_values: Vec<ArrayRef>,
+    /// Max values per column (single-element arrays).
+    max_values: Vec<ArrayRef>,
 }
 
 impl StatisticsCollector {
@@ -37,10 +51,15 @@ impl StatisticsCollector {
 
         let mut column_names = Vec::with_capacity(data_schema.fields().len());
         let mut null_counts = Vec::with_capacity(data_schema.fields().len());
+        let mut min_values = Vec::with_capacity(data_schema.fields().len());
+        let mut max_values = Vec::with_capacity(data_schema.fields().len());
 
         for field in data_schema.fields() {
             column_names.push(field.name().clone());
             null_counts.push(Self::create_zero_null_count(field.data_type()));
+            let null_array = Self::create_null_array(field.data_type());
+            min_values.push(null_array.clone());
+            max_values.push(null_array);
         }
 
         Self {
@@ -48,6 +67,8 @@ impl StatisticsCollector {
             column_names,
             stats_columns: stats_set,
             null_counts,
+            min_values,
+            max_values,
         }
     }
 
@@ -152,17 +173,326 @@ impl StatisticsCollector {
         }
     }
 
+    /// Create a null array of the given type with length 1.
+    fn create_null_array(data_type: &DataType) -> ArrayRef {
+        new_null_array(data_type, 1)
+    }
+
+    /// Truncate a string to the max prefix length for stats.
+    fn truncate_string(s: &str) -> String {
+        s.chars().take(STRING_PREFIX_LENGTH).collect()
+    }
+
+    /// Compute min/max for a column, returning (min, max) as single-element arrays.
+    fn compute_min_max(column: &ArrayRef) -> (ArrayRef, ArrayRef) {
+        macro_rules! compute_minmax_primitive {
+            ($array_type:ty, $column:expr) => {{
+                let array = $column.as_any().downcast_ref::<$array_type>().unwrap();
+                let min_val = min(array);
+                let max_val = max(array);
+                (
+                    Arc::new(<$array_type>::from(vec![min_val])) as ArrayRef,
+                    Arc::new(<$array_type>::from(vec![max_val])) as ArrayRef,
+                )
+            }};
+        }
+
+        macro_rules! compute_minmax_float {
+            ($array_type:ty, $column:expr) => {{
+                let array = $column.as_any().downcast_ref::<$array_type>().unwrap();
+                // Use arrow's min/max which handle NaN correctly
+                let min_val = min(array);
+                let max_val = max(array);
+                (
+                    Arc::new(<$array_type>::from(vec![min_val])) as ArrayRef,
+                    Arc::new(<$array_type>::from(vec![max_val])) as ArrayRef,
+                )
+            }};
+        }
+
+        match column.data_type() {
+            DataType::Int8 => compute_minmax_primitive!(Int8Array, column),
+            DataType::Int16 => compute_minmax_primitive!(Int16Array, column),
+            DataType::Int32 => compute_minmax_primitive!(Int32Array, column),
+            DataType::Int64 => compute_minmax_primitive!(Int64Array, column),
+            DataType::UInt8 => compute_minmax_primitive!(UInt8Array, column),
+            DataType::UInt16 => compute_minmax_primitive!(UInt16Array, column),
+            DataType::UInt32 => compute_minmax_primitive!(UInt32Array, column),
+            DataType::UInt64 => compute_minmax_primitive!(UInt64Array, column),
+            DataType::Float32 => compute_minmax_float!(Float32Array, column),
+            DataType::Float64 => compute_minmax_float!(Float64Array, column),
+            DataType::Date32 => compute_minmax_primitive!(Date32Array, column),
+            DataType::Date64 => compute_minmax_primitive!(Date64Array, column),
+            DataType::Timestamp(TimeUnit::Second, tz) => {
+                let array = column
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .unwrap();
+                let min_val = min(array);
+                let max_val = max(array);
+                (
+                    Arc::new(
+                        TimestampSecondArray::from(vec![min_val]).with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                    Arc::new(
+                        TimestampSecondArray::from(vec![max_val]).with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                )
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+                let array = column
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap();
+                let min_val = min(array);
+                let max_val = max(array);
+                (
+                    Arc::new(
+                        TimestampMillisecondArray::from(vec![min_val])
+                            .with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                    Arc::new(
+                        TimestampMillisecondArray::from(vec![max_val])
+                            .with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                )
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                let array = column
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                let min_val = min(array);
+                let max_val = max(array);
+                (
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![min_val])
+                            .with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![max_val])
+                            .with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                )
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                let array = column
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap();
+                let min_val = min(array);
+                let max_val = max(array);
+                (
+                    Arc::new(
+                        TimestampNanosecondArray::from(vec![min_val]).with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                    Arc::new(
+                        TimestampNanosecondArray::from(vec![max_val]).with_timezone_opt(tz.clone()),
+                    ) as ArrayRef,
+                )
+            }
+            DataType::Decimal128(p, s) => {
+                let array = column.as_any().downcast_ref::<Decimal128Array>().unwrap();
+                let min_val = min(array);
+                let max_val = max(array);
+                (
+                    Arc::new(
+                        Decimal128Array::from(vec![min_val])
+                            .with_precision_and_scale(*p, *s)
+                            .unwrap(),
+                    ) as ArrayRef,
+                    Arc::new(
+                        Decimal128Array::from(vec![max_val])
+                            .with_precision_and_scale(*p, *s)
+                            .unwrap(),
+                    ) as ArrayRef,
+                )
+            }
+            DataType::Utf8 => {
+                let array = column.as_any().downcast_ref::<StringArray>().unwrap();
+                let min_val =
+                    crate::arrow::compute::min_string(array).map(|s| Self::truncate_string(s));
+                let max_val =
+                    crate::arrow::compute::max_string(array).map(|s| Self::truncate_string(s));
+                (
+                    Arc::new(StringArray::from(vec![min_val])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::LargeUtf8 => {
+                let array = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                let min_val =
+                    crate::arrow::compute::min_string(array).map(|s| Self::truncate_string(s));
+                let max_val =
+                    crate::arrow::compute::max_string(array).map(|s| Self::truncate_string(s));
+                (
+                    Arc::new(LargeStringArray::from(vec![min_val])) as ArrayRef,
+                    Arc::new(LargeStringArray::from(vec![max_val])) as ArrayRef,
+                )
+            }
+            DataType::Utf8View => {
+                let array = column.as_any().downcast_ref::<StringViewArray>().unwrap();
+                // For StringViewArray, iterate manually to find min/max
+                let mut min_val: Option<String> = None;
+                let mut max_val: Option<String> = None;
+                for i in 0..array.len() {
+                    if !array.is_null(i) {
+                        let val = array.value(i);
+                        min_val = Some(match min_val {
+                            Some(m) if m.as_str() <= val => m,
+                            _ => val.to_string(),
+                        });
+                        max_val = Some(match max_val {
+                            Some(m) if m.as_str() >= val => m,
+                            _ => val.to_string(),
+                        });
+                    }
+                }
+                (
+                    Arc::new(StringViewArray::from(vec![
+                        min_val.map(|s| Self::truncate_string(&s))
+                    ])) as ArrayRef,
+                    Arc::new(StringViewArray::from(vec![
+                        max_val.map(|s| Self::truncate_string(&s))
+                    ])) as ArrayRef,
+                )
+            }
+            // Types without meaningful min/max stats
+            _ => {
+                let null = Self::create_null_array(column.data_type());
+                (null.clone(), null)
+            }
+        }
+    }
+
+    /// Merge min values, keeping the smaller one.
+    fn merge_min(existing: &ArrayRef, new: &ArrayRef) -> ArrayRef {
+        if existing.is_null(0) {
+            return new.clone();
+        }
+        if new.is_null(0) {
+            return existing.clone();
+        }
+        let (new_min, _) = Self::compute_min_max(new);
+        let (existing_min, _) = Self::compute_min_max(existing);
+        // Compare and return the smaller
+        Self::compare_and_select(&existing_min, &new_min, true)
+    }
+
+    /// Merge max values, keeping the larger one.
+    fn merge_max(existing: &ArrayRef, new: &ArrayRef) -> ArrayRef {
+        if existing.is_null(0) {
+            return new.clone();
+        }
+        if new.is_null(0) {
+            return existing.clone();
+        }
+        let (_, new_max) = Self::compute_min_max(new);
+        let (_, existing_max) = Self::compute_min_max(existing);
+        // Compare and return the larger
+        Self::compare_and_select(&existing_max, &new_max, false)
+    }
+
+    /// Compare two single-element arrays and return the min (if is_min) or max.
+    fn compare_and_select(a: &ArrayRef, b: &ArrayRef, is_min: bool) -> ArrayRef {
+        macro_rules! compare_primitive {
+            ($array_type:ty, $a:expr, $b:expr, $is_min:expr) => {{
+                let a_arr = $a.as_any().downcast_ref::<$array_type>().unwrap();
+                let b_arr = $b.as_any().downcast_ref::<$array_type>().unwrap();
+                let a_val = a_arr.value(0);
+                let b_val = b_arr.value(0);
+                let result = if $is_min {
+                    if a_val <= b_val {
+                        a_val
+                    } else {
+                        b_val
+                    }
+                } else {
+                    if a_val >= b_val {
+                        a_val
+                    } else {
+                        b_val
+                    }
+                };
+                Arc::new(<$array_type>::from(vec![result])) as ArrayRef
+            }};
+        }
+
+        match a.data_type() {
+            DataType::Int8 => compare_primitive!(Int8Array, a, b, is_min),
+            DataType::Int16 => compare_primitive!(Int16Array, a, b, is_min),
+            DataType::Int32 => compare_primitive!(Int32Array, a, b, is_min),
+            DataType::Int64 => compare_primitive!(Int64Array, a, b, is_min),
+            DataType::UInt8 => compare_primitive!(UInt8Array, a, b, is_min),
+            DataType::UInt16 => compare_primitive!(UInt16Array, a, b, is_min),
+            DataType::UInt32 => compare_primitive!(UInt32Array, a, b, is_min),
+            DataType::UInt64 => compare_primitive!(UInt64Array, a, b, is_min),
+            DataType::Date32 => compare_primitive!(Date32Array, a, b, is_min),
+            DataType::Date64 => compare_primitive!(Date64Array, a, b, is_min),
+            DataType::Float32 => {
+                let a_arr = a.as_any().downcast_ref::<Float32Array>().unwrap();
+                let b_arr = b.as_any().downcast_ref::<Float32Array>().unwrap();
+                let a_val = a_arr.value(0);
+                let b_val = b_arr.value(0);
+                let result = if is_min {
+                    a_val.min(b_val)
+                } else {
+                    a_val.max(b_val)
+                };
+                Arc::new(Float32Array::from(vec![result])) as ArrayRef
+            }
+            DataType::Float64 => {
+                let a_arr = a.as_any().downcast_ref::<Float64Array>().unwrap();
+                let b_arr = b.as_any().downcast_ref::<Float64Array>().unwrap();
+                let a_val = a_arr.value(0);
+                let b_val = b_arr.value(0);
+                let result = if is_min {
+                    a_val.min(b_val)
+                } else {
+                    a_val.max(b_val)
+                };
+                Arc::new(Float64Array::from(vec![result])) as ArrayRef
+            }
+            DataType::Utf8 => {
+                let a_arr = a.as_any().downcast_ref::<StringArray>().unwrap();
+                let b_arr = b.as_any().downcast_ref::<StringArray>().unwrap();
+                let a_val = a_arr.value(0);
+                let b_val = b_arr.value(0);
+                let result = if is_min {
+                    if a_val <= b_val {
+                        a_val
+                    } else {
+                        b_val
+                    }
+                } else {
+                    if a_val >= b_val {
+                        a_val
+                    } else {
+                        b_val
+                    }
+                };
+                Arc::new(StringArray::from(vec![result])) as ArrayRef
+            }
+            _ => a.clone(), // Fallback
+        }
+    }
+
     /// Update statistics with data from a RecordBatch.
     pub(crate) fn update(&mut self, batch: &RecordBatch) -> DeltaResult<()> {
         self.num_records += batch.num_rows() as i64;
 
-        // Update null counts
         for (col_idx, column) in batch.columns().iter().enumerate() {
             let col_name = &self.column_names[col_idx];
             if self.should_collect_stats(col_name) {
+                // Update null counts
                 let batch_null_counts = Self::compute_null_counts(column);
                 self.null_counts[col_idx] =
                     Self::merge_null_counts(&self.null_counts[col_idx], &batch_null_counts);
+
+                // Update min/max
+                let (batch_min, batch_max) = Self::compute_min_max(column);
+                self.min_values[col_idx] = Self::merge_min(&self.min_values[col_idx], &batch_min);
+                self.max_values[col_idx] = Self::merge_max(&self.max_values[col_idx], &batch_max);
             }
         }
 
@@ -206,6 +536,72 @@ impl StatisticsCollector {
                 true,
             ));
             arrays.push(Arc::new(null_count_struct));
+        }
+
+        // minValues - nested struct with min values
+        let min_fields: Vec<Field> = self
+            .column_names
+            .iter()
+            .enumerate()
+            .filter(|(idx, name)| {
+                self.should_collect_stats(name) && !self.min_values[*idx].is_null(0)
+            })
+            .map(|(idx, name)| Field::new(name, self.min_values[idx].data_type().clone(), true))
+            .collect();
+
+        if !min_fields.is_empty() {
+            let min_arrays: Vec<ArrayRef> = self
+                .column_names
+                .iter()
+                .enumerate()
+                .filter(|(idx, name)| {
+                    self.should_collect_stats(name) && !self.min_values[*idx].is_null(0)
+                })
+                .map(|(idx, _)| self.min_values[idx].clone())
+                .collect();
+
+            let min_struct = StructArray::try_new(min_fields.into(), min_arrays, None)
+                .map_err(|e| Error::generic(format!("Failed to create minValues: {e}")))?;
+
+            fields.push(Field::new(
+                "minValues",
+                min_struct.data_type().clone(),
+                true,
+            ));
+            arrays.push(Arc::new(min_struct));
+        }
+
+        // maxValues - nested struct with max values
+        let max_fields: Vec<Field> = self
+            .column_names
+            .iter()
+            .enumerate()
+            .filter(|(idx, name)| {
+                self.should_collect_stats(name) && !self.max_values[*idx].is_null(0)
+            })
+            .map(|(idx, name)| Field::new(name, self.max_values[idx].data_type().clone(), true))
+            .collect();
+
+        if !max_fields.is_empty() {
+            let max_arrays: Vec<ArrayRef> = self
+                .column_names
+                .iter()
+                .enumerate()
+                .filter(|(idx, name)| {
+                    self.should_collect_stats(name) && !self.max_values[*idx].is_null(0)
+                })
+                .map(|(idx, _)| self.max_values[idx].clone())
+                .collect();
+
+            let max_struct = StructArray::try_new(max_fields.into(), max_arrays, None)
+                .map_err(|e| Error::generic(format!("Failed to create maxValues: {e}")))?;
+
+            fields.push(Field::new(
+                "maxValues",
+                max_struct.data_type().clone(),
+                true,
+            ));
+            arrays.push(Arc::new(max_struct));
         }
 
         // tightBounds
@@ -364,5 +760,132 @@ mod tests {
         // Only id should be present
         assert!(null_count.column_by_name("id").is_some());
         assert!(null_count.column_by_name("value").is_none());
+    }
+
+    #[test]
+    fn test_statistics_collector_min_max() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("number", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![5, 1, 9, 3])),
+                Arc::new(StringArray::from(vec![
+                    Some("banana"),
+                    Some("apple"),
+                    Some("cherry"),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let mut collector =
+            StatisticsCollector::new(schema, &["number".to_string(), "name".to_string()]);
+        collector.update(&batch).unwrap();
+        let stats = collector.finalize().unwrap();
+
+        // Check minValues
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let number_min = min_values
+            .column_by_name("number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(number_min.value(0), 1);
+
+        let name_min = min_values
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_min.value(0), "apple");
+
+        // Check maxValues
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        let number_max = max_values
+            .column_by_name("number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(number_max.value(0), 9);
+
+        let name_max = max_values
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_max.value(0), "cherry");
+    }
+
+    #[test]
+    fn test_statistics_collector_min_max_multiple_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![5, 10, 3]))],
+        )
+        .unwrap();
+
+        let batch2 =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 8]))])
+                .unwrap();
+
+        let mut collector = StatisticsCollector::new(schema, &["value".to_string()]);
+        collector.update(&batch1).unwrap();
+        collector.update(&batch2).unwrap();
+        let stats = collector.finalize().unwrap();
+
+        let min_values = stats
+            .column_by_name("minValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let value_min = min_values
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_min.value(0), 1); // min across both batches
+
+        let max_values = stats
+            .column_by_name("maxValues")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let value_max = max_values
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(value_max.value(0), 10); // max across both batches
     }
 }
