@@ -594,6 +594,12 @@ pub struct LoggingTest {
     _guard: DefaultGuard,
 }
 
+impl Default for LoggingTest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoggingTest {
     pub fn new() -> Self {
         let logs = Arc::new(Mutex::new(Vec::new()));
