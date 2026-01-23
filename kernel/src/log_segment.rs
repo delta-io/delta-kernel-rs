@@ -54,7 +54,7 @@ pub(crate) struct CheckpointReadInfo {
 /// and checkpoint metadata.
 ///
 /// This struct provides named access to the return values instead of tuple indexing.
-pub(crate) struct ActionsWithCheckpointInfo<A> {
+pub(crate) struct ActionsWithCheckpointInfo<A: Iterator<Item = DeltaResult<ActionsBatch>> + Send> {
     /// Iterator over action batches read from the log segment.
     pub actions: A,
     /// Metadata about checkpoint reading, including the schema used.
@@ -450,7 +450,7 @@ impl LogSegment {
         // `replay` expects commit files to be sorted in descending order, so the return value here is correct
         let commit_stream = CommitReader::try_new(engine, self, commit_read_schema)?;
 
-        let (checkpoint_stream, checkpoint_info) = self.create_checkpoint_stream(
+        let checkpoint_result = self.create_checkpoint_stream(
             engine,
             checkpoint_read_schema,
             meta_predicate,
@@ -458,8 +458,8 @@ impl LogSegment {
         )?;
 
         Ok(ActionsWithCheckpointInfo {
-            actions: commit_stream.chain(checkpoint_stream),
-            checkpoint_info,
+            actions: commit_stream.chain(checkpoint_result.actions),
+            checkpoint_info: checkpoint_result.checkpoint_info,
         })
     }
 
@@ -634,10 +634,9 @@ impl LogSegment {
         action_schema: SchemaRef,
         meta_predicate: Option<PredicateRef>,
         stats_schema: Option<&StructType>,
-    ) -> DeltaResult<(
-        impl Iterator<Item = DeltaResult<ActionsBatch>> + Send,
-        CheckpointReadInfo,
-    )> {
+    ) -> DeltaResult<
+        ActionsWithCheckpointInfo<impl Iterator<Item = DeltaResult<ActionsBatch>> + Send>,
+    > {
         let need_file_actions = schema_contains_file_actions(&action_schema);
 
         // Extract file actions schema and sidecar files
@@ -763,7 +762,10 @@ impl LogSegment {
             has_stats_parsed,
             checkpoint_read_schema: augmented_checkpoint_read_schema,
         };
-        Ok((actions_iter, checkpoint_info))
+        Ok(ActionsWithCheckpointInfo {
+            actions: actions_iter,
+            checkpoint_info,
+        })
     }
 
     /// Extracts sidecar file references from a checkpoint file.
