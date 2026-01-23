@@ -10,9 +10,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{
-    BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform, VariadicExpressionOp,
-};
+use crate::expressions::{BinaryExpressionOp, Expression, ExpressionRef, Scalar, Transform};
 use crate::schema::{DataType, SchemaRef, StructType};
 use crate::table_features::ColumnMappingMode;
 use crate::{DeltaResult, Error};
@@ -137,17 +135,14 @@ pub(crate) fn get_transform_expr(
                 let base_row_id = base_row_id.ok_or_else(|| {
                     Error::generic("Asked to generate RowIds, but no baseRowId found.")
                 })?;
-                let expr = Arc::new(Expression::variadic(
-                    VariadicExpressionOp::Coalesce,
-                    vec![
-                        Expression::column([field_name]),
-                        Expression::binary(
-                            BinaryExpressionOp::Plus,
-                            Expression::literal(base_row_id),
-                            Expression::column([row_index_field_name]),
-                        ),
-                    ],
-                ));
+                let expr = Arc::new(Expression::coalesce([
+                    Expression::column([field_name]),
+                    Expression::binary(
+                        BinaryExpressionOp::Plus,
+                        Expression::literal(base_row_id),
+                        Expression::column([row_index_field_name]),
+                    ),
+                ]));
                 transform.with_replaced_field(field_name.clone(), expr)
             }
             MetadataDerivedColumn {
@@ -592,17 +587,14 @@ mod tests {
             .expect("Should have row_id_col transform");
         assert!(row_id_transform.is_replace);
 
-        let expeceted_expr = Arc::new(Expression::variadic(
-            VariadicExpressionOp::Coalesce,
-            vec![
-                Expression::column(["row_id_col"]),
-                Expression::binary(
-                    BinaryExpressionOp::Plus,
-                    Expression::literal(4i64),
-                    Expression::column(["row_index_col"]),
-                ),
-            ],
-        ));
+        let expeceted_expr = Arc::new(Expression::coalesce([
+            Expression::column(["row_id_col"]),
+            Expression::binary(
+                BinaryExpressionOp::Plus,
+                Expression::literal(4i64),
+                Expression::column(["row_index_col"]),
+            ),
+        ]));
         assert_eq!(row_id_transform.exprs.len(), 1);
         let expr = &row_id_transform.exprs[0];
         assert_eq!(expr, &expeceted_expr);
