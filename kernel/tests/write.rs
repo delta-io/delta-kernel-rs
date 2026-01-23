@@ -2918,11 +2918,11 @@ async fn test_post_commit_snapshot_simple() {
 
     let schema = get_simple_int_schema();
 
-    for (table_url, engine, _store, _table_name) in
-        setup_test_tables(schema.clone(), &[], None, "test_table")
-            .await
-            .unwrap()
-    {
+    let setup = setup_test_tables(schema.clone(), &[], None, "test_table")
+        .await
+        .unwrap();
+
+    for (table_url, engine, _store, _table_name) in setup {
         let mut current_snapshot = Snapshot::builder_for(table_url).build(&engine).unwrap();
 
         for i in 0..10 {
