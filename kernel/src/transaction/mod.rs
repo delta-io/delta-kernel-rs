@@ -1588,7 +1588,7 @@ pub struct CommittedTransaction {
     commit_version: Version,
     /// The [`PostCommitStats`] for this transaction.
     post_commit_stats: PostCommitStats,
-    /// The [`Snapshot`] of the table after this transaction was committed.
+    /// The [`SnapshotRef`] of the table after this transaction was committed.
     ///
     /// This is optional to allow incremental development of new features (e.g., table creation,
     /// transaction retries) without blocking on implementing post-commit snapshot support.
@@ -1606,7 +1606,7 @@ impl CommittedTransaction {
         &self.post_commit_stats
     }
 
-    /// The [`Snapshot`] of the table after this transaction was committed.
+    /// The [`SnapshotRef`] of the table after this transaction was committed.
     pub fn post_commit_snapshot(&self) -> Option<&SnapshotRef> {
         self.post_commit_snapshot.as_ref()
     }
