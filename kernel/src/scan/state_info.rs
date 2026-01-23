@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::scan::data_skipping::stats_schema::build_stats_schema;
 use crate::scan::field_classifiers::TransformFieldClassifier;
 use crate::scan::PhysicalPredicate;
 use crate::schema::{DataType, MetadataColumnSpec, SchemaRef, StructType};
@@ -27,6 +28,9 @@ pub(crate) struct StateInfo {
     pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// The column mapping mode for this scan
     pub(crate) column_mapping_mode: ColumnMappingMode,
+    /// The stats schema for data skipping (built from predicate columns).
+    /// Used to construct checkpoint read schema with stats_parsed.
+    pub(crate) stats_schema: Option<SchemaRef>,
 }
 
 /// Validating the metadata columns also extracts information needed to properly construct the full
@@ -203,6 +207,12 @@ impl StateInfo {
             None => PhysicalPredicate::None,
         };
 
+        // Build stats schema from predicate columns for data skipping
+        let stats_schema = match &physical_predicate {
+            PhysicalPredicate::Some(_, schema) => build_stats_schema(schema),
+            _ => None,
+        };
+
         let transform_spec =
             if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
                 Some(Arc::new(transform_spec))
@@ -216,6 +226,7 @@ impl StateInfo {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
+            stats_schema,
         })
     }
 }
