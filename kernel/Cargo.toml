@@ -65,6 +65,8 @@ tokio = { version = "1.47", optional = true, features = ["rt-multi-thread"] }
 # both arrow versions below are optional and require object_store
 object_store = { version = "0.12.3", optional = true, features = ["aws", "azure", "gcp", "http"] }
 comfy-table = { version = "7.1", optional = true }
+# used for Float trait in stats computation
+num-traits = { version = "0.2", optional = true }
 
 # arrow 56
 [dependencies.arrow_56]
@@ -118,6 +120,7 @@ default-engine-base = [
   "arrow-expression",
   "futures",
   "need-arrow",
+  "num-traits",
   "tokio",
 ]
 # the default-engine-native-tls use the reqwest crate with default features which uses native-tls. if you want
